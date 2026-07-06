@@ -1,0 +1,126 @@
+// PDF metadata extraction — ports crates/xberg/src/pdf/oxide/metadata.rs
+// (info dictionary strings, date parsing, author/keyword splitting, PDF-specific fields).
+using System.Text;
+
+namespace Xberg.Internal.Pdf;
+
+public sealed class PdfMetaResult
+{
+    public string? Title, Subject, CreatedBy, CreatedAt, ModifiedAt, Producer, PdfVersion;
+    public List<string>? Authors, Keywords;
+    public bool IsEncrypted;
+    public long? Width, Height;
+    public uint PageCount;
+}
+
+public static class PdfMetadataExtractor
+{
+    public static PdfMetaResult Extract(PdfDocument doc)
+    {
+        var r = new PdfMetaResult();
+        if (doc.VersionMajor > 0) r.PdfVersion = $"{doc.VersionMajor}.{doc.VersionMinor}";
+        r.IsEncrypted = doc.IsEncrypted;
+        r.PageCount = (uint)doc.PageCount;
+
+        if (doc.PageCount > 0)
+        {
+            var (llx, lly, urx, ury) = doc.GetPageMediaBox(0);
+            r.Width = (long)Math.Round(Math.Abs(urx - llx), MidpointRounding.AwayFromZero);
+            r.Height = (long)Math.Round(Math.Abs(ury - lly), MidpointRounding.AwayFromZero);
+        }
+
+        var info = doc.InfoDict;
+        r.Producer = GetInfoString(info, "Producer");
+        r.Title = GetInfoString(info, "Title");
+        r.Subject = GetInfoString(info, "Subject");
+        r.CreatedBy = GetInfoString(info, "Creator");
+
+        var author = GetInfoString(info, "Author");
+        if (author != null) { var a = ParseAuthors(author); if (a.Count > 0) r.Authors = a; }
+        var kw = GetInfoString(info, "Keywords");
+        if (kw != null) { var k = ParseKeywords(kw); if (k.Count > 0) r.Keywords = k; }
+
+        var cd = GetInfoString(info, "CreationDate");
+        if (cd != null) r.CreatedAt = ParsePdfDate(cd);
+        var md = GetInfoString(info, "ModDate");
+        if (md != null) r.ModifiedAt = ParsePdfDate(md);
+
+        return r;
+    }
+
+    private static string? GetInfoString(PdfDict? info, string key)
+    {
+        if (info == null) return null;
+        var v = info.Get(key);
+        if (v is PdfString s) return DecodePdfString(s.Bytes);
+        if (v is PdfName n) { var t = n.Value.Trim(); return t.Length == 0 ? null : t; }
+        return null;
+    }
+
+    public static string? DecodePdfString(byte[] bytes)
+    {
+        if (bytes.Length == 0) return null;
+        string decoded;
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            var sb = new StringBuilder();
+            for (int i = 2; i + 1 < bytes.Length; i += 2)
+                sb.Append((char)((bytes[i] << 8) | bytes[i + 1]));
+            decoded = sb.ToString();
+        }
+        else if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            decoded = Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        }
+        else
+        {
+            // Try strict UTF-8, else Latin-1 (PDFDocEncoding approximation).
+            if (IsValidUtf8(bytes)) decoded = Encoding.UTF8.GetString(bytes);
+            else { var sb = new StringBuilder(bytes.Length); foreach (var b in bytes) sb.Append((char)b); decoded = sb.ToString(); }
+        }
+        decoded = decoded.Trim();
+        return decoded.Length == 0 ? null : decoded;
+    }
+
+    private static bool IsValidUtf8(byte[] bytes)
+    {
+        try { var d = new UTF8Encoding(false, true); d.GetString(bytes); return true; }
+        catch { return false; }
+    }
+
+    public static List<string> ParseAuthors(string authorStr)
+    {
+        authorStr = authorStr.Replace(" and ", ", ");
+        var authors = new List<string>();
+        foreach (var segment in authorStr.Split(';'))
+            foreach (var a in segment.Split(','))
+            {
+                var t = a.Trim();
+                if (t.Length > 0) authors.Add(t);
+            }
+        return authors;
+    }
+
+    public static List<string> ParseKeywords(string kw)
+    {
+        return kw.Replace(';', ',').Split(',')
+            .Select(k => k.Trim()).Where(k => k.Length > 0).ToList();
+    }
+
+    public static string ParsePdfDate(string dateStr)
+    {
+        string c = dateStr.Trim();
+        if (c.StartsWith("D:") && c.Length >= 10)
+        {
+            string year = c.Substring(2, 4), month = c.Substring(6, 2), day = c.Substring(8, 2);
+            if (c.Length >= 16)
+                return $"{year}-{month}-{day}T{c.Substring(10, 2)}:{c.Substring(12, 2)}:{c.Substring(14, 2)}Z";
+            if (c.Length >= 14)
+                return $"{year}-{month}-{day}T{c.Substring(10, 2)}:{c.Substring(12, 2)}:00Z";
+            return $"{year}-{month}-{day}T00:00:00Z";
+        }
+        if (c.Length >= 8)
+            return $"{c.Substring(0, 4)}-{c.Substring(4, 2)}-{c.Substring(6, 2)}T00:00:00Z";
+        return dateStr;
+    }
+}
