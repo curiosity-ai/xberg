@@ -179,7 +179,14 @@ async fn generate(path: &Path, rel: &str) -> Result<ReferenceOutput, String> {
         config.output_format = fmt();
         let input = ExtractInput::from_uri(path_str.clone());
 
-        match extract(input, &config).await {
+        // Guard against pathological inputs that spin forever in a backend parser.
+        let fut = extract(input, &config);
+        let result = match tokio::time::timeout(std::time::Duration::from_secs(45), fut).await {
+            Ok(r) => r,
+            Err(_) => Err(xberg::XbergError::Other("timed out after 45s".to_string())),
+        };
+
+        match result {
             Ok(result) => {
                 if let Some(doc) = result.results.into_iter().next() {
                     content.insert((*name).to_string(), doc.content.clone());
