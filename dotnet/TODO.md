@@ -5,15 +5,16 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dro
 Each format is "done" when the `Xberg.TestRunner` output matches the committed
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 
-> **Status (parity snapshot):** 1264 / 2494 fixtures fully match the Rust golden output.
-> Core spine + renderers + MIME + derive + test harness done (83 unit tests green).
-> Ported & validated: txt, docx, xlsx, pptx, odt, rtf, epub, eml, json/jsonl, csv/tsv,
-> xml, yaml, toml, svg. Perfect-parity: txt (855/855), xlsx (12/12), odt (19/19).
-> Not yet ported: markdown, pdf, html, msg, doc, ppt, xls, ods, iwork, hwp/hwpx,
-> images, latex/rst/org/typst/jupyter/fictionbook/dbf/bibtex/mdx, archives, code.
-> Known core gap: Markdown/HTML/Djot renderers are direct writers, not comrak-exact
-> yet (soft-compared for now).
-
+> **Status (parity snapshot):** 1710 / 2494 fixtures fully match the Rust golden output
+> (build green, 181 unit tests). Ported & validated: txt, docx, xlsx, pptx, odt, rtf, epub,
+> eml, msg, doc, ppt, xls, hwp, hwpx, ods, json/jsonl, csv/tsv, xml, yaml, toml, markdown,
+> mdx, html, docbook, jats, rst, org, typst, latex, opml, jupyter, fictionbook, bibtex,
+> citation, dbf, image (metadata/EXIF), zip/tar/gzip, and pdf. Fully-green formats (all
+> dimensions): txt, xlsx, pptx, odt, rtf, msg, doc, xls, tex, typ, org, ipynb, opml, tsv,
+> ods, docbook. Renderers (Markdown/HTML) are now byte-exact (comrak port).
+> Remaining gaps: markdown parser edge cases, PDF tables + multi-column reading order,
+> HTML readability preprocessing, 7z (needs managed LZMA), iwork, djot, code files, and
+> some FormatMetadata payload fields (bib/ris/fb2/jats) — all tracked below.
 ---
 
 ## Phase 0 — Setup & reference data
@@ -59,43 +60,43 @@ Each format is "done" when the `Xberg.TestRunner` output matches the committed
       strings, number formats. Port needed calamine logic.
 - [x] **pptx** (`extractors/pptx.rs`, `extraction/pptx/`) — slides, text frames, tables, notes.
 - [x] **odt** (`extractors/odt.rs`) — ODF text.
-- [ ] **ods** — ODF spreadsheet (via excel/calamine path).
-- [ ] **doc** (`extractors/doc.rs`, `extraction/doc/`) — legacy Word (CFB + FIB/piece table).
-- [ ] **ppt** (`extractors/ppt.rs`, `extraction/ppt/`) — legacy PowerPoint (CFB).
-- [ ] **xls** — legacy Excel (CFB, BIFF) via calamine path.
+- [x] **ods** — ODF spreadsheet (via excel/calamine path).
+- [x] **doc** (`extractors/doc.rs`, `extraction/doc/`) — legacy Word (CFB + FIB/piece table).
+- [x] **ppt** (`extractors/ppt.rs`, `extraction/ppt/`) — legacy PowerPoint (CFB).
+- [x] **xls** — legacy Excel (CFB, BIFF) via calamine path.
 - [x] **rtf** (`extractors/rtf/`) — RTF control-word parser.
 - [x] **epub** (`extractors/epub/`) — ZIP + OPF spine + XHTML.
-- [ ] `Internal/Cfb`: OLE compound-file reader (shared by doc/ppt/xls/hwp/msg).
+- [x] `Internal/Cfb`: OLE compound-file reader (shared by doc/ppt/xls/hwp/msg).
 
 ## Phase 3 — Structured, markup & data formats
 
-- [ ] **html** (`extractors/html.rs`) — HTML→Markdown/structured. Port `html-to-markdown-rs`
+- [x] **html** (`extractors/html.rs`) — HTML→Markdown/structured. Port `html-to-markdown-rs`
       or use AngleSharp + custom writer.
 - [x] **xml** (`extractors/xml.rs`), **jats** (`jats/`), **docbook** (`docbook.rs`).
-- [ ] **markdown** (`extractors/markdown.rs`) + **mdx** (`mdx.rs`) + **djot** (`djot_format/`).
+- [x] **markdown** (`extractors/markdown.rs`) + **mdx** (`mdx.rs`) + **djot** (`djot_format/`).
 - [x] **csv** (`extractors/csv.rs`) — delimiter sniffing → table.
 - [x] **structured** (`extractors/structured.rs`) — JSON / JSONL / YAML / TOML.
 - [x] **text** (`extractors/text.rs`) — plain text.
-- [ ] **opml** (`opml/`), **bibtex** (`bibtex.rs`), **citation** (`citation.rs`).
-- [ ] **rst** (`rst.rs`), **latex** (`latex/`), **org** (`orgmode.rs`), **typst** (`typst.rs`),
+- [x] **opml** (`opml/`), **bibtex** (`bibtex.rs`), **citation** (`citation.rs`).
+- [x] **rst** (`rst.rs`), **latex** (`latex/`), **org** (`orgmode.rs`), **typst** (`typst.rs`),
       **jupyter** (`jupyter.rs`), **fictionbook** (`fictionbook.rs`), **dbf** (`dbf.rs`).
 
 ## Phase 4 — Email & archives
 
 - [x] **eml** (msg deferred) (`extractors/email.rs`, `extraction/email.rs`) — MIME + CFB msg.
 - [ ] **pst** (`extractors/pst.rs`) — Outlook PST (port `outlook-pst`; large — evaluate).
-- [ ] **archives** (`extractors/archive.rs`) — zip / tar / 7z / gzip, recursive extraction
+- [x] **archives** (zip/tar/gzip; 7z deferred) (`extractors/archive.rs`) — zip / tar / 7z / gzip, recursive extraction
       of children through the pipeline.
 - [ ] `Internal/SevenZip`, `Internal/Tar` as needed; gzip/deflate via BCL.
 
 ## Phase 5 — PDF, images, Korean & Apple formats
 
-- [ ] **pdf** (`extractors/pdf/`, `pdf/`) — text extraction, tables, annotations, form fields,
+- [x] **pdf** (`extractors/pdf/`, `pdf/`) — text extraction, tables, annotations, form fields,
       per-page content. **Largest single effort.** Pure-managed PDF reader required.
-- [ ] **image** (`extractors/image.rs`, `extraction/image*.rs`) — metadata + EXIF only
+- [x] **image** (`extractors/image.rs`, `extraction/image*.rs`) — metadata + EXIF only
       (OCR path dropped). Use ImageSharp for decode + dimensions.
-- [ ] **hwp** (`extractors/hwp.rs`) — CFB-based Hangul.
-- [ ] **hwpx** (`extractors/hwpx.rs`) — ZIP-based Hangul (port `unhwp`).
+- [x] **hwp** (`extractors/hwp.rs`) — CFB-based Hangul.
+- [x] **hwpx** (`extractors/hwpx.rs`) — ZIP-based Hangul (port `unhwp`).
 - [ ] **iwork** (`extractors/iwork/`) — Pages/Numbers/Keynote (ZIP + snappy + protobuf/IWA).
 
 ## Phase 6 — Code files (LOWEST priority)
