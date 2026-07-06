@@ -28,6 +28,13 @@ public sealed class TextSpan
     public string Text = "";
     public double X, Y, Width, Height;
     public double FontSize;
+    public bool IsBold;
+
+    // Geometry accessors mirroring pdf_oxide Rect (PDF coords: Y grows up).
+    public double Left => X;
+    public double Right => X + Width;
+    public double Top => Y;      // pdf_oxide Rect::top() == y (lower edge); larger Y = higher on page
+    public double Bottom => Y + Height;
 }
 
 public sealed class PdfContentExtractor
@@ -239,6 +246,7 @@ public sealed class PdfContentExtractor
                 Width = endX - startX,
                 Height = effSize,
                 FontSize = (float)effSize,
+                IsBold = font?.IsBold ?? false,
             });
         }
     }

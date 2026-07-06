@@ -244,4 +244,50 @@ public class PdfExtractorTests
         sb.Append($"startxref\n{xrefPos}\n%%EOF");
         return Encoding.ASCII.GetBytes(sb.ToString());
     }
+
+    // ---- Column-aware reading order (XY-cut) ----
+    // Ports the intent of pdf_oxide's XYCutStrategy: a two-column page must read
+    // the whole left column top-to-bottom before the right column, not interleave.
+
+    private static TextSpan Span(string text, double x, double y, double w, double fs = 10.0)
+        => new TextSpan { Text = text, X = x, Y = y, Width = w, Height = fs, FontSize = fs };
+
+    [Fact]
+    public void Assemble_TwoColumnPage_ReadsColumnMajor()
+    {
+        // Region ~[50,500] wide with a clear ~70pt gutter (240..310). Six lines
+        // per column, each a multi-word run so the horizontal projection has a
+        // real valley at the gutter. Input order interleaves the columns.
+        var spans = new List<TextSpan>();
+        for (int line = 0; line < 6; line++)
+        {
+            double y = 700 - line * 20;
+            spans.Add(Span($"left column text line {line}", 50, y, 180));
+            spans.Add(Span($"right column text line {line}", 310, y, 180));
+        }
+
+        string outText = PdfPageText.Assemble(spans);
+        int firstRight = outText.IndexOf("right column text line 0", StringComparison.Ordinal);
+        int lastLeft = outText.IndexOf("left column text line 5", StringComparison.Ordinal);
+        Assert.True(firstRight >= 0 && lastLeft >= 0);
+        // Entire left column must precede the right column.
+        Assert.True(lastLeft < firstRight,
+            "left column must be fully emitted before the right column (column-major reading order)");
+    }
+
+    [Fact]
+    public void Assemble_SingleColumn_PreservesTopToBottom()
+    {
+        var spans = new List<TextSpan>
+        {
+            Span("first line of the paragraph body", 72, 700, 300),
+            Span("second line of the paragraph body", 72, 686, 300),
+            Span("third line of the paragraph body", 72, 672, 300),
+        };
+        string outText = PdfPageText.Assemble(spans);
+        int a = outText.IndexOf("first", StringComparison.Ordinal);
+        int b = outText.IndexOf("second", StringComparison.Ordinal);
+        int c = outText.IndexOf("third", StringComparison.Ordinal);
+        Assert.True(a >= 0 && a < b && b < c, "single-column text must stay top-to-bottom");
+    }
 }
