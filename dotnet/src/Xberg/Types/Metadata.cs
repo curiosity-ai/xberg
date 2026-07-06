@@ -261,5 +261,13 @@ public sealed class CitationMetadata { public long CitationCount { get; set; } }
 public sealed class FictionBookMetadata { }
 public sealed class DbfMetadata { public long RecordCount { get; set; } public long FieldCount { get; set; } }
 public sealed class JatsMetadata { }
-public sealed class EpubMetadata { }
+public sealed class EpubMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Coverage { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? DcFormat { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Relation { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Source { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? DcType { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CoverImage { get; set; }
+}
 public sealed class PstMetadata { public long MessageCount { get; set; } }

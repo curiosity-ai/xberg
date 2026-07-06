@@ -1,0 +1,177 @@
+using System.Text.Json;
+using Xberg.Core;
+using Xberg.Internal.Ooxml;
+using Xberg.Types;
+
+namespace Xberg.Extractors;
+
+/// <summary>
+/// Excel spreadsheet extractor. Ports `extractors/excel.rs` + `extraction/excel.rs` for the
+/// ZIP-based OOXML spreadsheet formats (xlsx/xlsm/xltm/xlam). Each non-empty sheet becomes an
+/// H2 heading + one Table; one <see cref="PageContent"/> is emitted per sheet.
+/// Binary formats (.xls/.xla/.xlsb) and ODS are not supported.
+/// </summary>
+public sealed class XlsxExtractor : IExtractor
+{
+    public IEnumerable<string> SupportedMimeTypes => new[]
+    {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel.sheet.macroEnabled.12",
+        "application/vnd.ms-excel.addin.macroEnabled.12",
+        "application/vnd.ms-excel.template.macroEnabled.12",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-excel.addin.macroEnabled",
+        "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+        "application/vnd.oasis.opendocument.spreadsheet",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+    };
+
+    // Standard metadata keys mapped to typed Metadata fields (excluded from `additional`).
+    private static readonly HashSet<string> StandardKeys = new()
+    {
+        "title", "subject", "created_by", "creator", "modified_by",
+        "created_at", "modified_at", "keywords", "language",
+    };
+
+    public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
+    {
+        string extension = mimeType switch
+        {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => ".xlsx",
+            "application/vnd.ms-excel.sheet.macroEnabled.12" => ".xlsm",
+            "application/vnd.ms-excel.addin.macroEnabled.12" => ".xlam",
+            "application/vnd.ms-excel.template.macroEnabled.12" => ".xltm",
+            "application/vnd.ms-excel" => ".xls",
+            "application/vnd.ms-excel.addin.macroEnabled" => ".xla",
+            "application/vnd.ms-excel.sheet.binary.macroEnabled.12" => ".xlsb",
+            "application/vnd.oasis.opendocument.spreadsheet" => ".ods",
+            _ => ".xlsx",
+        };
+
+        bool officeMetadata = extension is ".xlsx" or ".xlsm" or ".xlam" or ".xltm";
+        var workbook = XlsxReader.Read(content, officeMetadata);
+        var doc = WorkbookToInternalDocument(workbook);
+        doc.MimeType = mimeType;
+        return doc;
+    }
+
+    private static InternalDocument WorkbookToInternalDocument(ExcelWorkbook workbook)
+    {
+        var doc = BuildInternalDocument(workbook);
+
+        var excelMeta = new ExcelMetadata
+        {
+            SheetCount = (uint)workbook.Sheets.Count,
+            SheetNames = workbook.Sheets.Select(s => s.Name).ToList(),
+        };
+
+        var wbMeta = workbook.Metadata;
+        string? Get(string k) => wbMeta.TryGetValue(k, out var v) ? v : null;
+
+        string? createdBy = Get("created_by") ?? Get("creator");
+        string? title = Get("title");
+        string? subject = Get("subject");
+        string? modifiedBy = Get("modified_by");
+        string? createdAt = Get("created_at");
+        string? modifiedAt = Get("modified_at");
+        string? language = Get("language");
+        List<string>? authors = createdBy is null ? null : new List<string> { createdBy };
+        List<string>? keywords = Get("keywords") is { } kw
+            ? kw.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).ToList()
+            : null;
+
+        var additional = new Dictionary<string, JsonElement>();
+        foreach (var (k, v) in wbMeta)
+            if (!StandardKeys.Contains(k))
+                additional[k] = JsonString(v);
+
+        doc.Metadata = new Metadata
+        {
+            Title = title,
+            Subject = subject,
+            Authors = authors,
+            Keywords = keywords,
+            Language = language,
+            CreatedAt = createdAt,
+            ModifiedAt = modifiedAt,
+            CreatedBy = createdBy,
+            ModifiedBy = modifiedBy,
+            Format = FormatMetadata.Excel(excelMeta),
+            Additional = additional,
+        };
+        return doc;
+    }
+
+    private static InternalDocument BuildInternalDocument(ExcelWorkbook workbook)
+    {
+        var builder = new InternalDocumentBuilder("excel");
+        var pages = new List<PageContent>(workbook.Sheets.Count);
+
+        for (int i = 0; i < workbook.Sheets.Count; i++)
+        {
+            var sheet = workbook.Sheets[i];
+            uint pageNumber = (uint)(i + 1);
+            string? nameOpt = sheet.Name.Length == 0 ? null : sheet.Name;
+
+            if (sheet.TableCells is { Count: > 0 } cells)
+            {
+                if (sheet.Name.Length > 0)
+                    builder.PushHeading(2, sheet.Name, null, null);
+                builder.PushTableFromCells(cells, pageNumber, null);
+
+                string pageContent = sheet.Name.Length == 0
+                    ? sheet.Markdown
+                    : $"## {EscapeSheetNameForHeading(sheet.Name)}\n\n{sheet.Markdown}";
+
+                var table = new Table
+                {
+                    Cells = cells.Select(r => new List<string>(r)).ToList(),
+                    Markdown = sheet.Markdown,
+                    PageNumber = pageNumber,
+                };
+                pages.Add(new PageContent
+                {
+                    PageNumber = pageNumber,
+                    Content = pageContent,
+                    Tables = new List<Table> { table },
+                    IsBlank = false,
+                    SheetName = nameOpt,
+                });
+            }
+            else
+            {
+                string content = nameOpt is null ? "" : $"## {EscapeSheetNameForHeading(nameOpt)}\n\n";
+                pages.Add(new PageContent
+                {
+                    PageNumber = pageNumber,
+                    Content = content,
+                    IsBlank = true,
+                    SheetName = nameOpt,
+                });
+            }
+        }
+
+        var doc = builder.Build();
+        doc.PrebuiltPages = pages;
+        return doc;
+    }
+
+    private static readonly char[] InlineMetachars = { '\\', '`', '*', '_', '[', ']', '<', '>', '!' };
+
+    private static string EscapeSheetNameForHeading(string name)
+    {
+        name = name.TrimStart();
+        var sb = new System.Text.StringBuilder(name.Length + 8);
+        for (int i = 0; i < name.Length; i++)
+        {
+            char ch = name[i];
+            bool needsEscape = (i == 0 && ch is '#' or '>' or '-' or '*' or '+' or '~') || Array.IndexOf(InlineMetachars, ch) >= 0;
+            if (needsEscape) sb.Append('\\');
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    private static JsonElement JsonString(string s) =>
+        JsonDocument.Parse(JsonSerializer.Serialize(s)).RootElement.Clone();
+}
