@@ -19,6 +19,7 @@ public static class Json
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
             WriteIndented = false,
+            Encoder = SerdeJsonEncoder.Shared,
         };
         o.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
         // The tagged-union converters are applied via [JsonConverter] attributes on their types.

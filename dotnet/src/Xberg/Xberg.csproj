@@ -14,6 +14,7 @@
     <PackageTags>document;extraction;pdf;docx;xlsx;pptx;text;markdown;html</PackageTags>
     <RepositoryUrl>https://github.com/curiosity-ai/xberg</RepositoryUrl>
     <IsPackable>true</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

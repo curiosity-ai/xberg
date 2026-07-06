@@ -14,7 +14,7 @@ public static class JsonRenderer
 {
     private static readonly JsonSerializerOptions WriteOptions = new()
     {
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        Encoder = SerdeJsonEncoder.Shared,
         WriteIndented = false,
     };
 

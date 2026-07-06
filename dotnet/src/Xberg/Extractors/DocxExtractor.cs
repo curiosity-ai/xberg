@@ -30,6 +30,7 @@ public sealed class DocxExtractor : IExtractor
         PopulateImages(doc, internalDoc);
         internalDoc.MimeType = mimeType;
         internalDoc.Metadata = BuildMetadata(pkg);
+        SetPageStructure(doc, internalDoc.Metadata);
         return internalDoc;
     }
 
@@ -186,6 +187,108 @@ public sealed class DocxExtractor : IExtractor
         }
     }
 
+    // ── page structure (metadata.pages) via to_plain_text form-feed boundaries ──
+    private static void SetPageStructure(DocxDocument doc, Metadata meta)
+    {
+        string text = BuildPlainText(doc);
+        var bytes = Encoding.UTF8.GetBytes(text);
+        var bounds = new List<(int Start, int End, uint Page)>();
+        int start = 0; uint page = 1;
+        for (int i = 0; i < bytes.Length; i++)
+        {
+            if (bytes[i] == 0x0c) { bounds.Add((start, i, page)); start = i + 1; page++; }
+        }
+        bounds.Add((start, bytes.Length, page));
+        if (bounds.Count <= 1) return;
+
+        meta.Pages = new PageStructure
+        {
+            TotalCount = (uint)bounds.Count,
+            UnitType = PageUnitType.Page,
+            Boundaries = bounds.Select(b => (object)new BoundaryDto(b.Start, b.End, b.Page)).ToList(),
+            Pages = bounds.Select(b => (object)new PageInfoDto(b.Page)).ToList(),
+        };
+    }
+
+    private sealed record BoundaryDto(int ByteStart, int ByteEnd, uint PageNumber);
+    private sealed record PageInfoDto(uint Number);
+
+    /// <summary>Ports `Document::to_plain_text` (used for page-boundary computation).</summary>
+    private static string BuildPlainText(DocxDocument doc)
+    {
+        var sb = new StringBuilder();
+        void EnsureBlank()
+        {
+            if (sb.Length == 0) return;
+            if (sb.Length >= 2 && sb[^1] == '\n' && sb[^2] == '\n') return;
+            if (sb[^1] != '\n') sb.Append('\n');
+            sb.Append('\n');
+        }
+
+        foreach (var el in doc.Elements)
+        {
+            switch (el.Kind)
+            {
+                case DocElementKind.Paragraph:
+                    var t = CollectText(el.Paragraph!.Runs);
+                    if (t.Length > 0) { EnsureBlank(); sb.Append(t); }
+                    break;
+                case DocElementKind.Table:
+                    EnsureBlank();
+                    if (!string.IsNullOrEmpty(el.Table!.Caption)) { sb.Append(el.Table.Caption); sb.Append("\n\n"); }
+                    sb.Append(TablePlainText(el.Table));
+                    break;
+                case DocElementKind.Drawing:
+                    var d = el.Drawing!.Description;
+                    if (!string.IsNullOrEmpty(d)) { EnsureBlank(); sb.Append(d); }
+                    break;
+                case DocElementKind.PageBreak:
+                    sb.Append('\f');
+                    break;
+            }
+        }
+
+        AppendNotes(sb, doc.Footnotes);
+        AppendNotes(sb, doc.Endnotes);
+        return sb.ToString().Trim();
+    }
+
+    private static void AppendNotes(StringBuilder sb, List<DocxNote> notes)
+    {
+        if (notes.Count == 0) return;
+        sb.Append("\n\n");
+        foreach (var note in notes)
+        {
+            string text = string.Join(" ", note.Paragraphs.Select(p => CollectText(p.Runs)).Where(s => s.Length > 0));
+            if (text.Length > 0) sb.Append($"{note.Id}: {text}\n");
+        }
+    }
+
+    /// <summary>Ports `Table::to_plain_text` → tab-separated cells (v-merge continue → empty).</summary>
+    private static string TablePlainText(DocxTable table)
+    {
+        var cells = new List<List<string>>();
+        foreach (var row in table.Rows)
+        {
+            var rowCells = new List<string>();
+            foreach (var cell in row.Cells)
+            {
+                string text = cell.VMergeContinue
+                    ? ""
+                    : string.Join(" ", cell.Paragraphs.Select(p => CollectText(p.Runs))).Trim();
+                for (int s = 0; s < cell.GridSpan; s++) rowCells.Add(text);
+            }
+            cells.Add(rowCells);
+        }
+        var sb = new StringBuilder();
+        foreach (var row in cells)
+        {
+            for (int i = 0; i < row.Count; i++) { if (i > 0) sb.Append('\t'); sb.Append(row[i]); }
+            sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+
     private static bool IsQuoteStyle(string? style)
     {
         if (style is null) return false;
@@ -311,6 +414,8 @@ public sealed class DocxExtractor : IExtractor
         AddStr("category", core.Category);
         AddStr("content_status", core.ContentStatus);
         AddStr("description", core.Description);
+        // Custom properties also surface as `custom_<name>` entries in `additional`.
+        foreach (var (k, v) in custom) additional["custom_" + k] = v;
 
         var docxMeta = new DocxMetadata
         {
