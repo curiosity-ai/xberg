@@ -1,0 +1,55 @@
+using System.Text;
+using Xberg.Core;
+using Xberg.Internal.Html;
+using Xberg.Types;
+
+namespace Xberg.Extractors;
+
+/// <summary>
+/// HTML document extractor. Ported from Rust `extractors/html.rs` + `extraction/html/`.
+/// The Rust path uses the `html-to-markdown-rs` crate; this port reimplements the byte-level
+/// walker (<see cref="HtmlWalker"/>) that produces the equivalent InternalDocument (headings
+/// wrapped in section Groups, paragraphs, lists, tables, code, blockquotes, images) plus a
+/// metadata scan (<see cref="HtmlMeta"/>). Markdown/HTML/Djot rendering is left to the renderers.
+/// </summary>
+public sealed class HtmlExtractor : IExtractor
+{
+    public IEnumerable<string> SupportedMimeTypes => new[]
+    {
+        "text/html",
+        "application/xhtml+xml",
+    };
+
+    public int Priority => 50;
+
+    public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
+    {
+        string html = XmlPullReader.Decode(content);
+
+        var builder = new InternalDocumentBuilder("html");
+        new HtmlWalker(html, builder).Walk();
+        var doc = builder.Build();
+
+        var htmlMeta = HtmlMeta.Extract(html);
+        var metadata = new Metadata();
+        if (!IsEmpty(htmlMeta))
+        {
+            metadata.Title = htmlMeta.Title;
+            metadata.Authors = htmlMeta.Author is null ? null : new List<string> { htmlMeta.Author };
+            metadata.Language = htmlMeta.Language;
+            metadata.Subject = htmlMeta.Description;
+            metadata.Keywords = htmlMeta.Keywords.Count > 0 ? new List<string>(htmlMeta.Keywords) : null;
+            metadata.Format = FormatMetadata.Html(htmlMeta);
+        }
+
+        doc.Metadata = metadata;
+        doc.MimeType = mimeType;
+        return doc;
+    }
+
+    private static bool IsEmpty(HtmlMetadata m) =>
+        m.Title is null && m.Description is null && m.Keywords.Count == 0 && m.Author is null &&
+        m.CanonicalUrl is null && m.BaseHref is null && m.Language is null && m.TextDirection is null &&
+        m.OpenGraph.Count == 0 && m.TwitterCard.Count == 0 && m.MetaTags.Count == 0 &&
+        m.Headers.Count == 0 && m.Links.Count == 0 && m.Images.Count == 0 && m.StructuredData.Count == 0;
+}
