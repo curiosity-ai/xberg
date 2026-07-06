@@ -5,15 +5,14 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dro
 Each format is "done" when the `Xberg.TestRunner` output matches the committed
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 
-> **Status (parity snapshot):** 1171 / 2494 fixtures fully match the Rust golden output.
+> **Status (parity snapshot):** 1264 / 2494 fixtures fully match the Rust golden output.
 > Core spine + renderers + MIME + derive + test harness done (83 unit tests green).
 > Ported & validated: txt, docx, xlsx, pptx, odt, rtf, epub, eml, json/jsonl, csv/tsv,
-> xml, yaml, toml, svg. Perfect-parity extensions: xlsx (12/12), odt (19/19).
+> xml, yaml, toml, svg. Perfect-parity: txt (855/855), xlsx (12/12), odt (19/19).
 > Not yet ported: markdown, pdf, html, msg, doc, ppt, xls, ods, iwork, hwp/hwpx,
 > images, latex/rst/org/typst/jupyter/fictionbook/dbf/bibtex/mdx, archives, code.
 > Known core gap: Markdown/HTML/Djot renderers are direct writers, not comrak-exact
-> (soft-compared for now); JsonRenderer escapes supplementary-plane Unicode as
-> surrogate pairs instead of raw UTF-8 (affects a few JSON fixtures).
+> yet (soft-compared for now).
 
 ---
 
