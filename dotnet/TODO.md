@@ -23,32 +23,32 @@ Each format is "done" when the `Xberg.TestRunner` output matches the committed
 - [x] Write `dotnet/Claude.md` (architecture + mapping).
 - [x] Create the `dotnet/` solution: `Xberg` (lib), `Xberg.Tests`, `Xberg.TestRunner` (CLI).
 - [x] Write the Rust golden-reference generator (`tools/xberg-reference-gen`).
-- [ ] Run the generator over `../test_documents`; commit `*-results-rust.json` to the
+- [x] Run the generator over `../test_documents`; commit `*-results-rust.json` to the
       `test_documents` companion repo.
-- [ ] Wire `Xberg.TestRunner` to load fixtures + golden files and diff per format.
+- [x] Wire `Xberg.TestRunner` to load fixtures + golden files and diff per format.
 
 ## Phase 1 — Core spine (foundational; everything depends on it)
 
-- [ ] `Types/`: `InternalDocument`, `InternalElement`, `ElementKind` (tagged union),
+- [x] `Types/`: `InternalDocument`, `InternalElement`, `ElementKind` (tagged union),
       `InternalElementId` (BLAKE3), `Relationship`.
-- [ ] `Types/`: `Metadata`, `Table`, `BoundingBox`, `ExtractedImage`, `ExtractedUri`,
+- [x] `Types/`: `Metadata`, `Table`, `BoundingBox`, `ExtractedImage`, `ExtractedUri`,
       `PageContent`, `ExtractedDocument`, `ExtractionResult`, `ProcessingWarning`.
-- [ ] `Types/`: `DocumentStructure` tree + `NodeContent` + `ContentLayer` + `TextAnnotation`
+- [x] `Types/`: `DocumentStructure` tree + `NodeContent` + `ContentLayer` + `TextAnnotation`
       (needed for the structured object output).
-- [ ] `Internal/Blake3`: BLAKE3 hash (must match Rust byte output for element IDs).
-- [ ] `Core/Config`: trimmed `ExtractionConfig`, `OutputFormat`, `ResultFormat`, per-format
+- [x] `Internal/Blake3`: BLAKE3 hash (must match Rust byte output for element IDs).
+- [x] `Core/Config`: trimmed `ExtractionConfig`, `OutputFormat`, `ResultFormat`, per-format
       option structs (native-only).
-- [ ] `Core/Mime`: extension + magic-byte MIME detection (`detect_mime_type*`), format table.
-- [ ] `Core/Registry`: extractor registry, dispatch by MIME; `IExtractor` interface.
-- [ ] `Rendering/Common`: nesting state, `IsBodyElement`, container helpers, `GetLanguage`.
-- [ ] `Rendering/Plain`.
-- [ ] `Rendering/Json` (heading-driven tree — port verbatim from `json.rs`).
-- [ ] `Rendering/Markdown` (GFM). Decide: port comrak AST bridge or direct writer.
-- [ ] `Rendering/Html` (+ styled variant).
-- [ ] `Rendering/Djot`.
-- [ ] `Core/Derive`: `InternalDocument → ExtractedDocument` (native path of `derive.rs`):
+- [x] `Core/Mime`: extension + magic-byte MIME detection (`detect_mime_type*`), format table.
+- [x] `Core/Registry`: extractor registry, dispatch by MIME; `IExtractor` interface.
+- [x] `Rendering/Common`: nesting state, `IsBodyElement`, container helpers, `GetLanguage`.
+- [x] `Rendering/Plain`.
+- [x] `Rendering/Json` (heading-driven tree — port verbatim from `json.rs`).
+- [x] `Rendering/Markdown` (GFM). Decide: port comrak AST bridge or direct writer.
+- [x] `Rendering/Html` (+ styled variant).
+- [x] `Rendering/Djot`.
+- [x] `Core/Derive`: `InternalDocument → ExtractedDocument` (native path of `derive.rs`):
       page splitting, structure derivation, language detection (optional), URI collection.
-- [ ] `Xberg` public API: `Extract(input, config)` sync + async, `ExtractBatch`.
+- [x] `Xberg` public API: `Extract(input, config)` sync + async, `ExtractBatch`.
 
 ## Phase 2 — Office formats (priority)
 
