@@ -1,3 +1,9 @@
+# Standalone workspace so this dev-only helper lives entirely under dotnet/ without
+# being registered in the root xberg workspace — keeps the Rust tree pristine for
+# upstream merges. It path-depends on ../../../crates/xberg (whose own workspace
+# inheritance still resolves against the root xberg workspace).
+[workspace]
+
 [package]
 name = "xberg-reference-gen"
 version = "0.1.0"
