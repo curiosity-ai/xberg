@@ -129,25 +129,38 @@ public static class DocxReader
         switch (el.Name.LocalName)
         {
             case "p":
-                // Drawings open (and are recorded) before the enclosing paragraph closes.
-                EmitDrawings(el, doc, rels);
+                // Drawings + page breaks open (and are recorded) before the enclosing paragraph closes.
+                EmitPreElements(el, doc, rels, pageBreaks: true);
                 doc.Elements.Add(new DocElement { Kind = DocElementKind.Paragraph, Paragraph = ParseParagraph(el, rels) });
                 break;
             case "tbl":
                 // Drawings inside cells open before the table closes → emitted before the Table.
-                EmitDrawings(el, doc, rels);
+                // Page breaks inside tables are ignored (matches Rust `table_stack.is_empty()`).
+                EmitPreElements(el, doc, rels, pageBreaks: false);
                 doc.Elements.Add(new DocElement { Kind = DocElementKind.Table, Table = ParseTable(el, rels) });
                 break;
         }
     }
 
-    private static void EmitDrawings(XElement container, DocxDocument doc, Dictionary<string, string> rels)
+    private static void EmitPreElements(XElement container, DocxDocument doc, Dictionary<string, string> rels, bool pageBreaks)
     {
-        foreach (var d in container.Descendants().Where(e => e.Name.LocalName == "drawing"))
+        foreach (var e in container.Descendants())
         {
-            var draw = ParseDrawing(d, rels);
-            doc.Drawings.Add(draw);
-            doc.Elements.Add(new DocElement { Kind = DocElementKind.Drawing, Drawing = draw });
+            switch (e.Name.LocalName)
+            {
+                case "drawing":
+                    var draw = ParseDrawing(e, rels);
+                    doc.Drawings.Add(draw);
+                    doc.Elements.Add(new DocElement { Kind = DocElementKind.Drawing, Drawing = draw });
+                    break;
+                case "lastRenderedPageBreak" when pageBreaks:
+                    doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
+                    break;
+                case "br" when pageBreaks &&
+                    e.Attributes().FirstOrDefault(a => a.Name.LocalName == "type")?.Value == "page":
+                    doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
+                    break;
+            }
         }
     }
 
