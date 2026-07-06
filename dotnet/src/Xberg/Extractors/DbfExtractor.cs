@@ -33,7 +33,14 @@ public sealed class DbfExtractor : IExtractor
             Format = new FormatMetadata
             {
                 FormatType = "dbf",
-                Payload = new DbfMetadata { RecordCount = parsed.RecordCount, FieldCount = parsed.FieldNames.Count },
+                Payload = new DbfMetadata
+                {
+                    RecordCount = parsed.RecordCount,
+                    FieldCount = parsed.FieldNames.Count,
+                    Fields = parsed.FieldNames
+                        .Zip(parsed.FieldTypes, (name, ftype) => new DbfFieldInfo { Name = name, FieldType = ftype })
+                        .ToList(),
+                },
             },
         };
         return doc;

@@ -470,15 +470,114 @@ internal static class SerdeJson
         }
     }
 
+    // Exact power-of-ten table (10^0 .. 10^308), each the nearest f64. Mirrors serde_json's
+    // `static POW10: [f64; 309]`. Built via correctly-rounded parse of the `1e{n}` literals.
+    private static readonly double[] Pow10 = BuildPow10();
+
+    private static double[] BuildPow10()
+    {
+        var t = new double[309];
+        for (int i = 0; i < t.Length; i++)
+            t[i] = double.Parse("1e" + i.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
+        return t;
+    }
+
+    // Faithful port of serde_json's default (non-`float_roundtrip`) f64 parser: significand
+    // accumulation with u64-overflow handling (parse_long_integer / parse_decimal_overflow),
+    // then `f64_from_parts` (significand-as-f64 scaled by an exact power of ten).
+    internal static double SerdeParseF64(string raw)
+    {
+        int i = 0;
+        bool positive = true;
+        if (i < raw.Length && raw[i] == '-') { positive = false; i++; }
+        else if (i < raw.Length && raw[i] == '+') { i++; }
+
+        ulong significand = 0;
+        int exponent = 0;
+        bool sigFull = false; // significand can no longer accept digits without u64 overflow
+
+        // Integer part.
+        while (i < raw.Length && raw[i] >= '0' && raw[i] <= '9')
+        {
+            uint digit = (uint)(raw[i] - '0');
+            if (!sigFull && significand <= (ulong.MaxValue - digit) / 10)
+                significand = significand * 10 + digit;
+            else { sigFull = true; exponent++; } // parse_long_integer: count skipped int digits
+            i++;
+        }
+
+        // Fractional part.
+        if (i < raw.Length && raw[i] == '.')
+        {
+            i++;
+            while (i < raw.Length && raw[i] >= '0' && raw[i] <= '9')
+            {
+                uint digit = (uint)(raw[i] - '0');
+                if (!sigFull && significand <= (ulong.MaxValue - digit) / 10)
+                {
+                    significand = significand * 10 + digit;
+                    exponent--;
+                }
+                else sigFull = true; // parse_decimal_overflow: ignore further fractional digits
+                i++;
+            }
+        }
+
+        // Exponent part.
+        if (i < raw.Length && (raw[i] == 'e' || raw[i] == 'E'))
+        {
+            i++;
+            bool posExp = true;
+            if (i < raw.Length && (raw[i] == '+' || raw[i] == '-')) { posExp = raw[i] == '+'; i++; }
+            int exp = 0;
+            while (i < raw.Length && raw[i] >= '0' && raw[i] <= '9')
+            {
+                int digit = raw[i] - '0';
+                if (exp <= (int.MaxValue - digit) / 10) exp = exp * 10 + digit;
+                i++;
+            }
+            exponent += posExp ? exp : -exp;
+        }
+
+        return F64FromParts(positive, significand, exponent);
+    }
+
+    private static double F64FromParts(bool positive, ulong significand, int exponent)
+    {
+        double f = significand;
+        while (true)
+        {
+            int abs = exponent == int.MinValue ? int.MaxValue : Math.Abs(exponent);
+            if (abs < Pow10.Length)
+            {
+                double pow = Pow10[abs];
+                if (exponent >= 0) f *= pow; else f /= pow;
+                break;
+            }
+            if (f == 0.0) break;
+            if (exponent >= 0) { f = double.PositiveInfinity; break; }
+            f /= 1e308;
+            exponent += 308;
+        }
+        return positive ? f : -f;
+    }
+
     // Reproduce serde_json's number formatting: integers verbatim (itoa); floats via
     // shortest round-trip (ryu) with a mandatory decimal point and lowercase,
     // sign-stripped exponents.
+    //
+    // Crucially, the *value* is reparsed with serde_json's default (non-`float_roundtrip`)
+    // fast-path float parser, which is NOT correctly rounded: it accumulates the significand
+    // as a u64 and multiplies/divides by an exact power-of-ten table, double-rounding when the
+    // significand exceeds 2^53. This yields values up to 1 ULP away from the correctly-rounded
+    // double that `JsonElement.GetDouble()`/`double.Parse` produce, so we must mirror it to
+    // match serde's output byte-for-byte (e.g. `498.92708999999996` → `498.92709`).
     private static string FormatNumber(JsonElement e)
     {
         string raw = e.GetRawText();
         if (raw.IndexOfAny(new[] { '.', 'e', 'E' }) < 0) return raw; // integer
 
-        string s = e.GetDouble().ToString(CultureInfo.InvariantCulture);
+        string s = SerdeParseF64(raw).ToString(CultureInfo.InvariantCulture);
         int ei = s.IndexOfAny(new[] { 'e', 'E' });
         if (ei >= 0)
         {

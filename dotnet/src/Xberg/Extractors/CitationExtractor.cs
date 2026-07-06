@@ -28,11 +28,12 @@ public sealed class CitationExtractor : IExtractor
         // CitationMetadata.format, but the C# CitationMetadata payload is a stub without that
         // field (documented gap), so the dispatch only selects the parser here.
         List<Citation> citations;
+        string formatString;
         switch (mimeType)
         {
-            case "application/x-research-info-systems": citations = CitationParser.ParseRis(text); break;
-            case "application/x-pubmed": citations = CitationParser.ParsePubMed(text); break;
-            case "application/x-endnote+xml": citations = CitationParser.ParseEndNoteXml(text); break;
+            case "application/x-research-info-systems": citations = CitationParser.ParseRis(text); formatString = "RIS"; break;
+            case "application/x-pubmed": citations = CitationParser.ParsePubMed(text); formatString = "PubMed"; break;
+            case "application/x-endnote+xml": citations = CitationParser.ParseEndNoteXml(text); formatString = "EndNote XML"; break;
             default:
             {
                 var empty = new InternalDocument("citation")
@@ -40,7 +41,7 @@ public sealed class CitationExtractor : IExtractor
                     MimeType = mimeType,
                     Metadata = new Metadata
                     {
-                        Format = new FormatMetadata { FormatType = "citation", Payload = new CitationMetadata { CitationCount = 0 } },
+                        Format = new FormatMetadata { FormatType = "citation", Payload = new CitationMetadata { CitationCount = 0, Format = "Unknown" } },
                     },
                 };
                 return empty;
@@ -50,6 +51,8 @@ public sealed class CitationExtractor : IExtractor
         var builder = new InternalDocumentBuilder("citation");
         var authorsSet = new SortedSet<string>(StringComparer.Ordinal);
         var keywordsSet = new SortedSet<string>(StringComparer.Ordinal);
+        var yearsSet = new SortedSet<uint>();
+        var doisVec = new List<string>();
 
         foreach (var citation in citations)
         {
@@ -58,9 +61,12 @@ public sealed class CitationExtractor : IExtractor
                 string authorName = a.GivenName is not null ? $"{a.GivenName} {a.Name}" : a.Name;
                 if (authorName.Length != 0) authorsSet.Add(authorName);
             }
-            if (citation.Year > 0) { /* year_range tracked in stub-only metadata */ }
+            if (citation.Year > 0) yearsSet.Add((uint)citation.Year);
             if (!string.IsNullOrEmpty(citation.Doi))
+            {
+                doisVec.Add(citation.Doi);
                 builder.PushUri(MarkupHelpers.Citation($"https://doi.org/{citation.Doi}", citation.Title));
+            }
             foreach (var kw in citation.Keywords) if (kw.Length != 0) keywordsSet.Add(kw);
         }
 
@@ -73,12 +79,25 @@ public sealed class CitationExtractor : IExtractor
 
         var doc = builder.Build();
         doc.MimeType = mimeType;
+        var authorsList = authorsSet.ToList();
+        var keywordsList = keywordsSet.ToList();
+        var citationMeta = new CitationMetadata
+        {
+            CitationCount = citations.Count,
+            Format = formatString,
+            Authors = authorsList,
+            YearRange = yearsSet.Count > 0
+                ? new YearRange { Min = yearsSet.Min, Max = yearsSet.Max, Years = yearsSet.ToList() }
+                : null,
+            Dois = doisVec,
+            Keywords = keywordsList,
+        };
         var meta = new Metadata
         {
-            Format = new FormatMetadata { FormatType = "citation", Payload = new CitationMetadata { CitationCount = citations.Count } },
+            Format = new FormatMetadata { FormatType = "citation", Payload = citationMeta },
         };
-        if (authorsSet.Count > 0) meta.Authors = authorsSet.ToList();
-        if (keywordsSet.Count > 0) meta.Keywords = keywordsSet.ToList();
+        if (authorsList.Count > 0) meta.Authors = authorsList;
+        if (keywordsList.Count > 0) meta.Keywords = keywordsList;
         doc.Metadata = meta;
         return doc;
     }

@@ -44,12 +44,19 @@ public sealed class EpubExtractor : IExtractor
 
         var additionalMetadata = EpubOpf.BuildAdditionalMetadata(package.Metadata);
 
-        // NOTE: The C# `EpubMetadata` struct is currently empty. Once its fields exist, populate:
-        //   coverage=package.Metadata.Coverage, dc_format=package.Metadata.Format,
-        //   relation=package.Metadata.Relation, source=package.Metadata.Source,
-        //   dc_type=package.Metadata.DcType, cover_image=package.Metadata.CoverImageHref.
-        // (There is no `FormatMetadata.Epub(...)` factory yet, so construct the tagged value directly.)
-        var epubFormatMetadata = new FormatMetadata { FormatType = "epub", Payload = new EpubMetadata() };
+        var epubFormatMetadata = new FormatMetadata
+        {
+            FormatType = "epub",
+            Payload = new EpubMetadata
+            {
+                Coverage = package.Metadata.Coverage,
+                DcFormat = package.Metadata.Format,
+                Relation = package.Metadata.Relation,
+                Source = package.Metadata.Source,
+                DcType = package.Metadata.DcType,
+                CoverImage = package.Metadata.CoverImageHref,
+            },
+        };
 
         var (spineDocuments, bodyWarnings) = EpubContent.ReadBodyDocuments(archive, package);
         processingWarnings.AddRange(bodyWarnings);

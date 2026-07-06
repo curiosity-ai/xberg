@@ -63,13 +63,15 @@ public sealed class DocxExtractor : IExtractor
                 {
                     var para = el.Paragraph!;
                     string text = CollectText(para.Runs);
-                    if (text.Length == 0) { CloseLists(); continue; }
+                    var mathFormulas = CollectMathFormulas(para.Runs);
+                    if (text.Length == 0 && mathFormulas.Count == 0) { CloseLists(); continue; }
 
                     byte? headingLevel = DocxReader.ResolveHeadingLevel(para.StyleId);
                     bool isQuote = IsQuoteStyle(para.StyleId);
 
                     if (headingLevel is { } level)
                     {
+                        // Headings do not emit standalone math formulas (matches Rust).
                         CloseLists();
                         string headingText = text.Length == 0 ? RunsToMarkdown(para.Runs) : text;
                         b.PushHeading(level, headingText, null, null);
@@ -77,40 +79,49 @@ public sealed class DocxExtractor : IExtractor
                     else if (isQuote)
                     {
                         CloseLists();
-                        b.PushQuoteStart();
-                        b.PushParagraph(text, new(), null, null);
-                        b.PushQuoteEnd();
+                        foreach (var f in mathFormulas) b.PushFormula(f, null, null);
+                        if (text.Length != 0)
+                        {
+                            b.PushQuoteStart();
+                            b.PushParagraph(text, new(), null, null);
+                            b.PushQuoteEnd();
+                        }
                     }
                     else if (para.NumId is { } nid)
                     {
-                        long nlvl = para.NumLevel ?? 0;
-                        bool isOrdered = doc.NumberingOrdered.TryGetValue((nid, nlvl), out var ord) && ord;
-                        if (currentListNumId != nid)
+                        foreach (var f in mathFormulas) b.PushFormula(f, null, null);
+                        if (text.Length != 0)
                         {
-                            if (currentListNumId is not null)
-                                for (long i = 0; i < openListCount; i++) b.EndList();
-                            b.PushList(isOrdered);
-                            currentListNumId = nid;
-                            currentListOrdered = isOrdered;
-                            currentNesting = nlvl;
-                            openListCount = 1;
+                            long nlvl = para.NumLevel ?? 0;
+                            bool isOrdered = doc.NumberingOrdered.TryGetValue((nid, nlvl), out var ord) && ord;
+                            if (currentListNumId != nid)
+                            {
+                                if (currentListNumId is not null)
+                                    for (long i = 0; i < openListCount; i++) b.EndList();
+                                b.PushList(isOrdered);
+                                currentListNumId = nid;
+                                currentListOrdered = isOrdered;
+                                currentNesting = nlvl;
+                                openListCount = 1;
+                            }
+                            else if (nlvl > currentNesting)
+                            {
+                                for (long i = 0; i < nlvl - currentNesting; i++) { b.PushList(isOrdered); openListCount++; }
+                                currentNesting = nlvl;
+                            }
+                            else if (nlvl < currentNesting)
+                            {
+                                for (long i = 0; i < currentNesting - nlvl; i++) { b.EndList(); openListCount = Math.Max(0, openListCount - 1); }
+                                currentNesting = nlvl;
+                            }
+                            b.PushListItem(text, currentListOrdered, new(), null, null);
                         }
-                        else if (nlvl > currentNesting)
-                        {
-                            for (long i = 0; i < nlvl - currentNesting; i++) { b.PushList(isOrdered); openListCount++; }
-                            currentNesting = nlvl;
-                        }
-                        else if (nlvl < currentNesting)
-                        {
-                            for (long i = 0; i < currentNesting - nlvl; i++) { b.EndList(); openListCount = Math.Max(0, openListCount - 1); }
-                            currentNesting = nlvl;
-                        }
-                        b.PushListItem(text, currentListOrdered, new(), null, null);
                     }
                     else
                     {
                         CloseLists();
-                        b.PushParagraph(text, new(), null, null);
+                        foreach (var f in mathFormulas) b.PushFormula(f, null, null);
+                        if (text.Length != 0) b.PushParagraph(text, new(), null, null);
                     }
                     break;
                 }
@@ -308,6 +319,16 @@ public sealed class DocxExtractor : IExtractor
         return sb.ToString();
     }
 
+    /// <summary>Non-empty LaTeX strings from math runs, emitted as standalone Formula nodes
+    /// (matches Rust `collect_run_annotations` math_formulas).</summary>
+    private static List<string> CollectMathFormulas(List<DocxRun> runs)
+    {
+        var list = new List<string>();
+        foreach (var run in runs)
+            if (run.MathLatex is { Length: > 0 } latex) list.Add(latex);
+        return list;
+    }
+
     // ── table cell grid (docx.rs build_internal_document Table arm) ────────────
     private static List<List<string>> BuildTableCells(DocxTable table)
     {
@@ -346,7 +367,14 @@ public sealed class DocxExtractor : IExtractor
         while (i < runs.Count)
         {
             var r = runs[i];
-            if (r.MathLatex is not null) { i++; continue; }
+            // Math runs (and empty runs) are emitted individually. Math renders as
+            // `$$latex$$` (display) or `$latex$` (inline), matching Rust `Run::to_markdown`.
+            if (r.MathLatex is not null)
+            {
+                sb.Append(r.MathDisplay ? $"$${r.MathLatex}$$" : $"${r.MathLatex}$");
+                i++;
+                continue;
+            }
             int j = i + 1;
             while (j < runs.Count && runs[j].MathLatex is null && SameGroup(runs[j], r)) j++;
             bool allSameUS = true;

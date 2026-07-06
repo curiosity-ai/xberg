@@ -26,9 +26,14 @@ public sealed class BibtexExtractor : IExtractor
         var entries = BibtexParser.Parse(bibtex);
         var authorsSet = new SortedSet<string>(StringComparer.Ordinal);
         var entriesMeta = new List<Dictionary<string, string>>();
+        var citationKeys = new List<string>();
+        var yearsSet = new SortedSet<uint>();
+        var entryTypes = new SortedDictionary<string, long>(StringComparer.Ordinal);
 
         foreach (var entry in entries)
         {
+            citationKeys.Add(entry.Key);
+            entryTypes[entry.EntryType] = entryTypes.GetValueOrDefault(entry.EntryType) + 1;
             var sb = new StringBuilder();
             sb.Append('@').Append(entry.EntryType).Append('{').Append(entry.Key).Append(",\n");
             var entryFields = new Dictionary<string, string> { ["entry_type"] = entry.EntryType };
@@ -38,6 +43,7 @@ public sealed class BibtexExtractor : IExtractor
                 entryFields[name] = value;
                 if (name == "author")
                     foreach (var a in value.Split(" and ")) { string ta = a.Trim(); if (ta.Length != 0) authorsSet.Add(ta); }
+                if (name == "year" && uint.TryParse(value, out var yr)) yearsSet.Add(yr);
             }
             sb.Append("}\n\n");
 
@@ -71,11 +77,22 @@ public sealed class BibtexExtractor : IExtractor
         var doc = builder.Build();
         doc.MimeType = mimeType;
 
+        var authorsList = authorsSet.ToList();
+        var bibMeta = new BibtexMetadata
+        {
+            EntryCount = entries.Count,
+            CitationKeys = citationKeys,
+            Authors = authorsList,
+            YearRange = yearsSet.Count > 0
+                ? new YearRange { Min = yearsSet.Min, Max = yearsSet.Max, Years = yearsSet.ToList() }
+                : null,
+            EntryTypes = entryTypes.Count > 0 ? entryTypes : null,
+        };
         var meta = new Metadata
         {
-            Format = new FormatMetadata { FormatType = "bibtex", Payload = new BibtexMetadata { EntryCount = entries.Count } },
+            Format = new FormatMetadata { FormatType = "bibtex", Payload = bibMeta },
         };
-        if (authorsSet.Count > 0) meta.Authors = authorsSet.ToList();
+        if (authorsList.Count > 0) meta.Authors = authorsList;
         meta.Additional["entries"] = JsonSerializer.SerializeToElement(entriesMeta, Json.Options);
         doc.Metadata = meta;
         return doc;

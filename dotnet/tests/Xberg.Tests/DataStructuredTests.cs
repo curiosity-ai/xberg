@@ -91,6 +91,27 @@ public class DataStructuredTests
         Assert.False(doc.Metadata.Additional.ContainsKey("package.count"));
     }
 
+    [Theory]
+    // serde_json's default (non-float_roundtrip) fast-path parser double-rounds: it scales a
+    // u64 significand by an exact power of ten, so many-digit inputs land 1 ULP off the
+    // correctly-rounded double and then print shorter. These pairs come from docling goldens.
+    [InlineData("498.92708999999996", "498.92709")]
+    [InlineData("252.05723999999998", "252.05724")]
+    [InlineData("478.30521000000005", "478.3052100000001")]
+    [InlineData("126.95307000000003", "126.95307000000004")]
+    [InlineData("61.569008000000004", "61.569008")]
+    [InlineData("159.48581000000001", "159.48581")]
+    // Plain / already-shortest values must round-trip unchanged.
+    [InlineData("96.301003", "96.301003")]
+    [InlineData("1.5", "1.5")]
+    [InlineData("0.0", "0.0")]
+    [InlineData("-2.25", "-2.25")]
+    public void SerdeFloatFormatting_MatchesSerdeJson(string input, string expected)
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(input);
+        Assert.Equal(expected, SerdeJson.Compact(doc.RootElement));
+    }
+
     [Fact]
     public void SupportedMimeTypes_MatchRust()
     {

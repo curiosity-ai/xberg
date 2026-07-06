@@ -14,6 +14,7 @@ public sealed class DocxRun
     public bool Highlight;
     public string? HyperlinkUrl;
     public string? MathLatex;
+    public bool MathDisplay;
 }
 
 public sealed class DocxParagraph
@@ -202,10 +203,20 @@ public static class DocxReader
                     if (url is null && anchor is not null) url = "#" + anchor;
                     ParseRunContainer(child, para, url, rels);
                     break;
-                case "oMath":
                 case "oMathPara":
-                    // Math not converted; emit an empty math run so paragraph isn't dropped only by math.
+                {
+                    string latex = OmmlMath.ConvertOMathPara(child);
+                    if (latex.Length != 0)
+                        para.Runs.Add(new DocxRun { MathLatex = latex, MathDisplay = true });
                     break;
+                }
+                case "oMath":
+                {
+                    string latex = OmmlMath.ConvertOMath(child);
+                    if (latex.Length != 0)
+                        para.Runs.Add(new DocxRun { MathLatex = latex, MathDisplay = false });
+                    break;
+                }
             }
         }
     }
@@ -250,7 +261,7 @@ public static class DocxReader
         {
             switch (child.Name.LocalName)
             {
-                case "t": run.Text += child.Value; break;
+                case "t": run.Text += DropXmlEntities(child.Value); break;
                 case "br":
                     var brType = child.Attributes().FirstOrDefault(a => a.Name.LocalName == "type")?.Value;
                     if (brType != "page") run.Text += "\n";
@@ -494,4 +505,22 @@ public static class DocxReader
     }
 
     private static long? ParseLong(string? s) => long.TryParse(s, out var v) ? v : null;
+
+    /// <summary>
+    /// Drop XML entity references from decoded text. Rust's quick_xml surfaces character/entity
+    /// references (<c>&amp;lt;</c>, <c>&amp;amp;</c>, numeric refs) as separate events that the
+    /// DOCX parser ignores, so entity-encoded characters are absent from the extracted text.
+    /// In well-formed XML text content the characters <c>&lt;</c>, <c>&gt;</c>, and <c>&amp;</c>
+    /// can only originate from such references, so removing them reproduces Rust's output.
+    /// </summary>
+    internal static string DropXmlEntities(string s)
+    {
+        if (s.IndexOfAny(EntitySourceChars) < 0) return s;
+        var sb = new StringBuilder(s.Length);
+        foreach (char c in s)
+            if (c is not ('<' or '>' or '&')) sb.Append(c);
+        return sb.ToString();
+    }
+
+    private static readonly char[] EntitySourceChars = { '<', '>', '&' };
 }

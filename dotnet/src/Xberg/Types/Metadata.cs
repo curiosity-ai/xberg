@@ -256,11 +256,66 @@ public sealed class PdfMetadata
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? PageCount { get; set; }
 }
 
-public sealed class BibtexMetadata { public long EntryCount { get; set; } }
-public sealed class CitationMetadata { public long CitationCount { get; set; } }
-public sealed class FictionBookMetadata { }
-public sealed class DbfMetadata { public long RecordCount { get; set; } public long FieldCount { get; set; } }
-public sealed class JatsMetadata { }
+/// <summary>Year range for bibliographic metadata (Rust `YearRange`).</summary>
+public sealed class YearRange
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? Min { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? Max { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<uint> Years { get; set; } = new();
+}
+
+public sealed class BibtexMetadata
+{
+    public long EntryCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> CitationKeys { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Authors { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public YearRange? YearRange { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public SortedDictionary<string, long>? EntryTypes { get; set; }
+}
+
+public sealed class CitationMetadata
+{
+    public long CitationCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Format { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Authors { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public YearRange? YearRange { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Dois { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Keywords { get; set; } = new();
+}
+
+public sealed class FictionBookMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Genres { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Sequences { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Annotation { get; set; }
+}
+
+public sealed class DbfFieldInfo
+{
+    public string Name { get; set; } = "";
+    public string FieldType { get; set; } = "";
+}
+
+public sealed class DbfMetadata
+{
+    public long RecordCount { get; set; }
+    public long FieldCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<DbfFieldInfo> Fields { get; set; } = new();
+}
+
+public sealed class ContributorRole
+{
+    public string Name { get; set; } = "";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Role { get; set; }
+}
+
+public sealed class JatsMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Copyright { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? License { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public SortedDictionary<string, string> HistoryDates { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<ContributorRole> ContributorRoles { get; set; } = new();
+}
 public sealed class EpubMetadata
 {
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Coverage { get; set; }

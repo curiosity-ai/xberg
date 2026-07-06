@@ -145,9 +145,16 @@ public sealed class FictionBookExtractor : IExtractor
         if (genres.Count != 0) meta.Subject = string.Join(", ", genres);
         if (authors.Count != 0) meta.Authors = authors;
 
-        // FictionBookMetadata payload struct in the C# port is a stub (no genres/sequences/annotation);
-        // populate the available Format tag; note the field gap.
-        meta.Format = new FormatMetadata { FormatType = "fiction_book", Payload = new FictionBookMetadata() };
+        meta.Format = new FormatMetadata
+        {
+            FormatType = "fiction_book",
+            Payload = new FictionBookMetadata
+            {
+                Genres = genres,
+                Sequences = sequences,
+                Annotation = annotationText.Length != 0 ? annotationText.ToString() : null,
+            },
+        };
 
         if (authorDetails.Count != 0)
             meta.Additional["author_details"] = JsonSerializer.SerializeToElement(authorDetails, Json.Options);

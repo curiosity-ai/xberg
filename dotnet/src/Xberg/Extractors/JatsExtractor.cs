@@ -51,8 +51,15 @@ public sealed class JatsExtractor : IExtractor
             subjectParts.Add($"{Capitalize(dtype)}: {dval}");
         if (jm.CopyrightStatement is not null) subjectParts.Add($"Copyright: {jm.CopyrightStatement}");
 
-        // JatsMetadata payload is an empty stub in the C# port (gap): only format_type is emitted.
-        metadata.Format = new FormatMetadata { FormatType = "jats", Payload = new JatsMetadata() };
+        var jatsPayload = new JatsMetadata
+        {
+            Copyright = jm.CopyrightStatement,
+            License = jm.License,
+        };
+        foreach (var (dtype, dval) in jm.HistoryDates) jatsPayload.HistoryDates[dtype] = dval;
+        foreach (var (name, role) in jm.ContributorRoles)
+            jatsPayload.ContributorRoles.Add(new ContributorRole { Name = name, Role = role.Length == 0 ? null : role });
+        metadata.Format = new FormatMetadata { FormatType = "jats", Payload = jatsPayload };
 
         if (subjectParts.Count > 0) metadata.Subject = string.Join(" | ", subjectParts);
 
@@ -431,6 +438,7 @@ public sealed class JatsExtractor : IExtractor
         public string? PublicationDate, Volume, Issue, Pages, JournalTitle, ArticleType, AbstractText, CorrespondingAuthor;
         public readonly List<(string, string)> HistoryDates = new();
         public string? CopyrightStatement, License;
+        public readonly List<(string, string)> ContributorRoles = new();
     }
 
     private static JatsMeta ExtractAllMetadata(string content)
@@ -541,7 +549,8 @@ public sealed class JatsExtractor : IExtractor
                         if (currentAuthor.Length > 0)
                         {
                             m.Authors.Add(currentAuthor.ToString());
-                            if (currentContribType.Length > 0) { /* contributor role: gap (JatsMetadata stub) */ }
+                            if (currentContribType.Length > 0)
+                                m.ContributorRoles.Add((currentAuthor.ToString(), currentContribType));
                         }
                         inContrib = false; currentAuthor.Clear(); currentContribType = ""; break;
                     case "name": if (inName) inName = false; break;
