@@ -122,6 +122,23 @@ async fn main() {
     );
 }
 
+/// Replace machine-specific absolute-path fields in `metadata.additional` with the
+/// portable relative path so golden files are reproducible across machines. Also drops
+/// `extraction_duration_ms` (timing, non-deterministic).
+fn normalize_metadata(mut meta: serde_json::Value, rel: &str) -> serde_json::Value {
+    if let Some(obj) = meta.as_object_mut() {
+        obj.remove("extraction_duration_ms");
+        if let Some(additional) = obj.get_mut("additional").and_then(|a| a.as_object_mut()) {
+            for key in ["source_uri", "final_uri"] {
+                if additional.contains_key(key) {
+                    additional.insert(key.to_string(), serde_json::Value::String(rel.to_string()));
+                }
+            }
+        }
+    }
+    meta
+}
+
 /// Whether a path should be treated as an extraction input.
 fn is_candidate(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -168,7 +185,7 @@ async fn generate(path: &Path, rel: &str) -> Result<ReferenceOutput, String> {
                     content.insert((*name).to_string(), doc.content.clone());
                     if *name == "plain" {
                         extraction_method = doc.extraction_method.map(|m| m.as_str().to_string());
-                        metadata = serde_json::to_value(&doc.metadata).ok();
+                        metadata = serde_json::to_value(&doc.metadata).ok().map(|m| normalize_metadata(m, rel));
                         tables = serde_json::to_value(&doc.tables).ok();
                         detected_languages = doc.detected_languages.clone();
                     }
