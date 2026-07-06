@@ -1,4 +1,6 @@
 using System.Text;
+using System.Text.RegularExpressions;
+using Xberg.Internal.Commonmark;
 using Xberg.Types;
 
 namespace Xberg.Rendering;
@@ -6,180 +8,98 @@ namespace Xberg.Rendering;
 /// <summary>
 /// Renders an <see cref="InternalDocument"/> to GFM Markdown.
 ///
-/// DEVIATION FROM RUST: the Rust renderer builds a comrak AST and formats it via
-/// `format_commonmark`. Porting comrak's exact AST/formatter (~70 KB of `comrak_bridge.rs`)
-/// is out of scope for the core spine, so this is a direct element-walk GFM writer. Output is
-/// close but may differ from comrak in whitespace/escaping edge cases; the string post-processing
-/// helpers (<see cref="UnescapeBackslashSequences"/>, <see cref="ReplaceHtmlEntities"/>,
-/// <see cref="CollapseExcessNewlines"/>) are ported faithfully and unit-tested.
+/// Faithful port of <c>crates/xberg/src/rendering/markdown.rs</c>: builds a comrak AST via
+/// <see cref="ComrakBridge"/>, serializes it with <see cref="CommonMarkFormatter"/>
+/// (<c>format_commonmark</c>, <c>render.width = 0</c>), then applies the same string
+/// post-processing as Rust so output matches byte-for-byte.
 /// </summary>
 public static class MarkdownRenderer
 {
+    private static readonly char[] UnescapeTargets = { '_', '[', ']', '(', ')', '*', '=' };
+
+    private static readonly Regex ArxivWatermarkRegex = new(
+        @"(?:\s+\S+(?:\s+\S+){0,8})?\s*arXiv:\d{4}\.\d{4,5}(?:v\d+)?(?:\s*\[[\w.-]+\])?\s*(?:\d{1,2}\s+\w+\s+\d{4})?",
+        RegexOptions.Compiled);
+
     public static string Render(InternalDocument doc)
     {
-        var sb = new StringBuilder(doc.Elements.Count * 80);
-        var state = new RenderState();
+        var root = ComrakBridge.Build(doc);
 
-        foreach (var elem in doc.Elements)
+        // Guard: empty AST (comrak panics on this; we return empty).
+        if (root.FirstChild is null) return "";
+
+        string output = CommonMarkFormatter.Format(root);
+
+        // Strip comrak-generated HTML comments (e.g. `<!-- end list -->`).
+        if (output.Contains("<!--"))
         {
-            if (elem.Layer != ContentLayer.Body) continue;
-
-            switch (elem.Kind.Tag)
+            var kept = new List<string>();
+            foreach (var line in RenderCommon.SplitLines(output))
             {
-                case ElementKindTag.ListStart:
-                    state.PushContainer(NestingKind.ListKind(elem.Kind.Ordered, 0), elem.Depth);
-                    continue;
-                case ElementKindTag.QuoteStart:
-                    state.PushContainer(NestingKind.BlockQuote, elem.Depth);
-                    continue;
-                case ElementKindTag.GroupStart:
-                    state.PushContainer(NestingKind.Group, elem.Depth);
-                    continue;
-                case ElementKindTag.ListEnd:
-                case ElementKindTag.QuoteEnd:
-                case ElementKindTag.GroupEnd:
-                    RenderCommon.HandleContainerEnd(elem.Kind, state);
-                    continue;
+                string trimmed = line.Trim();
+                if (!(trimmed.StartsWith("<!--", StringComparison.Ordinal) && trimmed.EndsWith("-->", StringComparison.Ordinal)))
+                    kept.Add(line);
             }
-
-            int bq = state.BlockquoteDepth();
-
-            switch (elem.Kind.Tag)
-            {
-                case ElementKindTag.Title:
-                    if (elem.Text.Length > 0)
-                        AppendBlock(sb, "# " + InlineText(elem), bq);
-                    break;
-                case ElementKindTag.Heading:
-                    if (elem.Text.Length > 0)
-                    {
-                        int level = Math.Clamp(elem.Kind.Level, (byte)1, (byte)6);
-                        AppendBlock(sb, new string('#', level) + " " + InlineText(elem), bq);
-                    }
-                    break;
-                case ElementKindTag.Paragraph:
-                    if (elem.Text.Length > 0)
-                        AppendBlock(sb, InlineText(elem), bq);
-                    break;
-                case ElementKindTag.ListItem:
-                    {
-                        int listDepth = Math.Max(0, state.ListDepth() - 1);
-                        string indent = new string(' ', listDepth * 2);
-                        string marker = elem.Kind.Ordered ? state.NextListNumber() + ". " : "- ";
-                        sb.Append(indent).Append(marker).Append(InlineText(elem)).Append('\n');
-                    }
-                    break;
-                case ElementKindTag.Code:
-                    {
-                        string lang = RenderCommon.GetLanguage(elem) ?? "";
-                        AppendBlock(sb, "```" + lang + "\n" + elem.Text.TrimEnd('\n') + "\n```", bq);
-                    }
-                    break;
-                case ElementKindTag.Formula:
-                    if (elem.Text.Length > 0)
-                        AppendBlock(sb, "$$\n" + elem.Text + "\n$$", bq);
-                    break;
-                case ElementKindTag.Table:
-                    {
-                        int ti = (int)elem.Kind.TableIndex;
-                        if (ti < doc.Tables.Count)
-                        {
-                            var table = doc.Tables[ti];
-                            string t = table.Cells.Count > 0
-                                ? RenderCommon.RenderTableMarkdown(table.Cells)
-                                : table.Markdown;
-                            if (t.Trim().Length > 0)
-                                AppendBlock(sb, t.TrimEnd('\n'), bq);
-                        }
-                    }
-                    break;
-                case ElementKindTag.Image:
-                    {
-                        int ii = (int)elem.Kind.ImageIndex;
-                        if (ii < doc.Images.Count)
-                        {
-                            var img = doc.Images[ii];
-                            string alt = img.Description ?? elem.Text;
-                            string src = img.Data.Length > 0
-                                ? $"image_{elem.Kind.ImageIndex}.{img.Format}"
-                                : img.SourcePath ?? "";
-                            AppendBlock(sb, $"![{alt}]({src})", bq);
-                        }
-                    }
-                    break;
-                case ElementKindTag.Citation:
-                    if (elem.Text.Length > 0) AppendBlock(sb, InlineText(elem), bq);
-                    break;
-                case ElementKindTag.Slide:
-                    if (elem.Text.Length > 0) AppendBlock(sb, InlineText(elem), bq);
-                    break;
-                case ElementKindTag.DefinitionTerm:
-                    AppendBlock(sb, InlineText(elem), bq);
-                    break;
-                case ElementKindTag.DefinitionDescription:
-                    AppendBlock(sb, ": " + InlineText(elem), bq);
-                    break;
-                case ElementKindTag.Admonition:
-                    {
-                        var title = RenderCommon.GetAdmonitionTitle(elem) ?? RenderCommon.GetAdmonitionKind(elem);
-                        AppendBlock(sb, "> **" + title + "**", bq);
-                        if (elem.Text.Length > 0) AppendBlock(sb, elem.Text, bq);
-                    }
-                    break;
-                case ElementKindTag.RawBlock:
-                    if (elem.Text.Length > 0) AppendBlock(sb, elem.Text, bq);
-                    break;
-                case ElementKindTag.MetadataBlock:
-                    {
-                        var entries = RenderCommon.ParseMetadataEntries(elem.Text);
-                        if (entries.Count > 0)
-                        {
-                            var b = new StringBuilder();
-                            foreach (var (k, v) in entries) b.Append(k).Append(": ").Append(v).Append('\n');
-                            AppendBlock(sb, b.ToString().TrimEnd('\n'), bq);
-                        }
-                        else if (elem.Text.Length > 0) AppendBlock(sb, elem.Text, bq);
-                    }
-                    break;
-                case ElementKindTag.PageBreak:
-                    AppendBlock(sb, "---", bq);
-                    break;
-                case ElementKindTag.OcrText:
-                    if (elem.Text.Length > 0) AppendBlock(sb, elem.Text, bq);
-                    break;
-            }
+            output = string.Join("\n", kept);
         }
 
-        string output = sb.ToString();
+        // Decode leftover HTML entities: `&#10;` -> space, `&#2;` -> removed.
         output = ReplaceHtmlEntities(output);
+
+        // Un-escape underscores, brackets, parens, stars, equals in one pass.
+        output = UnescapeBackslashSequences(output, UnescapeTargets);
+
+        // Un-escape `\*` and `\#` at the START of lines only.
+        if (output.Contains("\\*") || output.Contains("\\#"))
+        {
+            var mapped = new List<string>();
+            foreach (var line in RenderCommon.SplitLines(output))
+            {
+                string trimmed = line.TrimStart();
+                if (trimmed.StartsWith("\\* ", StringComparison.Ordinal)
+                    || trimmed.StartsWith("\\#.", StringComparison.Ordinal)
+                    || trimmed.StartsWith("\\#\\.", StringComparison.Ordinal))
+                    mapped.Add(ReplaceFirst(ReplaceFirst(line, "\\*", "*"), "\\#", "#"));
+                else
+                    mapped.Add(line);
+            }
+            output = string.Join("\n", mapped);
+        }
+
+        // Collapse runs of 3+ newlines into exactly 2.
         output = CollapseExcessNewlines(output);
 
+        // Strip arXiv watermark noise.
+        output = StripArxivWatermarkNoise(output);
+
+        // Trim trailing whitespace but keep a single trailing newline.
         int trimmedLen = RenderCommon.TrimEndLen(output);
         if (trimmedLen == 0) return "";
         return output.Substring(0, trimmedLen) + "\n";
     }
 
-    private static string InlineText(InternalElement elem)
+    private static string StripArxivWatermarkNoise(string text)
     {
-        if (elem.Annotations.Count == 0) return elem.Text;
-        return RenderCommon.RenderAnnotatedText(elem.Text, elem.Annotations, EmitInline);
+        int searchLimit = Math.Min(text.Length, 6000);
+        if (searchLimit > 0 && searchLimit < text.Length && char.IsLowSurrogate(text[searchLimit])) searchLimit--;
+        string searchArea = text.Substring(0, searchLimit);
+
+        var m = ArxivWatermarkRegex.Match(searchArea);
+        if (!m.Success || m.Length == 0) return text;
+
+        string after = searchArea.Substring(m.Index + m.Length);
+        char? beforeChar = m.Index > 0 ? searchArea[m.Index - 1] : null;
+        bool atBoundary = beforeChar == '.' || after.StartsWith("\n", StringComparison.Ordinal);
+        if (!atBoundary) return text;
+
+        return text.Remove(m.Index, m.Length);
     }
 
-    private static string EmitInline(string span, AnnotationKind kind) => kind.Which switch
+    private static string ReplaceFirst(string input, string oldValue, string newValue)
     {
-        AnnotationKind.Tag.Bold => "**" + span + "**",
-        AnnotationKind.Tag.Italic => "*" + span + "*",
-        AnnotationKind.Tag.Code => "`" + span + "`",
-        AnnotationKind.Tag.Strikethrough => "~~" + span + "~~",
-        AnnotationKind.Tag.Link => "[" + span + "](" + (kind.Url ?? "") + ")",
-        _ => span,
-    };
-
-    private static void AppendBlock(StringBuilder sb, string block, int bqDepth)
-    {
-        if (sb.Length > 0) sb.Append('\n');
-        RenderCommon.PushWithBq(sb, block, bqDepth);
-        if (sb.Length == 0 || sb[^1] != '\n') sb.Append('\n');
+        int idx = input.IndexOf(oldValue, StringComparison.Ordinal);
+        if (idx < 0) return input;
+        return input.Substring(0, idx) + newValue + input.Substring(idx + oldValue.Length);
     }
 
     // ------------------------------------------------------------------
