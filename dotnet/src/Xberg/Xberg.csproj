@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Xberg</RootNamespace>
+    <AssemblyName>Xberg</AssemblyName>
+
+    <!-- NuGet package metadata -->
+    <PackageId>Xberg</PackageId>
+    <Version>0.1.0-alpha</Version>
+    <Authors>Curiosity GmbH</Authors>
+    <Description>Native C# port of the Xberg document content-extraction engine. Extracts text, metadata, tables and structured content from Office documents, PDF, HTML, email, archives and more. No native dependencies.</Description>
+    <Packagelicense>MIT</Packagelicense>
+    <PackageTags>document;extraction;pdf;docx;xlsx;pptx;text;markdown;html</PackageTags>
+    <RepositoryUrl>https://github.com/curiosity-ai/xberg</RepositoryUrl>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+    <PackageReference Include="SixLabors.Fonts" Version="2.0.9" />
+  </ItemGroup>
+
+</Project>
