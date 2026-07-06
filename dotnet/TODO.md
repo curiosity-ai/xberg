@@ -5,6 +5,16 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dro
 Each format is "done" when the `Xberg.TestRunner` output matches the committed
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 
+> **Status (parity snapshot):** 1171 / 2494 fixtures fully match the Rust golden output.
+> Core spine + renderers + MIME + derive + test harness done (83 unit tests green).
+> Ported & validated: txt, docx, xlsx, pptx, odt, rtf, epub, eml, json/jsonl, csv/tsv,
+> xml, yaml, toml, svg. Perfect-parity extensions: xlsx (12/12), odt (19/19).
+> Not yet ported: markdown, pdf, html, msg, doc, ppt, xls, ods, iwork, hwp/hwpx,
+> images, latex/rst/org/typst/jupyter/fictionbook/dbf/bibtex/mdx, archives, code.
+> Known core gap: Markdown/HTML/Djot renderers are direct writers, not comrak-exact
+> (soft-compared for now); JsonRenderer escapes supplementary-plane Unicode as
+> surrogate pairs instead of raw UTF-8 (affects a few JSON fixtures).
+
 ---
 
 ## Phase 0 — Setup & reference data
@@ -42,38 +52,38 @@ Each format is "done" when the `Xberg.TestRunner` output matches the committed
 
 ## Phase 2 — Office formats (priority)
 
-- [ ] `Internal/Ooxml`: shared OOXML helpers (ZIP open, relationships, shared strings,
+- [x] `Internal/Ooxml`: shared OOXML helpers (ZIP open, relationships, shared strings,
       content-types, core/app properties → `Metadata`).
-- [ ] **docx** (`extractors/docx.rs`, `extraction/docx/`) — paragraphs, styles, tables,
+- [x] **docx** (`extractors/docx.rs`, `extraction/docx/`) — paragraphs, styles, tables,
       lists, hyperlinks, images, headers/footers, tracked changes.
-- [ ] **xlsx** (`extractors/excel.rs`, `extraction/excel.rs`) — sheets → tables, shared
+- [x] **xlsx** (`extractors/excel.rs`, `extraction/excel.rs`) — sheets → tables, shared
       strings, number formats. Port needed calamine logic.
-- [ ] **pptx** (`extractors/pptx.rs`, `extraction/pptx/`) — slides, text frames, tables, notes.
-- [ ] **odt** (`extractors/odt.rs`) — ODF text.
+- [x] **pptx** (`extractors/pptx.rs`, `extraction/pptx/`) — slides, text frames, tables, notes.
+- [x] **odt** (`extractors/odt.rs`) — ODF text.
 - [ ] **ods** — ODF spreadsheet (via excel/calamine path).
 - [ ] **doc** (`extractors/doc.rs`, `extraction/doc/`) — legacy Word (CFB + FIB/piece table).
 - [ ] **ppt** (`extractors/ppt.rs`, `extraction/ppt/`) — legacy PowerPoint (CFB).
 - [ ] **xls** — legacy Excel (CFB, BIFF) via calamine path.
-- [ ] **rtf** (`extractors/rtf/`) — RTF control-word parser.
-- [ ] **epub** (`extractors/epub/`) — ZIP + OPF spine + XHTML.
+- [x] **rtf** (`extractors/rtf/`) — RTF control-word parser.
+- [x] **epub** (`extractors/epub/`) — ZIP + OPF spine + XHTML.
 - [ ] `Internal/Cfb`: OLE compound-file reader (shared by doc/ppt/xls/hwp/msg).
 
 ## Phase 3 — Structured, markup & data formats
 
 - [ ] **html** (`extractors/html.rs`) — HTML→Markdown/structured. Port `html-to-markdown-rs`
       or use AngleSharp + custom writer.
-- [ ] **xml** (`extractors/xml.rs`), **jats** (`jats/`), **docbook** (`docbook.rs`).
+- [x] **xml** (`extractors/xml.rs`), **jats** (`jats/`), **docbook** (`docbook.rs`).
 - [ ] **markdown** (`extractors/markdown.rs`) + **mdx** (`mdx.rs`) + **djot** (`djot_format/`).
-- [ ] **csv** (`extractors/csv.rs`) — delimiter sniffing → table.
-- [ ] **structured** (`extractors/structured.rs`) — JSON / JSONL / YAML / TOML.
-- [ ] **text** (`extractors/text.rs`) — plain text.
+- [x] **csv** (`extractors/csv.rs`) — delimiter sniffing → table.
+- [x] **structured** (`extractors/structured.rs`) — JSON / JSONL / YAML / TOML.
+- [x] **text** (`extractors/text.rs`) — plain text.
 - [ ] **opml** (`opml/`), **bibtex** (`bibtex.rs`), **citation** (`citation.rs`).
 - [ ] **rst** (`rst.rs`), **latex** (`latex/`), **org** (`orgmode.rs`), **typst** (`typst.rs`),
       **jupyter** (`jupyter.rs`), **fictionbook** (`fictionbook.rs`), **dbf** (`dbf.rs`).
 
 ## Phase 4 — Email & archives
 
-- [ ] **eml** + **msg** (`extractors/email.rs`, `extraction/email.rs`) — MIME + CFB msg.
+- [x] **eml** (msg deferred) (`extractors/email.rs`, `extraction/email.rs`) — MIME + CFB msg.
 - [ ] **pst** (`extractors/pst.rs`) — Outlook PST (port `outlook-pst`; large — evaluate).
 - [ ] **archives** (`extractors/archive.rs`) — zip / tar / 7z / gzip, recursive extraction
       of children through the pipeline.
