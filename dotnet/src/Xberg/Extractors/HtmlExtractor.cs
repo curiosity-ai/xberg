@@ -30,6 +30,24 @@ public sealed class HtmlExtractor : IExtractor
         new HtmlWalker(html, builder).Walk();
         var doc = builder.Build();
 
+        // Rust's HTML extractor records each table twice: once from the DocumentStructure
+        // walk (page_number 0, referenced by a Table element) and again from the separate
+        // table_data list with page_number = i+1 (extractors/html.rs). Replicate the second
+        // pass so the `tables` collection matches byte-for-byte. The duplicates are not
+        // referenced by any element, so they only affect the top-level tables list.
+        int structuralTableCount = doc.Tables.Count;
+        for (int i = 0; i < structuralTableCount; i++)
+        {
+            var src = doc.Tables[i];
+            doc.Tables.Add(new Table
+            {
+                Cells = src.Cells.Select(r => new List<string>(r)).ToList(),
+                Markdown = src.Markdown,
+                PageNumber = (uint)(i + 1),
+                BoundingBox = null,
+            });
+        }
+
         var htmlMeta = HtmlMeta.Extract(html);
         var metadata = new Metadata();
         if (!IsEmpty(htmlMeta))

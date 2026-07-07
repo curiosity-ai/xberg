@@ -53,7 +53,11 @@ public class HtmlExtractorTests
     public void Html_Table()
     {
         var doc = Html("<table><tr><th>Name</th><th>Age</th></tr><tr><td>Alice</td><td>30</td></tr></table>");
-        Assert.Single(doc.Tables);
+        // Rust records each table twice: the DocumentStructure copy (page 0) and the
+        // table_data copy (page i+1). Both carry identical cells.
+        Assert.Equal(2, doc.Tables.Count);
+        Assert.Equal(0u, doc.Tables[0].PageNumber);
+        Assert.Equal(1u, doc.Tables[1].PageNumber);
         Assert.Equal(new[] { "Name", "Age" }, doc.Tables[0].Cells[0]);
         Assert.Equal(new[] { "Alice", "30" }, doc.Tables[0].Cells[1]);
     }
