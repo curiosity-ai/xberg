@@ -115,6 +115,13 @@ foreach (var goldenPath in goldenFiles)
             dim.Mismatch++;
             if (!soft) allHard = false;
             AddExample(examples, $"{name}", rel, want, have, opts);
+            if (opts.Dump is not null)
+            {
+                var safe = rel.Replace('/', '_');
+                Directory.CreateDirectory(opts.Dump);
+                File.WriteAllText(Path.Combine(opts.Dump, $"{safe}.{name}.rust.txt"), want);
+                File.WriteAllText(Path.Combine(opts.Dump, $"{safe}.{name}.cs.txt"), have);
+            }
         }
     }
 
@@ -291,6 +298,7 @@ static Options? ParseArgs(string[] args)
             case "--diff": o.Diff = true; break;
             case "--strict-md": o.StrictMd = true; break;
             case "--list-ok": o.ListOk = true; break;
+            case "--dump": o.Dump = args[++i]; break;
         }
     }
     if (!Directory.Exists(o.Root)) { Console.Error.WriteLine($"not a directory: {o.Root}"); return null; }
@@ -306,6 +314,7 @@ sealed class Options
     public bool Diff;
     public bool StrictMd;
     public bool ListOk;
+    public string? Dump;
 }
 
 sealed class DimStat { public int Match; public int Mismatch; }
