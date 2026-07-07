@@ -149,4 +149,49 @@ public class RendererParityTests
         Assert.Equal("", MarkdownRenderer.Render(doc));
         Assert.Equal("", HtmlRenderer.Render(doc));
     }
+
+    // Backslash-escaping parity: comrak's format_commonmark escapes punctuation in text
+    // nodes, and MarkdownRenderer's post-processing then un-escapes the subset that does not
+    // affect re-parsing (`_ [ ] ( ) * =`). What survives is `\#`, `\~`, `\\` mid-paragraph.
+    // The expected strings below are the byte-exact output of the upstream Rust pipeline
+    // (`xberg-reference-gen`, comrak 0.53.0) for the same text nodes.
+    [Fact]
+    public void TextNodePunctuationEscapingMatchesComrak()
+    {
+        var doc = Build(b =>
+        {
+            b.PushParagraph("Dash - test. Under _x_ y. Star *z*. Dot 1. two. Hash # h. Tilde ~t~ end.",
+                new(), null, null);
+            b.PushParagraph("Second para: a~~b and c\\d and 3.5 and -5 and =eq.", new(), null, null);
+        });
+
+        Assert.Equal(
+            "Dash - test. Under _x_ y. Star *z*. Dot 1. two. Hash \\# h. Tilde \\~t\\~ end.\n\n"
+            + "Second para: a\\~\\~b and c\\\\d and 3.5 and -5 and =eq.\n",
+            MarkdownRenderer.Render(doc));
+
+        // HTML escaping leaves ASCII punctuation untouched (only &, <, >, " are entity-escaped).
+        Assert.Equal(
+            "<p>Dash - test. Under _x_ y. Star *z*. Dot 1. two. Hash # h. Tilde ~t~ end.</p>\n"
+            + "<p>Second para: a~~b and c\\d and 3.5 and -5 and =eq.</p>\n",
+            HtmlRenderer.Render(doc));
+    }
+
+    // At begin_content (paragraph start) comrak escapes `-`/`+`/`=` (they would otherwise
+    // start a list / setext rule). Post-processing then un-escapes `=` (in the un-escape set)
+    // but leaves `\-` and `\+`. Verifies the begin_content branch of outc + post-processing.
+    [Fact]
+    public void BeginContentEscapingMatchesComrak()
+    {
+        var doc = Build(b =>
+        {
+            b.PushParagraph("- not a list", new(), null, null);
+            b.PushParagraph("+ also not", new(), null, null);
+            b.PushParagraph("= not setext", new(), null, null);
+        });
+
+        Assert.Equal(
+            "\\- not a list\n\n\\+ also not\n\n= not setext\n",
+            MarkdownRenderer.Render(doc));
+    }
 }
