@@ -207,6 +207,21 @@ public static class MarkdownParser
             int indent = AsciiIndentLen(line);
             string trimmedStart = line.Substring(indent);
 
+            // Footnote definition: [^label]: content (+ indented continuation lines).
+            if (indent <= 3 && trimmedStart.StartsWith("[^", StringComparison.Ordinal))
+            {
+                int fc = trimmedStart.IndexOf(']');
+                if (fc > 2 && fc + 1 < trimmedStart.Length && trimmedStart[fc + 1] == ':')
+                {
+                    string flabel = trimmedStart.Substring(2, fc - 2);
+                    if (flabel.Length > 0 && flabel.IndexOf(' ') < 0 && flabel.IndexOf('\t') < 0)
+                    {
+                        i = ParseFootnoteDef(lines, i, hi, ev, indent, flabel, fc + 2);
+                        continue;
+                    }
+                }
+            }
+
             // Link reference definition — collected in ScanRefDefs, dropped from block stream.
             if (indent <= 3 && trimmedStart.StartsWith("[") && TryParseRefDef(line, out _, out _, out _))
             {
@@ -488,6 +503,35 @@ public static class MarkdownParser
             ev.Add(MdEvent.Simple(MdEventKind.EndItem));
         }
         ev.Add(MdEvent.Simple(MdEventKind.EndList));
+        return i;
+    }
+
+    /// <summary>Parses a footnote definition (<c>[^label]: ...</c>) starting at
+    /// <paramref name="start"/>. The first line's trailing text plus any subsequent lines indented
+    /// by at least four columns form the definition body (parsed recursively as blocks). Emits
+    /// <see cref="MdEventKind.StartFootnoteDefinition"/>/<see cref="MdEventKind.EndFootnoteDefinition"/>.</summary>
+    private static int ParseFootnoteDef(List<string> lines, int start, int hi, List<MdEvent> ev,
+        int baseIndent, string label, int firstContentCol)
+    {
+        const int contIndent = 4;
+        string firstLine = lines[start].Substring(baseIndent);
+        string rest = firstContentCol <= firstLine.Length
+            ? firstLine.Substring(firstContentCol).TrimStart(' ', '\t')
+            : "";
+        var content = new List<string> { rest };
+        int i = start + 1;
+        while (i < hi)
+        {
+            string cl = lines[i];
+            if (IsBlank(cl)) { content.Add(""); i++; continue; }
+            if (AsciiIndentLen(cl) >= contIndent) { content.Add(cl.Substring(contIndent)); i++; continue; }
+            break;
+        }
+        while (content.Count > 0 && content[^1].Trim().Length == 0) content.RemoveAt(content.Count - 1);
+
+        ev.Add(new MdEvent { Kind = MdEventKind.StartFootnoteDefinition, Text = label, Url = "" });
+        ParseBlocks(content, 0, content.Count, ev);
+        ev.Add(MdEvent.Simple(MdEventKind.EndFootnoteDefinition));
         return i;
     }
 
