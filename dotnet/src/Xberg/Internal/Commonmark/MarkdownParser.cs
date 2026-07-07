@@ -178,16 +178,34 @@ public static class MarkdownParser
 
     private static bool IsBlank(string s) => s.Trim().Length == 0;
 
+    /// <summary>Number of leading ASCII block-indentation characters (space/tab only).
+    /// Unlike <see cref="string.TrimStart()"/>, Unicode whitespace such as U+00A0 (nbsp) is
+    /// NOT treated as indentation — per CommonMark it is ordinary inline content. Counting it
+    /// as indentation caused a non-terminating loop when the indented-code branch was entered
+    /// on an nbsp-indented line but the inner scanner (ASCII-space only) refused to advance.</summary>
+    private static int AsciiIndentLen(string s)
+    {
+        int k = 0;
+        while (k < s.Length && (s[k] == ' ' || s[k] == '\t')) k++;
+        return k;
+    }
+
     private static void ParseBlocks(List<string> lines, int lo, int hi, List<MdEvent> ev)
     {
         int i = lo;
+        int stuckAt = -1;
         while (i < hi)
         {
+            // Strict-progress safety net: if a full iteration ever returns to the top without
+            // advancing the cursor, force a single-line advance so no input can hang the parser.
+            if (i == stuckAt) { i++; stuckAt = -1; continue; }
+            stuckAt = i;
+
             string line = lines[i];
             if (IsBlank(line)) { i++; continue; }
 
-            string trimmedStart = line.TrimStart();
-            int indent = line.Length - trimmedStart.Length;
+            int indent = AsciiIndentLen(line);
+            string trimmedStart = line.Substring(indent);
 
             // Link reference definition — collected in ScanRefDefs, dropped from block stream.
             if (indent <= 3 && trimmedStart.StartsWith("[") && TryParseRefDef(line, out _, out _, out _))

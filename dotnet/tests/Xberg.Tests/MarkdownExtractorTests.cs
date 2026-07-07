@@ -106,6 +106,37 @@ public class MarkdownExtractorTests
     }
 
     [Fact]
+    public void NbspIndentedLineDoesNotHang()
+    {
+        // Regression: a line indented with non-breaking spaces (U+00A0) was mistaken for an
+        // indented code block by the block-indent measure (TrimStart treats nbsp as whitespace),
+        // but the inner ASCII-space scanner refused to advance, spinning the parser forever.
+        string md = "---\n\n    with a continuation\n";
+        var task = System.Threading.Tasks.Task.Run(() =>
+            Xberg.Internal.Commonmark.MarkdownParser.Parse(md));
+        Assert.True(task.Wait(TimeSpan.FromSeconds(5)), "MarkdownParser hung on nbsp-indented line");
+    }
+
+    [Fact]
+    public void WriterFixtureParsesQuickly()
+    {
+        // Full fixture that previously hung the parser (nested lists, footnotes, indented code,
+        // nbsp indentation). Assert it parses to completion within a generous bound.
+        string[] candidates =
+        {
+            "/workspace/test_documents/ground_truth/fictionbook/writer.md",
+            Path.Combine(AppContext.BaseDirectory, "../../../../../../test_documents/ground_truth/fictionbook/writer.md"),
+        };
+        string? path = candidates.FirstOrDefault(File.Exists);
+        if (path is null) return; // fixture tree not present in this environment
+        string md = File.ReadAllText(path);
+        var task = System.Threading.Tasks.Task.Run(() =>
+            Xberg.Internal.Commonmark.MarkdownParser.Parse(md));
+        Assert.True(task.Wait(TimeSpan.FromSeconds(10)), "MarkdownParser hung on writer.md fixture");
+        Assert.NotEmpty(task.Result);
+    }
+
+    [Fact]
     public void MdxStripsImportsAndJsx()
     {
         var ex = new MdxExtractor();
