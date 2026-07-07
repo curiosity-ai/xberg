@@ -32,10 +32,14 @@ public sealed class HtmlWalker
     private int _pDepth;                     // >0 while inside a <p> (paragraphs are emitted only from <p>)
     private PreBlock? _preBlock;
     private TableAccumulator? _table;
-    private int _listDepth;                 // number of open <ul>/<ol>
-    private readonly List<bool> _listOrdered = new();
-    private bool _inListItem;
-    private readonly StringBuilder _listItemText = new();
+    // List handling: html-to-markdown emits a SEPARATE list node for every <ul>/<ol>
+    // (all siblings under the current section), while nested lists are ALSO flattened into
+    // their parent item's text with indented bullet/number markers. We buffer the whole
+    // list subtree into a tree and emit it when the outermost list closes.
+    private readonly List<LList> _listStack = new();   // currently-open lists
+    private readonly List<LItem> _itemStack = new();   // currently-open <li> items
+    private bool InListItem => _itemStack.Count > 0;
+    private StringBuilder CurrentItemBuffer => _itemStack[^1].Inline;
 
     // Definition list
     private bool _inDl;
@@ -43,9 +47,6 @@ public sealed class HtmlWalker
     private bool _inDt, _inDd;
     private readonly StringBuilder _dtText = new();
     private readonly StringBuilder _ddText = new();
-
-    // Figure
-    private FigureContext? _figure;
 
     public HtmlWalker(string src, InternalDocumentBuilder builder)
     {
@@ -81,10 +82,9 @@ public sealed class HtmlWalker
 
         if (_table is not null) { _table.PushText(decoded); return; }
         if (_preBlock is not null) { _preBlock.Text.Append(decoded); return; }
-        if (_inListItem) { _listItemText.Append(decoded); return; }
+        if (InListItem) { CurrentItemBuffer.Append(decoded); return; }
         if (_inDt) { _dtText.Append(decoded); return; }
         if (_inDd) { _ddText.Append(decoded); return; }
-        if (_figure is { InCaption: true } fig) { fig.Caption.Append(decoded); return; }
         AppendNormalized(decoded);
     }
 
@@ -113,10 +113,9 @@ public sealed class HtmlWalker
     {
         if (_table is not null) { _table.PushText(s); return; }
         if (_preBlock is not null) { _preBlock.Text.Append(s); return; }
-        if (_inListItem) { _listItemText.Append(s); return; }
+        if (InListItem) { CurrentItemBuffer.Append(s); return; }
         if (_inDt) { _dtText.Append(s); return; }
         if (_inDd) { _ddText.Append(s); return; }
-        if (_figure is { InCaption: true } fig) { fig.Caption.Append(s); return; }
         AppendNormalized(s);
     }
 
@@ -163,7 +162,7 @@ public sealed class HtmlWalker
                 break;
             case "br":
                 if (_inPre || _preBlock is not null) { _preBlock?.Text.Append('\n'); }
-                else if (_inListItem) _listItemText.Append('\n');
+                else if (InListItem) CurrentItemBuffer.Append('\n');
                 else AppendNormalized("\x01");
                 break;
             case "strong": case "b": PushInline(InlineKind.Bold, null, null); break;
@@ -195,17 +194,15 @@ public sealed class HtmlWalker
                 _b.PushQuoteStart();
                 break;
             case "ul":
-                CloseParagraphContext();
-                _b.PushList(false); _listDepth++; _listOrdered.Add(false);
+                if (_listStack.Count == 0) CloseParagraphContext();
+                OpenList(false, 1);
                 break;
             case "ol":
-                CloseParagraphContext();
-                _b.PushList(true); _listDepth++; _listOrdered.Add(true);
+                if (_listStack.Count == 0) CloseParagraphContext();
+                OpenList(true, (int)ParseU32(ExtractAttr(attrs, "start"), 1));
                 break;
             case "li":
-                FlushListItem();
-                _inListItem = true;
-                _listItemText.Clear();
+                OpenItem();
                 break;
             case "table":
                 CloseParagraphContext();
@@ -223,19 +220,15 @@ public sealed class HtmlWalker
                 break;
             case "img":
             {
-                string? alt = ExtractAttr(attrs, "alt");
-                string? src = ExtractAttr(attrs, "src");
-                if (_figure is not null) { _figure.ImgAlt = alt; _figure.ImgSrc = src; }
-                else { CloseParagraphContext(); EmitImage(alt, src); }
+                // html-to-markdown emits every <img> as its own image node (using its alt),
+                // even inside <a>/<figure>; the enclosing link and any <figcaption> are ignored.
+                if (!InListItem)
+                {
+                    CloseParagraphContext();
+                    EmitImage(ExtractAttr(attrs, "alt"), ExtractAttr(attrs, "src"));
+                }
                 break;
             }
-            case "figure":
-                CloseParagraphContext();
-                _figure = new FigureContext();
-                break;
-            case "figcaption":
-                if (_figure is not null) { _figure.InCaption = true; }
-                break;
             case "dl":
                 CloseParagraphContext();
                 _inDl = true; _dlTerm = null;
@@ -269,6 +262,7 @@ public sealed class HtmlWalker
                 break;
             case "div": case "section": case "article": case "main": case "aside":
             case "header": case "footer": case "nav": case "details": case "summary":
+            case "figure": case "figcaption":
                 CloseParagraphContext();
                 break;
             default:
@@ -316,10 +310,9 @@ public sealed class HtmlWalker
                 _b.PushQuoteEnd();
                 break;
             case "ul": case "ol":
-                FlushListItem();
-                if (_listDepth > 0) { _b.EndList(); _listDepth--; if (_listOrdered.Count > 0) _listOrdered.RemoveAt(_listOrdered.Count - 1); }
+                CloseList();
                 break;
-            case "li": FlushListItem(); break;
+            case "li": CloseItem(); break;
             case "table":
                 if (_table is not null)
                 {
@@ -333,18 +326,9 @@ public sealed class HtmlWalker
             case "dl": FlushDefinitionItem(); _inDl = false; break;
             case "dt": _inDt = false; break;
             case "dd": _inDd = false; FlushDefinitionItem(); break;
-            case "figure":
-                if (_figure is not null)
-                {
-                    string? cap = _figure.Caption.ToString().Trim();
-                    string? desc = !string.IsNullOrEmpty(cap) ? cap : _figure.ImgAlt;
-                    EmitImage(desc, _figure.ImgSrc);
-                    _figure = null;
-                }
-                break;
-            case "figcaption": if (_figure is not null) _figure.InCaption = false; break;
             case "div": case "section": case "article": case "main": case "aside":
             case "header": case "footer": case "nav": case "details": case "summary":
+            case "figure": case "figcaption":
                 CloseParagraphContext();
                 break;
         }
@@ -424,7 +408,8 @@ public sealed class HtmlWalker
         {
             AppendInline("[");
             if (ParagraphContext) _lastWasSpace = true; // suppress leading space inside link text
-            _inlineStack.Add(new InlineSpan { Kind = kind, Href = href, Title = title });
+            int textStart = InListItem ? CurrentItemBuffer.Length : 0;
+            _inlineStack.Add(new InlineSpan { Kind = kind, Href = href, Title = title, TextStart = textStart });
             return;
         }
         string mk = Marker(kind);
@@ -450,12 +435,21 @@ public sealed class HtmlWalker
         _inlineStack.RemoveAt(idx);
         if (ParagraphContext)
             while (_textBuf.Length > 0 && _textBuf[^1] == ' ') _textBuf.Remove(_textBuf.Length - 1, 1);
-        string suffix = string.IsNullOrEmpty(span.Title) ? $"]({span.Href})" : $"]({span.Href} \"{span.Title}\")";
+        else if (InListItem)
+        {
+            // Link labels are whitespace-trimmed (matches html-to-markdown's normalize+trim).
+            var buf = CurrentItemBuffer;
+            while (buf.Length > span.TextStart && char.IsWhiteSpace(buf[^1])) buf.Remove(buf.Length - 1, 1);
+            while (span.TextStart < buf.Length && char.IsWhiteSpace(buf[span.TextStart])) buf.Remove(span.TextStart, 1);
+        }
+        // A present-but-empty title attribute still renders the "" marker (matches html-to-markdown);
+        // only an absent title (null) omits the quotes.
+        string suffix = span.Title is null ? $"]({span.Href})" : $"]({span.Href} \"{span.Title}\")";
         AppendInline(suffix);
     }
 
     private bool ParagraphContext =>
-        _table is null && _preBlock is null && !_inListItem && !_inDt && !_inDd && !(_figure?.InCaption ?? false);
+        _table is null && _preBlock is null && !InListItem && !_inDt && !_inDd;
 
     // ── flush helpers ─────────────────────────────────────────────────────────
     // Paragraphs are emitted ONLY from <p> elements — this mirrors html-to-markdown's
@@ -485,14 +479,105 @@ public sealed class HtmlWalker
         _inlineStack.Clear();
     }
 
-    private void FlushListItem()
+    // ── list tree (buffered, then emitted on outermost </ul>/</ol>) ────────────
+    private void OpenList(bool ordered, int start)
     {
-        if (!_inListItem) return;
-        _inListItem = false;
-        string text = NormalizeWhitespace(_listItemText.ToString());
-        if (text.Length > 0 && _listDepth > 0)
-            _b.PushListItem(text, _listOrdered.Count > 0 && _listOrdered[^1], new(), null, null);
-        _listItemText.Clear();
+        var lst = new LList { Ordered = ordered, Start = start };
+        if (_itemStack.Count > 0) _itemStack[^1].Nested.Add(lst);
+        _listStack.Add(lst);
+    }
+
+    private void OpenItem()
+    {
+        if (_listStack.Count == 0) return; // stray <li>
+        var lst = _listStack[^1];
+        if (lst.HasOpenItem) CloseItem();  // auto-close a previous sibling <li>
+        lst.HasOpenItem = true;
+        _itemStack.Add(new LItem());
+    }
+
+    private void CloseItem()
+    {
+        if (_itemStack.Count == 0 || _listStack.Count == 0) return;
+        var item = _itemStack[^1];
+        _itemStack.RemoveAt(_itemStack.Count - 1);
+        var lst = _listStack[^1];
+        lst.Items.Add(item);
+        lst.HasOpenItem = false;
+    }
+
+    private void CloseList()
+    {
+        if (_listStack.Count == 0) return;
+        if (_listStack[^1].HasOpenItem) CloseItem();
+        var closed = _listStack[^1];
+        _listStack.RemoveAt(_listStack.Count - 1);
+        if (_listStack.Count == 0) EmitListNode(closed, 1, 0); // outermost list → emit whole subtree
+    }
+
+    // Emit each list as its own node (all siblings under the current section) in the same
+    // pre-order html-to-markdown uses: the list itself, then the nested lists of its items.
+    private void EmitListNode(LList lst, int nl, int parentUd)
+    {
+        int ud = parentUd + (lst.Ordered ? 0 : 1);
+        _b.PushList(lst.Ordered);
+        foreach (var item in lst.Items)
+        {
+            string text = ItemText(item, nl, ud);
+            if (text.Length > 0) _b.PushListItem(text, lst.Ordered, new(), null, null);
+        }
+        _b.EndList();
+        foreach (var item in lst.Items)
+            foreach (var nested in item.Nested)
+                EmitListNode(nested, nl + 1, ud);
+    }
+
+    // The structure text for a single list item: its own inline text plus each nested list
+    // rendered as flattened markdown (excluding the item's own marker), then trimmed.
+    private string ItemText(LItem item, int nl, int ud)
+    {
+        var sb = new StringBuilder(NormalizeWhitespace(item.Inline.ToString()));
+        foreach (var nested in item.Nested)
+        {
+            sb.Append('\n');
+            sb.Append(RenderList(nested, nl + 1, ud));
+        }
+        return sb.ToString().Trim();
+    }
+
+    // Render a (nested) list to flattened markdown lines: `indent + marker + content`,
+    // bullets cycling "-*+" by <ul> depth, indent = 2 spaces per nesting level.
+    private string RenderList(LList lst, int nl, int parentUd)
+    {
+        int ud = parentUd + (lst.Ordered ? 0 : 1);
+        string indent = new string(' ', 2 * (nl - 1));
+        var lines = new List<string>();
+        int counter = lst.Start;
+        foreach (var item in lst.Items)
+        {
+            string marker = lst.Ordered ? $"{counter}. " : Bullet(ud) + " ";
+            string inline = NormalizeWhitespace(item.Inline.ToString());
+            var child = new StringBuilder();
+            foreach (var nested in item.Nested)
+            {
+                child.Append('\n');
+                child.Append(RenderList(nested, nl + 1, ud));
+            }
+            string childStr = child.ToString();
+            string body = inline.Length == 0 && childStr.Length > 0
+                ? marker.TrimEnd() + childStr
+                : marker + inline + childStr;
+            lines.Add(indent + body);
+            if (lst.Ordered) counter++;
+        }
+        return string.Join("\n", lines);
+    }
+
+    private static char Bullet(int ulDepth)
+    {
+        const string bullets = "-*+";
+        int idx = ulDepth <= 0 ? 0 : (ulDepth - 1) % bullets.Length;
+        return bullets[idx];
     }
 
     private void FlushDefinitionItem()
@@ -652,15 +737,22 @@ public sealed class HtmlWalker
 
     private sealed class PreBlock { public string? Language; public readonly StringBuilder Text = new(); }
 
+    private sealed class LList
+    {
+        public bool Ordered;
+        public int Start = 1;
+        public bool HasOpenItem;
+        public readonly List<LItem> Items = new();
+    }
+
+    private sealed class LItem
+    {
+        public readonly StringBuilder Inline = new();
+        public readonly List<LList> Nested = new();
+    }
+
     internal sealed class CellMeta { public string Text = ""; public uint ColSpan = 1; public uint RowSpan = 1; public bool IsHeader; }
 
-    private sealed class FigureContext
-    {
-        public string? ImgAlt;
-        public string? ImgSrc;
-        public readonly StringBuilder Caption = new();
-        public bool InCaption;
-    }
 
     private sealed class TableAccumulator
     {
