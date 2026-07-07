@@ -130,25 +130,27 @@ public static class PdfStructure
         return doc;
     }
 
-    /// <summary>Convert ColumnAware-ordered spans of one page to segments (dedupe redrawn, drop empty).</summary>
-    public static List<SegmentData> SegmentsFromSpans(List<TextSpan> orderedSpans)
+    /// <summary>Convert a page's assembled visual lines to segments. Line assembly (spacing,
+    /// glyph-fragmentation rebuild) is done by PdfPageText.BuildLineSegments so the text
+    /// matches the plain path exactly; here we only wrap it as SegmentData.</summary>
+    public static List<SegmentData> SegmentsFromLines(List<PdfPageText.LineSeg> lines)
     {
         var segs = new List<SegmentData>();
-        foreach (var s in orderedSpans)
+        foreach (var l in lines)
         {
-            if (string.IsNullOrWhiteSpace(s.Text)) continue;
+            if (string.IsNullOrWhiteSpace(l.Text)) continue;
             segs.Add(new SegmentData
             {
-                Text = s.Text,
-                X = (float)s.X,
-                Y = (float)s.Y,
-                Width = (float)s.Width,
-                Height = (float)s.Height,
-                FontSize = (float)s.FontSize,
-                IsBold = s.IsBold,
-                IsItalic = s.IsItalic,
-                IsMonospace = s.IsMonospace,
-                BaselineY = (float)s.Y,
+                Text = l.Text,
+                X = (float)l.X,
+                Y = (float)l.Y,
+                Width = (float)l.Width,
+                Height = (float)l.Height,
+                FontSize = (float)l.FontSize,
+                IsBold = l.IsBold,
+                IsItalic = l.IsItalic,
+                IsMonospace = l.IsMonospace,
+                BaselineY = (float)l.Y,
             });
         }
         return DedupeRedrawnSegments(segs);

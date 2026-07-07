@@ -124,8 +124,8 @@ public sealed class PdfExtractor : IExtractor
                 var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                 var extractor = new PdfContentExtractor(pdf, deadline);
                 var spans = extractor.Extract(contentBytes, resources);
-                var ordered = PdfPageText.OrderColumnAware(spans);
-                allPageSegments.Add(PdfStructure.SegmentsFromSpans(ordered));
+                var lines = PdfPageText.BuildLineSegments(spans);
+                allPageSegments.Add(PdfStructure.SegmentsFromLines(lines));
             }
             catch { allPageSegments.Add(new()); }
         }

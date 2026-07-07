@@ -145,6 +145,103 @@ public static class PdfPageText
         return ordered;
     }
 
+    /// <summary>One assembled visual line with aggregate font metrics.</summary>
+    public sealed class LineSeg
+    {
+        public string Text = "";
+        public double X, Y, Width, Height, FontSize;
+        public bool IsBold, IsItalic, IsMonospace;
+    }
+
+    /// <summary>Assemble a page's spans into visual lines with the SAME reading-order and
+    /// intra-line spacing rules as <see cref="Assemble"/> (including the glyph-fragmentation
+    /// rebuild). Feeds the structure/heading pipeline so its text matches the plain path.</summary>
+    public static List<LineSeg> BuildLineSegments(List<TextSpan> spans)
+    {
+        var lines = new List<LineSeg>();
+        if (spans.Count == 0) return lines;
+
+        var (ordered, orderedRuns) = OrderViaRuns(spans);
+
+        // Fragmented glyph lists: rebuild lines from positions (issue #962).
+        if (IsFragmentedSpanList(orderedRuns))
+        {
+            var sorted = ordered.OrderByDescending(s => s.Y, Comparer<double>.Create((a, b) => a.CompareTo(b))).ToList();
+            var groups = new List<List<TextSpan>>();
+            foreach (var span in sorted)
+            {
+                bool belongs = groups.Count > 0 && Math.Abs(span.Y - groups[^1][^1].Y) <= CoalesceThreshold;
+                if (belongs) groups[^1].Add(span);
+                else groups.Add(new List<TextSpan> { span });
+            }
+            foreach (var group in groups)
+            {
+                group.Sort((a, b) => a.X.CompareTo(b.X));
+                lines.Add(AssembleLine(group, byXThreshold: true));
+            }
+            return lines;
+        }
+
+        // Normal path: group consecutive same-line spans (mirrors Assemble's line logic).
+        var cur = new List<TextSpan>();
+        TextSpan? prev = null;
+        foreach (var span in ordered)
+        {
+            if (prev != null)
+            {
+                double yGap = Math.Abs(prev.Y - span.Y);
+                double effHeight = Math.Max(Math.Max(span.Height, prev.Height), span.FontSize * 0.5);
+                bool sameLine = yGap < effHeight * 0.5;
+                if (!sameLine) { lines.Add(AssembleLine(cur, byXThreshold: false)); cur = new List<TextSpan>(); }
+            }
+            cur.Add(span);
+            prev = span;
+        }
+        if (cur.Count > 0) lines.Add(AssembleLine(cur, byXThreshold: false));
+        return lines;
+    }
+
+    private static LineSeg AssembleLine(List<TextSpan> group, bool byXThreshold)
+    {
+        var sb = new StringBuilder();
+        double minX = double.MaxValue, maxRight = double.MinValue, maxHeight = 0, maxFont = 0;
+        int boldCount = 0, italicCount = 0, count = 0; bool allMono = true;
+        double prevEndX = double.NegativeInfinity;
+        double fontSize = group.Count == 0 ? 0 : group.Max(s => s.FontSize);
+        foreach (var s in group)
+        {
+            if (!double.IsNegativeInfinity(prevEndX))
+            {
+                double gap = s.X - prevEndX;
+                double threshold = byXThreshold ? fontSize * 0.5 : s.FontSize * 0.15;
+                if (gap > threshold) sb.Append(' ');
+            }
+            sb.Append(s.Text);
+            prevEndX = s.X + s.Width;
+            minX = Math.Min(minX, s.X);
+            maxRight = Math.Max(maxRight, s.X + s.Width);
+            maxHeight = Math.Max(maxHeight, s.Height);
+            maxFont = Math.Max(maxFont, s.FontSize);
+            if (s.IsBold) boldCount++;
+            if (s.IsItalic) italicCount++;
+            allMono &= s.IsMonospace;
+            count++;
+        }
+        double y = group.Count > 0 ? group[0].Y : 0;
+        return new LineSeg
+        {
+            Text = sb.ToString(),
+            X = minX == double.MaxValue ? 0 : minX,
+            Y = y,
+            Width = (maxRight == double.MinValue ? 0 : maxRight) - (minX == double.MaxValue ? 0 : minX),
+            Height = maxHeight,
+            FontSize = maxFont,
+            IsBold = boldCount * 2 > count,
+            IsItalic = italicCount * 2 > count,
+            IsMonospace = count > 0 && allMono,
+        };
+    }
+
     private static TextSpan CloneRun(TextSpan s) => new TextSpan
     {
         Text = s.Text, X = s.X, Y = s.Y, Width = s.Width, Height = s.Height,
