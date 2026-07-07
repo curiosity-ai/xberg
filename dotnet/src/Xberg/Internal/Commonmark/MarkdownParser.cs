@@ -372,6 +372,10 @@ public static class MarkdownParser
                         break;
                     if (pind <= 3 && pts.StartsWith("<") && TryHtmlBlock(lines, i, hi) > i)
                         break;
+                    // A GFM table interrupts a paragraph when the current line is a header row
+                    // immediately followed by a valid delimiter row.
+                    if (pind <= 3 && pl.Contains('|') && i + 1 < hi && IsTableStart(pl, lines[i + 1]))
+                        break;
                     // A list item can interrupt a paragraph (bullets always; ordered only when
                     // starting at 1), provided the item is non-empty.
                     if (pind <= 3 && TryListMarker(pts, out bool po, out int pml))
