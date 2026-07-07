@@ -66,8 +66,18 @@ foreach (var goldenPath in goldenFiles)
     {
         try
         {
-            var res = extractor.Extract(ExtractInput.FromUri(sourcePath), new ExtractionConfig { OutputFormat = fmt });
-            var doc = res.Results.FirstOrDefault();
+            // Per-file guard: a pathological fixture must not stall the whole sweep.
+            var capturedPath = sourcePath;
+            var task = System.Threading.Tasks.Task.Run(() =>
+                extractor.Extract(ExtractInput.FromUri(capturedPath), new ExtractionConfig { OutputFormat = fmt }));
+            if (!task.Wait(TimeSpan.FromSeconds(20)))
+            {
+                csharpFailed = true;
+                got[name] = "";
+                Console.Error.WriteLine($"TIMEOUT {name} {rel}");
+                continue;
+            }
+            var doc = task.Result.Results.FirstOrDefault();
             got[name] = doc?.Content ?? "";
             if (name == "plain") plainDoc = doc;
         }
