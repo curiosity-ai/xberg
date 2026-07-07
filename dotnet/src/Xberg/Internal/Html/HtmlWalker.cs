@@ -500,6 +500,22 @@ public sealed class HtmlWalker
             if (span.Href is not null && span.Href.StartsWith('#') &&
                 buf.Length - span.TextStart == 1 && buf[span.TextStart] == '^')
                 buf[span.TextStart] = '↑';
+
+            // GFM autolink: when the label equals an absolute-scheme href, emit `<href>`
+            // (mailto uses the address without the scheme). Matches html-to-markdown defaults.
+            if (span.Href is not null && span.TextStart >= 1 && buf[span.TextStart - 1] == '[' && HasUriScheme(span.Href))
+            {
+                bool isMailto = span.Href.StartsWith("mailto:", StringComparison.Ordinal);
+                string autoText = isMailto ? span.Href[7..] : span.Href;
+                string label = buf.ToString(span.TextStart, buf.Length - span.TextStart);
+                if (label == autoText)
+                {
+                    buf.Length = span.TextStart - 1;   // drop the "[" and label
+                    buf.Append('<').Append(autoText).Append('>');
+                    _lastWasSpace = false;
+                    return;
+                }
+            }
         }
         // The label was just trimmed, so the closing "]" must follow it directly — drop any
         // pending word-break space left over from the label's trailing whitespace.
@@ -646,6 +662,19 @@ public sealed class HtmlWalker
             if (lst.Ordered) counter++;
         }
         return string.Join("\n", lines);
+    }
+
+    // A URI has a scheme when it starts with an ASCII letter followed by [A-Za-z0-9+-.]* then ':'.
+    private static bool HasUriScheme(string href)
+    {
+        if (href.Length == 0 || !char.IsAsciiLetter(href[0])) return false;
+        for (int i = 1; i < href.Length; i++)
+        {
+            char c = href[i];
+            if (c == ':') return true;
+            if (!(char.IsAsciiLetterOrDigit(c) || c is '+' or '-' or '.')) return false;
+        }
+        return false;
     }
 
     private static char Bullet(int ulDepth)
