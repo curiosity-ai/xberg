@@ -60,6 +60,16 @@ public sealed class HtmlExtractor : IExtractor
             metadata.Format = FormatMetadata.Html(htmlMeta);
         }
 
+        // Mirror Rust extractors/html.rs: when Markdown output is requested, run the
+        // html-to-markdown conversion port and store it as pre-rendered content so the
+        // pipeline returns it verbatim (after GFM normalization).
+        if (config.OutputFormat.Which == OutputFormat.Kind.Markdown)
+        {
+            string md = HtmlToMarkdown.Convert(html);
+            metadata.OutputFormat = "markdown";
+            doc.PreRenderedContent = HtmlToMarkdown.NormalizeHtmlMarkdown(md);
+        }
+
         doc.Metadata = metadata;
         doc.MimeType = mimeType;
         return doc;
