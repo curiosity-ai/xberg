@@ -40,15 +40,36 @@ public sealed class PdfExtractor : IExtractor
         // --- Metadata ---
         var meta = PdfMetadataExtractor.Extract(pdf);
 
-        // --- Build InternalDocument (flat paragraph split, mirrors Rust mod.rs) ---
-        var doc = new InternalDocument("pdf");
-        doc.MimeType = mimeType;
-        foreach (var paragraph in nativeText.Split("\n\n"))
+        // --- Build InternalDocument ---
+        // For Markdown/Djot/HTML the Rust path pre-renders a *structured* document with
+        // heading detection (pdf/structure/pipeline.rs). Plain/Json use the flat native
+        // text split. Mirror that: structured elements only when the output format needs them.
+        InternalDocument doc;
+        bool needsStructured = config.OutputFormat.Equals(OutputFormat.Markdown)
+            || config.OutputFormat.Equals(OutputFormat.Djot)
+            || config.OutputFormat.Equals(OutputFormat.Html);
+        InternalDocument? structured = null;
+        if (needsStructured)
         {
-            var trimmed = paragraph.Trim();
-            if (trimmed.Length > 0)
-                doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, trimmed, 0));
+            try { structured = BuildStructured(pdf, deadline); }
+            catch { structured = null; }
         }
+
+        if (structured is not null && structured.Elements.Count > 0)
+        {
+            doc = structured;
+        }
+        else
+        {
+            doc = new InternalDocument("pdf");
+            foreach (var paragraph in nativeText.Split("\n\n"))
+            {
+                var trimmed = paragraph.Trim();
+                if (trimmed.Length > 0)
+                    doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, trimmed, 0));
+            }
+        }
+        doc.MimeType = mimeType;
 
         doc.Metadata = new Metadata
         {
@@ -85,6 +106,30 @@ public sealed class PdfExtractor : IExtractor
             });
 
         return doc;
+    }
+
+    // Extract per-page font-metric segments (ColumnAware order) and run the structure
+    // pipeline to produce a heading-aware InternalDocument.
+    private static InternalDocument? BuildStructured(PdfDocument pdf, long deadline)
+    {
+        int pageCount = pdf.PageCount;
+        var allPageSegments = new List<List<SegmentData>>(pageCount);
+        for (int i = 0; i < pageCount; i++)
+        {
+            if (DateTime.UtcNow.Ticks > deadline) return null;
+            try
+            {
+                byte[] contentBytes = pdf.GetPageContent(i);
+                if (contentBytes.Length == 0) { allPageSegments.Add(new()); continue; }
+                var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
+                var extractor = new PdfContentExtractor(pdf, deadline);
+                var spans = extractor.Extract(contentBytes, resources);
+                var ordered = PdfPageText.OrderColumnAware(spans);
+                allPageSegments.Add(PdfStructure.SegmentsFromSpans(ordered));
+            }
+            catch { allPageSegments.Add(new()); }
+        }
+        return PdfStructure.Build(allPageSegments);
     }
 
     private static string ExtractText(PdfDocument pdf, long deadline)

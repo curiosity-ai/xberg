@@ -27,6 +27,7 @@ public sealed class PdfFont
 
     public bool IsBold;
     public bool IsItalic;
+    public bool IsMonospace;
     public double FontMatrixA = 0.001;
     public double Ascent = 0.95;
     public double Descent = -0.35;
@@ -57,6 +58,7 @@ public sealed class PdfFont
         string bf = f.BaseFont.ToLowerInvariant();
         if (bf.Contains("bold")) f.IsBold = true;
         if (bf.Contains("italic") || bf.Contains("oblique")) f.IsItalic = true;
+        if (bf.Contains("mono") || bf.Contains("courier") || bf.Contains("consol")) f.IsMonospace = true;
         return f;
     }
 
@@ -72,6 +74,7 @@ public sealed class PdfFont
             symbolic = (flags & 4) != 0 && (flags & 32) == 0;
             if ((flags & (1 << 18)) != 0) f.IsBold = true;
             if ((flags & (1 << 6)) != 0) f.IsItalic = true;
+            if ((flags & 1) != 0) f.IsMonospace = true;
             f.MissingWidth = doc.Resolve(descriptor.Get("MissingWidth")).AsNumber() ?? 0;
             var asc = doc.Resolve(descriptor.Get("Ascent")).AsNumber();
             var desc = doc.Resolve(descriptor.Get("Descent")).AsNumber();

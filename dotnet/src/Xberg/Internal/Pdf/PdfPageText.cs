@@ -136,10 +136,19 @@ public static class PdfPageText
         return (result, orderedRuns);
     }
 
+    /// <summary>Return spans in ColumnAware (XY-cut) reading order — the ordering the
+    /// structure/heading pipeline consumes (mirrors pdf_oxide ReadingOrder::ColumnAware).</summary>
+    public static List<TextSpan> OrderColumnAware(List<TextSpan> spans)
+    {
+        if (spans.Count == 0) return new List<TextSpan>();
+        var (ordered, _) = OrderViaRuns(spans);
+        return ordered;
+    }
+
     private static TextSpan CloneRun(TextSpan s) => new TextSpan
     {
         Text = s.Text, X = s.X, Y = s.Y, Width = s.Width, Height = s.Height,
-        FontSize = s.FontSize, IsBold = s.IsBold,
+        FontSize = s.FontSize, IsBold = s.IsBold, IsItalic = s.IsItalic, IsMonospace = s.IsMonospace,
     };
 
     // Port of is_fragmented_span_list (oxide/text.rs).

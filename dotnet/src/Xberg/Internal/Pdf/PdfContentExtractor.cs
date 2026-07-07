@@ -29,6 +29,8 @@ public sealed class TextSpan
     public double X, Y, Width, Height;
     public double FontSize;
     public bool IsBold;
+    public bool IsItalic;
+    public bool IsMonospace;
 
     // Geometry accessors mirroring pdf_oxide Rect (PDF coords: Y grows up).
     public double Left => X;
@@ -247,6 +249,8 @@ public sealed class PdfContentExtractor
                 Height = effSize,
                 FontSize = (float)effSize,
                 IsBold = font?.IsBold ?? false,
+                IsItalic = font?.IsItalic ?? false,
+                IsMonospace = font?.IsMonospace ?? false,
             });
         }
     }
