@@ -122,7 +122,7 @@ public static class JsonRenderer
                     FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
                     {
                         int ti = (int)elem.Kind.TableIndex;
-                        if (ti < doc.Tables.Count)
+                        if (ti >= 0 && ti < doc.Tables.Count)
                             PushToCurrent(rootBody, sectionStack, ref openBlockquote, TableNode(doc.Tables[ti]));
                     }
                     break;
@@ -131,7 +131,7 @@ public static class JsonRenderer
                     FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
                     {
                         int ii = (int)elem.Kind.ImageIndex;
-                        ExtractedImage? image = ii < doc.Images.Count ? doc.Images[ii] : null;
+                        ExtractedImage? image = ii >= 0 && ii < doc.Images.Count ? doc.Images[ii] : null;
                         string? alt = image?.Description;
                         string? src = null;
                         if (image is not null)

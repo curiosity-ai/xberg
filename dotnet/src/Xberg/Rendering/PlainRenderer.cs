@@ -84,7 +84,7 @@ public static class PlainRenderer
                 case ElementKindTag.Table:
                     {
                         int ti = (int)elem.Kind.TableIndex;
-                        if (ti < doc.Tables.Count)
+                        if (ti >= 0 && ti < doc.Tables.Count)
                         {
                             var table = doc.Tables[ti];
                             string tableStr = table.Cells.Count > 0
@@ -102,7 +102,7 @@ public static class PlainRenderer
                 case ElementKindTag.Image:
                     {
                         int ii = (int)elem.Kind.ImageIndex;
-                        if (ii < doc.Images.Count)
+                        if (ii >= 0 && ii < doc.Images.Count)
                         {
                             var img = doc.Images[ii];
                             if (img.Description is { Length: > 0 } desc)

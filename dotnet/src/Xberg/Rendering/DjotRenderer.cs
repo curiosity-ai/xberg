@@ -57,7 +57,7 @@ public static class DjotRenderer
                 case ElementKindTag.Table:
                     {
                         int ti = (int)elem.Kind.TableIndex;
-                        if (ti < doc.Tables.Count)
+                        if (ti >= 0 && ti < doc.Tables.Count)
                         {
                             var table = doc.Tables[ti];
                             string t = table.Cells.Count > 0
@@ -70,7 +70,7 @@ public static class DjotRenderer
                 case ElementKindTag.Image:
                     {
                         int ii = (int)elem.Kind.ImageIndex;
-                        if (ii < doc.Images.Count)
+                        if (ii >= 0 && ii < doc.Images.Count)
                         {
                             var img = doc.Images[ii];
                             string alt = img.Description ?? elem.Text;

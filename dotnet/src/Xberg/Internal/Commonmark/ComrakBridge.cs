@@ -168,7 +168,7 @@ internal static class ComrakBridge
                 case ElementKindTag.Table:
                 {
                     int ti = (int)elemKind.TableIndex;
-                    if (ti < doc.Tables.Count)
+                    if (ti >= 0 && ti < doc.Tables.Count)
                     {
                         var table = doc.Tables[ti];
                         if (table.Cells.Count > 0)
@@ -185,7 +185,7 @@ internal static class ComrakBridge
                 case ElementKindTag.Image:
                 {
                     int ii = (int)elemKind.ImageIndex;
-                    ExtractedImage? image = ii < doc.Images.Count ? doc.Images[ii] : null;
+                    ExtractedImage? image = ii >= 0 && ii < doc.Images.Count ? doc.Images[ii] : null;
                     string desc = image?.Description ?? "";
                     string url;
                     if (image is null)

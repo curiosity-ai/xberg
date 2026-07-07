@@ -154,7 +154,7 @@ public static class Derive
                 if (elem.Kind.Tag == ElementKindTag.Table)
                 {
                     int ti = (int)elem.Kind.TableIndex;
-                    if (ti < doc.Tables.Count) tables.Add(doc.Tables[ti]);
+                    if (ti >= 0 && ti < doc.Tables.Count) tables.Add(doc.Tables[ti]);
                 }
                 else if (elem.Kind.Tag == ElementKindTag.Image)
                 {
@@ -371,13 +371,13 @@ public static class Derive
             case ElementKindTag.Table:
                 {
                     int ti = (int)elem.Kind.TableIndex;
-                    var grid = ti < doc.Tables.Count ? TableToGrid(doc.Tables[ti]) : new TableGrid();
+                    var grid = ti >= 0 && ti < doc.Tables.Count ? TableToGrid(doc.Tables[ti]) : new TableGrid();
                     return NodeContent.Table(grid);
                 }
             case ElementKindTag.Image:
                 {
                     int ii = (int)elem.Kind.ImageIndex;
-                    string? description = ii < doc.Images.Count ? doc.Images[ii].Description : null;
+                    string? description = ii >= 0 && ii < doc.Images.Count ? doc.Images[ii].Description : null;
                     string? src = elem.Attributes is not null && elem.Attributes.TryGetValue("src", out var s) ? s : null;
                     return new NodeContent
                     {
