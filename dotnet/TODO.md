@@ -5,7 +5,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dro
 Each format is "done" when the `Xberg.TestRunner` output matches the committed
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 
-> **Status (parity snapshot):** 1710 / 2494 fixtures fully match the Rust golden output
+> **Status (parity snapshot):** 2035/2494 strict (byte-exact incl. markdown+HTML render);
+> ~2096/2494 on content dimensions (text + structured JSON + metadata + tables). 206 tests.
+> Remaining gap to higher parity is fundamental: PDF text geometry (pdfium-exact word
+> coordinates, ~220 PDFs) and the separate html_to_markdown_rs engine Rust uses for HTML/EPUB
+> markdown (~40-60). Non-deterministic Rust hashmap ordering (zip/tar/dbf) and OCR/audio are
+> unmatchable by design.
 > (build green, 181 unit tests). Ported & validated: txt, docx, xlsx, pptx, odt, rtf, epub,
 > eml, msg, doc, ppt, xls, hwp, hwpx, ods, json/jsonl, csv/tsv, xml, yaml, toml, markdown,
 > mdx, html, docbook, jats, rst, org, typst, latex, opml, jupyter, fictionbook, bibtex,
