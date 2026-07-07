@@ -151,6 +151,8 @@ public static class HtmlMeta
                             ImageType = ClassifyImage(src ?? ""),
                             Attributes = attrs,
                         });
+                        // A link wrapping an image carries the image markdown as its label text.
+                        if (inAnchor) anchorText.Append("![").Append(alt ?? "").Append("](").Append(src ?? "").Append(')');
                         break;
                     }
                     case "script":
