@@ -30,6 +30,7 @@ public static class HtmlMeta
         bool inAnchor = false;
         var anchorText = new StringBuilder();
         string anchorHref = "";
+        string? anchorTitle = null;
         List<string[]> anchorAttrs = new();
         List<string> anchorRel = new();
         bool inTitle = false;
@@ -74,6 +75,7 @@ public static class HtmlMeta
                         {
                             Href = anchorHref,
                             Text = text,
+                            Title = anchorTitle,
                             LinkType = ClassifyLink(anchorHref),
                             Rel = anchorRel,
                             Attributes = anchorAttrs,
@@ -133,6 +135,7 @@ public static class HtmlMeta
                         inAnchor = true;
                         anchorText.Clear();
                         anchorHref = ExtractAttrDecoded(attrsStr, "href") ?? "";
+                        anchorTitle = ExtractAttrDecoded(attrsStr, "title");
                         anchorAttrs = ParseAttrs(attrsStr, exclude: "href", out anchorRel);
                         break;
                     }
@@ -228,15 +231,17 @@ public static class HtmlMeta
         }
     }
 
+    // Mirrors html-to-markdown's LinkMetadata::classify_link (metadata/types.rs). Note the
+    // scheme checks are case-sensitive there, and "//"/"/" both classify as internal.
     private static string ClassifyLink(string href)
     {
-        if (href.Length == 0) return "other";
         if (href.StartsWith('#')) return "anchor";
-        if (href.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase)) return "email";
-        if (href.StartsWith("tel:", StringComparison.OrdinalIgnoreCase)) return "phone";
-        if (href.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-            href.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
-            href.StartsWith("//", StringComparison.Ordinal)) return "external";
+        if (href.StartsWith("mailto:", StringComparison.Ordinal)) return "email";
+        if (href.StartsWith("tel:", StringComparison.Ordinal)) return "phone";
+        if (href.StartsWith("http://", StringComparison.Ordinal) ||
+            href.StartsWith("https://", StringComparison.Ordinal)) return "external";
+        if (href.StartsWith('/') || href.StartsWith("../", StringComparison.Ordinal) ||
+            href.StartsWith("./", StringComparison.Ordinal)) return "internal";
         return "other";
     }
 
@@ -308,6 +313,8 @@ public static class HtmlMeta
             if (!key.Equals(exclude, StringComparison.OrdinalIgnoreCase))
                 result.Add(new[] { key, value });
         }
+        // html-to-markdown collects attributes into a BTreeMap → alphabetical by key.
+        result.Sort((a, b) => string.CompareOrdinal(a[0], b[0]));
         return result;
     }
 
@@ -325,6 +332,8 @@ public static class HtmlMeta
     {
         public string Href { get; set; } = "";
         public string Text { get; set; } = "";
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public string? Title { get; set; }
         public string LinkType { get; set; } = "other";
         public List<string> Rel { get; set; } = new();
         public List<string[]> Attributes { get; set; } = new();
