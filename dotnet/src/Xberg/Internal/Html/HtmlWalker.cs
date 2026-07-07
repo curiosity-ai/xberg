@@ -82,7 +82,7 @@ public sealed class HtmlWalker
 
         if (_table is not null) { _table.PushText(decoded); return; }
         if (_preBlock is not null) { _preBlock.Text.Append(decoded); return; }
-        if (InListItem) { CurrentItemBuffer.Append(decoded); return; }
+        if (InListItem) { AppendNormalizedTo(CurrentItemBuffer, decoded); return; }
         if (_inDt) { _dtText.Append(decoded); return; }
         if (_inDd) { _ddText.Append(decoded); return; }
         AppendNormalized(decoded);
@@ -90,30 +90,76 @@ public sealed class HtmlWalker
 
     // Append text to the paragraph buffer, collapsing whitespace on the fly (mirrors
     // NormalizeWhitespace) and preserving the \x01 <br> sentinel so offsets stay stable.
-    private void AppendNormalized(string s)
+    private void AppendNormalized(string s) => AppendNormalizedTo(_textBuf, s);
+
+    // Boundary-aware whitespace normalization into `target`: collapses spaces/tabs, keeps
+    // newlines INTERNAL to a text node, and reduces leading/trailing (element-boundary)
+    // whitespace to a single pending word-break space. Shared _lastWasSpace state carries the
+    // pending space across nodes/inline elements. Used for both paragraph and list-item text.
+    private void AppendNormalizedTo(StringBuilder target, string s)
     {
-        foreach (char c in s)
+        int n = s.Length, idx = 0;
+        bool nodeContent = false;   // has content been seen within THIS text node yet
+        while (idx < n)
         {
+            char c = s[idx];
+            if (c == '\r') { idx++; continue; }
             if (c == '\x01')
             {
-                while (_textBuf.Length > 0 && _textBuf[^1] == ' ') _textBuf.Remove(_textBuf.Length - 1, 1);
-                _textBuf.Append('\x01');
+                while (target.Length > 0 && target[^1] == ' ') target.Remove(target.Length - 1, 1);
+                target.Append('\x01');
                 _lastWasSpace = true;
+                nodeContent = true;
+                idx++;
+                continue;
             }
-            else if (c is ' ' or '\t' or '\n' or '\r' or '\f')
+            if (c is ' ' or '\t' or '\n' or '\f' or '\v')
             {
-                if (!_lastWasSpace) { _textBuf.Append(' '); _lastWasSpace = true; }
+                var run = new StringBuilder();
+                bool prevSp = false;
+                int j = idx;
+                while (j < n)
+                {
+                    char w = s[j];
+                    if (w == '\r') { j++; continue; }
+                    if (w == '\n') { run.Append('\n'); prevSp = false; j++; }
+                    else if (w is ' ' or '\t' or '\f' or '\v') { if (!prevSp) { run.Append(' '); prevSp = true; } j++; }
+                    else break;
+                }
+                bool trailing = j >= n;
+                if (!nodeContent || trailing)
+                {
+                    _lastWasSpace = true;
+                }
+                else
+                {
+                    target.Append(run);
+                    _lastWasSpace = run.Length > 0 && run[^1] == ' ';
+                }
+                idx = j;
+                continue;
             }
-            else { _textBuf.Append(c); _lastWasSpace = false; }
+            if (_lastWasSpace)
+            {
+                if (target.Length > 0 && target[^1] != ' ' && target[^1] != '\n') target.Append(' ');
+                _lastWasSpace = false;
+            }
+            target.Append(c);
+            nodeContent = true;
+            idx++;
         }
     }
+
+    // Finalize buffered inline text: <br> sentinel → newline, then trim ends (internal newlines
+    // preserved). Buffer is already space-collapsed by AppendNormalizedTo.
+    private static string FinalizeInline(string s) => s.Replace('\x01', '\n').Trim();
 
     // Append a literal inline string to whichever buffer is active (used by <q> quotes).
     private void AppendInline(string s)
     {
         if (_table is not null) { _table.PushText(s); return; }
         if (_preBlock is not null) { _preBlock.Text.Append(s); return; }
-        if (InListItem) { CurrentItemBuffer.Append(s); return; }
+        if (InListItem) { AppendNormalizedTo(CurrentItemBuffer, s); return; }
         if (_inDt) { _dtText.Append(s); return; }
         if (_inDd) { _ddText.Append(s); return; }
         AppendNormalized(s);
@@ -144,6 +190,15 @@ public sealed class HtmlWalker
 
     private void HandleOpen(string tag, string attrs, bool selfClosing)
     {
+        // Readability/boilerplate removal (html-to-markdown Standard preset): drop <nav>/<form>
+        // unconditionally and <header>/<footer>/<aside> when they carry navigation hints. The
+        // whole subtree is skipped so its chrome never reaches the InternalDocument.
+        if (ShouldDropForPreprocessing(tag, attrs))
+        {
+            if (!selfClosing) SkipSubtree(tag);
+            return;
+        }
+
         switch (tag)
         {
             case "head":
@@ -162,7 +217,7 @@ public sealed class HtmlWalker
                 break;
             case "br":
                 if (_inPre || _preBlock is not null) { _preBlock?.Text.Append('\n'); }
-                else if (InListItem) CurrentItemBuffer.Append('\n');
+                else if (InListItem) AppendNormalizedTo(CurrentItemBuffer, "\x01");
                 else AppendNormalized("\x01");
                 break;
             case "strong": case "b": PushInline(InlineKind.Bold, null, null); break;
@@ -179,8 +234,15 @@ public sealed class HtmlWalker
             case "sup": PushInline(InlineKind.Superscript, null, null); break;
             case "mark": PushInline(InlineKind.Highlight, null, null); break;
             case "a":
-                PushInline(InlineKind.Link, ExtractAttr(attrs, "href") ?? "", ExtractAttr(attrs, "title"));
+            {
+                string? href = ExtractAttr(attrs, "href");
+                // href entities are decoded (matches html-to-markdown); the title attribute is
+                // kept raw (html-to-markdown does not entity-decode link titles).
+                PushInline(InlineKind.Link,
+                    href is null ? "" : DecodeEntities(href),
+                    ExtractAttr(attrs, "title"));
                 break;
+            }
             case "q":
                 AppendInline("\"");
                 break;
@@ -244,17 +306,13 @@ public sealed class HtmlWalker
                 _inDd = true; _ddText.Clear();
                 break;
             case "script": case "style":
-            {
-                string closeTag = $"</{tag}>";
-                int close = _src.IndexOf(closeTag, _pos, StringComparison.OrdinalIgnoreCase);
-                _pos = close < 0 ? _src.Length : close + closeTag.Length;
-                break; // raw block skipped for content
-            }
+                SkipRawElement(tag); // raw block skipped for content
+                break;
             case "video": case "audio":
             {
-                string closeTag = $"</{tag}>";
-                int close = _src.IndexOf(closeTag, _pos, StringComparison.OrdinalIgnoreCase);
-                if (close >= 0) _pos = close + closeTag.Length;
+                int before = _pos;
+                SkipRawElement(tag);
+                if (_pos >= _src.Length && before < _src.Length) _pos = before; // no close tag: don't swallow rest
                 break;
             }
             case "hr":
@@ -277,7 +335,7 @@ public sealed class HtmlWalker
             case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
             {
                 byte level = byte.TryParse(tag.AsSpan(1), out var l) ? l : (byte)1;
-                string text = _textBuf.ToString().Trim();
+                string text = NormalizeWhitespace(_textBuf.ToString());
                 if (text.Length > 0) EmitHeading(level, text);
                 ClearTextBuf();
                 _annotations.Clear();
@@ -407,9 +465,7 @@ public sealed class HtmlWalker
         if (kind == InlineKind.Link)
         {
             AppendInline("[");
-            if (ParagraphContext) _lastWasSpace = true; // suppress leading space inside link text
-            int textStart = InListItem ? CurrentItemBuffer.Length : 0;
-            _inlineStack.Add(new InlineSpan { Kind = kind, Href = href, Title = title, TextStart = textStart });
+            _inlineStack.Add(new InlineSpan { Kind = kind, Href = href, Title = title, TextStart = ActiveInlineBuffer?.Length ?? 0 });
             return;
         }
         string mk = Marker(kind);
@@ -433,15 +489,21 @@ public sealed class HtmlWalker
         if (idx < 0) return;
         var span = _inlineStack[idx];
         _inlineStack.RemoveAt(idx);
-        if (ParagraphContext)
-            while (_textBuf.Length > 0 && _textBuf[^1] == ' ') _textBuf.Remove(_textBuf.Length - 1, 1);
-        else if (InListItem)
+        var buf = ActiveInlineBuffer;
+        if (buf is not null && span.TextStart <= buf.Length)
         {
             // Link labels are whitespace-trimmed (matches html-to-markdown's normalize+trim).
-            var buf = CurrentItemBuffer;
             while (buf.Length > span.TextStart && char.IsWhiteSpace(buf[^1])) buf.Remove(buf.Length - 1, 1);
             while (span.TextStart < buf.Length && char.IsWhiteSpace(buf[span.TextStart])) buf.Remove(span.TextStart, 1);
+            // Wikipedia back-reference normalization: a bare "^" label with a fragment href
+            // becomes "↑" to avoid clashing with markdown footnote syntax (link.rs).
+            if (span.Href is not null && span.Href.StartsWith('#') &&
+                buf.Length - span.TextStart == 1 && buf[span.TextStart] == '^')
+                buf[span.TextStart] = '↑';
         }
+        // The label was just trimmed, so the closing "]" must follow it directly — drop any
+        // pending word-break space left over from the label's trailing whitespace.
+        _lastWasSpace = false;
         // A present-but-empty title attribute still renders the "" marker (matches html-to-markdown);
         // only an absent title (null) omits the quotes.
         string suffix = span.Title is null ? $"]({span.Href})" : $"]({span.Href} \"{span.Title}\")";
@@ -450,6 +512,15 @@ public sealed class HtmlWalker
 
     private bool ParagraphContext =>
         _table is null && _preBlock is null && !InListItem && !_inDt && !_inDd;
+
+    // The StringBuilder that AppendInline currently targets (null for table cells / <pre>,
+    // whose buffers aren't directly editable here).
+    private StringBuilder? ActiveInlineBuffer =>
+        _table is not null || _preBlock is not null ? null
+        : InListItem ? CurrentItemBuffer
+        : _inDt ? _dtText
+        : _inDd ? _ddText
+        : _textBuf;
 
     // ── flush helpers ─────────────────────────────────────────────────────────
     // Paragraphs are emitted ONLY from <p> elements — this mirrors html-to-markdown's
@@ -463,7 +534,9 @@ public sealed class HtmlWalker
 
     private void EmitParagraph()
     {
-        string text = NormalizeWhitespace(_textBuf.ToString()).TrimEnd('\n');
+        // The buffer is already space-collapsed and boundary-aware (AppendNormalized), so we only
+        // convert the <br> sentinel to a newline and trim the ends — internal newlines are kept.
+        string text = _textBuf.ToString().Replace('\x01', '\n').Trim();
         if (text.Length > 0)
         {
             var anns = new List<TextAnnotation>(_annotations);
@@ -494,6 +567,8 @@ public sealed class HtmlWalker
         if (lst.HasOpenItem) CloseItem();  // auto-close a previous sibling <li>
         lst.HasOpenItem = true;
         _itemStack.Add(new LItem());
+        _lastWasSpace = true;   // fresh word-break state for the new item's text
+
     }
 
     private void CloseItem()
@@ -536,7 +611,7 @@ public sealed class HtmlWalker
     // rendered as flattened markdown (excluding the item's own marker), then trimmed.
     private string ItemText(LItem item, int nl, int ud)
     {
-        var sb = new StringBuilder(NormalizeWhitespace(item.Inline.ToString()));
+        var sb = new StringBuilder(FinalizeInline(item.Inline.ToString()));
         foreach (var nested in item.Nested)
         {
             sb.Append('\n');
@@ -556,7 +631,7 @@ public sealed class HtmlWalker
         foreach (var item in lst.Items)
         {
             string marker = lst.Ordered ? $"{counter}. " : Bullet(ud) + " ";
-            string inline = NormalizeWhitespace(item.Inline.ToString());
+            string inline = FinalizeInline(item.Inline.ToString());
             var child = new StringBuilder();
             foreach (var nested in item.Nested)
             {
@@ -608,6 +683,107 @@ public sealed class HtmlWalker
     private static int Utf8Len(StringBuilder sb) => Encoding.UTF8.GetByteCount(sb.ToString());
     private static uint ParseU32(string? s, uint fallback) => uint.TryParse(s, out var v) ? v : fallback;
 
+    // ── preprocessing / boilerplate removal ──────────────────────────────────
+    // Mirrors html-to-markdown's should_drop_for_preprocessing (Standard preset,
+    // remove_navigation + remove_forms enabled).
+    private static readonly string[] NavKeywords =
+    {
+        "nav", "navigation", "navbar", "breadcrumbs", "breadcrumb", "toc", "sidebar",
+        "sidenav", "menu", "menubar", "mainmenu", "subnav", "tabs", "tablist", "toolbar",
+        "pager", "pagination", "skipnav", "skip-link", "skiplinks", "site-nav", "site-menu",
+        "site-header", "site-footer", "topbar", "bottombar", "masthead", "vector-nav",
+        "vector-header", "vector-footer",
+    };
+
+    private static bool ShouldDropForPreprocessing(string tag, string attrs)
+    {
+        if (tag is "nav" or "form") return true;
+        if (tag is "header" or "footer" or "aside") return HasNavigationHint(attrs);
+        return false;
+    }
+
+    private static bool HasNavigationHint(string attrs)
+    {
+        if (AttrMatchesAny(attrs, "role", new[] { "navigation", "menubar", "tablist", "toolbar" }))
+            return true;
+        if (AttrContainsAny(attrs, "aria-label", new[] { "navigation", "menu", "contents", "table of contents", "toc" }))
+            return true;
+        return AttrMatchesAny(attrs, "class", NavKeywords) || AttrMatchesAny(attrs, "id", NavKeywords);
+    }
+
+    // Token-aware match: split on whitespace, map _:./ → -, lowercase, exact-equal a keyword.
+    private static bool AttrMatchesAny(string attrs, string attr, string[] keywords)
+    {
+        string? value = ExtractAttr(attrs, attr);
+        if (value is null) return false;
+        foreach (var token in value.Split(new[] { ' ', '\t', '\n', '\r', '\f' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var sb = new StringBuilder(token.Length);
+            foreach (char c in token) sb.Append(c is '_' or ':' or '.' or '/' ? '-' : char.ToLowerInvariant(c));
+            string norm = sb.ToString();
+            if (norm.Length > 0 && Array.IndexOf(keywords, norm) >= 0) return true;
+        }
+        return false;
+    }
+
+    private static bool AttrContainsAny(string attrs, string attr, string[] keywords)
+    {
+        string? value = ExtractAttr(attrs, attr);
+        if (value is null) return false;
+        string lower = value.ToLowerInvariant();
+        foreach (var kw in keywords) if (lower.Contains(kw, StringComparison.Ordinal)) return true;
+        return false;
+    }
+
+    // Advance _pos past the closing tag of a raw-text element (script/style/…). Tolerates
+    // whitespace inside the close tag (e.g. `</style\n>`) and matches case-insensitively.
+    private void SkipRawElement(string tag)
+    {
+        string closeStart = "</" + tag;
+        int i = _pos;
+        while (true)
+        {
+            int c = _src.IndexOf(closeStart, i, StringComparison.OrdinalIgnoreCase);
+            if (c < 0) { _pos = _src.Length; return; }
+            int k = c + closeStart.Length;
+            while (k < _src.Length && char.IsWhiteSpace(_src[k])) k++;
+            if (k < _src.Length && _src[k] == '>') { _pos = k + 1; return; }
+            i = c + 1;
+        }
+    }
+
+    // Skip the entire subtree of an opening `tag` (already consumed) up to its matching close,
+    // tracking same-tag nesting. Comments/PIs and self-closing same-tag elements are handled.
+    private void SkipSubtree(string tag)
+    {
+        int depth = 1;
+        while (_pos < _src.Length && depth > 0)
+        {
+            int lt = _src.IndexOf('<', _pos);
+            if (lt < 0) { _pos = _src.Length; return; }
+            _pos = lt;
+            if (Starts("<!--"))
+            {
+                int e = _src.IndexOf("-->", _pos + 4, StringComparison.Ordinal);
+                _pos = e < 0 ? _src.Length : e + 3;
+                continue;
+            }
+            int gt = _src.IndexOf('>', _pos);
+            if (gt < 0) { _pos = _src.Length; return; }
+            string raw = _src[(_pos + 1)..gt];
+            _pos = gt + 1;
+            if (raw.StartsWith('!') || raw.StartsWith('?')) continue;
+            bool closing = raw.StartsWith('/');
+            string c = closing ? raw[1..] : raw;
+            bool selfClose = c.TrimEnd().EndsWith('/');
+            c = c.TrimEnd('/').Trim();
+            var (nm, _) = SplitTagName(c);
+            if (!nm.Equals(tag, StringComparison.OrdinalIgnoreCase)) continue;
+            if (closing) depth--;
+            else if (!selfClose) depth++;
+        }
+    }
+
     // ── static utilities (ported from structure.rs) ──────────────────────────
     internal static (string name, string attrs) SplitTagName(string content)
     {
@@ -616,30 +792,44 @@ public sealed class HtmlWalker
         return sp < 0 ? (content, "") : (content[..sp], content[(sp + 1)..]);
     }
 
+    // Quote-aware attribute lookup: tokenizes the attribute string so a `name=` sequence inside
+    // a quoted value (e.g. `?title=` in an href query string) is never mistaken for the attribute.
+    // Returns null when absent, "" when present with an empty/omitted value.
     internal static string? ExtractAttr(string attrs, string name)
     {
-        string search = name + "=";
-        int searchFrom = 0;
-        int abs;
-        while (true)
+        int i = 0, n = attrs.Length;
+        while (i < n)
         {
-            int candidate = attrs.IndexOf(search, searchFrom, StringComparison.Ordinal);
-            if (candidate < 0) return null;
-            abs = candidate;
-            if (abs == 0 || !char.IsLetterOrDigit(attrs[abs - 1])) break;
-            searchFrom = abs + 1;
+            while (i < n && char.IsWhiteSpace(attrs[i])) i++;
+            if (i >= n) break;
+            int ks = i;
+            while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
+            string key = attrs[ks..i];
+            while (i < n && char.IsWhiteSpace(attrs[i])) i++;
+            string? value = null;
+            if (i < n && attrs[i] == '=')
+            {
+                i++;
+                while (i < n && char.IsWhiteSpace(attrs[i])) i++;
+                if (i < n && (attrs[i] == '"' || attrs[i] == '\''))
+                {
+                    char q = attrs[i++];
+                    int vs = i;
+                    while (i < n && attrs[i] != q) i++;
+                    value = attrs[vs..i];
+                    if (i < n) i++;
+                }
+                else
+                {
+                    int vs = i;
+                    while (i < n && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>') i++;
+                    value = attrs[vs..i];
+                }
+            }
+            if (key.Length == 0) { i++; continue; }
+            if (key.Equals(name, StringComparison.OrdinalIgnoreCase)) return value ?? "";
         }
-        string afterEq = attrs[(abs + search.Length)..].TrimStart();
-        if (afterEq.Length == 0) return null;
-        char quote = afterEq[0];
-        if (quote == '"' || quote == '\'')
-        {
-            string rest = afterEq[1..];
-            int end = rest.IndexOf(quote);
-            return end < 0 ? null : rest[..end];
-        }
-        int e = afterEq.IndexOfAny(new[] { ' ', '\t', '\n', '\r', '\f', '>' });
-        return e < 0 ? afterEq : afterEq[..e];
+        return null;
     }
 
     private static string? ExtractLanguageFromClass(string? cls)
@@ -708,6 +898,9 @@ public sealed class HtmlWalker
         return outp.ToString();
     }
 
+    // Collapse ALL runs of whitespace (including newlines) to a single space, trimming ends.
+    // Used for list items, table cells, headings and definitions, where the raw buffered text
+    // is not boundary-aware. Paragraph text preserves internal newlines via FinalizeParagraph.
     internal static string NormalizeWhitespace(string s)
     {
         var outp = new StringBuilder(s.Length);
