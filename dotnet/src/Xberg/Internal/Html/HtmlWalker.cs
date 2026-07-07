@@ -29,6 +29,7 @@ public sealed class HtmlWalker
 
     // Container state
     private bool _inPre;
+    private int _pDepth;                     // >0 while inside a <p> (paragraphs are emitted only from <p>)
     private PreBlock? _preBlock;
     private TableAccumulator? _table;
     private int _listDepth;                 // number of open <ul>/<ol>
@@ -65,7 +66,7 @@ public sealed class HtmlWalker
             if (_src[_pos] == '<') HandleTag();
             else HandleText();
         }
-        FlushParagraph();
+        CloseParagraphContext();
         while (_groupStack.Count > 0) { _b.PushGroupEnd(); _groupStack.RemoveAt(_groupStack.Count - 1); }
     }
 
@@ -154,12 +155,11 @@ public sealed class HtmlWalker
                 break;
             }
             case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
-                FlushParagraph();
-                ClearTextBuf();
-                _annotations.Clear();
+                CloseParagraphContext();
                 break;
             case "p":
-                FlushParagraph();
+                CloseParagraphContext();
+                _pDepth++;
                 break;
             case "br":
                 if (_inPre || _preBlock is not null) { _preBlock?.Text.Append('\n'); }
@@ -186,20 +186,20 @@ public sealed class HtmlWalker
                 AppendInline("\"");
                 break;
             case "pre":
-                FlushParagraph();
+                CloseParagraphContext();
                 _inPre = true;
                 _preBlock = new PreBlock();
                 break;
             case "blockquote":
-                FlushParagraph();
+                CloseParagraphContext();
                 _b.PushQuoteStart();
                 break;
             case "ul":
-                FlushParagraph();
+                CloseParagraphContext();
                 _b.PushList(false); _listDepth++; _listOrdered.Add(false);
                 break;
             case "ol":
-                FlushParagraph();
+                CloseParagraphContext();
                 _b.PushList(true); _listDepth++; _listOrdered.Add(true);
                 break;
             case "li":
@@ -208,7 +208,7 @@ public sealed class HtmlWalker
                 _listItemText.Clear();
                 break;
             case "table":
-                FlushParagraph();
+                CloseParagraphContext();
                 _table = new TableAccumulator();
                 break;
             case "tr": if (_table is not null) _table.OpenRow(); break;
@@ -226,18 +226,18 @@ public sealed class HtmlWalker
                 string? alt = ExtractAttr(attrs, "alt");
                 string? src = ExtractAttr(attrs, "src");
                 if (_figure is not null) { _figure.ImgAlt = alt; _figure.ImgSrc = src; }
-                else { FlushParagraph(); EmitImage(alt, src); }
+                else { CloseParagraphContext(); EmitImage(alt, src); }
                 break;
             }
             case "figure":
-                FlushParagraph();
+                CloseParagraphContext();
                 _figure = new FigureContext();
                 break;
             case "figcaption":
                 if (_figure is not null) { _figure.InCaption = true; }
                 break;
             case "dl":
-                FlushParagraph();
+                CloseParagraphContext();
                 _inDl = true; _dlTerm = null;
                 break;
             case "dt":
@@ -265,11 +265,11 @@ public sealed class HtmlWalker
                 break;
             }
             case "hr":
-                FlushParagraph();
+                CloseParagraphContext();
                 break;
             case "div": case "section": case "article": case "main": case "aside":
             case "header": case "footer": case "nav": case "details": case "summary":
-                FlushParagraph();
+                CloseParagraphContext();
                 break;
             default:
                 break; // span/html/body/title/link and unknowns: passthrough
@@ -290,7 +290,7 @@ public sealed class HtmlWalker
                 _inlineStack.Clear();
                 break;
             }
-            case "p": FlushParagraph(); break;
+            case "p": CloseParagraphContext(); break;
             case "strong": case "b": PopInline(InlineKind.Bold); break;
             case "em": case "i": case "var": case "cite": case "dfn": PopInline(InlineKind.Italic); break;
             case "kbd": case "samp": PopInline(InlineKind.Code); break;
@@ -312,7 +312,7 @@ public sealed class HtmlWalker
                 _inPre = false;
                 break;
             case "blockquote":
-                FlushParagraph();
+                CloseParagraphContext();
                 _b.PushQuoteEnd();
                 break;
             case "ul": case "ol":
@@ -345,7 +345,7 @@ public sealed class HtmlWalker
             case "figcaption": if (_figure is not null) _figure.InCaption = false; break;
             case "div": case "section": case "article": case "main": case "aside":
             case "header": case "footer": case "nav": case "details": case "summary":
-                FlushParagraph();
+                CloseParagraphContext();
                 break;
         }
     }
@@ -458,7 +458,16 @@ public sealed class HtmlWalker
         _table is null && _preBlock is null && !_inListItem && !_inDt && !_inDd && !(_figure?.InCaption ?? false);
 
     // ── flush helpers ─────────────────────────────────────────────────────────
-    private void FlushParagraph()
+    // Paragraphs are emitted ONLY from <p> elements — this mirrors html-to-markdown's
+    // DocumentStructure, where the paragraph handler is the sole producer of Paragraph
+    // nodes. Loose inline text and text directly inside <div>/<summary>/etc. is discarded.
+    private void CloseParagraphContext()
+    {
+        if (_pDepth > 0) { EmitParagraph(); _pDepth = 0; }
+        else DiscardParagraph();
+    }
+
+    private void EmitParagraph()
     {
         string text = NormalizeWhitespace(_textBuf.ToString()).TrimEnd('\n');
         if (text.Length > 0)
@@ -466,6 +475,11 @@ public sealed class HtmlWalker
             var anns = new List<TextAnnotation>(_annotations);
             _b.PushParagraph(text, anns, null, null);
         }
+        DiscardParagraph();
+    }
+
+    private void DiscardParagraph()
+    {
         ClearTextBuf();
         _annotations.Clear();
         _inlineStack.Clear();
