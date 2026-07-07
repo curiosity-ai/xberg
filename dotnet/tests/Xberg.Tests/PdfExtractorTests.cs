@@ -290,4 +290,43 @@ public class PdfExtractorTests
         int c = outText.IndexOf("third", StringComparison.Ordinal);
         Assert.True(a >= 0 && a < b && b < c, "single-column text must stay top-to-bottom");
     }
+
+    // ---- Heading-aware structure pipeline (PdfStructure) ----
+
+    private static SegmentData Seg(string text, float y, float fs, bool bold = false)
+        => new SegmentData { Text = text, X = 72, Y = y, Width = 300, Height = fs, FontSize = fs, IsBold = bold, BaselineY = y };
+
+    [Fact]
+    public void Structure_DetectsHeadingFromLargerFont()
+    {
+        // One large-font title line above several uniform body lines: clustering should
+        // classify the large line as a heading and the rest as body paragraphs.
+        var page = new List<SegmentData>
+        {
+            Seg("Document Title Here", 700, 22f),
+            Seg("This is the first body sentence of the document.", 660, 10f),
+            Seg("This is the second body sentence, continuing on.", 646, 10f),
+            Seg("A third body sentence rounds out the paragraph text.", 632, 10f),
+        };
+        var doc = PdfStructure.Build(new List<List<SegmentData>> { page });
+        Assert.NotNull(doc);
+        Assert.Contains(doc!.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text.Contains("Document Title"));
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+    }
+
+    [Fact]
+    public void Structure_NormalizesUnicodeAndDetectsListItems()
+    {
+        // Curly quote should be normalized to ASCII (Stage-5 text repair), and a bullet
+        // line should become a list item.
+        var page = new List<SegmentData>
+        {
+            Seg("It’s a normalized quote", 700, 10f),
+            Seg("• a bullet list item here", 680, 10f),
+        };
+        var doc = PdfStructure.Build(new List<List<SegmentData>> { page });
+        Assert.NotNull(doc);
+        Assert.Contains(doc!.Elements, e => e.Text.Contains("It's a normalized quote"));
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.ListItem);
+    }
 }
