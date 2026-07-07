@@ -424,22 +424,18 @@ public static class MarkdownParser
         char c0 = trimmedStart[0];
         if (c0 == '-' || c0 == '*' || c0 == '+')
         {
-            if (trimmedStart.Length >= 2 && (trimmedStart[1] == ' ' || trimmedStart[1] == '\t'))
-            {
-                markerLen = 2;
-                return true;
-            }
+            // A bare marker (no following content) is a valid empty list item in CommonMark.
+            if (trimmedStart.Length == 1) { markerLen = 1; return true; }
+            if (trimmedStart[1] == ' ' || trimmedStart[1] == '\t') { markerLen = 2; return true; }
             return false;
         }
         // ordered
         int k = 0;
         while (k < trimmedStart.Length && char.IsDigit(trimmedStart[k])) k++;
-        if (k > 0 && k <= 9 && k < trimmedStart.Length && (trimmedStart[k] == '.' || trimmedStart[k] == ')')
-            && k + 1 < trimmedStart.Length && (trimmedStart[k + 1] == ' ' || trimmedStart[k + 1] == '\t'))
+        if (k > 0 && k <= 9 && k < trimmedStart.Length && (trimmedStart[k] == '.' || trimmedStart[k] == ')'))
         {
-            ordered = true;
-            markerLen = k + 2;
-            return true;
+            if (k + 1 == trimmedStart.Length) { ordered = true; markerLen = k + 1; return true; }
+            if (trimmedStart[k + 1] == ' ' || trimmedStart[k + 1] == '\t') { ordered = true; markerLen = k + 2; return true; }
         }
         return false;
     }
