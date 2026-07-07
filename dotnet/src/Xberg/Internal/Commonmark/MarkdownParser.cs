@@ -259,9 +259,9 @@ public static class MarkdownParser
                 char fenceChar = trimmedStart[0];
                 int fenceLen = 0;
                 while (fenceLen < trimmedStart.Length && trimmedStart[fenceLen] == fenceChar) fenceLen++;
+                // pulldown-cmark exposes the full (trimmed) info string, not just the first word.
                 string info = trimmedStart.Substring(fenceLen).Trim();
-                string lang = info.Length == 0 ? "" : info.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)[0];
-                ev.Add(new MdEvent { Kind = MdEventKind.StartCodeBlock, Text = lang, Url = "" });
+                ev.Add(new MdEvent { Kind = MdEventKind.StartCodeBlock, Text = info, Url = "" });
                 var code = new StringBuilder();
                 i++;
                 bool closed = false;
