@@ -329,4 +329,107 @@ public class PdfExtractorTests
         Assert.Contains(doc!.Elements, e => e.Text.Contains("It's a normalized quote"));
         Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.ListItem);
     }
+
+    // ---- Table reconstruction (port parity with table_core.rs + table_reconstruct.rs) ----
+
+    private static List<List<string>> Grid(params string[][] rows) => rows.Select(r => r.ToList()).ToList();
+
+    [Fact]
+    public void TableToMarkdown_BasicAndEscapesPipes()
+    {
+        var md = PdfTableReconstruct.TableToMarkdown(Grid(new[] { "Name", "Value" }, new[] { "Alice", "42" }));
+        Assert.Contains("| Name | Value |", md);
+        Assert.Contains("| --- | --- |", md);
+        Assert.Contains("| Alice | 42 |", md);
+        Assert.Equal("", PdfTableReconstruct.TableToMarkdown(new List<List<string>>()));
+        Assert.Contains("a\\|b", PdfTableReconstruct.TableToMarkdown(Grid(new[] { "Header" }, new[] { "a|b" })));
+    }
+
+    [Fact]
+    public void PostProcess_RejectsProse_AcceptsRealTable()
+    {
+        var prose = Grid(
+            new[] { "Foreword", "", "", "", "", "ISO 21111-10:2021(E)", "", "" },
+            new[] { "ISO", "(the", "International", "Organization", "for", "Standardization)is", "a", "worldwide" },
+            new[] { "bodies", "(ISO", "member", "bodies).The", "work", "of", "preparing", "International" },
+            new[] { "through", "ISO", "technical", "committees.Each", "member", "body", "interested", "in" });
+        Assert.Null(PdfTableReconstruct.PostProcessTable(prose, false, false));
+
+        var real = Grid(
+            new[] { "Name", "Department", "Annual Salary" },
+            new[] { "John Smith", "Engineering Dept", "$95,000" },
+            new[] { "Jane Doe", "Marketing Team", "$88,500" },
+            new[] { "Bob Johnson", "Sales Division", "$92,000" },
+            new[] { "Alice Williams", "Human Resources", "$85,000" });
+        Assert.NotNull(PdfTableReconstruct.PostProcessTable(real, false, false));
+    }
+
+    [Fact]
+    public void PostProcess_RejectsMultiColumnProseFlowThrough()
+    {
+        var table = Grid(
+            new[] { "Header Left", "Header Right" },
+            new[] { "The results of this experiment show that the proposed method", "significantly outperforms the baseline in all metrics tested" },
+            new[] { "across multiple datasets including the standard benchmark", "suite commonly used in the literature for evaluation of" },
+            new[] { "natural language processing tasks and related problems", "involving text classification and information extraction" },
+            new[] { "methods that rely on deep learning architectures with", "attention mechanisms and transformer-based embeddings" });
+        Assert.Null(PdfTableReconstruct.PostProcessTable(table, false, false));
+        Assert.Null(PdfTableReconstruct.PostProcessTable(table, true, false));
+    }
+
+    [Fact]
+    public void IsWellFormed_RejectsDegenerateAndProse_AcceptsVaried()
+    {
+        Assert.False(PdfTableReconstruct.IsWellFormedTable(Grid(new[] { "Header", "Value" })));
+        Assert.False(PdfTableReconstruct.IsWellFormedTable(Grid(new[] { "H" }, new[] { "R1" }, new[] { "R2" })));
+
+        var repetitive = Grid(
+            new[] { "Bookmark", "File PDF", "Year 4" }, new[] { "Bookmark", "File PDF", "Year 4" },
+            new[] { "Bookmark", "File PDF", "Year 4" }, new[] { "Bookmark", "File PDF", "Year 4" },
+            new[] { "Bookmark", "File PDF", "Year 4" });
+        Assert.False(PdfTableReconstruct.IsWellFormedTable(repetitive));
+
+        var varied = Grid(
+            new[] { "ID", "Product Name", "Price" },
+            new[] { "1", "Widget Alpha Premium", "$29.99" },
+            new[] { "2", "Gadget Beta Standard", "$149.50" },
+            new[] { "3", "Tool Gamma Deluxe Ed", "$7.25" },
+            new[] { "4", "Part Delta Industrial", "$1,299.00" });
+        Assert.True(PdfTableReconstruct.IsWellFormedTable(varied));
+    }
+
+    [Fact]
+    public void LooksLikeCodeListing_DetectsBraces()
+    {
+        Assert.True(PdfTableReconstruct.LooksLikeCodeListing(Grid(new[] { "if (x)", "{" }, new[] { "return", "}" })));
+        Assert.False(PdfTableReconstruct.LooksLikeCodeListing(Grid(new[] { "Name", "Age" }, new[] { "Alice", "42" })));
+    }
+
+    [Fact]
+    public void ReconstructTable_MergesIntraCellWordSpacing()
+    {
+        HocrWord W(string t, uint l, uint top, uint w) => new HocrWord { Text = t, Left = l, Top = top, Width = w, Height = 12, Confidence = 95.0 };
+        var words = new List<HocrWord>
+        {
+            W("Chose", 57, 496, 30), W("Truc", 306, 496, 23),
+            W("Chose", 57, 510, 28), W("1", 90, 510, 6), W("Truc", 306, 510, 21), W("1", 332, 510, 5),
+            W("Chose", 57, 524, 28), W("2", 90, 524, 6), W("Truc", 306, 524, 21), W("2", 332, 524, 5),
+        };
+        var table = PdfTableReconstruct.ReconstructTable(words, 60, 0.5);
+        Assert.Equal(3, table.Count);
+        Assert.Equal(2, table[0].Count);
+        Assert.Equal("Chose 1", table[1][0]);
+        Assert.Equal("Truc 2", table[2][1]);
+    }
+
+    [Fact]
+    public void SegmentsToWords_SplitsProportionally()
+    {
+        var seg = new SegmentData { Text = "Col A", X = 100, Y = 500, Width = 100, Height = 12 };
+        var words = PdfTableReconstruct.SegmentsToWords(new List<SegmentData> { seg }, 800f);
+        Assert.Equal(2, words.Count);
+        Assert.Equal("Col", words[0].Text);
+        Assert.Equal("A", words[1].Text);
+        Assert.Equal(180u, words[1].Left);
+    }
 }

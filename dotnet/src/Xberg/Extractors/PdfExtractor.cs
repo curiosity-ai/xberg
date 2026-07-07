@@ -34,24 +34,36 @@ public sealed class PdfExtractor : IExtractor
         if (pageCount == 0)
             throw new InvalidDataException("pdf has no readable pages");
 
-        // --- Text extraction (native, column/row-aware assembly per page) ---
-        string nativeText = ExtractText(pdf, deadline);
+        // --- Single per-page content pass: page text + font-metric segments ---
+        // Content-stream parsing dominates cost, so parse each page exactly once and
+        // derive both the assembled page text (plain/json) and the SegmentData used for
+        // tables + heading structure (md/html) from the same spans.
+        bool needsStructured = config.OutputFormat.Equals(OutputFormat.Markdown)
+            || config.OutputFormat.Equals(OutputFormat.Djot)
+            || config.OutputFormat.Equals(OutputFormat.Html);
+
+        string nativeText = ExtractTextAndSegments(pdf, deadline, out var pageSegments);
 
         // --- Metadata ---
         var meta = PdfMetadataExtractor.Extract(pdf);
+
+        // --- Tables (text-layer heuristic tier) ---
+        // Mirrors the Rust three-tier detector, minus pdf_oxide's native/bordered
+        // ruling-line grid passes (no managed equivalent). Extract regardless of
+        // output format — tables live in the result independent of `content`.
+        List<Xberg.Types.Table> tables;
+        try { tables = PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false); }
+        catch { tables = new List<Xberg.Types.Table>(); }
 
         // --- Build InternalDocument ---
         // For Markdown/Djot/HTML the Rust path pre-renders a *structured* document with
         // heading detection (pdf/structure/pipeline.rs). Plain/Json use the flat native
         // text split. Mirror that: structured elements only when the output format needs them.
         InternalDocument doc;
-        bool needsStructured = config.OutputFormat.Equals(OutputFormat.Markdown)
-            || config.OutputFormat.Equals(OutputFormat.Djot)
-            || config.OutputFormat.Equals(OutputFormat.Html);
         InternalDocument? structured = null;
         if (needsStructured)
         {
-            try { structured = BuildStructured(pdf, deadline); }
+            try { structured = PdfStructure.Build(pageSegments); }
             catch { structured = null; }
         }
 
@@ -70,6 +82,7 @@ public sealed class PdfExtractor : IExtractor
             }
         }
         doc.MimeType = mimeType;
+        doc.Tables = tables;
 
         doc.Metadata = new Metadata
         {
@@ -108,52 +121,40 @@ public sealed class PdfExtractor : IExtractor
         return doc;
     }
 
-    // Extract per-page font-metric segments (ColumnAware order) and run the structure
-    // pipeline to produce a heading-aware InternalDocument.
-    private static InternalDocument? BuildStructured(PdfDocument pdf, long deadline)
+    // Single per-page pass: parse each page's content stream once, then derive both the
+    // assembled page text (returned, joined by blank lines) and the font-metric
+    // SegmentData grid (out param) used for tables and heading structure. Mirrors Rust
+    // `oxide::text::extract_text` + `oxide::hierarchy::extract_all_segments` sharing spans.
+    private static string ExtractTextAndSegments(PdfDocument pdf, long deadline, out List<List<SegmentData>> pageSegments)
     {
         int pageCount = pdf.PageCount;
-        var allPageSegments = new List<List<SegmentData>>(pageCount);
-        for (int i = 0; i < pageCount; i++)
-        {
-            if (DateTime.UtcNow.Ticks > deadline) return null;
-            try
-            {
-                byte[] contentBytes = pdf.GetPageContent(i);
-                if (contentBytes.Length == 0) { allPageSegments.Add(new()); continue; }
-                var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
-                var extractor = new PdfContentExtractor(pdf, deadline);
-                var spans = extractor.Extract(contentBytes, resources);
-                var lines = PdfPageText.BuildLineSegments(spans);
-                allPageSegments.Add(PdfStructure.SegmentsFromLines(lines));
-            }
-            catch { allPageSegments.Add(new()); }
-        }
-        return PdfStructure.Build(allPageSegments);
-    }
-
-    private static string ExtractText(PdfDocument pdf, long deadline)
-    {
+        pageSegments = new List<List<SegmentData>>(pageCount);
         var sb = new System.Text.StringBuilder();
-        int pageCount = pdf.PageCount;
+
         for (int i = 0; i < pageCount; i++)
         {
+            // Match the previous text path: once the wall-clock guard trips, stop
+            // emitting pages entirely rather than appending empty tails.
             if (DateTime.UtcNow.Ticks > deadline) break;
-            string pageText;
+
+            string pageText = "";
+            List<SegmentData> segs = new();
             try
             {
                 byte[] contentBytes = pdf.GetPageContent(i);
-                if (contentBytes.Length == 0) { pageText = ""; }
-                else
+                if (contentBytes.Length != 0)
                 {
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
                     pageText = PdfPageText.Assemble(spans);
+                    var lines = PdfPageText.BuildLineSegments(spans);
+                    segs = PdfStructure.SegmentsFromLines(lines);
                 }
             }
-            catch { pageText = ""; }
+            catch { pageText = ""; segs = new(); }
 
+            pageSegments.Add(segs);
             if (i > 0) sb.Append("\n\n");
             sb.Append(PdfPageText.FixControlChars(pageText));
         }

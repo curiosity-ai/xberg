@@ -4,12 +4,61 @@ using System.Text.Json.Serialization;
 namespace Xberg.Types;
 
 /// <summary>Bounding box in document coordinates.</summary>
+[JsonConverter(typeof(BoundingBoxConverter))]
 public sealed class BoundingBox
 {
     public double X0 { get; set; }
     public double Y0 { get; set; }
     public double X1 { get; set; }
     public double Y1 { get; set; }
+}
+
+/// <summary>Serializes <see cref="BoundingBox"/> coordinates the way Rust's `serde_json`
+/// renders `f64`: whole numbers keep a trailing `.0` (e.g. <c>72.0</c>, not <c>72</c>), so
+/// the golden reference files compare equal. System.Text.Json's default `double` writer
+/// drops the fractional part for integral values, which broke byte-exact parity for every
+/// table/image bounding box with integer edges.</summary>
+public sealed class BoundingBoxConverter : JsonConverter<BoundingBox>
+{
+    public override BoundingBox Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        if (reader.TokenType != JsonTokenType.StartObject) throw new JsonException();
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+        {
+            if (reader.TokenType != JsonTokenType.PropertyName) continue;
+            string name = reader.GetString()!;
+            reader.Read();
+            double v = reader.TokenType == JsonTokenType.Number ? reader.GetDouble() : 0;
+            switch (name)
+            {
+                case "x0": x0 = v; break;
+                case "y0": y0 = v; break;
+                case "x1": x1 = v; break;
+                case "y1": y1 = v; break;
+            }
+        }
+        return new BoundingBox { X0 = x0, Y0 = y0, X1 = x1, Y1 = y1 };
+    }
+
+    public override void Write(Utf8JsonWriter writer, BoundingBox value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        WriteCoord(writer, "x0", value.X0);
+        WriteCoord(writer, "y0", value.Y0);
+        WriteCoord(writer, "x1", value.X1);
+        WriteCoord(writer, "y1", value.Y1);
+        writer.WriteEndObject();
+    }
+
+    private static void WriteCoord(Utf8JsonWriter writer, string name, double v)
+    {
+        writer.WritePropertyName(name);
+        if (double.IsFinite(v) && v == Math.Floor(v) && Math.Abs(v) < 9.2e18)
+            writer.WriteRawValue(((long)v).ToString(System.Globalization.CultureInfo.InvariantCulture) + ".0");
+        else
+            writer.WriteNumberValue(v);
+    }
 }
 
 /// <summary>Extraction method. Serialized as a bare snake_case string.</summary>
