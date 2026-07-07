@@ -67,7 +67,7 @@ public sealed class MarkdownExtractor : IExtractor
                 string key = kv.Key;
                 string val;
                 if (kv.Value is JsonValue jv && jv.TryGetValue<string>(out var s)) val = s;
-                else val = kv.Value?.ToJsonString() ?? "";
+                else val = YamlValueDebug(kv.Value);
                 entries.Add((key, val));
             }
             if (entries.Count > 0) b.PushMetadataBlock(entries, null);
@@ -387,6 +387,58 @@ public sealed class MarkdownExtractor : IExtractor
         return b.Build();
 
         static AnnotationKind MakeSimple(AnnotationKind.Tag tag) => new() { Which = tag };
+    }
+
+    /// <summary>Renders a non-string YAML frontmatter value the way the Rust extractor does —
+    /// <c>format!("{value:?}")</c> on a <c>serde_yaml</c> <c>Value</c>. serde_yaml implements a
+    /// custom Debug: <c>Sequence [..]</c>, <c>String("..")</c>, <c>Number(n)</c>, <c>Bool(b)</c>,
+    /// <c>Null</c>, and mappings as <c>{k: v}</c>.</summary>
+    private static string YamlValueDebug(JsonNode? node)
+    {
+        switch (node)
+        {
+            case null:
+                return "Null";
+            case JsonArray arr:
+            {
+                var items = arr.Select(YamlValueDebug);
+                return "Sequence [" + string.Join(", ", items) + "]";
+            }
+            case JsonObject obj:
+            {
+                var kvs = obj.Select(kv => $"{YamlDebugString(kv.Key)}: {YamlValueDebug(kv.Value)}");
+                return "Mapping {" + string.Join(", ", kvs) + "}";
+            }
+            case JsonValue v:
+            {
+                if (v.TryGetValue<string>(out var s)) return $"String({YamlDebugString(s)})";
+                if (v.TryGetValue<bool>(out var b)) return b ? "Bool(true)" : "Bool(false)";
+                return $"Number({v.ToJsonString()})";
+            }
+            default:
+                return node.ToJsonString();
+        }
+    }
+
+    /// <summary>Rust's <c>{:?}</c> string formatting: double-quoted with C-style escapes.</summary>
+    private static string YamlDebugString(string s)
+    {
+        var sb = new StringBuilder(s.Length + 2);
+        sb.Append('"');
+        foreach (char c in s)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\t': sb.Append("\\t"); break;
+                case '\r': sb.Append("\\r"); break;
+                default: sb.Append(c); break;
+            }
+        }
+        sb.Append('"');
+        return sb.ToString();
     }
 
     private static void PushAnnStart(List<(int, uint, string?, string?)> annStarts, int kind,
