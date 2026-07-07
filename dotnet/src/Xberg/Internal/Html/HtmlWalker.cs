@@ -154,6 +154,23 @@ public sealed class HtmlWalker
     // preserved). Buffer is already space-collapsed by AppendNormalizedTo.
     private static string FinalizeInline(string s) => s.Replace('\x01', '\n').Trim();
 
+    // Table cell text normalization: collapse spaces/tabs to a single space but PRESERVE
+    // newlines (html-to-markdown renders <br> in a cell as " \n" and keeps them), then trim.
+    private static string CellNormalize(string s)
+    {
+        var outp = new StringBuilder(s.Length);
+        bool pendingSpace = false, seen = false;
+        foreach (char c in s)
+        {
+            if (c == '\r') continue;
+            if (c == '\n') { if (pendingSpace && seen) outp.Append(' '); pendingSpace = false; if (seen) outp.Append('\n'); }
+            else if (c is ' ' or '\t' or '\f' or '\v') { if (seen) pendingSpace = true; }
+            else { if (pendingSpace) { outp.Append(' '); pendingSpace = false; } outp.Append(c); seen = true; }
+        }
+        while (outp.Length > 0 && (outp[^1] == ' ' || outp[^1] == '\n')) outp.Remove(outp.Length - 1, 1);
+        return outp.ToString();
+    }
+
     // Append a literal inline string to whichever buffer is active (used by <q> quotes).
     private void AppendInline(string s)
     {
@@ -217,6 +234,7 @@ public sealed class HtmlWalker
                 break;
             case "br":
                 if (_inPre || _preBlock is not null) { _preBlock?.Text.Append('\n'); }
+                else if (_table is not null) _table.PushText(" \n");   // rendered as " \n" inside cells
                 else if (InListItem) AppendNormalizedTo(CurrentItemBuffer, "\x01");
                 else AppendNormalized("\x01");
                 break;
@@ -426,7 +444,7 @@ public sealed class HtmlWalker
         bool hasSpans = rows.Any(r => r.Any(c => c.ColSpan > 1 || c.RowSpan > 1));
         if (!hasSpans)
         {
-            var simple = rows.Select(r => r.Select(c => NormalizeWhitespace(c.Text)).ToList()).ToList();
+            var simple = rows.Select(r => r.Select(c => CellNormalize(c.Text)).ToList()).ToList();
             _b.PushTableFromCells(simple, null, null);
             return;
         }
@@ -439,7 +457,7 @@ public sealed class HtmlWalker
             int col = 0;
             foreach (var cell in row)
             {
-                if (col < numCols) line[col] = NormalizeWhitespace(cell.Text);
+                if (col < numCols) line[col] = CellNormalize(cell.Text);
                 col += (int)cell.ColSpan;
             }
             grid.Add(line);
