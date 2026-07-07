@@ -27,6 +27,7 @@ public static class HtmlMeta
         int captureHeading = 0;           // heading level currently open (0 = none)
         var headingText = new StringBuilder();
         int headingDepthAtOpen = 0;
+        int inCell = 0;                   // open <td>/<th> nesting (headings in cells are reprocessed)
         bool inAnchor = false;
         var anchorText = new StringBuilder();
         string anchorHref = "";
@@ -61,11 +62,20 @@ public static class HtmlMeta
 
                 if (closing)
                 {
+                    if (tag is "td" or "th") { if (inCell > 0) inCell--; }
                     if (tag is "h1" or "h2" or "h3" or "h4" or "h5" or "h6" && captureHeading != 0)
                     {
                         string text = HtmlWalker.NormalizeWhitespace(headingText.ToString());
                         if (text.Length > 0)
-                            m.Headers.Add(new Header { Level = captureHeading, Text = text, Depth = headingDepthAtOpen, HtmlOffset = 0 });
+                        {
+                            // A heading inside a table cell is walked three times (grid + markdown +
+                            // structure passes) by html-to-markdown, each recording it at depth 0.
+                            if (inCell > 0)
+                                for (int r = 0; r < 3; r++)
+                                    m.Headers.Add(new Header { Level = captureHeading, Text = text, Depth = 0, HtmlOffset = 0 });
+                            else
+                                m.Headers.Add(new Header { Level = captureHeading, Text = text, Depth = headingDepthAtOpen, HtmlOffset = 0 });
+                        }
                         captureHeading = 0;
                     }
                     else if (tag == "a" && inAnchor)
@@ -124,6 +134,9 @@ public static class HtmlMeta
                     }
                     case "title":
                         inTitle = true; titleText.Clear();
+                        break;
+                    case "td": case "th":
+                        if (!selfClose) inCell++;
                         break;
                     case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
                         captureHeading = tag[1] - '0';
