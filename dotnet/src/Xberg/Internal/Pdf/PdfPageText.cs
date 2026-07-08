@@ -57,10 +57,11 @@ public static class PdfPageText
                 if (sameLine)
                 {
                     double xGap = span.X - prevEndX;
-                    // pdf_oxide double-space guard (extractors/text.rs:4747): never
-                    // synthesize a gap space next to an existing literal space.
-                    if (xGap > span.FontSize * 0.15 &&
-                        !(sb.Length > 0 && sb[^1] == ' ' && span.Text.StartsWith(' ')))
+                    // pdf_oxide boundary-space guard (has_boundary_space, extractors/
+                    // text.rs:1622): never synthesize a gap space when the accumulated
+                    // text already ends with whitespace OR the next span starts with
+                    // whitespace (Rule 0). Requiring BOTH double-spaced justified prose.
+                    if (xGap > span.FontSize * 0.15 && !HasBoundaryWhitespace(sb, span.Text))
                         sb.Append(' ');
                 }
                 else if (yGap > paragraphGap) sb.Append("\n\n");
@@ -230,9 +231,8 @@ public static class PdfPageText
             {
                 double gap = s.X - prevEndX;
                 double threshold = byXThreshold ? fontSize * 0.5 : s.FontSize * 0.15;
-                // pdf_oxide double-space guard (extractors/text.rs:4747).
-                if (gap > threshold &&
-                    !(sb.Length > 0 && sb[^1] == ' ' && s.Text.StartsWith(' ')))
+                // pdf_oxide boundary-space guard (has_boundary_space, text.rs:1622).
+                if (gap > threshold && !HasBoundaryWhitespace(sb, s.Text))
                     sb.Append(' ');
             }
             // Dedupe literal space across span boundary (pdf_oxide merge guard).
@@ -316,7 +316,7 @@ public static class PdfPageText
             foreach (var span in group)
             {
                 if (!double.IsInfinity(prevEndX) && span.X - prevEndX > spaceThreshold &&
-                    !(sb.Length > 0 && sb[^1] == ' ' && span.Text.StartsWith(' ')))
+                    !HasBoundaryWhitespace(sb, span.Text))
                     sb.Append(' ');
                 sb.Append(span.Text);
                 prevEndX = span.X + span.Width;
@@ -444,6 +444,18 @@ public static class PdfPageText
         foreach (var gx in gaps) { columns.Add((left, gx)); left = gx; }
         columns.Add((left, maxX));
         return columns;
+    }
+
+    // Port of has_boundary_space (extractors/text.rs:1622). True when a space
+    // already sits at the span boundary: the accumulated text ends with
+    // whitespace OR the following span text starts with whitespace. Used to
+    // suppress a synthesized gap-space (Rule 0) so justified prose whose words
+    // carry literal space glyphs isn't double-spaced.
+    private static bool HasBoundaryWhitespace(StringBuilder preceding, string following)
+    {
+        if (preceding.Length > 0 && char.IsWhiteSpace(preceding[^1])) return true;
+        if (following.Length > 0 && char.IsWhiteSpace(following[0])) return true;
+        return false;
     }
 
     /// <summary>Port of fix_pdf_control_chars (crates/xberg/src/pdf/text.rs).</summary>
