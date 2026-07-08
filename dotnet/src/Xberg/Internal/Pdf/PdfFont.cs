@@ -16,6 +16,12 @@ public sealed class PdfFont
     private Dictionary<int, double>? _widths;
     public int FirstChar;
     public double MissingWidth;
+    // pdf_oxide default_width (fonts/font_dict.rs): 600 fixed-pitch / 500
+    // proportional / 550 when the descriptor carries no /Flags. Used as the final
+    // width fallback for simple fonts (after /Widths and Standard-14 AFM metrics).
+    private double _simpleDefaultWidth = 550.0;
+    // Standard-14 AFM metrics, resolved once from BaseFont (null if not a Standard-14).
+    private Fonts.StandardFonts.Metrics? _afm;
 
     // ToUnicode (both simple and Type0).
     private PdfCMap? _toUnicode;
@@ -70,11 +76,14 @@ public sealed class PdfFont
         var descriptor = doc.Resolve(fontDict.Get("FontDescriptor")).AsDict();
         if (descriptor != null)
         {
-            int flags = (int)(doc.Resolve(descriptor.Get("Flags")).AsLong() ?? 0);
+            var flagsObj = doc.Resolve(descriptor.Get("Flags"));
+            int flags = (int)(flagsObj.AsLong() ?? 0);
             symbolic = (flags & 4) != 0 && (flags & 32) == 0;
             if ((flags & (1 << 18)) != 0) f.IsBold = true;
             if ((flags & (1 << 6)) != 0) f.IsItalic = true;
             if ((flags & 1) != 0) f.IsMonospace = true;
+            // pdf_oxide default_width from FixedPitch flag (bit 1).
+            if (flagsObj is PdfNumber) f._simpleDefaultWidth = (flags & 1) != 0 ? 600.0 : 500.0;
             f.MissingWidth = doc.Resolve(descriptor.Get("MissingWidth")).AsNumber() ?? 0;
             var asc = doc.Resolve(descriptor.Get("Ascent")).AsNumber();
             var desc = doc.Resolve(descriptor.Get("Descent")).AsNumber();
@@ -96,7 +105,13 @@ public sealed class PdfFont
             ?? (f.Subtype == "TrueType" && !symbolic ? PdfEncodings.WinAnsi : PdfEncodings.Standard);
         // Type3 FontMatrix
         if (f.Subtype == "Type3" && doc.Resolve(fontDict.Get("FontMatrix")).AsArray() is PdfArray fm && fm.Items.Count >= 1)
+        {
             f.FontMatrixA = doc.Resolve(fm.Items[0]).AsNumber() ?? 0.001;
+            // pdf_oxide rescales default_width so callers multiplying by font_matrix_a
+            // still yield the intended em fraction when the matrix isn't 1/1000.
+            if (f.FontMatrixA != 0.001 && f.FontMatrixA != 0.0)
+                f._simpleDefaultWidth = f._simpleDefaultWidth * 0.001 / f.FontMatrixA;
+        }
 
         var enc = new string[256];
         Array.Copy(baseEnc, enc, 256);
@@ -115,6 +130,9 @@ public sealed class PdfFont
             }
         }
         f._encoding = enc;
+
+        // Standard-14 AFM metrics (resolved once; used when /Widths lacks a code).
+        f._afm = Fonts.StandardFonts.Resolve(f.BaseFont);
 
         // Widths
         f.FirstChar = (int)(doc.Resolve(fontDict.Get("FirstChar")).AsLong() ?? 0);
@@ -249,9 +267,13 @@ public sealed class PdfFont
     {
         if (!IsType0)
         {
+            // pdf_oxide get_glyph_width order: /Widths (covered code) → Standard-14
+            // AFM metrics → default_width. MissingWidth is intentionally NOT consulted
+            // here (pdf_oxide uses the flags-derived default_width instead).
             if (_widths != null && _widths.TryGetValue(code, out var w)) return w;
-            if (MissingWidth != 0) return MissingWidth;
-            return 500.0;
+            var afm = _afm?.Width(code);
+            if (afm.HasValue) return afm.Value;
+            return _simpleDefaultWidth;
         }
         int cid = _cmap?.LookupCid(code) ?? code;
         if (_cidWidths != null && _cidWidths.TryGetValue(cid, out var cw)) return cw;
