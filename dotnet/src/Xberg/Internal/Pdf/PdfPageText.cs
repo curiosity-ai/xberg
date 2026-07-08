@@ -462,7 +462,50 @@ public static class PdfPageText
         if (!prevSpace && !nextSpace) return false;
         if (prevSpace && nextSpace) return true;
         double mergeThreshold = Math.Max(5.0, fontSize * 0.5);
-        return xGap <= mergeThreshold;
+        if (xGap > mergeThreshold) return false;
+        // A line-leading list marker ("1.", "•") sits in its own marked-content
+        // run in pdf_oxide and therefore never merges with the item text, so the
+        // gap to the text keeps its space ("•  PRINT", "1.  Undo"). Our span
+        // stream has no MCID, so detect the marker by shape and keep its space.
+        if (prevSpace && IsLineLeadingListMarker(preceding)) return false;
+        return true;
+    }
+
+    private static readonly char[] BulletChars =
+        { '•', '◦', '▪', '‣', '·', '●', '○', '■', '□', '⁃', '∙', '⁌', '⁍' };
+
+    // True when the last non-whitespace token in `sb` is a list marker that
+    // begins its visual line (only indentation between it and the prior newline
+    // or the start of text). The line-start requirement keeps mid-sentence
+    // numbers like "1980." from being mistaken for an ordered marker.
+    private static bool IsLineLeadingListMarker(StringBuilder sb)
+    {
+        int i = sb.Length - 1;
+        while (i >= 0 && char.IsWhiteSpace(sb[i])) i--;      // skip trailing gap/space
+        int tokEnd = i;
+        while (i >= 0 && !char.IsWhiteSpace(sb[i])) i--;      // read the token
+        int tokStart = i + 1;
+        if (tokStart > tokEnd) return false;
+        // Only spaces/tabs may separate the token from the line start.
+        while (i >= 0 && (sb[i] == ' ' || sb[i] == '\t')) i--;
+        bool lineStart = i < 0 || sb[i] == '\n' || sb[i] == '\r';
+        if (!lineStart) return false;
+        int len = tokEnd - tokStart + 1;
+        if (len == 1)
+        {
+            char c = sb[tokStart];
+            return Array.IndexOf(BulletChars, c) >= 0 || c == '*' || c == '-' || c == '–' || c == '—';
+        }
+        // Ordered: <digits>[.)] or a single letter <letter>[.)].
+        char last = sb[tokEnd];
+        if (last != '.' && last != ')') return false;
+        int digits = 0;
+        for (int k = tokStart; k < tokEnd; k++)
+        {
+            if (!char.IsDigit(sb[k])) { digits = -1; break; }
+            digits++;
+        }
+        return digits >= 1 && digits <= 3;
     }
 
     /// <summary>Port of fix_pdf_control_chars (crates/xberg/src/pdf/text.rs).</summary>
