@@ -55,6 +55,63 @@ internal static class HtmlToMarkdown
         public bool InStrong { get; init; }
         public bool InLink { get; init; }
         public bool MeasureWidthOnly { get; init; }
+        // When set, every <table> handled contributes a 2D cell grid to this sink (mirrors the
+        // crate's structure collector `push_table_data`): nested tables are emitted before their
+        // parent, in the order the two cell-walks (render + collect) encounter them.
+        public Action<List<List<string>>>? TableEmit { get; init; }
+    }
+
+    // ── table grid emission (structure collector) ────────────────────────────
+    /// <summary>
+    /// Walk a parsed &lt;table&gt; node and emit a 2D cell grid for it and every nested table,
+    /// mirroring the html-to-markdown crate's document-structure collector. Each grid is passed
+    /// to <paramref name="emit"/>; nested tables are emitted before their enclosing table.
+    /// </summary>
+    public static void EmitTableTree(HNode table, Action<List<List<string>>> emit)
+    {
+        var ctx = new Ctx { TableEmit = emit };
+        var dummy = new StringBuilder();
+        HandleTableWithContext(table, dummy, ctx);
+    }
+
+    // collect_table_grid: 2D cell grid, cells placed left-to-right advancing by colspan
+    // (rowspan does not reserve columns in later rows), content rendered under an in-cell context.
+    private static List<List<string>> CollectGrid(HNode table, Ctx ctx)
+    {
+        var placed = new List<(string content, int row, int col)>();
+        int rowIndex = 0, maxCols = 0;
+        foreach (var row in TableRows(table))
+        {
+            int col = 0;
+            foreach (var cell in CollectTableCells(row))
+            {
+                string content = RenderCellForGrid(cell, ctx);
+                placed.Add((content, rowIndex, col));
+                col += GetColspan(cell);
+            }
+            if (col > maxCols) maxCols = col;
+            rowIndex++;
+        }
+        var grid = new List<List<string>>(rowIndex);
+        for (int r = 0; r < rowIndex; r++)
+        {
+            var line = new List<string>(maxCols);
+            for (int c = 0; c < maxCols; c++) line.Add("");
+            grid.Add(line);
+        }
+        foreach (var (content, r, c) in placed)
+            if (r < rowIndex && c < maxCols) grid[r][c] = content;
+        return grid;
+    }
+
+    // Cell content for the grid: walk children under in-cell context, normalize (keep newlines),
+    // trim. Mirrors collect_grid_row's `normalize_whitespace(walk_node(children)).trim()`.
+    private static string RenderCellForGrid(HNode cell, Ctx ctx)
+    {
+        var buf = new StringBuilder();
+        var cctx = ctx with { InTableCell = true };
+        foreach (var c in cell.Children) WalkNode(c, buf, cctx);
+        return NormalizeWhitespaceKeepNewlines(buf.ToString()).Trim();
     }
 
     // ── frontmatter (head_metadata.rs + main_helpers::extract_head_metadata) ─
@@ -211,6 +268,10 @@ internal static class HtmlToMarkdown
                 HandleBlockquote(node, output, ctx);
                 break;
             case "table":
+                // During an outer table's width-measurement pre-pass, don't recurse into the
+                // nested table handler (which would emit its grid and launch its own pre-pass);
+                // fall back to descendant text content, matching the crate (issue #406).
+                if (ctx.MeasureWidthOnly) { output.Append(TextContent(node)); break; }
                 HandleTableWithContext(node, output, ctx);
                 break;
             case "caption":
@@ -1566,6 +1627,15 @@ internal static class HtmlToMarkdown
     {
         var tableOutput = new StringBuilder();
         HandleTable(node, tableOutput, ctx);
+
+        // Structure-collector side effect: after rendering (which already emitted any nested
+        // tables encountered in cells), collect this table's grid (re-walking cells emits those
+        // nested tables a second time), then emit this table — nested-before-parent order.
+        if (ctx.TableEmit is not null)
+        {
+            var grid = CollectGrid(node, ctx);
+            ctx.TableEmit(grid);
+        }
 
         if (ctx.InListItem)
         {

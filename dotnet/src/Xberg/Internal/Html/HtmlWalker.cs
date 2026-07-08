@@ -185,8 +185,11 @@ public sealed class HtmlWalker
     private void ClearTextBuf() { _textBuf.Clear(); _lastWasSpace = true; }
 
     // ── tags ───────────────────────────────────────────────────────────────
+    private int _tagStart;
+
     private void HandleTag()
     {
+        _tagStart = _pos;
         int gt = _src.IndexOf('>', _pos);
         if (gt < 0) { _pos = _src.Length; return; }
         string tagContent = _src[(_pos + 1)..gt];
@@ -285,8 +288,24 @@ public sealed class HtmlWalker
                 OpenItem();
                 break;
             case "table":
-                CloseParagraphContext();
-                _table = new TableAccumulator();
+                // Top-level tables: capture the raw subtree HTML, skip it in the stream, and
+                // delegate grid building to the html-to-markdown converter so cell content is
+                // rendered under an in-cell markdown context and nested tables are flattened as
+                // separate tables (mirrors the crate's structure collector). Tables nested inside
+                // list items / definition lists / <pre> keep the legacy accumulator path.
+                if (_table is null && _preBlock is null && !InListItem && !_inDt && !_inDd && !selfClosing)
+                {
+                    CloseParagraphContext();
+                    int end = FindMatchingClose("table", _pos);
+                    string tableHtml = _src[_tagStart..end];
+                    _pos = end;
+                    EmitTablesFromHtml(tableHtml);
+                }
+                else
+                {
+                    CloseParagraphContext();
+                    _table = new TableAccumulator();
+                }
                 break;
             case "tr": if (_table is not null) _table.OpenRow(); break;
             case "thead": case "tbody": case "tfoot": break;
@@ -437,6 +456,68 @@ public sealed class HtmlWalker
         }
         if (!string.IsNullOrEmpty(src))
             _b.PushUri(new ExtractedUri { Url = src!, Label = description, Kind = UriKind.Image });
+    }
+
+    // Find the index just past the `</tag>` that matches the already-opened `tag` (current _pos
+    // is just after its opening `<tag ...>`), tracking same-tag nesting. Returns _src.Length if
+    // no matching close is found.
+    private int FindMatchingClose(string tag, int from)
+    {
+        int depth = 1;
+        int p = from;
+        while (p < _src.Length)
+        {
+            int lt = _src.IndexOf('<', p);
+            if (lt < 0) return _src.Length;
+            p = lt;
+            if (string.CompareOrdinal(_src, p, "<!--", 0, 4) == 0)
+            {
+                int e = _src.IndexOf("-->", p + 4, StringComparison.Ordinal);
+                p = e < 0 ? _src.Length : e + 3;
+                continue;
+            }
+            int gt = _src.IndexOf('>', p);
+            if (gt < 0) return _src.Length;
+            string raw = _src[(p + 1)..gt];
+            p = gt + 1;
+            if (raw.StartsWith('!') || raw.StartsWith('?')) continue;
+            bool closing = raw.StartsWith('/');
+            string c = closing ? raw[1..] : raw;
+            bool self = c.TrimEnd().EndsWith('/');
+            c = c.TrimEnd('/').Trim();
+            var (nm, _) = SplitTagName(c);
+            if (!nm.Equals(tag, StringComparison.OrdinalIgnoreCase)) continue;
+            if (closing) { depth--; if (depth == 0) return p; }
+            else if (!self) depth++;
+        }
+        return _src.Length;
+    }
+
+    // Parse a captured <table>…</table> subtree and emit its grid (plus any nested tables, in the
+    // crate's nested-before-parent order) as InternalDocument tables.
+    private void EmitTablesFromHtml(string tableHtml)
+    {
+        var root = HtmlDom.Parse(tableHtml);
+        var table = FindFirstTag(root, "table");
+        if (table is null) return;
+        HtmlToMarkdown.EmitTableTree(table, grid =>
+        {
+            if (grid.Count > 0) _b.PushTableFromCells(grid, null, null);
+        });
+    }
+
+    private static HNode? FindFirstTag(HNode node, string tag)
+    {
+        foreach (var c in node.Children)
+        {
+            if (c.Tag == tag) return c;
+            if (c.Tag is not null)
+            {
+                var r = FindFirstTag(c, tag);
+                if (r is not null) return r;
+            }
+        }
+        return null;
     }
 
     private void EmitTable(List<List<CellMeta>> rows)
@@ -901,10 +982,11 @@ public sealed class HtmlWalker
             if (c != '&') { outp.Append(c); continue; }
             var entity = new StringBuilder();
             bool tooLong = false;
+            bool terminated = false;
             while (i < s.Length)
             {
                 char ec = s[i++];
-                if (ec == ';') break;
+                if (ec == ';') { terminated = true; break; }
                 entity.Append(ec);
                 if (entity.Length > 10) { outp.Append('&'); outp.Append(entity); tooLong = true; break; }
             }
@@ -940,7 +1022,10 @@ public sealed class HtmlWalker
                     try { outp.Append(char.ConvertFromUtf32(cp.Value)); continue; } catch { }
                 }
             }
-            outp.Append('&'); outp.Append(e); outp.Append(';');
+            // Unknown entity — preserve raw. Only re-emit the trailing ';' when the source
+            // actually terminated the entity with one (matches the `tl` HTML parser used by
+            // the golden; a bare '&' followed by non-entity text keeps no spurious ';').
+            outp.Append('&'); outp.Append(e); if (terminated) outp.Append(';');
         }
         return outp.ToString();
     }
