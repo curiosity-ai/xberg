@@ -273,7 +273,10 @@ public sealed class PdfLexer
         if (StartsWith("stream"))
         {
             Pos += 6;
-            // After "stream" keyword: CRLF or LF.
+            // After "stream" keyword: CRLF or LF. Some producers emit stray
+            // spaces/tabs before the EOL ("stream \r\n") — tolerate them
+            // (pdfa_001/nougat_026 fixtures), like lopdf/pdf_oxide do.
+            while (Pos < _buf.Length && (_buf[Pos] == 32 || _buf[Pos] == 9)) Pos++;
             if (Pos < _buf.Length && _buf[Pos] == 13) Pos++;
             if (Pos < _buf.Length && _buf[Pos] == 10) Pos++;
             int dataStart = Pos;

@@ -147,8 +147,7 @@ public sealed class PdfExtractor : IExtractor
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
-                    pageText = PdfPageText.Assemble(spans);
-                    var lines = PdfPageText.BuildLineSegments(spans);
+                    (pageText, var lines) = PdfPageText.AssembleWithLines(spans);
                     segs = PdfStructure.SegmentsFromLines(lines);
                 }
             }

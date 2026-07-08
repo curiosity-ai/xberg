@@ -18,17 +18,20 @@ public static class PdfPageText
     private const double CoalesceThreshold = 5.0;
 
     /// <summary>Sort spans into ColumnAware reading order and assemble into text.</summary>
-    public static string Assemble(List<TextSpan> spans)
-    {
-        if (spans.Count == 0) return "";
+    public static string Assemble(List<TextSpan> spans) => AssembleOrdered(OrderViaRuns(spans));
 
-        // Column-aware reading order (XY-cut), matching pdf_oxide. Run on
-        // line-merged runs so per-glyph/per-Tj span granularity does not create
-        // spurious column gutters (pdf_oxide runs XY-cut on merged word/line
-        // spans, not raw glyphs). Ordering is applied to runs; the original
-        // spans are then emitted in run order and assembled as before, so the
-        // space/line-break logic is unchanged.
-        var (ordered, orderedRuns) = OrderViaRuns(spans);
+    /// <summary>Assemble + line segments from ONE ordering pass (the ordering —
+    /// presort, run merge, XY-cut — dominates cost on large documents).</summary>
+    public static (string text, List<LineSeg> lines) AssembleWithLines(List<TextSpan> spans)
+    {
+        var ordering = OrderViaRuns(spans);
+        return (AssembleOrdered(ordering), BuildLineSegmentsOrdered(ordering));
+    }
+
+    private static string AssembleOrdered((List<TextSpan> ordered, List<TextSpan> orderedRuns) t)
+    {
+        var (ordered, orderedRuns) = t;
+        if (ordered.Count == 0) return "";
 
         // Issue #962: glyph-fragmented span lists are rebuilt from positions.
         // Detected on the MERGED runs (word-level), matching pdf_oxide which runs
@@ -54,7 +57,11 @@ public static class PdfPageText
                 if (sameLine)
                 {
                     double xGap = span.X - prevEndX;
-                    if (xGap > span.FontSize * 0.15) sb.Append(' ');
+                    // pdf_oxide double-space guard (extractors/text.rs:4747): never
+                    // synthesize a gap space next to an existing literal space.
+                    if (xGap > span.FontSize * 0.15 &&
+                        !(sb.Length > 0 && sb[^1] == ' ' && span.Text.StartsWith(' ')))
+                        sb.Append(' ');
                 }
                 else if (yGap > paragraphGap) sb.Append("\n\n");
                 else sb.Append('\n');
@@ -71,6 +78,13 @@ public static class PdfPageText
     // walks the original spans so spacing/line-break decisions are unchanged.
     private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(List<TextSpan> spans)
     {
+        // pdf_oxide sorts spans into reading order (rounded-Y descending, X
+        // ascending, column-aware) BEFORE merge_adjacent_spans (extractors/
+        // text.rs :: sort_spans_by_reading_order). Without this, show-ops that
+        // arrive out of visual order (TJ negative offsets, right-aligned
+        // columns) merge/emit in stream order and scramble within-line text.
+        spans = SortSpansByReadingOrder(spans);
+
         var runs = new List<TextSpan>();
         var members = new List<List<int>>();
         TextSpan? cur = null;
@@ -157,11 +171,13 @@ public static class PdfPageText
     /// intra-line spacing rules as <see cref="Assemble"/> (including the glyph-fragmentation
     /// rebuild). Feeds the structure/heading pipeline so its text matches the plain path.</summary>
     public static List<LineSeg> BuildLineSegments(List<TextSpan> spans)
-    {
-        var lines = new List<LineSeg>();
-        if (spans.Count == 0) return lines;
+        => BuildLineSegmentsOrdered(OrderViaRuns(spans));
 
-        var (ordered, orderedRuns) = OrderViaRuns(spans);
+    private static List<LineSeg> BuildLineSegmentsOrdered((List<TextSpan> ordered, List<TextSpan> orderedRuns) t)
+    {
+        var (ordered, orderedRuns) = t;
+        var lines = new List<LineSeg>();
+        if (ordered.Count == 0) return lines;
 
         // Fragmented glyph lists: rebuild lines from positions (issue #962).
         if (IsFragmentedSpanList(orderedRuns))
@@ -214,8 +230,12 @@ public static class PdfPageText
             {
                 double gap = s.X - prevEndX;
                 double threshold = byXThreshold ? fontSize * 0.5 : s.FontSize * 0.15;
-                if (gap > threshold) sb.Append(' ');
+                // pdf_oxide double-space guard (extractors/text.rs:4747).
+                if (gap > threshold &&
+                    !(sb.Length > 0 && sb[^1] == ' ' && s.Text.StartsWith(' ')))
+                    sb.Append(' ');
             }
+            // Dedupe literal space across span boundary (pdf_oxide merge guard).
             sb.Append(s.Text);
             prevEndX = s.X + s.Width;
             minX = Math.Min(minX, s.X);
@@ -295,12 +315,135 @@ public static class PdfPageText
             double prevEndX = double.NegativeInfinity;
             foreach (var span in group)
             {
-                if (!double.IsInfinity(prevEndX) && span.X - prevEndX > spaceThreshold) sb.Append(' ');
+                if (!double.IsInfinity(prevEndX) && span.X - prevEndX > spaceThreshold &&
+                    !(sb.Length > 0 && sb[^1] == ' ' && span.Text.StartsWith(' ')))
+                    sb.Append(' ');
                 sb.Append(span.Text);
                 prevEndX = span.X + span.Width;
             }
         }
         return sb.ToString();
+    }
+
+    // ── Reading-order pre-sort (pdf_oxide extractors/text.rs) ────────────────
+    // Port of TextExtractor::sort_spans_by_reading_order + detect_span_columns
+    // + simple_sort_spans + sort_spans_by_columns. Returns a NEW sorted list
+    // (the caller's list is left untouched).
+    private static int SafeCmp(double a, double b)
+    {
+        bool na = double.IsNaN(a), nb = double.IsNaN(b);
+        if (na && nb) return 0;
+        if (na) return 1;
+        if (nb) return -1;
+        return a.CompareTo(b);
+    }
+
+    private static int RoundKey(double v) =>
+        double.IsNaN(v) ? int.MinValue : (int)Math.Round(v, MidpointRounding.AwayFromZero);
+
+    internal static List<TextSpan> SortSpansByReadingOrder(List<TextSpan> spans)
+    {
+        if (spans.Count == 0) return new List<TextSpan>();
+        var columns = DetectSpanColumns(spans);
+        if (columns.Count <= 1)
+            return SortedByYThenX(spans);
+
+        // Multi-column: assign each span to a column by center-x, sort within
+        // each column, read columns left-to-right.
+        var columnSpans = new List<TextSpan>[columns.Count];
+        for (int c = 0; c < columns.Count; c++) columnSpans[c] = new List<TextSpan>();
+        foreach (var span in spans)
+        {
+            double cx = span.X + span.Width / 2.0;
+            int idx = 0;
+            for (int c = 0; c < columns.Count; c++)
+                if (cx >= columns[c].left && cx <= columns[c].right) { idx = c; break; }
+            columnSpans[idx].Add(span);
+        }
+        var result = new List<TextSpan>(spans.Count);
+        foreach (var col in columnSpans)
+            result.AddRange(SortedByYThenX(col));
+        return result;
+    }
+
+    // Stable sort by rounded Y descending, then X ascending (Rust sort_by is stable).
+    private static List<TextSpan> SortedByYThenX(List<TextSpan> spans) =>
+        spans
+            .Select((s, i) => (s, i))
+            .OrderBy(t => t, Comparer<(TextSpan s, int i)>.Create((x, y) =>
+            {
+                // Non-finite Y sorts after all numbers (pdf_oxide NaN handling).
+                bool xa = double.IsFinite(x.s.Y), yb = double.IsFinite(y.s.Y);
+                if (!xa || !yb)
+                {
+                    int c0 = xa == yb ? 0 : (xa ? -1 : 1);
+                    return c0 != 0 ? c0 : x.i.CompareTo(y.i);
+                }
+                int c = RoundKey(y.s.Y).CompareTo(RoundKey(x.s.Y));
+                if (c == 0) c = SafeCmp(x.s.X, y.s.X);
+                return c != 0 ? c : x.i.CompareTo(y.i);
+            }))
+            .Select(t => t.s)
+            .ToList();
+
+    // Port of detect_span_columns (X-histogram gap detection).
+    private static List<(double left, double right)> DetectSpanColumns(List<TextSpan> spans)
+    {
+        var columns = new List<(double, double)>();
+        if (spans.Count == 0) return columns;
+
+        double minX = double.PositiveInfinity, maxX = double.NegativeInfinity;
+        foreach (var s in spans)
+        {
+            minX = Math.Min(minX, s.X);
+            maxX = Math.Max(maxX, s.X + s.Width);
+        }
+        double pageWidth = maxX - minX;
+        if (!(pageWidth > 0.0) || !double.IsFinite(pageWidth))
+        {
+            columns.Add((minX, maxX));
+            return columns;
+        }
+
+        const int bins = 100;
+        double binWidth = pageWidth / bins;
+        var histogram = new int[bins];
+        foreach (var s in spans)
+        {
+            double sb = (s.X - minX) / binWidth;
+            double eb = (s.X + s.Width - minX) / binWidth;
+            if (double.IsNaN(sb) || double.IsNaN(eb)) continue;
+            int startBin = (int)Math.Clamp(sb, 0, bins - 1);
+            int endBin = (int)Math.Clamp(eb, 0, bins - 1);
+            for (int i = startBin; i <= endBin; i++) histogram[i]++;
+        }
+
+        double avgDensity = histogram.Sum() / (double)bins;
+        double gapThreshold = Math.Max(avgDensity * 0.2, 1.0);
+
+        var gaps = new List<double>();
+        bool inGap = false; int gapStart = 0;
+        for (int i = 0; i < bins; i++)
+        {
+            if (histogram[i] <= gapThreshold)
+            {
+                if (!inGap) { gapStart = i; inGap = true; }
+            }
+            else if (inGap)
+            {
+                double gapWidth = (i - gapStart) * binWidth;
+                if (gapWidth > Math.Max(pageWidth * 0.02, 15.0))
+                    gaps.Add(minX + gapStart * binWidth);
+                inGap = false;
+            }
+        }
+
+        if (gaps.Count == 0) { columns.Add((minX, maxX)); return columns; }
+
+        double left = minX;
+        foreach (var gx in gaps) { columns.Add((left, gx)); left = gx; }
+        columns.Add((left, maxX));
+        return columns;
     }
 
     /// <summary>Port of fix_pdf_control_chars (crates/xberg/src/pdf/text.rs).</summary>

@@ -62,11 +62,33 @@ public sealed class PdfContentExtractor
     private Matrix _tlm = Matrix.Identity;
     private readonly long _deadline;
 
+    // Show-op span buffer, mirroring pdf_oxide's TjBuffer (extractors/text.rs).
+    // A whole TJ array — and consecutive Tj operators — accumulate into ONE
+    // span; only large negative TJ offsets (< SpaceInsertionThreshold) split
+    // it. Emitting one span per show-string scrambles kerned runs once spans
+    // are sorted by position (senate-expenditures fixture).
+    private sealed class TjBuffer
+    {
+        public StringBuilder Text = new();
+        public double StartX, StartY;          // user-space origin at buffer start
+        public double AccumWidth;              // text-space width (incl. Tz)
+        public double UserHScale;              // sqrt(a²+c²) of combined matrix
+        public double EffFontSize;             // font_size * sqrt(b²+d²)
+        public bool IsBold, IsItalic, IsMonospace;
+        public bool HasRtl;
+    }
+
+    private TjBuffer? _buf;
+
+    // pdf_oxide TextExtractionConfig::default().space_insertion_threshold.
+    private const double SpaceInsertionThreshold = -120.0;
+
     public PdfContentExtractor(PdfDocument doc, long deadlineTicks) { _doc = doc; _deadline = deadlineTicks; }
 
     public List<TextSpan> Extract(byte[] content, PdfDict? resources)
     {
         Run(content, resources, 0);
+        FlushBuffer();
         return _spans;
     }
 
@@ -102,17 +124,32 @@ public sealed class PdfContentExtractor
         }
     }
 
+    // Per-document font cache: resolved font dicts are reference-cached by
+    // PdfDocument, so the same PdfDict instance recurs across pages. Parsing
+    // a font (ToUnicode CMap, widths, encoding) is expensive; without this
+    // cache large books re-parse every font on every page (bayesian/intel
+    // fixtures tripped the 25s guard).
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<PdfDocument, Dictionary<PdfDict, PdfFont>> FontCaches = new();
+
     private Dictionary<string, PdfFont> LoadFonts(PdfDict? resources)
     {
         var map = new Dictionary<string, PdfFont>(StringComparer.Ordinal);
         var fontsDict = _doc.Resolve(resources?.Get("Font")).AsDict();
         if (fontsDict == null) return map;
+        var cache = FontCaches.GetOrCreateValue(_doc);
         foreach (var kv in fontsDict.Map)
         {
             var fd = _doc.Resolve(kv.Value).AsDict();
             if (fd != null)
             {
-                try { map[kv.Key] = PdfFont.Load(fd, _doc); } catch { }
+                if (cache.TryGetValue(fd, out var cached)) { map[kv.Key] = cached; continue; }
+                try
+                {
+                    var font = PdfFont.Load(fd, _doc);
+                    cache[fd] = font;
+                    map[kv.Key] = font;
+                }
+                catch { }
             }
         }
         return map;
@@ -125,27 +162,32 @@ public sealed class PdfContentExtractor
         switch (op)
         {
             case "q": _stack.Push(_gs.Clone()); break;
-            case "Q": if (_stack.Count > 0) _gs = _stack.Pop(); break;
+            case "Q": FlushBuffer(); if (_stack.Count > 0) _gs = _stack.Pop(); break;
             case "cm":
                 if (ops.Count >= 6)
+                {
+                    FlushBuffer();
                     _gs.Ctm = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5)).Multiply(_gs.Ctm);
+                }
                 break;
-            case "BT": _tm = Matrix.Identity; _tlm = Matrix.Identity; break;
-            case "ET": break;
+            case "BT": FlushBuffer(); _tm = Matrix.Identity; _tlm = Matrix.Identity; break;
+            case "ET": FlushBuffer(); break;
             case "Td":
-                if (ops.Count >= 2) { _tlm = new Matrix(1, 0, 0, 1, Num(ops, 0), Num(ops, 1)).Multiply(_tlm); _tm = _tlm; }
+                if (ops.Count >= 2) { FlushBuffer(); _tlm = new Matrix(1, 0, 0, 1, Num(ops, 0), Num(ops, 1)).Multiply(_tlm); _tm = _tlm; }
                 break;
             case "TD":
                 if (ops.Count >= 2)
                 {
+                    FlushBuffer();
                     _gs.Leading = -Num(ops, 1);
                     _tlm = new Matrix(1, 0, 0, 1, Num(ops, 0), Num(ops, 1)).Multiply(_tlm); _tm = _tlm;
                 }
                 break;
             case "Tm":
-                if (ops.Count >= 6) { _tlm = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5)); _tm = _tlm; }
+                if (ops.Count >= 6) { FlushBuffer(); _tlm = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5)); _tm = _tlm; }
                 break;
             case "T*":
+                FlushBuffer();
                 _tlm = new Matrix(1, 0, 0, 1, 0, -_gs.Leading).Multiply(_tlm); _tm = _tlm;
                 break;
             case "Tc": _gs.CharSpace = Num(ops, 0); break;
@@ -154,6 +196,7 @@ public sealed class PdfContentExtractor
             case "TL": _gs.Leading = Num(ops, 0); break;
             case "Ts": _gs.Rise = Num(ops, 0); break;
             case "Tf":
+                FlushBuffer();
                 if (ops.Count >= 2 && ops[0] is PdfName fn)
                 {
                     fonts.TryGetValue(fn.Value, out var font);
@@ -165,12 +208,14 @@ public sealed class PdfContentExtractor
                 if (ops.Count >= 1 && ops[^1] is PdfString s) ShowText(s.Bytes);
                 break;
             case "'":
+                FlushBuffer();
                 _tlm = new Matrix(1, 0, 0, 1, 0, -_gs.Leading).Multiply(_tlm); _tm = _tlm;
                 if (ops.Count >= 1 && ops[^1] is PdfString s2) ShowText(s2.Bytes);
                 break;
             case "\"":
                 if (ops.Count >= 3)
                 {
+                    FlushBuffer();
                     _gs.WordSpace = Num(ops, 0);
                     _gs.CharSpace = Num(ops, 1);
                     _tlm = new Matrix(1, 0, 0, 1, 0, -_gs.Leading).Multiply(_tlm); _tm = _tlm;
@@ -178,26 +223,102 @@ public sealed class PdfContentExtractor
                 }
                 break;
             case "TJ":
+                FlushBuffer();
                 if (ops.Count >= 1 && ops[^1] is PdfArray arr) ShowTextArray(arr);
                 break;
             case "Do":
+                FlushBuffer();
                 if (ops.Count >= 1 && ops[0] is PdfName xn) DoXObject(xn.Value, xobjects, depth);
                 break;
         }
     }
 
+    // TJ array (pdf_oxide process_tj_array_tiebreaker): accumulate all strings
+    // into one span; only offsets below SpaceInsertionThreshold split the span
+    // (flush + synthetic space span, mirroring insert_space_as_span).
     private void ShowTextArray(PdfArray arr)
     {
-        foreach (var it in arr.Items)
+        for (int i = 0; i < arr.Items.Count; i++)
         {
+            var it = arr.Items[i];
             if (it is PdfString s) ShowText(s.Bytes);
             else if (it is PdfNumber n)
             {
+                if (n.Value < SpaceInsertionThreshold)
+                {
+                    bool bufEndsWithSpace = _buf != null && _buf.Text.Length > 0
+                        && char.IsWhiteSpace(_buf.Text[^1]);
+                    FlushBuffer();
+                    bool nextStartsWithSpace = i + 1 < arr.Items.Count
+                        && arr.Items[i + 1] is PdfString ns && ns.Bytes.Length > 0
+                        && (ns.Bytes[0] == 0x20 || ns.Bytes[0] == 0x09 || ns.Bytes[0] == 0x0A || ns.Bytes[0] == 0x0D);
+                    if (!bufEndsWithSpace && !nextStartsWithSpace) InsertSpaceSpan();
+                }
                 // TJ adjustment: subtract n/1000 * fontSize * Tz from text position.
                 double adj = -n.Value / 1000.0 * _gs.FontSize * (_gs.Hscale / 100.0);
                 _tm = new Matrix(1, 0, 0, 1, adj, 0).Multiply(_tm);
             }
         }
+    }
+
+    // Synthetic space span for a large TJ offset (pdf_oxide insert_space_as_span).
+    private void InsertSpaceSpan()
+    {
+        var combined = _tm.Multiply(_gs.Ctm);
+        double effSize = _gs.FontSize * Math.Sqrt(combined.D * combined.D + combined.B * combined.B);
+        double spaceAdvance = (250.0 * _gs.FontSize / 1000.0 + _gs.WordSpace) * (_gs.Hscale / 100.0);
+        _spans.Add(new TextSpan
+        {
+            Text = " ",
+            X = combined.E,
+            Y = combined.F,
+            Width = spaceAdvance,
+            Height = effSize,
+            FontSize = effSize,
+            IsBold = false,
+            IsItalic = _gs.Font?.IsItalic ?? false,
+            IsMonospace = false,
+        });
+    }
+
+    private void StartBuffer()
+    {
+        var combined = _tm.Multiply(_gs.Ctm);
+        _buf = new TjBuffer
+        {
+            StartX = combined.E,
+            StartY = combined.F,
+            EffFontSize = _gs.FontSize * Math.Sqrt(combined.D * combined.D + combined.B * combined.B),
+            UserHScale = Math.Sqrt(combined.A * combined.A + combined.C * combined.C),
+            IsBold = _gs.Font?.IsBold ?? false,
+            IsItalic = _gs.Font?.IsItalic ?? false,
+            IsMonospace = _gs.Font?.IsMonospace ?? false,
+        };
+    }
+
+    private void FlushBuffer()
+    {
+        var b = _buf;
+        _buf = null;
+        if (b == null || b.Text.Length == 0) return;
+        string text = b.Text.ToString();
+        // RTL correction (pdf_oxide flush_tj_buffer): text within a buffer is
+        // in visual LTR draw order; when it contains RTL characters and the
+        // buffer advanced left-to-right, reverse to logical order.
+        if (text.Length > 1 && b.HasRtl && b.AccumWidth > 0.0)
+            text = PdfBidi.ReverseRtlKeepNumbers(text);
+        _spans.Add(new TextSpan
+        {
+            Text = text,
+            X = b.StartX,
+            Y = b.StartY,
+            Width = b.AccumWidth * b.UserHScale,
+            Height = b.EffFontSize,
+            FontSize = b.EffFontSize,
+            IsBold = b.IsBold,
+            IsItalic = b.IsItalic,
+            IsMonospace = b.IsMonospace,
+        });
     }
 
     private void ShowText(byte[] bytes)
@@ -207,15 +328,8 @@ public sealed class PdfContentExtractor
         double hs = _gs.Hscale / 100.0;
         double fmA = font?.FontMatrixA ?? 0.001;
 
-        var sb = new StringBuilder();
-        // Start position of the span.
-        var startCombined = _tm.Multiply(_gs.Ctm);
-        double startX = startCombined.E;
-        double startY = startCombined.F + _gs.Rise * Math.Sqrt(startCombined.B * startCombined.B + startCombined.D * startCombined.D) * Math.Sign(1);
-        double effSize = fontSize * Math.Sqrt(startCombined.D * startCombined.D + startCombined.B * startCombined.B);
-        bool any = false;
-        double lastEndX = startX;
-        double baselineY = startCombined.F;
+        if (_buf == null) StartBuffer();
+        var buf = _buf!;
 
         var codes = font != null ? font.DecodeCodes(bytes) : DefaultCodes(bytes);
         foreach (int code in codes)
@@ -228,30 +342,13 @@ public sealed class PdfContentExtractor
             foreach (var ch in u)
             {
                 if (ch == '\0' || (char.IsControl(ch) && ch != '\t' && ch != '\n' && ch != '\r')) continue;
-                sb.Append(ch);
-                any = true;
+                buf.Text.Append(ch);
+                if (!buf.HasRtl && PdfBidi.IsRtlText(ch)) buf.HasRtl = true;
             }
 
             // Advance text matrix.
             _tm = new Matrix(1, 0, 0, 1, tx, 0).Multiply(_tm);
-        }
-        var endCombined = _tm.Multiply(_gs.Ctm);
-        double endX = endCombined.E;
-
-        if (any)
-        {
-            _spans.Add(new TextSpan
-            {
-                Text = sb.ToString(),
-                X = startX,
-                Y = baselineY,
-                Width = endX - startX,
-                Height = effSize,
-                FontSize = (float)effSize,
-                IsBold = font?.IsBold ?? false,
-                IsItalic = font?.IsItalic ?? false,
-                IsMonospace = font?.IsMonospace ?? false,
-            });
+            buf.AccumWidth += tx;
         }
     }
 
@@ -277,6 +374,7 @@ public sealed class PdfContentExtractor
         }
         var formRes = _doc.Resolve(st.Dict.Get("Resources")).AsDict();
         try { Run(_doc.DecodeStream(st), formRes, depth + 1); } catch { }
+        FlushBuffer();
         if (_stack.Count > 0) _gs = _stack.Pop();
         _tm = savedTm; _tlm = savedTlm;
     }
