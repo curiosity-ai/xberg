@@ -19,6 +19,18 @@ using Xberg.Types;
 //     --strict-md         count markdown/html mismatches as failures (default: soft/reported)
 //     --list-ok           also list fixtures that fully match
 
+// Single-file extract mode: `--extract <file> [--format plain|markdown|html|json]`
+// Prints the C# extractor's output for one file (used to build the quality gallery).
+if (args.Length >= 2 && args[0] == "--extract")
+{
+    var fmt = OutputFormat.Plain;
+    for (int i = 2; i < args.Length - 1; i++)
+        if (args[i] == "--format") fmt = OutputFormat.FromString(args[i + 1]);
+    var res = new Extractor().Extract(ExtractInput.FromUri(args[1]), new ExtractionConfig { OutputFormat = fmt });
+    Console.Out.Write(res.Results.FirstOrDefault()?.Content ?? "");
+    return 0;
+}
+
 var opts = ParseArgs(args);
 if (opts is null) return 2;
 
