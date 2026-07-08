@@ -78,6 +78,27 @@ public sealed class EpubExtractor : IExtractor
             Additional = additionalMetadata,
         };
 
+        // Pre-rendered markdown (epub/mod.rs "Accumulate pre-rendered markdown"):
+        // every spine document is converted BEFORE the navigation-document skip, the
+        // fragments joined with a blank line, line trailing-whitespace trimmed, and a
+        // single trailing newline appended. Stored as pre_rendered_content so the
+        // pipeline returns it verbatim instead of the comrak re-render.
+        if (config.OutputFormat.Which == Core.OutputFormat.Kind.Markdown && spineDocuments.Count > 0)
+        {
+            var fragments = new List<string>(spineDocuments.Count);
+            foreach (var spineDoc in spineDocuments)
+                fragments.Add(Internal.Html.HtmlToMarkdown.Convert(spineDoc.Xhtml).TrimEnd('\n', '\r'));
+
+            string combined = string.Join("\n\n", fragments);
+            combined = string.Join("\n", combined.Split('\n').Select(l => l.TrimEnd()));
+            string trimmed = combined.TrimEnd();
+            if (trimmed.Length > 0)
+            {
+                doc.PreRenderedContent = trimmed + "\n";
+                doc.Metadata.OutputFormat = "markdown";
+            }
+        }
+
         return doc;
     }
 
