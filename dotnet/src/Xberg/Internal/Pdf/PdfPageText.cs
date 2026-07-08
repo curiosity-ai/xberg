@@ -57,11 +57,7 @@ public static class PdfPageText
                 if (sameLine)
                 {
                     double xGap = span.X - prevEndX;
-                    // pdf_oxide boundary-space guard (has_boundary_space, extractors/
-                    // text.rs:1622): never synthesize a gap space when the accumulated
-                    // text already ends with whitespace OR the next span starts with
-                    // whitespace (Rule 0). Requiring BOTH double-spaced justified prose.
-                    if (xGap > span.FontSize * 0.15 && !HasBoundaryWhitespace(sb, span.Text))
+                    if (xGap > span.FontSize * 0.15 && !SuppressGapSpace(sb, span.Text, xGap, span.FontSize))
                         sb.Append(' ');
                 }
                 else if (yGap > paragraphGap) sb.Append("\n\n");
@@ -231,8 +227,7 @@ public static class PdfPageText
             {
                 double gap = s.X - prevEndX;
                 double threshold = byXThreshold ? fontSize * 0.5 : s.FontSize * 0.15;
-                // pdf_oxide boundary-space guard (has_boundary_space, text.rs:1622).
-                if (gap > threshold && !HasBoundaryWhitespace(sb, s.Text))
+                if (gap > threshold && !SuppressGapSpace(sb, s.Text, gap, s.FontSize))
                     sb.Append(' ');
             }
             // Dedupe literal space across span boundary (pdf_oxide merge guard).
@@ -316,7 +311,7 @@ public static class PdfPageText
             foreach (var span in group)
             {
                 if (!double.IsInfinity(prevEndX) && span.X - prevEndX > spaceThreshold &&
-                    !HasBoundaryWhitespace(sb, span.Text))
+                    !SuppressGapSpace(sb, span.Text, span.X - prevEndX, fontSize))
                     sb.Append(' ');
                 sb.Append(span.Text);
                 prevEndX = span.X + span.Width;
@@ -446,16 +441,28 @@ public static class PdfPageText
         return columns;
     }
 
-    // Port of has_boundary_space (extractors/text.rs:1622). True when a space
-    // already sits at the span boundary: the accumulated text ends with
-    // whitespace OR the following span text starts with whitespace. Used to
-    // suppress a synthesized gap-space (Rule 0) so justified prose whose words
-    // carry literal space glyphs isn't double-spaced.
-    private static bool HasBoundaryWhitespace(StringBuilder preceding, string following)
+    // Decide whether to suppress a synthesized gap-space at a span boundary.
+    //
+    // pdf_oxide applies has_boundary_space (extractors/text.rs:1622) — "space
+    // already present when preceding ends OR following starts with whitespace"
+    // — only INSIDE merge_adjacent_spans, i.e. for spans close enough to merge
+    // into one run. The xberg join layer that this method mirrors
+    // (extract_page_text_column_aware) then joins the already-merged runs with a
+    // plain `x_gap > font_size*0.15 -> push(' ')` rule and NO boundary guard.
+    //
+    // Since our assembly walks the original (pre-merge) spans, we reproduce both
+    // tiers here: within the merge regime (small gap) a one-sided boundary space
+    // suppresses the synthetic space (justified prose "eos  et" -> "eos et");
+    // beyond it (large inter-run gap) only a two-sided literal+literal collision
+    // is suppressed, so list-bullet indents keep their gap space ("•  IBM").
+    private static bool SuppressGapSpace(StringBuilder preceding, string following, double xGap, double fontSize)
     {
-        if (preceding.Length > 0 && char.IsWhiteSpace(preceding[^1])) return true;
-        if (following.Length > 0 && char.IsWhiteSpace(following[0])) return true;
-        return false;
+        bool prevSpace = preceding.Length > 0 && char.IsWhiteSpace(preceding[^1]);
+        bool nextSpace = following.Length > 0 && char.IsWhiteSpace(following[0]);
+        if (!prevSpace && !nextSpace) return false;
+        if (prevSpace && nextSpace) return true;
+        double mergeThreshold = Math.Max(5.0, fontSize * 0.5);
+        return xGap <= mergeThreshold;
     }
 
     /// <summary>Port of fix_pdf_control_chars (crates/xberg/src/pdf/text.rs).</summary>
