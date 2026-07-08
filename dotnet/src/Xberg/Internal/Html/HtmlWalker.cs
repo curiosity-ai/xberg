@@ -505,7 +505,7 @@ public sealed class HtmlWalker
         HtmlToMarkdown.EmitTableTree(table, grid =>
         {
             if (grid.Count > 0) _b.PushTableFromCells(grid, null, null);
-        });
+        }, (alt, src) => EmitImage(alt, src));
     }
 
     private static HNode? FindFirstTag(HNode node, string tag)

@@ -59,6 +59,9 @@ internal static class HtmlToMarkdown
         // crate's structure collector `push_table_data`): nested tables are emitted before their
         // parent, in the order the two cell-walks (render + collect) encounter them.
         public Action<List<List<string>>>? TableEmit { get; init; }
+        // When set, every <img> handled reports its (alt, src) to this sink (mirrors the crate's
+        // structure collector `push_image`), so images inside table cells become image nodes.
+        public Action<string?, string>? ImageEmit { get; init; }
     }
 
     // ── table grid emission (structure collector) ────────────────────────────
@@ -67,9 +70,10 @@ internal static class HtmlToMarkdown
     /// mirroring the html-to-markdown crate's document-structure collector. Each grid is passed
     /// to <paramref name="emit"/>; nested tables are emitted before their enclosing table.
     /// </summary>
-    public static void EmitTableTree(HNode table, Action<List<List<string>>> emit)
+    public static void EmitTableTree(HNode table, Action<List<List<string>>> emit,
+        Action<string?, string>? imageEmit = null)
     {
-        var ctx = new Ctx { TableEmit = emit };
+        var ctx = new Ctx { TableEmit = emit, ImageEmit = imageEmit };
         var dummy = new StringBuilder();
         HandleTableWithContext(table, dummy, ctx);
     }
@@ -1074,6 +1078,10 @@ internal static class HtmlToMarkdown
         string alt = node.Attr("alt") ?? "";
         string? title = node.Attr("title");
 
+        // Structure-collector side effect: report every <img> so cell images become nodes
+        // (the crate's push_image runs unconditionally, once per handler invocation).
+        ctx.ImageEmit?.Invoke(alt.Length == 0 ? null : alt, src);
+
         bool shouldUseAltText = ctx.ConvertAsInline || ctx.InHeading;
         if (shouldUseAltText) { output.Append(alt); return; }
 
@@ -1862,18 +1870,13 @@ internal static class HtmlToMarkdown
 
     private static string RenderCellContent(HNode cell, Ctx ctx)
     {
-        bool hasTagChild = cell.Children.Any(c => c.Tag is not null);
-        if (hasTagChild)
-        {
-            var buf = new StringBuilder();
-            var cctx = ctx with { InTableCell = true };
-            foreach (var c in cell.Children) WalkNode(c, buf, cctx);
-            return buf.ToString();
-        }
-        var raw = new StringBuilder();
-        AppendTextContent(cell, raw);
-        string normalized = NormalizeWhitespaceKeepNewlines(raw.ToString());
-        return EscapeCellText(normalized);
+        // Always walk children under an in-cell context (mirrors the crate's convert_table_cell,
+        // which routes every cell through walk_node). Text nodes decode entities and escape
+        // *_| there, so `&nbsp;`-only cells collapse to empty exactly like the grid path.
+        var buf = new StringBuilder();
+        var cctx = ctx with { InTableCell = true };
+        foreach (var c in cell.Children) WalkNode(c, buf, cctx);
+        return buf.ToString();
     }
 
     private static string EscapeCellText(string text)
