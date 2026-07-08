@@ -249,7 +249,8 @@ public sealed class HtmlWalker
                     _preBlock = new PreBlock { Language = ExtractLanguageFromClass(ExtractAttr(attrs, "class")) };
                 else PushInline(InlineKind.Code, null, null);
                 break;
-            case "u": case "ins": PushInline(InlineKind.Underline, null, null); break;
+            case "u": PushInline(InlineKind.Underline, null, null); break;
+            case "ins": PushInline(InlineKind.Highlight, null, null); break;
             case "s": case "del": case "strike": PushInline(InlineKind.Strikethrough, null, null); break;
             case "sub": PushInline(InlineKind.Subscript, null, null); break;
             case "sup": PushInline(InlineKind.Superscript, null, null); break;
@@ -384,7 +385,8 @@ public sealed class HtmlWalker
             case "em": case "i": case "var": case "cite": case "dfn": PopInline(InlineKind.Italic); break;
             case "kbd": case "samp": PopInline(InlineKind.Code); break;
             case "code": if (!_inPre) PopInline(InlineKind.Code); break;
-            case "u": case "ins": PopInline(InlineKind.Underline); break;
+            case "u": PopInline(InlineKind.Underline); break;
+            case "ins": PopInline(InlineKind.Highlight); break;
             case "s": case "del": case "strike": PopInline(InlineKind.Strikethrough); break;
             case "sub": PopInline(InlineKind.Subscript); break;
             case "sup": PopInline(InlineKind.Superscript); break;
@@ -556,6 +558,7 @@ public sealed class HtmlWalker
         InlineKind.Italic => "*",
         InlineKind.Code => "`",
         InlineKind.Strikethrough => "~~",
+        InlineKind.Highlight => "==",
         _ => "",
     };
 
@@ -568,18 +571,21 @@ public sealed class HtmlWalker
             return;
         }
         string mk = Marker(kind);
-        bool alreadyOpen = mk.Length > 0 && _inlineStack.Exists(s => s.Kind == kind);
-        if (mk.Length > 0 && !alreadyOpen) AppendInline(mk);
-        _inlineStack.Add(new InlineSpan { Kind = kind });
+        // Only <strong>/<b> de-dupe when nested inside the same kind (crate `in_strong`);
+        // <em>/<i>, strikethrough and highlight always emit their markers (no de-dupe).
+        bool dedup = kind == InlineKind.Bold && _inlineStack.Exists(s => s.Kind == kind);
+        bool emit = mk.Length > 0 && !dedup;
+        if (emit) AppendInline(mk);
+        _inlineStack.Add(new InlineSpan { Kind = kind, Emitted = emit });
     }
 
     private void PopInline(InlineKind expected)
     {
         int idx = _inlineStack.FindLastIndex(s => s.Kind == expected);
         if (idx < 0) return;
+        var span = _inlineStack[idx];
         _inlineStack.RemoveAt(idx);
-        string mk = Marker(expected);
-        if (mk.Length > 0 && !_inlineStack.Exists(s => s.Kind == expected)) AppendInline(mk);
+        if (span.Emitted) AppendInline(Marker(expected));
     }
 
     private void PopInlineLink()
@@ -1058,7 +1064,7 @@ public sealed class HtmlWalker
     // ── nested state types ─────────────────────────────────────────────────
     private enum InlineKind { Bold, Italic, Code, Underline, Strikethrough, Link, Subscript, Superscript, Highlight }
 
-    private struct InlineSpan { public InlineKind Kind; public int TextStart; public string? Href; public string? Title; }
+    private struct InlineSpan { public InlineKind Kind; public int TextStart; public string? Href; public string? Title; public bool Emitted; }
 
     private sealed class PreBlock { public string? Language; public readonly StringBuilder Text = new(); }
 

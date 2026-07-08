@@ -229,8 +229,11 @@ internal static class HtmlToMarkdown
             case "del": case "s": case "strike":
                 HandleStrikethrough(node, output, ctx);
                 break;
-            case "mark":     // HighlightStyle::None → passthrough
-            case "ins": case "u": case "small": case "abbr": case "bdi": case "bdo":
+            case "mark":     // HighlightStyle::DoubleEqual (default) → ==…==
+            case "ins":      // inserted text → ==…== (marks.rs handle_inserted)
+                HandleHighlight(node, output, ctx);
+                break;
+            case "u": case "small": case "abbr": case "bdi": case "bdo":
             case "rb": case "rtc":
                 WalkChildren(node, output, ctx);
                 break;
@@ -735,6 +738,25 @@ internal static class HtmlToMarkdown
         if (content.ToString().Trim().Length > 0)
         {
             output.Append(prefix).Append("~~").Append(trimmed).Append("~~");
+            AppendInlineSuffix(output, suffix, trimmed.Length > 0, node);
+        }
+        else if (content.Length > 0)
+        {
+            output.Append(prefix);
+            AppendInlineSuffix(output, suffix, false, node);
+        }
+    }
+
+    // ins / mark → ==content== (marks.rs handle_inserted / handle_mark, DoubleEqual default)
+    private static void HandleHighlight(HNode node, StringBuilder output, Ctx ctx)
+    {
+        if (ctx.InCode) { WalkChildren(node, output, ctx); return; }
+        var content = new StringBuilder();
+        foreach (var c in node.Children) WalkNode(c, content, ctx);
+        var (prefix, suffix, trimmed) = ChompInline(content.ToString());
+        if (content.ToString().Trim().Length > 0)
+        {
+            output.Append(prefix).Append("==").Append(trimmed).Append("==");
             AppendInlineSuffix(output, suffix, trimmed.Length > 0, node);
         }
         else if (content.Length > 0)
