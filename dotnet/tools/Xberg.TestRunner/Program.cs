@@ -189,7 +189,7 @@ static string NormalizeSorted(string s)
 static double Similarity(string a, string b)
 {
     // Bounded LCS-ratio on capped inputs (cheap, good enough for bucketing).
-    const int cap = 40000;
+    const int cap = 2500;  // LCS is O(n*m); a small cap keeps similarity bucketing cheap
     if (a.Length > cap) a = a[..cap];
     if (b.Length > cap) b = b[..cap];
     if (a.Length == 0 && b.Length == 0) return 1.0;
