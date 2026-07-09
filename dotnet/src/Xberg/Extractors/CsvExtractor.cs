@@ -125,8 +125,20 @@ public sealed partial class CsvExtractor : IExtractor
         return rows;
     }
 
+    // Ordered fallback labels, mirroring Rust `decode_csv_bytes_fallback` (encoding_rs).
+    private static readonly string[] CsvEncodingLabels =
+        { "shift_jis", "windows-31j", "windows-1252", "iso-8859-1", "gb18030", "big5" };
+
+    /// <summary>
+    /// Decode raw CSV bytes with encoding detection, porting Rust `decode_csv_bytes`.
+    /// UTF-8 fast path first; otherwise try the fallback labels in order and pick the first
+    /// that decodes without producing replacement characters (matching encoding_rs's
+    /// <c>had_errors == false</c> check). Legacy code pages are enabled by the module
+    /// initializer in <see cref="Core.Encodings"/>.
+    /// </summary>
     private static string DecodeCsvBytes(ReadOnlySpan<byte> content)
     {
+        // Fast path: valid UTF-8.
         try
         {
             var strict = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
@@ -134,20 +146,42 @@ public sealed partial class CsvExtractor : IExtractor
         }
         catch (DecoderFallbackException)
         {
-            // Fallback: try common non-UTF-8 encodings (Shift-JIS, cp932, windows-1252, …).
-            foreach (var label in new[] { "shift_jis", "windows-31j", "windows-1252", "iso-8859-1", "gb18030", "big5" })
-            {
-                try
-                {
-                    var enc = Encoding.GetEncoding(label,
-                        EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
-                    return enc.GetString(content);
-                }
-                catch { /* try next */ }
-            }
-            try { return Encoding.GetEncoding("shift_jis").GetString(content); }
-            catch { return Encoding.UTF8.GetString(content); }
+            // continue to legacy-charset detection
         }
+
+        byte[] bytes = content.ToArray();
+
+        // First label that decodes cleanly (no U+FFFD replacement) wins.
+        foreach (var label in CsvEncodingLabels)
+        {
+            if (TryDecodeWithoutErrors(label, bytes, out string decoded))
+                return decoded;
+        }
+
+        // All candidates had errors: decode as Shift-JIS anyway (lossy), matching Rust,
+        // then fall back to lossy UTF-8.
+        try { return Encoding.GetEncoding("shift_jis").GetString(bytes); }
+        catch (ArgumentException) { return Encoding.UTF8.GetString(bytes); }
+    }
+
+    /// <summary>
+    /// Decode <paramref name="bytes"/> with <paramref name="label"/> using the encoding's
+    /// default replacement fallback, returning false when the label is unknown or the decoded
+    /// text contains a U+FFFD replacement character (i.e. the encoding had decode errors).
+    /// Note: we deliberately do NOT use <see cref="DecoderFallback.ExceptionFallback"/> — .NET's
+    /// CP932 flags valid NEC/IBM-extension characters (e.g. 髙, bytes EE E0) as best-fit and
+    /// would throw on them, unlike WHATWG shift_jis / encoding_rs which decode them correctly.
+    /// </summary>
+    private static bool TryDecodeWithoutErrors(string label, byte[] bytes, out string decoded)
+    {
+        decoded = "";
+        Encoding enc;
+        try { enc = Encoding.GetEncoding(label); }
+        catch (ArgumentException) { return false; }
+        string s = enc.GetString(bytes);
+        if (s.Contains('�')) return false;
+        decoded = s;
+        return true;
     }
 
     private static bool DetectHeader(List<List<string>> rows)

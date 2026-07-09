@@ -495,14 +495,48 @@ internal static class MimeParser
     // UTF-16 transcode (BOM only; the no-BOM chardet heuristic is deferred)
     // -----------------------------------------------------------------------
 
+    /// <summary>
+    /// Port of Rust `maybe_transcode_utf16`. `mail_parser` (and this parser) expect
+    /// ASCII/UTF-8 input, so UTF-16 EML files are transcoded to UTF-8 first.
+    ///
+    /// Detection: (1) an explicit BOM (FF FE = LE, FE FF = BE), or (2) no BOM but an
+    /// alternating-null-byte pattern in the first 8 bytes — the common shape of a UTF-16
+    /// file that starts with ASCII headers. Rust confirms case (2) with chardetng (accepting
+    /// only a UTF-8/windows-1252 guess); lacking chardetng, we instead require the payload to
+    /// decode as valid UTF-16 (throwing decoder), which rejects legacy single-byte content.
+    /// </summary>
     private static byte[]? MaybeTranscodeUtf16(byte[] data)
     {
         if (data.Length < 4) return null;
-        if (data[0] == 0xFF && data[1] == 0xFE)
-            return Utf8NoBom.GetBytes(Encoding.Unicode.GetString(data, 2, (data.Length - 2) & ~1));
-        if (data[0] == 0xFE && data[1] == 0xFF)
-            return Utf8NoBom.GetBytes(Encoding.BigEndianUnicode.GetString(data, 2, (data.Length - 2) & ~1));
-        return null;
+
+        bool isLe;
+        int skip;
+
+        if (data[0] == 0xFF && data[1] == 0xFE) { isLe = true; skip = 2; }
+        else if (data[0] == 0xFE && data[1] == 0xFF) { isLe = false; skip = 2; }
+        else if (data.Length >= 16)
+        {
+            // No BOM: look for alternating null bytes across the first 8 bytes.
+            bool isLeHeuristic = data[1] == 0x00 && data[3] == 0x00 && data[5] == 0x00 && data[7] == 0x00;
+            bool isBeHeuristic = data[0] == 0x00 && data[2] == 0x00 && data[4] == 0x00 && data[6] == 0x00;
+            if (isLeHeuristic || isBeHeuristic) { isLe = isLeHeuristic; skip = 0; }
+            else return null;
+        }
+        else return null;
+
+        int len = (data.Length - skip) & ~1;
+        var decoder = isLe
+            ? new UnicodeEncoding(bigEndian: false, byteOrderMark: false, throwOnInvalidBytes: true)
+            : new UnicodeEncoding(bigEndian: true, byteOrderMark: false, throwOnInvalidBytes: true);
+        try
+        {
+            string s = decoder.GetString(data, skip, len);
+            return Utf8NoBom.GetBytes(s);
+        }
+        catch (DecoderFallbackException)
+        {
+            return null;
+        }
     }
 
     private static string NonEmptyOr(string s, string fallback) => s.Length > 0 ? s : fallback;
