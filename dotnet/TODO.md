@@ -9,20 +9,6 @@ Each format is "done" when the `Xberg.TestRunner` output matches the committed
 > fixtures (<80%) are genuine content misses.** 231 unit tests. The remaining real misses are
 > mostly big new-format ports (iWork, 7z/xlsb) or unmatchable-by-nature (non-deterministic /
 > mojibake goldens); the rest are deep PDF reading-order. Byte-vs-content gap (~230) is cosmetic.
-> ~2096/2494 on content dimensions (text + structured JSON + metadata + tables). 206 tests.
-> Remaining gap to higher parity is fundamental: PDF text geometry (pdfium-exact word
-> coordinates, ~220 PDFs) and the separate html_to_markdown_rs engine Rust uses for HTML/EPUB
-> markdown (~40-60). Non-deterministic Rust hashmap ordering (zip/tar/dbf) and OCR/audio are
-> unmatchable by design.
-> (build green, 181 unit tests). Ported & validated: txt, docx, xlsx, pptx, odt, rtf, epub,
-> eml, msg, doc, ppt, xls, hwp, hwpx, ods, json/jsonl, csv/tsv, xml, yaml, toml, markdown,
-> mdx, html, docbook, jats, rst, org, typst, latex, opml, jupyter, fictionbook, bibtex,
-> citation, dbf, image (metadata/EXIF), zip/tar/gzip, and pdf. Fully-green formats (all
-> dimensions): txt, xlsx, pptx, odt, rtf, msg, doc, xls, tex, typ, org, ipynb, opml, tsv,
-> ods, docbook. Renderers (Markdown/HTML) are now byte-exact (comrak port).
-> Remaining gaps: markdown parser edge cases, PDF tables + multi-column reading order,
-> HTML readability preprocessing, 7z (needs managed LZMA), iwork, djot, code files, and
-> some FormatMetadata payload fields (bib/ris/fb2/jats) — all tracked below.
 ---
 
 ## Phase 0 — Setup & reference data
