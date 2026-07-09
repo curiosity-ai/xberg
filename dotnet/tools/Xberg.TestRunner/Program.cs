@@ -145,10 +145,70 @@ foreach (var goldenPath in goldenFiles)
     if (tablesMatch) es.TablesMatch++; else { es.TablesMismatch++; allHard = false; AddExample(examples, "tables", rel, Compact(golden["tables"]), Compact(SerializeToNode(plainDoc?.Tables)), opts); }
 
     if (allHard) { es.Ok++; stats.Ok++; if (opts.ListOk) Console.WriteLine($"  ok  {rel}"); }
+
+    // ── Content-parity (separate from byte-parity) ──────────────────────────
+    // Byte-parity penalises us for cosmetic and even for being-more-correct-than-Rust
+    // differences. Content-parity asks the honest question: is the extracted TEXT the
+    // same, ignoring whitespace/spacing and reading-order? Measured on the plain text.
+    {
+        string rustPlain = golden["content"]?["plain"]?.GetValue<string>() ?? "";
+        string csPlain = got["plain"];
+        if (rustPlain == csPlain) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
+        else if (NormalizeText(rustPlain) == NormalizeText(csPlain)) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
+        else if (NormalizeSorted(rustPlain) == NormalizeSorted(csPlain)) { stats.ContentOrder++; stats.ContentClose++; }
+        else
+        {
+            double r = Similarity(rustPlain, csPlain);
+            if (r >= 0.95) stats.ContentClose++;
+            else if (r >= 0.80) stats.ContentPartial++;
+            else stats.ContentLow++;
+        }
+    }
 }
 
 PrintReport(stats, examples, opts);
+Console.WriteLine();
+Console.WriteLine("─── Content parity (plain text; whitespace/order-normalized) ───");
+int cTotal = stats.Total;
+Console.WriteLine($"  content-identical (ws/order-normalized): {stats.ContentExact + stats.ContentOrder}  ({Pct(stats.ContentExact + stats.ContentOrder, cTotal)})");
+Console.WriteLine($"  ≥95% similar (near-identical):           {stats.ContentClose}  ({Pct(stats.ContentClose, cTotal)})");
+Console.WriteLine($"  80–95% similar (minor content drift):    {stats.ContentPartial}");
+Console.WriteLine($"  <80% similar (real content miss):        {stats.ContentLow}");
 return 0;
+
+static string Pct(int n, int d) => d == 0 ? "—" : $"{100.0 * n / d:F1}%";
+
+// Whitespace + line-order insensitive (catches pure reading-order differences).
+static string NormalizeSorted(string s)
+{
+    var lines = s.Split('\n').Select(l => NormalizeText(l)).Where(l => l.Length > 0).ToList();
+    lines.Sort(StringComparer.Ordinal);
+    return string.Join("\n", lines);
+}
+
+static double Similarity(string a, string b)
+{
+    // Bounded LCS-ratio on capped inputs (cheap, good enough for bucketing).
+    const int cap = 40000;
+    if (a.Length > cap) a = a[..cap];
+    if (b.Length > cap) b = b[..cap];
+    if (a.Length == 0 && b.Length == 0) return 1.0;
+    int lcs = Lcs(a, b);
+    return 2.0 * lcs / (a.Length + b.Length);
+}
+
+static int Lcs(string a, string b)
+{
+    var prev = new int[b.Length + 1];
+    var cur = new int[b.Length + 1];
+    for (int i = 1; i <= a.Length; i++)
+    {
+        for (int j = 1; j <= b.Length; j++)
+            cur[j] = a[i - 1] == b[j - 1] ? prev[j - 1] + 1 : Math.Max(prev[j], cur[j - 1]);
+        (prev, cur) = (cur, prev);
+    }
+    return prev[b.Length];
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 static (string name, OutputFormat fmt)[] Formats() =>
@@ -334,6 +394,7 @@ sealed class DimStat { public int Match; public int Mismatch; }
 sealed class ExtStat
 {
     public int Total, Ok, BothUnsupported, Extra, MetaMatch, MetaMismatch, TablesMatch, TablesMismatch;
+    public int ContentExact;
     public readonly DimStat Plain = new(), Markdown = new(), Html = new(), Json = new();
     public DimStat Dim(string n) => n switch { "plain" => Plain, "markdown" => Markdown, "html" => Html, _ => Json };
 }
@@ -341,5 +402,7 @@ sealed class ExtStat
 sealed class Stats
 {
     public int Total, Ok, BothUnsupported, Extra, NoSource, BadGolden;
+    // Content-parity buckets (plain text, whitespace/order-normalized).
+    public int ContentExact, ContentOrder, ContentClose, ContentPartial, ContentLow;
     public readonly Dictionary<string, ExtStat> ByExt = new();
 }
