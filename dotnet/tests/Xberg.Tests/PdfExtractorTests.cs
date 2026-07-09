@@ -432,4 +432,79 @@ public class PdfExtractorTests
         Assert.Equal("A", words[1].Text);
         Assert.Equal(180u, words[1].Left);
     }
+
+    // ---- Double-drawn / duplicate-glyph de-duplication (issue #71 / #1114) ----
+
+    private static TextSpan Sp(string text, double x, double y, double w, double h = 10)
+        => new TextSpan { Text = text, X = x, Y = y, Width = w, Height = h, FontSize = h };
+
+    [Fact]
+    public void Dedup_DropsGeometricallyOverlappingGlyphs()
+    {
+        // A run drawn twice at a ~0.3pt offset (fill+stroke). After the reading-
+        // order sort the twin glyphs are adjacent; the second copy is dropped.
+        var spans = new List<TextSpan>
+        {
+            Sp("本", 503.87, 186, 8.54), Sp("科", 512.48, 186, 8.54),
+            Sp("本", 503.60, 186, 8.54), Sp("科", 512.20, 186, 8.54),
+        };
+        var kept = PdfPageText.DeduplicateOverlappingSpans(
+            PdfPageText.SortSpansByReadingOrder(spans));
+        Assert.Equal(new[] { "本", "科" }, kept.Select(s => s.Text).ToArray());
+    }
+
+    [Fact]
+    public void Dedup_DropsExactContentDuplicate()
+    {
+        // Same word emitted twice at the identical position (content phase,
+        // text >= 5 bytes, overlapping X/Y).
+        var spans = new List<TextSpan>
+        {
+            Sp("Duplicated", 117.61, 481.86, 85.0),
+            Sp("Duplicated", 117.61, 481.86, 85.0),
+        };
+        var kept = PdfPageText.DeduplicateOverlappingSpans(spans);
+        Assert.Single(kept);
+    }
+
+    [Fact]
+    public void Dedup_DropsStrokeFillOverlapByIoU()
+    {
+        // Large display title drawn twice at a ~1.5pt offset — not on the same
+        // rounded baseline, so only the IoU (stroke+fill) phase catches it.
+        var spans = new List<TextSpan>
+        {
+            Sp("THE", 240.30, 789.07, 139.25, 62.0),
+            Sp("THE", 238.94, 790.67, 139.25, 62.0),
+        };
+        var kept = PdfPageText.DeduplicateOverlappingSpans(spans);
+        Assert.Single(kept);
+    }
+
+    [Fact]
+    public void Dedup_KeepsLegitimatelyShiftedDuplicates()
+    {
+        // "Vertical shift" drawn twice with a real 3.7pt vertical offset: these
+        // are distinct lines (issue-1114 keeps both). Must NOT be collapsed.
+        var spans = new List<TextSpan>
+        {
+            Sp("Vertical shift", 117.61, 187.09, 97.94),
+            Sp("Vertical shift", 117.61, 183.37, 97.94),
+        };
+        var kept = PdfPageText.DeduplicateOverlappingSpans(spans);
+        Assert.Equal(2, kept.Count);
+    }
+
+    [Fact]
+    public void Dedup_KeepsAdjacentNarrowGlyphDoublets()
+    {
+        // Genuine "ll" — two 'l' glyphs one advance apart must survive (the
+        // ratio-based threshold stays below one advance).
+        var spans = new List<TextSpan>
+        {
+            Sp("l", 100.0, 200.0, 2.5), Sp("l", 102.5, 200.0, 2.5),
+        };
+        var kept = PdfPageText.DeduplicateOverlappingSpans(spans);
+        Assert.Equal(2, kept.Count);
+    }
 }

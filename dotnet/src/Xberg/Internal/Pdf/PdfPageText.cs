@@ -82,6 +82,12 @@ public static class PdfPageText
         // columns) merge/emit in stream order and scramble within-line text.
         spans = SortSpansByReadingOrder(spans);
 
+        // Drop double-drawn / duplicate glyphs (fill+stroke, faux-bold,
+        // overprint render passes) — mirrors pdf_oxide
+        // TextExtractor::deduplicate_overlapping_spans, which runs right
+        // AFTER sort_spans_by_reading_order and BEFORE merge_adjacent_spans.
+        spans = DeduplicateOverlappingSpans(spans);
+
         var runs = new List<TextSpan>();
         var members = new List<List<int>>();
         TextSpan? cur = null;
@@ -319,6 +325,128 @@ public static class PdfPageText
         }
         return sb.ToString();
     }
+
+    // ── Duplicate-glyph de-duplication (pdf_oxide extractors/text.rs) ────────
+    // Port of TextExtractor::deduplicate_overlapping_spans (+ its Phase-0
+    // dedup_stroke_fill_overlap). Some PDFs render text multiple times at the
+    // same position for effect — fill+stroke outlines, faux-bold shadowing,
+    // overprint passes — producing doubled output like "THE THE" / "TALKTALK".
+    // MUST run on the reading-order-sorted list so the twin passes are adjacent
+    // (the geometric phase compares each span only to the previous kept one).
+
+    // Fraction of a span's per-glyph advance treated as "overlap". 0.30 catches
+    // real render-pass duplicates (they sit well under 5% of one advance apart)
+    // while staying below heavy kerning so legit narrow-glyph neighbours
+    // (`ll`, `rr`, `II`, `ii`) survive.
+    private const double DedupOverlapRatio = 0.30;
+    // Absolute cap on the overlap window (points), preserving behaviour for
+    // pathologically oversized advances (drop-caps, large display text).
+    private const double DedupOverlapCapPt = 2.0;
+
+    internal static List<TextSpan> DeduplicateOverlappingSpans(List<TextSpan> spans)
+    {
+        if (spans.Count < 2) return spans;
+
+        // Phase 0: stroke+fill overlap. A label drawn twice (once stroked, once
+        // filled) at essentially the same CTM surfaces as two same-text spans
+        // whose bboxes overlap heavily; drop the later one. Bucketed by
+        // lowercased text so it is O(n) rather than O(n²).
+        spans = DedupStrokeFillOverlap(spans);
+
+        var result = new List<TextSpan>(spans.Count);
+        int? prevYRounded = null;
+        double prevX = 0;
+        string? prevText = null;
+        var seenContent = new Dictionary<string, (double x, double y)>(StringComparer.Ordinal);
+
+        foreach (var span in spans)
+        {
+            int yRounded = RoundKey(span.Y);
+            double x = span.X;
+
+            // PHASE 1 — geometric: same rounded line, same text, X within a
+            // fraction of the span's per-glyph advance.
+            bool geometricDuplicate = false;
+            if (prevYRounded is int py && prevText is string pt)
+            {
+                double charCount = Math.Max(1, span.Text.Length);
+                double perGlyphWidth = Math.Max(span.Width / charCount, 0.1);
+                double threshold = Math.Min(perGlyphWidth * DedupOverlapRatio, DedupOverlapCapPt);
+                geometricDuplicate = yRounded == py && Math.Abs(x - prevX) < threshold && span.Text == pt;
+            }
+
+            // PHASE 2 — content: identical text seen earlier at an OVERLAPPING
+            // position (same line within 2pt, X within 5pt). Catches duplicates
+            // the geometric phase missed while leaving column repeats intact.
+            bool contentDuplicate = false;
+            if (!geometricDuplicate && Utf8ByteLength(span.Text) >= 5
+                && seenContent.TryGetValue(span.Text, out var prevPos))
+            {
+                double yDiff = Math.Abs(span.Y - prevPos.y);
+                double xDiff = Math.Abs(span.X - prevPos.x);
+                contentDuplicate = yDiff < 2.0 && xDiff < 5.0;
+            }
+
+            if (geometricDuplicate || contentDuplicate) continue;
+
+            prevYRounded = yRounded;
+            prevX = x;
+            prevText = span.Text;
+            if (Utf8ByteLength(span.Text) >= 5)
+                seenContent[span.Text] = (span.X, span.Y);
+            result.Add(span);
+        }
+        return result;
+    }
+
+    private const double DedupCell = 16.0;
+
+    // Port of dedup_stroke_fill_overlap. Same-text spans whose bboxes overlap an
+    // earlier one by IoU >= 0.7 are the canonical stroke+fill pattern; drop them.
+    private static List<TextSpan> DedupStrokeFillOverlap(List<TextSpan> spans)
+    {
+        if (spans.Count < 2) return spans;
+        var seen = new Dictionary<string, Dictionary<(int, int), List<TextSpan>>>(StringComparer.Ordinal);
+        var kept = new List<TextSpan>(spans.Count);
+        foreach (var span in spans)
+        {
+            string trimmed = span.Text.Trim();
+            if (trimmed.Length < 2) { kept.Add(span); continue; }
+            string key = trimmed.ToLowerInvariant();
+            int cx = (int)Math.Floor((span.X + span.Width * 0.5) / DedupCell);
+            int cy = (int)Math.Floor((span.Y + span.Height * 0.5) / DedupCell);
+            bool isDup = false;
+            if (seen.TryGetValue(key, out var grid))
+            {
+                for (int gx = cx - 1; gx <= cx + 1 && !isDup; gx++)
+                for (int gy = cy - 1; gy <= cy + 1 && !isDup; gy++)
+                {
+                    if (!grid.TryGetValue((gx, gy), out var others)) continue;
+                    foreach (var other in others)
+                    {
+                        double ix1 = Math.Max(span.X, other.X);
+                        double iy1 = Math.Max(span.Y, other.Y);
+                        double ix2 = Math.Min(span.X + span.Width, other.X + other.Width);
+                        double iy2 = Math.Min(span.Y + span.Height, other.Y + other.Height);
+                        if (ix2 <= ix1 || iy2 <= iy1) continue;
+                        double inter = (ix2 - ix1) * (iy2 - iy1);
+                        double areaA = span.Width * span.Height;
+                        double areaB = other.Width * other.Height;
+                        double union = areaA + areaB - inter;
+                        if (union > 0.0 && inter / union >= 0.7) { isDup = true; break; }
+                    }
+                }
+            }
+            if (isDup) continue;
+            if (!seen.TryGetValue(key, out var g2)) { g2 = new(); seen[key] = g2; }
+            if (!g2.TryGetValue((cx, cy), out var cell)) { cell = new(); g2[(cx, cy)] = cell; }
+            cell.Add(span);
+            kept.Add(span);
+        }
+        return kept;
+    }
+
+    private static int Utf8ByteLength(string s) => System.Text.Encoding.UTF8.GetByteCount(s);
 
     // ── Reading-order pre-sort (pdf_oxide extractors/text.rs) ────────────────
     // Port of TextExtractor::sort_spans_by_reading_order + detect_span_columns
