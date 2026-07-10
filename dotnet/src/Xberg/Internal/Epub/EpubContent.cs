@@ -370,17 +370,11 @@ internal static class EpubContent
 
     private static string? DirectText(XElement node)
     {
-        var sb = new StringBuilder();
-        bool sawText = false;
-        foreach (var child in node.Nodes())
-        {
-            if (child is XText t)
-            {
-                sb.Append(t.Value);
-                sawText = true;
-            }
-        }
-        return sawText ? sb.ToString() : null;
+        // Mirror roxmltree `Node::text()`: the text of the FIRST child node, and only when
+        // that first child is itself a text node. When an element (e.g. `<a id="CONTENTS"/>`)
+        // precedes the text, roxmltree returns None — so a `<h2><a/>CONTENTS</h2>` heading must
+        // NOT be treated as a "Contents" nav marker. (XCData derives from XText, so CDATA counts.)
+        return node.FirstNode is XText t ? t.Value : null;
     }
 
     // -----------------------------------------------------------------------

@@ -162,6 +162,12 @@ foreach (var goldenPath in goldenFiles)
             if (r >= 0.95) stats.ContentClose++;
             else if (r >= 0.80) stats.ContentPartial++;
             else stats.ContentLow++;
+
+            // Record real content losses: Rust extracted clean, substantial text and we
+            // produced meaningfully less of it (not just reformatted / reordered).
+            bool rClean = GarbageRatio(rustPlain) < 0.02 && NormalizeText(rustPlain).Length >= 40;
+            if (r < 0.80 && rClean && NormalizeText(csPlain).Length < NormalizeText(rustPlain).Length * 0.9)
+                stats.Misses.Add(new MissRow(ext, rel, rustPlain.Length, csPlain.Length, r));
         }
 
         // ── Catastrophe audit (judges OUR output on its own merits) ──────────
@@ -198,6 +204,17 @@ Console.WriteLine();
 Console.WriteLine($"─── Catastrophe audit (broken output, judged on its own merits) ───");
 Console.WriteLine($"  catastrophes: {stats.Catastrophes}  ({Pct(stats.Catastrophes, cTotal)} of fixtures)");
 foreach (var line in stats.CatastropheList) Console.WriteLine(line);
+
+Console.WriteLine();
+Console.WriteLine($"─── Content losses (Rust caught clean text we under-extract) — {stats.Misses.Count} fixtures ───");
+// Group by extension: count + total chars lost, worst formats first.
+foreach (var g in stats.Misses.GroupBy(m => m.Ext)
+                              .Select(g => new { Ext = g.Key, N = g.Count(), Lost = g.Sum(m => (long)(m.RustLen - m.CsLen)) })
+                              .OrderByDescending(g => g.Lost))
+    Console.WriteLine($"  {g.Ext,-8} {g.N,4} fixtures   {g.Lost,10:N0} chars lost");
+Console.WriteLine("  ── worst 40 individual fixtures (by chars lost) ──");
+foreach (var m in stats.Misses.OrderByDescending(m => m.RustLen - m.CsLen).Take(40))
+    Console.WriteLine($"  [{m.Ext,-6}] rust={m.RustLen,8:N0}  cs={m.CsLen,8:N0}  sim={m.Sim:F2}  {m.Rel}");
 return 0;
 
 static string Pct(int n, int d) => d == 0 ? "—" : $"{100.0 * n / d:F1}%";
@@ -441,5 +458,9 @@ sealed class Stats
     public int ContentExact, ContentOrder, ContentClose, ContentPartial, ContentLow;
     public int Catastrophes;
     public readonly List<string> CatastropheList = new();
+    // Fixtures where Rust extracted clean content that we under-extract (content loss).
+    public readonly List<MissRow> Misses = new();
     public readonly Dictionary<string, ExtStat> ByExt = new();
 }
+
+readonly record struct MissRow(string Ext, string Rel, int RustLen, int CsLen, double Sim);
