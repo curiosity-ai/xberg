@@ -227,7 +227,7 @@ public static class XlsxReader
     }
 
     // ── markdown table (faithful to generate_markdown_and_cells) ───────────────
-    private static string GenerateMarkdown(string name, List<List<string>> cells)
+    internal static string GenerateMarkdown(string name, List<List<string>> cells)
     {
         var sb = new StringBuilder();
         sb.Append("## ").Append(name).Append("\n\n");

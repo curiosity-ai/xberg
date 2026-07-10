@@ -307,7 +307,7 @@ internal static class BiffReader
     }
 
     // ── value helpers ────────────────────────────────────────────────────────────
-    private static double RkToDouble(uint rk)
+    internal static double RkToDouble(uint rk)
     {
         bool fx100 = (rk & 0x01) != 0;
         bool fInt = (rk & 0x02) != 0;
@@ -327,7 +327,7 @@ internal static class BiffReader
 
     /// <summary>Format a numeric cell the way Rust's <c>format!("{}", f64)</c> does: shortest
     /// round-trippable representation, whole numbers without a trailing decimal.</summary>
-    private static string FormatNumber(double v)
+    internal static string FormatNumber(double v)
     {
         if (double.IsNaN(v)) return "NaN";
         if (double.IsPositiveInfinity(v)) return "inf";

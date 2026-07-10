@@ -35,6 +35,12 @@ public sealed class XlsxExtractor : IExtractor
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
+        // Legacy-binary workbooks can arrive under any Excel MIME (e.g. a CFB `.xla` maps to
+        // the macro-template MIME). Rust ends up in calamine's BIFF parser for such content;
+        // mirror that by sniffing the CFB signature and delegating to the BIFF extractor.
+        if (content.Length >= 8 && content[0] == 0xD0 && content[1] == 0xCF && content[2] == 0x11 && content[3] == 0xE0)
+            return new XlsExtractor().Extract(content, mimeType, config);
+
         string extension = mimeType switch
         {
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => ".xlsx",
@@ -49,7 +55,9 @@ public sealed class XlsxExtractor : IExtractor
         };
 
         bool officeMetadata = extension is ".xlsx" or ".xlsm" or ".xlam" or ".xltm";
-        var workbook = XlsxReader.Read(content, officeMetadata);
+        var workbook = extension == ".xlsb"
+            ? XlsbReader.Read(content)
+            : XlsxReader.Read(content, officeMetadata);
         var doc = WorkbookToInternalDocument(workbook);
         doc.MimeType = mimeType;
         return doc;
