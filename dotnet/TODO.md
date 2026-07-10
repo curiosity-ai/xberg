@@ -5,10 +5,14 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dro
 Each format is "done" when the `Xberg.TestRunner` output matches the committed
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 
-> **Status:** byte-parity 2072/2494 strict; **content-parity 92.5% ≥95%-similar, only 42
-> fixtures (<80%) are genuine content misses.** 231 unit tests. The remaining real misses are
-> mostly big new-format ports (iWork, 7z/xlsb) or unmatchable-by-nature (non-deterministic /
-> mojibake goldens); the rest are deep PDF reading-order. Byte-vs-content gap (~230) is cosmetic.
+> **Status:** **content-parity 86.5% byte-identical, 92.7% ≥95%-similar; 39 fixtures (<80%)
+> are genuine content misses; 3 catastrophes (all unported formats: 7z/xlsb/xla).** 231 unit
+> tests. Recent targeted fixes for cases Rust extracts and we didn't: epub nav-detection
+> (roxmltree text() semantics — recovered a skipped front-matter spine item), docx VML text-box
+> content, PDF AcroForm field values. The remaining real misses are big new-format ports
+> (iWork, 7z/xlsb/xla), a stale SVG golden (we match current Rust, which excludes `<script>`),
+> two html-to-markdown ordering quirks, and deep PDF reading-order / math-glyph spacing (a
+> limitation Rust shares on the worst fixtures).
 ---
 
 ## Phase 0 — Setup & reference data
