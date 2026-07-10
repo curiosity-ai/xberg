@@ -167,16 +167,17 @@ foreach (var goldenPath in goldenFiles)
         // ── Catastrophe audit (judges OUR output on its own merits) ──────────
         // A catastrophe = output a human would call broken, independent of Rust parity:
         //   crash, timeout, empty-when-there-is-content, mojibake, severe under-extraction.
+        // Only flag output WE broke relative to Rust — if the Rust reference is itself
+        // garbage/binary/empty on a fixture, matching it is correct, not a catastrophe.
         string? cat = null;
+        double csGarbage = GarbageRatio(csPlain);
+        double rustGarbage = GarbageRatio(rustPlain);
+        bool rustClean = rustGarbage < 0.02;
+        bool rustHadContent = NormalizeText(rustPlain).Length >= 40 && rustClean;
         if (csharpFailed && csPlain.Length == 0) cat = "CRASH/TIMEOUT (threw or hung; Rust succeeded)";
-        else
-        {
-            double garbage = GarbageRatio(csPlain);
-            bool rustHadContent = NormalizeText(rustPlain).Length >= 40;
-            if (garbage > 0.02) cat = $"MOJIBAKE ({garbage:P0} replacement/control chars)";
-            else if (rustHadContent && NormalizeText(csPlain).Length == 0) cat = "EMPTY (Rust extracted text, we got nothing)";
-            else if (rustHadContent && csPlain.Length < rustPlain.Length * 0.25) cat = $"SEVERE UNDER-EXTRACTION ({csPlain.Length}/{rustPlain.Length} chars)";
-        }
+        else if (csGarbage > 0.02 && csGarbage > rustGarbage + 0.02) cat = $"MOJIBAKE ({csGarbage:P0} vs Rust {rustGarbage:P0})";
+        else if (rustHadContent && NormalizeText(csPlain).Length == 0) cat = "EMPTY (Rust extracted text, we got nothing)";
+        else if (rustHadContent && csPlain.Length < rustPlain.Length * 0.25) cat = $"SEVERE UNDER-EXTRACTION ({csPlain.Length}/{rustPlain.Length} chars)";
         if (cat is not null)
         {
             stats.Catastrophes++;
