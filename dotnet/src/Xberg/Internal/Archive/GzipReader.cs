@@ -9,7 +9,8 @@ namespace Xberg.Internal.Archive;
 internal static class GzipReader
 {
     /// <summary>Decompress a gzip stream and extract metadata/text/bytes. If the decompressed
-    /// payload is a TAR archive, delegates to <see cref="TarReader"/> (format "GZIP+TAR").</summary>
+    /// payload is a TAR archive, delegates to <see cref="TarReader"/>; Rust keeps the outer
+    /// "GZIP" format label for .tar.gz, so we do too.</summary>
     public static ArchiveReadResult Read(byte[] bytes)
     {
         byte[] decompressed = Decompress(bytes);
@@ -17,7 +18,7 @@ internal static class GzipReader
         if (TarReader.IsTarArchive(decompressed))
         {
             var tar = TarReader.Read(decompressed);
-            tar.Info.Format = "GZIP+TAR";
+            tar.Info.Format = "GZIP";
             return tar;
         }
 

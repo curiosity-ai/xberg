@@ -119,14 +119,40 @@ public class ArchiveImageTests
         Assert.Equal(1u, archive.FileCount);
     }
 
-    // ── 7z (deferred) ────────────────────────────────────────────────────────
+    // ── 7z ───────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void SevenZip_IsDeferred()
+    public void SevenZip_TruncatedArchive_Throws()
     {
-        Assert.Throws<NotSupportedException>(() =>
+        // A bare signature with no headers is invalid input, not an empty archive.
+        Assert.ThrowsAny<Exception>(() =>
             new SevenZipExtractor().Extract(new byte[] { 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C },
                 "application/x-7z-compressed", new ExtractionConfig()));
+    }
+
+    [Fact]
+    public void SevenZip_LzmaArchive_ExtractsListingAndText()
+    {
+        // documents.7z from the fixture corpus (216 bytes, embedded verbatim):
+        // one LZMA1 folder with two text substreams, plus an LZMA-compressed header.
+        byte[] archive = Convert.FromHexString(
+            "377ABCAF271C0004468192F89700000000000000210000000000000078864A39" +
+            "01001D66616B655F746578742E747874636F6E74726163745F746573742E7478" +
+            "74000000813307AE0FD02CF4BC9F3F4741070ABEBB844EBE67D49BFB468D43BE" +
+            "E316ECB252530CDD05A3C594E9CD9A1A3ED4970EA1AAC00D3AEE4BD97D10F7A5" +
+            "A3A46ED4FEA4EC721F7307FA68C7E71B28FBD46B161AFFE2DCB3FF0D01EBB199" +
+            "EEDFBB2B3622484026F221FF16D8BCCF8BD4806A00000017062201097500070B" +
+            "01000123030101055D001000000C809E0A01977991E10000");
+        var doc = ExtractPlain(archive, "application/x-7z-compressed");
+
+        Assert.Contains("7Z Archive (2 files, 30 bytes)", doc.Content);
+        Assert.Contains("text/simple.txt (17 bytes)", doc.Content);
+        Assert.Contains("text/multilingual.txt (13 bytes)", doc.Content);
+        Assert.Contains("contract_test.txt", doc.Content);
+        Assert.Contains("fake_text.txt", doc.Content);
+        var archiveMeta = Assert.IsType<ArchiveMetadata>(doc.Metadata.Format!.Payload);
+        Assert.Equal("7Z", archiveMeta.Format);
+        Assert.Equal(2u, archiveMeta.FileCount);
     }
 
     // ── Image ────────────────────────────────────────────────────────────────
