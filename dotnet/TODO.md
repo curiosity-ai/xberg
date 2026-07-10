@@ -5,14 +5,14 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dro
 Each format is "done" when the `Xberg.TestRunner` output matches the committed
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 
-> **Status:** **content-parity 86.5% byte-identical, 92.7% ≥95%-similar; 39 fixtures (<80%)
-> are genuine content misses; 3 catastrophes (all unported formats: 7z/xlsb/xla).** 231 unit
-> tests. Recent targeted fixes for cases Rust extracts and we didn't: epub nav-detection
-> (roxmltree text() semantics — recovered a skipped front-matter spine item), docx VML text-box
-> content, PDF AcroForm field values. The remaining real misses are big new-format ports
-> (iWork, 7z/xlsb/xla), a stale SVG golden (we match current Rust, which excludes `<script>`),
-> two html-to-markdown ordering quirks, and deep PDF reading-order / math-glyph spacing (a
-> limitation Rust shares on the worst fixtures).
+> **Status:** **content-parity 86.6% identical, 92.8% ≥95%-similar; 35 fixtures (<80%) are
+> genuine content misses; ZERO catastrophes.** 232 unit tests. Every format in the corpus now
+> extracts. Recent fixes for cases Rust caught and we didn't: epub nav-detection (roxmltree
+> text() semantics), docx VML text-box content, PDF AcroForm field values, legacy .xla (CFB
+> sniff), .xlsb (new BIFF12 reader), 7z (new managed LZMA/LZMA2 decoder + container parser),
+> tgz format label. The remaining real misses are iWork (unported), a stale SVG golden (we
+> match current Rust, which excludes `<script>`), two html-to-markdown ordering quirks, and
+> deep PDF reading-order / math-glyph spacing (a limitation Rust shares on the worst fixtures).
 ---
 
 ## Phase 0 — Setup & reference data
@@ -83,9 +83,9 @@ Each format is "done" when the `Xberg.TestRunner` output matches the committed
 
 - [x] **eml** (msg deferred) (`extractors/email.rs`, `extraction/email.rs`) — MIME + CFB msg.
 - [ ] **pst** (`extractors/pst.rs`) — Outlook PST (port `outlook-pst`; large — evaluate).
-- [x] **archives** (zip/tar/gzip; 7z deferred) (`extractors/archive.rs`) — zip / tar / 7z / gzip, recursive extraction
+- [x] **archives** (`extractors/archive.rs`) — zip / tar / 7z / gzip, recursive extraction
       of children through the pipeline.
-- [ ] `Internal/SevenZip`, `Internal/Tar` as needed; gzip/deflate via BCL.
+- [x] `Internal/SevenZip` (managed LZMA/LZMA2 + 7z container), `Internal/Tar`; gzip/deflate via BCL.
 
 ## Phase 5 — PDF, images, Korean & Apple formats
 
