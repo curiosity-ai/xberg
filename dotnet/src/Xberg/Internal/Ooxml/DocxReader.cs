@@ -154,6 +154,15 @@ public static class DocxReader
                     doc.Drawings.Add(draw);
                     doc.Elements.Add(new DocElement { Kind = DocElementKind.Drawing, Drawing = draw });
                     break;
+                case "txbxContent":
+                    // Text-box content. Rust's flat event reader keeps the VML (`<w:pict>`) copy but
+                    // drops the DrawingML (`<w:drawing>`) copy — `parse_drawing` consumes the whole
+                    // `<w:drawing>` subtree. `<mc:AlternateContent>` carries both (Choice=DrawingML,
+                    // Fallback=VML), so emitting only VML matches Rust and avoids double-counting.
+                    if (e.Ancestors().Any(a => a.Name.LocalName == "pict"))
+                        foreach (var tp in e.Elements().Where(x => x.Name.LocalName == "p"))
+                            doc.Elements.Add(new DocElement { Kind = DocElementKind.Paragraph, Paragraph = ParseParagraph(tp, rels) });
+                    break;
                 case "lastRenderedPageBreak" when pageBreaks:
                     doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
                     break;
