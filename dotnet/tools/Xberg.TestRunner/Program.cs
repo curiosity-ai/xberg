@@ -163,6 +163,25 @@ foreach (var goldenPath in goldenFiles)
             else if (r >= 0.80) stats.ContentPartial++;
             else stats.ContentLow++;
         }
+
+        // ── Catastrophe audit (judges OUR output on its own merits) ──────────
+        // A catastrophe = output a human would call broken, independent of Rust parity:
+        //   crash, timeout, empty-when-there-is-content, mojibake, severe under-extraction.
+        string? cat = null;
+        if (csharpFailed && csPlain.Length == 0) cat = "CRASH/TIMEOUT (threw or hung; Rust succeeded)";
+        else
+        {
+            double garbage = GarbageRatio(csPlain);
+            bool rustHadContent = NormalizeText(rustPlain).Length >= 40;
+            if (garbage > 0.02) cat = $"MOJIBAKE ({garbage:P0} replacement/control chars)";
+            else if (rustHadContent && NormalizeText(csPlain).Length == 0) cat = "EMPTY (Rust extracted text, we got nothing)";
+            else if (rustHadContent && csPlain.Length < rustPlain.Length * 0.25) cat = $"SEVERE UNDER-EXTRACTION ({csPlain.Length}/{rustPlain.Length} chars)";
+        }
+        if (cat is not null)
+        {
+            stats.Catastrophes++;
+            if (stats.CatastropheList.Count < 60) stats.CatastropheList.Add($"  [{ext}] {rel}  →  {cat}");
+        }
     }
 }
 
@@ -174,9 +193,24 @@ Console.WriteLine($"  content-identical (ws/order-normalized): {stats.ContentExa
 Console.WriteLine($"  ≥95% similar (near-identical):           {stats.ContentClose}  ({Pct(stats.ContentClose, cTotal)})");
 Console.WriteLine($"  80–95% similar (minor content drift):    {stats.ContentPartial}");
 Console.WriteLine($"  <80% similar (real content miss):        {stats.ContentLow}");
+Console.WriteLine();
+Console.WriteLine($"─── Catastrophe audit (broken output, judged on its own merits) ───");
+Console.WriteLine($"  catastrophes: {stats.Catastrophes}  ({Pct(stats.Catastrophes, cTotal)} of fixtures)");
+foreach (var line in stats.CatastropheList) Console.WriteLine(line);
 return 0;
 
 static string Pct(int n, int d) => d == 0 ? "—" : $"{100.0 * n / d:F1}%";
+
+// Fraction of chars that are U+FFFD (mojibake) or C0/C1 control (excluding \t\n\r).
+static double GarbageRatio(string s)
+{
+    if (s.Length == 0) return 0;
+    int bad = 0;
+    foreach (char c in s)
+        if (c == '�' || (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || (c >= 0x7F && c <= 0x9F))
+            bad++;
+    return (double)bad / s.Length;
+}
 
 // Whitespace + line-order insensitive (catches pure reading-order differences).
 static string NormalizeSorted(string s)
@@ -404,5 +438,7 @@ sealed class Stats
     public int Total, Ok, BothUnsupported, Extra, NoSource, BadGolden;
     // Content-parity buckets (plain text, whitespace/order-normalized).
     public int ContentExact, ContentOrder, ContentClose, ContentPartial, ContentLow;
+    public int Catastrophes;
+    public readonly List<string> CatastropheList = new();
     public readonly Dictionary<string, ExtStat> ByExt = new();
 }
