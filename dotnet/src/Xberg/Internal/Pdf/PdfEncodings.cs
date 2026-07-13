@@ -20,6 +20,73 @@ public static class PdfEncodings
         _ => null,
     };
 
+    // ── built-in encodings of the symbolic standard-14 fonts ───────────────────
+    // Ports pdf_oxide `symbol_encoding_lookup` / `zapf_dingbats_encoding_lookup`
+    // (PDF 32000-1 Annex D.4/D.5 subsets). For symbolic fonts whose base name
+    // contains Symbol / Zapf / Dingbat, the built-in table takes priority over
+    // /Encoding (spec 9.6.6.1: symbolic fonts ignore the Encoding entry).
+    public static readonly string?[] Symbol = BuildSymbol();
+    public static readonly string?[] ZapfDingbats = BuildZapfDingbats();
+
+    private static string?[] BuildSymbol()
+    {
+        var a = new string?[256];
+        void S(int c, char ch) => a[c] = ch.ToString();
+        // Greek lowercase
+        S(0x61,'α'); S(0x62,'β'); S(0x63,'χ'); S(0x64,'δ'); S(0x65,'ε'); S(0x66,'φ'); S(0x67,'γ');
+        S(0x68,'η'); S(0x69,'ι'); S(0x6A,'ϕ'); S(0x6B,'κ'); S(0x6C,'λ'); S(0x6D,'μ'); S(0x6E,'ν');
+        S(0x6F,'ο'); S(0x70,'π'); S(0x71,'θ'); S(0x72,'ρ'); S(0x73,'σ'); S(0x74,'τ'); S(0x75,'υ');
+        S(0x76,'ϖ'); S(0x77,'ω'); S(0x78,'ξ'); S(0x79,'ψ'); S(0x7A,'ζ');
+        // Greek uppercase
+        S(0x41,'Α'); S(0x42,'Β'); S(0x43,'Χ'); S(0x44,'Δ'); S(0x45,'Ε'); S(0x46,'Φ'); S(0x47,'Γ');
+        S(0x48,'Η'); S(0x49,'Ι'); S(0x4B,'Κ'); S(0x4C,'Λ'); S(0x4D,'Μ'); S(0x4E,'Ν'); S(0x4F,'Ο');
+        S(0x50,'Π'); S(0x51,'Θ'); S(0x52,'Ρ'); S(0x53,'Σ'); S(0x54,'Τ'); S(0x55,'Υ'); S(0x57,'Ω');
+        S(0x58,'Ξ'); S(0x59,'Ψ'); S(0x5A,'Ζ');
+        // Math operators
+        S(0xB1,'±'); S(0xB4,'÷'); S(0xB5,'∞'); S(0xB6,'∂'); S(0xB7,'•'); S(0xB9,'≠'); S(0xBA,'≡');
+        S(0xBB,'≈'); S(0xBC,'…'); S(0xBE,'⊥'); S(0xBF,'⊙');
+        S(0xD0,'°'); S(0xD1,'∇'); S(0xD2,'¬'); S(0xD3,'∧'); S(0xD4,'∨'); S(0xD5,'∏'); S(0xD6,'√');
+        S(0xD7,'⋅'); S(0xD8,'⊕'); S(0xD9,'⊗');
+        S(0xDA,'∈'); S(0xDB,'∉'); S(0xDC,'∠'); S(0xDD,'∇'); S(0xDE,'®'); S(0xDF,'©'); S(0xE0,'™');
+        S(0xE1,'∑'); S(0xE2,'⊂'); S(0xE3,'⊃'); S(0xE4,'⊆'); S(0xE5,'⊇'); S(0xE6,'∪'); S(0xE7,'∩');
+        S(0xE8,'∀'); S(0xE9,'∃'); S(0xEA,'¬');
+        S(0xF1,'〈'); S(0xF2,'∫'); S(0xF3,'⌠'); S(0xF4,'⌡'); S(0xF5,'⊓'); S(0xF6,'⊔'); S(0xF7,'〉');
+        // Punctuation overlapping ASCII
+        S(0x20,' '); S(0x21,'!'); S(0x22,'∀'); S(0x23,'#'); S(0x24,'∃'); S(0x25,'%'); S(0x26,'&');
+        S(0x27,'∋'); S(0x28,'('); S(0x29,')'); S(0x2A,'∗'); S(0x2B,'+'); S(0x2C,','); S(0x2D,'−');
+        S(0x2E,'.'); S(0x2F,'/');
+        for (int c = 0x30; c <= 0x39; c++) S(c, (char)c); // digits map to themselves
+        S(0x3A,':'); S(0x3B,';'); S(0x3C,'<'); S(0x3D,'='); S(0x3E,'>'); S(0x3F,'?');
+        S(0x40,'≅');
+        S(0x5B,'['); S(0x5C,'∴'); S(0x5D,']'); S(0x5E,'⊥'); S(0x5F,'_');
+        S(0x7B,'{'); S(0x7C,'|'); S(0x7D,'}'); S(0x7E,'∼');
+        // Operators past the base Annex-D set (mirrors pdf_oxide additions)
+        S(0xA3,'≤'); S(0xA5,'∞'); S(0xB3,'≥');
+        return a;
+    }
+
+    private static string?[] BuildZapfDingbats()
+    {
+        var a = new string?[256];
+        void S(int c, int cp) => a[c] = char.ConvertFromUtf32(cp);
+        S(0x20, ' ');
+        // 0x21–0x6B run sequentially from U+2701 with four historical exceptions.
+        for (int c = 0x21; c <= 0x6B; c++) S(c, 0x2701 + (c - 0x21));
+        S(0x25, 0x260E); S(0x2A, 0x261B); S(0x2B, 0x261E); S(0x48, 0x2605);
+        // Circles / squares block.
+        S(0x6C, 0x25CF); S(0x6D, 0x25CB); S(0x6E, 0x274D);
+        for (int c = 0x6F; c <= 0x7A; c++) S(c, 0x25A0 + (c - 0x6F));
+        // Circled numbers and arrows (range arms in pdf_oxide).
+        for (int c = 0xAC; c <= 0xB5; c++) S(c, 0x2460 + (c - 0xAC)); // ①…⑩
+        for (int c = 0xB6; c <= 0xBF; c++) S(c, 0x2776 + (c - 0xB6)); // ❶…❿
+        for (int c = 0xC0; c <= 0xC9; c++) S(c, 0x2780 + (c - 0xC0)); // ➀…➉
+        for (int c = 0xCA; c <= 0xD3; c++) S(c, 0x278A + (c - 0xCA)); // ➊…➓
+        S(0xD4, 0x2794); S(0xD5, 0x2192); S(0xD6, 0x2194); S(0xD7, 0x2195);
+        for (int c = 0xD8; c <= 0xEF; c++) S(c, 0x2798 + (c - 0xD8)); // ➘…➯
+        for (int c = 0xF1; c <= 0xFE; c++) S(c, 0x27B1 + (c - 0xF1)); // ➱…➾
+        return a;
+    }
+
     private static string[] AsciiBase()
     {
         var a = new string[256];

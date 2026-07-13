@@ -129,6 +129,23 @@ public sealed class PdfFont
                 }
             }
         }
+
+        // Symbolic standard fonts: per spec 9.6.6.1 (and pdf_oxide's priority order) a
+        // symbolic font named *Symbol* / *Zapf* / *Dingbat* maps through its BUILT-IN
+        // encoding, overriding /Encoding and /Differences. Symbolic = descriptor flag
+        // bit 3 when present, else inferred from the base font name (standard-14
+        // Symbol/ZapfDingbats often carry no descriptor).
+        string bfLower = f.BaseFont.ToLowerInvariant();
+        bool symbolicFont = descriptor != null
+            ? (doc.Resolve(descriptor.Get("Flags")).AsLong() is long fl && (fl & 4) != 0)
+            : bfLower.Contains("symbol") || bfLower.Contains("zapf") || bfLower.Contains("dingbat");
+        string?[]? builtIn = null;
+        if (symbolicFont && bfLower.Contains("symbol")) builtIn = PdfEncodings.Symbol;
+        else if (symbolicFont && (bfLower.Contains("zapf") || bfLower.Contains("dingbat"))) builtIn = PdfEncodings.ZapfDingbats;
+        if (builtIn != null)
+            for (int c = 0; c < 256; c++)
+                if (builtIn[c] is string s) enc[c] = s;
+
         f._encoding = enc;
 
         // Standard-14 AFM metrics (resolved once; used when /Widths lacks a code).
