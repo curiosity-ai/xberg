@@ -82,6 +82,11 @@ public sealed class StructuredExtractor : IExtractor
             ["field_count"] = JsonSerializer.SerializeToElement(result.TextFields.Count),
             ["data_format"] = JsonSerializer.SerializeToElement(result.Format),
         };
+        // Surface the full flattened `path: value` view: the structured renderer only emits
+        // headings/lists for a subset of shapes, so this is the one place a consumer can always
+        // get every leaf field as text, regardless of source format or nesting.
+        if (result.Flattened.Count > 0)
+            additional["flattened_fields"] = JsonSerializer.SerializeToElement(result.Flattened);
         foreach (var (key, value) in result.Metadata)
             additional[key] = JsonSerializer.SerializeToElement(value);
 
@@ -93,13 +98,24 @@ public sealed class StructuredExtractor : IExtractor
 
     private static InternalDocument BuildInternalDocument(StructuredResult result, string sourceFormat, string? language)
     {
-        // For JSON objects, build a heading/list/paragraph structure. Rust re-parses
-        // `result.content` (pretty JSON); we keep the already-parsed root element.
-        if (sourceFormat == "json" && result.JsonRoot is JsonElement root && root.ValueKind == JsonValueKind.Object)
+        // Render document structure (headings, sub-headings, lists) from the parsed value for
+        // every structured format, not just JSON objects: YAML, TOML and JSONL parse into the
+        // same shape, and a top-level array (JSONL's natural shape, and valid JSON on its own)
+        // gets per-item structure instead of an opaque code block.
+        if (sourceFormat is "json" or "jsonl" or "yaml" or "toml" && result.JsonRoot is { } root)
         {
-            var builder = new InternalDocumentBuilder(sourceFormat);
-            BuildJsonInternalStructure(root, builder, 1);
-            return builder.Build();
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                var builder = new InternalDocumentBuilder(sourceFormat);
+                BuildJsonInternalStructure(root, builder, 1);
+                return builder.Build();
+            }
+            if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
+            {
+                var builder = new InternalDocumentBuilder(sourceFormat);
+                BuildJsonArray(root, builder, 1);
+                return builder.Build();
+            }
         }
 
         // Fallback: a single code block with the raw content.
@@ -125,15 +141,7 @@ public sealed class StructuredExtractor : IExtractor
                             break;
                         case JsonValueKind.Array:
                             builder.PushHeading(level, prop.Name, null, null);
-                            builder.PushList(false);
-                            foreach (var item in val.EnumerateArray())
-                            {
-                                string text = item.ValueKind == JsonValueKind.String
-                                    ? item.GetString()!
-                                    : SerdeJson.Compact(item);
-                                builder.PushListItem(text, false, new(), null, null);
-                            }
-                            builder.EndList();
+                            BuildJsonArray(val, builder, depth + 1);
                             break;
                         case JsonValueKind.String:
                             builder.PushParagraph($"{prop.Name}: {val.GetString()}", new(), null, null);
@@ -145,13 +153,7 @@ public sealed class StructuredExtractor : IExtractor
                 }
                 break;
             case JsonValueKind.Array:
-                builder.PushList(false);
-                foreach (var item in value.EnumerateArray())
-                {
-                    string text = item.ValueKind == JsonValueKind.String ? item.GetString()! : SerdeJson.Compact(item);
-                    builder.PushListItem(text, false, new(), null, null);
-                }
-                builder.EndList();
+                BuildJsonArray(value, builder, depth);
                 break;
             case JsonValueKind.String:
                 builder.PushParagraph(value.GetString()!, new(), null, null);
@@ -162,6 +164,47 @@ public sealed class StructuredExtractor : IExtractor
         }
     }
 
+    /// <summary>
+    /// Render array scalars as list items and recursively expand structured items.
+    /// Lists are closed before an object or nested array is rendered so headings and
+    /// paragraphs do not become implicit children of the preceding list item.
+    /// </summary>
+    private static void BuildJsonArray(JsonElement values, InternalDocumentBuilder builder, int depth)
+    {
+        const string ArrayItemLabel = "Item";
+
+        bool listIsOpen = false;
+        int index = 0;
+        foreach (var value in values.EnumerateArray())
+        {
+            index++;
+            if (value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+            {
+                if (listIsOpen) { builder.EndList(); listIsOpen = false; }
+                builder.PushHeading((byte)Math.Min(depth, 6), $"{ArrayItemLabel} {index}", null, null);
+                BuildJsonInternalStructure(value, builder, depth + 1);
+            }
+            else
+            {
+                string text = value.ValueKind == JsonValueKind.String
+                    ? value.GetString()!
+                    : SerdeJson.Compact(value);
+                if (!listIsOpen) { builder.PushList(false); listIsOpen = true; }
+                builder.PushListItem(text, false, new(), null, null);
+            }
+        }
+        if (listIsOpen) builder.EndList();
+    }
+
+    /// <summary>Materialize a parsed YAML/TOML node as a <see cref="JsonElement"/> so the
+    /// structure builder sees the same shape as the JSON path.</summary>
+    private static JsonElement? ToElement(System.Text.Json.Nodes.JsonNode? node)
+    {
+        if (node is null) return null;
+        try { return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone(); }
+        catch (JsonException) { return null; }
+    }
+
     // ── format parsers ──────────────────────────────────────────────────────
 
     private static StructuredResult ParseJson(byte[] data)
@@ -170,10 +213,11 @@ public sealed class StructuredExtractor : IExtractor
         var root = doc.RootElement.Clone();
         var meta = new Dictionary<string, string>(StringComparer.Ordinal);
         var textFields = new List<string>();
+        var flattened = new List<string>();
         var path = new StringBuilder();
-        ExtractFromJson(root, path, meta, textFields);
+        ExtractFromJson(root, path, meta, textFields, flattened);
         string content = SerdeJson.Pretty(root);
-        return new StructuredResult(content, "json", meta, textFields, root);
+        return new StructuredResult(content, "json", meta, textFields, root, flattened);
     }
 
     private static StructuredResult ParseJsonl(byte[] data)
@@ -181,6 +225,7 @@ public sealed class StructuredExtractor : IExtractor
         string text = Encoding.UTF8.GetString(StripBom(data).Span);
         var meta = new Dictionary<string, string>(StringComparer.Ordinal);
         var textFields = new List<string>();
+        var flattened = new List<string>();
         var docs = new List<JsonDocument>();
         try
         {
@@ -191,7 +236,7 @@ public sealed class StructuredExtractor : IExtractor
                 var doc = JsonDocument.Parse(trimmed);
                 docs.Add(doc);
                 var path = new StringBuilder();
-                ExtractFromJson(doc.RootElement, path, meta, textFields);
+                ExtractFromJson(doc.RootElement, path, meta, textFields, flattened);
             }
 
             string content;
@@ -213,7 +258,10 @@ public sealed class StructuredExtractor : IExtractor
                 sb.Append("\n]");
                 content = sb.ToString();
             }
-            return new StructuredResult(content, "jsonl", meta, textFields, null);
+            // JSONL's natural shape is a top-level array; keep it parsed so the structure
+            // builder can give each record its own section instead of one opaque code block.
+            var arrayRoot = JsonDocument.Parse(content).RootElement.Clone();
+            return new StructuredResult(content, "jsonl", meta, textFields, arrayRoot, flattened);
         }
         finally
         {
@@ -227,9 +275,10 @@ public sealed class StructuredExtractor : IExtractor
         var value = YamlParser.Parse(text);
         var meta = new Dictionary<string, string>(StringComparer.Ordinal);
         var textFields = new List<string>();
+        var flattened = new List<string>();
         var path = new StringBuilder();
-        ExtractFromNode(value, path, meta, textFields);
-        return new StructuredResult(text, "yaml", meta, textFields, null);
+        ExtractFromNode(value, path, meta, textFields, flattened);
+        return new StructuredResult(text, "yaml", meta, textFields, ToElement(value), flattened);
     }
 
     private static StructuredResult ParseToml(byte[] data)
@@ -238,15 +287,19 @@ public sealed class StructuredExtractor : IExtractor
         var value = TomlParser.Parse(text);
         var meta = new Dictionary<string, string>(StringComparer.Ordinal);
         var textFields = new List<string>();
+        var flattened = new List<string>();
         var path = new StringBuilder();
-        ExtractFromNode(value, path, meta, textFields);
-        return new StructuredResult(text, "toml", meta, textFields, null);
+        ExtractFromNode(value, path, meta, textFields, flattened);
+        return new StructuredResult(text, "toml", meta, textFields, ToElement(value), flattened);
     }
 
     // ── metadata walks ──────────────────────────────────────────────────────
 
+    /// <summary>Walk a JSON value, collecting <c>path: value</c> lines for every scalar leaf
+    /// into <paramref name="flattened"/> and recording text-field paths in the metadata map.
+    /// Null leaves and blank strings contribute nothing.</summary>
     private static void ExtractFromJson(JsonElement value, StringBuilder path,
-        Dictionary<string, string> meta, List<string> textFields)
+        Dictionary<string, string> meta, List<string> textFields, List<string> flattened)
     {
         switch (value.ValueKind)
         {
@@ -256,7 +309,7 @@ public sealed class StructuredExtractor : IExtractor
                     int baseLen = path.Length;
                     if (path.Length > 0) path.Append('.');
                     path.Append(prop.Name);
-                    ExtractFromJson(prop.Value, path, meta, textFields);
+                    ExtractFromJson(prop.Value, path, meta, textFields, flattened);
                     path.Length = baseLen;
                 }
                 break;
@@ -267,25 +320,36 @@ public sealed class StructuredExtractor : IExtractor
                     int baseLen = path.Length;
                     if (path.Length == 0) { path.Append("item_"); path.Append(i); }
                     else { path.Append('['); path.Append(i); path.Append(']'); }
-                    ExtractFromJson(item, path, meta, textFields);
+                    ExtractFromJson(item, path, meta, textFields, flattened);
                     path.Length = baseLen;
                     i++;
                 }
                 break;
             case JsonValueKind.String:
                 string s = value.GetString()!;
-                if (s.Trim().Length > 0 && IsTextField(path.ToString()))
+                if (s.Trim().Length > 0)
                 {
-                    meta[path.ToString()] = s;
-                    textFields.Add(path.ToString());
+                    string key = path.ToString();
+                    flattened.Add($"{key}: {s}");
+                    if (IsTextField(key)) { meta[key] = s; textFields.Add(key); }
                 }
+                break;
+            case JsonValueKind.Number:
+                flattened.Add($"{path}: {SerdeJson.Compact(value)}");
+                break;
+            case JsonValueKind.True:
+                flattened.Add($"{path}: true");
+                break;
+            case JsonValueKind.False:
+                flattened.Add($"{path}: false");
                 break;
         }
     }
 
     // Walk over the JsonNode trees produced by the YAML/TOML parsers.
+    /// <summary>YAML/TOML counterpart of <see cref="ExtractFromJson"/>.</summary>
     private static void ExtractFromNode(JsonNode? value, StringBuilder path,
-        Dictionary<string, string> meta, List<string> textFields)
+        Dictionary<string, string> meta, List<string> textFields, List<string> flattened)
     {
         switch (value)
         {
@@ -295,7 +359,7 @@ public sealed class StructuredExtractor : IExtractor
                     int baseLen = path.Length;
                     if (path.Length > 0) path.Append('.');
                     path.Append(kv.Key);
-                    ExtractFromNode(kv.Value, path, meta, textFields);
+                    ExtractFromNode(kv.Value, path, meta, textFields, flattened);
                     path.Length = baseLen;
                 }
                 break;
@@ -305,16 +369,31 @@ public sealed class StructuredExtractor : IExtractor
                     int baseLen = path.Length;
                     if (path.Length == 0) { path.Append("item_"); path.Append(i); }
                     else { path.Append('['); path.Append(i); path.Append(']'); }
-                    ExtractFromNode(arr[i], path, meta, textFields);
+                    ExtractFromNode(arr[i], path, meta, textFields, flattened);
                     path.Length = baseLen;
                 }
                 break;
-            case JsonValue jv when jv.GetValueKind() == JsonValueKind.String:
-                string s = jv.GetValue<string>();
-                if (s.Trim().Length > 0 && IsTextField(path.ToString()))
+            case JsonValue jv:
+                switch (jv.GetValueKind())
                 {
-                    meta[path.ToString()] = s;
-                    textFields.Add(path.ToString());
+                    case JsonValueKind.String:
+                        string s = jv.GetValue<string>();
+                        if (s.Trim().Length > 0)
+                        {
+                            string key = path.ToString();
+                            flattened.Add($"{key}: {s}");
+                            if (IsTextField(key)) { meta[key] = s; textFields.Add(key); }
+                        }
+                        break;
+                    case JsonValueKind.Number:
+                        flattened.Add($"{path}: {jv.ToJsonString()}");
+                        break;
+                    case JsonValueKind.True:
+                        flattened.Add($"{path}: true");
+                        break;
+                    case JsonValueKind.False:
+                        flattened.Add($"{path}: false");
+                        break;
                 }
                 break;
         }
@@ -336,7 +415,7 @@ public sealed class StructuredExtractor : IExtractor
 
     private readonly record struct StructuredResult(
         string Content, string Format, Dictionary<string, string> Metadata,
-        List<string> TextFields, JsonElement? JsonRoot);
+        List<string> TextFields, JsonElement? JsonRoot, List<string> Flattened);
 }
 
 /// <summary>

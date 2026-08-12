@@ -37,6 +37,10 @@ public sealed class Extractor
             {
                 var internalDoc = extractor.Extract(bytes, mimeType, config);
                 var extracted = Derive.DeriveExtractionResult(internalDoc, config.IncludeDocumentStructure, config.OutputFormat);
+                // Record the format the content was rendered in (Rust `pipeline::format`).
+                // Set after derive so the extractor-supplied value the renderer consults for
+                // `PreRenderedContent` is not disturbed.
+                extracted.Metadata.OutputFormat = config.OutputFormat.ToString();
                 result.Results.Add(extracted);
             }
         }
