@@ -2,17 +2,19 @@
 //!
 //! Produces a heading-driven tree where headings create nested sections.
 //! The output is a JSON object with a `title` (optional) and `body` array
-//! of typed nodes (section, paragraph, table, code, formula, list, image, blockquote).
+//! of typed nodes. Every non-container [`ElementKind`] maps to a node whose
+//! `type` tag is that kind's [`ElementKind::discriminant`] string, so no body
+//! content is silently discarded.
 
 use serde::Serialize;
 
-use crate::types::internal::{ElementKind, InternalDocument};
+use crate::types::annotations::PdfAnnotation;
+use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
 
-use super::common::{NestingKind, RenderState, get_language, handle_container_end, is_body_element, is_container_end};
-
-// ============================================================================
-// JSON Document Types
-// ============================================================================
+use super::common::{
+    FootnoteCollector, NestingKind, RenderState, get_admonition_kind, get_admonition_title, get_language,
+    handle_container_end, is_body_element, is_container_end, parse_metadata_entries,
+};
 
 /// Top-level JSON document.
 #[cfg_attr(alef, alef(skip))]
@@ -23,6 +25,9 @@ pub struct JsonDocument {
     pub title: Option<String>,
     /// Body content nodes.
     pub body: Vec<JsonNode>,
+    /// PDF annotations extracted from the document (issue #63), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Vec<PdfAnnotation>>,
 }
 
 /// A node in the JSON document tree.
@@ -72,11 +77,97 @@ pub enum JsonNode {
     /// A blockquote containing nested content.
     #[serde(rename = "blockquote")]
     Blockquote { body: Vec<JsonNode> },
+    /// A page break marker.
+    #[serde(rename = "page_break")]
+    PageBreak {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page: Option<u32>,
+    },
+    /// A footnote reference marker occurring in body text.
+    #[serde(rename = "footnote_ref")]
+    FootnoteRef {
+        /// Sequential footnote number, matching the `[^n]` markers other renderers emit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        number: Option<u32>,
+        /// Anchor key linking this reference to its definition.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// A footnote definition.
+    #[serde(rename = "footnote_definition")]
+    FootnoteDefinition {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// A reviewer/editor comment reference marker occurring in body text (e.g.
+    /// DOCX comments). Distinct from `FootnoteRef` (xberg-io/xberg#300).
+    #[serde(rename = "comment_ref")]
+    CommentRef {
+        /// Anchor key linking this reference to its definition.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// A reviewer/editor comment definition (the comment body). Distinct from
+    /// `FootnoteDefinition` (xberg-io/xberg#300).
+    #[serde(rename = "comment_definition")]
+    CommentDefinition {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// A citation or bibliographic reference.
+    #[serde(rename = "citation")]
+    Citation {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// A presentation slide marker with an optional title.
+    #[serde(rename = "slide")]
+    Slide {
+        number: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// A definition-list term.
+    #[serde(rename = "definition_term")]
+    DefinitionTerm { text: String },
+    /// A definition-list description.
+    #[serde(rename = "definition_description")]
+    DefinitionDescription { text: String },
+    /// An admonition / callout (note, warning, tip, …).
+    #[serde(rename = "admonition")]
+    Admonition {
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        text: String,
+    },
+    /// A raw block preserved verbatim.
+    #[serde(rename = "raw_block")]
+    RawBlock {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+    },
+    /// A structured metadata block (frontmatter, email headers).
+    #[serde(rename = "metadata_block")]
+    MetadataBlock {
+        entries: Vec<JsonMetadataEntry>,
+        /// Raw block text, present only when no `key: value` entries could be parsed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
 }
 
-// ============================================================================
-// Section Stack
-// ============================================================================
+/// A single `key: value` pair inside a [`JsonNode::MetadataBlock`].
+#[cfg_attr(alef, alef(skip))]
+#[derive(Debug, Serialize)]
+pub struct JsonMetadataEntry {
+    pub key: String,
+    pub value: String,
+}
 
 /// An open section on the stack, accumulating child nodes.
 struct OpenSection {
@@ -85,19 +176,11 @@ struct OpenSection {
     body: Vec<JsonNode>,
 }
 
-// ============================================================================
-// List Accumulator
-// ============================================================================
-
 /// Tracks an open list being accumulated from ListStart..ListEnd markers.
 struct OpenList {
     ordered: bool,
     items: Vec<String>,
 }
-
-// ============================================================================
-// Renderer
-// ============================================================================
 
 /// Render an `InternalDocument` as a JSON tree string.
 ///
@@ -106,7 +189,6 @@ struct OpenList {
 #[cfg_attr(alef, alef(skip))]
 pub fn render_json(doc: &InternalDocument) -> String {
     let json_doc = build_json_document(doc);
-    // serde_json::to_string should not fail on our types (no maps with non-string keys).
     serde_json::to_string(&json_doc).unwrap_or_else(|e| {
         tracing::error!(error = %e, "failed to serialize JSON document");
         r#"{"body":[]}"#.to_string()
@@ -121,14 +203,14 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
     let mut state = RenderState::default();
     let mut open_list: Option<OpenList> = None;
     let mut open_blockquote: Option<Vec<JsonNode>> = None;
+    let footnotes = FootnoteCollector::new(doc);
 
-    for elem in &doc.elements {
+    for (elem_index, elem) in doc.elements.iter().enumerate() {
         if !is_body_element(elem) {
             continue;
         }
 
         if is_container_end(elem) {
-            // Flush list/blockquote if ending
             match elem.kind {
                 ElementKind::ListEnd => {
                     if let Some(list) = open_list.take() {
@@ -159,13 +241,10 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
             }
 
             ElementKind::Heading { level } => {
-                // Flush any open list before starting a new section.
                 flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
 
-                // Close sections at same or deeper level.
                 close_sections_to_level(&mut section_stack, &mut root_body, level);
 
-                // Open a new section.
                 section_stack.push(OpenSection {
                     heading: elem.text.clone(),
                     level,
@@ -177,7 +256,6 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
                 if elem.text.is_empty() {
                     continue;
                 }
-                // If inside an open list (orphan list items without markers), skip.
                 let node = JsonNode::Paragraph {
                     text: elem.text.clone(),
                 };
@@ -185,7 +263,6 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
             }
 
             ElementKind::ListStart { ordered } => {
-                // Flush any prior list.
                 flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
                 state.push_container(NestingKind::List { ordered, item_count: 0 }, elem.depth);
                 open_list = Some(OpenList {
@@ -198,7 +275,6 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
                 if let Some(ref mut list) = open_list {
                     list.items.push(elem.text.clone());
                 } else {
-                    // Orphan list item without ListStart — create an inline list node.
                     let node = JsonNode::List {
                         ordered,
                         items: vec![elem.text.clone()],
@@ -274,37 +350,176 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
                 }
             }
 
-            // Container end markers, page breaks, footnotes, etc. — skip.
-            ElementKind::ListEnd
-            | ElementKind::QuoteEnd
-            | ElementKind::GroupStart
-            | ElementKind::GroupEnd
-            | ElementKind::PageBreak
-            | ElementKind::FootnoteDefinition
-            | ElementKind::FootnoteRef
-            | ElementKind::Citation
-            | ElementKind::Slide { .. }
-            | ElementKind::DefinitionTerm
-            | ElementKind::DefinitionDescription
-            | ElementKind::Admonition
-            | ElementKind::RawBlock
-            | ElementKind::MetadataBlock => {}
+            ElementKind::PageBreak => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::PageBreak { page: elem.page };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::FootnoteRef => {
+                let node = JsonNode::FootnoteRef {
+                    number: footnotes.ref_number(elem_index as u32),
+                    id: elem.anchor.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::FootnoteDefinition => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::FootnoteDefinition {
+                    text: elem.text.clone(),
+                    id: elem.anchor.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::CommentRef => {
+                // Not tracked by `FootnoteCollector`, so there is no sequential number —
+                // the anchor id is the only stable link to the definition.
+                let node = JsonNode::CommentRef {
+                    id: elem.anchor.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::CommentDefinition => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::CommentDefinition {
+                    text: elem.text.clone(),
+                    id: elem.anchor.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::Citation => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::Citation {
+                    text: elem.text.clone(),
+                    id: elem.anchor.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::Slide { number } => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::Slide {
+                    number,
+                    title: if elem.text.is_empty() {
+                        None
+                    } else {
+                        Some(elem.text.clone())
+                    },
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::DefinitionTerm => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::DefinitionTerm {
+                    text: elem.text.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::DefinitionDescription => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::DefinitionDescription {
+                    text: elem.text.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::Admonition => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::Admonition {
+                    kind: get_admonition_kind(elem).to_string(),
+                    title: get_admonition_title(elem).map(|t| t.to_string()),
+                    text: elem.text.clone(),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::RawBlock => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let node = JsonNode::RawBlock {
+                    text: elem.text.clone(),
+                    format: get_attribute(elem, "format"),
+                };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::MetadataBlock => {
+                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                let entries: Vec<JsonMetadataEntry> = parse_metadata_entries(&elem.text)
+                    .into_iter()
+                    .map(|(key, value)| JsonMetadataEntry {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    })
+                    .collect();
+                let text = if entries.is_empty() && !elem.text.is_empty() {
+                    Some(elem.text.clone())
+                } else {
+                    None
+                };
+                let node = JsonNode::MetadataBlock { entries, text };
+                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+            }
+
+            ElementKind::ListEnd | ElementKind::QuoteEnd | ElementKind::GroupStart | ElementKind::GroupEnd => {}
         }
     }
 
-    // Flush any remaining open list.
     flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
 
-    // Flush any remaining open blockquote.
     if let Some(bq_body) = open_blockquote.take() {
         let node = JsonNode::Blockquote { body: bq_body };
         push_to_current(&mut root_body, &mut section_stack, &mut None, node);
     }
 
-    // Close all remaining open sections.
     close_sections_to_level(&mut section_stack, &mut root_body, 0);
 
-    JsonDocument { title, body: root_body }
+    // Footnote definitions live on `ContentLayer::Footnote`, not `ContentLayer::Body`,
+    // so the per-element loop above never sees them: `is_body_element` filters them
+    // out before the `ElementKind::FootnoteDefinition` arm is reached. That filter is
+    // correct — a definition is document furniture, not body flow, and must not be
+    // interleaved into whatever section happened to be open when its reference
+    // occurred — but it also meant the definition a `[^n]` marker points at was
+    // dropped entirely (xberg-io/xberg#288). Collect the ones the main loop skipped
+    // and append them once, in document order, at the very end, mirroring how the
+    // Markdown renderer (`comrak_bridge::render_markdown`) emits collected footnote
+    // definitions after the rest of the tree instead of inline. ~keep
+    for elem in &doc.elements {
+        if elem.kind == ElementKind::FootnoteDefinition && !is_body_element(elem) {
+            root_body.push(JsonNode::FootnoteDefinition {
+                text: elem.text.clone(),
+                id: elem.anchor.clone(),
+            });
+        }
+    }
+
+    // Comment definitions (#300) live on `ContentLayer::Footnote` too, so they hit
+    // the same `is_body_element` filter as footnote definitions above — collect
+    // them the same way instead of silently dropping the comment body. ~keep
+    for elem in &doc.elements {
+        if elem.kind == ElementKind::CommentDefinition && !is_body_element(elem) {
+            root_body.push(JsonNode::CommentDefinition {
+                text: elem.text.clone(),
+                id: elem.anchor.clone(),
+            });
+        }
+    }
+
+    JsonDocument {
+        title,
+        body: root_body,
+        annotations: doc.annotations.clone(),
+    }
+}
+
+/// Read a named attribute off an element, if present.
+fn get_attribute(elem: &InternalElement, key: &str) -> Option<String> {
+    elem.attributes.as_ref().and_then(|attrs| attrs.get(key).cloned())
 }
 
 /// Push a node to the current target (innermost open section, or root body).
@@ -314,12 +529,10 @@ fn push_to_current(
     open_blockquote: &mut Option<Vec<JsonNode>>,
     node: JsonNode,
 ) {
-    // If inside a blockquote, push there.
     if let Some(bq) = open_blockquote {
         bq.push(node);
         return;
     }
-    // Otherwise, push to innermost open section or root.
     if let Some(section) = section_stack.last_mut() {
         section.body.push(node);
     } else {
@@ -338,7 +551,6 @@ fn close_sections_to_level(section_stack: &mut Vec<OpenSection>, root_body: &mut
                 level: section.level,
                 body: section.body,
             };
-            // Append to parent section or root.
             if let Some(parent) = section_stack.last_mut() {
                 parent.body.push(node);
             } else {
@@ -365,10 +577,6 @@ fn flush_list(
         push_to_current(root_body, section_stack, open_blockquote, node);
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -428,7 +636,6 @@ mod tests {
         assert_eq!(section["type"], "section");
         assert_eq!(section["heading"], "Chapter 1");
         assert_eq!(section["level"], 1);
-        // Body should have: paragraph "Intro" and a nested section
         assert_eq!(section["body"].as_array().unwrap().len(), 2);
         assert_eq!(section["body"][0]["type"], "paragraph");
         let sub_section = &section["body"][1];
@@ -479,7 +686,6 @@ mod tests {
         let code = &parsed["body"][0];
         assert_eq!(code["type"], "code");
         assert_eq!(code["text"], "some code");
-        // language should be absent (skip_serializing_if)
         assert!(code.get("language").is_none() || code["language"].is_null());
     }
 
@@ -536,7 +742,6 @@ mod tests {
         let json_str = render_json(&doc);
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["title"], "My Document");
-        // Title should not appear as a body node.
         assert_eq!(parsed["body"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["body"][0]["type"], "paragraph");
     }
@@ -582,7 +787,6 @@ mod tests {
         b.push_formula("x^2", None, None);
         let doc = b.build();
         let json_str = render_json(&doc);
-        // Must be valid JSON.
         let result: Result<serde_json::Value, _> = serde_json::from_str(&json_str);
         assert!(result.is_ok(), "JSON output is not valid: {}", json_str);
     }

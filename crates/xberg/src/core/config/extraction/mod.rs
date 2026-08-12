@@ -15,18 +15,18 @@ mod file_config;
 mod loaders;
 mod types;
 
-// Re-export all public types for backward compatibility
 pub use self::core::ExtractionConfig;
 pub use self::file_config::FileExtractionConfig;
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub(crate) use self::types::BatchBytesItem;
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub(crate) use self::types::BatchFileItem;
 #[cfg(feature = "svg")]
 pub use self::types::SvgOptions;
 pub use self::types::{
-    ExtractInput, ExtractInputKind, ExtractionErrorItem, ExtractionResult, ExtractionSummary, ImageExtractionConfig,
-    ImageOutputFormat, LanguageDetectionConfig, TokenReductionOptions, UrlExtractionConfig, UrlExtractionMode,
+    BreadcrumbTarget, ExtractInput, ExtractInputKind, ExtractionErrorItem, ExtractionResult, ExtractionSummary,
+    ImageExtractionConfig, ImageOutputFormat, LanguageDetectionConfig, TokenReductionOptions, UrlExtractionConfig,
+    UrlExtractionMode,
 };
 
 #[cfg(test)]

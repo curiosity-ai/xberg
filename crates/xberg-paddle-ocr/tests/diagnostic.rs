@@ -4,6 +4,9 @@
 //! Since this crate doesn't have PNG/image decoder features, we create test
 //! images programmatically.
 
+#![cfg(feature = "ort")] // ~keep: this diagnostic drives the `ort` session API directly
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+
 use std::path::PathBuf;
 
 fn get_workspace_root() -> PathBuf {
@@ -22,11 +25,8 @@ fn create_test_image() -> image::RgbImage {
     let height = 100u32;
     let mut img = image::RgbImage::from_pixel(width, height, image::Rgb([255, 255, 255]));
 
-    // Draw a thick black rectangle to simulate text (a simple "block" pattern)
-    // This ensures the detection model has SOMETHING to detect
     let black = image::Rgb([0, 0, 0]);
 
-    // Draw "H" shape (x: 20-60, y: 20-80)
     for y in 20..80 {
         img.put_pixel(20, y, black);
         img.put_pixel(21, y, black);
@@ -43,7 +43,6 @@ fn create_test_image() -> image::RgbImage {
         img.put_pixel(x, 50, black);
     }
 
-    // Draw thick solid block to be very obvious (x: 80-180, y: 30-70)
     for y in 30..70 {
         for x in 80..180 {
             img.put_pixel(x, y, black);
@@ -62,23 +61,20 @@ fn diagnostic_detection_pipeline() {
         return;
     }
 
-    // Discover ORT library
     discover_ort();
 
     eprintln!("=== PaddleOCR Diagnostic Test ===");
     eprintln!("Model dir: {:?}", model_dir);
 
-    // Step 1: Create test image
     let img = create_test_image();
     eprintln!("Step 1 - Test image created: {}x{}", img.width(), img.height());
 
-    // Step 2: Initialize OcrLite
-    let mut ocr_lite = xberg_paddle_ocr::OcrLite::new();
+    let mut ocr_engine = xberg_paddle_ocr::PaddleOcrEngine::new();
     let det_path = model_dir.join("det/model.onnx");
     let cls_path = model_dir.join("cls/model.onnx");
     let rec_path = model_dir.join("rec/model.onnx");
 
-    let init_result = ocr_lite.init_models(
+    let init_result = ocr_engine.init_models(
         det_path.to_str().unwrap(),
         cls_path.to_str().unwrap(),
         rec_path.to_str().unwrap(),
@@ -93,7 +89,6 @@ fn diagnostic_detection_pipeline() {
         }
     }
 
-    // Step 3: Run detection with various parameter sets
     let test_cases = vec![
         ("A: Default params", 50u32, 960u32, 0.3f32, 0.5f32, 1.6f32, true, false),
         ("B: Very low thresholds", 50, 960, 0.01, 0.01, 1.6, false, false),
@@ -111,7 +106,7 @@ fn diagnostic_detection_pipeline() {
             padding, max_side, box_score, box_thresh, unclip
         );
 
-        let result = ocr_lite.detect(
+        let result = ocr_engine.detect(
             &img,
             *padding,
             *max_side,
@@ -165,7 +160,6 @@ fn diagnostic_raw_ort_inference() {
 
     eprintln!("=== Raw ORT Inference Test ===");
 
-    // Load model directly via ort
     use ort::session::Session;
 
     let mut session = Session::builder().unwrap().commit_from_file(&det_model).unwrap();
@@ -180,7 +174,6 @@ fn diagnostic_raw_ort_inference() {
         eprintln!("  name='{}'", output.name());
     }
 
-    // Create a small 32x32 test tensor (NCHW format: batch=1, channels=3, h=32, w=32)
     let input_data: Vec<f32> = vec![0.5; 3 * 32 * 32];
     let tensor =
         ort::value::Tensor::from_array(ndarray::Array::from_shape_vec((1, 3, 32, 32), input_data).unwrap()).unwrap();
@@ -190,7 +183,6 @@ fn diagnostic_raw_ort_inference() {
 
     let outputs = session.run(ort::inputs![input_name => tensor]).unwrap();
 
-    // Check output
     let (output_name, output_value) = outputs.iter().next().unwrap();
     eprintln!("Output name: {}", output_name);
 
@@ -249,16 +241,13 @@ fn diagnostic_crnn_model_output() {
         eprintln!("  name='{}'", output.name());
     }
 
-    // Check metadata for character list
     {
         let metadata = session.metadata().unwrap();
 
-        // Check all metadata custom keys
         eprintln!("Model metadata:");
         eprintln!("  description: {:?}", metadata.description());
         eprintln!("  producer: {:?}", metadata.producer());
 
-        // Try to get the character key
         match metadata.custom("character") {
             Some(chars) => {
                 let bytes = chars.as_bytes();
@@ -276,7 +265,6 @@ fn diagnostic_crnn_model_output() {
                     eprintln!("  preview (first 100 chars): {:?}", preview);
                 }
 
-                // Check for null bytes or other encoding issues
                 let null_count = bytes.iter().filter(|&&b| b == 0).count();
                 if null_count > 0 {
                     eprintln!("  WARNING: {} null bytes found in character string!", null_count);
@@ -287,7 +275,6 @@ fn diagnostic_crnn_model_output() {
             }
         }
 
-        // Try other possible metadata keys
         for key in [
             "character",
             "characters",
@@ -306,19 +293,16 @@ fn diagnostic_crnn_model_output() {
                 );
             }
         }
-    } // metadata dropped here
+    }
 
-    // Test 1: Run inference with a simple input (height=48, width=200)
-    // CRNN expects NCHW: [1, 3, 48, width]
     let h = 48usize;
     let w = 200usize;
 
-    // Create a pattern that looks like text (alternating black/white vertical stripes)
     let mut input_data: Vec<f32> = vec![0.0; 3 * h * w];
     for c in 0..3 {
         for y in 10..38 {
             for x in (20..180).step_by(2) {
-                input_data[c * h * w + y * w + x] = -1.0; // normalized black
+                input_data[c * h * w + y * w + x] = -1.0;
             }
         }
     }
@@ -342,14 +326,12 @@ fn diagnostic_crnn_model_output() {
         let vocab_size = shape[2] as usize;
         eprintln!("Time steps: {}, Vocabulary size: {}", time_steps, vocab_size);
 
-        // Check if outputs are meaningful
         let data_vec: Vec<f32> = data.to_vec();
         let min = data_vec.iter().cloned().fold(f32::INFINITY, f32::min);
         let max = data_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mean: f32 = data_vec.iter().sum::<f32>() / data_vec.len() as f32;
         eprintln!("Overall stats: min={:.6}, max={:.6}, mean={:.6}", min, max, mean);
 
-        // Check argmax distribution
         let mut argmax_zero_count = 0;
         let mut argmax_nonzero_count = 0;
         for t in 0..time_steps {
@@ -392,10 +374,8 @@ fn diagnostic_crnn_model_output() {
         }
     }
 
-    // Drop outputs before reusing session
     drop(outputs);
 
-    // Test 2: Run with a uniform white image (should produce all blanks - valid baseline)
     let white_data: Vec<f32> = vec![1.0; 3 * h * w];
     let white_tensor =
         ort::value::Tensor::from_array(ndarray::Array::from_shape_vec((1, 3, h, w), white_data).unwrap()).unwrap();

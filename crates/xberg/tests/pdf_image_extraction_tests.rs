@@ -3,13 +3,19 @@
 //! Verifies that embedded images in PDFs produce proper `![](image_N.fmt)`
 //! references instead of empty `![]()` placeholders.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "pdf")]
 
 use std::path::PathBuf;
 use xberg::core::config::{ExtractionConfig, OutputFormat};
 
 mod helpers;
-use helpers::{extract_uri_document, extract_uri_document_blocking};
+use helpers::extract_uri_document;
+// Gated to match its callers, every one of which is `#[cfg(feature = "ocr")]`.
+// Without this, a leg that enables `pdf` but not `ocr` sees an unused import
+// and fails on `-D warnings`. ~keep
+#[cfg(feature = "ocr")]
+use helpers::extract_uri_document_blocking;
 
 fn test_documents_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -40,7 +46,6 @@ fn test_multipage_marketing_no_empty_image_refs() {
     let result = extract_markdown("pdf/multipage_marketing.pdf");
     let content = &result.content;
 
-    // Must not contain empty image references
     assert!(
         !content.contains("![]()"),
         "Markdown output must not contain empty image references ![](), got:\n{}",
@@ -53,7 +58,6 @@ fn test_multipage_marketing_has_image_refs() {
     let result = extract_markdown("pdf/multipage_marketing.pdf");
     let content = &result.content;
 
-    // Must contain at least one proper image reference
     assert!(
         content.contains("![](image_"),
         "Markdown output must contain image references like ![](image_N.png), got:\n{}",
@@ -65,11 +69,9 @@ fn test_multipage_marketing_has_image_refs() {
 fn test_multipage_marketing_images_populated() {
     let result = extract_markdown("pdf/multipage_marketing.pdf");
 
-    // Extraction result must have images with actual data
     let images = result.images.as_ref().expect("images field must be Some");
     assert!(!images.is_empty(), "Extraction result must contain extracted images");
 
-    // At least some images should have non-empty data
     let images_with_data = images.iter().filter(|img| !img.data.is_empty()).count();
     assert!(
         images_with_data > 0,
@@ -95,7 +97,6 @@ fn test_docling_has_image_refs() {
     let result = extract_markdown("pdf/docling.pdf");
     let content = &result.content;
 
-    // Docling has at least 1 figure
     assert!(
         content.contains("![](image_"),
         "Docling markdown must contain image references, got:\n{}",
@@ -108,7 +109,6 @@ fn test_docling_content_quality() {
     let result = extract_markdown("pdf/docling.pdf");
     let content = &result.content;
 
-    // Verify key content from the Docling technical report is present
     assert!(content.contains("Docling"), "Must contain 'Docling'");
     assert!(content.contains("PDF"), "Must contain 'PDF'");
     assert!(
@@ -128,6 +128,22 @@ fn test_docling_content_quality() {
 /// repository due to size). To reproduce locally, generate a Ghostscript vector
 /// decomposition PDF and place it at:
 ///   test_documents/pdf/ghostscript_inline_images_repro.pdf
+///
+/// The budget below guards against the O(N²) blowup coming back — which cost
+/// *minutes* — and is not a throughput target.
+///
+/// It was originally 10s, which no machine has ever met in a debug build: measured
+/// 2026-08-09 at 27.0s locally (isolated, `cargo test` debug profile) against 13.2s
+/// on macos-latest and 14.5s on ubuntu-24.04-arm. That bound went unnoticed because
+/// the skip branch above was always taken — `test_documents` is bucket-fetched, and
+/// CI only began materialising this fixture once the corpus fetcher landed. The
+/// first CI run that actually had the file was the first one to measure anything.
+/// So this is a budget that was never exercised, not a performance regression.
+/// Upper bound for the Ghostscript inline-image repro. See the note on
+/// [`test_ghostscript_inline_images_completes_in_reasonable_time`] — this guards against a
+/// complexity regression, so it sits well above the slowest healthy CI measurement.
+const MAX_GHOSTSCRIPT_INLINE_IMAGE_EXTRACTION: std::time::Duration = std::time::Duration::from_secs(45);
+
 #[test]
 fn test_ghostscript_inline_images_completes_in_reasonable_time() {
     let path = test_documents_dir().join("pdf/ghostscript_inline_images_repro.pdf");
@@ -148,25 +164,15 @@ fn test_ghostscript_inline_images_completes_in_reasonable_time() {
         .expect("extraction must succeed for Ghostscript inline-image PDF");
     let elapsed = start.elapsed();
 
-    // Before the fix, a single-page PDF with ~1,924 inline images took ~56 seconds.
-    // After the fix it should complete in well under 10 seconds even on slow CI.
     assert!(
-        elapsed.as_secs() < 10,
-        "Ghostscript inline-image PDF must extract in under 10 seconds, took {elapsed:?}"
+        elapsed < MAX_GHOSTSCRIPT_INLINE_IMAGE_EXTRACTION,
+        "Ghostscript inline-image PDF took {elapsed:?}, over the \
+         {MAX_GHOSTSCRIPT_INLINE_IMAGE_EXTRACTION:?} blowup guard -- suspect the O(N²) inline-image \
+         scan of issue #752 has returned"
     );
 
-    // The file has no text — content may be empty or minimal; that is expected.
     let _ = result;
 }
-
-// ─── Regression tests for issue #796 ────────────────────────────────────────
-//
-// Before the fix, setting `images.extract_images = false` (or
-// `pdf_options.extract_images = false`) still caused full base64 image data to
-// appear in `ExtractedDocument.images` when `output_format` was `Markdown` or
-// `Djot`. The root cause was that `inject_placeholders` in `extraction.rs`
-// defaulted to `true` without checking `extract_images`, allowing the structure
-// pipeline to call `populate_images_from_oxide` unconditionally.
 
 /// Helper: extract with a specific output format and images explicitly disabled
 /// via `ImageExtractionConfig.extract_images = false`.
@@ -215,7 +221,6 @@ fn test_regression_796_markdown_no_images_when_disabled_via_images_config() {
          output_format=Markdown. Got {} image(s).",
         result.images.as_ref().map(|v| v.len()).unwrap_or(0)
     );
-    // Confirm the text content was still extracted (no regression on content).
     assert!(
         !result.content.is_empty(),
         "Content must still be extracted when images are disabled"
@@ -284,23 +289,6 @@ fn test_regression_796_plain_no_images_when_disabled() {
     );
 }
 
-// ─── Content-level image suppression tests ───────────────────────────────────
-//
-// The earlier #796 tests only assert `result.images.is_empty()`. That field is
-// gated separately (extraction.rs:112) and is always empty when
-// `extract_images=false`, even if the `inject_placeholders` guard at line 216 is
-// removed. The guard controls whether `ElementKind::Image` elements are injected
-// into the InternalDocument — which in turn controls whether image placeholder
-// references (`![]()` / `![](image_N.fmt)`) appear in `result.content`.
-//
-// The Djot renderer (`djot.rs`) lacked the `doc.images.get()` None check that
-// comrak_bridge, html_styled, and plain all have. Removing the guard would cause
-// `![]()` to leak into Djot content with no test catching it.
-//
-// JSON renderer gap (out of scope): json.rs emits `{"type":"image","alt":null,"src":null}`
-// for orphaned elements — null fields are valid structured JSON and produce no broken
-// markup, so it is intentionally not addressed here.
-
 /// Djot content must not contain image markup when `extract_images=false`.
 ///
 /// End-to-end contract test: requires both the `inject_placeholders` guard in
@@ -322,7 +310,6 @@ fn test_djot_content_has_no_image_refs_when_extraction_disabled() {
          Got content:\n{}",
         &result.content[..result.content.len().min(400)]
     );
-    // Text content must still be present — no regression on extraction.
     assert!(
         !result.content.is_empty(),
         "Djot content must not be empty when images are disabled"
@@ -367,11 +354,6 @@ fn test_djot_content_has_no_image_refs_when_disabled_via_pdf_options() {
     );
 }
 
-// ─── Page-level and chunk-level image index references ────────────────────────
-//
-// Pages carry `image_indices: Vec<usize>` — zero-based indices into the
-// top-level `ExtractedDocument.images` collection. Chunks carry the same field.
-
 fn extract_with_pages_and_images(relative_path: &str) -> xberg::types::ExtractedDocument {
     use xberg::core::config::{ImageExtractionConfig, PageConfig};
     let path = test_documents_dir().join(relative_path);
@@ -406,16 +388,12 @@ fn test_page_image_indices_are_valid_when_images_extracted() {
         .expect("pages must be Some when extract_pages=true");
     assert!(!pages.is_empty(), "fixture must have pages");
 
-    // At least one page must carry image_indices (not all pages need images).
     let pages_with_images: Vec<_> = pages.iter().filter(|p| !p.image_indices.is_empty()).collect();
     assert!(
         !pages_with_images.is_empty(),
         "at least one page must have image_indices populated when the PDF contains images"
     );
 
-    // Every index must be in-bounds and the referenced image must report
-    // belonging to this page (cross-validation: wrong-page bugs would pass a
-    // bounds-only check).
     for page in pages {
         for &idx in &page.image_indices {
             assert!(
@@ -511,7 +489,6 @@ fn test_chunk_image_indices_are_valid_when_images_extracted() {
         .expect("chunks must be Some when chunking is configured");
     assert!(!chunks.is_empty(), "fixture must produce chunks");
 
-    // At least one chunk must carry image_indices.
     let chunks_with_images: Vec<_> = chunks.iter().filter(|c| !c.metadata.image_indices.is_empty()).collect();
     assert!(
         !chunks_with_images.is_empty(),
@@ -520,7 +497,6 @@ fn test_chunk_image_indices_are_valid_when_images_extracted() {
 
     for chunk in chunks {
         for &idx in &chunk.metadata.image_indices {
-            // In-bounds check.
             assert!(
                 (idx as usize) < images.len(),
                 "chunk image_indices[{}] = {} is out of bounds (images.len() = {})",
@@ -529,8 +505,6 @@ fn test_chunk_image_indices_are_valid_when_images_extracted() {
                 images.len()
             );
 
-            // Cross-validation: referenced image must belong to a page within
-            // the chunk's page range.
             if let (Some(first), Some(last)) = (chunk.metadata.first_page, chunk.metadata.last_page) {
                 let img_page = images[idx as usize]
                     .page_number
@@ -592,7 +566,6 @@ fn test_max_images_per_page_cap_respected_in_output() {
         .as_ref()
         .expect("images must be Some when extract_images=true");
 
-    // Cap must be respected per page in the output.
     let mut per_page: HashMap<u32, usize> = HashMap::new();
     for img in images {
         *per_page.entry(img.page_number.unwrap_or(1)).or_default() += 1;
@@ -620,14 +593,13 @@ fn test_no_images_returned_when_extraction_disabled_on_dense_pdf() {
         return;
     }
 
-    let config = ExtractionConfig::default(); // extract_images defaults to false
+    let config = ExtractionConfig::default();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt
         .block_on(extract_uri_document(&path, None, &config))
         .expect("extraction must succeed");
 
-    // No images should be returned when extraction is disabled.
     assert!(
         result.images.is_none() || result.images.as_ref().is_some_and(|v| v.is_empty()),
         "images must be absent when extract_images=false"
@@ -660,10 +632,9 @@ fn test_image_positions_consistent_with_image_data() {
 
     let images = match result.images.as_ref() {
         Some(imgs) if !imgs.is_empty() => imgs,
-        _ => return, // no images in this PDF — nothing to verify
+        _ => return,
     };
 
-    // image_index values must be unique across the returned set.
     let mut seen = std::collections::HashSet::new();
     for img in images {
         assert!(
@@ -673,9 +644,6 @@ fn test_image_positions_consistent_with_image_data() {
         );
     }
 
-    // Every `![](image_N.ext)` placeholder in Markdown must resolve to an index in
-    // result.images.  This would fail if inject_placeholders emitted a reference for
-    // an image that was never extracted (orphaned placeholder).
     let known: std::collections::HashSet<u32> = images.iter().map(|i| i.image_index).collect();
     let re = regex::Regex::new(r"!\[\]\(image_(\d+)\.[a-z]+\)").unwrap();
     for cap in re.captures_iter(&result.content) {
@@ -702,14 +670,12 @@ fn test_no_decompression_when_images_disabled() {
     let path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
     assert!(path.exists(), "missing fixture: {}", path.display());
 
-    // Default config: extract_images defaults to false.
     let config = ExtractionConfig::default();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt
         .block_on(extract_uri_document(&path, None, &config))
         .expect("extraction must succeed");
 
-    // The text-only path must not return any image data.
     assert!(
         result.images.as_ref().is_none_or(|v| v.is_empty()),
         "images must be absent on text-only extraction (extract_images=false). \
@@ -717,7 +683,6 @@ fn test_no_decompression_when_images_disabled() {
         result.images.as_ref().map_or(0, |v| v.len())
     );
 
-    // Text content must still be present — no regression on the extraction itself.
     assert!(
         !result.content.is_empty(),
         "text content must still be extracted when images are disabled"
@@ -738,8 +703,6 @@ fn test_no_decompression_trace_when_images_disabled() {
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
 
-    // ── Captured-event layer ────────────────────────────────────────────────
-
     #[allow(clippy::type_complexity)]
     #[derive(Clone, Default)]
     struct EventCapture {
@@ -753,12 +716,10 @@ fn test_no_decompression_trace_when_images_disabled() {
         fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
             let target = event.metadata().target().to_owned();
 
-            // Only record events from our target to avoid unbounded accumulation.
             if target != "xberg::pdf::oxide::images" {
                 return;
             }
 
-            // Walk the fields to capture the `event` key if present.
             struct FieldVisitor(Option<String>);
             impl tracing::field::Visit for FieldVisitor {
                 fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -780,8 +741,6 @@ fn test_no_decompression_trace_when_images_disabled() {
         }
     }
 
-    // ── Test body ───────────────────────────────────────────────────────────
-
     let path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
     assert!(path.exists(), "missing fixture: {}", path.display());
 
@@ -792,9 +751,8 @@ fn test_no_decompression_trace_when_images_disabled() {
     let filter = EnvFilter::new("debug");
     let subscriber = tracing_subscriber::registry().with(filter).with(capture_clone);
 
-    // Wrap the runtime inside with_default so all spans/events are recorded.
     let result = tracing::subscriber::with_default(subscriber, || {
-        let config = ExtractionConfig::default(); // extract_images defaults to false
+        let config = ExtractionConfig::default();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -803,13 +761,11 @@ fn test_no_decompression_trace_when_images_disabled() {
             .expect("extraction must succeed")
     });
 
-    // Output assertion: no image data returned.
     assert!(
         result.images.as_ref().is_none_or(|v| v.is_empty()),
         "images must be absent when extract_images=false"
     );
 
-    // Trace assertion: the decompression_started event must not have fired.
     let events = capture.events.lock().unwrap();
     let decompression_events: Vec<_> = events
         .iter()
@@ -825,19 +781,6 @@ fn test_no_decompression_trace_when_images_disabled() {
         decompression_events.len()
     );
 }
-
-// ─── ocr_inline_images decompression path ─────────────────────────────────────
-//
-// When `ocr_inline_images=true`, the extraction branch condition
-// `images_extraction_enabled || ocr_inline_images` is true regardless of
-// `extract_images`.  Images are decompressed and stored in `result.images` even
-// when `ImageExtractionConfig.extract_images = false`.  Without this test, a
-// regression that short-circuits the extraction when `images_extraction_enabled`
-// is false would go undetected.
-//
-// Note: unbounded decompression when `ocr_inline_images=true` and
-// `config.images=None` (no cap) is a known limitation tracked separately in
-// xberg#989.  Set `config.images.max_images_per_page` to apply a cap.
 
 /// When `ocr_inline_images=true` and `extract_images=false`, images must still
 /// be decompressed — `ocr_inline_images` forces entry into the extraction branch.
@@ -857,12 +800,10 @@ fn test_ocr_inline_images_enters_decompression_path() {
 
     let config = ExtractionConfig {
         output_format: OutputFormat::Markdown,
-        // Explicitly disable extract_images — images_extraction_enabled will be false.
         images: Some(ImageExtractionConfig {
             extract_images: false,
             ..Default::default()
         }),
-        // Enable ocr_inline_images — this must force entry into the extraction branch.
         pdf_options: Some(PdfConfig {
             ocr_inline_images: true,
             ..Default::default()
@@ -873,8 +814,6 @@ fn test_ocr_inline_images_enters_decompression_path() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(extract_uri_document(&path, None, &config)).unwrap();
 
-    // Images must be decompressed even though extract_images=false, because
-    // ocr_inline_images=true enters the extraction branch regardless.
     let images = result.images.as_ref().expect(
         "result.images must be Some when ocr_inline_images=true, \
          even if extract_images=false — the extraction branch must be entered",
@@ -885,17 +824,6 @@ fn test_ocr_inline_images_enters_decompression_path() {
          when ocr_inline_images=true forces entry into the decompression branch"
     );
 }
-
-// ─── include_page_rasters integration tests ──────────────────────────────────
-//
-// These tests exercise the full pipeline: ExtractionConfig with
-// include_page_rasters=true → PDF OCR via Tesseract (per-page rendering) →
-// merge/reindex in mod.rs → ExtractedDocument.images contains PageRaster entries.
-//
-// They are the minimum proof that build_page_raster_image is actually called and
-// that the result survives the merge/reindex at mod.rs:501-507.  The unit tests
-// for build_page_raster_image in ocr.rs verify the helper itself; these tests
-// verify the integration path.
 
 /// Enabling `include_page_rasters` on a PDF with `force_ocr=true` must produce
 /// `ImageKind::PageRaster` entries in `ExtractedDocument.images`.
@@ -971,7 +899,6 @@ fn test_include_page_rasters_produces_rasters_on_force_ocr_pdf() {
         );
     }
 
-    // image_index values must be unique — reindex in mod.rs:501-507 must not collide.
     let mut seen = std::collections::HashSet::new();
     for img in images {
         assert!(
@@ -981,7 +908,6 @@ fn test_include_page_rasters_produces_rasters_on_force_ocr_pdf() {
         );
     }
 
-    // No page_rasters warning: Tesseract processes per-page, so the bypass never fires.
     let raster_warnings: Vec<_> = result
         .processing_warnings
         .iter()
@@ -1097,7 +1023,6 @@ fn test_include_page_rasters_on_force_ocr_pages_path() {
         images.len()
     );
 
-    // Only page 1 was selected — all rasters must reference page 1.
     for raster in &rasters {
         assert_eq!(
             raster.page_number,
@@ -1112,7 +1037,6 @@ fn test_include_page_rasters_on_force_ocr_pages_path() {
         );
     }
 
-    // image_index values must be unique across the full result set.
     let mut seen = std::collections::HashSet::new();
     for img in images {
         assert!(
@@ -1302,8 +1226,6 @@ fn test_regression_1077_raw_pdf_images_re_encoded_as_png() {
         ..Default::default()
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
-    // Before the fix this errored with
-    // "image dimension probe failed: The image format could not be determined".
     let result = rt
         .block_on(extract_uri_document(&path, None, &config))
         .expect("extraction of mp_axmp_rec_en.pdf must succeed without probe errors");
@@ -1318,11 +1240,6 @@ fn test_regression_1077_raw_pdf_images_re_encoded_as_png() {
         "mp_axmp_rec_en.pdf must yield at least one extracted image"
     );
 
-    // The #1077 guarantee is that no image escapes as a headerless, unprobeable buffer:
-    // every extracted image must carry a real, determinable format whose magic bytes match
-    // its declared `format`. Raw pixel buffers are re-encoded to PNG; DCT-embedded images
-    // are passed through as JPEG (pdf_oxide >= 0.3.66 returns these directly rather than as
-    // ImageData::Raw). A "raw" format or a format/magic-byte mismatch is the regression.
     for img in images.iter() {
         let magic = &img.data[..8.min(img.data.len())];
         let magic_matches = match img.format.as_ref() {

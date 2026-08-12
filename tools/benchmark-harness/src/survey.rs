@@ -116,7 +116,6 @@ pub fn print_survey_table(results: &[DocStats]) {
         );
     }
 
-    // Summary
     let n = results.len();
     let total_time: f64 = results.iter().map(|s| s.extraction_ms).sum();
     let errors = results.iter().filter(|s| s.error.is_some()).count();

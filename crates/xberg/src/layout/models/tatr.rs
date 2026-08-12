@@ -21,15 +21,11 @@ use ort::{inputs, session::Session, value::Tensor};
 use crate::layout::error::LayoutError;
 use crate::layout::session::build_session;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// DETR standard shortest-edge target.
 const DETR_SHORT_EDGE: u32 = 800;
 
 /// DETR standard longest-edge cap.
-const DETR_LONG_EDGE: u32 = 1333;
+const DETR_LONG_EDGE: u32 = 1000;
 
 /// ImageNet normalization mean (RGB channel order).
 const IMAGENET_MEAN_RGB: [f32; 3] = [0.485, 0.456, 0.406];
@@ -72,9 +68,6 @@ const NMS_IOB_THRESHOLD_COLS: f32 = 0.3;
 /// are removed as noise. Prevents spurious thin column detections from
 /// splitting the grid incorrectly.
 const MIN_COL_WIDTH_FRAC: f32 = 0.01;
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 #[cfg_attr(alef, alef(skip))]
 /// TATR object detection class labels.
@@ -109,7 +102,7 @@ impl TatrClass {
             3 => Some(Self::ColumnHeader),
             4 => Some(Self::ProjectedRowHeader),
             5 => Some(Self::SpanningCell),
-            _ => None, // 6 = NoObject, anything else = invalid
+            _ => None,
         }
     }
 }
@@ -136,6 +129,10 @@ pub struct TatrResult {
     pub headers: Vec<TatrDetection>,
     /// Detected spanning cells.
     pub spanning: Vec<TatrDetection>,
+    /// The model's own detected `Table` bbox (highest-confidence one), in
+    /// crop-pixel coordinates. `None` if the model produced no `Table`
+    /// detection above threshold (xberg-io/xberg#193).
+    pub table_bbox: Option<[f32; 4]>,
 }
 /// A cell bounding box within the reconstructed table grid (pixel coordinates in the crop).
 #[cfg_attr(alef, alef(skip))]
@@ -150,10 +147,6 @@ pub struct CellBBox {
     /// Bottom edge in crop-pixel coordinates.
     pub y2: f32,
 }
-
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
 
 /// TATR (Table Transformer) table structure recognition model.
 ///
@@ -173,13 +166,14 @@ impl TatrModel {
     pub(crate) fn from_file(
         path: &str,
         accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
+        thread_budget: usize,
     ) -> Result<Self, LayoutError> {
-        let budget = crate::core::config::concurrency::resolve_thread_budget(None);
-        let session = match build_session(path, accel, budget) {
+        let thread_budget = thread_budget.max(1);
+        let session = match build_session(path, accel, thread_budget) {
             Ok(s) => s,
             Err(first_err) => {
                 tracing::warn!("TATR: platform EP failed ({first_err}), retrying with CPU-only");
-                match Self::build_cpu_session(path, budget) {
+                match Self::build_cpu_session(path, thread_budget) {
                     Ok(s) => s,
                     Err(cpu_err) => {
                         tracing::warn!("TATR: CPU-only also failed: {cpu_err}");
@@ -214,7 +208,6 @@ impl TatrModel {
         let img_w = table_img.width() as f32;
         let img_h = table_img.height() as f32;
 
-        // Preprocess: DETR-standard resize + ImageNet normalize + NCHW
         let (input_tensor, resized_w, resized_h) = preprocess_detr(table_img);
         let tensor = Tensor::from_array(input_tensor)?;
 
@@ -222,7 +215,6 @@ impl TatrModel {
             self.input_name.as_str() => tensor
         ])?;
 
-        // Extract float outputs: logits [1, 125, 7] and pred_boxes [1, 125, 4]
         let mut float_outputs: Vec<(Vec<usize>, Vec<f32>)> = Vec::new();
         for (_name, value) in outputs.iter() {
             if let Ok(view) = value.try_extract_tensor::<f32>() {
@@ -239,7 +231,6 @@ impl TatrModel {
             )));
         }
 
-        // Identify logits (last dim == NUM_CLASSES) vs pred_boxes (last dim == 4).
         let (logits_shape, logits_data, boxes_shape, boxes_data) = if float_outputs[0].0.last() == Some(&NUM_CLASSES) {
             let (ls, ld) = float_outputs.remove(0);
             let (bs, bd) = float_outputs.remove(0);
@@ -260,29 +251,28 @@ impl TatrModel {
                 columns: Vec::new(),
                 headers: Vec::new(),
                 spanning: Vec::new(),
+                table_bbox: None,
             });
         }
 
-        // Post-process each query
         let mut rows = Vec::new();
         let mut columns = Vec::new();
         let mut headers = Vec::new();
         let mut spanning = Vec::new();
+        let mut table_bbox: Option<[f32; 4]> = None;
+        let mut table_confidence = 0.0f32;
 
         for q in 0..num_queries {
             let logit_offset = q * num_classes;
             let logits_slice = &logits_data[logit_offset..logit_offset + num_classes];
 
-            // Softmax + argmax + confidence
             let (class_idx, confidence) = softmax_argmax(logits_slice);
 
-            // Skip NoObject (class 6) and unmapped classes
             let class = match TatrClass::from_index(class_idx) {
                 Some(c) => c,
                 None => continue,
             };
 
-            // Apply class-specific confidence threshold
             let threshold = match class {
                 TatrClass::SpanningCell => CONF_THRESHOLD_SPANNING,
                 TatrClass::Table => CONF_THRESHOLD_ROW_COL,
@@ -292,7 +282,6 @@ impl TatrModel {
                 continue;
             }
 
-            // Convert normalized (cx, cy, w, h) to pixel (x1, y1, x2, y2)
             let box_offset = q * box_dim;
             let cx = boxes_data[box_offset];
             let cy = boxes_data[box_offset + 1];
@@ -301,7 +290,6 @@ impl TatrModel {
 
             let bbox = cxcywh_to_xyxy(cx, cy, w, h, resized_w as f32, resized_h as f32);
 
-            // Scale from resized coordinates back to original image coordinates
             let scale_x = img_w / resized_w as f32;
             let scale_y = img_h / resized_h as f32;
             let bbox = [
@@ -324,11 +312,19 @@ impl TatrModel {
                     headers.push(detection);
                 }
                 TatrClass::SpanningCell => spanning.push(detection),
-                TatrClass::Table => {} // Table bbox is informational; not stored separately
+                // Previously dropped: the model's own Table bbox is a more
+                // precise localization of the table within the crop than the
+                // full crop extent, and callers had no way to widen columns
+                // to it (xberg-io/xberg#193). Keep the highest-confidence one.
+                TatrClass::Table => {
+                    if detection.confidence > table_confidence {
+                        table_confidence = detection.confidence;
+                        table_bbox = Some(detection.bbox);
+                    }
+                }
             }
         }
 
-        // Sort rows top-to-bottom by y2, columns left-to-right by x2
         rows.sort_by(|a, b| a.bbox[3].total_cmp(&b.bbox[3]));
         columns.sort_by(|a, b| a.bbox[2].total_cmp(&b.bbox[2]));
 
@@ -337,18 +333,15 @@ impl TatrModel {
             columns,
             headers,
             spanning,
+            table_bbox,
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Preprocessing
-// ---------------------------------------------------------------------------
-
 /// Preprocess an image using DETR-standard preprocessing.
 ///
 /// Pipeline:
-/// 1. Resize: scale shortest edge to 800px, cap longest edge at 1333px (aspect-preserving)
+/// 1. Resize: scale shortest edge to 800px, cap longest edge at 1000px (aspect-preserving)
 /// 2. Normalize: ImageNet mean/std in RGB channel order
 /// 3. Layout: NCHW `[1, 3, H, W]` f32
 ///
@@ -357,7 +350,7 @@ fn preprocess_detr(img: &RgbImage) -> (Array4<f32>, u32, u32) {
     let (orig_w, orig_h) = (img.width(), img.height());
     let (new_w, new_h) = compute_detr_resize(orig_w, orig_h);
 
-    let resized = image::imageops::resize(img, new_w, new_h, image::imageops::FilterType::CatmullRom);
+    let resized = image::imageops::resize(img, new_w, new_h, image::imageops::FilterType::Triangle);
 
     let w = new_w as usize;
     let h = new_h as usize;
@@ -377,7 +370,6 @@ fn preprocess_detr(img: &RgbImage) -> (Array4<f32>, u32, u32) {
             let r = pixels[src_idx] as f32 * (1.0 / 255.0);
             let g = pixels[src_idx + 1] as f32 * (1.0 / 255.0);
             let b = pixels[src_idx + 2] as f32 * (1.0 / 255.0);
-            // RGB channel order
             data[dst_idx] = (r - IMAGENET_MEAN_RGB[0]) * inv_std_r;
             data[hw + dst_idx] = (g - IMAGENET_MEAN_RGB[1]) * inv_std_g;
             data[2 * hw + dst_idx] = (b - IMAGENET_MEAN_RGB[2]) * inv_std_b;
@@ -392,32 +384,38 @@ fn preprocess_detr(img: &RgbImage) -> (Array4<f32>, u32, u32) {
 /// Compute DETR resize dimensions.
 ///
 /// Scales shortest edge to [`DETR_SHORT_EDGE`] (800), then caps longest edge
-/// at [`DETR_LONG_EDGE`] (1333), maintaining aspect ratio.
+/// at [`DETR_LONG_EDGE`] (1000), maintaining aspect ratio.
 fn compute_detr_resize(orig_w: u32, orig_h: u32) -> (u32, u32) {
-    let short = orig_w.min(orig_h) as f32;
-    let long = orig_w.max(orig_h) as f32;
-
-    // Scale so shortest edge = DETR_SHORT_EDGE
-    let mut scale = DETR_SHORT_EDGE as f32 / short;
-
-    // If longest edge exceeds cap after scaling, scale down further
-    if (long * scale).round() > DETR_LONG_EDGE as f32 {
-        scale = DETR_LONG_EDGE as f32 / long;
+    let short = u64::from(orig_w.min(orig_h));
+    let long = u64::from(orig_w.max(orig_h));
+    if short == 0 {
+        return (orig_w.max(1), orig_h.max(1));
     }
 
-    let new_w = (orig_w as f32 * scale).round().max(1.0) as u32;
-    let new_h = (orig_h as f32 * scale).round().max(1.0) as u32;
+    // Match Hugging Face's `get_resize_output_image_size` exactly: compute and
+    // truncate the tentative long edge first, then use that truncated value
+    // when applying the long-edge cap. Collapsing this into one ratio causes
+    // one-pixel drift for some dimensions. ~keep
+    let requested_short = u64::from(DETR_SHORT_EDGE);
+    let requested_long = requested_short * long / short;
+    let (new_short, new_long) = if requested_long > u64::from(DETR_LONG_EDGE) {
+        (
+            u64::from(DETR_LONG_EDGE) * requested_short / requested_long,
+            u64::from(DETR_LONG_EDGE),
+        )
+    } else {
+        (requested_short, requested_long)
+    };
 
-    (new_w, new_h)
+    if orig_w <= orig_h {
+        (new_short.max(1) as u32, new_long.max(1) as u32)
+    } else {
+        (new_long.max(1) as u32, new_short.max(1) as u32)
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Post-processing helpers
-// ---------------------------------------------------------------------------
 
 /// Softmax over a slice, returning `(argmax_index, max_probability)`.
 fn softmax_argmax(logits: &[f32]) -> (usize, f32) {
-    // Numerical stability: subtract max before exp
     let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
     let mut sum = 0.0f32;
@@ -479,10 +477,6 @@ fn iob(a: [f32; 4], b: [f32; 4]) -> f32 {
     inter / area_a
 }
 
-// ---------------------------------------------------------------------------
-// Cell grid construction
-// ---------------------------------------------------------------------------
-
 /// Build a 2D cell grid from TATR detections.
 ///
 /// The grid is `[num_rows][num_cols]` where each cell is the intersection
@@ -496,39 +490,58 @@ fn iob(a: [f32; 4], b: [f32; 4]) -> f32 {
 ///
 /// If `table_bbox` is provided, it is used to clip the row widening bounds.
 pub(crate) fn build_cell_grid(result: &TatrResult, table_bbox: Option<[f32; 4]>) -> Vec<Vec<CellBBox>> {
+    build_cell_grid_with_structure(result, table_bbox).0
+}
+
+/// Header-row and merged-span metadata for a cell grid, derived from TATR's
+/// `headers`/`spanning` detections (xberg-io/xberg#176).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TableStructure {
+    /// Number of leading grid rows that overlap a TATR header detection
+    /// (`ColumnHeader` or `ProjectedRowHeader`). `0` means TATR detected no
+    /// header rows at all; callers should fall back to their own default.
+    pub(crate) header_row_count: usize,
+    /// Grid-index ranges `(row_start, row_end_exclusive, col_start,
+    /// col_end_exclusive)` covered by a single TATR spanning-cell detection.
+    pub(crate) spans: Vec<(usize, usize, usize, usize)>,
+}
+
+/// IoB threshold for associating a grid row/column with a header or spanning
+/// detection: more than half the row/column must be covered.
+const STRUCTURE_IOB_THRESHOLD: f32 = 0.5;
+
+/// Same as [`build_cell_grid`], but also returns the [`TableStructure`]
+/// (header rows + merged spans) derived from `result.headers` and
+/// `result.spanning` against the same row/column bands used to build the
+/// grid.
+pub(crate) fn build_cell_grid_with_structure(
+    result: &TatrResult,
+    table_bbox: Option<[f32; 4]>,
+) -> (Vec<Vec<CellBBox>>, TableStructure) {
     if result.rows.is_empty() || result.columns.is_empty() {
-        return Vec::new();
+        return (Vec::new(), TableStructure::default());
     }
 
-    // Determine table-wide x extents for row widening
     let (table_x1, table_x2) = if let Some(tb) = table_bbox {
         (tb[0], tb[2])
     } else {
-        // Use the full extent of all row bounding boxes
         let min_x1 = result.rows.iter().map(|r| r.bbox[0]).fold(f32::INFINITY, f32::min);
         let max_x2 = result.rows.iter().map(|r| r.bbox[2]).fold(f32::NEG_INFINITY, f32::max);
         (min_x1, max_x2)
     };
 
-    // Widen rows to full table width
     let widened_rows: Vec<[f32; 4]> = result
         .rows
         .iter()
         .map(|r| [table_x1, r.bbox[1], table_x2, r.bbox[3]])
         .collect();
 
-    // NMS on rows (by confidence, IoB threshold), then sort top-to-bottom.
-    // nms_by_iob returns rows in confidence order; we must restore spatial
-    // order so the cell grid rows correspond to top-to-bottom reading order.
     let mut nms_rows = nms_by_iob(&result.rows, &widened_rows, NMS_IOB_THRESHOLD_ROWS);
     nms_rows.sort_by(|a, b| a[1].total_cmp(&b[1]));
 
-    // NMS on columns (using original bboxes) with a lower threshold to
-    // preserve narrow adjacent columns, then sort left-to-right.
     let col_bboxes: Vec<[f32; 4]> = result.columns.iter().map(|c| c.bbox).collect();
     let mut nms_cols = nms_by_iob(&result.columns, &col_bboxes, NMS_IOB_THRESHOLD_COLS);
 
-    // Remove noise columns narrower than MIN_COL_WIDTH_FRAC of table width.
     let table_width = table_x2 - table_x1;
     if table_width > 0.0 {
         let min_col_width = table_width * MIN_COL_WIDTH_FRAC;
@@ -537,7 +550,6 @@ pub(crate) fn build_cell_grid(result: &TatrResult, table_bbox: Option<[f32; 4]>)
 
     nms_cols.sort_by(|a, b| a[0].total_cmp(&b[0]));
 
-    // Build grid: intersection of each (row, col) pair
     let mut grid = Vec::with_capacity(nms_rows.len());
     for row_bbox in &nms_rows {
         let mut row_cells = Vec::with_capacity(nms_cols.len());
@@ -548,7 +560,87 @@ pub(crate) fn build_cell_grid(result: &TatrResult, table_bbox: Option<[f32; 4]>)
         grid.push(row_cells);
     }
 
-    grid
+    let structure = TableStructure {
+        header_row_count: compute_header_row_count(&result.headers, &nms_rows),
+        spans: compute_spans(&result.spanning, &nms_rows, &nms_cols),
+    };
+
+    (grid, structure)
+}
+
+/// Fraction of the `[lo, hi]` extent covered by `[other_lo, other_hi]`.
+///
+/// Row bands are widened to the full table width and column bands to the
+/// full table height, but the perpendicular axis is *not* normalized that
+/// way — a header or spanning-cell detection typically covers only part of
+/// a column's height (or a row's width). Projecting onto the single
+/// perpendicular axis of each band, rather than computing 2D IoB against the
+/// detection's whole box, avoids that axis's mismatch swamping the overlap
+/// fraction.
+fn axis_overlap_fraction(lo: f32, hi: f32, other_lo: f32, other_hi: f32) -> f32 {
+    let extent = hi - lo;
+    if extent <= 0.0 {
+        return 0.0;
+    }
+    let overlap = (hi.min(other_hi) - lo.max(other_lo)).max(0.0);
+    overlap / extent
+}
+
+/// Count the leading grid rows that overlap a header detection, stopping at
+/// the first row that does not — TATR's header rows are always the topmost
+/// rows of the table, so a single leading run is the correct interpretation
+/// even for multi-row headers.
+fn compute_header_row_count(headers: &[TatrDetection], rows: &[[f32; 4]]) -> usize {
+    let mut count = 0;
+    for row in rows {
+        let is_header = headers
+            .iter()
+            .any(|h| axis_overlap_fraction(row[1], row[3], h.bbox[1], h.bbox[3]) > STRUCTURE_IOB_THRESHOLD);
+        if !is_header {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Map each TATR spanning-cell detection onto the grid-index rectangle it
+/// covers, based on axis overlap with the row/column bands used to build the
+/// grid. Detections that resolve to a single cell (no actual merge) are
+/// skipped.
+fn compute_spans(
+    spanning: &[TatrDetection],
+    rows: &[[f32; 4]],
+    cols: &[[f32; 4]],
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut spans = Vec::new();
+    for span in spanning {
+        let row_indices: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| axis_overlap_fraction(r[1], r[3], span.bbox[1], span.bbox[3]) > STRUCTURE_IOB_THRESHOLD)
+            .map(|(i, _)| i)
+            .collect();
+        let col_indices: Vec<usize> = cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| axis_overlap_fraction(c[0], c[2], span.bbox[0], span.bbox[2]) > STRUCTURE_IOB_THRESHOLD)
+            .map(|(i, _)| i)
+            .collect();
+
+        if row_indices.len() * col_indices.len() <= 1 {
+            continue;
+        }
+
+        let (Some(&row_start), Some(&row_last)) = (row_indices.first(), row_indices.last()) else {
+            continue;
+        };
+        let (Some(&col_start), Some(&col_last)) = (col_indices.first(), col_indices.last()) else {
+            continue;
+        };
+        spans.push((row_start, row_last + 1, col_start, col_last + 1));
+    }
+    spans
 }
 
 /// Apply NMS using IoB (Intersection over Box) metric.
@@ -559,7 +651,6 @@ pub(crate) fn build_cell_grid(result: &TatrResult, table_bbox: Option<[f32; 4]>)
 /// `bboxes` are the (possibly widened) bounding boxes corresponding 1:1
 /// with `detections`. `threshold` is the IoB suppression threshold.
 fn nms_by_iob(detections: &[TatrDetection], bboxes: &[[f32; 4]], threshold: f32) -> Vec<[f32; 4]> {
-    // Build index-confidence pairs, sort by confidence descending
     let mut indices: Vec<usize> = (0..detections.len()).collect();
     indices.sort_by(|&a, &b| detections[b].confidence.total_cmp(&detections[a].confidence));
 
@@ -589,65 +680,49 @@ fn intersect_boxes(a: [f32; 4], b: [f32; 4]) -> CellBBox {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // -- DETR resize --
-
     #[test]
     fn test_compute_detr_resize_landscape() {
-        // 1600x1200: short=1200, scale=800/1200=0.667
-        // new: 1067x800, longest=1067 < 1333 → no capping
         let (w, h) = compute_detr_resize(1600, 1200);
-        assert!(h == 800 || w == 800, "shortest edge should be 800, got {w}x{h}");
-        assert!(w <= DETR_LONG_EDGE, "longest edge {w} exceeds cap {DETR_LONG_EDGE}");
-        assert!(h <= DETR_LONG_EDGE, "longest edge {h} exceeds cap {DETR_LONG_EDGE}");
+        assert_eq!((w, h), (1000, 750));
     }
 
     #[test]
     fn test_compute_detr_resize_portrait() {
-        // 600x1000: short=600, scale=800/600=1.333
-        // new: 800x1333, longest=1333 → exactly at cap
         let (w, h) = compute_detr_resize(600, 1000);
-        assert!(w.min(h) <= DETR_SHORT_EDGE);
-        assert!(w.max(h) <= DETR_LONG_EDGE, "longest edge exceeds cap: {w}x{h}");
+        assert_eq!((w, h), (600, 1000));
     }
 
     #[test]
     fn test_compute_detr_resize_very_elongated() {
-        // 100x3000: short=100, scale=800/100=8.0 → long=24000 >> 1333
-        // Re-scale: 1333/3000=0.444 → new: 44x1333
         let (w, h) = compute_detr_resize(100, 3000);
-        assert!(w.max(h) <= DETR_LONG_EDGE, "longest edge exceeds cap: {w}x{h}");
+        assert_eq!((w, h), (33, 1000));
     }
 
     #[test]
     fn test_compute_detr_resize_square() {
-        // 800x800: already at target
         let (w, h) = compute_detr_resize(800, 800);
         assert_eq!(w, 800);
         assert_eq!(h, 800);
     }
 
     #[test]
-    fn test_compute_detr_resize_small() {
-        // 200x300: short=200, scale=800/200=4.0
-        // new: 800x1200, longest=1200 < 1333 → no capping
-        let (w, h) = compute_detr_resize(200, 300);
-        assert_eq!(w, 800);
-        assert_eq!(h, 1200);
+    fn test_compute_detr_resize_truncates_like_hugging_face() {
+        assert_eq!(compute_detr_resize(102, 101), (807, 800));
+        assert_eq!(compute_detr_resize(6, 17), (353, 1000));
     }
 
-    // -- Box conversion --
+    #[test]
+    fn test_compute_detr_resize_small() {
+        let (w, h) = compute_detr_resize(200, 300);
+        assert_eq!((w, h), (666, 1000));
+    }
 
     #[test]
     fn test_cxcywh_to_xyxy_center() {
-        // Center of a 100x100 image, 50x50 box
         let bbox = cxcywh_to_xyxy(0.5, 0.5, 0.5, 0.5, 100.0, 100.0);
         assert!((bbox[0] - 25.0).abs() < 1e-5, "x1={}", bbox[0]);
         assert!((bbox[1] - 25.0).abs() < 1e-5, "y1={}", bbox[1]);
@@ -657,7 +732,6 @@ mod tests {
 
     #[test]
     fn test_cxcywh_to_xyxy_top_left() {
-        // Box at top-left corner covering full image
         let bbox = cxcywh_to_xyxy(0.5, 0.5, 1.0, 1.0, 200.0, 100.0);
         assert!((bbox[0] - 0.0).abs() < 1e-5);
         assert!((bbox[1] - 0.0).abs() < 1e-5);
@@ -667,13 +741,10 @@ mod tests {
 
     #[test]
     fn test_cxcywh_to_xyxy_clamps_negative() {
-        // Box that extends past the origin should clamp to 0
         let bbox = cxcywh_to_xyxy(0.0, 0.0, 0.5, 0.5, 100.0, 100.0);
         assert_eq!(bbox[0], 0.0, "x1 should be clamped to 0");
         assert_eq!(bbox[1], 0.0, "y1 should be clamped to 0");
     }
-
-    // -- Softmax + argmax --
 
     #[test]
     fn test_softmax_argmax_clear_winner() {
@@ -700,11 +771,8 @@ mod tests {
         assert_eq!(idx, 2, "should pick the least negative");
     }
 
-    // -- IoB --
-
     #[test]
     fn test_iob_full_containment() {
-        // a is fully inside b
         let a = [10.0, 10.0, 20.0, 20.0];
         let b = [0.0, 0.0, 100.0, 100.0];
         let result = iob(a, b);
@@ -721,10 +789,6 @@ mod tests {
 
     #[test]
     fn test_iob_partial_overlap() {
-        // a = [0,0,10,10] area=100
-        // b = [5,0,15,10]
-        // intersection = [5,0,10,10] area=50
-        // IoB = 50/100 = 0.5
         let a = [0.0, 0.0, 10.0, 10.0];
         let b = [5.0, 0.0, 15.0, 10.0];
         let result = iob(a, b);
@@ -733,13 +797,11 @@ mod tests {
 
     #[test]
     fn test_iob_zero_area() {
-        let a = [5.0, 5.0, 5.0, 5.0]; // zero area
+        let a = [5.0, 5.0, 5.0, 5.0];
         let b = [0.0, 0.0, 10.0, 10.0];
         let result = iob(a, b);
         assert_eq!(result, 0.0, "zero-area box should return 0.0");
     }
-
-    // -- NMS --
 
     #[test]
     fn test_nms_suppresses_overlapping() {
@@ -757,7 +819,6 @@ mod tests {
         ];
         let bboxes: Vec<[f32; 4]> = detections.iter().map(|d| d.bbox).collect();
         let kept = nms_by_iob(&detections, &bboxes, NMS_IOB_THRESHOLD_ROWS);
-        // The second detection heavily overlaps the first → should be suppressed
         assert_eq!(kept.len(), 1, "overlapping detection should be suppressed");
         assert_eq!(kept[0], [0.0, 0.0, 100.0, 20.0]);
     }
@@ -783,8 +844,6 @@ mod tests {
 
     #[test]
     fn test_nms_keeps_adjacent_rows_with_minor_overlap() {
-        // Two rows that overlap by 2px (10% of height) should be kept.
-        // This tests the fix: IoB threshold 0.5 preserves close but distinct rows.
         let detections = vec![
             TatrDetection {
                 bbox: [0.0, 0.0, 100.0, 20.0],
@@ -799,11 +858,8 @@ mod tests {
         ];
         let bboxes: Vec<[f32; 4]> = detections.iter().map(|d| d.bbox).collect();
         let kept = nms_by_iob(&detections, &bboxes, NMS_IOB_THRESHOLD_ROWS);
-        // IoB = intersection(100*2) / area(100*20) = 0.1 < 0.5 → both kept
         assert_eq!(kept.len(), 2, "adjacent rows with minor overlap should both be kept");
     }
-
-    // -- Cell grid --
 
     #[test]
     fn test_build_cell_grid_2x2() {
@@ -834,20 +890,19 @@ mod tests {
             ],
             headers: Vec::new(),
             spanning: Vec::new(),
+            table_bbox: None,
         };
 
         let grid = build_cell_grid(&result, None);
         assert_eq!(grid.len(), 2, "should have 2 rows");
         assert_eq!(grid[0].len(), 2, "should have 2 columns per row");
 
-        // Top-left cell: row [0,0..20] intersect col [0..50,0..40]
         let tl = &grid[0][0];
         assert!((tl.x1 - 0.0).abs() < 1e-5);
         assert!((tl.y1 - 0.0).abs() < 1e-5);
         assert!((tl.x2 - 50.0).abs() < 1e-5);
         assert!((tl.y2 - 20.0).abs() < 1e-5);
 
-        // Bottom-right cell: row [0,20..40] intersect col [50..100,0..40]
         let br = &grid[1][1];
         assert!((br.x1 - 50.0).abs() < 1e-5);
         assert!((br.y1 - 20.0).abs() < 1e-5);
@@ -862,6 +917,7 @@ mod tests {
             columns: Vec::new(),
             headers: Vec::new(),
             spanning: Vec::new(),
+            table_bbox: None,
         };
         let grid = build_cell_grid(&result, None);
         assert!(grid.is_empty());
@@ -882,19 +938,16 @@ mod tests {
             }],
             headers: Vec::new(),
             spanning: Vec::new(),
+            table_bbox: None,
         };
 
-        // Table bbox should widen the row to [0, 5, 100, 25]
         let grid = build_cell_grid(&result, Some([0.0, 0.0, 100.0, 30.0]));
         assert_eq!(grid.len(), 1);
         assert_eq!(grid[0].len(), 1);
-        // Row widened to table x-extent [0..100], intersected with col [0..50]
         let cell = &grid[0][0];
         assert!((cell.x1 - 0.0).abs() < 1e-5, "x1={}", cell.x1);
         assert!((cell.x2 - 50.0).abs() < 1e-5, "x2={}", cell.x2);
     }
-
-    // -- TatrClass --
 
     #[test]
     fn test_tatr_class_from_index() {
@@ -904,24 +957,21 @@ mod tests {
         assert_eq!(TatrClass::from_index(3), Some(TatrClass::ColumnHeader));
         assert_eq!(TatrClass::from_index(4), Some(TatrClass::ProjectedRowHeader));
         assert_eq!(TatrClass::from_index(5), Some(TatrClass::SpanningCell));
-        assert_eq!(TatrClass::from_index(6), None); // NoObject
-        assert_eq!(TatrClass::from_index(7), None); // out of range
+        assert_eq!(TatrClass::from_index(6), None);
+        assert_eq!(TatrClass::from_index(7), None);
     }
 
     #[test]
     fn test_build_cell_grid_rows_sorted_spatially() {
-        // Rows provided in reverse confidence order (bottom row has higher
-        // confidence). After NMS + spatial sorting, the grid should still
-        // have the top row first.
         let result = TatrResult {
             rows: vec![
                 TatrDetection {
-                    bbox: [0.0, 30.0, 100.0, 50.0], // bottom row
+                    bbox: [0.0, 30.0, 100.0, 50.0],
                     confidence: 0.95,
                     class_name: TatrClass::Row,
                 },
                 TatrDetection {
-                    bbox: [0.0, 0.0, 100.0, 20.0], // top row
+                    bbox: [0.0, 0.0, 100.0, 20.0],
                     confidence: 0.80,
                     class_name: TatrClass::Row,
                 },
@@ -933,11 +983,11 @@ mod tests {
             }],
             headers: Vec::new(),
             spanning: Vec::new(),
+            table_bbox: None,
         };
 
         let grid = build_cell_grid(&result, None);
         assert_eq!(grid.len(), 2, "should have 2 rows");
-        // First grid row should be the spatially top row (y1 = 0)
         assert!(
             grid[0][0].y1 < grid[1][0].y1,
             "grid rows should be sorted top-to-bottom: row0.y1={} row1.y1={}",
@@ -948,7 +998,6 @@ mod tests {
 
     #[test]
     fn test_build_cell_grid_columns_sorted_spatially() {
-        // Columns with right column having higher confidence.
         let result = TatrResult {
             rows: vec![TatrDetection {
                 bbox: [0.0, 0.0, 100.0, 20.0],
@@ -957,23 +1006,23 @@ mod tests {
             }],
             columns: vec![
                 TatrDetection {
-                    bbox: [60.0, 0.0, 100.0, 20.0], // right column
+                    bbox: [60.0, 0.0, 100.0, 20.0],
                     confidence: 0.95,
                     class_name: TatrClass::Column,
                 },
                 TatrDetection {
-                    bbox: [0.0, 0.0, 50.0, 20.0], // left column
+                    bbox: [0.0, 0.0, 50.0, 20.0],
                     confidence: 0.80,
                     class_name: TatrClass::Column,
                 },
             ],
             headers: Vec::new(),
             spanning: Vec::new(),
+            table_bbox: None,
         };
 
         let grid = build_cell_grid(&result, None);
         assert_eq!(grid[0].len(), 2, "should have 2 columns");
-        // First column should be the left column (x1 = 0)
         assert!(
             grid[0][0].x1 < grid[0][1].x1,
             "grid columns should be sorted left-to-right: col0.x1={} col1.x1={}",
@@ -981,8 +1030,6 @@ mod tests {
             grid[0][1].x1,
         );
     }
-
-    // -- Preprocessing dimensions --
 
     #[test]
     fn test_preprocess_detr_output_shape() {
@@ -993,21 +1040,14 @@ mod tests {
         assert_eq!(shape[1], 3, "channel dim");
         assert_eq!(shape[2], rh as usize, "height dim");
         assert_eq!(shape[3], rw as usize, "width dim");
-        // Shortest edge (480) should scale to 800: 480→800, 640→1067
-        assert_eq!(rh, 800);
-        assert_eq!(rw, 1067);
+        assert_eq!(rh, 750);
+        assert_eq!(rw, 1000);
     }
-
-    // -- Per-class NMS thresholds --
 
     #[test]
     fn test_nms_col_threshold_preserves_narrow_adjacent_columns() {
-        // Two narrow adjacent columns that overlap by ~35% of their width.
-        // With row threshold (0.5) they would be kept, but this tests that
-        // the column threshold (0.3) is lower, allowing suppression of true
-        // duplicates while the moderate overlap here (0.35) is still preserved.
         let col_width = 20.0;
-        let overlap = 7.0; // 7/20 = 0.35 IoB
+        let overlap = 7.0;
         let detections = vec![
             TatrDetection {
                 bbox: [0.0, 0.0, col_width, 100.0],
@@ -1022,11 +1062,9 @@ mod tests {
         ];
         let bboxes: Vec<[f32; 4]> = detections.iter().map(|d| d.bbox).collect();
 
-        // With row threshold (0.5): 0.35 < 0.5 → both kept
         let kept_row = nms_by_iob(&detections, &bboxes, NMS_IOB_THRESHOLD_ROWS);
         assert_eq!(kept_row.len(), 2, "row threshold should keep both");
 
-        // With column threshold (0.3): 0.35 > 0.3 → second suppressed
         let kept_col = nms_by_iob(&detections, &bboxes, NMS_IOB_THRESHOLD_COLS);
         assert_eq!(
             kept_col.len(),
@@ -1037,7 +1075,6 @@ mod tests {
 
     #[test]
     fn test_nms_col_threshold_keeps_well_separated_columns() {
-        // Two columns with only ~15% IoB overlap — both thresholds should keep them.
         let detections = vec![
             TatrDetection {
                 bbox: [0.0, 0.0, 20.0, 100.0],
@@ -1045,7 +1082,7 @@ mod tests {
                 class_name: TatrClass::Column,
             },
             TatrDetection {
-                bbox: [17.0, 0.0, 37.0, 100.0], // 3/20 = 0.15 overlap
+                bbox: [17.0, 0.0, 37.0, 100.0],
                 confidence: 0.85,
                 class_name: TatrClass::Column,
             },
@@ -1058,7 +1095,6 @@ mod tests {
 
     #[test]
     fn test_min_col_width_filter_removes_noise_columns() {
-        // A 100px-wide table with one real column and one noise column (0.5px wide).
         let result = TatrResult {
             rows: vec![TatrDetection {
                 bbox: [0.0, 0.0, 100.0, 20.0],
@@ -1067,23 +1103,24 @@ mod tests {
             }],
             columns: vec![
                 TatrDetection {
-                    bbox: [0.0, 0.0, 50.0, 20.0], // real column: 50px wide
+                    bbox: [0.0, 0.0, 50.0, 20.0],
                     confidence: 0.9,
                     class_name: TatrClass::Column,
                 },
                 TatrDetection {
-                    bbox: [60.0, 0.0, 60.5, 20.0], // noise column: 0.5px wide (< 1% of 100)
+                    bbox: [60.0, 0.0, 60.5, 20.0],
                     confidence: 0.5,
                     class_name: TatrClass::Column,
                 },
                 TatrDetection {
-                    bbox: [70.0, 0.0, 100.0, 20.0], // real column: 30px wide
+                    bbox: [70.0, 0.0, 100.0, 20.0],
                     confidence: 0.85,
                     class_name: TatrClass::Column,
                 },
             ],
             headers: Vec::new(),
             spanning: Vec::new(),
+            table_bbox: None,
         };
 
         let grid = build_cell_grid(&result, Some([0.0, 0.0, 100.0, 20.0]));
@@ -1096,10 +1133,6 @@ mod tests {
 
     #[test]
     fn test_build_cell_grid_uses_per_class_nms() {
-        // Verify that build_cell_grid uses different NMS thresholds for rows vs columns.
-        // Two overlapping columns (IoB ~0.4) should both survive with NMS_IOB_THRESHOLD_COLS=0.3
-        // only if they are not heavily overlapping. With 0.4 > 0.3, the second is suppressed.
-        // But two overlapping rows (IoB ~0.4) should both survive with NMS_IOB_THRESHOLD_ROWS=0.5.
         let result = TatrResult {
             rows: vec![
                 TatrDetection {
@@ -1108,7 +1141,7 @@ mod tests {
                     class_name: TatrClass::Row,
                 },
                 TatrDetection {
-                    bbox: [0.0, 15.0, 100.0, 40.0], // 10/25 = 0.4 IoB with first
+                    bbox: [0.0, 15.0, 100.0, 40.0],
                     confidence: 0.85,
                     class_name: TatrClass::Row,
                 },
@@ -1120,14 +1153,120 @@ mod tests {
             }],
             headers: Vec::new(),
             spanning: Vec::new(),
+            table_bbox: None,
         };
 
         let grid = build_cell_grid(&result, None);
-        // Rows: 0.4 < 0.5 threshold → both kept
         assert_eq!(
             grid.len(),
             2,
             "rows with 0.4 IoB should both survive row NMS (threshold 0.5)"
         );
+    }
+
+    fn header_detection(bbox: [f32; 4]) -> TatrDetection {
+        TatrDetection {
+            bbox,
+            confidence: 0.9,
+            class_name: TatrClass::ColumnHeader,
+        }
+    }
+
+    fn spanning_detection(bbox: [f32; 4]) -> TatrDetection {
+        TatrDetection {
+            bbox,
+            confidence: 0.9,
+            class_name: TatrClass::SpanningCell,
+        }
+    }
+
+    #[test]
+    fn test_compute_header_row_count_single_header_row() {
+        let rows = [[0.0, 0.0, 100.0, 20.0], [0.0, 20.0, 100.0, 40.0]];
+        let headers = [header_detection([0.0, 0.0, 100.0, 20.0])];
+        assert_eq!(compute_header_row_count(&headers, &rows), 1);
+    }
+
+    #[test]
+    fn test_compute_header_row_count_multi_row_header() {
+        let rows = [
+            [0.0, 0.0, 100.0, 20.0],
+            [0.0, 20.0, 100.0, 40.0],
+            [0.0, 40.0, 100.0, 60.0],
+        ];
+        let headers = [header_detection([0.0, 0.0, 100.0, 40.0])];
+        assert_eq!(
+            compute_header_row_count(&headers, &rows),
+            2,
+            "a header detection spanning two row bands must mark both as header rows"
+        );
+    }
+
+    #[test]
+    fn test_compute_header_row_count_no_headers_returns_zero() {
+        let rows = [[0.0, 0.0, 100.0, 20.0]];
+        assert_eq!(
+            compute_header_row_count(&[], &rows),
+            0,
+            "absence of TATR header detections must not be conflated with an explicit single header row"
+        );
+    }
+
+    #[test]
+    fn test_compute_spans_merges_two_columns() {
+        let rows = [[0.0, 0.0, 100.0, 20.0]];
+        let cols = [[0.0, 0.0, 50.0, 20.0], [50.0, 0.0, 100.0, 20.0]];
+        let spanning = [spanning_detection([0.0, 0.0, 100.0, 20.0])];
+        let spans = compute_spans(&spanning, &rows, &cols);
+        assert_eq!(spans, vec![(0, 1, 0, 2)]);
+    }
+
+    #[test]
+    fn test_compute_spans_skips_single_cell_overlap() {
+        let rows = [[0.0, 0.0, 100.0, 20.0]];
+        let cols = [[0.0, 0.0, 50.0, 20.0], [50.0, 0.0, 100.0, 20.0]];
+        // Covers only the first column: not an actual merge.
+        let spanning = [spanning_detection([0.0, 0.0, 50.0, 20.0])];
+        let spans = compute_spans(&spanning, &rows, &cols);
+        assert!(spans.is_empty(), "a detection covering a single cell is not a span");
+    }
+
+    #[test]
+    fn test_build_cell_grid_with_structure_reports_header_and_span() {
+        let result = TatrResult {
+            rows: vec![
+                TatrDetection {
+                    bbox: [0.0, 0.0, 100.0, 20.0],
+                    confidence: 0.9,
+                    class_name: TatrClass::Row,
+                },
+                TatrDetection {
+                    bbox: [0.0, 20.0, 100.0, 40.0],
+                    confidence: 0.9,
+                    class_name: TatrClass::Row,
+                },
+            ],
+            columns: vec![
+                TatrDetection {
+                    bbox: [0.0, 0.0, 50.0, 40.0],
+                    confidence: 0.9,
+                    class_name: TatrClass::Column,
+                },
+                TatrDetection {
+                    bbox: [50.0, 0.0, 100.0, 40.0],
+                    confidence: 0.9,
+                    class_name: TatrClass::Column,
+                },
+            ],
+            headers: vec![header_detection([0.0, 0.0, 100.0, 20.0])],
+            spanning: vec![spanning_detection([0.0, 0.0, 100.0, 20.0])],
+            table_bbox: Some([0.0, 0.0, 100.0, 40.0]),
+        };
+
+        let (grid, structure) = build_cell_grid_with_structure(&result, result.table_bbox);
+        assert_eq!(grid.len(), 2, "grid shape must be unaffected by structure metadata");
+        assert_eq!(grid[0].len(), 2);
+        assert_eq!(structure.header_row_count, 1);
+        assert_eq!(structure.spans, vec![(0, 1, 0, 2)]);
     }
 }

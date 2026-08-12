@@ -134,8 +134,6 @@ fn collect<'d>(dir: &'d Dir<'d>, out: &mut Vec<&'d include_dir::File<'d>>) {
         }
     }
     for sub in dir.dirs() {
-        // Skip per-preset `samples/` subdirs — those carry sample document
-        // outputs (and other artifacts), not preset definitions.
         if sub.path().file_name().and_then(|n| n.to_str()) == Some("samples") {
             continue;
         }

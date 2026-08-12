@@ -52,6 +52,12 @@ enum class ChunkType {
     @com.fasterxml.jackson.annotation.JsonProperty("formula") FORMULA,
     /** Code block or preformatted content. */
     @com.fasterxml.jackson.annotation.JsonProperty("code_block") CODE_BLOCK,
+    /** Function or method definition (tree-sitter structured code chunking). */
+    @com.fasterxml.jackson.annotation.JsonProperty("function") FUNCTION,
+    /** Class, struct, interface, or trait definition (tree-sitter structured code chunking). */
+    @com.fasterxml.jackson.annotation.JsonProperty("class") CLASS,
+    /** Module, namespace, or top-level file scope (tree-sitter structured code chunking). */
+    @com.fasterxml.jackson.annotation.JsonProperty("module") MODULE,
     /** Embedded or referenced image content. */
     @com.fasterxml.jackson.annotation.JsonProperty("image") IMAGE,
     /** Organizational chart or hierarchy diagram. */
@@ -73,6 +79,9 @@ enum class ChunkType {
         TABLE_LIKE -> "table_like"
         FORMULA -> "formula"
         CODE_BLOCK -> "code_block"
+        FUNCTION -> "function"
+        CLASS -> "class"
+        MODULE -> "module"
         IMAGE -> "image"
         ORG_CHART -> "org_chart"
         DIAGRAM -> "diagram"
@@ -93,6 +102,9 @@ enum class ChunkType {
             "table_like" -> TABLE_LIKE
             "formula" -> FORMULA
             "code_block" -> CODE_BLOCK
+            "function" -> FUNCTION
+            "class" -> CLASS
+            "module" -> MODULE
             "image" -> IMAGE
             "org_chart" -> ORG_CHART
             "diagram" -> DIAGRAM

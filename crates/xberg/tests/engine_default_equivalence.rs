@@ -98,8 +98,6 @@ async fn engine_default_matches_free_function_for_batch() {
         .await
         .expect("engine extract_batch");
 
-    // The batch path attaches per-item `extraction_duration_ms`, which varies
-    // between runs, so compare structural fields rather than exact JSON.
     assert_eq!(free.results.len(), engine_output.results.len());
     assert_eq!(free.summary.inputs, engine_output.summary.inputs);
     assert_eq!(free.summary.results, engine_output.summary.results);

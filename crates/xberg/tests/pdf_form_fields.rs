@@ -1,3 +1,7 @@
+//! Issue #1120: form field values that live only in Widget annotations, with no
+//! trace in the page content stream, must still be recovered by PDF form field
+//! extraction — the interactive (non-flattened) PDF pattern.
+
 #![cfg(feature = "pdf")]
 
 mod helpers;
@@ -12,7 +16,6 @@ use xberg::ExtractionConfig;
 /// The values are intentionally absent from the content stream to replicate the
 /// interactive (non-flattened) PDF pattern that issue #1120 reports.
 fn make_interactive_form_pdf() -> Vec<u8> {
-    // Page content: field labels only (no values)
     let content_stream = b"BT /Helvetica 12 Tf 72 700 Td (Name:) Tj 0 -30 Td (Email:) Tj ET";
 
     let mut pdf: Vec<u8> = Vec::new();
@@ -36,13 +39,11 @@ fn make_interactive_form_pdf() -> Vec<u8> {
     let off2 = pdf.len();
     push_bytes!(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
 
-    // Obj 4: content stream (defined before page obj so length is known)
     let off4 = pdf.len();
     push_str!(format!("4 0 obj\n<< /Length {} >>\nstream\n", content_stream.len()));
     push_bytes!(content_stream);
     push_bytes!(b"\nendstream\nendobj\n");
 
-    // Obj 3: page — references content + both Widget annotations
     let off3 = pdf.len();
     push_bytes!(
         b"3 0 obj\n\
@@ -53,7 +54,6 @@ fn make_interactive_form_pdf() -> Vec<u8> {
          endobj\n"
     );
 
-    // Obj 5: AcroForm
     let off5 = pdf.len();
     push_bytes!(
         b"5 0 obj\n\
@@ -62,7 +62,6 @@ fn make_interactive_form_pdf() -> Vec<u8> {
          endobj\n"
     );
 
-    // Obj 6: Widget — "name" field, value "John Smith", at y=680..700 (PDF coords)
     let off6 = pdf.len();
     push_bytes!(
         b"6 0 obj\n\
@@ -84,7 +83,6 @@ fn make_interactive_form_pdf() -> Vec<u8> {
          endobj\n"
     );
 
-    // Obj 8: Font
     let off8 = pdf.len();
     push_bytes!(
         b"8 0 obj\n\
@@ -120,7 +118,6 @@ fn make_interactive_form_pdf() -> Vec<u8> {
 /// rendered into the page content stream AND the Widget annotation still exists with /V.
 /// After the fix, the value must appear exactly once (not duplicated).
 fn make_flattened_form_pdf() -> Vec<u8> {
-    // Content stream includes the value "Jane Doe" alongside the label
     let content_stream = b"BT /Helvetica 12 Tf 72 700 Td (Name: Jane Doe) Tj ET";
 
     let mut pdf: Vec<u8> = Vec::new();
@@ -162,7 +159,6 @@ fn make_flattened_form_pdf() -> Vec<u8> {
     let off5 = pdf.len();
     push_bytes!(b"5 0 obj\n<< /Type /AcroForm /Fields [6 0 R] /DA (/Helvetica 12 Tf 0 g) >>\nendobj\n");
 
-    // Widget with the same value as in the content stream
     let off6 = pdf.len();
     push_bytes!(
         b"6 0 obj\n\

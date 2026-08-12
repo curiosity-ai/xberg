@@ -34,7 +34,6 @@ pub trait SnippetValidator: Send + Sync {
         false
     }
 }
-
 /// Registry of validators keyed by language.
 pub struct ValidatorRegistry {
     validators: HashMap<Language, Box<dyn SnippetValidator>>,
@@ -95,9 +94,7 @@ fn strip_ansi_codes(s: &str) -> String {
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // Skip ESC[...m sequences
             if let Some('[') = chars.next() {
-                // Consume until 'm' or end
                 for c2 in chars.by_ref() {
                     if c2 == 'm' {
                         break;
@@ -123,7 +120,6 @@ pub fn run_command(cmd: &mut std::process::Command, timeout_secs: u64) -> Result
 
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    // Wait with timeout
     match child.wait_timeout(timeout) {
         Ok(Some(status)) => {
             let mut output = String::new();
@@ -133,7 +129,6 @@ pub fn run_command(cmd: &mut std::process::Command, timeout_secs: u64) -> Result
             if let Some(mut stderr) = child.stderr.take() {
                 let _ = stderr.read_to_string(&mut output);
             }
-            // Strip ANSI codes to ensure clean output for validators
             let clean_output = strip_ansi_codes(&output);
             Ok((status.success(), clean_output))
         }
@@ -179,7 +174,6 @@ mod tests {
 
     #[test]
     fn test_strip_ansi_codes_color_sequences() {
-        // Test basic color code stripping
         let input = "\x1b[1m\x1b[91merror\x1b[0m: something went wrong";
         let output = strip_ansi_codes(input);
         assert_eq!(output, "error: something went wrong");
@@ -187,7 +181,6 @@ mod tests {
 
     #[test]
     fn test_strip_ansi_codes_multiple_sequences() {
-        // Test multiple color sequences in one string
         let input = "\x1b[1mBold\x1b[0m \x1b[32mGreen\x1b[0m text";
         let output = strip_ansi_codes(input);
         assert_eq!(output, "Bold Green text");
@@ -195,7 +188,6 @@ mod tests {
 
     #[test]
     fn test_strip_ansi_codes_no_codes() {
-        // Test string with no ANSI codes
         let input = "plain text without codes";
         let output = strip_ansi_codes(input);
         assert_eq!(output, "plain text without codes");
@@ -203,7 +195,6 @@ mod tests {
 
     #[test]
     fn test_strip_ansi_codes_empty_string() {
-        // Test empty string
         let input = "";
         let output = strip_ansi_codes(input);
         assert_eq!(output, "");
@@ -211,7 +202,6 @@ mod tests {
 
     #[test]
     fn test_strip_ansi_codes_only_codes() {
-        // Test string with only ANSI codes
         let input = "\x1b[1m\x1b[91m\x1b[0m";
         let output = strip_ansi_codes(input);
         assert_eq!(output, "");
@@ -219,7 +209,6 @@ mod tests {
 
     #[test]
     fn test_strip_ansi_codes_rust_error_pattern() {
-        // Test the specific pattern from Rust compiler error output
         let input = "\x1b[1m\x1b[91merror\x1b[0m[E0432]: unresolved import `foo`";
         let output = strip_ansi_codes(input);
         assert_eq!(output, "error[E0432]: unresolved import `foo`");

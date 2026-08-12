@@ -74,14 +74,11 @@ trait SemanticLevel: Copy + fmt::Debug + Ord + PartialOrd + 'static {
             .batching(move |it| {
                 loop {
                     match it.next() {
-                        // If we've hit the end, actually return None
                         None if final_match => return None,
-                        // First time we hit None, return the final section of the text
                         None => {
                             final_match = true;
                             return text.get(cursor..).map(|t| Either::Left(once((cursor, t))));
                         }
-                        // Return text preceding match + the match
                         Some((_, range)) => {
                             if range.start < cursor {
                                 continue;
@@ -121,7 +118,6 @@ where
     Level: SemanticLevel,
 {
     fn new(mut ranges: Vec<(Level, Range<usize>)>) -> Self {
-        // Sort by start. If start is equal, sort by end in reverse order, so larger ranges come first.
         ranges.sort_unstable_by(|(_, a), (_, b)| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
         Self { cursor: 0, ranges }
     }
@@ -139,8 +135,6 @@ where
         offset: usize,
         level: Level,
     ) -> impl Iterator<Item = (Level, Range<usize>)> + '_ {
-        // Find the first item of this level. Allows us to skip larger items of a higher level that surround this one.
-        // Otherwise all lower levels would only return the first item of the higher level that wraps it.
         let first_item = self
             .ranges_after_offset(offset)
             .position(|(l, _)| l == level)
@@ -148,17 +142,14 @@ where
                 self.ranges_after_offset(offset)
                     .skip(i)
                     .coalesce(|(a_level, a_range), (b_level, b_range)| {
-                        // If we are at the first item, if two neighboring elements have the same level and start, take the shorter one
                         if a_level == b_level && a_range.start == b_range.start && i == 0 {
                             Ok((b_level, b_range))
                         } else {
                             Err(((a_level, a_range), (b_level, b_range)))
                         }
                     })
-                    // Just take the first of these items
                     .next()
             });
-        // let first_item = self.ranges_after_offset(offset).find(|(l, _)| l == &level);
         self.ranges_after_offset(offset)
             .filter(move |(l, _)| l >= &level)
             .skip_while(move |(l, r)| {
@@ -270,12 +261,9 @@ where
         let chunk = self.text.get(start..end)?;
         self.chunk_stats.update_max_chunk_size(end - start);
 
-        // Reset caches so we can reuse the memory allocation
         self.chunk_sizer.clear_cache();
-        // Optionally move cursor back if overlap is desired
         self.update_cursor(end);
 
-        // Trim whitespace if user requested it
         Some(self.trim.trim(start, chunk))
     }
 
@@ -298,7 +286,6 @@ where
 
             match fits {
                 Ordering::Less => {
-                    // We got further than the last one, so update end
                     if text_end > end {
                         end = text_end;
                         successful_index = Some(mid);
@@ -306,7 +293,6 @@ where
                     }
                 }
                 Ordering::Equal => {
-                    // If we found a smaller equals use it. Or if this is the first equals we found
                     if text_end < end || !equals_found {
                         end = text_end;
                         successful_index = Some(mid);
@@ -315,7 +301,6 @@ where
                     equals_found = true;
                 }
                 Ordering::Greater => {
-                    // If we're too big on our smallest run, we must return at least one section
                     if mid == 0 && start == end {
                         end = text_end;
                         successful_index = Some(mid);
@@ -324,20 +309,17 @@ where
                 }
             }
 
-            // Adjust search area
             if fits.is_lt() {
                 low = mid + 1;
             } else if mid > 0 {
                 high = mid - 1;
             } else {
-                // Nothing to adjust
                 break;
             }
         }
 
         if let (Some(successful_index), Some(chunk_size)) = (successful_index, successful_chunk_size) {
             let mut range = successful_index..self.next_sections.len();
-            // We've already checked the successful index
             range.next();
 
             for index in range {
@@ -366,10 +348,8 @@ where
             return;
         }
 
-        // Binary search for overlap
         let mut start = end;
         let mut low = 0;
-        // Find closest index that would work
         let mut high = match self
             .next_sections
             .binary_search_by_key(&end, |(offset, str)| offset + str.len())
@@ -385,12 +365,10 @@ where
                     .chunk_size(offset, self.text.get(offset..end).expect("Invalid range"), self.trim);
             let fits = self.overlap.fits(chunk_size);
 
-            // We got further than the last one, so update start
             if fits.is_le() && offset < start && offset > self.cursor {
                 start = offset;
             }
 
-            // Adjust search area
             if fits.is_lt() && mid > 0 {
                 high = mid - 1;
             } else {
@@ -405,7 +383,6 @@ where
     /// Increasing length of chunk until we find biggest size to minimize validation time
     /// on huge chunks
     fn update_next_sections(&mut self) -> usize {
-        // First thing, clear out the list, but reuse the allocated memory
         self.next_sections.clear();
 
         let remaining_text = self.text.get(self.cursor..).unwrap();
@@ -456,8 +433,6 @@ where
             .take_while(move |(offset, _)| max_offset.is_none_or(|max| *offset <= max))
             .filter(|(_, str)| !str.is_empty());
 
-        // Start filling up the next sections. Since calculating the size of the chunk gets more expensive
-        // the farther we go, we conservatively check for a smaller range to do the later binary search in.
         let mut low = 0;
         let mut prev_equals: Option<usize> = None;
         let max = self.capacity.max;
@@ -472,12 +447,10 @@ where
                 }
             }
             let new_num = self.next_sections.len();
-            // If we've iterated through the whole iterator, break here.
             if new_num - prev_num == 0 {
                 break;
             }
 
-            // Check if the last item fits
             if let Some(&(offset, str)) = self.next_sections.last() {
                 let text_end = offset + str.len();
                 if (text_end - self.cursor) < target_offset {
@@ -503,12 +476,9 @@ where
 
                 match fits {
                     Ordering::Less => {
-                        // We know we can go higher
                         low = new_num.saturating_sub(1);
                     }
                     Ordering::Equal => {
-                        // Don't update low because it could be a range
-                        // If we've seen a previous equals, we can break if the size is bigger already
                         if let Some(prev) = prev_equals
                             && prev < chunk_size
                         {
@@ -536,18 +506,14 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Make sure we haven't reached the end
             if self.cursor >= self.text.len() {
                 return None;
             }
 
             match self.next_chunk()? {
-                // Make sure we didn't get an empty chunk. Should only happen in
-                // cases where we trim.
                 (_, "") => {}
                 c => {
                     let item_end = c.0 + c.1.len();
-                    // Skip because we've emitted a chunk whose content we've already emitted
                     if item_end <= self.prev_item_end {
                         continue;
                     }

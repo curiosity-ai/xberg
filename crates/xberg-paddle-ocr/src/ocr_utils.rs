@@ -8,6 +8,8 @@ use image::imageops;
 use imageproc::geometric_transformations::{Interpolation, Projection};
 use ndarray::{Array, Array4};
 
+const VERTICAL_TEXT_ASPECT_RATIO: f32 = 1.5;
+
 pub struct OcrUtils;
 
 impl OcrUtils {
@@ -36,9 +38,6 @@ impl OcrUtils {
 
         let raw = img_src.as_raw();
 
-        // Write each channel plane as a contiguous slice. ndarray stores (1,3,H,W)
-        // in C-contiguous (row-major) order, so plane [0,ch] is a contiguous H*W block.
-        // This enables LLVM to auto-vectorize the inner loop (4-8 f32 ops per cycle).
         for ch in 0..3 {
             let norm = norm_vals[ch];
             let adj = adjusted[ch];
@@ -49,7 +48,6 @@ impl OcrUtils {
             let plane_slice = plane.into_slice().expect("contiguous memory");
 
             for (i, out) in plane_slice.iter_mut().enumerate() {
-                // raw is HWC: pixel i has R at raw[i*3], G at raw[i*3+1], B at raw[i*3+2]
                 *out = raw[i * 3 + ch] as f32 * norm - adj;
             }
         }
@@ -87,53 +85,30 @@ impl OcrUtils {
     }
 
     pub fn get_rotate_crop_image(img_src: &image::RgbImage, box_points: &[Point]) -> image::RgbImage {
-        let mut points = box_points.to_vec();
-
-        // Calculate bounding box
-        let (min_x, min_y, max_x, max_y) = points.iter().fold(
-            (u32::MAX, u32::MAX, 0u32, 0u32),
-            |(min_x, min_y, max_x, max_y), point| {
-                (
-                    min_x.min(point.x),
-                    min_y.min(point.y),
-                    max_x.max(point.x),
-                    max_y.max(point.y),
-                )
-            },
-        );
-
-        // Crop image
-        let img_crop = imageops::crop_imm(img_src, min_x, min_y, max_x - min_x, max_y - min_y).to_image();
-
-        for point in &mut points {
-            point.x = point.x.saturating_sub(min_x);
-            point.y = point.y.saturating_sub(min_y);
+        let fallback = Self::bounding_crop(img_src, box_points);
+        if box_points.len() < 4 {
+            return fallback;
         }
 
-        // Ensure we have enough points for transformation
-        if points.len() < 4 {
-            // Fallback: return the cropped image as-is if we don't have 4 points
-            return img_crop;
-        }
+        let edge_length = |first: Point, second: Point| {
+            let dx = first.x as f32 - second.x as f32;
+            let dy = first.y as f32 - second.y as f32;
+            (dx * dx + dy * dy).sqrt()
+        };
+        let img_crop_width =
+            edge_length(box_points[0], box_points[1]).max(edge_length(box_points[2], box_points[3])) as u32;
+        let img_crop_height =
+            edge_length(box_points[0], box_points[3]).max(edge_length(box_points[1], box_points[2])) as u32;
 
-        // Direct multiplication instead of .pow(2) — avoids integer power function overhead.
-        let dx_w = (points[0].x as i32 - points[1].x as i32) as f32;
-        let dy_w = (points[0].y as i32 - points[1].y as i32) as f32;
-        let img_crop_width = (dx_w * dx_w + dy_w * dy_w).sqrt() as u32;
-        let dx_h = (points[0].x as i32 - points[3].x as i32) as f32;
-        let dy_h = (points[0].y as i32 - points[3].y as i32) as f32;
-        let img_crop_height = (dx_h * dx_h + dy_h * dy_h).sqrt() as u32;
-
-        // Ensure dimensions are valid (non-zero)
         if img_crop_width == 0 || img_crop_height == 0 {
-            return img_crop;
+            return fallback;
         }
 
         let src_points = [
-            (points[0].x as f32, points[0].y as f32),
-            (points[1].x as f32, points[1].y as f32),
-            (points[2].x as f32, points[2].y as f32),
-            (points[3].x as f32, points[3].y as f32),
+            (box_points[0].x as f32, box_points[0].y as f32),
+            (box_points[1].x as f32, box_points[1].y as f32),
+            (box_points[2].x as f32, box_points[2].y as f32),
+            (box_points[3].x as f32, box_points[3].y as f32),
         ];
 
         let dst_points = [
@@ -146,22 +121,20 @@ impl OcrUtils {
         let projection = match Projection::from_control_points(src_points, dst_points) {
             Some(proj) => proj,
             None => {
-                // If projection cannot be created, return the cropped image as fallback
-                return img_crop;
+                return fallback;
             }
         };
 
         let mut part_img = image::RgbImage::new(img_crop_width, img_crop_height);
         imageproc::geometric_transformations::warp_into(
-            &img_crop,
+            img_src,
             projection,
-            Interpolation::Nearest,
-            imageproc::geometric_transformations::Border::Constant(image::Rgb([255, 255, 255])),
+            Interpolation::Bicubic,
+            imageproc::geometric_transformations::Border::Replicate,
             &mut part_img,
         );
 
-        // Rotate image if needed
-        if part_img.height() >= part_img.width() * 3 / 2 {
+        if part_img.height() as f32 / part_img.width() as f32 >= VERTICAL_TEXT_ASPECT_RATIO {
             let mut rotated = image::RgbImage::new(part_img.height(), part_img.width());
 
             for (x, y, pixel) in part_img.enumerate_pixels() {
@@ -172,6 +145,28 @@ impl OcrUtils {
         } else {
             part_img
         }
+    }
+
+    fn bounding_crop(img_src: &image::RgbImage, points: &[Point]) -> image::RgbImage {
+        let Some(first) = points.first() else {
+            return image::RgbImage::new(0, 0);
+        };
+        let (min_x, min_y, max_x, max_y) = points.iter().skip(1).fold(
+            (first.x, first.y, first.x, first.y),
+            |(min_x, min_y, max_x, max_y), point| {
+                (
+                    min_x.min(point.x),
+                    min_y.min(point.y),
+                    max_x.max(point.x),
+                    max_y.max(point.y),
+                )
+            },
+        );
+        let left = min_x.min(img_src.width());
+        let top = min_y.min(img_src.height());
+        let width = max_x.min(img_src.width()).saturating_sub(left);
+        let height = max_y.min(img_src.height()).saturating_sub(top);
+        imageops::crop_imm(img_src, left, top, width, height).to_image()
     }
 
     pub fn mat_rotate_clock_wise_180(src: &mut image::RgbImage) {
@@ -202,5 +197,55 @@ impl OcrUtils {
         }
 
         if count == 0 { 0.0 } else { sum / count as f32 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rotate_crop_uses_longest_opposing_edges() {
+        let source = image::RgbImage::from_pixel(20, 20, image::Rgb([32, 64, 96]));
+        let points = [
+            Point { x: 2, y: 2 },
+            Point { x: 12, y: 2 },
+            Point { x: 16, y: 14 },
+            Point { x: 2, y: 12 },
+        ];
+
+        let crop = OcrUtils::get_rotate_crop_image(&source, &points);
+
+        assert_eq!(crop.dimensions(), (14, 12));
+    }
+
+    #[test]
+    fn test_rotate_crop_replicates_source_at_warp_boundary() {
+        let source = image::RgbImage::from_pixel(10, 10, image::Rgb([32, 64, 96]));
+        let points = [
+            Point { x: 0, y: 0 },
+            Point { x: 9, y: 0 },
+            Point { x: 9, y: 9 },
+            Point { x: 0, y: 9 },
+        ];
+
+        let crop = OcrUtils::get_rotate_crop_image(&source, &points);
+
+        assert!(crop.pixels().all(|pixel| *pixel == image::Rgb([32, 64, 96])));
+    }
+
+    #[test]
+    fn test_rotate_crop_does_not_rotate_below_vertical_threshold() {
+        let source = image::RgbImage::from_pixel(8, 8, image::Rgb([32, 64, 96]));
+        let points = [
+            Point { x: 0, y: 0 },
+            Point { x: 3, y: 0 },
+            Point { x: 3, y: 4 },
+            Point { x: 0, y: 4 },
+        ];
+
+        let crop = OcrUtils::get_rotate_crop_image(&source, &points);
+
+        assert_eq!(crop.dimensions(), (3, 4));
     }
 }

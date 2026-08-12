@@ -9,19 +9,38 @@
 //!
 //! Fixtures come from the repo-root `test_documents/` submodule. No HEIF
 //! binaries live in the xberg codebase itself.
+//!
+//! `test_documents/` is a bucket-fetched corpus (see
+//! `test_documents/scripts/fetch_corpus.py`) and is not present in a bare
+//! checkout, so fixtures are read at runtime rather than baked in via
+//! `include_bytes!`; tests skip cleanly with a greppable message when the
+//! corpus hasn't been fetched.
 
 #![cfg(feature = "heic")]
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 
 mod helpers;
-use helpers::extract_bytes_document;
+use helpers::{extract_bytes_document, get_test_file_path};
 
 use xberg::FormatMetadata;
 use xberg::core::config::ExtractionConfig;
 use xberg::core::mime::list_supported_formats;
 
-const TEST_HEIC: &[u8] = include_bytes!("../../../test_documents/images/test.heic");
-const TEST_HEIF: &[u8] = include_bytes!("../../../test_documents/images/test.heif");
-const TEST_AVIF: &[u8] = include_bytes!("../../../test_documents/images/test.avif");
+/// Read a `test_documents/` fixture at runtime, skipping the calling test
+/// with a greppable message when the bucket-fetched corpus is absent.
+fn load_fixture(relative: &str) -> Option<Vec<u8>> {
+    let path = get_test_file_path(relative);
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            eprintln!(
+                "SKIP: fixture {} not available ({e}); run `python3 test_documents/scripts/fetch_corpus.py` to fetch it",
+                path.display()
+            );
+            None
+        }
+    }
+}
 
 fn ocr_disabled_config() -> ExtractionConfig {
     ExtractionConfig {
@@ -30,7 +49,7 @@ fn ocr_disabled_config() -> ExtractionConfig {
     }
 }
 
-async fn extract_image_metadata(bytes: &'static [u8], mime: &str) -> xberg::ImageMetadata {
+async fn extract_image_metadata(bytes: &[u8], mime: &str) -> xberg::ImageMetadata {
     let config = ocr_disabled_config();
     let result = extract_bytes_document(bytes, mime, &config)
         .await
@@ -43,7 +62,10 @@ async fn extract_image_metadata(bytes: &'static [u8], mime: &str) -> xberg::Imag
 
 #[tokio::test]
 async fn extract_bytes_handles_heic() {
-    let img = extract_image_metadata(TEST_HEIC, "image/heic").await;
+    let Some(bytes) = load_fixture("images/test.heic") else {
+        return;
+    };
+    let img = extract_image_metadata(&bytes, "image/heic").await;
     assert!(img.width > 0, "HEIC width should be > 0");
     assert!(img.height > 0, "HEIC height should be > 0");
     assert_eq!(img.format, "HEIF");
@@ -51,7 +73,10 @@ async fn extract_bytes_handles_heic() {
 
 #[tokio::test]
 async fn extract_bytes_handles_heif() {
-    let img = extract_image_metadata(TEST_HEIF, "image/heif").await;
+    let Some(bytes) = load_fixture("images/test.heif") else {
+        return;
+    };
+    let img = extract_image_metadata(&bytes, "image/heif").await;
     assert!(img.width > 0);
     assert!(img.height > 0);
     assert_eq!(img.format, "HEIF");
@@ -59,7 +84,10 @@ async fn extract_bytes_handles_heif() {
 
 #[tokio::test]
 async fn extract_bytes_handles_avif() {
-    let img = extract_image_metadata(TEST_AVIF, "image/avif").await;
+    let Some(bytes) = load_fixture("images/test.avif") else {
+        return;
+    };
+    let img = extract_image_metadata(&bytes, "image/avif").await;
     assert!(img.width > 0);
     assert!(img.height > 0);
     assert_eq!(img.format, "HEIF");

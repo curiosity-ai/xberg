@@ -66,7 +66,6 @@ pub(crate) async fn rerank_via_llm(
 
     let usage = extract_rerank_usage(&response, &config.model);
 
-    // Sort by relevance_score descending (providers may not guarantee order).
     let mut results_raw = response.results;
     results_raw.sort_by(|a, b| {
         b.relevance_score
@@ -74,8 +73,6 @@ pub(crate) async fn rerank_via_llm(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Apply top_k truncation (already applied via RerankRequest.top_n, but providers
-    // may return more — truncate defensively).
     if let Some(k) = top_k {
         results_raw.truncate(k);
     }
@@ -109,7 +106,6 @@ pub(crate) async fn rerank_via_llm(
 /// We attempt a best-effort parse; failures produce `None` rather than an error.
 #[cfg(feature = "reranker")]
 fn extract_rerank_usage(response: &liter_llm::RerankResponse, model: &str) -> Option<crate::types::LlmUsage> {
-    // Extract token counts from meta if the provider includes them.
     let (input_tokens, total_tokens) = response
         .meta
         .as_ref()

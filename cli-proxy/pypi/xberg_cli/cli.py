@@ -38,7 +38,6 @@ def main() -> None:
         completed = subprocess.run([bundled, *sys.argv[1:]], check=False)
         sys.exit(completed.returncode)
 
-    # Fall back to the runtime download path (sdist / unknown platform).
     sys.exit(run(sys.argv[1:]))
 
 

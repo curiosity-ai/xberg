@@ -5,19 +5,19 @@
 
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 use std::fs;
 
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 use super::error::OcrError;
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 use super::validation::TESSERACT_SUPPORTED_LANGUAGE_CODES;
 
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 const TESSDATA_FAST_BASE_URL: &str = "https://github.com/tesseract-ocr/tessdata_fast/raw/main";
 
 /// All language codes to download (supported languages + osd for script detection).
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 fn all_download_codes() -> Vec<&'static str> {
     let mut codes: Vec<&str> = TESSERACT_SUPPORTED_LANGUAGE_CODES.iter().copied().collect();
     if !codes.contains(&"osd") {
@@ -58,7 +58,7 @@ impl TessdataManager {
     /// Returns the manifest of all tessdata files.
     ///
     /// Paths are relative to the cache root (prefixed with "tessdata/").
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[cfg_attr(alef, alef(skip))]
     pub fn manifest() -> Vec<crate::paddle_ocr::ModelManifestEntry> {
         all_download_codes()
@@ -78,7 +78,7 @@ impl TessdataManager {
     ///
     /// When the `paddle-ocr` feature is not enabled, no download URLs are available
     /// and this method always returns `Ok(0)`.
-    #[cfg(not(feature = "paddle-ocr"))]
+    #[cfg(not(paddle_ocr))]
     pub fn ensure_all_languages(&self) -> Result<usize, crate::error::XbergError> {
         Ok(0)
     }
@@ -88,7 +88,7 @@ impl TessdataManager {
     /// Skips files that already exist. Returns the count of newly downloaded files.
     ///
     /// Requires the `paddle-ocr` feature for HTTP download support (ureq).
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     pub fn ensure_all_languages(&self) -> Result<usize, OcrError> {
         fs::create_dir_all(&self.cache_dir).map_err(|e| {
             OcrError::TesseractInitializationFailed(format!(
@@ -124,7 +124,7 @@ impl TessdataManager {
 }
 
 /// Download a single traineddata file with retries.
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 fn download_traineddata(url: &str, dest: &Path) -> Result<(), String> {
     const MAX_ATTEMPTS: u32 = 3;
 
@@ -193,7 +193,7 @@ mod tests {
         assert!(manager.is_language_cached("eng"));
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_all_download_codes_includes_osd() {
         let codes = all_download_codes();
@@ -202,7 +202,7 @@ mod tests {
         assert!(codes.contains(&"fra"));
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_all_download_codes_sorted() {
         let codes = all_download_codes();
@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(codes, sorted);
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_manifest_returns_entries() {
         let entries = TessdataManager::manifest();
@@ -222,7 +222,7 @@ mod tests {
         assert!(paths.contains(&"tessdata/osd.traineddata"));
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_manifest_entries_have_valid_urls() {
         let entries = TessdataManager::manifest();
@@ -241,13 +241,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_ensure_all_languages_with_existing_files() {
         let temp_dir = TempDir::new().unwrap();
         let manager = TessdataManager::new(Some(temp_dir.path().to_path_buf()));
 
-        // Pre-populate all files so no downloads occur
         for code in all_download_codes() {
             fs::write(temp_dir.path().join(format!("{code}.traineddata")), "fake").unwrap();
         }

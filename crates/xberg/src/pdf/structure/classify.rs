@@ -1,8 +1,85 @@
 //! Heading classification for paragraphs using font-size clustering.
 
-use super::constants::{MAX_BOLD_HEADING_WORD_COUNT, MAX_HEADING_DISTANCE_MULTIPLIER, MAX_HEADING_WORD_COUNT};
+use super::constants::{
+    MAX_BOLD_HEADING_WORD_COUNT, MAX_HEADING_DISTANCE_MULTIPLIER, MAX_HEADING_WORD_COUNT, MIN_BLOCKS_FOR_FONT_HEADING,
+    MIN_HEADING_FONT_GAP, MIN_HEADING_FONT_RATIO,
+};
 use super::regions::{looks_like_bare_url, looks_like_figure_label};
 use super::types::{LayoutHintClass, PdfParagraph};
+
+const SAL_DIRECTION_PREFIXES: [&str; 6] = [
+    "__deref__inout",
+    "__deref__out",
+    "__deref__in",
+    "__inout",
+    "__out",
+    "__in",
+];
+const SAL_DIRECTION_MODIFIERS: [&str; 7] = ["opt", "ecount", "bcount", "full", "part", "z", "nz"];
+const CHANGELOG_VERSION_MAX_LEFT_OFFSET_RATIO: f32 = 0.75;
+const CHANGELOG_VERSION_MAX_VERTICAL_GAP_RATIO: f32 = 2.0;
+const CHANGELOG_VERSION_MAX_VERTICAL_OVERLAP_RATIO: f32 = 0.25;
+const CHANGELOG_COMBINED_MIN_HEIGHT_RATIO: f32 = 1.5;
+const CHANGELOG_COMBINED_MIN_BASELINE_GAP_RATIO: f32 = 0.5;
+const SPARSE_PEER_HEADING_MIN_PAGES: usize = 2;
+const SPARSE_PEER_HEADING_FONT_TOLERANCE: f32 = 0.5;
+type ParagraphBbox = (f32, f32, f32, f32);
+
+/// Demote structure-tree heading tags attached to standalone SAL annotations.
+///
+/// Tagged API references sometimes expose direction annotations such as `__in`
+/// as headings. These are parameter metadata, not document structure. Keep the
+/// guard deliberately narrow, and retain headings backed by a layout heading
+/// class or code-block classification.
+pub(super) fn demote_structure_annotation_headings(paragraphs: &mut [PdfParagraph]) {
+    for para in paragraphs {
+        if para.heading_level.is_none()
+            || para.is_code_block
+            || matches!(
+                para.layout_class,
+                Some(LayoutHintClass::Title | LayoutHintClass::SectionHeader)
+            )
+        {
+            continue;
+        }
+
+        let text = paragraph_plain_text(para);
+        if is_sal_direction_annotation(text.trim()) {
+            para.heading_level = None;
+        }
+    }
+}
+
+fn is_sal_direction_annotation(text: &str) -> bool {
+    let base = if let Some((base, arguments)) = text.split_once('(') {
+        let Some(arguments) = arguments.strip_suffix(')') else {
+            return false;
+        };
+        if arguments.is_empty()
+            || !arguments
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ','))
+        {
+            return false;
+        }
+        base
+    } else {
+        text
+    };
+
+    SAL_DIRECTION_PREFIXES.iter().any(|prefix| {
+        let Some(suffix) = base.strip_prefix(prefix) else {
+            return false;
+        };
+        suffix.is_empty()
+            || suffix.strip_prefix('_').is_some_and(|modifiers| {
+                !modifiers.is_empty()
+                    && modifiers
+                        .split('_')
+                        .all(|modifier| SAL_DIRECTION_MODIFIERS.contains(&modifier))
+            })
+    })
+}
 
 /// Classify paragraphs as headings or body using the global heading map and bold heuristic.
 pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: &[(f32, Option<u8>)]) {
@@ -17,7 +94,6 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
         "classify_paragraphs: start"
     );
     let gap_info = precompute_gap_info(heading_map);
-    // Body font size = centroid of the cluster with no heading level
     let body_font_size = heading_map
         .iter()
         .find(|(_, level)| level.is_none())
@@ -26,14 +102,9 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
     for para in paragraphs.iter_mut() {
         let word_count = para.word_count;
 
-        // Pass 1: font-size-based heading classification.
-        // When the layout model says Text, only promote to heading if there is
-        // strong typographic evidence: the font size maps to a heading cluster
-        // AND the paragraph is bold (sub-headings the model missed).
         let layout_says_text = para.layout_class == Some(super::types::LayoutHintClass::Text);
         let heading_level = find_heading_level(para.dominant_font_size, heading_map, &gap_info);
         let heading_level = if layout_says_text {
-            // Override layout Text only when bold + heading font size → sub-heading
             if para.is_bold && heading_level.is_some() {
                 heading_level
             } else {
@@ -43,7 +114,6 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             heading_level
         };
 
-        // Helper: get paragraph text from either full-text path or segment path.
         let para_text: String = if !para.text.is_empty() {
             para.text.clone()
         } else {
@@ -64,9 +134,7 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             continue;
         }
 
-        // Pass 2: bold or italic short paragraphs → section headings (H2).
         let is_italic = if !para.text.is_empty() {
-            // Full-text path: check the is_italic flag on the paragraph (from char API majority)
             para.lines
                 .first()
                 .and_then(|l| l.segments.first())
@@ -85,19 +153,14 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             && word_count <= MAX_BOLD_HEADING_WORD_COUNT
         {
             let t = para_text.trim();
-            // Italic-only paragraphs need extra guards: academic papers use italic
-            // for author names, affiliations, emails which shouldn't be headings.
             let italic_ok = if is_italic && !para.is_bold {
                 !t.contains('@') && !t.contains(',') && t.chars().next().is_some_and(|c| c.is_uppercase())
             } else {
                 true
             };
-            // Guard: very short text (1-2 words) at body font size is typically a
-            // figure label (e.g., "Untightened nut"), not a real heading.
             let too_short_at_body =
                 word_count <= 2 && body_font_size > 0.0 && para.dominant_font_size <= body_font_size + 0.5;
-            let period_ok = !t.ends_with('.') || is_section_pattern(t);
-            // Allow colon-ending for ALL-CAPS label-headings like "AGENCY:" or "ACTION:"
+            let period_ok = !ends_with_sentence_period(t) || is_section_pattern(t);
             let colon_ok = !t.ends_with(':') || is_all_caps_text(t);
             if italic_ok
                 && !too_short_at_body
@@ -107,18 +170,11 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
                 && !looks_like_bare_url(t)
                 && !super::layout_classify::is_separator_text(t)
             {
-                // Use font-size ratio to body to differentiate H2 vs H3:
-                // - font > 1.2× body → H2 (clearly larger sub-heading)
-                // - font > body (bold at body size) → H3 (same-size bold sub-heading)
-                // - section numbering also influences level via infer_section_level
                 let level = infer_bold_heading_level(para.dominant_font_size, body_font_size, t);
                 para.heading_level = Some(level);
             }
         }
 
-        // Pass 2.5: section numbering pattern detection.
-        // Short paragraphs starting with section numbers (1., 2.1, I., A.) are
-        // likely headings even if not bold — common in academic papers.
         if para.heading_level.is_none()
             && !para.is_list_item
             && !para.is_code_block
@@ -130,10 +186,7 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
                 && !looks_like_figure_label(t)
                 && !super::layout_classify::is_separator_text(t)
             {
-                // Only promote if font size is at or above body size (avoid promoting
-                // footnotes or captions that happen to start with numbers).
                 let at_or_above_body = body_font_size <= 0.0 || para.dominant_font_size >= body_font_size - 0.5;
-                // Guard against layout model saying this is body text
                 let layout_ok = !layout_says_text
                     || (body_font_size > 0.0 && para.dominant_font_size > body_font_size + 1.0)
                     || para.is_bold;
@@ -144,14 +197,10 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             }
         }
 
-        // Pass 3: code blocks should never be headings
         if para.is_code_block {
             para.heading_level = None;
         }
 
-        // Pass 3.5: heuristic formula detection.
-        // Short paragraphs with high density of math characters (Greek letters,
-        // math operators, set theory symbols) are likely formulas.
         if para.heading_level.is_none()
             && !para.is_list_item
             && !para.is_code_block
@@ -166,9 +215,6 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             }
         }
 
-        // Pass 4: rescue pass — promote short, large-font paragraphs to headings.
-        // Catches headings that were missed by Passes 1-2.5 (e.g., non-bold headings
-        // at a font size that didn't form its own cluster but is clearly larger than body).
         if para.heading_level.is_none()
             && !para.is_list_item
             && !para.is_code_block
@@ -180,7 +226,7 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             let rescue_wc = rescue_text.split_whitespace().count();
             let rescue_colon_ok = !rescue_text.ends_with(':') || is_all_caps_text(rescue_text);
             if (1..=8).contains(&rescue_wc)
-                && !rescue_text.ends_with('.')
+                && !ends_with_sentence_period(rescue_text)
                 && rescue_colon_ok
                 && !looks_like_figure_label(rescue_text)
                 && !super::layout_classify::is_separator_text(rescue_text)
@@ -199,16 +245,8 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
         }
     }
 
-    // Pass 5: demote rescued headings that follow non-terminated paragraphs.
-    // If the previous paragraph ends without sentence-ending punctuation, the
-    // current paragraph is likely a continuation fragment (e.g., from a column
-    // break), not a real heading.
     demote_continuation_headings(paragraphs);
 
-    // Pass 6: ALL-CAPS heading detection.
-    // Short ALL-CAPS paragraphs (<=15 words, >80% uppercase letters) are often
-    // headings in government/legal documents (e.g., "DEPARTMENT OF TRANSPORTATION",
-    // "AGENCY:", "SUMMARY:"). Promote if not already a heading/list/code.
     for para in paragraphs.iter_mut() {
         if para.heading_level.is_some()
             || para.is_list_item
@@ -235,8 +273,6 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             continue;
         }
 
-        // Skip single words that are just abbreviations (e.g., "USA")
-        // unless they end with colon (label-heading like "AGENCY:")
         if wc == 1 && !t.ends_with(':') {
             continue;
         }
@@ -245,20 +281,18 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
             continue;
         }
 
-        // Skip if it looks like a figure label or separator
         if looks_like_figure_label(t) || super::layout_classify::is_separator_text(t) {
             continue;
         }
 
-        // Determine heading level from font-size ratio to body
         let level = if body_font_size > 0.0 {
             let ratio = para.dominant_font_size / body_font_size;
             if ratio > 1.4 {
                 1
             } else if ratio > 1.2 || wc <= 5 {
-                2 // Larger font or short ALL-CAPS title → H2
+                2
             } else {
-                3 // Longer ALL-CAPS label → H3
+                3
             }
         } else if wc <= 5 {
             2
@@ -268,14 +302,8 @@ pub(super) fn classify_paragraphs(paragraphs: &mut [PdfParagraph], heading_map: 
         para.heading_level = Some(level);
     }
 
-    // Pass 7: W2.B — indentation-based list detection.
-    // Paragraphs that are horizontally shifted right (indented) relative to the
-    // surrounding paragraphs at the same indent level are likely list items.
     detect_indentation_based_lists(paragraphs);
 
-    // Pass 8: W2.C — monospace code-block detection.
-    // Multiple consecutive paragraphs where all lines are monospace should be
-    // detected as code blocks for better markdown rendering.
     detect_monospace_code_blocks(paragraphs);
 }
 
@@ -291,11 +319,8 @@ fn detect_indentation_based_lists(paragraphs: &mut [PdfParagraph]) {
         return;
     }
 
-    // Group paragraphs by page (approximate via position tracking)
-    // For now, use a simpler heuristic: process all and mark indented items
-    const INDENT_THRESHOLD: f32 = 12.0; // Points
+    const INDENT_THRESHOLD: f32 = 12.0;
 
-    // Compute modal left X (the most common left position)
     let mut left_positions: Vec<f32> = paragraphs
         .iter()
         .filter_map(|p| p.block_bbox.map(|(left, _, _, _)| left))
@@ -305,28 +330,24 @@ fn detect_indentation_based_lists(paragraphs: &mut [PdfParagraph]) {
         return;
     }
 
-    // Find modal (most common) left X
     left_positions.sort_by(|a, b| a.total_cmp(b));
     let modal_left = {
         let mut freq_map: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
         for &pos in &left_positions {
-            let bucket = (pos * 10.0) as i32; // Group within 1pt
+            let bucket = (pos * 10.0) as i32;
             *freq_map.entry(bucket).or_default() += 1;
         }
         let (bucket, _) = freq_map.into_iter().max_by_key(|(_, count)| *count).unwrap_or((0, 0));
         bucket as f32 / 10.0
     };
 
-    // Mark indented paragraphs as list items
     for i in 0..paragraphs.len() {
         let para = &paragraphs[i];
 
-        // Skip if already classified
         if para.is_list_item || para.is_code_block || para.is_formula || para.heading_level.is_some() {
             continue;
         }
 
-        // Check indentation
         let left_x = para.block_bbox.map(|(left, _, _, _)| left).unwrap_or(0.0);
         let is_indented = left_x >= modal_left + INDENT_THRESHOLD;
 
@@ -334,7 +355,6 @@ fn detect_indentation_based_lists(paragraphs: &mut [PdfParagraph]) {
             continue;
         }
 
-        // Get word count
         let para_text = if !para.text.is_empty() {
             para.text.clone()
         } else {
@@ -347,9 +367,11 @@ fn detect_indentation_based_lists(paragraphs: &mut [PdfParagraph]) {
         };
         let word_count = para_text.split_whitespace().count();
 
-        // Check contextual signals
+        if super::pipeline::is_probable_author_byline(&para_text) || is_numeric_prose_continuation(&para_text) {
+            continue;
+        }
+
         let has_context = if i > 0 {
-            // Check if previous paragraph is short (another list item)
             let prev_text = if !paragraphs[i - 1].text.is_empty() {
                 paragraphs[i - 1].text.clone()
             } else {
@@ -385,12 +407,24 @@ fn detect_indentation_based_lists(paragraphs: &mut [PdfParagraph]) {
             false
         };
 
-        // Mark as list item if: short (<= 30 words) AND (has context OR followed by context)
         if (word_count <= 30) && (has_context || followed_by_context) {
             paragraphs[i].is_list_item = true;
             paragraphs[i].layout_class = Some(LayoutHintClass::ListItem);
         }
     }
+}
+
+fn is_numeric_prose_continuation(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first.is_empty() || !first.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    words
+        .next()
+        .is_none_or(|word| word.chars().next().is_some_and(char::is_lowercase))
 }
 
 /// W2.C: Detect monospace code-block sequences.
@@ -407,13 +441,11 @@ fn detect_monospace_code_blocks(paragraphs: &mut [PdfParagraph]) {
     while i < paragraphs.len() {
         let para = &paragraphs[i];
 
-        // Skip if already classified
         if para.is_code_block || para.is_list_item || para.is_formula || para.heading_level.is_some() {
             i += 1;
             continue;
         }
 
-        // Check if this paragraph is all monospace
         let is_all_monospace = !para.lines.is_empty() && para.lines.iter().all(|l| l.is_monospace);
 
         if !is_all_monospace {
@@ -421,7 +453,6 @@ fn detect_monospace_code_blocks(paragraphs: &mut [PdfParagraph]) {
             continue;
         }
 
-        // Look ahead to see if the next paragraph is also all monospace
         if i + 1 < paragraphs.len() {
             let next_para = &paragraphs[i + 1];
             let next_is_monospace = !next_para.lines.is_empty()
@@ -431,13 +462,11 @@ fn detect_monospace_code_blocks(paragraphs: &mut [PdfParagraph]) {
                 && next_para.heading_level.is_none();
 
             if next_is_monospace {
-                // Found a sequence: mark both as code blocks
                 paragraphs[i].is_code_block = true;
                 paragraphs[i].layout_class = Some(LayoutHintClass::Code);
                 paragraphs[i + 1].is_code_block = true;
                 paragraphs[i + 1].layout_class = Some(LayoutHintClass::Code);
 
-                // Continue marking consecutive monospace paragraphs
                 let mut j = i + 2;
                 while j < paragraphs.len() {
                     let para_j = &paragraphs[j];
@@ -472,12 +501,10 @@ fn detect_monospace_code_blocks(paragraphs: &mut [PdfParagraph]) {
 /// numbers, or section markers.
 fn starts_with_lowercase_or_continuation(text: &str) -> bool {
     let first_char = text.chars().next();
-    // If the first character is a lowercase letter, it's likely a sentence continuation.
     if first_char.is_some_and(|c| c.is_lowercase()) {
         return true;
     }
 
-    // Check for common continuation words that indicate a sentence fragment.
     let first_word = text.split_whitespace().next().unwrap_or("");
     let lower = first_word.to_lowercase();
     matches!(
@@ -529,13 +556,10 @@ fn demote_continuation_headings(paragraphs: &mut [PdfParagraph]) {
     }
 
     for i in 1..paragraphs.len() {
-        // Only consider paragraphs that have a heading level
         if paragraphs[i].heading_level.is_none() {
             continue;
         }
 
-        // Skip if the previous paragraph is a heading, list item, code, or formula
-        // (those are structurally distinct and don't indicate continuation).
         let prev = &paragraphs[i - 1];
         if prev.heading_level.is_some()
             || prev.is_list_item
@@ -546,7 +570,6 @@ fn demote_continuation_headings(paragraphs: &mut [PdfParagraph]) {
             continue;
         }
 
-        // Check if the previous paragraph ends without sentence-ending punctuation.
         let prev_text = if !prev.text.is_empty() {
             prev.text.clone()
         } else {
@@ -615,13 +638,18 @@ pub(super) fn precompute_gap_info(heading_map: &[(f32, Option<u8>)]) -> GapInfo 
 
 /// Refine heading levels across the entire document.
 ///
-/// 1. Promotes the first heading to H1 when no H1 exists (title inference).
+/// 1. Promotes the first heading to H1 when no H1 exists (title inference),
+///    unless a sparse document repeats the same H2 tier at the start of pages.
 /// 2. Merges consecutive H1 headings at the same font size into one title (any page).
 /// 3. Demotes numbered section headings from H1 to H2 when a non-numbered title H1 exists.
+/// 4. Preserves changelog section/version hierarchy where geometry confirms adjacency.
 pub(super) fn refine_heading_hierarchy(all_pages: &mut [Vec<PdfParagraph>]) {
-    // Step 0: If no H1 exists but H2+ headings do, promote the first heading
-    // on page 0 (or the largest font heading) to H1. Many docs have a title
-    // that gets classified as H2 by bold promotion or font clustering.
+    split_combined_changelog_version_headings(all_pages);
+    refine_heading_hierarchy_inner(all_pages);
+    promote_changelog_version_headings(all_pages);
+}
+
+fn refine_heading_hierarchy_inner(all_pages: &mut [Vec<PdfParagraph>]) {
     let h1_count: usize = all_pages
         .iter()
         .flat_map(|page| page.iter())
@@ -633,29 +661,35 @@ pub(super) fn refine_heading_hierarchy(all_pages: &mut [Vec<PdfParagraph>]) {
             .iter()
             .flat_map(|page| page.iter())
             .any(|p| p.heading_level.is_some());
-        if has_any_heading {
+        if has_any_heading && !has_repeated_sparse_peer_heading_tier(all_pages) {
             promote_title_heading(all_pages);
         }
 
-        // Additional title promotion: if still no H1 exists, check if the first
-        // paragraph on page 0 has the largest font size on that page AND is short
-        // (<=10 words). This catches unclassified title paragraphs at the top of
-        // documents that were missed by font-size clustering and bold heuristics.
         let still_no_h1 = !all_pages
             .iter()
             .flat_map(|page| page.iter())
             .any(|p| p.heading_level == Some(1));
         if still_no_h1 && !all_pages.is_empty() && !all_pages[0].is_empty() {
+            let total_paragraphs: usize = all_pages.iter().map(|page| page.len()).sum();
             let page0 = &all_pages[0];
             let max_font_on_page = page0.iter().map(|p| p.dominant_font_size).fold(0.0f32, f32::max);
             let first = &page0[0];
             let first_text = paragraph_plain_text(first);
             let first_wc = first_text.split_whitespace().count();
-            if first.dominant_font_size >= max_font_on_page
+            let rest_font_size = other_paragraphs_font_size(all_pages, 0, 0);
+            let clears_font_gate = rest_font_size.is_none_or(|body_font| {
+                body_font <= 0.0
+                    || (first.dominant_font_size >= body_font * MIN_HEADING_FONT_RATIO
+                        && first.dominant_font_size >= body_font + MIN_HEADING_FONT_GAP)
+            });
+            if total_paragraphs >= MIN_BLOCKS_FOR_FONT_HEADING
+                && clears_font_gate
+                && first.dominant_font_size >= max_font_on_page
                 && first_wc <= 10
                 && first_wc > 0
                 && !first.is_page_furniture
                 && !looks_like_bare_url(&first_text)
+                && !is_changelog_hierarchy_member(page0, 0)
             {
                 all_pages[0][0].heading_level = Some(1);
             }
@@ -672,14 +706,10 @@ pub(super) fn refine_heading_hierarchy(all_pages: &mut [Vec<PdfParagraph>]) {
         return;
     }
 
-    // Step 1: Merge consecutive H1s at the same font size on each page.
-    // Split titles like "KAISUN HOLDINGS" / "LIMITED" appear as consecutive
-    // H1 paragraphs with the same font size.
     for page in all_pages.iter_mut() {
         merge_consecutive_h1s(page);
     }
 
-    // Re-count after merging
     let h1_count: usize = all_pages
         .iter()
         .flat_map(|page| page.iter())
@@ -690,9 +720,6 @@ pub(super) fn refine_heading_hierarchy(all_pages: &mut [Vec<PdfParagraph>]) {
         return;
     }
 
-    // Step 2: Demote numbered section headings.
-    // If the first H1 is a title (not starting with a number), demote subsequent
-    // numbered H1s to H2.
     let first_h1_is_title = all_pages
         .iter()
         .flat_map(|page| page.iter())
@@ -719,28 +746,185 @@ pub(super) fn refine_heading_hierarchy(all_pages: &mut [Vec<PdfParagraph>]) {
     }
 }
 
+fn split_combined_changelog_version_headings(all_pages: &mut [Vec<PdfParagraph>]) {
+    for page in all_pages {
+        let mut index = 0;
+        while index < page.len() {
+            let Some(version) = combined_changelog_version(&page[index]) else {
+                index += 1;
+                continue;
+            };
+            if !page[index].is_bold
+                || page[index].is_list_item
+                || page[index].is_code_block
+                || page[index].is_formula
+                || page[index].is_page_furniture
+            {
+                index += 1;
+                continue;
+            }
+            let Some((parent_bbox, version_bbox)) = combined_changelog_split_bboxes(&page[index]) else {
+                index += 1;
+                continue;
+            };
+
+            let mut version_paragraph = page[index].clone();
+            page[index].text = "Recent Change Log".to_string();
+            page[index].lines.clear();
+            page[index].heading_level = Some(2);
+            page[index].block_bbox = Some(parent_bbox);
+            page[index].word_count = 3;
+
+            version_paragraph.text = version;
+            version_paragraph.lines.clear();
+            version_paragraph.heading_level = Some(3);
+            version_paragraph.is_list_item = false;
+            version_paragraph.is_code_block = false;
+            version_paragraph.is_formula = false;
+            version_paragraph.is_page_furniture = false;
+            version_paragraph.block_bbox = Some(version_bbox);
+            version_paragraph.word_count = 1;
+            page.insert(index + 1, version_paragraph);
+            index += 2;
+        }
+    }
+}
+
+fn combined_changelog_version(paragraph: &PdfParagraph) -> Option<String> {
+    let text = effective_text(paragraph);
+    let text = text.trim();
+    let version = if let Some(version) = text.strip_prefix("Recent Change Log\n") {
+        version
+    } else {
+        if !combined_changelog_has_multiline_geometry(paragraph) {
+            return None;
+        }
+        text.strip_prefix("Recent Change Log ")?
+    }
+    .trim();
+    (!version.contains(char::is_whitespace) && is_semantic_version(version)).then(|| version.to_string())
+}
+
+fn combined_changelog_has_multiline_geometry(paragraph: &PdfParagraph) -> bool {
+    let baseline_gap = paragraph
+        .lines
+        .iter()
+        .map(|line| line.baseline_y)
+        .fold(None, |bounds, baseline| match bounds {
+            None => Some((baseline, baseline)),
+            Some((minimum, maximum)) => Some((minimum.min(baseline), maximum.max(baseline))),
+        })
+        .is_some_and(|(minimum, maximum)| {
+            maximum - minimum >= paragraph.dominant_font_size * CHANGELOG_COMBINED_MIN_BASELINE_GAP_RATIO
+        });
+    let tall_bbox = paragraph.block_bbox.is_some_and(|(_, bottom, _, top)| {
+        top - bottom >= paragraph.dominant_font_size * CHANGELOG_COMBINED_MIN_HEIGHT_RATIO
+    });
+
+    baseline_gap || tall_bbox
+}
+
+fn combined_changelog_split_bboxes(paragraph: &PdfParagraph) -> Option<(ParagraphBbox, ParagraphBbox)> {
+    let (left, bottom, right, top) = paragraph.block_bbox.or_else(|| {
+        let mut segments = paragraph.lines.iter().flat_map(|line| line.segments.iter());
+        let first = segments.next()?;
+        Some(segments.fold(
+            (first.x, first.y, first.x + first.width, first.y + first.height),
+            |(left, bottom, right, top), segment| {
+                (
+                    left.min(segment.x),
+                    bottom.min(segment.y),
+                    right.max(segment.x + segment.width),
+                    top.max(segment.y + segment.height),
+                )
+            },
+        ))
+    })?;
+    let midpoint = bottom + (top - bottom) / 2.0;
+    Some(((left, midpoint, right, top), (left, bottom, right, midpoint)))
+}
+
+fn promote_changelog_version_headings(all_pages: &mut [Vec<PdfParagraph>]) {
+    for page in all_pages {
+        for index in 0..page.len().saturating_sub(1) {
+            let (before, after) = page.split_at_mut(index + 1);
+            let parent = &mut before[index];
+            let version = &mut after[0];
+
+            if !is_changelog_version_pair(parent, version) {
+                continue;
+            }
+
+            parent.heading_level = Some(2);
+            version.heading_level = Some(3);
+        }
+    }
+}
+
+fn is_changelog_version_pair(parent: &PdfParagraph, version: &PdfParagraph) -> bool {
+    parent.heading_level.is_some()
+        && effective_text(parent).trim() == "Recent Change Log"
+        && version.is_bold
+        && is_semantic_version(effective_text(version).trim())
+        && !version.is_list_item
+        && !version.is_code_block
+        && !version.is_formula
+        && !version.is_page_furniture
+        && changelog_version_is_near_and_aligned(parent, version)
+}
+
+fn is_semantic_version(text: &str) -> bool {
+    let version = text.strip_prefix('v').unwrap_or(text);
+    let mut parts = version.split('.');
+    let first = parts.next();
+    let second = parts.next();
+    let third = parts.next();
+    let has_extra = parts.next().is_some();
+
+    !has_extra
+        && first.is_some_and(is_ascii_digits)
+        && second.is_some_and(is_ascii_digits)
+        && third.is_none_or(is_ascii_digits)
+}
+
+fn is_ascii_digits(part: &str) -> bool {
+    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn changelog_version_is_near_and_aligned(parent: &PdfParagraph, version: &PdfParagraph) -> bool {
+    let (Some((parent_left, parent_bottom, _, _)), Some((version_left, _, _, version_top))) =
+        (parent.block_bbox, version.block_bbox)
+    else {
+        return false;
+    };
+
+    let reference_size = parent.dominant_font_size.max(version.dominant_font_size);
+    let left_offset = (parent_left - version_left).abs();
+    let vertical_gap = parent_bottom - version_top;
+
+    left_offset <= reference_size * CHANGELOG_VERSION_MAX_LEFT_OFFSET_RATIO
+        && vertical_gap >= -reference_size * CHANGELOG_VERSION_MAX_VERTICAL_OVERLAP_RATIO
+        && vertical_gap <= reference_size * CHANGELOG_VERSION_MAX_VERTICAL_GAP_RATIO
+}
+
 /// Determine heading level for a bold/italic paragraph based on font-size ratio to body.
 ///
 /// - Font size > 1.2× body → H2 (clearly larger sub-heading)
 /// - Font size at body size but bold → H3 (same-size bold sub-heading)
 /// - Section numbering overrides: uses dot count for depth (e.g., "3.2" → H3)
 fn infer_bold_heading_level(font_size: f32, body_font_size: f32, text: &str) -> u8 {
-    // If text starts with a section number, use numbering depth
     if starts_with_section_number(text) {
         return infer_section_level(text);
     }
 
-    // Use font-size ratio to differentiate H2 vs H3
     if body_font_size > 0.0 {
         let ratio = font_size / body_font_size;
         if ratio > 1.2 {
-            return 2; // Clearly larger than body → H2
+            return 2;
         }
-        // Bold at roughly body size → H3 (sub-section heading)
         return 3;
     }
 
-    // No body font size info, default to H2
     2
 }
 
@@ -753,7 +937,6 @@ fn infer_bold_heading_level(font_size: f32, body_font_size: f32, text: &str) -> 
 fn infer_section_level(text: &str) -> u8 {
     let trimmed = text.trim();
 
-    // Check for alphabetic prefix: "A.", "B.1"
     let first_char = trimmed.chars().next().unwrap_or(' ');
     let is_alpha_prefix = first_char.is_ascii_alphabetic()
         && trimmed.len() >= 2
@@ -766,23 +949,20 @@ fn infer_section_level(text: &str) -> u8 {
             .unwrap_or(0);
         1 + rest_end
     } else {
-        // Check for roman numerals
         let roman_chars: &[u8] = b"IVXLCDM";
         let bytes = trimmed.as_bytes();
         let roman_end = bytes.iter().position(|b| !roman_chars.contains(b)).unwrap_or(0);
         if roman_end > 0 && roman_end <= 5 && roman_end < bytes.len() {
             let next = bytes[roman_end];
             if (next == b'.' || next == b' ' || next == b')') && is_valid_roman(&trimmed[..roman_end]) {
-                // Roman numeral → top-level (H2), no sub-numbering
                 return 2;
             }
         }
-        // Numeric prefix: "3.2.1"
         trimmed.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(0)
     };
 
     if numbering_end == 0 {
-        return 2; // No numbering, default H2
+        return 2;
     }
 
     let numbering = &trimmed[..numbering_end];
@@ -794,10 +974,20 @@ fn infer_section_level(text: &str) -> u8 {
     };
 
     match effective_dots {
-        0 => 2, // "1 Introduction" → H2
-        1 => 3, // "3.2 AI models" → H3
-        _ => 4, // "3.2.1 Details" → H4
+        0 => 2,
+        1 => 3,
+        _ => 4,
     }
+}
+
+/// Check whether text ends with a genuine sentence-terminating period.
+///
+/// A trailing ellipsis (`...` or the `…` glyph) is a truncation marker — common
+/// in headings and truncated titles ("Impaired Glucose Tolerance ...") — not a
+/// sentence terminator, so it does not disqualify a line from being a heading.
+pub(super) fn ends_with_sentence_period(text: &str) -> bool {
+    let t = text.trim_end();
+    t.ends_with('.') && !t.ends_with("..")
 }
 
 /// Check if text looks like a section/legal heading that legitimately ends with a period.
@@ -810,12 +1000,10 @@ pub(super) fn is_section_pattern(text: &str) -> bool {
     if t.starts_with('§') {
         return true;
     }
-    // All-caps short text ending with period is likely a structural heading
     let words = t.split_whitespace().count();
     if words <= 6 && t.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()) {
         return true;
     }
-    // Starts with section number: "3.2. Methods" or "162-56. Place"
     starts_with_section_number(t)
 }
 
@@ -837,7 +1025,6 @@ pub(super) fn is_numbered_section_heading(text: &str) -> bool {
         return false;
     }
 
-    // Roman-numeral markers are section headings.
     let roman_chars: &[u8] = b"IVXLCDM";
     let roman_end = bytes.iter().position(|b| !roman_chars.contains(b)).unwrap_or(0);
     if roman_end > 0
@@ -848,8 +1035,6 @@ pub(super) fn is_numbered_section_heading(text: &str) -> bool {
         return true;
     }
 
-    // Parse leading arabic numbering, counting dot-separated levels.
-    // idx only ever advances over ASCII bytes, so slicing `t` at it is safe.
     let mut levels = 0usize;
     let mut idx = 0usize;
     loop {
@@ -863,7 +1048,7 @@ pub(super) fn is_numbered_section_heading(text: &str) -> bool {
         levels += 1;
         idx += digit_len;
         if bytes.get(idx) == Some(&b'.') && bytes.get(idx + 1).is_some_and(|b| b.is_ascii_digit()) {
-            idx += 1; // consume the level separator and parse the next group
+            idx += 1;
         } else {
             break;
         }
@@ -872,10 +1057,9 @@ pub(super) fn is_numbered_section_heading(text: &str) -> bool {
         return false;
     }
     if levels >= 2 {
-        return true; // "3.2 Methods" / "3.2.1 Details"
+        return true;
     }
 
-    // Single-level marker: consume the trailing '.' / ')' and inspect the remainder.
     if matches!(bytes.get(idx), Some(b'.') | Some(b')')) {
         idx += 1;
     }
@@ -894,7 +1078,6 @@ pub(super) fn starts_with_section_number(text: &str) -> bool {
     if bytes.is_empty() {
         return false;
     }
-    // Arabic digits: "1 ", "2.1 ", "3.2. "
     let digit_end = bytes.iter().position(|&b| !b.is_ascii_digit()).unwrap_or(0);
     if digit_end > 0 && digit_end < bytes.len() {
         let next = bytes[digit_end];
@@ -902,14 +1085,11 @@ pub(super) fn starts_with_section_number(text: &str) -> bool {
             return true;
         }
     }
-    // Roman numerals: "I.", "II.", "III.", "IV.", "V.", "VI.", "VII.", "VIII.", "IX.", "X."
-    // Also "I " without dot (e.g., "I INTRODUCTION")
     let roman_chars: &[u8] = b"IVXLCDM";
     let roman_end = bytes.iter().position(|b| !roman_chars.contains(b)).unwrap_or(0);
     if roman_end > 0 && roman_end <= 5 && roman_end < bytes.len() {
         let next = bytes[roman_end];
         if next == b'.' || next == b' ' || next == b')' {
-            // Verify it's a valid roman numeral (not just random letters like "INVALID")
             let prefix = &trimmed[..roman_end];
             if is_valid_roman(prefix) {
                 return true;
@@ -955,8 +1135,7 @@ fn is_valid_roman(s: &str) -> bool {
 /// Only applies when the document has at least 3 numbered H2 headings, indicating
 /// a consistent numbering scheme.
 pub(super) fn demote_unnumbered_subsections(all_pages: &mut [Vec<PdfParagraph>]) {
-    // Collect all H2 headings with their position and numbered status
-    let mut h2_info: Vec<(usize, usize, bool)> = Vec::new(); // (page_idx, para_idx, is_numbered)
+    let mut h2_info: Vec<(usize, usize, bool)> = Vec::new();
     for (page_idx, page) in all_pages.iter().enumerate() {
         for (para_idx, para) in page.iter().enumerate() {
             if para.heading_level == Some(2) {
@@ -968,10 +1147,9 @@ pub(super) fn demote_unnumbered_subsections(all_pages: &mut [Vec<PdfParagraph>])
 
     let numbered_count = h2_info.iter().filter(|(_, _, numbered)| *numbered).count();
     if numbered_count < 3 {
-        return; // Not enough numbered sections to establish a pattern
+        return;
     }
 
-    // Find ranges: between consecutive numbered H2s, demote unnumbered H2s to H3
     let numbered_positions: Vec<usize> = h2_info
         .iter()
         .enumerate()
@@ -982,10 +1160,8 @@ pub(super) fn demote_unnumbered_subsections(all_pages: &mut [Vec<PdfParagraph>])
     for window in numbered_positions.windows(2) {
         let start = window[0];
         let end = window[1];
-        // Demote unnumbered H2s between these two numbered H2s
         for &(page_idx, para_idx, is_numbered) in &h2_info[start + 1..end] {
             if !is_numbered {
-                // Don't demote headings confirmed by the layout model.
                 let layout_confirmed = matches!(
                     all_pages[page_idx][para_idx].layout_class,
                     Some(super::types::LayoutHintClass::SectionHeader | super::types::LayoutHintClass::Title)
@@ -1015,16 +1191,16 @@ pub(super) fn demote_heading_runs(all_pages: &mut [Vec<PdfParagraph>]) {
                 continue;
             };
 
-            // Find the end of this consecutive same-level heading run
             let mut run_end = run_start + 1;
-            while run_end < page.len() && page[run_end].heading_level == Some(level) {
+            while run_end < page.len()
+                && page[run_end].heading_level == Some(level)
+                && page[run_end].layout_region_path == page[run_start].layout_region_path
+            {
                 run_end += 1;
             }
 
             let run_len = run_end - run_start;
             if run_len > MAX_CONSECUTIVE {
-                // Demote all but the first heading in the run, unless
-                // the layout model confirmed it as a heading region.
                 for para in &mut page[run_start + 1..run_end] {
                     let layout_confirmed = matches!(
                         para.layout_class,
@@ -1041,6 +1217,41 @@ pub(super) fn demote_heading_runs(all_pages: &mut [Vec<PdfParagraph>]) {
     }
 }
 
+/// Char-weighted dominant font size of every paragraph in the document except
+/// the one at `(exclude_page, exclude_index)`.
+///
+/// Used to gate the "no heading anywhere" title-promotion fallback: the
+/// excluded paragraph is the force-promotion candidate, so this answers "how
+/// much larger is the candidate than the rest of the document's text", the
+/// same ratio/gap test `assign_heading_levels_smart` applies to font-size
+/// clusters. Returns `None` when there is no other text to compare against.
+fn other_paragraphs_font_size(
+    all_pages: &[Vec<PdfParagraph>],
+    exclude_page: usize,
+    exclude_index: usize,
+) -> Option<f32> {
+    let mut weighted_sum = 0.0f64;
+    let mut total_chars = 0usize;
+    for (page_idx, page) in all_pages.iter().enumerate() {
+        for (para_idx, para) in page.iter().enumerate() {
+            if page_idx == exclude_page && para_idx == exclude_index {
+                continue;
+            }
+            let char_count = paragraph_plain_text(para).chars().count();
+            if char_count == 0 {
+                continue;
+            }
+            weighted_sum += f64::from(para.dominant_font_size) * char_count as f64;
+            total_chars += char_count;
+        }
+    }
+    if total_chars == 0 {
+        None
+    } else {
+        Some((weighted_sum / total_chars as f64) as f32)
+    }
+}
+
 /// Extract plain text from a paragraph.
 fn paragraph_plain_text(para: &PdfParagraph) -> String {
     para.lines
@@ -1051,6 +1262,42 @@ fn paragraph_plain_text(para: &PdfParagraph) -> String {
         .join(" ")
 }
 
+/// Preserve peer H2 sections when a sparse document repeats their font tier at
+/// the start of multiple pages. This prevents generic title inference from
+/// arbitrarily promoting only the first peer section. ~keep
+fn has_repeated_sparse_peer_heading_tier(all_pages: &[Vec<PdfParagraph>]) -> bool {
+    let paragraph_count: usize = all_pages.iter().map(Vec::len).sum();
+    if paragraph_count >= MIN_BLOCKS_FOR_FONT_HEADING {
+        return false;
+    }
+
+    let has_explicit_title = all_pages
+        .iter()
+        .flat_map(|page| page.iter())
+        .any(|paragraph| paragraph.heading_level.is_some() && paragraph.layout_class == Some(LayoutHintClass::Title));
+    if has_explicit_title {
+        return false;
+    }
+
+    let leading_h2_fonts: Vec<f32> = all_pages
+        .iter()
+        .filter_map(|page| {
+            page.iter()
+                .find(|paragraph| !paragraph.is_page_furniture && !paragraph_plain_text(paragraph).trim().is_empty())
+                .filter(|paragraph| paragraph.heading_level == Some(2) && paragraph.dominant_font_size.is_finite())
+                .map(|paragraph| paragraph.dominant_font_size)
+        })
+        .collect();
+
+    leading_h2_fonts.iter().any(|candidate| {
+        leading_h2_fonts
+            .iter()
+            .filter(|font_size| (**font_size - *candidate).abs() <= SPARSE_PEER_HEADING_FONT_TOLERANCE)
+            .count()
+            >= SPARSE_PEER_HEADING_MIN_PAGES
+    })
+}
+
 /// Promote the most likely title heading to H1 when no H1 exists.
 ///
 /// Strategy:
@@ -1058,9 +1305,12 @@ fn paragraph_plain_text(para: &PdfParagraph) -> String {
 /// 2. Otherwise, on the first page only, promote the heading with the largest
 ///    font size IF it's clearly larger than other headings (at least 1.5pt gap).
 fn promote_title_heading(all_pages: &mut [Vec<PdfParagraph>]) {
-    // First check for layout-confirmed Title
     for page in all_pages.iter_mut() {
-        for para in page.iter_mut() {
+        for index in 0..page.len() {
+            if is_changelog_hierarchy_member(page, index) {
+                continue;
+            }
+            let para = &mut page[index];
             if para.heading_level.is_some() && para.layout_class == Some(super::types::LayoutHintClass::Title) {
                 para.heading_level = Some(1);
                 return;
@@ -1068,8 +1318,6 @@ fn promote_title_heading(all_pages: &mut [Vec<PdfParagraph>]) {
         }
     }
 
-    // Only promote on the first page, and only if one heading is clearly
-    // larger than others (to avoid false promotion when all headings are same size)
     if all_pages.is_empty() {
         return;
     }
@@ -1077,7 +1325,7 @@ fn promote_title_heading(all_pages: &mut [Vec<PdfParagraph>]) {
     let headings: Vec<(usize, f32)> = page
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.heading_level.is_some())
+        .filter(|(index, p)| p.heading_level.is_some() && !is_changelog_hierarchy_member(page, *index))
         .map(|(i, p)| (i, p.dominant_font_size))
         .collect();
 
@@ -1085,13 +1333,11 @@ fn promote_title_heading(all_pages: &mut [Vec<PdfParagraph>]) {
         return;
     }
 
-    // If there's exactly one heading on page 0, promote it
     if headings.len() == 1 {
         all_pages[0][headings[0].0].heading_level = Some(1);
         return;
     }
 
-    // If multiple headings, only promote if the largest is clearly bigger (1.5pt gap)
     let max_size = headings.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
     let second_max = headings
         .iter()
@@ -1104,6 +1350,11 @@ fn promote_title_heading(all_pages: &mut [Vec<PdfParagraph>]) {
     {
         all_pages[0][idx].heading_level = Some(1);
     }
+}
+
+fn is_changelog_hierarchy_member(page: &[PdfParagraph], index: usize) -> bool {
+    (index + 1 < page.len() && is_changelog_version_pair(&page[index], &page[index + 1]))
+        || (index > 0 && is_changelog_version_pair(&page[index - 1], &page[index]))
 }
 
 /// Merge consecutive H1 paragraphs at the same font size into a single heading.
@@ -1121,21 +1372,17 @@ fn merge_consecutive_h1s(page: &mut Vec<PdfParagraph>) {
             i += 1;
             continue;
         }
-        // Find the run of consecutive H1s at the same font size that are
-        // grammatical continuations of the previous line.
         let base_fs = page[i].dominant_font_size;
         let mut run_end = i + 1;
         while run_end < page.len()
             && page[run_end].heading_level == Some(1)
+            && page[run_end].layout_region_path == page[i].layout_region_path
             && (page[run_end].dominant_font_size - base_fs).abs() < 0.5
             && looks_like_title_continuation(&page[run_end - 1], &page[run_end])
         {
             run_end += 1;
         }
         if run_end - i > 1 {
-            // Merge lines AND text from paragraphs [i+1..run_end] into page[i].
-            // Both fields must stay in sync: push_paragraph_element uses para.text
-            // when non-empty, so failing to update text silently discards merged content.
             let mut merged_lines = std::mem::take(&mut page[i].lines);
             let mut merged_text_parts: Vec<String> = if page[i].text.is_empty() {
                 Vec::new()
@@ -1169,20 +1416,14 @@ fn merge_consecutive_h1s(page: &mut Vec<PdfParagraph>) {
 /// under-merging of unusually long company names for zero false merges on cover-page
 /// model-code lists — the class of bug this function was introduced to fix.
 fn looks_like_title_continuation(prev: &PdfParagraph, next: &PdfParagraph) -> bool {
-    // Use para.text when populated (production path always sets it); fall back to
-    // joining lines only for the empty-text test-helper path.  This mirrors the
-    // preference in push_paragraph_element and avoids a mismatch where the guard
-    // reads lines while the caller mutates text.
     let next_text = effective_text(next);
     if looks_like_standalone_heading_text(&next_text) {
         return false;
     }
     let prev_text = effective_text(prev);
-    // Reject when the previous line ends with sentence-terminal punctuation.
     if prev_text.trim_end().ends_with(['.', '!', '?', ':']) {
         return false;
     }
-    // Accept the classic split-title shape: both lines short (≤4 words).
     let prev_wc = prev_text.split_whitespace().count();
     let next_wc = next_text.split_whitespace().count();
     prev_wc <= 4 && next_wc <= 4
@@ -1211,17 +1452,14 @@ fn looks_like_standalone_heading_text(text: &str) -> bool {
     let first = words.next().unwrap_or("");
     let second = words.next().unwrap_or("");
 
-    // Starts with a digit: numbered items ("1.", "1.2", "22").
     if first.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return true;
     }
-    // Mixed letters + digits in the first word alone ("A4", "HR28", "MS-410").
     let first_has_alpha = first.chars().any(|c| c.is_ascii_alphabetic());
     let first_has_digit = first.chars().any(|c| c.is_ascii_digit());
     if first_has_alpha && first_has_digit {
         return true;
     }
-    // Letters-only first word + digit-starting second word ("HR 22", "HR 28/24").
     if !second.is_empty()
         && first.chars().all(|c| c.is_ascii_alphabetic())
         && second.chars().next().is_some_and(|c| c.is_ascii_digit())
@@ -1244,18 +1482,15 @@ pub(super) fn mark_cross_page_repeating_text(all_pages: &mut [Vec<PdfParagraph>]
         return;
     }
 
-    let margin_frac = 0.10; // Top/bottom 10% of page = margin zone
+    let margin_frac = 0.10;
 
-    // Count how many pages each margin text appears on (fuzzy: alphanum-only).
     let mut text_page_count: ahash::AHashMap<String, usize> = ahash::AHashMap::new();
     let mut alphanum_to_exact: ahash::AHashMap<String, ahash::AHashSet<String>> = ahash::AHashMap::new();
-    // Track the page index where each alphanum key is first seen so it can be
-    // exempted from furniture-marking (mirrors pdf_oxide's first-occurrence rule).
     let mut first_seen_page: ahash::AHashMap<String, usize> = ahash::AHashMap::new();
 
     for (page_idx, page) in all_pages.iter().enumerate() {
         let page_h = page_heights.get(page_idx).copied().unwrap_or(792.0);
-        let top_margin_y = page_h * (1.0 - margin_frac); // PDF coords: top is high
+        let top_margin_y = page_h * (1.0 - margin_frac);
         let bottom_margin_y = page_h * margin_frac;
 
         let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
@@ -1264,7 +1499,6 @@ pub(super) fn mark_cross_page_repeating_text(all_pages: &mut [Vec<PdfParagraph>]
                 continue;
             }
 
-            // Only consider paragraphs in the margins.
             let in_margin = para
                 .block_bbox
                 .is_some_and(|(_, bottom, _, top)| top > top_margin_y || bottom < bottom_margin_y);
@@ -1291,9 +1525,6 @@ pub(super) fn mark_cross_page_repeating_text(all_pages: &mut [Vec<PdfParagraph>]
             if seen.insert(alphanum_key.clone()) {
                 let count = text_page_count.entry(alphanum_key.clone()).or_insert(0);
                 if *count == 0 {
-                    // Collision risk: two distinct normalized texts with the same alphanum
-                    // key share one first_seen entry. This mirrors the pre-existing collision
-                    // in text_page_count and does not introduce new inaccuracy.
                     first_seen_page.insert(alphanum_key, page_idx);
                 }
                 *count += 1;
@@ -1303,7 +1534,6 @@ pub(super) fn mark_cross_page_repeating_text(all_pages: &mut [Vec<PdfParagraph>]
 
     let threshold = all_pages.len() / 2;
 
-    // Collect text variants that repeat in margins on >50% of pages.
     let mut repeating: ahash::AHashSet<String> = ahash::AHashSet::new();
     for (alphanum_key, count) in &text_page_count {
         if *count > threshold
@@ -1326,8 +1556,6 @@ pub(super) fn mark_cross_page_repeating_text(all_pages: &mut [Vec<PdfParagraph>]
         "cross-page margin repeating text detected"
     );
 
-    // Mark matching paragraphs as furniture — only in margins, but never on the
-    // first page where the text appears (mirrors pdf_oxide's first-occurrence rule).
     for (page_idx, page) in all_pages.iter_mut().enumerate() {
         let page_h = page_heights.get(page_idx).copied().unwrap_or(792.0);
         let top_margin_y = page_h * (1.0 - margin_frac);
@@ -1348,7 +1576,7 @@ pub(super) fn mark_cross_page_repeating_text(all_pages: &mut [Vec<PdfParagraph>]
             if repeating.contains(&normalized) {
                 let alphanum_key: String = normalized.chars().filter(|c| c.is_alphanumeric()).collect();
                 if first_seen_page.get(&alphanum_key).copied() == Some(page_idx) {
-                    continue; // preserve the first occurrence
+                    continue;
                 }
                 tracing::trace!(
                     text = %normalized.chars().take(60).collect::<String>(),
@@ -1369,56 +1597,47 @@ pub(super) fn mark_cross_page_repeating_text(all_pages: &mut [Vec<PdfParagraph>]
 fn is_math_character(c: char) -> bool {
     matches!(
         c,
-        // Math operators and symbols
-        '\u{2200}' // ∀
-        | '\u{2203}' // ∃
-        | '\u{2208}' // ∈
-        | '\u{2209}' // ∉
-        | '\u{2282}' // ⊂
-        | '\u{2283}' // ⊃
-        | '\u{222A}' // ∪
-        | '\u{2229}' // ∩
-        | '\u{2211}' // ∑
-        | '\u{222B}' // ∫
-        | '\u{220F}' // ∏
-        | '\u{2202}' // ∂
-        | '\u{2207}' // ∇
-        | '\u{2264}' // ≤
-        | '\u{2265}' // ≥
-        | '\u{2260}' // ≠
-        | '\u{2248}' // ≈
-        | '\u{00B1}' // ±
-        | '\u{221E}' // ∞
-        | '\u{221A}' // √
-        | '\u{2192}' // →
-        | '\u{2190}' // ←
-        | '\u{2194}' // ↔
-        | '\u{21D2}' // ⇒
-        | '\u{21D0}' // ⇐
-        | '\u{27E8}' // ⟨
-        | '\u{27E9}' // ⟩
-        | '\u{00D7}' // ×
-        | '\u{00F7}' // ÷
-        // ASCII operators with a strong math signal of their own. Deliberately
-        // excludes prose-common characters (parentheses, hyphen, slash, colon,
-        // angle brackets) so ordinary text never reaches the density threshold.
-        | '+'
-        | '='
-        | '^'
-        // Superscript/subscript forms — exponents like a² reach extraction as
-        // these codepoints.
-        | '\u{00B9}' // ¹
-        | '\u{00B2}' // ²
-        | '\u{00B3}' // ³
-        | '\u{2070}'..='\u{209F}' // Superscripts and Subscripts block
+        '\u{2200}'
+            | '\u{2203}'
+            | '\u{2208}'
+            | '\u{2209}'
+            | '\u{2282}'
+            | '\u{2283}'
+            | '\u{222A}'
+            | '\u{2229}'
+            | '\u{2211}'
+            | '\u{222B}'
+            | '\u{220F}'
+            | '\u{2202}'
+            | '\u{2207}'
+            | '\u{2264}'
+            | '\u{2265}'
+            | '\u{2260}'
+            | '\u{2248}'
+            | '\u{00B1}'
+            | '\u{221E}'
+            | '\u{221A}'
+            | '\u{2192}'
+            | '\u{2190}'
+            | '\u{2194}'
+            | '\u{21D2}'
+            | '\u{21D0}'
+            | '\u{27E8}'
+            | '\u{27E9}'
+            | '\u{00D7}'
+            | '\u{00F7}'
+            | '+'
+            | '='
+            | '^'
+            | '\u{00B9}'
+            | '\u{00B2}'
+            | '\u{00B3}'
+            | '\u{2070}'..='\u{209F}'
     ) || is_greek_letter(c)
 }
 
 /// Check if a character is a Greek letter (lowercase α-ω or uppercase Α-Ω).
 fn is_greek_letter(c: char) -> bool {
-    // Greek and Coptic block: U+0370–U+03FF
-    // Lowercase: α (U+03B1) to ω (U+03C9)
-    // Uppercase: Α (U+0391) to Ω (U+03A9)
     matches!(c, '\u{0391}'..='\u{03A9}' | '\u{03B1}'..='\u{03C9}')
 }
 
@@ -1430,16 +1649,11 @@ fn is_greek_letter(c: char) -> bool {
 ///    text that the PDF extractor concatenates with body text) → strip the trailing noise.
 pub(super) fn mark_arxiv_noise(all_pages: &mut [Vec<PdfParagraph>]) {
     let arxiv_re = regex::Regex::new(r"arXiv:\d{4}\.\d{4,5}").expect("valid regex");
-    // Match trailing sidebar noise: title/page-num + arXiv ID (+ category + date) at end.
-    // The sidebar text from LaTeX gets concatenated by the PDF extractor with body text.
-    // We capture from the arXiv ID to end-of-string and also eat back any preceding
-    // short title/page-number fragment (up to ~8 words before arXiv:).
     let trailing_re = regex::Regex::new(
         r"(?:\s+(?:\S+\s+){0,8})?arXiv:\d{4}\.\d{4,5}(?:v\d+)?(?:\s*\[[\w.-]+\])?\s*(?:\d{1,2}\s+\w+\s+\d{4})?\s*$",
     )
     .expect("valid regex");
 
-    // Only check first 2 pages — arXiv watermarks don't appear later.
     for page in all_pages.iter_mut().take(2) {
         for para in page.iter_mut() {
             if para.is_page_furniture {
@@ -1453,7 +1667,6 @@ pub(super) fn mark_arxiv_noise(all_pages: &mut [Vec<PdfParagraph>]) {
                 continue;
             }
 
-            // Short paragraph dominated by the arXiv identifier → mark as furniture.
             if word_count <= 25 {
                 tracing::trace!(
                     text = %trimmed.chars().take(80).collect::<String>(),
@@ -1462,7 +1675,6 @@ pub(super) fn mark_arxiv_noise(all_pages: &mut [Vec<PdfParagraph>]) {
                 para.is_page_furniture = true;
                 para.heading_level = None;
             } else if let Some(m) = trailing_re.find(trimmed) {
-                // arXiv id is at the end of a longer paragraph — strip it from the last segment.
                 let noise = &trimmed[m.start()..];
                 tracing::trace!(
                     stripped = %noise.chars().take(80).collect::<String>(),
@@ -1476,19 +1688,16 @@ pub(super) fn mark_arxiv_noise(all_pages: &mut [Vec<PdfParagraph>]) {
 
 /// Strip trailing noise text from the last segment(s) of a paragraph.
 fn strip_trailing_text_from_paragraph(para: &mut PdfParagraph, noise: &str) {
-    // Walk lines in reverse to find the segment containing the noise.
     for line in para.lines.iter_mut().rev() {
         for seg in line.segments.iter_mut().rev() {
             if let Some(pos) = seg.text.find(noise) {
                 seg.text = seg.text[..pos].trim_end().to_string();
                 return;
             }
-            // If the entire segment is part of the noise, clear it.
             let seg_trimmed = seg.text.trim();
             if !seg_trimmed.is_empty() && noise.contains(seg_trimmed) {
                 seg.text.clear();
             } else {
-                // Reached body text — stop.
                 return;
             }
         }
@@ -1509,14 +1718,15 @@ pub(super) fn mark_cross_page_repeating_short_text(all_pages: &mut [Vec<PdfParag
     let max_words = 20;
     let threshold = (all_pages.len() as f64 * 0.7).ceil() as usize;
 
-    // Count how many pages each short text appears on.
     let mut text_page_count: ahash::AHashMap<String, usize> = ahash::AHashMap::new();
-    // Track the page where each key first appears to exempt it from furniture-marking.
     let mut first_seen_page: ahash::AHashMap<String, usize> = ahash::AHashMap::new();
     for (page_idx, page) in all_pages.iter().enumerate() {
         let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
         for para in page {
-            if para.is_page_furniture {
+            // Positioned paragraphs are handled by the margin-aware first tier.
+            // Restrict this broad fallback to unpositioned structure-tree text so
+            // repeated semantic form fields in the page body are not discarded.
+            if para.is_page_furniture || para.block_bbox.is_some() {
                 continue;
             }
             let text = paragraph_plain_text(para);
@@ -1535,9 +1745,6 @@ pub(super) fn mark_cross_page_repeating_short_text(all_pages: &mut [Vec<PdfParag
             if seen.insert(alphanum_key.clone()) {
                 let count = text_page_count.entry(alphanum_key.clone()).or_insert(0);
                 if *count == 0 {
-                    // Collision risk: two distinct normalized texts with the same alphanum
-                    // key share one first_seen entry. This mirrors the pre-existing collision
-                    // in text_page_count and does not introduce new inaccuracy.
                     first_seen_page.insert(alphanum_key, page_idx);
                 }
                 *count += 1;
@@ -1545,7 +1752,6 @@ pub(super) fn mark_cross_page_repeating_short_text(all_pages: &mut [Vec<PdfParag
         }
     }
 
-    // Collect keys that repeat on ≥70% of pages.
     let repeating: ahash::AHashSet<String> = text_page_count
         .into_iter()
         .filter(|(_, count)| *count >= threshold)
@@ -1563,11 +1769,9 @@ pub(super) fn mark_cross_page_repeating_short_text(all_pages: &mut [Vec<PdfParag
         "cross-page short-text repeating detection (tier 2)"
     );
 
-    // Mark matching paragraphs as furniture, but never on the first page where
-    // the text appears (mirrors pdf_oxide's first-occurrence rule).
     for (page_idx, page) in all_pages.iter_mut().enumerate() {
         for para in page.iter_mut() {
-            if para.is_page_furniture {
+            if para.is_page_furniture || para.block_bbox.is_some() {
                 continue;
             }
             let text = paragraph_plain_text(para);
@@ -1579,7 +1783,7 @@ pub(super) fn mark_cross_page_repeating_short_text(all_pages: &mut [Vec<PdfParag
             let alphanum_key: String = normalized.chars().filter(|c| c.is_alphanumeric()).collect();
             if repeating.contains(&alphanum_key) {
                 if first_seen_page.get(&alphanum_key).copied() == Some(page_idx) {
-                    continue; // preserve the first occurrence
+                    continue;
                 }
                 tracing::trace!(
                     text = %normalized.chars().take(60).collect::<String>(),
@@ -1610,6 +1814,7 @@ mod tests {
                 is_italic: false,
                 is_monospace: false,
                 baseline_y: 700.0,
+                rotation_degrees: 0.0,
                 assigned_role: None,
             })
             .collect();
@@ -1634,10 +1839,34 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
         }
+    }
+
+    #[test]
+    fn heading_runs_stop_at_layout_region_boundaries() {
+        use crate::pdf::structure::types::{LayoutHintClass, LayoutRegionPath, LayoutRegionTag};
+
+        let mut page = (0..4)
+            .map(|index| {
+                let mut paragraph = make_paragraph(18.0, 1);
+                paragraph.heading_level = Some(2);
+                paragraph.layout_region_path = Some(LayoutRegionPath {
+                    root: LayoutRegionTag {
+                        id: usize::from(index >= 2),
+                        class_name: Some(LayoutHintClass::Text),
+                    },
+                    child: None,
+                });
+                paragraph
+            })
+            .collect::<Vec<_>>();
+
+        demote_heading_runs(std::slice::from_mut(&mut page));
+        assert!(page.iter().all(|paragraph| paragraph.heading_level == Some(2)));
     }
 
     #[test]
@@ -1659,7 +1888,7 @@ mod tests {
     #[test]
     fn test_classify_too_many_segments_for_heading() {
         let heading_map = vec![(18.0, Some(1)), (12.0, None)];
-        let mut paragraphs = vec![make_paragraph(18.0, 21)]; // > MAX_HEADING_WORD_COUNT
+        let mut paragraphs = vec![make_paragraph(18.0, 21)];
         classify_paragraphs(&mut paragraphs, &heading_map);
         assert_eq!(paragraphs[0].heading_level, None);
     }
@@ -1681,7 +1910,6 @@ mod tests {
     fn test_find_heading_level_outlier_rejected() {
         let heading_map = vec![(12.0, None), (16.0, Some(2)), (20.0, Some(1))];
         let gap_info = precompute_gap_info(&heading_map);
-        // Font size 50.0 is way too far from any centroid
         assert_eq!(find_heading_level(50.0, &heading_map, &gap_info), None);
     }
 
@@ -1694,20 +1922,19 @@ mod tests {
 
     #[test]
     fn test_classify_bold_short_paragraph_promoted_to_heading() {
-        let heading_map = vec![(12.0, None)]; // no heading clusters
+        let heading_map = vec![(12.0, None)];
         let mut para = make_paragraph(12.0, 3);
         para.is_bold = true;
         para.lines[0].is_bold = true;
         let mut paragraphs = vec![para];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // Bold at body font size → H3 (sub-section heading)
         assert_eq!(paragraphs[0].heading_level, Some(3));
     }
 
     #[test]
     fn test_classify_bold_long_paragraph_not_promoted() {
         let heading_map = vec![(12.0, None)];
-        let mut para = make_paragraph(12.0, 20); // too many words
+        let mut para = make_paragraph(12.0, 20);
         para.is_bold = true;
         let mut paragraphs = vec![para];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -1727,7 +1954,6 @@ mod tests {
 
     #[test]
     fn test_classify_few_segments_many_words_not_heading() {
-        // 3 segments but each contains many words — total word count exceeds threshold
         let segments: Vec<SegmentData> = (0..3)
             .map(|i| SegmentData {
                 text: "one two three four five six seven".to_string(),
@@ -1740,6 +1966,7 @@ mod tests {
                 is_italic: false,
                 is_monospace: false,
                 baseline_y: 700.0,
+                rotation_degrees: 0.0,
                 assigned_role: None,
             })
             .collect();
@@ -1764,11 +1991,11 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
         }];
-        // 3 segments × 7 words = 21 words > MAX_HEADING_WORD_COUNT
         let heading_map = vec![(18.0, Some(1)), (12.0, None)];
         classify_paragraphs(&mut paragraphs, &heading_map);
         assert_eq!(paragraphs[0].heading_level, None);
@@ -1792,7 +2019,7 @@ mod tests {
         let mut page = vec![
             make_h1(24.0, "KAISUN HOLDINGS"),
             make_h1(24.0, "LIMITED"),
-            make_paragraph(12.0, 3), // body
+            make_paragraph(12.0, 3),
         ];
         merge_consecutive_h1s(&mut page);
         assert_eq!(page.len(), 2);
@@ -1802,9 +2029,6 @@ mod tests {
 
     #[test]
     fn test_merge_h1s_text_field_synced() {
-        // When paragraphs carry a non-empty text field (the production path),
-        // merging must keep text in sync with lines so that push_paragraph_element
-        // (which prefers para.text over para.lines) does not silently drop content.
         let mut page = vec![
             make_h1_with_text(24.0, "KAISUN HOLDINGS"),
             make_h1_with_text(24.0, "LIMITED"),
@@ -1825,8 +2049,6 @@ mod tests {
 
     #[test]
     fn test_merge_h1s_model_codes_not_merged() {
-        // Cover-page product codes like "HR 22", "HR 28" must NOT be merged.
-        // Each is a distinct product variant, not a split-title continuation.
         let mut page = vec![
             make_h1_with_text(24.0, "HR 22"),
             make_h1_with_text(24.0, "HR 28"),
@@ -1845,14 +2067,11 @@ mod tests {
     fn test_merge_h1s_different_font_no_merge() {
         let mut page = vec![make_h1(24.0, "Title"), make_h1(18.0, "Subtitle")];
         merge_consecutive_h1s(&mut page);
-        assert_eq!(page.len(), 2); // Not merged — different font sizes.
+        assert_eq!(page.len(), 2);
     }
 
     #[test]
     fn test_merge_h1s_long_first_line_not_merged() {
-        // A first heading with >4 words exceeds the split-title threshold.
-        // The function must not merge it with the following heading and must
-        // not panic or produce unexpected output.
         let mut page = vec![
             make_h1_with_text(24.0, "The Quick Brown Fox Jumped"),
             make_h1_with_text(24.0, "Over"),
@@ -1869,8 +2088,6 @@ mod tests {
 
     #[test]
     fn test_merge_h1s_terminal_punctuation_not_merged() {
-        // A heading ending with sentence-terminal punctuation is a complete
-        // statement, not a split title. It must not absorb the following heading.
         for suffix in [".", "!", "?", ":"] {
             let first = format!("SECTION ONE{suffix}");
             let mut page = vec![make_h1_with_text(24.0, &first), make_h1_with_text(24.0, "INTRODUCTION")];
@@ -1888,7 +2105,6 @@ mod tests {
     fn make_margin_body(text: &str) -> PdfParagraph {
         let mut p = make_paragraph(12.0, 1);
         p.lines[0].segments[0].text = text.to_string();
-        // Place in top margin: y > 792 * 0.90 = 712.8
         p.block_bbox = Some((50.0, 740.0, 300.0, 760.0));
         p
     }
@@ -1911,10 +2127,6 @@ mod tests {
             vec![make_margin_body("Page 1 of 10"), make_body_center("Unique content D")],
         ];
         mark_cross_page_repeating_text(&mut pages, &page_heights);
-        // "Page 1 of 10" appears in the margin on all 4 pages (>50%) → furniture on pages 1-3.
-        // Page 0 is the first occurrence and must be preserved (first-occurrence rule, issue #917).
-        // Previously this assertion was `true` — that was the bug: the first appearance was
-        // incorrectly stripped, dropping real content from the output.
         assert!(!pages[0][0].is_page_furniture, "first occurrence must not be furniture");
         assert!(pages[1][0].is_page_furniture);
         assert!(pages[2][0].is_page_furniture);
@@ -1929,16 +2141,12 @@ mod tests {
         for _ in 0..6 {
             let mut h = make_h1(24.0, "Chapter");
             h.heading_level = Some(1);
-            // Place heading in top margin
             h.block_bbox = Some((50.0, 740.0, 300.0, 770.0));
             let mut body = make_paragraph(12.0, 3);
             body.block_bbox = Some((50.0, 400.0, 300.0, 420.0));
             pages.push(vec![h, body]);
         }
         mark_cross_page_repeating_text(&mut pages, &page_heights);
-        // Headings repeating in margins on >50% of pages → furniture on pages 1-5.
-        // Page 0 is the first occurrence and must be preserved (issue #917).
-        // Previously this assertion was `true` — that was the bug.
         assert!(!pages[0][0].is_page_furniture, "first occurrence must not be furniture");
         assert!(pages[1][0].is_page_furniture);
         assert!(pages[1][0].heading_level.is_none());
@@ -1975,10 +2183,6 @@ mod tests {
             ],
         ];
         mark_cross_page_repeating_text(&mut pages, &page_heights);
-        // Both variants share the same alphanum key; first_seen is page 0.
-        // Page 0 is exempt (first-occurrence rule, issue #917); pages 1-5 are furniture.
-        // Previously both `pages[0][0]` and `pages[3][0]` were asserted `true` — that was
-        // the bug: the first copyright occurrence was stripped from the output.
         assert!(
             !pages[0][0].is_page_furniture,
             "first occurrence of copyright notice must be preserved"
@@ -1997,7 +2201,6 @@ mod tests {
 
     #[test]
     fn test_layout_text_bold_heading_font_promoted() {
-        // Sub-heading: layout model says Text, but bold + heading font size → promote
         let heading_map = vec![(16.0, Some(2)), (12.0, None)];
         let mut para = make_paragraph(16.0, 3);
         para.is_bold = true;
@@ -2009,7 +2212,6 @@ mod tests {
 
     #[test]
     fn test_layout_text_non_bold_heading_font_not_promoted() {
-        // Layout says Text, heading font size but NOT bold → stay as body
         let heading_map = vec![(16.0, Some(2)), (12.0, None)];
         let mut para = make_paragraph(16.0, 3);
         para.layout_class = Some(super::super::types::LayoutHintClass::Text);
@@ -2020,22 +2222,18 @@ mod tests {
 
     #[test]
     fn test_layout_text_bold_body_font_not_promoted_pass1() {
-        // Layout says Text, bold but body font size → Pass 1 skips (no heading cluster match)
         let heading_map = vec![(16.0, Some(2)), (12.0, None)];
         let mut para = make_paragraph(12.0, 3);
         para.is_bold = true;
         para.layout_class = Some(super::super::types::LayoutHintClass::Text);
         let mut paragraphs = vec![para];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // Pass 1 won't promote (body font), Pass 2 won't either (body font <= body + 0.5)
         assert_eq!(paragraphs[0].heading_level, None);
     }
 
     #[test]
     fn test_layout_text_bold_larger_font_promoted_pass2() {
-        // Layout says Text, bold + font distinctly larger than body → Pass 2 promotes
-        // 14pt / 12pt body = 1.167 ratio (< 1.2) → H3 (sub-section bold heading)
-        let heading_map = vec![(12.0, None)]; // no heading clusters
+        let heading_map = vec![(12.0, None)];
         let mut para = make_paragraph(14.0, 3);
         para.is_bold = true;
         para.layout_class = Some(super::super::types::LayoutHintClass::Text);
@@ -2046,9 +2244,7 @@ mod tests {
 
     #[test]
     fn test_layout_text_bold_much_larger_font_promoted_h2() {
-        // Layout says Text, bold + font much larger than body → H2
-        // 15pt / 12pt body = 1.25 ratio (> 1.2) → H2
-        let heading_map = vec![(12.0, None)]; // no heading clusters
+        let heading_map = vec![(12.0, None)];
         let mut para = make_paragraph(15.0, 3);
         para.is_bold = true;
         para.layout_class = Some(super::super::types::LayoutHintClass::Text);
@@ -2059,19 +2255,16 @@ mod tests {
 
     #[test]
     fn test_infer_bold_heading_level_large_ratio_h2() {
-        // 15pt / 12pt = 1.25 → H2
         assert_eq!(infer_bold_heading_level(15.0, 12.0, "Methods"), 2);
     }
 
     #[test]
     fn test_infer_bold_heading_level_body_size_h3() {
-        // 12pt / 12pt = 1.0 → H3
         assert_eq!(infer_bold_heading_level(12.0, 12.0, "Methods"), 3);
     }
 
     #[test]
     fn test_infer_bold_heading_level_numbered_section() {
-        // Bold numbered section uses numbering depth
         assert_eq!(infer_bold_heading_level(12.0, 12.0, "3 Processing pipeline"), 2);
         assert_eq!(infer_bold_heading_level(12.0, 12.0, "3.2 AI models"), 3);
         assert_eq!(infer_bold_heading_level(12.0, 12.0, "3.2.1 Details"), 4);
@@ -2101,6 +2294,52 @@ mod tests {
         assert_eq!(infer_section_level("Layout Analysis Model"), 2);
     }
 
+    #[test]
+    fn structure_sal_annotations_are_not_headings() {
+        for annotation in [
+            "__in",
+            "__in_opt",
+            "__out",
+            "__out_opt",
+            "__inout",
+            "__inout_bcount_full(n)",
+            "__deref__out_bcount(n)",
+        ] {
+            let mut para = make_text_paragraph(12.0, annotation, false);
+            para.heading_level = Some(3);
+            demote_structure_annotation_headings(std::slice::from_mut(&mut para));
+            assert_eq!(para.heading_level, None, "annotation {annotation} remained a heading");
+        }
+    }
+
+    #[test]
+    fn structure_identifier_headings_are_preserved() {
+        for identifier in ["__init__", "__input", "__in_section", "API_V2"] {
+            let mut para = make_text_paragraph(18.0, identifier, true);
+            para.heading_level = Some(2);
+            demote_structure_annotation_headings(std::slice::from_mut(&mut para));
+            assert_eq!(para.heading_level, Some(2), "identifier {identifier} was demoted");
+        }
+    }
+
+    #[test]
+    fn structure_sal_heading_with_strong_layout_evidence_is_preserved() {
+        let mut para = make_text_paragraph(18.0, "__in", true);
+        para.heading_level = Some(2);
+        para.layout_class = Some(LayoutHintClass::SectionHeader);
+        demote_structure_annotation_headings(std::slice::from_mut(&mut para));
+        assert_eq!(para.heading_level, Some(2));
+    }
+
+    #[test]
+    fn structure_sal_code_block_is_preserved() {
+        let mut para = make_text_paragraph(12.0, "__out", false);
+        para.heading_level = Some(3);
+        para.is_code_block = true;
+        demote_structure_annotation_headings(std::slice::from_mut(&mut para));
+        assert_eq!(para.heading_level, Some(3));
+    }
+
     /// Helper to create a paragraph with specific text.
     fn make_text_paragraph(font_size: f32, text: &str, is_bold: bool) -> PdfParagraph {
         let segments = vec![SegmentData {
@@ -2114,6 +2353,7 @@ mod tests {
             is_italic: false,
             is_monospace: false,
             baseline_y: 700.0,
+            rotation_degrees: 0.0,
             assigned_role: None,
         }];
         let lines = vec![super::super::types::PdfLine {
@@ -2136,17 +2376,58 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
         }
     }
 
+    fn paragraph_at_indent(text: &str, left: f32) -> PdfParagraph {
+        let mut paragraph = make_text_paragraph(12.0, text, false);
+        paragraph.block_bbox = Some((left, 0.0, left + 200.0, 12.0));
+        paragraph
+    }
+
+    #[test]
+    fn indentation_does_not_promote_author_byline() {
+        let mut paragraphs = vec![
+            paragraph_at_indent("Header", 0.0),
+            paragraph_at_indent("O. Sanni, A.P.I. Popoola / Data in Brief", 20.0),
+            paragraph_at_indent("Footer", 0.0),
+        ];
+
+        detect_indentation_based_lists(&mut paragraphs);
+
+        assert!(!paragraphs[1].is_list_item);
+    }
+
+    #[test]
+    fn indentation_does_not_promote_numeric_continuations() {
+        let mut paragraphs = vec![
+            paragraph_at_indent("Header", 0.0),
+            paragraph_at_indent("457", 20.0),
+            paragraph_at_indent("8 show the remaining figures", 20.0),
+            paragraph_at_indent("Footer", 0.0),
+        ];
+
+        detect_indentation_based_lists(&mut paragraphs);
+
+        assert!(!paragraphs[1].is_list_item);
+        assert!(!paragraphs[2].is_list_item);
+    }
+
+    #[test]
+    fn numeric_prose_continuation_gate_is_narrow() {
+        assert!(is_numeric_prose_continuation("457"));
+        assert!(is_numeric_prose_continuation("8 show the remaining figures"));
+        assert!(!is_numeric_prose_continuation("8 Results"));
+        assert!(!is_numeric_prose_continuation("first item"));
+    }
+
     #[test]
     fn test_section_numbering_promotes_non_bold_heading() {
-        // Non-bold paragraph starting with section number at body font size
-        // gets promoted via Pass 2.5 (no layout class = no blocking)
-        let heading_map = vec![(12.0, None)]; // only body cluster
+        let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "3 Processing pipeline", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
         assert_eq!(paragraphs[0].heading_level, Some(2));
@@ -2154,7 +2435,6 @@ mod tests {
 
     #[test]
     fn test_section_numbering_blocked_by_layout_text() {
-        // Layout model says Text + non-bold + body font size → Pass 2.5 blocks promotion
         let heading_map = vec![(12.0, None)];
         let mut para = make_text_paragraph(12.0, "3 Processing pipeline", false);
         para.layout_class = Some(super::super::types::LayoutHintClass::Text);
@@ -2165,17 +2445,14 @@ mod tests {
 
     #[test]
     fn test_section_numbering_promotes_bold_at_body_size() {
-        // Bold paragraph with section number at body font size
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "3 Processing pipeline", true)];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // Bold + numbered → promoted via Pass 2 with infer_bold_heading_level
         assert_eq!(paragraphs[0].heading_level, Some(2));
     }
 
     #[test]
     fn test_section_numbering_subsection_bold() {
-        // Bold paragraph with sub-section number
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "3.2 AI models", true)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2184,7 +2461,6 @@ mod tests {
 
     #[test]
     fn test_bold_heading_with_heading_cluster_keeps_cluster_level() {
-        // When font-size clustering assigns H1, bold text should keep it
         let heading_map = vec![(18.0, Some(1)), (12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(18.0, "Title", true)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2193,7 +2469,6 @@ mod tests {
 
     #[test]
     fn test_formula_detection_math_symbols() {
-        // Paragraph with several math characters should be detected as formula
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "∑ x∈S f(x) ≤ ∞", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2203,7 +2478,6 @@ mod tests {
 
     #[test]
     fn test_formula_detection_greek_letters() {
-        // Paragraph with Greek letters at high density
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "α + β = γ", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2212,7 +2486,6 @@ mod tests {
 
     #[test]
     fn test_formula_detection_not_regular_text() {
-        // Regular paragraph text should NOT be marked as formula
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(
             12.0,
@@ -2225,18 +2498,14 @@ mod tests {
 
     #[test]
     fn test_formula_detection_skips_headings() {
-        // A heading with math characters should stay a heading, not become formula
         let heading_map = vec![(18.0, Some(1)), (12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(18.0, "∑ Results", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // Should be heading, not formula (heading takes precedence)
         assert_eq!(paragraphs[0].heading_level, Some(1));
     }
 
     #[test]
     fn test_formula_detection_ascii_operators() {
-        // Simple equations built from ASCII operators only (code_and_formula
-        // fixture: "a² + 8 = 12") must be detected without Unicode symbols.
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "a2 + 8 = 12", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2256,7 +2525,6 @@ mod tests {
 
     #[test]
     fn test_formula_detection_prose_with_equals_not_flagged() {
-        // A normal sentence that merely mentions an equals sign must not flip.
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(
             12.0,
@@ -2269,9 +2537,7 @@ mod tests {
 
     #[test]
     fn test_formula_detection_high_density() {
-        // Even with fewer than 3 math chars, 15%+ density triggers formula
         let heading_map = vec![(12.0, None)];
-        // "x→y" has 3 chars total, 1 math char → 33% > 15%
         let mut paragraphs = vec![make_text_paragraph(12.0, "x→y", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
         assert!(
@@ -2290,7 +2556,11 @@ mod tests {
         assert!(is_math_character('∞'));
         assert!(!is_math_character('a'));
         assert!(!is_math_character('1'));
-        assert!(!is_math_character('+'));
+        // '+', '=' and '^' are math characters: `a2 + 8 = 12` must classify as a
+        // formula (test_formula_detection_ascii_operators). ~keep
+        assert!(is_math_character('+'));
+        assert!(is_math_character('='));
+        assert!(is_math_character('^'));
     }
 
     #[test]
@@ -2303,42 +2573,32 @@ mod tests {
         assert!(!is_greek_letter('Z'));
     }
 
-    // ── Pass 4: rescue pass tests ──
-
     #[test]
     fn test_rescue_pass_promotes_large_font_short_paragraph() {
-        // Non-bold, non-heading-cluster paragraph at 15pt (body=12pt) with 3 words
-        // should be rescued as a heading via Pass 4.
-        let heading_map = vec![(12.0, None)]; // only body cluster
+        let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(15.0, "Results and Discussion", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // 15/12 = 1.25, > 1.0 but <= 1.3 -> H3
         assert_eq!(paragraphs[0].heading_level, Some(3));
     }
 
     #[test]
     fn test_rescue_pass_h1_for_very_large_font() {
-        // Font size > 1.6x body -> H1
         let heading_map = vec![(10.0, None)];
         let mut paragraphs = vec![make_text_paragraph(17.0, "Document Title", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // 17/10 = 1.7 > 1.6 -> H1
         assert_eq!(paragraphs[0].heading_level, Some(1));
     }
 
     #[test]
     fn test_rescue_pass_h3_for_slightly_larger_font() {
-        // Font slightly larger than body -> H3
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(13.0, "Methods", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // 13/12 = 1.083, > 1.0 but <= 1.2 -> H3
         assert_eq!(paragraphs[0].heading_level, Some(3));
     }
 
     #[test]
     fn test_rescue_pass_skips_long_paragraphs() {
-        // Paragraph with >8 words should NOT be rescued
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(
             15.0,
@@ -2351,7 +2611,6 @@ mod tests {
 
     #[test]
     fn test_rescue_pass_skips_period_ending() {
-        // Paragraph ending with period should NOT be rescued
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(15.0, "Some text here.", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2370,18 +2629,14 @@ mod tests {
 
     #[test]
     fn test_rescue_pass_skips_body_font_size() {
-        // Font at body size should NOT be rescued (needs > body + 0.5)
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "Methods", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
         assert_eq!(paragraphs[0].heading_level, None);
     }
 
-    // ── Pass 4 fragment guards ──
-
     #[test]
     fn test_rescue_pass_skips_lowercase_start() {
-        // Fragment starting with lowercase letter should NOT be promoted
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(15.0, "is necessary to address", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2393,7 +2648,6 @@ mod tests {
 
     #[test]
     fn test_rescue_pass_skips_continuation_word_the() {
-        // Fragment starting with "The" (continuation word, even uppercase) should NOT be promoted
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(15.0, "The unsafe condition", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2416,11 +2670,9 @@ mod tests {
 
     #[test]
     fn test_rescue_pass_allows_proper_heading() {
-        // Proper heading starting with uppercase non-continuation word
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(15.0, "Results and Discussion", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // 15/12 = 1.25, > 1.0 but <= 1.3 -> H3
         assert_eq!(
             paragraphs[0].heading_level,
             Some(3),
@@ -2430,8 +2682,6 @@ mod tests {
 
     #[test]
     fn test_demote_continuation_heading_after_unterminated_paragraph() {
-        // A heading following a paragraph without sentence-ending punctuation
-        // should be demoted (it's likely a column-break fragment).
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![
             make_text_paragraph(12.0, "the regulation requires that all operators", false),
@@ -2446,14 +2696,12 @@ mod tests {
 
     #[test]
     fn test_keep_heading_after_terminated_paragraph() {
-        // A heading following a properly terminated paragraph should stay.
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![
             make_text_paragraph(12.0, "The previous section covered the basics.", false),
             make_text_paragraph(15.0, "Safety Procedures", false),
         ];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // 15/12 = 1.25, > 1.0 but <= 1.3 -> H3
         assert_eq!(
             paragraphs[1].heading_level,
             Some(3),
@@ -2463,15 +2711,12 @@ mod tests {
 
     #[test]
     fn test_keep_heading_after_another_heading() {
-        // Heading after another heading should not be demoted by continuation check.
-        // Use a single body cluster so the second paragraph gets promoted via rescue pass.
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![
             make_text_paragraph(15.0, "Chapter One", false),
             make_text_paragraph(14.0, "Introduction", false),
         ];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // Both should be promoted by rescue pass: 15/12=1.25→H2, 14/12=1.17→H3
         assert!(
             paragraphs[0].heading_level.is_some(),
             "first heading should be promoted"
@@ -2484,35 +2729,267 @@ mod tests {
 
     #[test]
     fn test_starts_with_lowercase_or_continuation() {
-        // Lowercase start
         assert!(starts_with_lowercase_or_continuation("is necessary"));
         assert!(starts_with_lowercase_or_continuation("the quick fox"));
-        // Continuation words (capitalized)
         assert!(starts_with_lowercase_or_continuation("The quick fox"));
         assert!(starts_with_lowercase_or_continuation("And furthermore"));
         assert!(starts_with_lowercase_or_continuation("But however"));
         assert!(starts_with_lowercase_or_continuation("Which means"));
-        // Not continuation
         assert!(!starts_with_lowercase_or_continuation("Results"));
         assert!(!starts_with_lowercase_or_continuation("Safety Procedures"));
         assert!(!starts_with_lowercase_or_continuation("3 Methods"));
     }
 
-    // ── refine_heading_hierarchy: enhanced title promotion tests ──
-
+    /// A 2-paragraph document is too sparse for the "no heading anywhere"
+    /// fallback to trust a font-size difference: a larger opening line in a
+    /// tiny document is as likely to be display prose (see `hello_structure.pdf`,
+    /// `issue-987-test.pdf`) as an actual title. This replaces the previous
+    /// `test_refine_promotes_first_largest_font_paragraph_to_h1`, which asserted
+    /// promotion for this same 2-paragraph shape; that assertion encoded the
+    /// over-promotion bug this sparsity gate fixes.
     #[test]
-    fn test_refine_promotes_first_largest_font_paragraph_to_h1() {
-        // First paragraph on page 0 has the largest font, short text, no heading level
+    fn test_refine_does_not_promote_sparse_two_paragraph_doc() {
         let mut pages = vec![vec![
             make_text_paragraph(18.0, "Annual Report", false),
             make_text_paragraph(12.0, "Some body text here for the document", false),
         ]];
-        // No headings at all initially -- refine should promote the first paragraph
         refine_heading_hierarchy(&mut pages);
+        assert_eq!(
+            pages[0][0].heading_level, None,
+            "a 2-paragraph document must not force-promote its larger first line to h1"
+        );
+    }
+
+    /// At and above the sparsity floor, a first paragraph that is both the
+    /// largest font on the page and meaningfully larger than the rest of the
+    /// document's text is still promoted to h1.
+    #[test]
+    fn test_refine_promotes_first_largest_font_paragraph_to_h1_at_floor() {
+        let mut pages = vec![vec![
+            make_text_paragraph(18.0, "Annual Report", false),
+            make_text_paragraph(12.0, "Some body text here for the document", false),
+            make_text_paragraph(12.0, "More body text in a second paragraph", false),
+            make_text_paragraph(12.0, "Yet another paragraph of body text", false),
+            make_text_paragraph(12.0, "A final paragraph rounding out the document", false),
+        ]];
+        refine_heading_hierarchy(&mut pages);
+        assert_eq!(
+            pages[0][0].heading_level,
+            Some(1),
+            "at the sparsity floor a clearly larger title line must still be promoted"
+        );
+    }
+
+    #[test]
+    fn refine_heading_hierarchy_should_promote_single_leading_h2_to_h1() {
+        let mut heading = make_text_paragraph(24.0, "Hello World", false);
+        heading.heading_level = Some(2);
+        let body = make_text_paragraph(12.0, "I'll be back shortly!", false);
+        let mut pages = vec![vec![heading, body]];
+
+        refine_heading_hierarchy(&mut pages);
+
         assert_eq!(pages[0][0].heading_level, Some(1));
     }
 
-    // ── is_all_caps_text tests ──
+    #[test]
+    fn refine_heading_hierarchy_should_preserve_repeated_cross_page_h2_tier() {
+        let mut first_heading = make_text_paragraph(24.0, "Hello World", false);
+        first_heading.heading_level = Some(2);
+        let mut second_heading = make_text_paragraph(24.0, "Goodbye Cruel World...", false);
+        second_heading.heading_level = Some(2);
+        let mut pages = vec![
+            vec![first_heading, make_text_paragraph(12.0, "First page body text.", false)],
+            vec![
+                second_heading,
+                make_text_paragraph(12.0, "Second page body text.", false),
+            ],
+        ];
+
+        refine_heading_hierarchy(&mut pages);
+
+        assert_eq!(
+            [pages[0][0].heading_level, pages[1][0].heading_level],
+            [Some(2), Some(2)]
+        );
+    }
+
+    #[test]
+    fn test_refine_preserves_changelog_h2_and_promotes_adjacent_version_to_h3() {
+        let mut title = make_text_paragraph(24.0, "Project Guide", false);
+        title.heading_level = Some(1);
+        let mut changelog = make_text_paragraph(16.0, "Recent Change Log", false);
+        changelog.heading_level = Some(2);
+        changelog.block_bbox = Some((50.0, 700.0, 210.0, 718.0));
+        let mut version = make_text_paragraph(12.0, "v0.9.1", true);
+        version.block_bbox = Some((50.5, 680.0, 105.0, 692.0));
+        let body = make_text_paragraph(12.0, "Maintenance details follow.", true);
+        let mut pages = vec![vec![title, changelog, version, body]];
+
+        refine_heading_hierarchy(&mut pages);
+
+        assert_eq!(pages[0][1].heading_level, Some(2));
+        assert_eq!(pages[0][2].heading_level, Some(3));
+        assert_eq!(pages[0][3].heading_level, None);
+    }
+
+    #[test]
+    fn test_refine_splits_combined_changelog_and_version_heading() {
+        let mut title = make_text_paragraph(24.0, "Project Guide", false);
+        title.heading_level = Some(1);
+        let mut combined = make_text_paragraph(16.0, "Recent Change Log v0.9.1", true);
+        combined.text = "Recent Change Log v0.9.1".to_string();
+        combined.block_bbox = Some((50.0, 664.0, 210.0, 696.0));
+        let mut pages = vec![vec![title, combined]];
+
+        refine_heading_hierarchy(&mut pages);
+
+        assert_eq!(pages[0].len(), 3);
+        assert_eq!(pages[0][1].text, "Recent Change Log");
+        assert_eq!(pages[0][1].heading_level, Some(2));
+        assert_eq!(pages[0][2].text, "v0.9.1");
+        assert_eq!(pages[0][2].heading_level, Some(3));
+        assert!(!pages[0][2].is_list_item);
+        assert!(!pages[0][2].is_code_block);
+        assert!(!pages[0][2].is_formula);
+        assert!(!pages[0][2].is_page_furniture);
+        assert_eq!(pages[0][1].block_bbox, Some((50.0, 680.0, 210.0, 696.0)));
+        assert_eq!(pages[0][2].block_bbox, Some((50.0, 664.0, 210.0, 680.0)));
+    }
+
+    #[test]
+    fn test_refine_splits_combined_changelog_without_preexisting_h1() {
+        let mut combined = make_text_paragraph(16.0, "Recent Change Log v0.9.1", true);
+        combined.text = "Recent Change Log v0.9.1".to_string();
+        combined.block_bbox = Some((50.0, 664.0, 210.0, 696.0));
+        let mut pages = vec![vec![
+            combined,
+            make_text_paragraph(12.0, "First body paragraph.", false),
+            make_text_paragraph(12.0, "Second body paragraph.", false),
+            make_text_paragraph(12.0, "Third body paragraph.", false),
+            make_text_paragraph(12.0, "Fourth body paragraph.", false),
+        ]];
+
+        refine_heading_hierarchy(&mut pages);
+
+        assert_eq!(pages[0][0].heading_level, Some(2));
+        assert_eq!(pages[0][1].heading_level, Some(3));
+        assert!(
+            pages[0].iter().all(|paragraph| paragraph.heading_level != Some(1)),
+            "a synthetic changelog hierarchy must not create an unrelated h1"
+        );
+    }
+
+    #[test]
+    fn test_combined_changelog_split_rejects_ordinary_one_line_heading() {
+        let mut combined = make_text_paragraph(16.0, "Recent Change Log v0.9.1", true);
+        combined.text = "Recent Change Log v0.9.1".to_string();
+        combined.block_bbox = Some((50.0, 680.0, 310.0, 696.0));
+        let mut pages = vec![vec![combined]];
+
+        split_combined_changelog_version_headings(&mut pages);
+
+        assert_eq!(pages[0].len(), 1);
+        assert_eq!(pages[0][0].text, "Recent Change Log v0.9.1");
+        assert_eq!(pages[0][0].heading_level, None);
+    }
+
+    #[test]
+    fn test_combined_changelog_split_accepts_distinct_line_baselines() {
+        let mut combined = make_text_paragraph(16.0, "Recent Change Log v0.9.1", true);
+        combined.text = "Recent Change Log v0.9.1".to_string();
+        let mut version_line = combined.lines[0].clone();
+        version_line.baseline_y = 680.0;
+        version_line.segments[0].y = 680.0;
+        version_line.segments[0].baseline_y = 680.0;
+        combined.lines.push(version_line);
+        let mut pages = vec![vec![combined]];
+
+        split_combined_changelog_version_headings(&mut pages);
+
+        assert_eq!(pages[0].len(), 2);
+        assert_eq!(pages[0][0].heading_level, Some(2));
+        assert_eq!(pages[0][1].heading_level, Some(3));
+        assert!(is_changelog_version_pair(&pages[0][0], &pages[0][1]));
+    }
+
+    #[test]
+    fn test_combined_changelog_split_requires_geometry_and_plain_heading_state() {
+        let make_combined = || {
+            let mut paragraph = make_text_paragraph(16.0, "Recent Change Log v0.9.1", true);
+            paragraph.text = "Recent Change Log v0.9.1".to_string();
+            paragraph
+        };
+
+        let mut without_geometry = vec![vec![make_combined()]];
+        split_combined_changelog_version_headings(&mut without_geometry);
+        assert_eq!(without_geometry[0].len(), 1);
+
+        for invalid_state in 0..4 {
+            let mut paragraph = make_combined();
+            paragraph.block_bbox = Some((50.0, 680.0, 210.0, 696.0));
+            match invalid_state {
+                0 => paragraph.is_list_item = true,
+                1 => paragraph.is_code_block = true,
+                2 => paragraph.is_formula = true,
+                3 => paragraph.is_page_furniture = true,
+                _ => unreachable!(),
+            }
+            let mut pages = vec![vec![paragraph]];
+            split_combined_changelog_version_headings(&mut pages);
+            assert_eq!(pages[0].len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_standalone_recent_change_log_title_can_be_promoted_to_h1() {
+        let mut pages = vec![vec![
+            make_text_paragraph(18.0, "Recent Change Log", false),
+            make_text_paragraph(12.0, "First body paragraph.", false),
+            make_text_paragraph(12.0, "Second body paragraph.", false),
+            make_text_paragraph(12.0, "Third body paragraph.", false),
+            make_text_paragraph(12.0, "Fourth body paragraph.", false),
+        ]];
+
+        refine_heading_hierarchy(&mut pages);
+
+        assert_eq!(pages[0][0].heading_level, Some(1));
+    }
+
+    #[test]
+    fn test_refine_does_not_promote_distant_or_unaligned_changelog_versions() {
+        let mut title = make_text_paragraph(24.0, "Project Guide", false);
+        title.heading_level = Some(1);
+        let mut changelog = make_text_paragraph(16.0, "Recent Change Log", false);
+        changelog.heading_level = Some(2);
+        changelog.block_bbox = Some((50.0, 700.0, 210.0, 718.0));
+        let mut distant_version = make_text_paragraph(12.0, "1.2.3", true);
+        distant_version.block_bbox = Some((50.0, 600.0, 100.0, 612.0));
+        let mut second_changelog = changelog.clone();
+        second_changelog.block_bbox = Some((50.0, 700.0, 210.0, 718.0));
+        let mut unaligned_version = make_text_paragraph(12.0, "v2.0", true);
+        unaligned_version.block_bbox = Some((100.0, 680.0, 150.0, 692.0));
+        let mut pages = vec![
+            vec![title, changelog, distant_version],
+            vec![second_changelog, unaligned_version],
+        ];
+
+        refine_heading_hierarchy(&mut pages);
+
+        assert_eq!(pages[0][1].heading_level, Some(2));
+        assert_eq!(pages[0][2].heading_level, None);
+        assert_eq!(pages[1][0].heading_level, Some(2));
+        assert_eq!(pages[1][1].heading_level, None);
+    }
+
+    #[test]
+    fn test_semantic_version_match_is_bounded_to_two_or_three_numeric_parts() {
+        assert!(is_semantic_version("0.9"));
+        assert!(is_semantic_version("v1.2.3"));
+        assert!(!is_semantic_version("1"));
+        assert!(!is_semantic_version("1.2.3.4"));
+        assert!(!is_semantic_version("version 1.2"));
+    }
 
     #[test]
     fn test_is_all_caps_text_positive() {
@@ -2526,14 +3003,11 @@ mod tests {
     fn test_is_all_caps_text_negative() {
         assert!(!is_all_caps_text("Department of Transportation"));
         assert!(!is_all_caps_text("Some regular text here"));
-        assert!(!is_all_caps_text("a")); // too short (< 2 alpha chars)
+        assert!(!is_all_caps_text("a"));
     }
-
-    // ── Pass 6: ALL-CAPS heading detection tests ──
 
     #[test]
     fn test_all_caps_short_promoted_to_h2() {
-        // Short ALL-CAPS text (2+ words) at body font size → H2
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "EXECUTIVE SUMMARY", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2546,7 +3020,6 @@ mod tests {
 
     #[test]
     fn test_all_caps_longer_promoted_to_h3() {
-        // Longer ALL-CAPS text (6-15 words) at body font size → H3
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(
             12.0,
@@ -2563,7 +3036,6 @@ mod tests {
 
     #[test]
     fn test_all_caps_with_colon_promoted() {
-        // ALL-CAPS label ending with colon → heading
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "AGENCY:", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2576,7 +3048,6 @@ mod tests {
 
     #[test]
     fn test_all_caps_single_word_no_colon_not_promoted() {
-        // Single ALL-CAPS word without colon → abbreviation, skip
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "USA", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2588,7 +3059,6 @@ mod tests {
 
     #[test]
     fn test_all_caps_too_long_not_promoted() {
-        // ALL-CAPS text with >15 words → not promoted
         let heading_map = vec![(12.0, None)];
         let text = "THIS IS A VERY LONG ALL CAPS TEXT THAT HAS WAY TOO MANY WORDS TO BE A HEADING IN ANY DOCUMENT";
         let mut paragraphs = vec![make_text_paragraph(12.0, text, false)];
@@ -2601,7 +3071,6 @@ mod tests {
 
     #[test]
     fn test_all_caps_list_item_not_promoted() {
-        // ALL-CAPS list items should not be promoted
         let heading_map = vec![(12.0, None)];
         let mut para = make_text_paragraph(12.0, "ITEM ONE", false);
         para.is_list_item = true;
@@ -2615,22 +3084,17 @@ mod tests {
 
     #[test]
     fn test_all_caps_larger_font_gets_higher_level() {
-        // ALL-CAPS at larger font size → higher heading level
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(18.0, "TITLE", false)];
         classify_paragraphs(&mut paragraphs, &heading_map);
-        // 18/12 = 1.5 > 1.4 → H1 (from rescue pass, actually)
         assert!(
             paragraphs[0].heading_level.is_some(),
             "large ALL-CAPS should be promoted"
         );
     }
 
-    // ── Bold colon-ending ALL-CAPS tests ──
-
     #[test]
     fn test_bold_all_caps_colon_promoted() {
-        // Bold ALL-CAPS text ending with colon should be promoted (colon guard relaxed)
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "ACTION:", true)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2642,7 +3106,6 @@ mod tests {
 
     #[test]
     fn test_bold_mixed_case_colon_not_promoted() {
-        // Bold mixed-case text ending with colon should NOT be promoted (colon blocks)
         let heading_map = vec![(12.0, None)];
         let mut paragraphs = vec![make_text_paragraph(12.0, "Agency:", true)];
         classify_paragraphs(&mut paragraphs, &heading_map);
@@ -2652,15 +3115,11 @@ mod tests {
         );
     }
 
-    // ── Issue #917: first-occurrence exemption for repeating text ──
-
     /// A title block that also appears as a running header on subsequent pages must
     /// NOT be marked as furniture on the first page where it occurs.
     /// Regression test for #917: MCID-tagged title dropped in markdown/html output.
     #[test]
     fn test_cross_page_repeating_text_preserves_first_occurrence() {
-        // 6 pages: the title text appears in the top margin of every page.
-        // Pages 1-5: running header (furniture). Page 0: actual title (must be kept).
         let page_heights = vec![792.0_f32; 6];
         let title = "Analysis of Thermodynamic Properties";
         let mut pages: Vec<Vec<PdfParagraph>> = (0..6)
@@ -2675,7 +3134,6 @@ mod tests {
         for (i, page) in pages.iter().enumerate().take(6).skip(1) {
             assert!(page[0].is_page_furniture, "page {i} running header should be furniture");
         }
-        // Body text on every page must never be touched
         for (i, page) in pages.iter().enumerate().take(6) {
             assert!(
                 !page[1].is_page_furniture,
@@ -2688,10 +3146,13 @@ mod tests {
     /// Regression test for #917: short title paragraphs dropped in markdown/html output.
     #[test]
     fn test_cross_page_repeating_short_text_preserves_first_occurrence() {
-        // 5 pages (minimum for tier-2 to run): short title repeats on all pages.
         let title = "Xberg Conference Proceedings 2024";
         let mut pages: Vec<Vec<PdfParagraph>> = (0..5)
-            .map(|_| vec![make_margin_body(title), make_body_center("section body")])
+            .map(|_| {
+                let mut header = make_margin_body(title);
+                header.block_bbox = None;
+                vec![header, make_body_center("section body")]
+            })
             .collect();
         mark_cross_page_repeating_short_text(&mut pages);
 
@@ -2706,11 +3167,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_cross_page_repeating_short_text_preserves_positioned_body_fields() {
+        let mut pages: Vec<Vec<PdfParagraph>> = (0..5).map(|_| vec![make_body_center("Report Status")]).collect();
+
+        mark_cross_page_repeating_short_text(&mut pages);
+
+        assert!(pages.iter().all(|page| !page[0].is_page_furniture));
+    }
 }
 
 #[cfg(test)]
 mod numbered_section_heading_tests {
-    use super::is_numbered_section_heading;
+    use super::{ends_with_sentence_period, is_numbered_section_heading};
 
     #[test]
     fn multilevel_numbers_are_headings() {
@@ -2745,5 +3215,16 @@ mod numbered_section_heading_tests {
         assert!(!is_numbered_section_heading("Introduction"));
         assert!(!is_numbered_section_heading(""));
         assert!(!is_numbered_section_heading("1."));
+    }
+
+    #[test]
+    fn sentence_period_detected_but_ellipsis_is_not() {
+        // A genuine sentence-terminating period disqualifies a heading. ~keep
+        assert!(ends_with_sentence_period("This is a sentence."));
+        assert!(ends_with_sentence_period("Ends here.  "));
+        // A trailing ellipsis is a truncation marker, not a terminator. ~keep
+        assert!(!ends_with_sentence_period("Impaired Glucose Tolerance ..."));
+        assert!(!ends_with_sentence_period("Thermal Comfort As Related To …"));
+        assert!(!ends_with_sentence_period("No period at all"));
     }
 }

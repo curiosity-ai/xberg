@@ -2,6 +2,12 @@
 	"id": "url_batch_mixed_inputs",
 	"category": "url",
 	"description": "extract_batch: mixed bytes and URL inputs share one output envelope",
+	"docs": {
+		"topic": "url",
+		"title": "extract_batch: mixed bytes and URL inputs share one output envelope",
+		"description": "extract_batch: mixed bytes and URL inputs share one output envelope",
+		"side_effects": "server"
+	},
 	"tags": ["url", "batch"],
 	"call": "extract_batch",
 	"input": {
@@ -53,9 +59,5 @@
 			"field": "results[1].content",
 			"value": "Batch bytes content"
 		}
-	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM e2e does not enable URL ingestion"
-	}
+	]
 }

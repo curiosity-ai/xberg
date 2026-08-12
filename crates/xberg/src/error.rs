@@ -73,7 +73,7 @@ pub enum XbergError {
         #[from]
         #[cfg_attr(alef, alef(skip))]
         std::io::Error,
-    ), // Excluded from bindings; IO errors bubble up via Result
+    ),
 
     /// Document parsing failed (e.g. corrupt file, unsupported format feature).
     #[error("Parsing error: {message}")]

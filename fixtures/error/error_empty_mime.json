@@ -2,6 +2,14 @@
 	"id": "error_empty_mime",
 	"category": "error",
 	"description": "Error when extracting with empty MIME type",
+	"docs": {
+		"topic": "error",
+		"title": "Handle an empty MIME type",
+		"description": "Show how an empty MIME type is rejected consistently.",
+		"presentation": {
+			"files": [{ "field": "/bytes", "path": "test_documents/text/plain.txt" }]
+		}
+	},
 	"tags": ["error", "input", "mime"],
 	"call": "extract",
 	"input": {

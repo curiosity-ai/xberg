@@ -33,7 +33,6 @@ impl PaddleOCRVLProcessor {
         let img_h = img.height();
         let img_w = img.width();
 
-        // Resize to multiple of (patch_size * merge_size)
         let (resize_h, resize_w) = img_smart_resize(
             img_h,
             img_w,
@@ -45,7 +44,6 @@ impl PaddleOCRVLProcessor {
         let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
         let img_tensor = img_transform(&img, img_mean, img_std, &self.device, self.dtype)?;
 
-        // (c, h, w) => (1, c, h, w)
         let img_tensor = img_tensor
             .unsqueeze(0)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Unsqueeze failed: {}", e)))?;
@@ -59,7 +57,6 @@ impl PaddleOCRVLProcessor {
             .dim(1)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Get channel dim: {}", e)))?;
 
-        // img_tensor.dim[0] = 1, temporal_patch_size = 1, grid_t = 1
         let grid_t = img_tensor
             .dim(0)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Get grid_t: {}", e)))?
@@ -87,7 +84,6 @@ impl PaddleOCRVLProcessor {
             .reshape(shape)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Initial reshape: {}", e)))?;
 
-        // Permute: (grid_t, grid_h, grid_w, channel, temporal_patch_size, patch_size, patch_size)
         let img_tensor = img_tensor
             .permute(vec![0, 3, 5, 2, 1, 4, 6])
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Permute: {}", e)))?;
@@ -141,7 +137,6 @@ fn img_smart_resize(img_h: u32, img_w: u32, factor: u32, min_pixels: u32, max_pi
     let mut w = img_w as f64;
     let factor = factor as f64;
 
-    // Handle tiny images
     if h < factor {
         w = (w * factor + h / 2.0) / h;
         h = factor;
@@ -151,7 +146,6 @@ fn img_smart_resize(img_h: u32, img_w: u32, factor: u32, min_pixels: u32, max_pi
         w = factor;
     }
 
-    // Check aspect ratio constraint
     let aspect = if h > w { h / w } else { w / h };
     if aspect > 200.0 {
         return Err(CandleOcrError::UnsupportedConfig(format!(
@@ -160,19 +154,16 @@ fn img_smart_resize(img_h: u32, img_w: u32, factor: u32, min_pixels: u32, max_pi
         )));
     }
 
-    // Round to nearest multiple of factor
     let mut h_bar = ((h + factor / 2.0) / factor).floor() * factor;
     let mut w_bar = ((w + factor / 2.0) / factor).floor() * factor;
 
     let total_pixels = h_bar * w_bar;
 
     if total_pixels > max_pixels as f64 {
-        // Scale down to fit within max_pixels
         let beta = ((h * w) / max_pixels as f64).sqrt();
         h_bar = ((h / beta / factor).floor()) * factor;
         w_bar = ((w / beta / factor).floor()) * factor;
     } else if total_pixels < min_pixels as f64 {
-        // Scale up to meet min_pixels
         let beta = (min_pixels as f64 / (h * w)).sqrt();
         h_bar = ((h * beta / factor).ceil()) * factor;
         w_bar = ((w * beta / factor).ceil()) * factor;
@@ -220,7 +211,6 @@ mod tests {
 
     #[test]
     fn test_smart_resize_upscale() {
-        // Test upscaling to minimum pixels
         let (h, w) = img_smart_resize(100, 100, 28, 147_384, 2_822_400).unwrap();
         assert_eq!(h % 28, 0);
         assert_eq!(w % 28, 0);
@@ -229,7 +219,6 @@ mod tests {
 
     #[test]
     fn test_smart_resize_downscale() {
-        // Test downscaling to maximum pixels
         let (h, w) = img_smart_resize(2000, 2000, 28, 147_384, 2_822_400).unwrap();
         assert_eq!(h % 28, 0);
         assert_eq!(w % 28, 0);
@@ -238,7 +227,6 @@ mod tests {
 
     #[test]
     fn test_aspect_ratio_check() {
-        // Test aspect ratio constraint
         let result = img_smart_resize(100, 30000, 28, 147_384, 2_822_400);
         assert!(result.is_err());
     }

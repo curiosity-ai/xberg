@@ -778,9 +778,6 @@ fn test_auto_rotate_true_does_not_abort() {
         ..Default::default()
     };
 
-    // Whether osd.traineddata is present or absent, the shim catches any C++ exception
-    // from TessBaseAPIDetectOrientationScript and converts it to a graceful Err, which
-    // execution.rs then handles with a warn+continue, so OCR always completes.
     let result = extract_uri_document_blocking(&file_path, None, &config);
     assert!(
         result.is_ok(),

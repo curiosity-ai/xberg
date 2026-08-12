@@ -43,16 +43,27 @@ fn build_internal_document(
 
     let mut builder = InternalDocumentBuilder::new(source_format);
 
-    // Try to build structured document for JSON objects
-    if source_format == "json"
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&result.content)
-        && value.is_object()
+    // Render document structure (headings, sub-headings, lists) from the parsed value for
+    // every structured format, not just JSON objects: YAML, TOML, and JSONL already parse
+    // into the same `serde_json::Value` shape, and a top-level array (JSONL's natural shape,
+    // and valid JSON on its own) gets per-item structure instead of an opaque code block
+    // (xberg-io/xberg#155). ~keep
+    if matches!(source_format, "json" | "jsonl" | "yaml" | "toml")
+        && let Some(value) = result.value.as_ref()
     {
-        build_json_internal_structure(&value, &mut builder, 1, budget)?;
-        return Ok(builder.build());
+        match value {
+            serde_json::Value::Object(_) => {
+                build_json_internal_structure(value, &mut builder, 1, budget)?;
+                return Ok(builder.build());
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                build_json_array(items, &mut builder, 1, budget)?;
+                return Ok(builder.build());
+            }
+            _ => {}
+        }
     }
 
-    // Fallback: code block — account for the full content size
     budget.account_text(result.content.len())?;
     builder.push_code(&result.content, language, None, None);
     Ok(builder.build())
@@ -82,20 +93,7 @@ fn build_json_internal_structure(
                     }
                     serde_json::Value::Array(arr) => {
                         builder.push_heading(level, key, None, None);
-                        builder.push_list(false);
-                        for item in arr {
-                            budget.step()?;
-                            let text = match item {
-                                serde_json::Value::String(s) => {
-                                    budget.check_entity(s)?;
-                                    s.clone()
-                                }
-                                other => other.to_string(),
-                            };
-                            budget.account_text(text.len())?;
-                            builder.push_list_item(&text, false, vec![], None, None);
-                        }
-                        builder.end_list();
+                        build_json_array(arr, builder, depth + 1, budget)?;
                     }
                     serde_json::Value::String(s) => {
                         budget.check_entity(s)?;
@@ -113,22 +111,7 @@ fn build_json_internal_structure(
             budget.leave();
         }
         serde_json::Value::Array(arr) => {
-            budget.enter()?;
-            builder.push_list(false);
-            for item in arr {
-                budget.step()?;
-                let text = match item {
-                    serde_json::Value::String(s) => {
-                        budget.check_entity(s)?;
-                        s.clone()
-                    }
-                    other => other.to_string(),
-                };
-                budget.account_text(text.len())?;
-                builder.push_list_item(&text, false, vec![], None, None);
-            }
-            builder.end_list();
-            budget.leave();
+            build_json_array(arr, builder, depth, budget)?;
         }
         serde_json::Value::String(s) => {
             budget.check_entity(s)?;
@@ -141,6 +124,60 @@ fn build_json_internal_structure(
             builder.push_paragraph(&rendered, vec![], None, None);
         }
     }
+    Ok(())
+}
+
+/// Render array scalars as list items and recursively expand structured items.
+///
+/// Lists are closed before an object or nested array is rendered so headings
+/// and paragraphs do not become implicit children of the preceding list item.
+fn build_json_array(
+    values: &[serde_json::Value],
+    builder: &mut InternalDocumentBuilder,
+    depth: u8,
+    budget: &mut SecurityBudget,
+) -> Result<()> {
+    const ARRAY_ITEM_LABEL: &str = "Item";
+
+    budget.enter()?;
+    let mut list_is_open = false;
+    for (index, value) in values.iter().enumerate() {
+        budget.step()?;
+        match value {
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                if list_is_open {
+                    builder.end_list();
+                    list_is_open = false;
+                }
+                let label = format!("{ARRAY_ITEM_LABEL} {}", index + 1);
+                budget.account_text(label.len())?;
+                builder.push_heading(depth.min(6), &label, None, None);
+                build_json_internal_structure(value, builder, depth + 1, budget)?;
+            }
+            serde_json::Value::String(text) => {
+                budget.check_entity(text)?;
+                budget.account_text(text.len())?;
+                if !list_is_open {
+                    builder.push_list(false);
+                    list_is_open = true;
+                }
+                builder.push_list_item(text, false, vec![], None, None);
+            }
+            scalar => {
+                let rendered = scalar.to_string();
+                budget.account_text(rendered.len())?;
+                if !list_is_open {
+                    builder.push_list(false);
+                    list_is_open = true;
+                }
+                builder.push_list_item(&rendered, false, vec![], None, None);
+            }
+        }
+    }
+    if list_is_open {
+        builder.end_list();
+    }
+    budget.leave();
     Ok(())
 }
 
@@ -217,6 +254,16 @@ impl InternalDocumentExtractor for StructuredExtractor {
             Cow::Borrowed("data_format"),
             serde_json::json!(structured_result.format),
         );
+        // Surface the full flattened `path: value` view instead of discarding it
+        // (xberg-io/xberg#166): the structured renderer above only emits headings/lists for
+        // a subset of shapes, so this is the one place a consumer can always get every leaf
+        // field as text, regardless of source format or nesting.
+        if !structured_result.flattened.is_empty() {
+            additional.insert(
+                Cow::Borrowed("flattened_fields"),
+                serde_json::json!(structured_result.flattened),
+            );
+        }
 
         for (key, value) in &structured_result.metadata {
             additional.insert(Cow::Owned(key.clone()), serde_json::json!(value));
@@ -242,7 +289,7 @@ impl InternalDocumentExtractor for StructuredExtractor {
         )
     ))]
     async fn extract_path(&self, path: &Path, mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
-        let bytes = tokio::fs::read(path).await?;
+        let bytes = crate::core::io::read_file_async(path).await?;
         self.extract_content(&bytes, mime_type, config).await
     }
 
@@ -271,6 +318,63 @@ impl InternalDocumentExtractor for StructuredExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_json_array_objects_render_as_nested_markdown() {
+        let value = serde_json::json!({
+            "people": [
+                {
+                    "name": "Ada",
+                    "details": {
+                        "role": "Engineer",
+                        "active": true
+                    }
+                },
+                {
+                    "name": "Grace",
+                    "skills": ["compilers", "mathematics"]
+                }
+            ]
+        });
+        let mut builder = InternalDocumentBuilder::new("json");
+        let mut budget = SecurityBudget::from_config(&ExtractionConfig::default());
+
+        build_json_internal_structure(&value, &mut builder, 1, &mut budget).unwrap();
+        let markdown = crate::rendering::render_markdown(&builder.build());
+
+        assert!(markdown.contains("# people"), "missing array heading: {markdown}");
+        assert!(markdown.contains("## Item 1"), "missing first item heading: {markdown}");
+        assert!(markdown.contains("name: Ada"), "missing first nested value: {markdown}");
+        assert!(
+            markdown.contains("### details"),
+            "missing nested object heading: {markdown}"
+        );
+        assert!(
+            markdown.contains("role: Engineer"),
+            "missing deeply nested value: {markdown}"
+        );
+        assert!(markdown.contains("active: true"), "missing boolean value: {markdown}");
+        assert!(
+            markdown.contains("## Item 2"),
+            "missing second item heading: {markdown}"
+        );
+        assert!(
+            markdown.contains("name: Grace"),
+            "missing second nested value: {markdown}"
+        );
+        assert!(
+            markdown.contains("- compilers"),
+            "missing nested array value: {markdown}"
+        );
+        assert!(
+            markdown.contains("- mathematics"),
+            "missing nested array value: {markdown}"
+        );
+        assert!(
+            !markdown.contains(r#"{\"name\":\"Ada\""#),
+            "object remained compact JSON: {markdown}"
+        );
+    }
 
     #[test]
     fn test_structured_extractor_plugin_interface() {

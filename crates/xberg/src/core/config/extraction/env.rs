@@ -5,10 +5,11 @@
 
 use crate::{Result, XbergError};
 
+use super::super::csv::CsvConfig;
 use super::super::ocr::OcrConfig;
 use super::super::processing::ChunkingConfig;
 use super::core::ExtractionConfig;
-use super::types::TokenReductionOptions;
+use super::types::{BreadcrumbTarget, TokenReductionOptions};
 
 impl ExtractionConfig {
     /// Apply environment variable overrides to configuration.
@@ -18,24 +19,38 @@ impl ExtractionConfig {
     ///
     /// - `XBERG_OCR_LANGUAGE`: OCR language (ISO 639-1 or 639-3 code, e.g., "eng", "fra", "deu")
     /// - `XBERG_OCR_BACKEND`: OCR backend ("tesseract", "paddleocr", "paddle-ocr", or "vlm")
+    /// - `XBERG_OCR_MODEL_VERSION`: PaddleOCR model generation ("pp-ocrv6" or "pp-ocrv5")
+    /// - `XBERG_OCR_MODEL_TIER`: PaddleOCR model tier (e.g. "medium"/"small"/"tiny" for v6, "mobile"/"server" for v5)
     /// - `XBERG_CHUNKING_MAX_CHARS`: Maximum characters per chunk (positive integer)
     /// - `XBERG_CHUNKING_MAX_OVERLAP`: Maximum overlap between chunks (non-negative integer)
+    /// - `XBERG_CHUNKING_BREADCRUMB_TARGET`: Where the heading-path breadcrumb is written
+    ///   when `prepend_heading_context` is enabled ("content", "metadata", or "both")
+    ///   — see [`BreadcrumbTarget`](crate::core::config::extraction::BreadcrumbTarget)
     /// - `XBERG_CACHE_ENABLED`: Cache enabled flag ("true" or "false")
     /// - `XBERG_TOKEN_REDUCTION_MODE`: Token reduction mode ("off", "light", "moderate", "aggressive", or "maximum")
     /// - `XBERG_CHUNKING_TOKENIZER`: HuggingFace tokenizer model ID for token-based chunk sizing (requires `chunking-tokenizers` feature)
     /// - `XBERG_DISABLE_OCR`: Disable OCR entirely ("true" or "false")
     /// - `XBERG_LLM_MODEL`: LLM model for structured extraction (e.g., "openai/gpt-4o")
-    /// - `XBERG_LLM_API_KEY`: API key for the structured extraction LLM provider
-    /// - `XBERG_LLM_BASE_URL`: Custom base URL for the structured extraction LLM provider
+    /// - `XBERG_LLM_API_KEY`: API key for the structured extraction LLM provider. Applied only
+    ///   when structured extraction is already configured — a credential never enables it.
+    /// - `XBERG_LLM_BASE_URL`: Custom base URL for the structured extraction LLM provider. Applied
+    ///   only when structured extraction is already configured — an endpoint never enables it.
     /// - `XBERG_VLM_OCR_MODEL`: VLM model for vision-based OCR (e.g., "openai/gpt-4o")
     /// - `XBERG_VLM_EMBEDDING_MODEL`: LLM model for embedding generation (e.g., "openai/text-embedding-3-small")
     /// - `XBERG_EMBEDDING_PLUGIN_NAME`: Name of an in-process embedding backend registered via `plugins::register_embedding_backend`
     /// - `XBERG_MSG_FALLBACK_CODEPAGE`: (deferred) Windows codepage for MSG PT_STRING8 fallback
+    /// - `XBERG_CSV_DELIMITER`: CSV/TSV field delimiter, exactly one ASCII character
+    ///   (e.g. ",", ";", "\t", "|"). Overrides delimiter auto-detection.
+    /// - `XBERG_CSV_COMMENT_PREFIXES`: comma-separated list of line prefixes marking a
+    ///   CSV/TSV comment line to skip (e.g. "#,//")
     ///
     /// # Behavior
     ///
     /// - If an environment variable is set and valid, it overrides the current configuration value
-    /// - If a required parent config is `None` (e.g., `self.ocr` is None), it's created with defaults before applying the override
+    /// - If a required parent config is `None` (e.g., `self.ocr` is None), it's created with
+    ///   defaults before applying the override. The exception is credentials and endpoints —
+    ///   `XBERG_LLM_API_KEY` and `XBERG_LLM_BASE_URL` — which are applied to an existing config
+    ///   or ignored, and never enable a feature that was not asked for (issue #1421)
     /// - Invalid values return a `XbergError::Validation` with helpful error messages
     /// - Missing or unset environment variables are silently ignored
     ///
@@ -62,7 +77,6 @@ impl ExtractionConfig {
             validate_chunking_params, validate_language_code, validate_ocr_backend, validate_token_reduction_level,
         };
 
-        // XBERG_OCR_LANGUAGE override
         if let Ok(lang) = std::env::var("XBERG_OCR_LANGUAGE") {
             validate_language_code(&lang)?;
             if self.ocr.is_none() {
@@ -73,7 +87,6 @@ impl ExtractionConfig {
             }
         }
 
-        // XBERG_OCR_BACKEND override
         if let Ok(backend) = std::env::var("XBERG_OCR_BACKEND") {
             validate_ocr_backend(&backend)?;
             if self.ocr.is_none() {
@@ -84,7 +97,27 @@ impl ExtractionConfig {
             }
         }
 
-        // XBERG_CHUNKING_MAX_CHARS override
+        let paddle_model_version = std::env::var("XBERG_OCR_MODEL_VERSION").ok();
+        let paddle_model_tier = std::env::var("XBERG_OCR_MODEL_TIER").ok();
+        if paddle_model_version.is_some() || paddle_model_tier.is_some() {
+            if self.ocr.is_none() {
+                self.ocr = Some(OcrConfig::default());
+            }
+            if let Some(ref mut ocr) = self.ocr {
+                let mut paddle = match ocr.paddle_ocr_config.take() {
+                    Some(serde_json::Value::Object(map)) => map,
+                    _ => serde_json::Map::new(),
+                };
+                if let Some(version) = paddle_model_version {
+                    paddle.insert("model_version".to_string(), serde_json::Value::String(version));
+                }
+                if let Some(tier) = paddle_model_tier {
+                    paddle.insert("model_tier".to_string(), serde_json::Value::String(tier));
+                }
+                ocr.paddle_ocr_config = Some(serde_json::Value::Object(paddle));
+            }
+        }
+
         if let Ok(max_chars_str) = std::env::var("XBERG_CHUNKING_MAX_CHARS") {
             let max_chars: usize = max_chars_str.parse().map_err(|_| XbergError::Validation {
                 message: format!(
@@ -106,13 +139,11 @@ impl ExtractionConfig {
             }
 
             if let Some(ref mut chunking) = self.chunking {
-                // Validate against current overlap before updating
                 validate_chunking_params(max_chars, chunking.overlap)?;
                 chunking.max_characters = max_chars;
             }
         }
 
-        // XBERG_CHUNKING_MAX_OVERLAP override
         if let Ok(max_overlap_str) = std::env::var("XBERG_CHUNKING_MAX_OVERLAP") {
             let max_overlap: usize = max_overlap_str.parse().map_err(|_| XbergError::Validation {
                 message: format!(
@@ -127,13 +158,35 @@ impl ExtractionConfig {
             }
 
             if let Some(ref mut chunking) = self.chunking {
-                // Validate against current max_characters before updating
                 validate_chunking_params(chunking.max_characters, max_overlap)?;
                 chunking.overlap = max_overlap;
             }
         }
 
-        // XBERG_CACHE_ENABLED override
+        if let Ok(target_str) = std::env::var("XBERG_CHUNKING_BREADCRUMB_TARGET") {
+            let target = match target_str.to_lowercase().as_str() {
+                "content" => BreadcrumbTarget::Content,
+                "metadata" => BreadcrumbTarget::Metadata,
+                _ => {
+                    return Err(XbergError::Validation {
+                        message: format!(
+                            "Invalid value for XBERG_CHUNKING_BREADCRUMB_TARGET: '{}'. Must be 'content' or 'metadata'.",
+                            target_str
+                        ),
+                        source: None,
+                    });
+                }
+            };
+
+            if self.chunking.is_none() {
+                self.chunking = Some(ChunkingConfig::default());
+            }
+
+            if let Some(ref mut chunking) = self.chunking {
+                chunking.breadcrumb_target = target;
+            }
+        }
+
         if let Ok(cache_str) = std::env::var("XBERG_CACHE_ENABLED") {
             let cache_enabled = match cache_str.to_lowercase().as_str() {
                 "true" => true,
@@ -151,7 +204,6 @@ impl ExtractionConfig {
             self.use_cache = cache_enabled;
         }
 
-        // XBERG_TOKEN_REDUCTION_MODE override
         if let Ok(mode) = std::env::var("XBERG_TOKEN_REDUCTION_MODE") {
             validate_token_reduction_level(&mode)?;
             if self.token_reduction.is_none() {
@@ -165,7 +217,6 @@ impl ExtractionConfig {
             }
         }
 
-        // XBERG_OUTPUT_FORMAT override
         if let Ok(val) = std::env::var("XBERG_OUTPUT_FORMAT") {
             self.output_format = val.parse().map_err(|e: String| XbergError::Validation {
                 message: format!("Invalid value for XBERG_OUTPUT_FORMAT: {}", e),
@@ -173,7 +224,6 @@ impl ExtractionConfig {
             })?;
         }
 
-        // XBERG_CHUNKING_TOKENIZER override
         #[cfg(feature = "chunking-tokenizers")]
         if let Ok(model) = std::env::var("XBERG_CHUNKING_TOKENIZER") {
             if model.is_empty() {
@@ -192,8 +242,6 @@ impl ExtractionConfig {
             }
         }
 
-        // XBERG_LAYOUT_PRESET override (backward compat: enables layout detection).
-        // Only one model (RT-DETR) exists, so the specific preset value is ignored.
         #[cfg(feature = "layout-detection")]
         if let Ok(preset) = std::env::var("XBERG_LAYOUT_PRESET") {
             let lower = preset.to_lowercase();
@@ -209,11 +257,9 @@ impl ExtractionConfig {
             if self.layout.is_none() {
                 self.layout = Some(super::super::layout::LayoutDetectionConfig::default());
             }
-            // preset value is accepted but ignored -- only RT-DETR is available
             let _ = lower;
         }
 
-        // XBERG_DISABLE_OCR override
         if let Ok(val) = std::env::var("XBERG_DISABLE_OCR") {
             self.disable_ocr = match val.to_lowercase().as_str() {
                 "true" | "1" => true,
@@ -230,7 +276,6 @@ impl ExtractionConfig {
             };
         }
 
-        // XBERG_LLM_MODEL override
         if let Ok(value) = std::env::var("XBERG_LLM_MODEL") {
             if value.is_empty() {
                 return Err(XbergError::Validation {
@@ -249,10 +294,7 @@ impl ExtractionConfig {
                         model: value,
                         api_key: None,
                         base_url: None,
-                        timeout_secs: None,
-                        max_retries: None,
-                        temperature: None,
-                        max_tokens: None,
+                        ..Default::default()
                     },
                 });
             } else if let Some(ref mut config) = self.structured_extraction {
@@ -260,7 +302,18 @@ impl ExtractionConfig {
             }
         }
 
-        // XBERG_LLM_API_KEY override
+        // A credential is not a request to run a feature. `XBERG_LLM_API_KEY` and
+        // `XBERG_LLM_BASE_URL` therefore only ever *configure* a structured extraction
+        // that is already enabled; neither may bring one into existence. Before this,
+        // both fabricated a `StructuredExtractionConfig` with an empty `model` and an
+        // empty schema whenever they were set, and because
+        // `config.structured_extraction.is_some()` is the sole gate in the pipeline
+        // (`core/pipeline/mod.rs:449`), any deployment that merely had a key in its
+        // environment ran the post-processor on *every* document and failed on every
+        // one of them with "model must not be empty" (issue #1421). This mirrors the
+        // rule the VLM forwarding block below already follows for the same two vars.
+        // `XBERG_LLM_MODEL`, handled above, is a different case: naming a model for
+        // structured extraction is an explicit request for it. ~keep
         if let Ok(value) = std::env::var("XBERG_LLM_API_KEY") {
             if value.is_empty() {
                 return Err(XbergError::Validation {
@@ -268,29 +321,11 @@ impl ExtractionConfig {
                     source: None,
                 });
             }
-            if self.structured_extraction.is_none() {
-                self.structured_extraction = Some(super::super::llm::StructuredExtractionConfig {
-                    schema: serde_json::Value::Object(Default::default()),
-                    schema_name: "extraction".to_string(),
-                    schema_description: None,
-                    strict: false,
-                    prompt: None,
-                    llm: super::super::llm::LlmConfig {
-                        model: String::new(),
-                        api_key: Some(value),
-                        base_url: None,
-                        timeout_secs: None,
-                        max_retries: None,
-                        temperature: None,
-                        max_tokens: None,
-                    },
-                });
-            } else if let Some(ref mut config) = self.structured_extraction {
+            if let Some(ref mut config) = self.structured_extraction {
                 config.llm.api_key = Some(value);
             }
         }
 
-        // XBERG_LLM_BASE_URL override
         if let Ok(value) = std::env::var("XBERG_LLM_BASE_URL") {
             if value.is_empty() {
                 return Err(XbergError::Validation {
@@ -298,29 +333,11 @@ impl ExtractionConfig {
                     source: None,
                 });
             }
-            if self.structured_extraction.is_none() {
-                self.structured_extraction = Some(super::super::llm::StructuredExtractionConfig {
-                    schema: serde_json::Value::Object(Default::default()),
-                    schema_name: "extraction".to_string(),
-                    schema_description: None,
-                    strict: false,
-                    prompt: None,
-                    llm: super::super::llm::LlmConfig {
-                        model: String::new(),
-                        api_key: None,
-                        base_url: Some(value),
-                        timeout_secs: None,
-                        max_retries: None,
-                        temperature: None,
-                        max_tokens: None,
-                    },
-                });
-            } else if let Some(ref mut config) = self.structured_extraction {
+            if let Some(ref mut config) = self.structured_extraction {
                 config.llm.base_url = Some(value);
             }
         }
 
-        // XBERG_VLM_OCR_MODEL override
         if let Ok(value) = std::env::var("XBERG_VLM_OCR_MODEL") {
             if value.is_empty() {
                 return Err(XbergError::Validation {
@@ -335,12 +352,7 @@ impl ExtractionConfig {
                 if ocr.vlm_config.is_none() {
                     ocr.vlm_config = Some(super::super::llm::LlmConfig {
                         model: value,
-                        api_key: None,
-                        base_url: None,
-                        timeout_secs: None,
-                        max_retries: None,
-                        temperature: None,
-                        max_tokens: None,
+                        ..Default::default()
                     });
                 } else if let Some(ref mut vlm) = ocr.vlm_config {
                     vlm.model = value;
@@ -348,7 +360,31 @@ impl ExtractionConfig {
             }
         }
 
-        // XBERG_VLM_EMBEDDING_MODEL override
+        // Forward the general LLM credential env vars onto the VLM OCR client. Before
+        // this, `XBERG_LLM_API_KEY` / `XBERG_LLM_BASE_URL` only reached structured
+        // extraction (handled above), so a VLM OCR backend configured with a custom
+        // `base_url` could never resolve its key from the environment and failed with
+        // an authentication error — the env vars the docs promise as highest priority
+        // were silently ignored for the VLM path (issue #1339). This runs after the
+        // `XBERG_VLM_OCR_MODEL` block so a `vlm_config` created there is also covered,
+        // and only applies when VLM OCR is already configured, so it never silently
+        // enables the VLM path. The empty-string guard in the `XBERG_LLM_*` blocks
+        // above already rejects empty values before we get here.
+        if let Some(ref mut ocr) = self.ocr
+            && let Some(ref mut vlm) = ocr.vlm_config
+        {
+            if let Ok(value) = std::env::var("XBERG_LLM_API_KEY")
+                && !value.is_empty()
+            {
+                vlm.api_key = Some(value);
+            }
+            if let Ok(value) = std::env::var("XBERG_LLM_BASE_URL")
+                && !value.is_empty()
+            {
+                vlm.base_url = Some(value);
+            }
+        }
+
         if let Ok(value) = std::env::var("XBERG_VLM_EMBEDDING_MODEL") {
             if value.is_empty() {
                 return Err(XbergError::Validation {
@@ -362,26 +398,18 @@ impl ExtractionConfig {
             if let Some(ref mut chunking) = self.chunking {
                 chunking.embedding = Some(super::super::processing::EmbeddingConfig {
                     model: super::super::processing::EmbeddingModelType::Llm {
-                        llm: super::super::llm::LlmConfig {
+                        llm: Box::new(super::super::llm::LlmConfig {
                             model: value,
                             api_key: None,
                             base_url: None,
-                            timeout_secs: None,
-                            max_retries: None,
-                            temperature: None,
-                            max_tokens: None,
-                        },
+                            ..Default::default()
+                        }),
                     },
                     ..super::super::processing::EmbeddingConfig::default()
                 });
             }
         }
 
-        // XBERG_EMBEDDING_PLUGIN_NAME override.
-        // Selects an already-registered in-process embedding backend by name.
-        // Setting this together with XBERG_VLM_EMBEDDING_MODEL is rejected — they
-        // configure mutually-exclusive embedding sources and the result of "both set"
-        // would otherwise depend on source order in this function. Pick one.
         let plugin_name = std::env::var("XBERG_EMBEDDING_PLUGIN_NAME").ok();
         if plugin_name.is_some() && std::env::var("XBERG_VLM_EMBEDDING_MODEL").is_ok() {
             return Err(XbergError::Validation {
@@ -409,12 +437,43 @@ impl ExtractionConfig {
             }
         }
 
+        if let Ok(value) = std::env::var("XBERG_CSV_DELIMITER") {
+            crate::core::config_validation::validate_csv_delimiter(&value)?;
+            if self.csv.is_none() {
+                self.csv = Some(CsvConfig::default());
+            }
+            if let Some(ref mut csv) = self.csv {
+                csv.delimiter = Some(value);
+            }
+        }
+
+        if let Ok(value) = std::env::var("XBERG_CSV_COMMENT_PREFIXES") {
+            let prefixes: Vec<String> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if prefixes.is_empty() {
+                return Err(XbergError::Validation {
+                    message: "XBERG_CSV_COMMENT_PREFIXES must contain at least one non-empty prefix".to_string(),
+                    source: None,
+                });
+            }
+            if self.csv.is_none() {
+                self.csv = Some(CsvConfig::default());
+            }
+            if let Some(ref mut csv) = self.csv {
+                csv.comment_prefixes = prefixes;
+            }
+        }
+
         Ok(())
     }
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)] // env mutation in 2024 edition is unsafe; tests serialize via ENV_LOCK
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::core::config::processing::EmbeddingModelType;
@@ -424,7 +483,6 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn clear_embedding_env() {
-        // SAFETY: callers hold ENV_LOCK so no other thread is reading these vars.
         unsafe {
             std::env::remove_var("XBERG_EMBEDDING_PLUGIN_NAME");
             std::env::remove_var("XBERG_VLM_EMBEDDING_MODEL");
@@ -435,7 +493,6 @@ mod tests {
     fn embedding_plugin_and_vlm_embedding_model_are_mutually_exclusive() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_embedding_env();
-        // SAFETY: see clear_embedding_env.
         unsafe {
             std::env::set_var("XBERG_EMBEDDING_PLUGIN_NAME", "my-embedder");
             std::env::set_var("XBERG_VLM_EMBEDDING_MODEL", "openai/text-embedding-3-small");
@@ -457,7 +514,6 @@ mod tests {
     fn empty_embedding_plugin_name_rejected() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_embedding_env();
-        // SAFETY: see clear_embedding_env.
         unsafe { std::env::set_var("XBERG_EMBEDDING_PLUGIN_NAME", "") };
         let mut config = ExtractionConfig::default();
         let err = config
@@ -474,7 +530,6 @@ mod tests {
     fn embedding_plugin_env_sets_chunking_embedding_to_plugin_variant() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_embedding_env();
-        // SAFETY: see clear_embedding_env.
         unsafe { std::env::set_var("XBERG_EMBEDDING_PLUGIN_NAME", "my-embedder") };
         let mut config = ExtractionConfig::default();
         config
@@ -489,5 +544,275 @@ mod tests {
             other => panic!("expected Plugin variant, got {other:?}"),
         }
         clear_embedding_env();
+    }
+
+    fn clear_llm_cred_env() {
+        unsafe {
+            std::env::remove_var("XBERG_LLM_API_KEY");
+            std::env::remove_var("XBERG_LLM_BASE_URL");
+            std::env::remove_var("XBERG_VLM_OCR_MODEL");
+        }
+    }
+
+    /// Regression test for issue #1339: `XBERG_LLM_API_KEY` / `XBERG_LLM_BASE_URL`
+    /// must be forwarded onto an existing VLM OCR config so a custom `base_url` can
+    /// resolve its credential from the environment.
+    #[test]
+    fn llm_cred_env_forwarded_to_existing_vlm_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_cred_env();
+        unsafe {
+            std::env::set_var("XBERG_LLM_API_KEY", "sk-test-key");
+            std::env::set_var("XBERG_LLM_BASE_URL", "https://eu.api.openai.com/v1/");
+        }
+        let mut config = ExtractionConfig {
+            ocr: Some(crate::core::config::OcrConfig {
+                vlm_config: Some(crate::core::config::LlmConfig {
+                    model: "gpt-4o-mini".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        config.apply_env_overrides().expect("env overrides should apply");
+        let vlm = config.ocr.unwrap().vlm_config.unwrap();
+        assert_eq!(vlm.api_key.as_deref(), Some("sk-test-key"));
+        assert_eq!(vlm.base_url.as_deref(), Some("https://eu.api.openai.com/v1/"));
+        clear_llm_cred_env();
+    }
+
+    /// The forwarding must never fabricate a VLM config: a credential in the
+    /// environment configures an OCR path that is already enabled, and never turns
+    /// one on (issue #1339). The same rule now holds for structured extraction —
+    /// see `llm_cred_env_does_not_enable_structured_extraction` (issue #1421).
+    #[test]
+    fn llm_cred_env_does_not_create_vlm_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_cred_env();
+        unsafe {
+            std::env::set_var("XBERG_LLM_API_KEY", "sk-test-key");
+        }
+        let mut config = ExtractionConfig::default();
+        config.apply_env_overrides().expect("env overrides should apply");
+        assert!(
+            config.ocr.as_ref().and_then(|o| o.vlm_config.as_ref()).is_none(),
+            "VLM config must not be auto-created from LLM cred env vars"
+        );
+        clear_llm_cred_env();
+    }
+
+    /// Regression test for issue #1421. `config.structured_extraction.is_some()` is
+    /// the *only* gate the pipeline consults (`core/pipeline/mod.rs`), so fabricating
+    /// the config from a credential registered a post-processor that had neither a
+    /// model nor a schema and failed on every single document with
+    /// "model must not be empty". A key in the environment must leave the feature off.
+    #[test]
+    fn llm_cred_env_does_not_enable_structured_extraction() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_cred_env();
+        unsafe {
+            std::env::set_var("XBERG_LLM_API_KEY", "sk-test-key");
+            std::env::set_var("XBERG_LLM_BASE_URL", "https://eu.api.openai.com/v1/");
+        }
+        let mut config = ExtractionConfig::default();
+        config.apply_env_overrides().expect("env overrides should apply");
+        assert!(
+            config.structured_extraction.is_none(),
+            "a credential and an endpoint must not enable structured extraction; \
+             got {:?}",
+            config.structured_extraction
+        );
+        clear_llm_cred_env();
+    }
+
+    /// The other half of #1421: suppressing the fabrication must not stop the
+    /// credential reaching a structured extraction the user actually asked for.
+    #[test]
+    fn llm_cred_env_applies_to_existing_structured_extraction() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_cred_env();
+        unsafe {
+            std::env::set_var("XBERG_LLM_API_KEY", "sk-test-key");
+            std::env::set_var("XBERG_LLM_BASE_URL", "https://eu.api.openai.com/v1/");
+        }
+        let mut config = ExtractionConfig {
+            structured_extraction: Some(crate::core::config::StructuredExtractionConfig {
+                schema: serde_json::json!({"type": "object"}),
+                schema_name: "invoice".to_string(),
+                schema_description: None,
+                strict: false,
+                prompt: None,
+                llm: crate::core::config::LlmConfig {
+                    model: "openai/gpt-4o".to_string(),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        config.apply_env_overrides().expect("env overrides should apply");
+        let structured = config
+            .structured_extraction
+            .expect("structured extraction stays enabled");
+        assert_eq!(structured.llm.api_key.as_deref(), Some("sk-test-key"));
+        assert_eq!(
+            structured.llm.base_url.as_deref(),
+            Some("https://eu.api.openai.com/v1/")
+        );
+        assert_eq!(
+            structured.llm.model, "openai/gpt-4o",
+            "the configured model must survive"
+        );
+        assert_eq!(structured.schema_name, "invoice", "the configured schema must survive");
+        clear_llm_cred_env();
+    }
+
+    fn clear_breadcrumb_target_env() {
+        unsafe {
+            std::env::remove_var("XBERG_CHUNKING_BREADCRUMB_TARGET");
+        }
+    }
+
+    #[test]
+    fn breadcrumb_target_env_sets_chunking_field() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_breadcrumb_target_env();
+        unsafe { std::env::set_var("XBERG_CHUNKING_BREADCRUMB_TARGET", "metadata") };
+        let mut config = ExtractionConfig::default();
+        config
+            .apply_env_overrides()
+            .expect("valid breadcrumb target should apply");
+        assert_eq!(
+            config.chunking.as_ref().unwrap().breadcrumb_target,
+            BreadcrumbTarget::Metadata
+        );
+        clear_breadcrumb_target_env();
+    }
+
+    #[test]
+    fn breadcrumb_target_env_rejects_invalid_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_breadcrumb_target_env();
+        unsafe { std::env::set_var("XBERG_CHUNKING_BREADCRUMB_TARGET", "nonsense") };
+        let mut config = ExtractionConfig::default();
+        let err = config
+            .apply_env_overrides()
+            .expect_err("invalid breadcrumb target should be rejected");
+        assert!(matches!(err, XbergError::Validation { .. }));
+        clear_breadcrumb_target_env();
+    }
+
+    fn clear_paddle_model_env() {
+        unsafe {
+            std::env::remove_var("XBERG_OCR_MODEL_VERSION");
+            std::env::remove_var("XBERG_OCR_MODEL_TIER");
+        }
+    }
+
+    #[test]
+    fn paddle_model_env_vars_populate_paddle_ocr_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_paddle_model_env();
+        unsafe {
+            std::env::set_var("XBERG_OCR_MODEL_VERSION", "pp-ocrv5");
+            std::env::set_var("XBERG_OCR_MODEL_TIER", "server");
+        }
+        let mut config = ExtractionConfig::default();
+        config
+            .apply_env_overrides()
+            .expect("paddle model env vars should apply");
+        let paddle = config
+            .ocr
+            .as_ref()
+            .and_then(|o| o.paddle_ocr_config.as_ref())
+            .expect("paddle_ocr_config should be populated");
+        assert_eq!(paddle.get("model_version").and_then(|v| v.as_str()), Some("pp-ocrv5"));
+        assert_eq!(paddle.get("model_tier").and_then(|v| v.as_str()), Some("server"));
+        clear_paddle_model_env();
+    }
+
+    #[test]
+    fn paddle_model_env_wins_over_existing_config_and_preserves_other_keys() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_paddle_model_env();
+        unsafe { std::env::set_var("XBERG_OCR_MODEL_VERSION", "pp-ocrv5") };
+        let mut config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                paddle_ocr_config: Some(serde_json::json!({
+                    "model_version": "pp-ocrv6",
+                    "drop_score": 0.7,
+                })),
+                ..OcrConfig::default()
+            }),
+            ..ExtractionConfig::default()
+        };
+        config
+            .apply_env_overrides()
+            .expect("paddle model env override should apply");
+        let paddle = config.ocr.as_ref().unwrap().paddle_ocr_config.as_ref().unwrap();
+        assert_eq!(paddle.get("model_version").and_then(|v| v.as_str()), Some("pp-ocrv5"));
+        assert_eq!(paddle.get("drop_score").and_then(|v| v.as_f64()), Some(0.7));
+        assert!(paddle.get("model_tier").is_none());
+        clear_paddle_model_env();
+    }
+
+    fn clear_csv_env() {
+        unsafe {
+            std::env::remove_var("XBERG_CSV_DELIMITER");
+            std::env::remove_var("XBERG_CSV_COMMENT_PREFIXES");
+        }
+    }
+
+    #[test]
+    fn csv_delimiter_env_sets_csv_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_csv_env();
+        unsafe { std::env::set_var("XBERG_CSV_DELIMITER", ";") };
+        let mut config = ExtractionConfig::default();
+        config.apply_env_overrides().expect("valid delimiter should apply");
+        assert_eq!(config.csv.as_ref().unwrap().delimiter.as_deref(), Some(";"));
+        clear_csv_env();
+    }
+
+    #[test]
+    fn csv_delimiter_env_rejects_multi_byte_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_csv_env();
+        unsafe { std::env::set_var("XBERG_CSV_DELIMITER", "::") };
+        let mut config = ExtractionConfig::default();
+        let err = config
+            .apply_env_overrides()
+            .expect_err("multi-byte delimiter should be rejected");
+        assert!(matches!(err, XbergError::Validation { .. }));
+        clear_csv_env();
+    }
+
+    #[test]
+    fn csv_comment_prefixes_env_sets_csv_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_csv_env();
+        unsafe { std::env::set_var("XBERG_CSV_COMMENT_PREFIXES", "#, //") };
+        let mut config = ExtractionConfig::default();
+        config
+            .apply_env_overrides()
+            .expect("valid comment prefixes should apply");
+        assert_eq!(
+            config.csv.as_ref().unwrap().comment_prefixes,
+            vec!["#".to_string(), "//".to_string()]
+        );
+        clear_csv_env();
+    }
+
+    #[test]
+    fn csv_comment_prefixes_env_rejects_empty_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_csv_env();
+        unsafe { std::env::set_var("XBERG_CSV_COMMENT_PREFIXES", " , ") };
+        let mut config = ExtractionConfig::default();
+        let err = config
+            .apply_env_overrides()
+            .expect_err("blank comment prefixes should be rejected");
+        assert!(matches!(err, XbergError::Validation { .. }));
+        clear_csv_env();
     }
 }

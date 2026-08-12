@@ -1,15 +1,3 @@
-#![cfg_attr(
-    not(any(feature = "build-tesseract", feature = "build-tesseract-wasm")),
-    allow(unused_variables, dead_code)
-)]
-#![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::missing_transmute_annotations)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::new_without_default)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-#![allow(clippy::cmp_null)]
-#![allow(missing_docs)]
-
 //! # xberg-tesseract
 //!
 //! `xberg-tesseract` provides safe Rust bindings for Tesseract OCR with built-in compilation
@@ -21,7 +9,11 @@
 //!
 //! Here's a basic example of how to use `xberg-tesseract`:
 //!
-//! ```rust
+//! `no_run` like every other example in this crate: it calls into Tesseract, which needs
+//! `eng.traineddata` present under `TESSDATA_PREFIX`. Executing it fails with `InitError`
+//! on any machine without the language pack installed, which is most CI runners.
+//!
+//! ```rust,no_run
 //! use std::path::PathBuf;
 //! use std::error::Error;
 //! use xberg_tesseract::TesseractAPI;
@@ -128,6 +120,21 @@
 //!     Ok(())
 //! }
 //! ```
+
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(test, allow(clippy::print_stdout, clippy::print_stderr))]
+#![cfg_attr(
+    not(any(feature = "build-tesseract", feature = "build-tesseract-wasm")),
+    allow(unused_variables, dead_code)
+)]
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::missing_transmute_annotations)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::cmp_null)]
+#![allow(missing_docs)]
+
 /// Declare FFI functions with `extern "C-unwind"` on native targets (to catch
 /// C++ exceptions from Tesseract/Leptonica) and `extern "C"` on WASM (where
 /// the LLVM backend does not support `cleanupret` / C++ unwinding).
@@ -159,10 +166,6 @@ macro_rules! ffi_extern {
 pub use error::{Result, TesseractError};
 mod error;
 
-// WASM: Override __cxa_atexit to be a no-op. WASI SDK's __cxa_atexit calls calloc during
-// C++ static initialization, which crashes because dlmalloc's heap isn't properly set up
-// for wasm32-unknown-unknown. Since WASM modules never exit normally, atexit handlers
-// are unnecessary.
 #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
 mod wasm_compat {
     #[unsafe(no_mangle)]
@@ -171,11 +174,11 @@ mod wasm_compat {
         _arg: *mut core::ffi::c_void,
         _dso_handle: *mut core::ffi::c_void,
     ) -> i32 {
-        0 // Success, but don't actually register anything
+        0
     }
 }
 mod page_iterator;
-pub use page_iterator::{BlockInfo, PageIterator, ParaInfo};
+pub use page_iterator::{BlockInfo, PageIterator, ParaInfo, ParagraphExtractionOutcome};
 mod result_iterator;
 pub use result_iterator::{FontAttributes, ResultIterator, WordData};
 mod choice_iterator;

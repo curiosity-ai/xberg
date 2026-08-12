@@ -9,10 +9,11 @@
 		"size_class": "small",
 		"requires_ocr": true,
 		"languages": ["ja"],
+		"ocr_language": "jpn_vert",
 		"text_orientation": "vertical"
 	},
 	"ground_truth": {
 		"text_file": "../../../test_documents/ground_truth/jpeg/image_text.md",
-		"source": "mistral-pixtral"
+		"source": "manual"
 	}
 }

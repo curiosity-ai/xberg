@@ -7,6 +7,12 @@
 use super::geometry::Rect;
 use super::types::{LayoutHint, LayoutHintClass, PdfParagraph};
 
+const COMPARABLE_CONTAINMENT_TOLERANCE: f32 = 0.05;
+const MAX_PROSE_CODE_SYNTAX_RATIO: f64 = 0.03;
+const CODE_HEADING_OVERRIDE_CONFIDENCE: f32 = 0.8;
+const MIN_STRUCTURED_CODE_SYNTAX_CHARACTERS: usize = 3;
+const MIN_CODE_ASSIGNMENT_OPERATORS: usize = 2;
+
 /// Apply layout detection overrides to classified paragraphs.
 ///
 /// Uses two matching strategies:
@@ -25,24 +31,52 @@ pub(crate) fn apply_layout_overrides(
     min_containment: f32,
     body_font_size: Option<f32>,
 ) {
+    let _ = apply_layout_overrides_with_matches(paragraphs, hints, min_confidence, min_containment, body_font_size);
+}
+
+/// Record spatial layout classes without changing native paragraph semantics.
+///
+/// This supports consumers that need region provenance (for example guarded
+/// table-spill cleanup) while preserving font- and tag-derived headings, lists,
+/// code, and formulas.
+#[cfg(feature = "layout-detection")]
+pub(crate) fn annotate_layout_classes(
+    paragraphs: &mut [PdfParagraph],
+    hints: &[LayoutHint],
+    min_confidence: f32,
+    min_containment: f32,
+) {
+    for paragraph in paragraphs {
+        if let Some((_, hint, _)) = best_spatial_match(paragraph, hints, min_confidence, min_containment) {
+            paragraph.layout_class = Some(hint.class_name);
+        }
+    }
+}
+
+pub(crate) fn apply_layout_overrides_with_matches(
+    paragraphs: &mut [PdfParagraph],
+    hints: &[LayoutHint],
+    min_confidence: f32,
+    min_containment: f32,
+    body_font_size: Option<f32>,
+) -> Vec<Option<usize>> {
     if hints.is_empty() {
-        return;
+        return vec![None; paragraphs.len()];
     }
 
-    // Separate paragraphs into those with and without positional data.
     let has_any_positions = paragraphs.iter().any(|p| compute_paragraph_bbox(p).is_some());
-
-    if has_any_positions {
-        // Spatial matching for paragraphs with positional data
-        apply_spatial_overrides(paragraphs, hints, min_confidence, min_containment, body_font_size);
+    let matches = if has_any_positions {
+        apply_spatial_overrides_with_matches(paragraphs, hints, min_confidence, min_containment, body_font_size)
     } else {
-        // For structure tree pages (no positional data), the structure tree's own
-        // font-size classification is more reliable than proportional position matching.
-        // Proportional matching can misalign paragraphs that reorder between
-        // font-clustering and RT-DETR detection. Skip applying layout hints here.
         tracing::debug!("Skipping proportional layout overrides: structure tree pages use font-size classification");
-    }
+        vec![None; paragraphs.len()]
+    };
 
+    trace_layout_summary(paragraphs);
+    matches
+}
+
+fn trace_layout_summary(paragraphs: &[PdfParagraph]) {
     tracing::debug!(
         total = paragraphs.len(),
         headings = paragraphs.iter().filter(|p| p.heading_level.is_some()).count(),
@@ -70,45 +104,17 @@ pub(crate) fn apply_layout_overrides(
 /// to short paragraphs (≤200 chars), ListItem hints to list marker prefixes. This
 /// prevents false promotion of long body paragraphs that happen to spatially overlap
 /// a heading hint.
-fn apply_spatial_overrides(
+fn apply_spatial_overrides_with_matches(
     paragraphs: &mut [PdfParagraph],
     hints: &[LayoutHint],
     min_confidence: f32,
     min_containment: f32,
     body_font_size: Option<f32>,
-) {
-    let confident_hints: Vec<&LayoutHint> = hints.iter().filter(|h| h.confidence >= min_confidence).collect();
-
+) -> Vec<Option<usize>> {
+    let mut matches = vec![None; paragraphs.len()];
     for (para_idx, para) in paragraphs.iter_mut().enumerate() {
-        let para_bbox = match compute_paragraph_bbox(para) {
-            Some(bbox) => bbox,
-            None => continue,
-        };
-
-        if para_bbox.height() <= 0.0 {
-            continue;
-        }
-
-        // Try 2D containment first (most precise).
-        let best_2d = confident_hints
-            .iter()
-            .filter_map(|hint| {
-                let hint_rect = Rect::from_lbrt(hint.left, hint.bottom, hint.right, hint.top);
-                let containment = para_bbox.intersection_over_self(&hint_rect);
-                if containment >= min_containment {
-                    // For promotion classes, validate text content matches hint type
-                    let para_text = paragraph_text(para);
-                    if !matches_hint_text(hint, &para_text) {
-                        return None;
-                    }
-                    Some((*hint, containment))
-                } else {
-                    None
-                }
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-
-        if let Some((hint, containment)) = best_2d {
+        if let Some((hint_index, hint, containment)) = best_spatial_match(para, hints, min_confidence, min_containment)
+        {
             tracing::trace!(
                 para_idx,
                 hint_class = ?hint.class_name,
@@ -116,8 +122,89 @@ fn apply_spatial_overrides(
                 "spatial hint match"
             );
             apply_hint_to_paragraph(para, hint, body_font_size);
+            matches[para_idx] = Some(hint_index);
         }
     }
+    matches
+}
+
+fn best_spatial_match<'a>(
+    paragraph: &PdfParagraph,
+    hints: &'a [LayoutHint],
+    min_confidence: f32,
+    min_containment: f32,
+) -> Option<(usize, &'a LayoutHint, f32)> {
+    let paragraph_bbox = compute_paragraph_bbox(paragraph)?;
+    if paragraph_bbox.height() <= 0.0 {
+        return None;
+    }
+    let paragraph_text = paragraph_text(paragraph);
+    let matches = hints.iter().enumerate().filter_map(|(index, hint)| {
+        let hint_rect = Rect::from_lbrt(hint.left, hint.bottom, hint.right, hint.top);
+        let containment = paragraph_bbox.intersection_over_self(&hint_rect);
+        (hint.confidence >= min_confidence
+            && containment >= min_containment
+            && matches_hint_text(hint, &paragraph_text))
+        .then_some((index, hint, containment))
+    });
+    let candidates = matches.collect::<Vec<_>>();
+    let maximum = candidates
+        .iter()
+        .map(|(_, _, containment)| *containment)
+        .max_by(f32::total_cmp)?;
+    candidates
+        .into_iter()
+        .filter(|(_, _, containment)| maximum - containment <= COMPARABLE_CONTAINMENT_TOLERANCE)
+        .max_by(compare_spatial_matches)
+}
+
+fn compare_spatial_matches(a: &(usize, &LayoutHint, f32), b: &(usize, &LayoutHint, f32)) -> std::cmp::Ordering {
+    semantic_hint_priority(a.1.class_name)
+        .cmp(&semantic_hint_priority(b.1.class_name))
+        .then_with(|| a.1.confidence.total_cmp(&b.1.confidence))
+        .then_with(|| hint_area(b.1).total_cmp(&hint_area(a.1)))
+        .then_with(|| a.2.total_cmp(&b.2))
+        .then_with(|| layout_hint_class_rank(a.1.class_name).cmp(&layout_hint_class_rank(b.1.class_name)))
+        .then_with(|| a.1.left.total_cmp(&b.1.left))
+        .then_with(|| a.1.bottom.total_cmp(&b.1.bottom))
+        .then_with(|| a.1.right.total_cmp(&b.1.right))
+        .then_with(|| a.1.top.total_cmp(&b.1.top))
+}
+
+fn semantic_hint_priority(class_name: LayoutHintClass) -> u8 {
+    match class_name {
+        LayoutHintClass::Title
+        | LayoutHintClass::SectionHeader
+        | LayoutHintClass::ListItem
+        | LayoutHintClass::Caption
+        | LayoutHintClass::Footnote => 2,
+        _ => 1,
+    }
+}
+
+fn layout_hint_class_rank(class_name: LayoutHintClass) -> u8 {
+    match class_name {
+        LayoutHintClass::Title => 0,
+        LayoutHintClass::SectionHeader => 1,
+        LayoutHintClass::Code => 2,
+        LayoutHintClass::Formula => 3,
+        LayoutHintClass::ListItem => 4,
+        LayoutHintClass::Caption => 5,
+        LayoutHintClass::Footnote => 6,
+        LayoutHintClass::PageHeader => 7,
+        LayoutHintClass::PageFooter => 8,
+        LayoutHintClass::Table => 9,
+        LayoutHintClass::Picture => 10,
+        LayoutHintClass::DocumentIndex => 11,
+        LayoutHintClass::Form => 12,
+        LayoutHintClass::KeyValueRegion => 13,
+        LayoutHintClass::Text => 14,
+        LayoutHintClass::Other => 15,
+    }
+}
+
+fn hint_area(hint: &LayoutHint) -> f32 {
+    (hint.right - hint.left).max(0.0) * (hint.top - hint.bottom).max(0.0)
 }
 
 /// Check if text matches the content expectations of a layout hint class.
@@ -140,8 +227,41 @@ fn matches_hint_text(hint: &LayoutHint, para_text: &str) -> bool {
                 || trimmed.starts_with('*')
                 || trimmed.starts_with('·')
         }
-        _ => true, // no text constraint
+        L::Formula => has_formula_evidence(para_text),
+        _ => true,
     }
+}
+
+fn has_formula_evidence(text: &str) -> bool {
+    let total_chars = text.chars().count();
+    if total_chars == 0 {
+        return false;
+    }
+    let math_chars = text
+        .chars()
+        .filter(|character| {
+            matches!(
+                character,
+                '+' | '='
+                    | '^'
+                    | '∑'
+                    | '∫'
+                    | '∏'
+                    | '√'
+                    | '∞'
+                    | '≤'
+                    | '≥'
+                    | '≠'
+                    | '≈'
+                    | '±'
+                    | '×'
+                    | '÷'
+                    | '∂'
+                    | '∇'
+            )
+        })
+        .count();
+    math_chars >= 3 || (math_chars as f64 / total_chars as f64) >= 0.15
 }
 
 /// Extract full text from a paragraph.
@@ -158,110 +278,6 @@ fn paragraph_text(para: &PdfParagraph) -> String {
     }
 }
 
-/// Proportional matching: match paragraphs to hints using range-overlap.
-///
-/// Structure tree paragraphs have no positional data but are in reading order
-/// (top-to-bottom). Layout hints have PDF coordinates with known bounding boxes.
-///
-/// Strategy:
-/// 1. Sort hints by vertical position (top-to-bottom in reading order).
-/// 2. Each paragraph occupies a fractional range `[i/n, (i+1)/n]` of the page.
-/// 3. Each hint occupies a fractional range `[(page_height - top)/page_height, (page_height - bottom)/page_height]`.
-/// 4. Match each paragraph to the hint with the most fractional overlap.
-///
-/// Structure tree paragraphs lack positional data so we cannot do spatial matching.
-/// We use conservative fractional-overlap matching: each paragraph is assigned a
-/// fraction of the page [i/n, (i+1)/n] and matched against hint bounding boxes
-/// converted to page fractions. Only high-confidence, high-overlap matches are applied.
-///
-/// Note: Currently unused in favor of font-size classification on structure-tree pages,
-/// but retained for potential future use or debugging.
-#[allow(dead_code)]
-fn apply_proportional_overrides(paragraphs: &mut [PdfParagraph], hints: &[LayoutHint], min_confidence: f32) {
-    let n = paragraphs.len();
-    if n == 0 {
-        return;
-    }
-
-    let confident_hints: Vec<&LayoutHint> = hints.iter().filter(|h| h.confidence >= min_confidence).collect();
-    if confident_hints.is_empty() {
-        return;
-    }
-
-    let page_height = hints.iter().map(|h| h.top).fold(0.0_f32, f32::max);
-    if page_height <= 0.0 {
-        return;
-    }
-
-    tracing::debug!(
-        paragraph_count = n,
-        hint_count = confident_hints.len(),
-        page_height,
-        "Proportional matching: structure tree paragraphs without positions"
-    );
-
-    // Precompute each hint's fractional range on the page.
-    let hint_ranges: Vec<(f32, f32, &LayoutHint)> = confident_hints
-        .iter()
-        .map(|h| {
-            let frac_start = (page_height - h.top) / page_height;
-            let frac_end = (page_height - h.bottom) / page_height;
-            (frac_start.max(0.0), frac_end.min(1.0), *h)
-        })
-        .collect();
-
-    for (i, para) in paragraphs.iter_mut().enumerate() {
-        let para_start = i as f32 / n as f32;
-        let para_end = (i as f32 + 1.0) / n as f32;
-
-        let best = hint_ranges
-            .iter()
-            .filter_map(|&(h_start, h_end, hint)| {
-                let overlap_start = para_start.max(h_start);
-                let overlap_end = para_end.min(h_end);
-                let overlap = (overlap_end - overlap_start).max(0.0);
-                if overlap > 0.0 { Some((hint, overlap)) } else { None }
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-
-        if let Some((hint, overlap)) = best {
-            let para_span = para_end - para_start;
-            let overlap_frac = if para_span > 0.0 { overlap / para_span } else { 0.0 };
-
-            match hint.class_name {
-                LayoutHintClass::PageHeader if i == 0 && overlap_frac > 0.25 => {
-                    apply_hint_to_paragraph(para, hint, None);
-                }
-                LayoutHintClass::PageFooter if i == n - 1 && overlap_frac > 0.25 => {
-                    apply_hint_to_paragraph(para, hint, None);
-                }
-                LayoutHintClass::SectionHeader | LayoutHintClass::Title
-                    if para.heading_level.is_none() && !para.is_code_block && overlap_frac > 0.3 =>
-                {
-                    para.is_list_item = false;
-                    let text: String = if !para.text.is_empty() {
-                        para.text.clone()
-                    } else {
-                        para.lines
-                            .iter()
-                            .flat_map(|l| l.segments.iter())
-                            .map(|s| s.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    };
-                    let word_count = text.split_whitespace().count();
-                    if word_count <= super::constants::MAX_HEADING_WORD_COUNT && !is_separator_text(&text) {
-                        let level = infer_heading_level_from_text(&text, hint.class_name);
-                        para.heading_level = Some(level);
-                        para.layout_class = Some(hint.class_name);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 /// Check if text is a separator/filler line (dashes, underscores, tildes, etc.)
 /// that should never be classified as a heading.
 pub(super) fn is_separator_text(text: &str) -> bool {
@@ -271,13 +287,9 @@ pub(super) fn is_separator_text(text: &str) -> bool {
     }
     let total = trimmed.chars().count();
     let alnum = trimmed.chars().filter(|c| c.is_alphanumeric()).count();
-    // Pure separator: no alphanumeric characters at all
     if alnum == 0 {
         return true;
     }
-    // Mostly separator: very few alphanumeric chars among filler (dashes, underscores, tildes, etc.)
-    // e.g. "------------- M W _ _ _ _ _ _" or "---~ ---------"
-    // Require at least 6 total chars and <15% alphanumeric ratio
     total >= 6 && (alnum as f64 / total as f64) < 0.15
 }
 
@@ -295,36 +307,28 @@ pub(super) fn infer_heading_level_from_text(text: &str, hint_class: LayoutHintCl
 
     let trimmed = text.trim();
 
-    // Check for section numbering pattern at the start.
-    // Supports both numeric ("3.2") and alphabetic ("A.", "B.1") prefixes.
     let first_char = trimmed.chars().next().unwrap_or(' ');
     let is_alpha_prefix = first_char.is_ascii_alphabetic()
         && trimmed.len() >= 2
         && matches!(trimmed.as_bytes().get(1), Some(b'.' | b')' | b' '));
 
     let numbering_end = if is_alpha_prefix {
-        // Alphabetic prefix: "A." or "A.1" or "A.1.2"
-        // Start after the letter, continue through digits and dots
         let after_letter = &trimmed[1..];
         let rest_end = after_letter
             .find(|c: char| !c.is_ascii_digit() && c != '.')
             .unwrap_or(0);
-        1 + rest_end // include the letter
+        1 + rest_end
     } else {
-        // Numeric prefix: "3.2.1"
         trimmed.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(0)
     };
 
     if numbering_end == 0 {
-        // No numbering → default H2 for SectionHeader
         return 2;
     }
 
     let numbering = &trimmed[..numbering_end];
-    // Count dots to determine depth: "3" → 0 dots → H2, "3.2" → 1 dot → H3
     let dot_count = numbering.chars().filter(|&c| c == '.').count();
 
-    // Trailing dot (e.g., "3." or "A.") doesn't count as depth indicator
     let effective_dots = if numbering.ends_with('.') {
         dot_count.saturating_sub(1)
     } else {
@@ -332,9 +336,9 @@ pub(super) fn infer_heading_level_from_text(text: &str, hint_class: LayoutHintCl
     };
 
     match effective_dots {
-        0 => 2, // "1 Introduction" or "A Proofs" → H2
-        1 => 3, // "3.2 AI models" or "A.1 Details" → H3
-        _ => 4, // "3.2.1 Details" or "A.1.2 Sub" → H4
+        0 => 2,
+        1 => 3,
+        _ => 4,
     }
 }
 
@@ -353,7 +357,9 @@ pub(super) fn apply_hint_to_paragraph(para: &mut PdfParagraph, hint: &LayoutHint
 
     para.layout_class = Some(hint.class_name);
 
-    // Get text from full-text path or segment path.
+    let debug = super::layout_debug::layout_debug_flags();
+    let old_heading = para.heading_level;
+
     let para_text: String = if !para.text.is_empty() {
         para.text.clone()
     } else {
@@ -367,66 +373,80 @@ pub(super) fn apply_hint_to_paragraph(para: &mut PdfParagraph, hint: &LayoutHint
     let word_count = para_text.split_whitespace().count();
     let is_sep = is_separator_text(&para_text);
 
+    // Independent heading evidence: font clearly above body, bold weight, or a recognized
+    // section-numbering pattern. Used to veto destructive demotion (A2) and for override
+    // logging. Computed once so the guard and the log block agree. ~keep
+    let font_above_body = body_font_size.is_some_and(|body| body > 0.0 && para.dominant_font_size > body + 0.5);
+    let has_strong_heading_evidence =
+        font_above_body || para.is_bold || super::classify::is_section_pattern(para_text.trim());
+
     match hint.class_name {
         LayoutHintClass::Title
-            if !is_sep
+            if !debug.no_promote
+                && !is_sep
                 && !para.is_list_item
                 && (para.heading_level.is_none() || hint.confidence >= 0.7)
-                    && word_count <= super::constants::MAX_HEADING_WORD_COUNT => {
-                        para.heading_level = Some(1);
-                    }
+                && word_count <= super::constants::MAX_HEADING_WORD_COUNT =>
+        {
+            para.heading_level = Some(1);
+        }
         LayoutHintClass::SectionHeader
-            if !is_sep
+            if !debug.no_promote
+                && !is_sep
                 && !para.is_list_item
-                && (para.heading_level.is_none() || hint.confidence >= 0.7) => {
-                    let trimmed = para_text.trim();
-                    let too_long = word_count > super::constants::MAX_HEADING_WORD_COUNT;
-                    let ends_period = trimmed.ends_with('.')
-                        && !super::classify::is_section_pattern(trimmed);
-                    let ends_colon = trimmed.ends_with(':');
-                    let is_figure = super::regions::looks_like_figure_label(trimmed);
-                    let is_monospace = if !para.text.is_empty() {
-                        para.is_monospace_hint()
-                    } else {
-                        para.lines.iter().all(|l| l.is_monospace)
-                    };
-                    let text_level = infer_heading_level_from_text(&para_text, hint.class_name);
-                    // Guard: block unnumbered text near body font size (within
-                    // body-1.5pt to body+0.5pt). The layout model often misclassifies
-                    // bold body text as SectionHeader. Headings well below body size
-                    // (e.g., 8pt headings in 12pt body) pass through.
-                    //
-                    // Exception: when the layout model has high confidence (>=0.7) AND
-                    // the paragraph is bold, the near-body guard is relaxed — bold
-                    // formatting at body size is a legitimate heading style. Only block
-                    // if the text looks like a full sentence (ends with period AND >8 words).
-                    let near_body = body_font_size
-                        .is_some_and(|body| body > 0.0
-                            && para.dominant_font_size >= body - 1.5
-                            && para.dominant_font_size <= body + 0.5);
-                    let is_unnumbered = text_level == 2;
-                    let high_confidence_bold = hint.confidence >= 0.7 && para.is_bold;
-                    let looks_like_sentence = trimmed.ends_with('.') && word_count > 8;
-                    let body_size_guard = near_body && is_unnumbered
-                        && (!high_confidence_bold || looks_like_sentence);
-                    if !too_long && !ends_period && !ends_colon && !is_figure && !is_monospace && !body_size_guard {
-                        para.heading_level = Some(text_level);
-                    }
-                }
-        LayoutHintClass::Code => {
-            // Guard: reject Code classification for text that is clearly prose.
-            // The layout model sometimes misclassifies body text as code.
-            let is_prose = {
-                let sentence_endings = para_text.chars().filter(|&c| c == '.' || c == '!' || c == '?' || c == ',').count();
-                let syntax_chars = para_text.chars().filter(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ';' | '=' | '<' | '>' | '|' | '@' | '#' | '$')).count();
-                let syntax_ratio = if para_text.is_empty() { 0.0 } else { syntax_chars as f64 / para_text.len() as f64 };
-                sentence_endings >= 2 && syntax_ratio < 0.03 && word_count > 15
+                && (para.heading_level.is_none() || hint.confidence >= 0.7) =>
+        {
+            let trimmed = para_text.trim();
+            let too_long = word_count > super::constants::MAX_HEADING_WORD_COUNT;
+            let ends_period = trimmed.ends_with('.') && !super::classify::is_section_pattern(trimmed);
+            let ends_colon = trimmed.ends_with(':');
+            let is_figure = super::regions::looks_like_figure_label(trimmed);
+            let is_monospace = if !para.text.is_empty() {
+                para.is_monospace_hint()
+            } else {
+                para.lines.iter().all(|l| l.is_monospace)
             };
-            // Guard: never reclassify a confident native list item as code.
-            // List-marker prefixes (·, •, 1., etc.) are strong text-level evidence that
-            // the paragraph is a list item, not a code block. The layout model cannot
-            // reliably distinguish these, so native classification wins (fixes #598).
-            if !is_prose && !para.is_list_item {
+            let text_level = infer_heading_level_from_text(&para_text, hint.class_name);
+            let near_body = body_font_size.is_some_and(|body| {
+                body > 0.0 && para.dominant_font_size >= body - 1.5 && para.dominant_font_size <= body + 0.5
+            });
+            let is_unnumbered = text_level == 2;
+            let high_confidence_bold = hint.confidence >= 0.7 && para.is_bold;
+            let looks_like_sentence = trimmed.ends_with('.') && word_count > 8;
+            let body_size_guard = near_body && is_unnumbered && (!high_confidence_bold || looks_like_sentence);
+            if !too_long && !ends_period && !ends_colon && !is_figure && !is_monospace && !body_size_guard {
+                para.heading_level = Some(text_level);
+            }
+        }
+        LayoutHintClass::Code => {
+            let sentence_endings = para_text
+                .chars()
+                .filter(|&c| c == '.' || c == '!' || c == '?' || c == ',')
+                .count();
+            let syntax_chars = para_text
+                .chars()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        '{' | '}' | '(' | ')' | '[' | ']' | ';' | '=' | '<' | '>' | '|' | '@' | '#' | '$'
+                    )
+                })
+                .count();
+            let syntax_ratio = if para_text.is_empty() {
+                0.0
+            } else {
+                syntax_chars as f64 / para_text.len() as f64
+            };
+            let is_prose = sentence_endings >= 2 && syntax_ratio < MAX_PROSE_CODE_SYNTAX_RATIO && word_count > 15;
+            let assignment_operators = para_text.chars().filter(|&character| character == '=').count();
+            let has_structured_code_syntax = syntax_chars >= MIN_STRUCTURED_CODE_SYNTAX_CHARACTERS
+                && (para_text.chars().any(|character| matches!(character, '{' | '}' | ';'))
+                    || assignment_operators >= MIN_CODE_ASSIGNMENT_OPERATORS);
+            let preserves_heading = para.heading_level.is_some()
+                && has_strong_heading_evidence
+                && hint.confidence < CODE_HEADING_OVERRIDE_CONFIDENCE
+                && !has_structured_code_syntax;
+            if !is_prose && !preserves_heading && !para.is_list_item {
                 para.is_code_block = true;
                 para.heading_level = None;
             }
@@ -435,53 +455,48 @@ pub(super) fn apply_hint_to_paragraph(para: &mut PdfParagraph, hint: &LayoutHint
             para.is_formula = true;
             para.heading_level = None;
         }
-        LayoutHintClass::ListItem
-            // Only apply list-item styling if confidence is high. On OCR-rendered pages,
-            // low-confidence list classifications can drop marker content (category E).
-            if hint.confidence >= 0.8 => {
-                para.is_list_item = true;
-            }
-        LayoutHintClass::PageHeader | LayoutHintClass::PageFooter
-            // Only mark as furniture if confidence is high. On OCR-rendered pages,
-            // furniture detection is unreliable and can drop valid body content
-            // (fixes #936 category B/D: total output failure, PageHeader suppression).
-            //
-            // Guard: never suppress a paragraph that native classification already
-            // identified as a heading. The layout model sometimes misidentifies a
-            // document title (H1) as a PageHeader; the native heading classification
-            // is more reliable for short prominent text (fixes #905).
-            if para.heading_level.is_none() => {
-                para.is_page_furniture = hint.confidence >= 0.8;
-            }
-        LayoutHintClass::Picture
-            // Guard: never suppress a paragraph that native classification already
-            // identified as a heading. The layout model sometimes misidentifies a
-            // document title (H1) as a Picture region (e.g., large centered text
-            // that visually resembles a caption or diagram label). The native
-            // heading classification is more reliable for short prominent text
-            // (fixes #905).
-            if para.heading_level.is_none() => {
-                // Text classified as Picture by layout model is figure-internal
-                // text (diagram labels, axis text, etc.) — suppress from body output.
-                para.is_page_furniture = true;
-            }
+        LayoutHintClass::ListItem if hint.confidence >= 0.8 => {
+            para.is_list_item = true;
+        }
+        LayoutHintClass::PageHeader | LayoutHintClass::PageFooter if para.heading_level.is_none() => {
+            para.is_page_furniture = hint.confidence >= 0.8;
+        }
+        LayoutHintClass::Picture if para.heading_level.is_none() => {
+            para.is_page_furniture = true;
+        }
         LayoutHintClass::Text | LayoutHintClass::Caption | LayoutHintClass::Footnote
-            // Layout model says this is body text, not a heading.
-            // Demote font-size-classified headings when layout has high confidence.
-            if para.heading_level.is_some() && hint.confidence >= 0.7 => {
-                tracing::trace!(
-                    hint_class = ?hint.class_name,
-                    hint_confidence = hint.confidence,
-                    old_heading_level = ?para.heading_level,
-                    "Demoting heading: layout model classifies as body text"
-                );
-                para.heading_level = None;
-            }
+            if !debug.no_demote
+                && para.heading_level.is_some()
+                && !has_strong_heading_evidence
+                && hint.confidence >= super::constants::HEADING_DEMOTE_CONFIDENCE =>
+        {
+            tracing::trace!(
+                hint_class = ?hint.class_name,
+                hint_confidence = hint.confidence,
+                old_heading_level = ?para.heading_level,
+                "Demoting heading: layout model classifies as body text"
+            );
+            para.heading_level = None;
+        }
         _ => {}
     }
-}
 
-// ParaBBox replaced by geometry::Rect.
+    if debug.log_overrides {
+        let trimmed = para_text.trim();
+        tracing::info!(
+            hint_class = ?hint.class_name,
+            confidence = hint.confidence,
+            old_heading = ?old_heading,
+            new_heading = ?para.heading_level,
+            font_above_body,
+            is_bold = para.is_bold,
+            has_strong_heading_evidence,
+            words = word_count,
+            text = %trimmed.chars().take(60).collect::<String>(),
+            "layout override"
+        );
+    }
+}
 
 /// Compute a paragraph's bounding box from its line segments' positional data.
 ///
@@ -496,7 +511,6 @@ pub(super) fn apply_hint_to_paragraph(para: &mut PdfParagraph, hint: &LayoutHint
 /// - top = baseline + height (covers ascenders)
 /// - bottom = baseline (descent is small and usually within the layout hint's margin)
 fn compute_paragraph_bbox(para: &PdfParagraph) -> Option<Rect> {
-    // Prefer block-level bbox from structure tree (accurate block bounds).
     if let Some((left, bottom, right, top)) = para.block_bbox
         && right > left
         && top > bottom
@@ -504,7 +518,6 @@ fn compute_paragraph_bbox(para: &PdfParagraph) -> Option<Rect> {
         return Some(Rect::from_lbrt(left, bottom, right, top));
     }
 
-    // Fall back to computing bbox from segment positions (heuristic path).
     let mut left = f32::MAX;
     let mut right = f32::MIN;
     let mut bottom = f32::MAX;
@@ -513,14 +526,12 @@ fn compute_paragraph_bbox(para: &PdfParagraph) -> Option<Rect> {
 
     for line in &para.lines {
         for seg in &line.segments {
-            // Skip segments with no positional data
             if seg.x == 0.0 && seg.width == 0.0 && seg.y == 0.0 && seg.height == 0.0 {
                 continue;
             }
             has_data = true;
             left = left.min(seg.x);
             right = right.max(seg.x + seg.width);
-            // seg.y is the baseline. Text extends upward by ~font_size (seg.height).
             top = top.max(seg.y + seg.height);
             bottom = bottom.min(seg.y);
         }
@@ -532,8 +543,6 @@ fn compute_paragraph_bbox(para: &PdfParagraph) -> Option<Rect> {
         None
     }
 }
-
-// hint_containment removed — replaced by Rect::intersection_over_self().
 
 #[cfg(test)]
 mod tests {
@@ -553,6 +562,7 @@ mod tests {
             is_italic: false,
             is_monospace: false,
             baseline_y: y,
+            rotation_degrees: 0.0,
             assigned_role: None,
         }
     }
@@ -585,6 +595,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -601,8 +612,6 @@ mod tests {
             top,
         }
     }
-
-    // ── apply_layout_overrides tests (paragraph-level, used for struct tree path) ──
 
     #[test]
     fn test_title_override() {
@@ -630,11 +639,6 @@ mod tests {
 
     #[test]
     fn test_title_hint_does_not_promote_list_item_to_heading() {
-        // A natively-classified list item must not be promoted to H1 by a Title hint.
-        // Agenda-style numbered lists ("1. Ouverture de la séance") are misidentified
-        // as Title by the layout model; native list classification wins.
-        // Assembly corruption otherwise: list opened (is_list_item=true), heading
-        // emitted inside it, producing "  # 1\. Item text" (fixes #2023-06-20-PV).
         let mut para = make_para(50.0, 650.0, 300.0, 14.0);
         para.is_list_item = true;
         let mut paragraphs = vec![para];
@@ -652,8 +656,6 @@ mod tests {
 
     #[test]
     fn test_section_header_hint_does_not_promote_list_item_to_heading() {
-        // Same guard for SectionHeader: native list items must not be reclassified
-        // as headings by the layout model (symmetric with Title case).
         let mut para = make_para(50.0, 600.0, 300.0, 14.0);
         para.is_list_item = true;
         let mut paragraphs = vec![para];
@@ -687,7 +689,6 @@ mod tests {
 
     #[test]
     fn test_existing_heading_overridden_by_high_confidence() {
-        // High-confidence layout model overrides font-size heading level
         let mut paragraphs = vec![make_para(50.0, 750.0, 500.0, 20.0)];
         paragraphs[0].heading_level = Some(3);
         let hints = vec![make_hint(
@@ -699,24 +700,23 @@ mod tests {
             775.0,
         )];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
-        assert_eq!(paragraphs[0].heading_level, Some(2)); // SectionHeader → H2
+        assert_eq!(paragraphs[0].heading_level, Some(2));
     }
 
     #[test]
     fn test_existing_heading_preserved_low_confidence() {
-        // Low-confidence layout model does NOT override existing heading
         let mut paragraphs = vec![make_para(50.0, 750.0, 500.0, 20.0)];
         paragraphs[0].heading_level = Some(3);
         let hints = vec![make_hint(
             LayoutHintClass::SectionHeader,
-            0.6, // Below 0.7 threshold
+            0.6,
             40.0,
             745.0,
             560.0,
             775.0,
         )];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
-        assert_eq!(paragraphs[0].heading_level, Some(3)); // Preserved
+        assert_eq!(paragraphs[0].heading_level, Some(3));
     }
 
     #[test]
@@ -750,8 +750,6 @@ mod tests {
         );
     }
 
-    // ── infer_heading_level_from_text tests ──
-
     #[test]
     fn test_infer_heading_level_title() {
         assert_eq!(
@@ -762,7 +760,6 @@ mod tests {
 
     #[test]
     fn test_infer_heading_level_top_section() {
-        // "3 Processing pipeline" → H2
         assert_eq!(
             infer_heading_level_from_text("3 Processing pipeline", LayoutHintClass::SectionHeader),
             2
@@ -771,7 +768,6 @@ mod tests {
 
     #[test]
     fn test_infer_heading_level_subsection() {
-        // "3.2 AI models" → H3
         assert_eq!(
             infer_heading_level_from_text("3.2 AI models", LayoutHintClass::SectionHeader),
             3
@@ -780,7 +776,6 @@ mod tests {
 
     #[test]
     fn test_infer_heading_level_subsubsection() {
-        // "3.2.1 Details" → H4
         assert_eq!(
             infer_heading_level_from_text("3.2.1 Details", LayoutHintClass::SectionHeader),
             4
@@ -789,7 +784,6 @@ mod tests {
 
     #[test]
     fn test_infer_heading_level_trailing_dot() {
-        // "3. Processing" → trailing dot, still H2
         assert_eq!(
             infer_heading_level_from_text("3. Processing", LayoutHintClass::SectionHeader),
             2
@@ -798,21 +792,14 @@ mod tests {
 
     #[test]
     fn test_infer_heading_level_no_number() {
-        // "Layout Analysis Model" → no number, default H2
         assert_eq!(
             infer_heading_level_from_text("Layout Analysis Model", LayoutHintClass::SectionHeader),
             2
         );
     }
 
-    // ── proportional matching tests (structure tree path) ──
-
     #[test]
     fn test_no_positional_data_skips_layout_overrides() {
-        // When paragraphs have no positional data (structure-tree pages),
-        // proportional matching is skipped in favor of font-size classification.
-        // This is because the structure tree's own classification (font-clustering)
-        // is more reliable than proportional position matching.
         let lines = vec![make_line(vec![make_segment("text", 0.0, 0.0, 0.0, 0.0)])];
         let word_count = PdfParagraph::compute_word_count("", &lines);
         let mut paragraphs = vec![PdfParagraph {
@@ -826,29 +813,25 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
         }];
 
-        // Title hint is NOT applied when there's no positional data
         let hints = vec![make_hint(LayoutHintClass::Title, 0.9, 40.0, 0.0, 560.0, 760.0)];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
         assert_eq!(paragraphs[0].heading_level, None);
         assert_eq!(paragraphs[0].layout_class, None);
 
-        // Reset for next test
         paragraphs[0].heading_level = None;
         paragraphs[0].layout_class = None;
 
-        // PageHeader hint is also NOT applied when there's no positional data
         let hints = vec![make_hint(LayoutHintClass::PageHeader, 0.9, 40.0, 0.0, 560.0, 760.0)];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
         assert!(!paragraphs[0].is_page_furniture);
         assert_eq!(paragraphs[0].layout_class, None);
     }
-
-    // ── is_separator_text tests ──
 
     #[test]
     fn test_separator_pure_dashes() {
@@ -862,7 +845,6 @@ mod tests {
 
     #[test]
     fn test_separator_mixed_with_few_alnum() {
-        // < 15% alphanumeric among filler chars
         assert!(is_separator_text("------- M ---------"));
     }
 
@@ -879,15 +861,11 @@ mod tests {
 
     #[test]
     fn test_separator_short_symbols() {
-        // Short symbol strings are separators (no alphanumeric)
         assert!(is_separator_text("---"));
     }
 
-    // ── infer_heading_level_from_text additional tests ──
-
     #[test]
     fn test_infer_heading_level_alpha_prefix() {
-        // "A. Proofs" → alphabetic prefix → H2
         assert_eq!(
             infer_heading_level_from_text("A. Proofs", LayoutHintClass::SectionHeader),
             2
@@ -896,7 +874,6 @@ mod tests {
 
     #[test]
     fn test_infer_heading_level_alpha_subsection() {
-        // "A.1 Details" → 1 effective dot → H3
         assert_eq!(
             infer_heading_level_from_text("A.1 Details", LayoutHintClass::SectionHeader),
             3
@@ -905,14 +882,11 @@ mod tests {
 
     #[test]
     fn test_infer_heading_level_deep_subsection() {
-        // "1.2.3.4 Very deep" → 3 dots → H4 (capped at 4)
         assert_eq!(
             infer_heading_level_from_text("1.2.3.4 Very deep", LayoutHintClass::SectionHeader),
             4
         );
     }
-
-    // ── apply_hint_to_paragraph tests ──
 
     #[test]
     fn test_code_override() {
@@ -921,13 +895,12 @@ mod tests {
         let hints = vec![make_hint(LayoutHintClass::Code, 0.9, 40.0, 598.0, 400.0, 620.0)];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
         assert!(paragraphs[0].is_code_block);
-        assert_eq!(paragraphs[0].heading_level, None); // Heading cleared
+        assert_eq!(paragraphs[0].heading_level, None);
     }
 
     #[test]
     fn test_code_override_rejects_prose() {
         let mut para = make_para(50.0, 600.0, 300.0, 16.0);
-        // Set text to regular prose with multiple sentences
         para.text = "Duis autem vel eum iriure dolor in hendrerit in vulputate velit esse molestie consequat. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore.".to_string();
         let mut paragraphs = vec![para];
         let hints = vec![make_hint(LayoutHintClass::Code, 0.9, 40.0, 598.0, 400.0, 620.0)];
@@ -952,8 +925,55 @@ mod tests {
     }
 
     #[test]
+    fn test_code_override_preserves_strong_heading_below_confidence_threshold() {
+        for heading in ["Recent Change Log", "C# API", "API (v2)", "Results (n = 10)"] {
+            let mut para = make_para(50.0, 600.0, 300.0, 16.0);
+            para.text = heading.to_string();
+            para.heading_level = Some(2);
+            para.is_bold = true;
+            let mut paragraphs = vec![para];
+            let hints = [make_hint(LayoutHintClass::Code, 0.751_801_5, 40.0, 598.0, 400.0, 620.0)];
+
+            apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+
+            assert!(!paragraphs[0].is_code_block, "{heading}");
+            assert_eq!(paragraphs[0].heading_level, Some(2), "{heading}");
+        }
+    }
+
+    #[test]
+    fn test_code_override_accepts_structured_code_despite_strong_heading_evidence() {
+        let mut para = make_para(50.0, 600.0, 300.0, 16.0);
+        para.text = "function add(a, b) { return a + b; }".to_string();
+        para.heading_level = Some(2);
+        para.is_bold = true;
+        let mut paragraphs = vec![para];
+        let hints = [make_hint(LayoutHintClass::Code, 0.751_801_5, 40.0, 598.0, 400.0, 620.0)];
+
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+
+        assert!(paragraphs[0].is_code_block);
+        assert_eq!(paragraphs[0].heading_level, None);
+    }
+
+    #[test]
+    fn test_code_override_accepts_bold_code_without_native_heading() {
+        let mut para = make_para(50.0, 600.0, 300.0, 16.0);
+        para.text = "SELECT ID FROM USERS".to_string();
+        para.is_bold = true;
+        let mut paragraphs = vec![para];
+        let hints = [make_hint(LayoutHintClass::Code, 0.751_801_5, 40.0, 598.0, 400.0, 620.0)];
+
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+
+        assert!(paragraphs[0].is_code_block);
+        assert_eq!(paragraphs[0].heading_level, None);
+    }
+
+    #[test]
     fn test_formula_override() {
         let mut paragraphs = vec![make_para(50.0, 600.0, 300.0, 16.0)];
+        paragraphs[0].lines[0].segments[0].text = "E = mc^2".to_string();
         let hints = vec![make_hint(LayoutHintClass::Formula, 0.9, 40.0, 598.0, 400.0, 620.0)];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
         assert!(paragraphs[0].is_formula);
@@ -962,7 +982,6 @@ mod tests {
     #[test]
     fn test_list_item_override() {
         let mut paragraphs = vec![make_para(50.0, 600.0, 300.0, 16.0)];
-        // ListItem hint requires text starting with list marker
         paragraphs[0].text = "• Item one".to_string();
         let hints = vec![make_hint(LayoutHintClass::ListItem, 0.9, 40.0, 598.0, 400.0, 620.0)];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
@@ -984,7 +1003,67 @@ mod tests {
         paragraphs[0].heading_level = Some(2);
         let hints = vec![make_hint(LayoutHintClass::Text, 0.6, 40.0, 598.0, 400.0, 620.0)];
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
-        assert_eq!(paragraphs[0].heading_level, Some(2)); // Preserved, confidence < 0.7
+        assert_eq!(paragraphs[0].heading_level, Some(2));
+    }
+
+    #[test]
+    fn test_bold_heading_not_demoted_by_high_confidence_text_hint() {
+        // A2: a bold paragraph carries independent heading evidence, so even a
+        // high-confidence Text hint must not erase its heading level. ~keep
+        let mut paragraphs = vec![make_para(50.0, 600.0, 300.0, 16.0)];
+        paragraphs[0].heading_level = Some(2);
+        paragraphs[0].is_bold = true;
+        let hints = vec![make_hint(LayoutHintClass::Text, 0.95, 40.0, 598.0, 400.0, 620.0)];
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+        assert_eq!(
+            paragraphs[0].heading_level,
+            Some(2),
+            "bold heading must survive a high-confidence Text demotion hint"
+        );
+    }
+
+    #[test]
+    fn test_large_font_heading_not_demoted_by_text_hint() {
+        // A2: font clearly above body size is independent heading evidence. ~keep
+        let mut paragraphs = vec![make_para(50.0, 600.0, 300.0, 16.0)];
+        paragraphs[0].heading_level = Some(2);
+        paragraphs[0].dominant_font_size = 16.0;
+        let hints = vec![make_hint(LayoutHintClass::Text, 0.95, 40.0, 598.0, 400.0, 620.0)];
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, Some(10.0));
+        assert_eq!(
+            paragraphs[0].heading_level,
+            Some(2),
+            "font-above-body heading must survive a Text demotion hint"
+        );
+    }
+
+    #[test]
+    fn test_body_text_borderline_confidence_preserves_heading() {
+        // A2: demotion now requires confidence >= HEADING_DEMOTE_CONFIDENCE (0.85),
+        // above the old 0.7 bar. A 0.8 hint no longer erases a heading. ~keep
+        let mut paragraphs = vec![make_para(50.0, 600.0, 300.0, 16.0)];
+        paragraphs[0].heading_level = Some(2);
+        let hints = vec![make_hint(LayoutHintClass::Text, 0.8, 40.0, 598.0, 400.0, 620.0)];
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+        assert_eq!(
+            paragraphs[0].heading_level,
+            Some(2),
+            "0.8-confidence Text hint is below the demote threshold and must preserve the heading"
+        );
+    }
+
+    #[test]
+    fn test_body_font_false_heading_still_demotes() {
+        // A2 must not over-suppress: a body-font, non-bold, non-numbered false heading
+        // with a high-confidence Text hint still demotes (no independent evidence). ~keep
+        let mut paragraphs = vec![make_para(50.0, 600.0, 300.0, 16.0)];
+        paragraphs[0].heading_level = Some(2);
+        let hints = vec![make_hint(LayoutHintClass::Text, 0.9, 40.0, 598.0, 400.0, 620.0)];
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, Some(12.0));
+        assert_eq!(
+            paragraphs[0].heading_level, None,
+            "evidence-free false heading must still demote under a high-confidence Text hint"
+        );
     }
 
     #[test]
@@ -997,7 +1076,6 @@ mod tests {
 
     #[test]
     fn test_separator_text_not_promoted_to_heading() {
-        // A line of dashes should not become a heading even if layout says SectionHeader
         let lines = vec![make_line(vec![make_segment("----------", 50.0, 600.0, 300.0, 16.0)])];
         let word_count = PdfParagraph::compute_word_count("", &lines);
         let mut para = PdfParagraph {
@@ -1011,18 +1089,18 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
         };
         let hint = make_hint(LayoutHintClass::SectionHeader, 0.9, 40.0, 598.0, 400.0, 620.0);
         apply_hint_to_paragraph(&mut para, &hint, None);
-        assert_eq!(para.heading_level, None); // Separator not promoted
+        assert_eq!(para.heading_level, None);
     }
 
     #[test]
     fn test_compute_paragraph_bbox_no_positional_data() {
-        // Segments with all-zero positions should return None
         let lines = vec![make_line(vec![make_segment("text", 0.0, 0.0, 0.0, 0.0)])];
         let word_count = PdfParagraph::compute_word_count("", &lines);
         let para = PdfParagraph {
@@ -1036,6 +1114,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -1058,6 +1137,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: Some((50.0, 100.0, 400.0, 120.0)),
             word_count,
@@ -1087,6 +1167,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -1094,16 +1175,12 @@ mod tests {
         let bbox = compute_paragraph_bbox(&para).unwrap();
         assert!((bbox.left - 50.0).abs() < f32::EPSILON);
         assert!((bbox.y_min - 680.0).abs() < f32::EPSILON);
-        // right = max(50+100, 60+120) = max(150, 180) = 180
         assert!((bbox.right - 180.0).abs() < f32::EPSILON);
-        // top = max(700+12, 680+14) = max(712, 694) = 712
         assert!((bbox.y_max - 712.0).abs() < f32::EPSILON);
     }
 
     #[test]
     fn test_page_header_furniture_requires_high_confidence() {
-        // Low-confidence PageHeader hints should NOT mark paragraphs as furniture
-        // (fixes #936 category B: total output failure on OCR-rendered pages).
         let mut para = PdfParagraph {
             text: "Header text with content".to_string(),
             lines: vec![],
@@ -1115,12 +1192,12 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 5,
         };
 
-        // Test 1: confidence < 0.8 should NOT mark as furniture
         let low_conf_hint = LayoutHint {
             class_name: LayoutHintClass::PageHeader,
             confidence: 0.7,
@@ -1140,7 +1217,6 @@ mod tests {
             "layout_class should still be set"
         );
 
-        // Test 2: confidence >= 0.8 should mark as furniture
         let mut para2 = PdfParagraph {
             text: "Header text with content".to_string(),
             lines: vec![],
@@ -1152,6 +1228,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 5,
@@ -1173,7 +1250,6 @@ mod tests {
 
     #[test]
     fn test_page_footer_furniture_requires_high_confidence() {
-        // Low-confidence PageFooter hints should NOT mark paragraphs as furniture.
         let mut para = PdfParagraph {
             text: "Footer text".to_string(),
             lines: vec![],
@@ -1185,6 +1261,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 2,
@@ -1205,25 +1282,20 @@ mod tests {
         );
     }
 
-    // ── override-precedence tests: native classification wins over generic hints ──
-
     #[test]
     fn test_code_hint_does_not_override_native_list_item() {
-        // A native list item (·/• bullet marker) must not be reclassified as code
-        // when the layout model emits a Code hint. List markers are strong textual
-        // evidence; the layout model misidentifies bullet regions as code blocks
-        // (root cause of issue #598).
         let mut para = PdfParagraph {
             text: "· Explain the importance of asking questions.".to_string(),
             lines: vec![],
             dominant_font_size: 12.0,
             heading_level: None,
             is_bold: false,
-            is_list_item: true, // correctly set by native classifier
+            is_list_item: true,
             is_code_block: false,
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 7,
@@ -1255,7 +1327,6 @@ mod tests {
 
     #[test]
     fn test_code_hint_applies_to_non_list_item_paragraph() {
-        // Code hint must still work on regular paragraphs (no list-item flag).
         let mut para = PdfParagraph {
             text: "function add(a, b) { return a + b; }".to_string(),
             lines: vec![],
@@ -1267,6 +1338,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 8,
@@ -1288,21 +1360,18 @@ mod tests {
 
     #[test]
     fn test_page_header_hint_does_not_suppress_native_heading() {
-        // A natively classified H1 must not be suppressed as page furniture when
-        // the layout model emits a PageHeader hint. Document titles at the top of
-        // a page are commonly misidentified as page headers by the model; the native
-        // heading classification is more reliable (root cause of issue #905).
         let mut para = PdfParagraph {
             text: "Sample PDF".to_string(),
             lines: vec![],
             dominant_font_size: 24.0,
-            heading_level: Some(1), // correctly identified as H1 by native classifier
+            heading_level: Some(1),
             is_bold: true,
             is_list_item: false,
             is_code_block: false,
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 2,
@@ -1310,7 +1379,7 @@ mod tests {
 
         let hint = LayoutHint {
             class_name: LayoutHintClass::PageHeader,
-            confidence: 0.9, // high-confidence PageHeader hint
+            confidence: 0.9,
             left: 0.0,
             bottom: 0.0,
             right: 100.0,
@@ -1331,7 +1400,6 @@ mod tests {
 
     #[test]
     fn test_page_header_hint_applies_to_non_heading_paragraph() {
-        // PageHeader hint must still work on paragraphs that are not headings.
         let mut para = PdfParagraph {
             text: "Page 5".to_string(),
             lines: vec![],
@@ -1343,6 +1411,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 2,
@@ -1366,7 +1435,6 @@ mod tests {
 
     #[test]
     fn test_page_footer_hint_does_not_suppress_native_heading() {
-        // Same guard applies to PageFooter hints (symmetric with PageHeader).
         let mut para = PdfParagraph {
             text: "Conclusions".to_string(),
             lines: vec![],
@@ -1378,6 +1446,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 1,
@@ -1402,13 +1471,8 @@ mod tests {
 
     #[test]
     fn test_native_paragraph_table_hint_passes_through() {
-        // Specific layout hints (Table) are not subject to these guards:
-        // they add structural information rather than demoting existing classification.
-        // Confirm that Table hints continue to work normally.
         let mut paragraphs = vec![make_para(50.0, 600.0, 300.0, 16.0)];
         let hints = vec![make_hint(LayoutHintClass::Table, 0.9, 40.0, 598.0, 400.0, 620.0)];
-        // Table hint falls through to `_ => {}` in apply_hint_to_paragraph, only
-        // setting layout_class. Verify layout_class is set and nothing else breaks.
         apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
         assert_eq!(paragraphs[0].layout_class, Some(LayoutHintClass::Table));
         assert_eq!(paragraphs[0].heading_level, None);
@@ -1419,9 +1483,6 @@ mod tests {
 
     #[test]
     fn test_picture_hint_does_not_suppress_native_heading() {
-        // A Picture hint must never suppress a paragraph already classified as a heading.
-        // The layout model sometimes misidentifies a large centered document title as a
-        // picture label. The native heading classification must win (fixes #905).
         let lines = vec![make_line(vec![make_segment("Sample PDF", 0.0, 800.0, 200.0, 36.0)])];
         let word_count = PdfParagraph::compute_word_count("Sample PDF", &lines);
         let mut para = PdfParagraph {
@@ -1435,6 +1496,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -1450,8 +1512,6 @@ mod tests {
 
     #[test]
     fn test_picture_hint_applies_to_non_heading_paragraph() {
-        // For non-heading paragraphs (figure labels, axis text), Picture hint should
-        // mark the paragraph as page furniture so it is suppressed from body output.
         let mut para = make_para(12.0, 400.0, 100.0, 16.0);
         para.text = "Figure 1: schematic".to_string();
         let hint = make_hint(LayoutHintClass::Picture, 0.85, 0.0, 390.0, 200.0, 420.0);
@@ -1462,8 +1522,6 @@ mod tests {
 
     #[test]
     fn test_list_item_requires_high_confidence() {
-        // Low-confidence ListItem hints should NOT mark paragraphs as list items
-        // (fixes #936 category E: ListItem misclassification, marker digit loss).
         let mut para = PdfParagraph {
             text: "1. First item in list".to_string(),
             lines: vec![],
@@ -1475,12 +1533,12 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 4,
         };
 
-        // Test 1: confidence < 0.8 should NOT mark as list item
         let low_conf_hint = LayoutHint {
             class_name: LayoutHintClass::ListItem,
             confidence: 0.7,
@@ -1495,7 +1553,6 @@ mod tests {
             "Low-confidence ListItem (0.7) should NOT mark paragraph as list item"
         );
 
-        // Test 2: confidence >= 0.8 should mark as list item
         let mut para2 = PdfParagraph {
             text: "1. First item in list".to_string(),
             lines: vec![],
@@ -1507,6 +1564,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count: 4,
@@ -1524,5 +1582,61 @@ mod tests {
             para2.is_list_item,
             "High-confidence ListItem (0.85) should mark paragraph as list item"
         );
+    }
+
+    #[test]
+    fn semantic_hint_beats_broad_text_when_containment_is_comparable() {
+        let mut paragraphs = vec![make_para(10.0, 100.0, 100.0, 10.0)];
+        let hints = vec![
+            make_hint(LayoutHintClass::Text, 0.95, 10.0, 100.0, 110.0, 110.0),
+            make_hint(LayoutHintClass::SectionHeader, 0.90, 10.0, 100.0, 106.0, 110.0),
+        ];
+
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+
+        assert_eq!(paragraphs[0].layout_class, Some(LayoutHintClass::SectionHeader));
+        assert_eq!(paragraphs[0].heading_level, Some(2));
+    }
+
+    #[test]
+    fn materially_better_text_containment_is_preserved() {
+        let mut paragraphs = vec![make_para(10.0, 100.0, 100.0, 10.0)];
+        let hints = vec![
+            make_hint(LayoutHintClass::Text, 0.90, 10.0, 100.0, 110.0, 110.0),
+            make_hint(LayoutHintClass::SectionHeader, 0.99, 10.0, 100.0, 100.0, 110.0),
+        ];
+
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+
+        assert_eq!(paragraphs[0].layout_class, Some(LayoutHintClass::Text));
+        assert_eq!(paragraphs[0].heading_level, None);
+    }
+
+    #[test]
+    fn unvalidated_formula_hint_does_not_beat_comparable_text() {
+        let mut paragraphs = vec![make_para(10.0, 100.0, 100.0, 10.0)];
+        let hints = vec![
+            make_hint(LayoutHintClass::Text, 0.90, 10.0, 100.0, 110.0, 110.0),
+            make_hint(LayoutHintClass::Formula, 0.99, 10.0, 100.0, 106.0, 110.0),
+        ];
+
+        apply_layout_overrides(&mut paragraphs, &hints, 0.5, 0.5, None);
+
+        assert_eq!(paragraphs[0].layout_class, Some(LayoutHintClass::Text));
+        assert!(!paragraphs[0].is_formula);
+    }
+
+    #[test]
+    fn equivalent_semantic_hints_are_selected_independently_of_input_order() {
+        let title = make_hint(LayoutHintClass::Title, 0.90, 10.0, 100.0, 110.0, 110.0);
+        let section = make_hint(LayoutHintClass::SectionHeader, 0.90, 10.0, 100.0, 110.0, 110.0);
+        let mut forward = vec![make_para(10.0, 100.0, 100.0, 10.0)];
+        let mut reverse = forward.clone();
+
+        apply_layout_overrides(&mut forward, &[title.clone(), section.clone()], 0.5, 0.5, None);
+        apply_layout_overrides(&mut reverse, &[section, title], 0.5, 0.5, None);
+
+        assert_eq!(forward[0].layout_class, reverse[0].layout_class);
+        assert_eq!(forward[0].heading_level, reverse[0].heading_level);
     }
 }

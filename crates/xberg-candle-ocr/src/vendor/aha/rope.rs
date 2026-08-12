@@ -1,21 +1,19 @@
 // Vendored from jhqxxx/aha (Apache-2.0). See repo-root ATTRIBUTIONS.md § jhqxxx/aha.
-//! Subset of `aha::position_embed::rope` covering 1D, 2D, M-RoPE, and XD-RoPE
-//! position embeddings used by Qwen2 / Hunyuan-OCR / PaddleOCR-VL 1.5.
+//! Subset of `aha::position_embed::rope` covering 1D, 2D, and M-RoPE position
+//! embeddings used by Qwen2 / PaddleOCR-VL 1.5.
 //!
 //! Vendored symbols:
 //! - [`compute_default_rope_parameters`] — inverse-frequency schedule
 //! - [`rotate_half`] — split-half rotation helper
-//! - [`apply_rotary_pos_emb`] — standard rotate-half RoPE (Qwen2, Hunyuan-OCR)
+//! - [`apply_rotary_pos_emb`] — standard rotate-half RoPE (Qwen2)
 //! - [`apply_rotary_pos_emb_vision`] — vision-tower RoPE (PaddleOCR-VL vision)
 //! - [`apply_rotary_pos_emb_roformer`] — complex-domain RoPE (common modules)
 //! - [`RoPE`] — 1-D RoPE with optional repeat-interleave variant
 //! - [`Qwen2_5VLTextRotaryEmbedding`] — M-RoPE for PaddleOCR-VL text decoder
 //! - [`Qwen2_5VisionRotaryEmbedding`] — 2-D RoPE for PaddleOCR-VL vision tower
-//! - [`get_xd_cos_sin`] — XD-RoPE position gather for Hunyuan-OCR
 //!
-//! The helper functions `index_select_2d` and `split_tensor` from
-//! `aha::utils::tensor_utils` are inlined here because they are consumed only
-//! internally by [`get_xd_cos_sin`].
+//! The helper function `split_tensor` from `aha::utils::tensor_utils` is
+//! inlined here because it is consumed only internally.
 
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 
@@ -24,18 +22,6 @@ use crate::error::{CandleOcrError, Result};
 // ---------------------------------------------------------------------------
 // Internal tensor helpers (inlined from aha::utils::tensor_utils)
 // ---------------------------------------------------------------------------
-
-/// Select rows of a 2-D table `t` (shape `[table_len, dim]`) using a 2-D
-/// integer index `index` (shape `[n, k]`), returning `[n, k, dim]`.
-fn index_select_2d(t: &Tensor, index: &Tensor) -> Result<Tensor> {
-    let n = index.dim(0)?;
-    let mut rows: Vec<Tensor> = Vec::with_capacity(n);
-    for i in 0..n {
-        let idx_i = index.i(i)?;
-        rows.push(t.index_select(&idx_i, 0)?);
-    }
-    Ok(Tensor::stack(&rows, 0)?)
-}
 
 /// Split tensor `t` along `dim` into consecutive slices of sizes `splits`.
 fn split_tensor(t: &Tensor, splits: &[usize], dim: usize) -> Result<Vec<Tensor>> {
@@ -175,8 +161,7 @@ pub fn apply_rotary_pos_emb_roformer(q: &Tensor, k: &Tensor, cos: &Tensor, sin: 
 
 /// Standard 1-D RoPE embedding.
 ///
-/// Used by Qwen2 (`RoPE::forward`), DeepSeek-OCR, and Hunyuan-OCR text
-/// decoder.
+/// Used by Qwen2 (`RoPE::forward`) and the DeepSeek-OCR text decoder.
 #[derive(Debug, Clone)]
 pub struct RoPE {
     /// Inverse-frequency buffer: shape `(1, dim / 2)`.
@@ -368,72 +353,4 @@ impl Qwen2_5VisionRotaryEmbedding {
         let inv_freq = Tensor::from_vec(self.inv_freq.clone(), (1, self.inv_freq.len()), device)?;
         Ok(seq.matmul(&inv_freq)?)
     }
-}
-
-// ---------------------------------------------------------------------------
-// XD-RoPE for Hunyuan-OCR
-// ---------------------------------------------------------------------------
-
-/// Gather per-position XD-RoPE cosine/sine slices for Hunyuan-OCR.
-///
-/// This function is the entry point for Hunyuan's
-/// `forward_step_with_position_ids` XD-RoPE path.
-///
-/// # Arguments
-///
-/// * `cos`/`sin` — shape `(max_seq_len, head_dim)` precomputed buffers from
-///   [`RoPE::forward`].
-/// * `position_ids` — shape `(bs, x_dim, seq_len)` integer index tensor where
-///   `x_dim == xdrope_section.len()`.
-/// * `xdrope_section` — per-dimension head_dim split; entries sum to
-///   `head_dim / 2`.
-///
-/// # Returns
-///
-/// `(cos, sin)` of shape `(bs, seq_len, head_dim)`.
-///
-/// # Errors
-///
-/// Returns [`CandleOcrError::Candle`] on tensor operation failure.
-pub fn get_xd_cos_sin(
-    cos: &Tensor,
-    sin: &Tensor,
-    position_ids: &Tensor,
-    xdrope_section: Vec<usize>,
-) -> Result<(Tensor, Tensor)> {
-    let x_dim = xdrope_section.len();
-    let bs = position_ids.dim(0)?;
-
-    let mut cos_vec: Vec<Tensor> = Vec::with_capacity(bs);
-    let mut sin_vec: Vec<Tensor> = Vec::with_capacity(bs);
-    for i in 0..bs {
-        let pos_i = position_ids.i(i)?;
-        cos_vec.push(index_select_2d(cos, &pos_i)?);
-        sin_vec.push(index_select_2d(sin, &pos_i)?);
-    }
-
-    // (bs, x_dim, seq_len, dim) -> (bs, seq_len, x_dim, dim)
-    let cos_stacked = Tensor::stack(&cos_vec, 0)?.permute((0, 2, 1, 3))?.contiguous()?;
-    let sin_stacked = Tensor::stack(&sin_vec, 0)?.permute((0, 2, 1, 3))?.contiguous()?;
-
-    // Double section sizes because cos/sin carry head_dim not head_dim/2
-    let section_doubled: Vec<usize> = xdrope_section.iter().map(|&s| s * 2).collect();
-    let last_dim = cos_stacked.rank() - 1;
-
-    let cos_select: Vec<Tensor> = split_tensor(&cos_stacked, &section_doubled, last_dim)?
-        .into_iter()
-        .enumerate()
-        .map(|(i, m)| m.i((.., .., i % x_dim)).map_err(CandleOcrError::from))
-        .collect::<Result<Vec<_>>>()?;
-
-    let sin_select: Vec<Tensor> = split_tensor(&sin_stacked, &section_doubled, last_dim)?
-        .into_iter()
-        .enumerate()
-        .map(|(i, m)| m.i((.., .., i % x_dim)).map_err(CandleOcrError::from))
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok((
-        Tensor::cat(&cos_select, D::Minus1)?,
-        Tensor::cat(&sin_select, D::Minus1)?,
-    ))
 }

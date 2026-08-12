@@ -1,3 +1,8 @@
+//! Issue #961: numbered chapter headings in an untagged PDF must be classified as
+//! Heading/Title elements, not ListItem, when extracting with `ElementBased` result
+//! format.
+
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 mod helpers;
 use helpers::extract_bytes_document_blocking;
 

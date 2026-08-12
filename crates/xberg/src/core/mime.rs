@@ -6,9 +6,14 @@
 //! Format information is centralized in the `FORMATS` registry. All extension-to-MIME
 //! mappings and supported MIME type validation are derived from this single source of truth.
 
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+use crate::extractors::security::SecurityLimits;
 use crate::{Result, XbergError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -27,6 +32,95 @@ pub struct SupportedFormat {
 #[cfg(feature = "api")]
 pub(crate) const OCTET_STREAM_MIME_TYPE: &str = "application/octet-stream";
 pub(crate) const HTML_MIME_TYPE: &str = "text/html";
+
+/// Element names that identify a markup fragment as HTML rather than generic XML.
+///
+/// Deliberately conservative: every entry is an element that exists in HTML and is not a
+/// plausible root for the XML vocabularies this crate also extracts (DocBook, JATS, FB2,
+/// OPML, RSS). Ambiguous names shared with those vocabularies — `title`, `table`, `para`,
+/// `section`, `article`, `link`, `code` — are omitted on purpose, so a borderline document
+/// keeps its current XML routing instead of being silently rerouted.
+const HTML_FRAGMENT_ELEMENTS: &[&str] = &[
+    "a",
+    "b",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "div",
+    "em",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "i",
+    "iframe",
+    "img",
+    "input",
+    "label",
+    "li",
+    "main",
+    "meta",
+    "nav",
+    "ol",
+    "option",
+    "p",
+    "pre",
+    "script",
+    "select",
+    "span",
+    "strong",
+    "style",
+    "table",
+    "tbody",
+    "td",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+];
+
+/// Return `true` when `trimmed` opens as HTML rather than as generic XML.
+///
+/// Recognises the two document preambles case-insensitively (`<!doctype html>` is at least
+/// as common in the wild as the uppercase spelling) and, for fragments that carry no
+/// preamble at all, the name of the first element.
+fn looks_like_html(trimmed: &str) -> bool {
+    let lowered_prefix: String = trimmed.chars().take(16).flat_map(char::to_lowercase).collect();
+    if lowered_prefix.starts_with("<!doctype html") || lowered_prefix.starts_with("<html") {
+        return true;
+    }
+
+    let Some(after_bracket) = trimmed.strip_prefix('<') else {
+        return false;
+    };
+    let name_length = after_bracket
+        .find(|character: char| !character.is_ascii_alphanumeric())
+        .unwrap_or(after_bracket.len());
+    let (name, rest) = after_bracket.split_at(name_length);
+    // Require the tag to actually close here, so `<tr:foo>` (a namespace prefix that happens
+    // to collide with an HTML name) stays XML.
+    if !matches!(
+        rest.chars().next(),
+        Some('>') | Some(' ') | Some('/') | Some('\t') | Some('\n') | Some('\r')
+    ) {
+        return false;
+    }
+
+    let name = name.to_ascii_lowercase();
+    HTML_FRAGMENT_ELEMENTS.contains(&name.as_str())
+}
 pub(crate) const PDF_MIME_TYPE: &str = "application/pdf";
 pub(crate) const PLAIN_TEXT_MIME_TYPE: &str = "text/plain";
 pub(crate) const POWER_POINT_MIME_TYPE: &str =
@@ -36,17 +130,28 @@ pub(crate) const LEGACY_WORD_MIME_TYPE: &str = "application/msword";
 pub(crate) const LEGACY_POWERPOINT_MIME_TYPE: &str = "application/vnd.ms-powerpoint";
 
 pub(crate) const PST_MIME_TYPE: &str = "application/vnd.ms-outlook-pst";
+pub(crate) const WPD_MIME_TYPE: &str = "application/vnd.wordperfect";
 pub(crate) const JSON_MIME_TYPE: &str = "application/json";
 pub(crate) const XML_MIME_TYPE: &str = "application/xml";
 #[cfg(feature = "tree-sitter")]
 pub(crate) const SOURCE_CODE_MIME_TYPE: &str = "text/x-source-code";
 
 pub(crate) const EXCEL_MIME_TYPE: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+pub(crate) const ODT_MIME_TYPE: &str = "application/vnd.oasis.opendocument.text";
+pub(crate) const ODP_MIME_TYPE: &str = "application/vnd.oasis.opendocument.presentation";
+pub(crate) const ODS_MIME_TYPE: &str = "application/vnd.oasis.opendocument.spreadsheet";
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+const ZIP_MIME_TYPE: &str = "application/zip";
 
 pub(crate) const HWPX_MIME_TYPE: &str = "application/haansofthwpx";
 pub(crate) const IWORK_PAGES_MIME_TYPE: &str = "application/x-iwork-pages-sffpages";
 pub(crate) const IWORK_NUMBERS_MIME_TYPE: &str = "application/x-iwork-numbers-sffnumbers";
 pub(crate) const IWORK_KEYNOTE_MIME_TYPE: &str = "application/x-iwork-keynote-sffkey";
+
+/// Docling DocTags. The format has no registered media type, and its files are
+/// conventionally named `*.doctags.txt`, so callers reading those will need to
+/// pass this explicitly rather than relying on the extension.
+pub(crate) const DOCTAGS_MIME_TYPE: &str = "text/vnd.docling.doctags";
 
 /// A format definition in the centralized registry.
 ///
@@ -67,34 +172,27 @@ struct FormatEntry {
 /// (extension-to-MIME mapping) and `SUPPORTED_MIME_TYPES` (validation set) are
 /// derived from this array automatically.
 static FORMATS: &[FormatEntry] = &[
-    // ── Plain text ──────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["txt"],
         mime_type: "text/plain",
         aliases: &[],
     },
-    // Plain text variants handled by extractors (no file extension mapping)
     FormatEntry {
-        extensions: &[],
-        mime_type: "text/troff",
-        aliases: &[],
+        extensions: &["adoc", "asciidoc"],
+        mime_type: "text/asciidoc",
+        aliases: &["text/x-asciidoc"],
     },
     FormatEntry {
-        extensions: &[],
-        mime_type: "text/x-mdoc",
+        extensions: &["vtt"],
+        mime_type: "text/vtt",
         aliases: &[],
     },
-    FormatEntry {
-        extensions: &[],
-        mime_type: "text/x-pod",
-        aliases: &[],
-    },
-    FormatEntry {
-        extensions: &[],
-        mime_type: "text/x-dokuwiki",
-        aliases: &[],
-    },
-    // ── Markdown ────────────────────────────────────────────────────────
+    // text/troff, text/x-mdoc, text/x-pod and text/x-dokuwiki were removed here (#228). They
+    // carried no extensions, so they were unreachable except via a caller-supplied MIME, and
+    // the only "extractor" behind them was the plain-text one — which BOM-stripped and split
+    // on blank lines, turning roff macros and POD commands into prose that looked like a
+    // successful extraction. Listing them made `validate_mime_type` return Ok for formats
+    // nothing could actually parse, which is the advertised-but-unroutable half of GH#1387.
     FormatEntry {
         extensions: &["md", "markdown"],
         mime_type: "text/markdown",
@@ -120,31 +218,46 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "text/x-multimarkdown",
         aliases: &[],
     },
-    // ── MDX ─────────────────────────────────────────────────────────────
+    FormatEntry {
+        extensions: &[],
+        mime_type: "text/x-pandoc",
+        aliases: &[],
+    },
+    FormatEntry {
+        extensions: &["qmd"],
+        mime_type: "text/x-quarto",
+        aliases: &["application/x-quarto"],
+    },
+    FormatEntry {
+        extensions: &["rmd"],
+        mime_type: "text/x-r-markdown",
+        aliases: &[],
+    },
     FormatEntry {
         extensions: &["mdx"],
         mime_type: "text/mdx",
         aliases: &["text/x-mdx"],
     },
-    // ── Djot ────────────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["djot"],
         mime_type: "text/x-djot",
         aliases: &["text/djot"],
     },
-    // ── PDF ─────────────────────────────────────────────────────────────
+    FormatEntry {
+        extensions: &["doctags"],
+        mime_type: DOCTAGS_MIME_TYPE,
+        aliases: &["application/vnd.docling.doctags"],
+    },
     FormatEntry {
         extensions: &["pdf"],
         mime_type: "application/pdf",
         aliases: &[],
     },
-    // ── HTML ────────────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["html", "htm"],
         mime_type: "text/html",
         aliases: &["application/xhtml+xml"],
     },
-    // ── Word processing ─────────────────────────────────────────────────
     FormatEntry {
         extensions: &["docx"],
         mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -172,10 +285,14 @@ static FORMATS: &[FormatEntry] = &[
     },
     FormatEntry {
         extensions: &["odt"],
-        mime_type: "application/vnd.oasis.opendocument.text",
+        mime_type: ODT_MIME_TYPE,
         aliases: &[],
     },
-    // ── Presentations ───────────────────────────────────────────────────
+    FormatEntry {
+        extensions: &["odp"],
+        mime_type: ODP_MIME_TYPE,
+        aliases: &[],
+    },
     FormatEntry {
         extensions: &["pptx"],
         mime_type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -206,7 +323,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "application/vnd.ms-powerpoint",
         aliases: &[],
     },
-    // ── Spreadsheets ────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["xlsx"],
         mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -244,16 +360,14 @@ static FORMATS: &[FormatEntry] = &[
     },
     FormatEntry {
         extensions: &["ods"],
-        mime_type: "application/vnd.oasis.opendocument.spreadsheet",
+        mime_type: ODS_MIME_TYPE,
         aliases: &[],
     },
-    // ── dBASE ──────────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["dbf"],
         mime_type: "application/x-dbf",
         aliases: &["application/dbase"],
     },
-    // ── Hangul ─────────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["hwp"],
         mime_type: "application/x-hwp",
@@ -264,7 +378,11 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "application/haansofthwpx",
         aliases: &[],
     },
-    // ── Images ──────────────────────────────────────────────────────────
+    FormatEntry {
+        extensions: &["wpd", "wp", "wp5", "wp6"],
+        mime_type: WPD_MIME_TYPE,
+        aliases: &["application/wordperfect"],
+    },
     FormatEntry {
         extensions: &["bmp"],
         mime_type: "image/bmp",
@@ -320,9 +438,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "image/x-jbig2",
         aliases: &[],
     },
-    // HEIF container family. Pixel decoding requires the `heic` Cargo feature
-    // (native-only — libheif is a C library with no working WASM/Android story);
-    // EXIF metadata still works without `heic` when `ocr` or `ocr-wasm` is on.
     FormatEntry {
         extensions: &["heic", "heics"],
         mime_type: "image/heic",
@@ -363,7 +478,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "image/x-portable-pixmap",
         aliases: &[],
     },
-    // ── Data formats ────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["csv"],
         mime_type: "text/csv",
@@ -409,7 +523,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "image/svg+xml",
         aliases: &[],
     },
-    // ── Email ───────────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["eml"],
         mime_type: "message/rfc822",
@@ -425,7 +538,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "application/vnd.ms-outlook-pst",
         aliases: &[],
     },
-    // ── Archives ────────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["zip"],
         mime_type: "application/zip",
@@ -446,7 +558,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "application/x-7z-compressed",
         aliases: &[],
     },
-    // ── Document / academic formats ─────────────────────────────────────
     FormatEntry {
         extensions: &["rst"],
         mime_type: "text/x-rst",
@@ -503,7 +614,7 @@ static FORMATS: &[FormatEntry] = &[
         aliases: &["text/docbook"],
     },
     FormatEntry {
-        extensions: &["jats"],
+        extensions: &["jats", "nxml"],
         mime_type: "application/x-jats+xml",
         aliases: &["text/jats"],
     },
@@ -522,7 +633,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "application/x-typst",
         aliases: &["text/x-typst"],
     },
-    // ── Apple iWork ─────────────────────────────────────────────────────
     FormatEntry {
         extensions: &["pages"],
         mime_type: "application/x-iwork-pages-sffpages",
@@ -538,11 +648,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "application/x-iwork-keynote-sffkey",
         aliases: &[],
     },
-    // ── Audio / Video (speech-to-text transcription) ────────────────────
-    // Supported when the `transcription` feature is enabled.
-    // Registered unconditionally so list_supported_formats() and MIME detection
-    // are consistent; extraction fails gracefully with a clear error when the
-    // feature (or config) is absent — exactly the same contract as pdf/office etc.
     FormatEntry {
         extensions: &["mp3", "mpga"],
         mime_type: "audio/mpeg",
@@ -568,9 +673,6 @@ static FORMATS: &[FormatEntry] = &[
         mime_type: "video/mp4",
         aliases: &["video/mpeg"],
     },
-    // ── Source code (tree-sitter) ──────────────────────────────────────
-    // No file extension mapping — detection is dynamic via TSLP's
-    // detect_language_from_extension() as a fallback in detect_mime_type().
     FormatEntry {
         extensions: &[],
         mime_type: "text/x-source-code",
@@ -639,10 +741,6 @@ pub fn detect_mime_type(path: impl AsRef<Path>, check_exists: bool) -> Result<St
         return Ok(mime_type.to_string());
     }
 
-    // Tree-sitter detection: check if the extension belongs to a known
-    // programming language *before* falling back to mime_guess, which returns
-    // language-specific MIME types (e.g. "text/x-python") that are not in our
-    // supported set.
     #[cfg(feature = "tree-sitter")]
     {
         if let Some(ext) = &extension {
@@ -695,8 +793,6 @@ pub fn validate_mime_type(mime_type: &str) -> Result<String> {
         return Ok(mime_type.to_string());
     }
 
-    // Case-insensitive fallback: MIME types are case-insensitive per RFC 2045.
-    // This handles common mismatches like "macroEnabled" vs "macroenabled".
     let lower = mime_type.to_ascii_lowercase();
     for supported in SUPPORTED_MIME_TYPES.iter() {
         if supported.to_ascii_lowercase() == lower {
@@ -727,13 +823,78 @@ pub(crate) fn detect_or_validate(path: Option<&str>, mime_type: Option<&str>) ->
         validate_mime_type(mime)
     } else if let Some(p) = path.map(Path::new) {
         let detected = detect_mime_type(p, true)?;
-        tracing::debug!(path = %p.display(), detected = %detected, "detected MIME, now validating");
-        validate_mime_type(&detected)
+        let resolved = match magic_override(p, &detected) {
+            Some(from_magic) => {
+                tracing::debug!(path = %p.display(), extension_mime = %detected, magic_mime = %from_magic,
+                    "extension/content MIME disagree; preferring content");
+                from_magic
+            }
+            None => detected,
+        };
+        validate_mime_type(&resolved)
     } else {
         Err(XbergError::validation(
             "Must provide either path or mime_type".to_string(),
         ))
     }
+}
+
+/// If the file's magic bytes confidently indicate a different supported MIME
+/// type than the extension did, return it. Returns `None` when the content has
+/// no signature, the read fails, or content and extension agree.
+fn magic_override(path: &Path, extension_mime: &str) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = vec![0u8; 4096];
+    let n = file.read(&mut header).ok()?;
+    header.truncate(n);
+    if header.is_empty() {
+        return None;
+    }
+
+    let from_magic = detect_mime_type_from_bytes(&header).ok()?;
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    if (from_magic == ZIP_MIME_TYPE || from_magic.starts_with("application/vnd.oasis.opendocument."))
+        && let Some(odf_mime) = detect_odf_mime_from_zip(std::fs::File::open(path).ok()?)
+    {
+        return (odf_mime != extension_mime).then(|| odf_mime.to_string());
+    }
+
+    if from_magic == PLAIN_TEXT_MIME_TYPE {
+        return None;
+    }
+    if is_generic_xml_mime(&from_magic) && is_specific_xml_mime(extension_mime) {
+        return None;
+    }
+    if from_magic == JSON_MIME_TYPE && is_specific_json_mime(extension_mime) {
+        return None;
+    }
+    if from_magic != extension_mime && validate_mime_type(&from_magic).is_ok() {
+        Some(from_magic)
+    } else {
+        None
+    }
+}
+
+/// Generic XML signatures cannot distinguish specialized XML vocabularies.
+/// Preserve a supported extension-specific XML MIME so extractor selection can
+/// route formats such as FictionBook and DocBook to their semantic parsers.
+fn is_specific_xml_mime(mime_type: &str) -> bool {
+    mime_type != XML_MIME_TYPE && (mime_type.ends_with("+xml") || mime_type.contains("xml+"))
+}
+
+fn is_generic_xml_mime(mime_type: &str) -> bool {
+    matches!(mime_type, XML_MIME_TYPE | "text/xml")
+}
+
+/// Generic JSON detection cannot distinguish JSON-based document formats.
+/// Preserve extension-specific routing for notebooks and line-delimited JSON. ~keep
+fn is_specific_json_mime(mime_type: &str) -> bool {
+    mime_type != JSON_MIME_TYPE
+        && (mime_type.ends_with("+json")
+            || matches!(
+                mime_type,
+                "application/x-ndjson" | "application/jsonl" | "application/x-jsonlines"
+            ))
 }
 
 /// Detect MIME type from raw file bytes.
@@ -759,7 +920,13 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
     if let Some(kind) = infer::get(content) {
         let mime_type = kind.mime_type();
 
-        // Check if ZIP is actually an Office Open XML format
+        #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+        if mime_type.starts_with("application/vnd.oasis.opendocument.") {
+            return Ok(detect_odf_mime_from_zip(std::io::Cursor::new(content))
+                .unwrap_or(ZIP_MIME_TYPE)
+                .to_string());
+        }
+
         if mime_type == "application/zip"
             && let Some(office_mime) = detect_office_format_from_zip(content)
         {
@@ -771,9 +938,15 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
         }
     }
 
-    // PST (Outlook Personal Folders) magic signature: "!BDN" at offset 0
     if content.len() >= 4 && content[..4] == [0x21, 0x42, 0x44, 0x4E] {
         return Ok(PST_MIME_TYPE.to_string());
+    }
+
+    // WordPerfect (Windows/DOS variants): magic bytes `\xffWPC`. The Mac
+    // WordPerfect variant has no reliable magic bytes and is routed by the
+    // `.wpd` extension via `EXT_TO_MIME` instead.
+    if content.len() >= 4 && content[..4] == [0xFF, 0x57, 0x50, 0x43] {
+        return Ok(WPD_MIME_TYPE.to_string());
     }
 
     if let Ok(text) = std::str::from_utf8(content) {
@@ -785,19 +958,23 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
             return Ok(JSON_MIME_TYPE.to_string());
         }
 
-        if trimmed.starts_with("<?xml") || trimmed.starts_with('<') {
-            return Ok(XML_MIME_TYPE.to_string());
+        // The HTML checks must precede the generic `<` fallback. They used to follow it,
+        // where `trimmed.starts_with('<')` matched every tag first and made them dead code
+        // (#235). HTML still routed correctly for whole documents only because `infer::get`
+        // recognises those earlier in this function; a bare fragment reached here and was
+        // typed `application/xml`, then handed to the XML extractor. ~keep
+        if !trimmed.starts_with("<?xml") && looks_like_html(trimmed) {
+            return Ok(HTML_MIME_TYPE.to_string());
         }
 
-        if trimmed.starts_with("<!DOCTYPE html") || trimmed.starts_with("<html") {
-            return Ok(HTML_MIME_TYPE.to_string());
+        if trimmed.starts_with("<?xml") || trimmed.starts_with('<') {
+            return Ok(XML_MIME_TYPE.to_string());
         }
 
         if trimmed.starts_with("%PDF") {
             return Ok(PDF_MIME_TYPE.to_string());
         }
 
-        // Tree-sitter fallback: detect language from shebang line.
         #[cfg(feature = "tree-sitter")]
         if tree_sitter_language_pack::detect_language_from_content(trimmed).is_some() {
             return Ok(SOURCE_CODE_MIME_TYPE.to_string());
@@ -827,35 +1004,39 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
 /// This function scans the ZIP's local file headers without fully parsing the archive,
 /// making it efficient for MIME type detection.
 fn detect_office_format_from_zip(content: &[u8]) -> Option<&'static str> {
-    // Office format markers - these are file paths within the ZIP that identify the format
     const DOCX_MARKER: &[u8] = b"word/document.xml";
     const XLSX_MARKER: &[u8] = b"xl/workbook.xml";
     const PPTX_MARKER: &[u8] = b"ppt/presentation.xml";
-
-    // Apple iWork markers
     const PAGES_MARKER: &[u8] = b"Index/Document.iwa";
     const NUMBERS_MARKER: &[u8] = b"Index/CalculationEngine.iwa";
     const KEYNOTE_MARKER: &[u8] = b"Index/Presentation.iwa";
+    const KEYNOTE_SLIDE_MARKERS: &[&[u8]] = &[b"Index/Slide-", b"Index/Slide_"];
 
-    // HWPX checked first: Contents/content.hpf is unambiguous and won't false-positive
-    // on iWork or Office archives.
     const HWPX_MARKER: &[u8] = b"Contents/content.hpf";
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    if let Some(odf_mime) = detect_odf_mime_from_zip(std::io::Cursor::new(content)) {
+        return Some(odf_mime);
+    }
+
     if contains_subsequence(content, HWPX_MARKER) {
         return Some(HWPX_MIME_TYPE);
     }
 
-    // iWork before generic Office since iWork ZIPs also contain XML
     if contains_subsequence(content, PAGES_MARKER) {
         return Some(IWORK_PAGES_MIME_TYPE);
     }
     if contains_subsequence(content, NUMBERS_MARKER) {
         return Some(IWORK_NUMBERS_MIME_TYPE);
     }
-    if contains_subsequence(content, KEYNOTE_MARKER) {
+    // ~keep: Minimal Keynote packages may contain slide archives without a Presentation.iwa index.
+    if contains_subsequence(content, KEYNOTE_MARKER)
+        || KEYNOTE_SLIDE_MARKERS
+            .iter()
+            .any(|marker| contains_subsequence(content, marker))
+    {
         return Some(IWORK_KEYNOTE_MIME_TYPE);
     }
 
-    // Check for each Office marker using a sliding window search
     if contains_subsequence(content, DOCX_MARKER) {
         return Some(DOCX_MIME_TYPE);
     }
@@ -865,8 +1046,151 @@ fn detect_office_format_from_zip(content: &[u8]) -> Option<&'static str> {
     if contains_subsequence(content, PPTX_MARKER) {
         return Some(POWER_POINT_MIME_TYPE);
     }
-
     None
+}
+
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+fn detect_odf_mime_from_zip<R: Read + Seek>(mut reader: R) -> Option<&'static str> {
+    const MAX_MIMETYPE_LENGTH: u64 = ODP_MIME_TYPE.len() as u64;
+
+    let limits = SecurityLimits::default();
+    if !zip_central_directory_within_limits(&mut reader, &limits) {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(0)).ok()?;
+
+    let mut archive = zip::ZipArchive::new(reader).ok()?;
+
+    let mut mimetype_index = None;
+    for index in 0..archive.len() {
+        if archive.by_index(index).ok()?.name() == "mimetype" && mimetype_index.replace(index).is_some() {
+            return None;
+        }
+    }
+
+    let mimetype = archive.by_index(mimetype_index?).ok()?;
+    if mimetype.size() > MAX_MIMETYPE_LENGTH {
+        return None;
+    }
+
+    let mut value = Vec::with_capacity(mimetype.size() as usize);
+    mimetype.take(MAX_MIMETYPE_LENGTH + 1).read_to_end(&mut value).ok()?;
+    match value.as_slice() {
+        value if value == ODT_MIME_TYPE.as_bytes() => Some(ODT_MIME_TYPE),
+        value if value == ODP_MIME_TYPE.as_bytes() => Some(ODP_MIME_TYPE),
+        value if value == ODS_MIME_TYPE.as_bytes() => Some(ODS_MIME_TYPE),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+struct ZipCentralDirectory {
+    offset: u64,
+    size: usize,
+    entries: u16,
+}
+
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+fn read_zip_central_directory<R: Read + Seek>(reader: &mut R, limits: &SecurityLimits) -> Option<ZipCentralDirectory> {
+    const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
+    const EOCD_MIN_LENGTH: u64 = 22;
+    const MAX_ZIP_COMMENT_LENGTH: u64 = u16::MAX as u64;
+
+    let archive_length = reader.seek(SeekFrom::End(0)).ok()?;
+    if archive_length < EOCD_MIN_LENGTH || archive_length > limits.max_archive_size as u64 {
+        return None;
+    }
+
+    let tail_length = archive_length.min(EOCD_MIN_LENGTH + MAX_ZIP_COMMENT_LENGTH);
+    reader.seek(SeekFrom::End(-(tail_length as i64))).ok()?;
+    let mut tail = vec![0; tail_length as usize];
+    reader.read_exact(&mut tail).ok()?;
+
+    let eocd_offset = tail
+        .windows(EOCD_SIGNATURE.len())
+        .rposition(|window| window == EOCD_SIGNATURE)?;
+    let eocd = &tail[eocd_offset..];
+    if eocd.len() < EOCD_MIN_LENGTH as usize {
+        return None;
+    }
+
+    let disk_number = u16::from_le_bytes([eocd[4], eocd[5]]);
+    let central_directory_disk = u16::from_le_bytes([eocd[6], eocd[7]]);
+    let entries_on_disk = u16::from_le_bytes([eocd[8], eocd[9]]);
+    let entries = u16::from_le_bytes([eocd[10], eocd[11]]);
+    let size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as usize;
+    let offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+    let comment_length = u16::from_le_bytes([eocd[20], eocd[21]]) as usize;
+    let is_valid = eocd.len() == EOCD_MIN_LENGTH as usize + comment_length
+        && disk_number == 0
+        && central_directory_disk == 0
+        && entries_on_disk == entries
+        && entries != u16::MAX
+        && entries as usize <= limits.max_files_in_archive
+        && size <= limits.max_content_size
+        && offset.checked_add(size as u64).is_some_and(|end| end <= archive_length);
+    is_valid.then_some(ZipCentralDirectory { offset, size, entries })
+}
+
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+fn read_central_directory_entry<R: Read + Seek>(reader: &mut R) -> Option<(Vec<u8>, usize)> {
+    const HEADER_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
+    const HEADER_LENGTH: usize = 46;
+
+    let mut header = [0; HEADER_LENGTH];
+    reader.read_exact(&mut header).ok()?;
+    (&header[..4] == HEADER_SIGNATURE).then_some(())?;
+
+    let name_length = u16::from_le_bytes([header[28], header[29]]) as usize;
+    let extra_length = u16::from_le_bytes([header[30], header[31]]) as usize;
+    let comment_length = u16::from_le_bytes([header[32], header[33]]) as usize;
+    let entry_length = HEADER_LENGTH
+        .checked_add(name_length)?
+        .checked_add(extra_length)?
+        .checked_add(comment_length)?;
+
+    let mut name = vec![0; name_length];
+    reader.read_exact(&mut name).ok()?;
+    reader
+        .seek(SeekFrom::Current((extra_length + comment_length) as i64))
+        .ok()?;
+    Some((name, entry_length))
+}
+
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+fn central_directory_has_unique_mimetype<R: Read + Seek>(reader: &mut R, directory: &ZipCentralDirectory) -> bool {
+    if reader.seek(SeekFrom::Start(directory.offset)).is_err() {
+        return false;
+    }
+
+    let mut bytes_read = 0usize;
+    let mut mimetype_entries = 0usize;
+    for _ in 0..directory.entries {
+        let Some((name, entry_length)) = read_central_directory_entry(reader) else {
+            return false;
+        };
+        let Some(next_bytes_read) = bytes_read.checked_add(entry_length) else {
+            return false;
+        };
+        if next_bytes_read > directory.size {
+            return false;
+        }
+        if name == b"mimetype" {
+            mimetype_entries += 1;
+            if mimetype_entries > 1 {
+                return false;
+            }
+        }
+        bytes_read = next_bytes_read;
+    }
+
+    true
+}
+
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+fn zip_central_directory_within_limits<R: Read + Seek>(reader: &mut R, limits: &SecurityLimits) -> bool {
+    read_zip_central_directory(reader, limits)
+        .is_some_and(|directory| central_directory_has_unique_mimetype(reader, &directory))
 }
 
 /// Check if `haystack` contains `needle` as a subsequence.
@@ -901,13 +1225,15 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
 pub fn get_extensions_for_mime(mime_type: &str) -> Result<Vec<String>> {
     let mut extensions = Vec::new();
 
-    for (ext, mime) in EXT_TO_MIME.iter() {
-        if *mime == mime_type {
-            extensions.push(ext.to_string());
+    for entry in FORMATS {
+        if entry.mime_type == mime_type || entry.aliases.contains(&mime_type) {
+            extensions.extend(entry.extensions.iter().map(|extension| (*extension).to_string()));
         }
     }
 
     if !extensions.is_empty() {
+        extensions.sort();
+        extensions.dedup();
         return Ok(extensions);
     }
 
@@ -929,11 +1255,21 @@ pub fn get_extensions_for_mime(mime_type: &str) -> Result<Vec<String>> {
 /// Formats that have no registered file extension (such as source code,
 /// which is detected dynamically) are not included.
 ///
+/// The static `EXT_TO_MIME` table lists every format the *codebase* knows how
+/// to describe, regardless of which Cargo features were compiled in. Advertising
+/// that table directly would claim support for extractors that may not exist in
+/// this build (see GH#1387). To keep the advertised catalogue honest, the table
+/// is intersected with the document extractor registry: an extension is only
+/// included if some registered extractor actually claims its MIME type in this
+/// build. This can never drift from reality and automatically covers
+/// third-party extractors registered at runtime.
+///
 /// The list is sorted alphabetically by file extension.
 ///
 /// # Returns
 ///
-/// A vector of [`SupportedFormat`] entries sorted by extension.
+/// A vector of [`SupportedFormat`] entries sorted by extension, limited to
+/// formats with a registered extractor in this build.
 ///
 /// # Example
 ///
@@ -942,11 +1278,18 @@ pub fn get_extensions_for_mime(mime_type: &str) -> Result<Vec<String>> {
 ///
 /// let formats = list_supported_formats();
 /// assert!(!formats.is_empty());
-/// assert!(formats.iter().any(|f| f.extension == "pdf"));
 /// ```
 pub fn list_supported_formats() -> Vec<SupportedFormat> {
+    if let Err(error) = crate::extractors::ensure_initialized() {
+        tracing::warn!(%error, "failed to initialize document extractor registry before listing formats");
+    }
+
+    let registry = crate::plugins::registry::get_document_extractor_registry();
+    let registry_guard = registry.read();
+
     let mut formats: Vec<SupportedFormat> = EXT_TO_MIME
         .iter()
+        .filter(|(_ext, mime)| registry_guard.get(mime).is_ok())
         .map(|(ext, mime)| SupportedFormat {
             extension: ext.to_string(),
             mime_type: mime.to_string(),
@@ -960,7 +1303,143 @@ pub fn list_supported_formats() -> Vec<SupportedFormat> {
 mod tests {
     use super::*;
     use std::fs::File;
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    use std::io::{Cursor, Write};
     use tempfile::tempdir;
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    use zip::write::FileOptions;
+
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = FileOptions::<'_, ()>::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in entries {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(content).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    #[cfg(all(feature = "xml", feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    async fn assert_specialized_xml_routes_through_real_extractor(
+        extension: &str,
+        content: &str,
+        expected_mime: &str,
+        expected_text: &str,
+    ) {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join(format!("routing.{extension}"));
+        std::fs::write(&file_path, content).unwrap();
+
+        let config = crate::core::config::ExtractionConfig {
+            use_cache: false,
+            ..Default::default()
+        };
+        let result = crate::core::extractor::extract_file(&file_path, None, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.mime_type, expected_mime);
+        assert!(
+            result.content.contains(expected_text),
+            "specialized extractor lost expected text: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("<article") && !result.content.contains("<FictionBook"),
+            "generic XML markup leaked into extracted content: {}",
+            result.content
+        );
+    }
+
+    #[cfg(all(feature = "office", feature = "xml", feature = "tokio-runtime"))]
+    #[tokio::test]
+    async fn should_route_fb2_extension_to_fictionbook_extractor() {
+        let content = r#"<?xml version="1.0" encoding="utf-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+  <description><title-info><book-title>Routing Test</book-title></title-info></description>
+  <body><section><title><p>First Chapter</p></title><p>FictionBook semantic text.</p></section></body>
+</FictionBook>"#;
+
+        assert_specialized_xml_routes_through_real_extractor(
+            "fb2",
+            content,
+            "application/x-fictionbook+xml",
+            "FictionBook semantic text.",
+        )
+        .await;
+    }
+
+    #[cfg(all(feature = "office", feature = "xml", feature = "tokio-runtime"))]
+    #[tokio::test]
+    async fn should_route_docbook_extensions_to_docbook_extractor() {
+        let content = r#"<?xml version="1.0" encoding="utf-8"?>
+<article xmlns="http://docbook.org/ns/docbook" version="5.0">
+  <title>Routing Test</title><para>DocBook semantic text.</para>
+</article>"#;
+
+        for extension in ["docbook", "dbk"] {
+            assert_specialized_xml_routes_through_real_extractor(
+                extension,
+                content,
+                "application/docbook+xml",
+                "DocBook semantic text.",
+            )
+            .await;
+        }
+    }
+
+    #[cfg(all(feature = "xml", feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn should_route_nxml_extension_to_jats_extractor() {
+        let content = r#"<?xml version="1.0" encoding="utf-8"?>
+<article>
+<front><article-meta><title-group><article-title>Routing Test</article-title></title-group></article-meta></front>
+<body><sec><title>Results</title><p>NXML semantic text.</p></sec></body></article>"#;
+
+        assert_specialized_xml_routes_through_real_extractor(
+            "nxml",
+            content,
+            "application/x-jats+xml",
+            "NXML semantic text.",
+        )
+        .await;
+    }
+
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn should_route_benchmark_text_extensions_to_plain_text_extractor() {
+        let test_cases = [
+            ("adoc", "text/asciidoc", "AsciiDoc short-extension routing text."),
+            ("asciidoc", "text/asciidoc", "AsciiDoc routing text."),
+            ("vtt", "text/vtt", "WebVTT routing text."),
+        ];
+
+        for (extension, expected_mime, expected_text) in test_cases {
+            let dir = tempdir().unwrap();
+            let file_path = dir.path().join(format!("routing.{extension}"));
+            std::fs::write(&file_path, expected_text).unwrap();
+
+            let config = crate::core::config::ExtractionConfig {
+                use_cache: false,
+                ..Default::default()
+            };
+            let result = crate::core::extractor::extract_file(&file_path, None, &config)
+                .await
+                .unwrap();
+
+            assert_eq!(result.mime_type, expected_mime);
+            assert!(result.content.contains(expected_text));
+        }
+    }
+
+    #[test]
+    fn should_resolve_registered_mime_alias_to_extensions() {
+        assert_eq!(
+            get_extensions_for_mime("text/x-asciidoc").unwrap(),
+            vec!["adoc".to_string(), "asciidoc".to_string()]
+        );
+    }
 
     #[test]
     fn test_detect_mime_type_pdf() {
@@ -1050,6 +1529,9 @@ mod tests {
         let test_cases = vec![
             ("test.txt", PLAIN_TEXT_MIME_TYPE),
             ("test.md", "text/markdown"),
+            ("test.qmd", "text/x-quarto"),
+            ("test.Rmd", "text/x-r-markdown"),
+            ("test.rmd", "text/x-r-markdown"),
             ("test.html", HTML_MIME_TYPE),
             ("test.htm", HTML_MIME_TYPE),
         ];
@@ -1125,7 +1607,6 @@ mod tests {
         File::create(&file_path).unwrap();
 
         let _result = detect_mime_type(&file_path, true);
-        // Files without extensions may or may not be detected via mime_guess fallback
     }
 
     #[test]
@@ -1144,6 +1625,52 @@ mod tests {
         let result = detect_or_validate(file_path.to_str(), None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "application/pdf");
+    }
+
+    /// Regression for #1223: a file whose content is a DOCX but whose extension
+    /// says .pdf must route by content, matching the bytes entry point — the
+    /// path detector previously trusted the extension and picked the PDF
+    /// extractor.
+    #[test]
+    fn misnamed_file_routes_by_content_not_extension() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/office/merged_cells.docx");
+        let Ok(docx_bytes) = std::fs::read(&fixture) else {
+            eprintln!("skipping: fixture not present at {fixture:?}");
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let misnamed = dir.path().join("report.pdf");
+        std::fs::write(&misnamed, &docx_bytes).unwrap();
+
+        let detected = detect_or_validate(misnamed.to_str(), None).unwrap();
+        assert_eq!(
+            detected, "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "DOCX content named .pdf must detect as DOCX, not PDF"
+        );
+    }
+
+    #[test]
+    fn specialized_json_extensions_are_not_overridden_by_generic_json_detection() {
+        let dir = tempdir().unwrap();
+        let cases = [
+            ("document.json", br#"{"value":1}"#.as_slice(), JSON_MIME_TYPE),
+            ("records.jsonl", br#"{"value":1}"#.as_slice(), "application/x-ndjson"),
+            (
+                "notebook.ipynb",
+                br#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#.as_slice(),
+                "application/x-ipynb+json",
+            ),
+        ];
+
+        for (filename, content, expected_mime) in cases {
+            let path = dir.path().join(filename);
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(
+                detect_or_validate(path.to_str(), None).unwrap(),
+                expected_mime,
+                "{filename} should retain its extension-specific JSON MIME type"
+            );
+        }
     }
 
     #[test]
@@ -1169,22 +1696,10 @@ mod tests {
 
     #[test]
     fn test_detect_office_format_from_zip_bytes() {
-        // Test DOCX detection - minimal ZIP with word/document.xml marker
-        // This is a valid ZIP local file header with "word/document.xml" as filename
         let docx_bytes: &[u8] = &[
-            0x50, 0x4b, 0x03, 0x04, // ZIP local file header signature
-            0x14, 0x00, // version needed
-            0x00, 0x00, // general purpose bit flag
-            0x00, 0x00, // compression method (stored)
-            0x00, 0x00, // last mod time
-            0x00, 0x00, // last mod date
-            0x00, 0x00, 0x00, 0x00, // crc-32
-            0x00, 0x00, 0x00, 0x00, // compressed size
-            0x00, 0x00, 0x00, 0x00, // uncompressed size
-            0x11, 0x00, // file name length (17)
-            0x00, 0x00, // extra field length
-            b'w', b'o', b'r', b'd', b'/', b'd', b'o', b'c', b'u', b'm', b'e', b'n', b't', b'.', b'x', b'm',
-            b'l', // "word/document.xml"
+            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, b'w', b'o', b'r', b'd', b'/', b'd',
+            b'o', b'c', b'u', b'm', b'e', b'n', b't', b'.', b'x', b'm', b'l',
         ];
         let mime = detect_mime_type_from_bytes(docx_bytes).unwrap();
         assert_eq!(
@@ -1192,14 +1707,10 @@ mod tests {
             "Should detect DOCX from ZIP with word/document.xml"
         );
 
-        // Test XLSX detection
         let xlsx_bytes: &[u8] = &[
-            0x50, 0x4b, 0x03, 0x04, // ZIP signature
-            0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, // file name length (15)
-            0x00, 0x00, // extra field length
-            b'x', b'l', b'/', b'w', b'o', b'r', b'k', b'b', b'o', b'o', b'k', b'.', b'x', b'm',
-            b'l', // "xl/workbook.xml"
+            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, b'x', b'l', b'/', b'w', b'o', b'r',
+            b'k', b'b', b'o', b'o', b'k', b'.', b'x', b'm', b'l',
         ];
         let mime = detect_mime_type_from_bytes(xlsx_bytes).unwrap();
         assert_eq!(
@@ -1207,14 +1718,10 @@ mod tests {
             "Should detect XLSX from ZIP with xl/workbook.xml"
         );
 
-        // Test PPTX detection
         let pptx_bytes: &[u8] = &[
-            0x50, 0x4b, 0x03, 0x04, // ZIP signature
-            0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x14, 0x00, // file name length (20)
-            0x00, 0x00, // extra field length
-            b'p', b'p', b't', b'/', b'p', b'r', b'e', b's', b'e', b'n', b't', b'a', b't', b'i', b'o', b'n', b'.', b'x',
-            b'm', b'l', // "ppt/presentation.xml"
+            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, b'p', b'p', b't', b'/', b'p', b'r',
+            b'e', b's', b'e', b'n', b't', b'a', b't', b'i', b'o', b'n', b'.', b'x', b'm', b'l',
         ];
         let mime = detect_mime_type_from_bytes(pptx_bytes).unwrap();
         assert_eq!(
@@ -1222,25 +1729,107 @@ mod tests {
             "Should detect PPTX from ZIP with ppt/presentation.xml"
         );
 
-        // Test plain ZIP (no Office markers)
+        #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+        {
+            for expected_mime in [ODT_MIME_TYPE, ODP_MIME_TYPE, ODS_MIME_TYPE] {
+                let open_document_bytes = build_zip(&[("mimetype", expected_mime.as_bytes())]);
+                let mime = detect_mime_type_from_bytes(&open_document_bytes).unwrap();
+                assert_eq!(mime, expected_mime, "Should detect exact OpenDocument mimetype entry");
+            }
+        }
+
         let plain_zip_bytes: &[u8] = &[
-            0x50, 0x4b, 0x03, 0x04, // ZIP signature
-            0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x08, 0x00, // file name length (8)
-            0x00, 0x00, // extra field length
-            b't', b'e', b's', b't', b'.', b't', b'x', b't', // "test.txt"
+            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'.', b't',
+            b'x', b't',
         ];
         let mime = detect_mime_type_from_bytes(plain_zip_bytes).unwrap();
         assert_eq!(mime, "application/zip", "Plain ZIP should remain as application/zip");
     }
 
     #[test]
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    fn reordered_open_document_mimetype_routes_by_exact_entry() {
+        const PADDING: &[u8] = &[b'x'; 5_000];
+        let dir = tempdir().unwrap();
+
+        for (extension, expected_mime) in [("odt", ODT_MIME_TYPE), ("odp", ODP_MIME_TYPE), ("ods", ODS_MIME_TYPE)] {
+            let bytes = build_zip(&[("padding.bin", PADDING), ("mimetype", expected_mime.as_bytes())]);
+            assert_eq!(detect_mime_type_from_bytes(&bytes).unwrap(), expected_mime);
+
+            let path = dir.path().join(format!("reordered.{extension}"));
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(detect_or_validate(path.to_str(), None).unwrap(), expected_mime);
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    fn odf_detection_rejects_decoys_and_invalid_mimetype_entries() {
+        let generic_zip = build_zip(&[("decoy.txt", ODT_MIME_TYPE.as_bytes())]);
+        assert_eq!(detect_mime_type_from_bytes(&generic_zip).unwrap(), ZIP_MIME_TYPE);
+
+        let epub = build_zip(&[("mimetype", b"application/epub+zip")]);
+        assert_eq!(detect_mime_type_from_bytes(&epub).unwrap(), "application/epub+zip");
+
+        let mixed = build_zip(&[
+            ("mimetype", ODT_MIME_TYPE.as_bytes()),
+            ("decoy.txt", ODS_MIME_TYPE.as_bytes()),
+        ]);
+        assert_eq!(detect_mime_type_from_bytes(&mixed).unwrap(), ODT_MIME_TYPE);
+
+        let oversized = build_zip(&[("mimetype", b"application/vnd.oasis.opendocument.text-extra")]);
+        assert_eq!(detect_mime_type_from_bytes(&oversized).unwrap(), ZIP_MIME_TYPE);
+
+        let mut duplicate = build_zip(&[
+            ("mimetypa", ODT_MIME_TYPE.as_bytes()),
+            ("mimetypb", ODP_MIME_TYPE.as_bytes()),
+        ]);
+        for offset in 0..duplicate.len().saturating_sub(b"mimetypa".len()) {
+            let name = &duplicate[offset..offset + b"mimetypa".len()];
+            if name == b"mimetypa" || name == b"mimetypb" {
+                duplicate[offset..offset + b"mimetype".len()].copy_from_slice(b"mimetype");
+            }
+        }
+        assert_eq!(detect_mime_type_from_bytes(&duplicate).unwrap(), ZIP_MIME_TYPE);
+
+        let truncated = &mixed[..mixed.len() / 2];
+        assert_eq!(detect_mime_type_from_bytes(truncated).unwrap(), ZIP_MIME_TYPE);
+    }
+
+    #[test]
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    fn odf_zip_preflight_rejects_excessive_entry_count() {
+        let archive = build_zip(&[("content.txt", b"content")]);
+        let default_limits = SecurityLimits::default();
+        assert!(zip_central_directory_within_limits(
+            &mut Cursor::new(&archive),
+            &default_limits
+        ));
+
+        let restricted_limits = SecurityLimits {
+            max_files_in_archive: 0,
+            ..default_limits
+        };
+        assert!(!zip_central_directory_within_limits(
+            &mut Cursor::new(archive),
+            &restricted_limits
+        ));
+    }
+
+    #[test]
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    fn odf_extension_does_not_override_generic_zip_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-an-open-document.odt");
+        std::fs::write(&path, build_zip(&[("content.txt", b"plain archive")])).unwrap();
+
+        assert_eq!(detect_or_validate(path.to_str(), None).unwrap(), ZIP_MIME_TYPE);
+    }
+
+    #[test]
     fn test_detect_pst_from_bytes() {
-        // PST magic signature: "!BDN" followed by format-specific bytes
-        let pst_bytes: &[u8] = &[
-            0x21, 0x42, 0x44, 0x4E, // "!BDN" magic signature
-            0x00, 0x00, 0x00, 0x00, // padding (real PST files have more header data)
-        ];
+        let pst_bytes: &[u8] = &[0x21, 0x42, 0x44, 0x4E, 0x00, 0x00, 0x00, 0x00];
         let mime = detect_mime_type_from_bytes(pst_bytes).unwrap();
         assert_eq!(mime, PST_MIME_TYPE, "Should detect PST from magic bytes");
     }
@@ -1249,6 +1838,47 @@ mod tests {
     fn test_list_supported_formats_not_empty() {
         let formats = list_supported_formats();
         assert!(!formats.is_empty(), "Supported formats list should not be empty");
+    }
+
+    /// The headline "N formats · M file extensions" is hand-typed in the README
+    /// templates and the docs site, and nothing derived it from [`FORMATS`] — so it
+    /// drifted to "101 formats · 115 file extensions" against a table holding 100
+    /// entries and 120 extensions, and propagated into every generated README.
+    ///
+    /// Mirrors `core::formats::tests::test_known_formats_count`. If this fails because
+    /// a format was legitimately added or removed, update the numbers here **and** in
+    /// the copy listed below, which is where the published figures come from:
+    ///
+    /// - `templates/readme/root.md`, `cli.md`, `rust.md`,
+    ///   `templates/readme/partials/features.md.jinja`, `templates/docs/llms-body.md.jinja`
+    /// - `docs-site/src/content/docs/`: `index.mdx`, `features.mdx`, `ecosystem.md`,
+    ///   `cli/usage.mdx`, `guides/extraction.mdx`, `guides/rust-core-api.md`,
+    ///   `integrations/langchain.mdx`, `integrations/txtai.md`
+    ///
+    /// The generated READMEs (root `README.md`, `packages/*/README.md`, the crate
+    /// READMEs) pick the change up on the next alef regen -- do not hand-edit those.
+    #[test]
+    fn format_and_extension_counts_match_the_published_headline() {
+        const PUBLISHED_FORMATS: usize = 100;
+        const PUBLISHED_EXTENSIONS: usize = 120;
+
+        let extensions: HashSet<&str> = FORMATS
+            .iter()
+            .flat_map(|entry| entry.extensions.iter().copied())
+            .collect();
+
+        assert_eq!(
+            FORMATS.len(),
+            PUBLISHED_FORMATS,
+            "FORMATS has {} entries but the docs advertise {PUBLISHED_FORMATS} formats",
+            FORMATS.len()
+        );
+        assert_eq!(
+            extensions.len(),
+            PUBLISHED_EXTENSIONS,
+            "FORMATS covers {} unique extensions but the docs advertise {PUBLISHED_EXTENSIONS}",
+            extensions.len()
+        );
     }
 
     #[test]
@@ -1262,16 +1892,23 @@ mod tests {
 
     #[test]
     fn test_list_supported_formats_includes_common_formats() {
+        // `list_supported_formats` now filters against the registered extractor set
+        // (#308), so assertions for extensions gated behind optional Cargo features
+        // only hold when those features are compiled in.
         let formats = list_supported_formats();
         let extensions: Vec<&str> = formats.iter().map(|f| f.extension.as_str()).collect();
 
+        #[cfg(feature = "pdf")]
         assert!(extensions.contains(&"pdf"), "Should include pdf");
         assert!(extensions.contains(&"md"), "Should include md");
+        #[cfg(feature = "office")]
         assert!(extensions.contains(&"docx"), "Should include docx");
+        #[cfg(feature = "html")]
         assert!(extensions.contains(&"html"), "Should include html");
         assert!(extensions.contains(&"txt"), "Should include txt");
         assert!(extensions.contains(&"csv"), "Should include csv");
         assert!(extensions.contains(&"json"), "Should include json");
+        #[cfg(any(feature = "excel", feature = "excel-wasm"))]
         assert!(extensions.contains(&"xlsx"), "Should include xlsx");
     }
 
@@ -1287,7 +1924,6 @@ mod tests {
 
     #[test]
     fn test_formats_registry_consistency() {
-        // Every extension in EXT_TO_MIME should map to a MIME type that is in SUPPORTED_MIME_TYPES
         for (ext, mime) in EXT_TO_MIME.iter() {
             assert!(
                 SUPPORTED_MIME_TYPES.contains(mime),
@@ -1300,16 +1936,13 @@ mod tests {
 
     #[test]
     fn test_formats_registry_mdx() {
-        // MDX extension mapping
         assert_eq!(EXT_TO_MIME.get("mdx"), Some(&"text/mdx"));
-        // MDX MIME types are valid
         assert!(SUPPORTED_MIME_TYPES.contains("text/mdx"));
         assert!(SUPPORTED_MIME_TYPES.contains("text/x-mdx"));
     }
 
     #[test]
     fn test_formats_registry_aliases() {
-        // Verify key aliases are in SUPPORTED_MIME_TYPES
         assert!(
             SUPPORTED_MIME_TYPES.contains("text/x-markdown"),
             "text/x-markdown alias"
@@ -1326,5 +1959,52 @@ mod tests {
         );
         assert!(SUPPORTED_MIME_TYPES.contains("text/rtf"), "rtf alias");
         assert!(SUPPORTED_MIME_TYPES.contains("text/x-typst"), "typst alias");
+    }
+
+    /// Every alias in [`FORMATS`] must route to the same extractor as its canonical MIME
+    /// type.
+    ///
+    /// `validate_mime_type` accepts an alias verbatim — it does not normalize it to the
+    /// canonical form — and `DocumentExtractorRegistry::get` resolves by exact string with
+    /// no alias awareness. So an alias that no extractor lists in `supported_mime_types()`
+    /// is advertised as supported by `list_supported_formats()` and then rejected as
+    /// `UnsupportedFormat` at extraction time (#229, and #289 for the same shape).
+    ///
+    /// Formats whose canonical MIME has no registered extractor are skipped, so this stays
+    /// valid under any feature set: it only ever asserts that an alias is no worse off than
+    /// the canonical name beside it.
+    #[test]
+    fn every_declared_alias_resolves_to_the_same_extractor_as_its_canonical_mime() {
+        crate::extractors::ensure_initialized().expect("failed to initialize default extractors");
+        let registry = crate::plugins::registry::get_document_extractor_registry();
+        let registry = registry.read();
+
+        let mut unclaimed = Vec::new();
+        for format in FORMATS {
+            let Ok(canonical) = registry.get(format.mime_type) else {
+                continue;
+            };
+            for alias in format.aliases {
+                match registry.get(alias) {
+                    Ok(aliased) if aliased.name() == canonical.name() => {}
+                    Ok(aliased) => unclaimed.push(format!(
+                        "{alias} (alias of {}) resolves to {}, not {}",
+                        format.mime_type,
+                        aliased.name(),
+                        canonical.name()
+                    )),
+                    Err(_) => unclaimed.push(format!(
+                        "{alias} (alias of {}) resolves to no extractor, but {} does",
+                        format.mime_type, format.mime_type
+                    )),
+                }
+            }
+        }
+
+        assert!(
+            unclaimed.is_empty(),
+            "declared alias MIME types are advertised as supported but unroutable:\n  {}",
+            unclaimed.join("\n  ")
+        );
     }
 }

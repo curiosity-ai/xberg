@@ -20,7 +20,10 @@ pub enum CandleModelId {
 pub struct CandleOcrConfig {
     pub model: CandleModelId,
     pub device: DevicePreference,
+    /// Optional explicit Hugging Face Hub cache root. When unset, the standard
+    /// Hugging Face environment-variable conventions are used.
     pub cache_dir: Option<PathBuf>,
+    /// Optional immutable Hugging Face revision for caller-selected models.
     pub hf_revision: Option<String>,
     pub max_new_tokens: u32,
     pub temperature: f32,

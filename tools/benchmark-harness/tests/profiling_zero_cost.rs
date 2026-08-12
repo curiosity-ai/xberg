@@ -1,40 +1,72 @@
-//! Zero-cost profiling verification tests
+//! Verification that the no-op profiling path is the one compiled in when `profiling` is off.
 //!
-//! These tests verify that profiling has truly zero overhead when the feature is disabled.
-//! They only run when the profiling feature is NOT enabled, ensuring that profiling code
-//! is completely removed from the binary at compile time.
+//! These tests only build when the `profiling` feature is NOT enabled. Each asserts a value that
+//! the real pprof-backed implementation could not produce, so a regression in the feature gating
+//! (for example re-exporting the real `ProfileGuard` unconditionally) fails them.
+//!
+//! Scope: this is a behavioural check of the public API, not a binary inspection. Literal absence
+//! of pprof symbols from the linked artifact is not asserted here.
 
 #![cfg(not(feature = "profiling"))]
-#![allow(clippy::assertions_on_constants)]
 
-/// Verify that profiling is successfully excluded from the build when feature is disabled.
-///
-/// This test simply needs to compile and run to prove that:
-/// 1. The profiling feature gate is working correctly
-/// 2. No profiling code is present in the binary
-/// 3. The build succeeds without profiling dependencies
-///
-/// If this test runs, it means the profiling feature is properly isolated.
-#[test]
-fn test_profiling_absent_when_disabled() {
-    assert!(true, "Profiling successfully excluded from build when feature disabled");
+use benchmark_harness::profiling::ProfileGuard;
+use std::time::Duration;
+
+/// Sampling frequency in Hz requested from the profiler; the no-op path must ignore it entirely.
+const REQUESTED_SAMPLING_FREQUENCY_HZ: i32 = 1000;
+
+/// Work performed between starting and finishing the profiler, large enough that a real profiler
+/// sampling at [`REQUESTED_SAMPLING_FREQUENCY_HZ`] would record a non-zero duration.
+fn burn_measurable_cpu_time() {
+    let total: u64 = (0..2_000_000_u64).map(|value| value.wrapping_mul(7)).sum();
+    std::hint::black_box(total);
 }
 
-/// Verify that profiling symbols don't leak into the build.
-///
-/// This is a compile-time check via the test structure itself.
-/// The fact that this test compiles without profiling feature means
-/// the conditional compilation is working correctly.
 #[test]
-fn test_no_profiling_symbols_in_binary() {
-    assert!(true, "No profiling symbols present in binary");
+fn should_report_zero_samples_when_profiling_feature_is_disabled() {
+    let guard = ProfileGuard::new(REQUESTED_SAMPLING_FREQUENCY_HZ).expect("create no-op profile guard");
+    burn_measurable_cpu_time();
+
+    assert_eq!(
+        guard.estimated_sample_count(),
+        0,
+        "no-op profiler must collect no samples; a non-zero count means the real pprof profiler \
+         was compiled in despite the `profiling` feature being disabled"
+    );
 }
 
-/// Verify that no-op implementations are used when profiling is disabled.
-///
-/// Even though we can't import ProfileGuard/ProfileReport here (they're feature-gated),
-/// the fact that the code compiles and runs proves the no-op fallbacks are being used.
 #[test]
-fn test_noop_implementations_active() {
-    assert!(true, "No-op profiling implementations are active");
+fn should_report_zero_duration_when_profiling_feature_is_disabled() {
+    let guard = ProfileGuard::new(REQUESTED_SAMPLING_FREQUENCY_HZ).expect("create no-op profile guard");
+    burn_measurable_cpu_time();
+    let result = guard.finish().expect("finish no-op profile guard");
+
+    assert_eq!(result.sample_count, 0, "no-op profiling result must carry no samples");
+    assert_eq!(
+        result.duration,
+        Duration::ZERO,
+        "no-op profiling result must not measure elapsed time; the real implementation reports the \
+         guard's actual lifetime, which the CPU burn above makes non-zero"
+    );
+}
+
+#[test]
+fn should_not_write_a_flamegraph_when_profiling_feature_is_disabled() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let output_path = directory.path().join("nested").join("profile.svg");
+
+    let guard = ProfileGuard::new(REQUESTED_SAMPLING_FREQUENCY_HZ).expect("create no-op profile guard");
+    burn_measurable_cpu_time();
+    let result = guard.finish().expect("finish no-op profile guard");
+
+    result
+        .generate_flamegraph(&output_path)
+        .expect("no-op flamegraph generation must succeed without doing work");
+
+    assert!(
+        !output_path.exists(),
+        "no-op flamegraph generation must not write `{}`; the real implementation creates parent \
+         directories and writes an SVG there",
+        output_path.display()
+    );
 }

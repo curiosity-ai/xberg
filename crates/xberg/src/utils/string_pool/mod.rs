@@ -28,5 +28,4 @@
 
 mod interned;
 
-// Re-export public types and functions
 pub use interned::InternedString;

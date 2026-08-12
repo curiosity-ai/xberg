@@ -27,7 +27,6 @@ async fn noop_cache_put_is_inert() {
 #[test]
 fn noop_progress_sink_emit_is_inert() {
     let sink = NoopProgressSink;
-    // Emitting must not panic and must have no observable effect.
     sink.emit(ProgressEvent {
         stage: "stage".to_string(),
         message: Some("detail".to_string()),
@@ -37,7 +36,6 @@ fn noop_progress_sink_emit_is_inert() {
 
 #[tokio::test]
 async fn engine_new_default_cache_is_noop() {
-    // Engine::new_default() must wire the in-core NoopCache default.
     let engine = Engine::new_default();
     assert_eq!(
         engine.cache_backend().get("k").await,
@@ -145,9 +143,6 @@ mod llm_client {
 
     #[test]
     fn default_llm_client_is_a_trait_object() {
-        // The default delegates verbatim to llm::structured::complete_with_json_schema
-        // (a single call site); behavioral equivalence is by direct delegation. Here we
-        // only assert the default type implements the seam trait and is injectable.
         let _client: Arc<dyn LlmClient> = Arc::new(LiterLlmClient);
     }
 }
@@ -158,8 +153,6 @@ mod model_provider {
 
     #[tokio::test]
     async fn unknown_model_errors_without_download() {
-        // An unknown model type fails the manager's lookup before any network
-        // access, proving the default delegates to the model manager's path.
         let provider = DefaultModelProvider::default();
         let result = provider
             .ensure_model(&ModelId::new("definitely-not-a-real-model"))

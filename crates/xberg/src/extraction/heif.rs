@@ -66,8 +66,6 @@ pub(crate) fn decode_heic_to_png(bytes: &[u8]) -> Result<Vec<u8>> {
         .interleaved
         .ok_or_else(|| XbergError::parsing("HEIF decode returned no interleaved RGBA plane".to_string()))?;
 
-    // libheif rows are padded to `stride` bytes. Repack to a tight (width * 4)-byte
-    // row layout before handing off to the PNG encoder.
     let row_bytes = (width as usize) * 4;
     let mut packed = Vec::with_capacity(row_bytes * (height as usize));
     for row in 0..(height as usize) {
@@ -94,17 +92,13 @@ mod tests {
 
     #[test]
     fn detects_known_heif_brands() {
-        // Synthesise an ftyp box with each major brand we register.
         let make = |brand: &[u8; 4]| {
-            let mut buf = Vec::from(&b"\x00\x00\x00\x18"[..]); // box size (24)
+            let mut buf = Vec::from(&b"\x00\x00\x00\x18"[..]);
             buf.extend_from_slice(b"ftyp");
             buf.extend_from_slice(brand);
-            buf.extend_from_slice(&[0u8; 12]); // padding to fill the box
+            buf.extend_from_slice(&[0u8; 12]);
             buf
         };
-        // ISO/IEC 14496-12 / 23008-12 / 23000-22 major brands actually emitted by
-        // HEIF-family encoders. `heif` itself is not a real ftyp brand — HEIF still
-        // images use `mif1` or codec-specific brands (`heic`, `heix`, `avif`, …).
         for brand in [b"heic", b"heix", b"avif", b"avcs", b"mif1", b"avis"] {
             assert!(
                 is_heif_container(&make(brand)),
@@ -119,9 +113,7 @@ mod tests {
         assert!(!is_heif_container(b""));
         assert!(!is_heif_container(b"hello world"));
         assert!(!is_heif_container(&[0u8; 4]));
-        // PNG magic bytes
         assert!(!is_heif_container(b"\x89PNG\r\n\x1a\n0000"));
-        // ftyp box with an unknown brand
         assert!(!is_heif_container(b"\x00\x00\x00\x18ftypxxxxRESERVED___"));
     }
 
@@ -131,8 +123,10 @@ mod tests {
         use image::ImageReader;
         use std::io::Cursor;
 
-        const HEIC: &[u8] = include_bytes!("../../../../test_documents/images/test.heic");
-        let png = decode_heic_to_png(HEIC).expect("decode_heic_to_png");
+        let Some(heic) = crate::utils::read_test_fixture("images/test.heic") else {
+            return;
+        };
+        let png = decode_heic_to_png(&heic).expect("decode_heic_to_png");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output is not a PNG");
 
         let reader = ImageReader::new(Cursor::new(&png))

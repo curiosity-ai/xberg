@@ -2,8 +2,13 @@
 
 use crate::Result;
 use crate::core::config::ExtractionConfig;
-use crate::extractors::iwork::{dedup_text, extract_metadata_from_zip, extract_text_from_proto, read_iwa_file};
+use crate::extractors::iwork::{
+    IwaExpansionBudget, dedup_text, extract_metadata_from_zip, extract_text_from_proto, push_member_parse_warning,
+    read_iwa_file, validate_iwork_zip,
+};
+use crate::extractors::security::{SecurityBudget, SecurityLimits};
 use crate::plugins::{InternalDocumentExtractor, Plugin};
+use crate::types::ProcessingWarning;
 use crate::types::internal::InternalDocument;
 use crate::types::internal_builder::InternalDocumentBuilder;
 use async_trait::async_trait;
@@ -63,6 +68,8 @@ struct PagesData {
     supplementary_texts: Vec<String>,
     /// Metadata extracted from the ZIP archive.
     metadata: crate::types::metadata::Metadata,
+    /// Warnings for IWA members that failed to parse (#106).
+    warnings: Vec<ProcessingWarning>,
 }
 
 /// Parse a Pages ZIP and extract all text from IWA files.
@@ -74,11 +81,13 @@ struct PagesData {
 ///
 /// We prioritize Document IWA files for the main body and separate
 /// annotation/data content.
-fn parse_pages(content: &[u8]) -> Result<PagesData> {
+fn parse_pages(content: &[u8], limits: &SecurityLimits) -> Result<PagesData> {
+    validate_iwork_zip(content, limits)?;
+    let mut budget = SecurityBudget::for_iwork(limits);
+    let mut expansion = IwaExpansionBudget::from_limits(limits);
     let iwa_paths = super::collect_iwa_paths(content)?;
     let metadata = extract_metadata_from_zip(content);
 
-    // Separate document-content IWA files from annotations and data records
     let mut doc_paths: Vec<&String> = Vec::new();
     let mut other_paths: Vec<&String> = Vec::new();
 
@@ -91,34 +100,39 @@ fn parse_pages(content: &[u8]) -> Result<PagesData> {
         }
     }
 
-    // If no document-specific paths were found, treat all paths as document content
     if doc_paths.is_empty() {
         doc_paths = iwa_paths.iter().collect();
         other_paths.clear();
     }
 
+    let mut warnings: Vec<ProcessingWarning> = Vec::new();
+
     let mut doc_texts: Vec<String> = Vec::new();
     for path in &doc_paths {
-        match read_iwa_file(content, path) {
+        match read_iwa_file(content, path, &mut expansion) {
             Ok(decompressed) => {
-                let texts = extract_text_from_proto(&decompressed);
+                let texts = extract_text_from_proto(&decompressed, &mut budget)?;
                 doc_texts.extend(texts);
             }
-            Err(_) => {
-                tracing::debug!("Skipping IWA file (decompression failed): {path}");
+            Err(error) if matches!(&error, crate::error::XbergError::Security { .. }) => return Err(error),
+            Err(error) => {
+                tracing::debug!(%error, "Skipping IWA file (decompression failed): {path}");
+                push_member_parse_warning(&mut warnings, path, &error);
             }
         }
     }
 
     let mut other_texts_raw: Vec<String> = Vec::new();
     for path in &other_paths {
-        match read_iwa_file(content, path) {
+        match read_iwa_file(content, path, &mut expansion) {
             Ok(decompressed) => {
-                let texts = extract_text_from_proto(&decompressed);
+                let texts = extract_text_from_proto(&decompressed, &mut budget)?;
                 other_texts_raw.extend(texts);
             }
-            Err(_) => {
-                tracing::debug!("Skipping IWA file (decompression failed): {path}");
+            Err(error) if matches!(&error, crate::error::XbergError::Security { .. }) => return Err(error),
+            Err(error) => {
+                tracing::debug!(%error, "Skipping IWA file (decompression failed): {path}");
+                push_member_parse_warning(&mut warnings, path, &error);
             }
         }
     }
@@ -133,6 +147,7 @@ fn parse_pages(content: &[u8]) -> Result<PagesData> {
         document_texts,
         supplementary_texts,
         metadata,
+        warnings,
     })
 }
 
@@ -152,15 +167,17 @@ impl InternalDocumentExtractor for PagesExtractor {
                     return Err(crate::error::XbergError::Cancelled);
                 }
                 let content_owned = content.to_vec();
+                let limits = config.security_limits.clone().unwrap_or_default();
                 let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
                     let _guard = span.entered();
-                    parse_pages(&content_owned)
+                    parse_pages(&content_owned, &limits)
                 })
                 .await
                 .map_err(|e| crate::error::XbergError::parsing(format!("Pages extraction task failed: {e}")))??
             } else {
-                parse_pages(content)?
+                let limits = config.security_limits.clone().unwrap_or_default();
+                parse_pages(content, &limits)?
             }
 
             #[cfg(not(feature = "tokio-runtime"))]
@@ -168,12 +185,16 @@ impl InternalDocumentExtractor for PagesExtractor {
                 if config.cancel_token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
                     return Err(crate::error::XbergError::Cancelled);
                 }
-                parse_pages(content)?
+                let limits = config.security_limits.clone().unwrap_or_default();
+                parse_pages(content, &limits)?
             }
         };
 
         let mut doc = build_pages_internal_document(&data);
         doc.mime_type = mime_type.to_string();
+        for warning in data.warnings {
+            crate::core::diagnostics::push_warning_deduped(&mut doc.processing_warnings, warning);
+        }
         Ok(doc)
     }
 
@@ -194,13 +215,10 @@ impl InternalDocumentExtractor for PagesExtractor {
 fn build_pages_internal_document(data: &PagesData) -> InternalDocument {
     let mut builder = InternalDocumentBuilder::new("pages");
 
-    // Apply metadata
     if data.metadata.title.is_some() || data.metadata.authors.is_some() {
         builder.set_metadata(data.metadata.clone());
     }
 
-    // Emit the first text block as the document title if it looks like one
-    // (short, no sentence-ending punctuation, appears before body text).
     let texts = &data.document_texts;
     let mut start_idx = 0;
     if let Some(first) = texts.first() {
@@ -211,7 +229,6 @@ fn build_pages_internal_document(data: &PagesData) -> InternalDocument {
         }
     }
 
-    // Emit remaining document text with heading detection
     for text in &texts[start_idx..] {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -225,7 +242,6 @@ fn build_pages_internal_document(data: &PagesData) -> InternalDocument {
         }
     }
 
-    // Emit supplementary text (annotations, data records) under a separate section
     if !data.supplementary_texts.is_empty() {
         let has_body = !data.document_texts.is_empty();
         if has_body {
@@ -283,5 +299,54 @@ mod tests {
         let extractor = PagesExtractor::new();
         let types = extractor.supported_mime_types();
         assert!(types.contains(&"application/x-iwork-pages-sffpages"));
+    }
+
+    fn iwa_text_frame(text: &str) -> Vec<u8> {
+        let mut payload = vec![0x1A, text.len() as u8];
+        payload.extend_from_slice(text.as_bytes());
+        let mut frame = vec![1, 0, 0, 0];
+        let length = payload.len();
+        frame[1] = (length & 0xff) as u8;
+        frame[2] = ((length >> 8) & 0xff) as u8;
+        frame[3] = ((length >> 16) & 0xff) as u8;
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    fn pages_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let options = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in entries {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// Regression for #106: a Document IWA member that fails to decompress
+    /// must surface a named `ProcessingWarning`, not vanish silently.
+    #[test]
+    fn should_warn_when_a_document_iwa_member_fails_to_parse() {
+        let good = iwa_text_frame("Body text");
+        let broken: Vec<u8> = vec![1, 0, 0];
+        let archive = pages_zip(&[("Index/Document-1.iwa", &good), ("Index/Document-2.iwa", &broken)]);
+
+        let data = parse_pages(&archive, &SecurityLimits::default()).unwrap();
+
+        assert_eq!(data.document_texts, vec!["Body text".to_string()]);
+        assert_eq!(data.warnings.len(), 1);
+        assert_eq!(data.warnings[0].source, "iwork");
+        assert!(
+            data.warnings[0].message.contains("Index/Document-2.iwa"),
+            "warning must name the failed member: {}",
+            data.warnings[0].message
+        );
     }
 }

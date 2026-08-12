@@ -4,7 +4,8 @@
 //! tabular, and table environments.
 
 use super::commands::process_line;
-use super::utilities::{clean_text, collect_environment, extract_braced, extract_env_name};
+use super::utilities::{clean_text, collect_environment, extract_braced, extract_env_name, is_table_structural_line};
+use crate::rendering::common::render_table_markdown;
 use crate::types::Table;
 
 /// Processes a list environment (itemize, enumerate, or description).
@@ -19,7 +20,6 @@ pub(crate) fn process_list(content: &str, list_type: &str, output: &mut String) 
         let line = lines[i];
         let trimmed = line.trim();
 
-        // Handle nested lists
         if (trimmed.contains("\\begin{") || trimmed.contains("\\begin {"))
             && let Some(env_name) = extract_env_name(trimmed)
             && (env_name == "itemize" || env_name == "enumerate" || env_name == "description")
@@ -29,7 +29,6 @@ pub(crate) fn process_list(content: &str, list_type: &str, output: &mut String) 
             process_list(&nested_content, &env_name, output);
             let nested_output = output[current_output_len..].to_string();
             output.truncate(current_output_len);
-            // Indent nested list
             for nested_line in nested_output.lines() {
                 output.push_str("  ");
                 output.push_str(nested_line);
@@ -39,13 +38,11 @@ pub(crate) fn process_list(content: &str, list_type: &str, output: &mut String) 
             continue;
         }
 
-        // Handle \item
         if trimmed.starts_with("\\item")
             && let Some(pos) = trimmed.find("\\item")
         {
             let after = trimmed[pos + 5..].trim();
 
-            // Handle \item[label] for description lists
             if after.starts_with('[')
                 && let Some(bracket_end) = after.find(']')
             {
@@ -60,7 +57,6 @@ pub(crate) fn process_list(content: &str, list_type: &str, output: &mut String) 
                 }
             }
 
-            // Regular list item
             let prefix = if list_type == "enumerate" {
                 format!("{}. ", item_num)
             } else {
@@ -79,20 +75,22 @@ pub(crate) fn process_list(content: &str, list_type: &str, output: &mut String) 
     output.push('\n');
 }
 
-/// Processes a tabular environment.
+/// Processes a `tabular`, `longtable`, `tabularx`, or `tabulary` environment.
 ///
-/// Converts LaTeX tables into markdown tables and creates Table structures.
+/// All four share the same `&`-separated cell / `\\`-terminated row grid; the
+/// column-spec argument syntax that differs between them is already stripped
+/// out by [`collect_environment`], and `longtable`'s page-break markers
+/// (`\endhead`, `\endfoot`, ...) are skipped via [`is_table_structural_line`].
+///
+/// Converts LaTeX tables into markdown tables (via the crate's canonical
+/// [`render_table_markdown`]) and creates `Table` structures.
 pub(crate) fn process_table(content: &str, output: &mut String, tables: &mut Vec<Table>) {
     let lines: Vec<&str> = content.lines().collect();
     let mut rows: Vec<Vec<String>> = Vec::new();
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.starts_with("\\hline")
-            || trimmed.is_empty()
-            || trimmed.contains("\\begin{tabular}")
-            || trimmed.contains("\\end{tabular}")
-        {
+        if is_table_structural_line(trimmed) {
             continue;
         }
 
@@ -109,24 +107,7 @@ pub(crate) fn process_table(content: &str, output: &mut String, tables: &mut Vec
     }
 
     if !rows.is_empty() {
-        let mut markdown = String::new();
-        for (i, row) in rows.iter().enumerate() {
-            markdown.push('|');
-            for cell in row {
-                markdown.push_str(&format!(" {} |", cell));
-            }
-            markdown.push('\n');
-
-            // Add header separator after first row
-            if i == 0 && rows.len() > 1 {
-                markdown.push('|');
-                for _ in row {
-                    markdown.push_str(" --- |");
-                }
-                markdown.push('\n');
-            }
-        }
-
+        let markdown = render_table_markdown(&rows);
         output.push_str(&markdown);
 
         let table = Table {
@@ -134,6 +115,7 @@ pub(crate) fn process_table(content: &str, output: &mut String, tables: &mut Vec
             markdown: markdown.clone(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         };
         tables.push(table);
     }
@@ -143,7 +125,6 @@ pub(crate) fn process_table(content: &str, output: &mut String, tables: &mut Vec
 ///
 /// Extracts the caption and processes the embedded tabular environment.
 pub(crate) fn process_table_with_caption(content: &str, output: &mut String, tables: &mut Vec<Table>) {
-    // Extract and add caption if present
     if content.contains("\\caption{")
         && let Some(caption) = extract_braced(content, "caption")
     {
@@ -151,7 +132,6 @@ pub(crate) fn process_table_with_caption(content: &str, output: &mut String, tab
         output.push('\n');
     }
 
-    // Process the tabular environment inside
     let end_tag = "\\end{tabular}";
     if content.contains("\\begin{tabular}")
         && let Some(start) = content.find("\\begin{tabular}")

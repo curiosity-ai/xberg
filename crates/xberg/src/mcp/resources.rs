@@ -41,20 +41,12 @@ pub fn list_resources() -> ListResourcesResult {
             .with_mime_type("application/json"),
     );
 
-    ListResourcesResult {
-        resources,
-        next_cursor: None,
-        meta: None,
-    }
+    ListResourcesResult::with_all_items(resources)
 }
 
 /// Return an empty resource template list (no URI templates are defined).
 pub fn list_resource_templates() -> ListResourceTemplatesResult {
-    ListResourceTemplatesResult {
-        resource_templates: vec![],
-        next_cursor: None,
-        meta: None,
-    }
+    ListResourceTemplatesResult::with_all_items(vec![])
 }
 
 /// Read the contents of a static resource by URI.
@@ -76,7 +68,7 @@ pub fn read_resource(uri: &str) -> Result<ReadResourceResult, ErrorData> {
             #[allow(unused_mut)]
             let mut entries: Vec<serde_json::Value> = Vec::new();
 
-            #[cfg(feature = "paddle-ocr")]
+            #[cfg(paddle_ocr)]
             {
                 let manifest = crate::paddle_ocr::ModelManager::manifest();
                 for entry in manifest {
@@ -111,7 +103,6 @@ pub fn read_resource(uri: &str) -> Result<ReadResourceResult, ErrorData> {
         }
 
         URI_OCR_LANGUAGES => {
-            // Canonical Tesseract ISO 639 language code list.
             let langs = serde_json::json!({
                 "languages": [
                     "afr","amh","ara","asm","aze","bel","ben","bod","bos","bul",
@@ -200,7 +191,6 @@ mod tests {
             assert!(v.get("languages").is_some());
             let langs = v["languages"].as_array().expect("languages should be array");
             assert!(!langs.is_empty());
-            // eng must be present
             let has_eng = langs.iter().any(|l| l.as_str() == Some("eng"));
             assert!(has_eng, "eng should be in OCR languages list");
         } else {

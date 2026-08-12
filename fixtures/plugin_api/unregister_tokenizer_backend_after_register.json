@@ -2,6 +2,12 @@
 	"id": "unregister_tokenizer_backend_after_register",
 	"category": "plugin_api",
 	"description": "unregister_tokenizer_backend",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "unregister_tokenizer_backend",
+		"description": "unregister_tokenizer_backend",
+		"side_effects": "safe"
+	},
 	"call": "unregister_tokenizer_backend",
 	"input": {
 		"name": "test-tokenizer-backend"

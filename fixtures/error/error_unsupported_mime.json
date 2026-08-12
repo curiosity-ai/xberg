@@ -2,6 +2,15 @@
 	"id": "error_unsupported_mime",
 	"category": "error",
 	"description": "Error when extracting with unsupported MIME type",
+	"docs": {
+		"topic": "error",
+		"title": "Error when extracting with unsupported MIME type",
+		"description": "Error when extracting with unsupported MIME type",
+		"presentation": {
+			"files": [{ "field": "/bytes", "path": "test_documents/text/plain.txt" }]
+		},
+		"side_effects": "safe"
+	},
 	"tags": ["error", "input", "mime"],
 	"call": "extract",
 	"input": {

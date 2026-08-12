@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
+use crate::core::diagnostics::push_warning;
 use crate::extraction::ooxml_constants::PRESENTATIONML_NAMESPACE;
+use crate::types::ProcessingWarning;
 use crate::types::revisions::{DiffLine, DocumentRevision, RevisionAnchor, RevisionDelta, RevisionKind};
 
 use super::container::PptxContainer;
@@ -20,31 +22,29 @@ use super::container::PptxContainer;
 ///
 /// Returns `None` when no comment XML parts exist in the archive, and
 /// `Some(vec![])` when files are present but contain no `<p:cm>` elements.
-/// On parse error the function logs a warning and returns `None` so that the
-/// rest of extraction still succeeds.
+/// A comment file or the author list that exists but fails to parse is
+/// surfaced as a `ProcessingWarning` naming the part, rather than only
+/// logging and silently discarding those comments (#238).
 pub(super) fn extract_comments<R: Read + Seek>(
     container: &mut PptxContainer<R>,
     slide_paths: &[String],
+    warnings: &mut Vec<ProcessingWarning>,
 ) -> Option<Vec<DocumentRevision>> {
-    let author_map = load_author_map(container);
+    let author_map = load_author_map(container, warnings);
     let mut all_comments: Vec<DocumentRevision> = Vec::new();
     let mut any_comment_file_found = false;
 
     for (slide_idx, _) in slide_paths.iter().enumerate() {
-        // PPTX stores comments in ppt/comments/comment{N}.xml, 1-indexed.
         let comment_path = format!("ppt/comments/comment{}.xml", slide_idx + 1);
         let xml_bytes = match container.read_file(&comment_path) {
             Ok(b) => {
                 any_comment_file_found = true;
                 b
             }
-            Err(_) => continue, // absent = no comments on this slide
+            Err(_) => continue,
         };
 
-        // slide index for anchor: the PPTX module numbers slides 1-indexed
-        // in slide_number but RevisionAnchor::Slide is 0-indexed per the spec
-        // comment in revisions.rs.  Use 0-based so anchor is consistent.
-        let slide_index = slide_idx; // 0-based
+        let slide_index = slide_idx;
 
         match parse_comment_xml(&xml_bytes, slide_index, &author_map) {
             Ok(revisions) => all_comments.extend(revisions),
@@ -53,6 +53,16 @@ pub(super) fn extract_comments<R: Read + Seek>(
                     path = %comment_path,
                     error = %e,
                     "failed to parse PPTX comment file; skipping slide comments"
+                );
+                push_warning(
+                    warnings,
+                    "pptx",
+                    format!(
+                        "Could not parse comments for slide {} ('{}'): {}; comments were not extracted",
+                        slide_idx + 1,
+                        comment_path,
+                        e
+                    ),
                 );
             }
         }
@@ -67,8 +77,13 @@ pub(super) fn extract_comments<R: Read + Seek>(
 
 /// Load `ppt/commentAuthors.xml` and return an `authorId → name` map.
 ///
-/// Returns an empty map when the file is absent or unparseable.
-fn load_author_map<R: Read + Seek>(container: &mut PptxContainer<R>) -> HashMap<u32, String> {
+/// Returns an empty map when the file is absent. A file that exists but
+/// fails to parse is surfaced as a `ProcessingWarning`, since comments will
+/// then be missing author attribution (#238).
+fn load_author_map<R: Read + Seek>(
+    container: &mut PptxContainer<R>,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> HashMap<u32, String> {
     let xml_bytes = match container.read_file("ppt/commentAuthors.xml") {
         Ok(b) => b,
         Err(_) => return HashMap::new(),
@@ -77,6 +92,14 @@ fn load_author_map<R: Read + Seek>(container: &mut PptxContainer<R>) -> HashMap<
         Ok(map) => map,
         Err(e) => {
             tracing::warn!(error = %e, "failed to parse ppt/commentAuthors.xml");
+            push_warning(
+                warnings,
+                "pptx",
+                format!(
+                    "Could not parse ppt/commentAuthors.xml: {}; comment authors were not resolved",
+                    e
+                ),
+            );
             HashMap::new()
         }
     }
@@ -126,8 +149,6 @@ fn parse_comment_xml(
             continue;
         }
 
-        // Derive revision_id from the `idx` attribute; fall back to a
-        // positional synthetic id so consumers always get a non-empty id.
         let revision_id = cm
             .attribute("idx")
             .filter(|s| !s.is_empty())
@@ -143,7 +164,6 @@ fn parse_comment_xml(
 
         let timestamp = cm.attribute("dt").filter(|s| !s.is_empty()).map(str::to_string);
 
-        // Collect the comment text from child <p:text> elements.
         let comment_text: String = cm
             .descendants()
             .filter(|n| n.has_tag_name((PRESENTATIONML_NAMESPACE, "text")))
@@ -156,7 +176,7 @@ fn parse_comment_xml(
         } else {
             RevisionDelta {
                 content: vec![DiffLine::Context(comment_text)],
-                table_changes: vec![],
+                ..Default::default()
             }
         };
 
@@ -244,7 +264,6 @@ mod tests {
     #[test]
     fn should_resolve_author_none_when_author_id_is_unmapped() {
         let author_map = make_author_map(&[(0, "Alice")]);
-        // authorId=99 is not in the map
         let xml = make_comment_xml(&[(1, 99, "2024-03-15T10:30:00Z", "Orphan comment")]);
         let revisions = parse_comment_xml(&xml, 2, &author_map).expect("should parse");
 
@@ -275,7 +294,6 @@ mod tests {
         assert_eq!(revisions[1].revision_id, "2");
         assert_eq!(revisions[1].author.as_deref(), Some("Bob"));
         assert_eq!(revisions[2].revision_id, "3");
-        // All on slide index 1
         for rev in &revisions {
             assert!(matches!(&rev.anchor, Some(RevisionAnchor::Slide { index: 1 })));
         }

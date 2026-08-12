@@ -7,9 +7,11 @@
 ## What This Package Provides
 
 {% if language == "wasm" %}
+
 - **Document intelligence core** — extract text, tables, images, metadata, entities, keywords, and code intelligence through the shared Rust engine.
 - **Format coverage** — PDF, Office, images, HTML/XML, email, archives, notebooks, citations, scientific formats, and plain text.
-- **OCR support** — Tesseract WASM when OCR is enabled; this build does not include ONNX Runtime, PaddleOCR, Candle, or native transcription dependencies.
+- **OCR support** — Tesseract WASM when OCR is enabled.
+- **Pure-Rust ML inference** — RT-DETR layout detection and document-orientation run through the pure-Rust `tract` engine (`detectLayout` / `detectOrientation`, with the `.onnx` weights streamed in). This build links no ONNX Runtime, so PaddleOCR, embeddings, reranking, and native transcription are not included.
 {% else %}
 - **Document intelligence core** — extract text, tables, images, metadata, entities, keywords, code intelligence, and transcripts in builds that enable transcription.
 - **Format coverage** — PDF, Office, images, HTML/XML, email, archives, notebooks, citations, scientific formats, plain text, and audio/video formats in builds that enable transcription.
@@ -132,7 +134,7 @@ For advanced configuration options including language detection, table extractio
 ## Documentation
 
 - **[Official Documentation](https://docs.xberg.io/)**
-- **[API Reference](https://docs.xberg.io/reference/api-python/)**
+- **[API Reference](https://docs.xberg.io/reference/api-{% if language == "ffi" %}c{% elif language == "kotlin_android" %}kotlin-android{% else %}{{ language }}{% endif %}/)**
 - **[Examples & Guides](https://docs.xberg.io/)**
 
 ## Contributing
@@ -143,7 +145,7 @@ Contributions are welcome! See [Contributing Guide](https://github.com/xberg-io/
 
 - [crawlberg](https://github.com/xberg-io/crawlberg) — web crawling and scraping with HTML→Markdown and headless-Chrome fallback.
 - [html-to-markdown](https://github.com/xberg-io/html-to-markdown) — fast, lossless HTML→Markdown engine.
-- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 143 providers.
+- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 165 providers.
 - [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-language-pack) — tree-sitter grammars and code-intelligence primitives.
 - [alef](https://github.com/xberg-io/alef) — the polyglot binding generator that produces this README and all per-language bindings.
 - [Discord](https://discord.gg/xt9WY3GnKR) — community, roadmap, announcements.

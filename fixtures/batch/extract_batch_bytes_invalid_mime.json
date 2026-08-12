@@ -2,6 +2,12 @@
 	"id": "extract_batch_bytes_invalid_mime",
 	"category": "batch",
 	"description": "extract_batch with invalid bytes MIME type",
+	"docs": {
+		"topic": "batch",
+		"title": "extract_batch with invalid bytes MIME type",
+		"description": "extract_batch with invalid bytes MIME type",
+		"side_effects": "safe"
+	},
 	"tags": [
 		"batch",
 		"bytes",

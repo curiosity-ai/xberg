@@ -8,15 +8,22 @@ on:
       - "packages/**"
       - "e2e/**"
       - "tools/**"
-      - "docs/**"
+      - "docs-site/**"
+      - "scripts/**"
       - "*.toml"
       - "*.yaml"
       - "*.yml"
       - "*.md"
       - ".github/**"
+      - ".task/**"
+      - ".gitmodules"
       - "Taskfile.yml"
       - "alef.toml"
       - "pyproject.toml"
+      - "plugin/**"
+      - ".claude-plugin/**"
+      - ".agents/plugins/**"
+      - "test_documents"
   pull_request:
     branches: [main]
     paths:
@@ -24,15 +31,22 @@ on:
       - "packages/**"
       - "e2e/**"
       - "tools/**"
-      - "docs/**"
+      - "docs-site/**"
+      - "scripts/**"
       - "*.toml"
       - "*.yaml"
       - "*.yml"
       - "*.md"
       - ".github/**"
+      - ".task/**"
+      - ".gitmodules"
       - "Taskfile.yml"
       - "alef.toml"
       - "pyproject.toml"
+      - "plugin/**"
+      - ".claude-plugin/**"
+      - ".agents/plugins/**"
+      - "test_documents"
   workflow_dispatch:
 
 concurrency:
@@ -43,8 +57,223 @@ permissions:
   contents: read
 
 jobs:
+  benchmark-scripts:
+    name: Benchmark script regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Task
+        uses: xberg-io/actions/install-task@v1
+      - name: Validate benchmark scripts
+        run: task benchmark:validate:scripts
+
+  plugin-freshness:
+    name: Plugin bundle freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      # The plugin version must track the core crate version (task version:sync keeps it
+      # pinned via sync_integration_versions.py). Guards against a core bump landing
+      # without the plugin version following — verify --plugin alone would not catch it. ~keep
+      - name: Verify plugin version tracks core
+        run: python3 scripts/sync_integration_versions.py --check
+      # Byte-verify the ai-rulez-generated coding-agent plugin bundles under plugin/
+      # match plugin/.ai-rulez (BLAKE3 provenance). Pinned to the ai-rulez version that
+      # generates them; bump in lockstep with the generator. Regenerate with
+      # `task plugin:generate`. ~keep
+      - name: Verify generated plugin bundles are current
+        run: uvx ai-rulez==4.11.0 verify --recursive --plugin --if-configured
+
+  submodule-gitlinks:
+    name: Submodule gitlinks reachable
+    runs-on: ubuntu-latest
+    steps:
+      # submodules: false is deliberate -- we do NOT want git's own checkout-time
+      # fetch of the submodule to run here. If a gitlink is unreachable, checkout
+      # would die with a cryptic "not our ref" fatal; this job instead runs the
+      # same check standalone so it can report the path, the SHA, and the fix. ~keep
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+      # CI has a reliable network, so unlike the local pre-push hook (which warns
+      # on fetch failure to tolerate flaky connections), this job always fails hard
+      # -- both on unreachable remotes and on a gitlink SHA that was never pushed.
+      - name: Verify submodule gitlinks are reachable on their remotes
+        run: scripts/ci/check-submodule-gitlinks.sh --on-fetch-failure=fail
+
+  alef-readme-paths:
+    name: Alef readme/docs paths resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Task
+        uses: xberg-io/actions/install-task@v1
+      # Static check: every readme/docs path alef.toml points at (templates,
+      # snippets_dir + snippet_language overrides, CLI/MCP doc sources, skills
+      # template_dir) must resolve on disk. Catches a class of bug that
+      # previously needed a full ~10-minute `alef all` regen cycle per broken
+      # path to discover -- this finds all of them in under a second. ~keep
+      - name: Verify alef.toml readme/docs paths resolve
+        run: task alef:verify:readme-paths
+      # GH#1387: the FFI crate selects core features by hand (it cannot use `full`
+      # -- cf7fa0533d dropped it to keep libheif/candle out of Swift's zigbuild
+      # Linux targets), and that hand list silently lost eight formats. The fix was
+      # applied to the GENERATED manifest, so the next regen reverted it invisibly:
+      # `alef verify` compares an inputs hash, not content, and is green on a
+      # manifest faithfully generated from a wrong source. This asserts alef.toml
+      # AND the generated manifest both carry the formats. ~keep
+      - name: Verify the native FFI build still selects every document format
+        run: task alef:verify:ffi-formats
+      # docs-site/src/content/docs/changelog.md is a hand-maintained copy of
+      # CHANGELOG.md -- nothing generates it and nothing synced it, so it silently
+      # fell a full release behind (repo at 1.1.0, published docs still at 1.0.14).
+      # Asserts every release section is present AND byte-identical, so neither a
+      # missed release nor a one-sided edit can drift again. ~keep
+      - name: Verify the docs-site changelog is in sync
+        run: task docs:verify:changelog
+
+  alef-bindings-freshness:
+    name: Alef-generated bindings freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Task
+        uses: xberg-io/actions/install-task@v1
+      # install-alef reads alef.toml's [workspace] alef_version and installs that
+      # exact pinned build, so this job doesn't go red every time alef cuts a
+      # release -- same hermeticity guarantee install-task gives the Task binary. ~keep
+      - name: Install alef CLI
+        uses: xberg-io/actions/install-alef@v1
+      # `alef verify` (aliased as `task alef:verify`) is a purpose-built freshness
+      # check: it recomputes each generated file's expected hash from the current
+      # Rust source and compares it to what's committed, without writing any files
+      # or running poly's post-generation formatters. That sidesteps the
+      # git-diff-after-regen trap the e2e freshness check uses (`task e2e:verify`),
+      # where formatter-only reflow of freshly generated output would show up as a
+      # spurious diff. Never run `alef all --clean` here -- `alef generate --lang X`
+      # deletes every other language's output, and even the safe `alef all` variant
+      # means a full 15-language regen (minutes, not the sub-second cost of verify).
+      # Blocking as of the b1c7c2a328 regen, which cleared the crates/xberg-node
+      # drift this job was masked for (#323 -- `cargo check -p xberg-node
+      # --all-targets` is clean on that tree). With the mask gone it correctly
+      # goes red on a stale tree, which is the point. ~keep
+      - name: Verify alef-generated bindings are current
+        run: task alef:verify
+
+  e2e-freshness:
+    name: Generated e2e suites freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # alef.toml's [[crates.source_crates]] entries hash Rust sources living in
+      # sibling polyrepo checkouts (`../crawlberg`, `../html-to-markdown`), so
+      # `alef e2e generate` cannot even compute its input hashes without them --
+      # it died with `failed to stat source
+      # ../crawlberg/crates/crawlberg/src/net/ssrf.rs`. actions/checkout refuses a
+      # path outside $GITHUB_WORKSPACE, so they are cloned inside it and then moved
+      # up next to the workspace, reproducing the polyrepo layout. xberg itself
+      # stays at the workspace root because install-alef resolves the pinned
+      # version by reading ./alef.toml. ~keep
+      # Both siblings are ordinary crates.io dependencies, so their checkouts must
+      # match the *resolved* versions rather than whatever their default branches
+      # currently hold -- hashing newer sources than the code actually compiled
+      # against would make this job red for a change nobody made. The refs are
+      # derived from Cargo.lock so a dependency bump cannot silently desync them.
+      - name: Resolve sibling crate versions from Cargo.lock
+        id: siblings
+        run: |
+          set -euo pipefail
+          crawlberg="$(awk '/^name = "crawlberg"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
+          html_to_markdown="$(awk '/^name = "html-to-markdown-rs"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
+          if [ -z "$crawlberg" ] || [ -z "$html_to_markdown" ]; then
+            echo "::error::could not resolve sibling crate versions from Cargo.lock"
+            exit 1
+          fi
+          echo "crawlberg=v$crawlberg" >>"$GITHUB_OUTPUT"
+          echo "html_to_markdown=v$html_to_markdown" >>"$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          repository: xberg-io/crawlberg
+          ref: ${{ steps.siblings.outputs.crawlberg }}
+          path: .polyrepo-siblings/crawlberg
+      - uses: actions/checkout@v6
+        with:
+          repository: xberg-io/html-to-markdown
+          ref: ${{ steps.siblings.outputs.html_to_markdown }}
+          path: .polyrepo-siblings/html-to-markdown
+      - name: Place sibling checkouts where alef.toml expects them
+        run: |
+          mv .polyrepo-siblings/crawlberg ../crawlberg
+          mv .polyrepo-siblings/html-to-markdown ../html-to-markdown
+          rmdir .polyrepo-siblings
+      - name: Install Task
+        uses: xberg-io/actions/install-task@v1
+      - name: Install alef CLI
+        uses: xberg-io/actions/install-alef@v1
+      # `task e2e:verify` (`alef e2e generate` then `git diff --exit-code e2e/`)
+      # was previously invoked by nothing -- it was only named in a comment on
+      # the alef-bindings-freshness job above as though it ran. Wiring it here
+      # fails whenever a fixture changes without the generated e2e suites being
+      # regenerated and committed alongside it. ~keep
+      - name: Verify generated e2e suites are current
+        run: task e2e:verify
+
+  docs-snippets:
+    name: Docs snippets gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Task
+        uses: xberg-io/actions/install-task@v1
+      - name: Install alef CLI
+        uses: xberg-io/actions/install-alef@v1
+      # `task docs:snippets:all` (audit + gaps + syntax-validate) is described
+      # as the "canonical docs:snippets gate" in .task/tools/docs.yml, but
+      # nothing invoked it -- a broken or orphaned snippet could land
+      # undetected. ~keep
+      - name: Run docs snippets gate
+        run: task docs:snippets:all
+
   validate:
     uses: xberg-io/actions/.github/workflows/reusable-validate.yml@v1
     with:
       setup-rust: true
+      # poly's cargo-clippy hook builds the whole workspace, and
+      # tools/benchmark-harness depends on xberg with `full`, which pulls
+      # heic -> xberg-libheif -> libheif-sys. Its build script shells out to
+      # `pkg-config libheif >= 1.21` and Ubuntu Noble only ships 1.17.6, so
+      # without this the Lint step dies before linting anything. ~keep
+      install-system-deps: true
       setup-python: true
+      # poly delegates Elixir formatting to `mix format` when mix is on PATH, and falls
+      # back to its own built-in Elixir formatter when it is not. The two disagree, so
+      # without a toolchain the `Format check` step flagged all 240 committed .ex files
+      # -- which are correctly mix-formatted (they honour packages/elixir/.formatter.exs:
+      # import_deps: [:rustler], line_length: 140). Reproduced exactly: with mix on PATH
+      # `poly fmt --check packages/elixir` reports "All formatted"; with PATH=/usr/bin:/bin
+      # it reports the same 240 files CI did. ~keep
+      setup-elixir: true
+      # poly's rubocop and steep hooks both run `bundle exec` with root =
+      # packages/ruby (poly.toml:644,650). Without a Ruby toolchain the Lint step
+      # dies with `poly-hook: 1: bundle: not found` -- which is what it started
+      # doing once install-system-deps got it past the libheif failure above.
+      # The reusable workflow's ruby-working-directory already defaults to
+      # packages/ruby, so it needs no override. ~keep
+      setup-ruby: true
+      # The three hooks below were the remaining `×` in the Lint step once setup-ruby got
+      # rubocop and steep to `✓`. None of them was a code-quality failure -- each was a
+      # missing or mismatched toolchain, so the hook could never report anything useful.
+      #
+      # checkstyle died with `UnsupportedClassVersionError:
+      # com/puppycrawl/tools/checkstyle/api/CheckstyleException has been compiled by a more
+      # recent version of Java`. java-version is 25, not the workflow's 21 default, to match
+      # packages/java/pom.xml:40 `<maven.compiler.release>25</maven.compiler.release>`; 21
+      # clears checkstyle 13.9.0's own floor but not the bindings' target bytecode. ~keep
+      setup-java: true
+      java-version: "25"
+      # golangci-lint failed with `poly-hook: 1: golangci-lint: not found`. ~keep
+      setup-go: true
+      # dart-analyze failed with no Dart SDK present. ~keep
+      setup-dart: true

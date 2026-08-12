@@ -53,7 +53,6 @@ fn get_or_init_engine(
 ) -> crate::Result<PooledEngine> {
     let key = (preference, dtype);
 
-    // Fast path: engine already in pool.
     {
         let pool = ENGINE_POOL.read();
         if let Some(engine) = pool.get(&key) {
@@ -61,7 +60,6 @@ fn get_or_init_engine(
         }
     }
 
-    // Slow path: select the device and build the engine, then insert under write lock.
     let device = preference.select().map_err(|e| crate::XbergError::Ocr {
         message: format!("Failed to select compute device: {e}"),
         source: Some(Box::new(e)),
@@ -82,7 +80,6 @@ fn get_or_init_engine(
     let new_engine = Arc::new(parking_lot::Mutex::new(new_engine));
 
     let mut pool = ENGINE_POOL.write();
-    // Double-check: another thread may have inserted while we were building.
     if let Some(existing) = pool.get(&key) {
         return Ok(Arc::clone(existing));
     }
@@ -186,7 +183,6 @@ impl OcrBackend for DeepseekOcrBackend {
     /// Returns an error if the image is empty, model_path is not provided,
     /// the model fails to initialize, or inference fails.
     async fn process_image(&self, image_bytes: &[u8], config: &OcrConfig) -> Result<ExtractedDocument> {
-        // Validate image data first so callers get the most specific error.
         if image_bytes.is_empty() {
             return Err(crate::XbergError::Validation {
                 message: "Empty image data provided to DeepSeek-OCR".to_string(),
@@ -201,15 +197,14 @@ impl OcrBackend for DeepseekOcrBackend {
             source: None,
         })?;
 
-        let image_bytes = image_bytes.to_vec();
+        let image_bytes_owned = image_bytes.to_vec();
         let dtype = self.dtype;
 
-        // Run inference in a blocking task to avoid blocking the async runtime.
         let content = tokio::task::spawn_blocking(move || {
             let engine = get_or_init_engine(device, dtype, &model_path, version)?;
             let mut engine_guard = engine.lock();
             let output = engine_guard
-                .process_image(&image_bytes, None)
+                .process_image(&image_bytes_owned, None)
                 .map_err(|e| crate::XbergError::Ocr {
                     message: format!("DeepSeek-OCR inference failed: {e}"),
                     source: Some(Box::new(e)),
@@ -222,11 +217,13 @@ impl OcrBackend for DeepseekOcrBackend {
             source: None,
         })??;
 
-        Ok(ExtractedDocument {
+        Ok(super::ocr_result::build_ocr_document(
             content,
-            mime_type: Cow::Borrowed("text/markdown"),
-            ..Default::default()
-        })
+            Vec::new(),
+            Cow::Borrowed("text/markdown"),
+            image_bytes,
+            config,
+        ))
     }
 
     /// Process an image file using the DeepSeek-OCR engine.
@@ -240,27 +237,13 @@ impl OcrBackend for DeepseekOcrBackend {
     }
 
     fn supports_language(&self, _lang: &str) -> bool {
-        // DeepSeek-OCR is trained on multilingual data. Accept all language codes.
         true
     }
 
     fn supported_languages(&self) -> Vec<String> {
-        // Major language codes supported by DeepSeek-OCR
         vec![
-            "eng", "en", // English
-            "zho", "zh", // Chinese (simplified and traditional)
-            "jpn", "ja", // Japanese
-            "kor", "ko", // Korean
-            "fra", "fr", // French
-            "deu", "de", // German
-            "spa", "es", // Spanish
-            "ita", "it", // Italian
-            "por", "pt", // Portuguese
-            "rus", "ru", // Russian
-            "ara", "ar", // Arabic
-            "hin", "hi", // Hindi
-            "tha", "th", // Thai
-            "vie", "vi", // Vietnamese
+            "eng", "en", "zho", "zh", "jpn", "ja", "kor", "ko", "fra", "fr", "deu", "de", "spa", "es", "ita", "it",
+            "por", "pt", "rus", "ru", "ara", "ar", "hin", "hi", "tha", "th", "vie", "vi",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -272,7 +255,6 @@ impl OcrBackend for DeepseekOcrBackend {
     }
 
     fn emits_structured_markdown(&self) -> bool {
-        // DeepSeek-OCR emits markdown output directly from the VLM.
         true
     }
 }
@@ -323,24 +305,30 @@ mod tests {
 
     #[test]
     fn test_parse_options_model_path() {
-        let mut config = OcrConfig::default();
-        config.backend_options = Some(serde_json::json!({"model_path": "/models/deepseek"}));
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({"model_path": "/models/deepseek"})),
+            ..Default::default()
+        };
         let (model_path, _device, _version) = DeepseekOcrBackend::parse_options(&config);
         assert_eq!(model_path.as_deref(), Some("/models/deepseek"));
     }
 
     #[test]
     fn test_parse_options_custom_device() {
-        let mut config = OcrConfig::default();
-        config.backend_options = Some(serde_json::json!({"device": "cpu"}));
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({"device": "cpu"})),
+            ..Default::default()
+        };
         let (_model_path, device, _version) = DeepseekOcrBackend::parse_options(&config);
         assert_eq!(device, DevicePreference::Cpu);
     }
 
     #[test]
     fn test_parse_options_version() {
-        let mut config = OcrConfig::default();
-        config.backend_options = Some(serde_json::json!({"version": 3}));
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({"version": 3})),
+            ..Default::default()
+        };
         let (_model_path, _device, version) = DeepseekOcrBackend::parse_options(&config);
         assert_eq!(version, 3);
     }

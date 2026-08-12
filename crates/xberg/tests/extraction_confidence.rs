@@ -29,7 +29,6 @@ async fn extract_populates_extraction_confidence_with_extract_time_defaults() {
         .as_ref()
         .expect("extraction_confidence is populated (was always None before P5)");
 
-    // Documented extract-time defaults.
     assert_eq!(
         confidence.text_coverage, 1.0,
         "text_coverage defaults to 1.0 at extract time"
@@ -39,13 +38,10 @@ async fn extract_populates_extraction_confidence_with_extract_time_defaults() {
         SchemaCompliance::AllValid,
         "schema compliance is AllValid at extract time (no schema yet)"
     );
-    // A plain-text document runs no OCR, so there is no recognition signal.
     assert!(
         confidence.ocr_aggregate.is_none(),
         "no OCR ran, so ocr_aggregate is None"
     );
-    // `combined` is a real score in [0, 1]; with no OCR it folds the OCR weight
-    // into text_coverage (1.0) and AllValid (1.0), so it must be 1.0.
     assert_eq!(
         confidence.combined, 1.0,
         "combined of full text coverage + AllValid is 1.0"

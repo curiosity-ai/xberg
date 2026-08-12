@@ -11,12 +11,10 @@ fn num_tokens_with_overflow(encoding: &Encoding, pad_id: Option<u32>) -> usize {
     let base = encoding
         .get_ids()
         .iter()
-        // Skip padding tokens at beginning and end so they don't count towards the chunk size
         .skip_while(|&id| pad_id.is_some_and(|pad_id| id == &pad_id))
         .take_while(|&id| pad_id.is_none_or(|pad_id| id != &pad_id))
         .count();
 
-    // If the [`Tokenizer`] has truncation, need to check overflow encodings to determine overall size.
     let overflow: usize = encoding
         .get_overflowing()
         .iter()
@@ -47,20 +45,23 @@ impl ChunkSizer for Tokenizer {
 mod tests {
     use super::*;
 
+    fn tokenizer(repo: &str, revision: &str) -> Tokenizer {
+        let path = crate::model_download::hf_resolve_file(repo, "tokenizer.json", Some(revision), None, None)
+            .unwrap_or_else(|error| panic!("Could not resolve tokenizer '{repo}@{revision}': {error}"));
+        Tokenizer::from_file(&path)
+            .unwrap_or_else(|error| panic!("Could not load tokenizer '{}': {error}", path.display()))
+    }
+
     #[test]
     fn returns_size() {
-        let tokenizer = Tokenizer::from_pretrained("bert-base-cased", None).unwrap();
+        let tokenizer = tokenizer("bert-base-cased", "cd5ef92a9fb2f889e972770a36d4ed042daf221e");
         let size = tokenizer.size(" An apple a");
         assert_eq!(size, 3);
     }
 
     #[test]
     fn returns_size_handles_prefix() {
-        // Use a tokenizer that adds padding tokens: thenlper/gte-small has a PAD token
-        // so pad_id is Some, and leading/trailing padding is skipped in the count.
-        // The text "An apple a" should still yield exactly 3 content tokens.
-        let tokenizer = Tokenizer::from_pretrained("thenlper/gte-small", None)
-            .expect("Could not load tokenizer 'thenlper/gte-small'");
+        let tokenizer = tokenizer("thenlper/gte-small", "17e1f347d17fe144873b1201da91788898c639cd");
 
         let size = tokenizer.size("An apple a");
         assert_eq!(size, 3);
@@ -68,20 +69,18 @@ mod tests {
 
     #[test]
     fn handles_padding() {
-        let tokenizer = Tokenizer::from_pretrained("thenlper/gte-small", None).unwrap();
+        let tokenizer = tokenizer("thenlper/gte-small", "17e1f347d17fe144873b1201da91788898c639cd");
         let size = tokenizer.size("An apple a");
         assert_eq!(size, 3);
     }
 
     #[test]
     fn handle_truncation() {
-        let tokenizer = Tokenizer::from_pretrained("sentence-transformers/all-MiniLM-L6-v2", None)
-            .expect("Could not load tokenizer 'sentence-transformers/all-MiniLM-L6-v2'");
+        let tokenizer = tokenizer(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+        );
 
-        // When the tokenizer has truncation (max_length=128) but no stride, encode_fast
-        // returns a single encoding capped at 128 tokens with no overflow entries.
-        // The ChunkSizer returns 128 for any text longer than the model's max_length,
-        // which is sufficient to signal to the text splitter that the chunk is too large.
         assert_eq!(
             tokenizer.size("An apple a day keeps the doctor away.".repeat(100).as_str()),
             128

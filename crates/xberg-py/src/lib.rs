@@ -218,6 +218,7 @@ impl AccelerationConfig {
 pub struct CaptioningConfig {
     /// LLM configuration used for the VLM call.
     #[pyo3(get)]
+    #[serde(skip)]
     pub llm: LlmConfig,
     /// Optional custom caption prompt. `None` uses the default `RegionKind.Caption`
     /// prompt that ships with `crate.llm.region_extractor`.
@@ -251,6 +252,94 @@ impl CaptioningConfig {
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
+pub struct ChunkClassificationDefinition {
+    /// Label name returned in `ChunkMetadata.classifications`.
+    #[pyo3(get)]
+    pub label: String,
+    /// Semantic description of when this label applies. Injected verbatim into
+    /// the classification prompt next to the label name.
+    #[pyo3(get)]
+    pub description: String,
+}
+
+#[pymethods]
+impl ChunkClassificationDefinition {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (label, description))]
+    #[new]
+    pub fn new(label: String, description: String) -> Self {
+        Self { label, description }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct ChunkClassificationConfig {
+    /// Minijinja prompt template. Receives `{{ definitions }}` (rendered label +
+    /// description list) and `{{ chunks }}` (a numbered list of chunk texts in
+    /// the current batch) variables. `None` lets the backend pick a sensible
+    /// default.
+    #[pyo3(get)]
+    pub prompt_template: Option<String>,
+    /// The set of label definitions the classifier may emit. Must contain at
+    /// least one entry.
+    #[pyo3(get)]
+    pub definitions: Vec<ChunkClassificationDefinition>,
+    /// LLM configuration used for classification.
+    #[pyo3(get)]
+    #[serde(skip)]
+    pub llm: LlmConfig,
+    /// Number of chunks batched into a single LLM request.
+    ///
+    /// Larger batches amortize the fixed prompt cost (definitions block) across
+    /// more chunks, at the risk of exceeding the model's context window for
+    /// very large taxonomies or chunk texts. Defaults to `DEFAULT_BATCH_SIZE`.
+    #[pyo3(get)]
+    pub batch_size: usize,
+    /// Maximum number of in-flight batch requests.
+    ///
+    /// Bounds concurrency against the configured LLM provider. Defaults to
+    /// `DEFAULT_MAX_CONCURRENCY`.
+    #[pyo3(get)]
+    pub max_concurrency: usize,
+}
+
+#[pymethods]
+impl ChunkClassificationConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (definitions, llm, batch_size, max_concurrency, prompt_template=None))]
+    #[new]
+    pub fn new(
+        definitions: Vec<ChunkClassificationDefinition>,
+        llm: LlmConfig,
+        batch_size: usize,
+        max_concurrency: usize,
+        prompt_template: Option<String>,
+    ) -> Self {
+        Self {
+            prompt_template,
+            definitions,
+            llm,
+            batch_size,
+            max_concurrency,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
 pub struct PageClassificationConfig {
     /// Minijinja prompt template. Receives `{{ labels }}` (joined list), `{{ page_text }}`
     /// and `{{ multi_label }}` variables. `None` lets the backend pick a sensible default.
@@ -264,6 +353,7 @@ pub struct PageClassificationConfig {
     pub multi_label: bool,
     /// LLM configuration used for classification.
     #[pyo3(get)]
+    #[serde(skip)]
     pub llm: LlmConfig,
 }
 
@@ -313,6 +403,17 @@ pub struct ContentFilterConfig {
     /// Default: `false` (footers are stripped or excluded).
     #[pyo3(get)]
     pub include_footers: bool,
+    /// Include footnote bodies in extraction output.
+    ///
+    /// - PDF: Prevents the layout model from treating `Footnote`-classified
+    ///   regions as furniture, so footnote bodies survive alongside the main
+    ///   text instead of being silently dropped.
+    /// - Other formats: No effect currently.
+    ///
+    /// Default: `false` (footnotes are stripped), matching the existing
+    /// `include_headers` / `include_footers` defaults.
+    #[pyo3(get)]
+    pub include_footnotes: bool,
     /// Enable the heuristic cross-page repeating text detector.
     ///
     /// When `true` (default), text that repeats verbatim across a supermajority
@@ -320,9 +421,10 @@ pub struct ContentFilterConfig {
     /// names or repeated headings are being incorrectly removed by the heuristic.
     ///
     /// Note: when a layout-detection model is active, the model may independently
-    /// classify page-header / page-footer regions as furniture on a per-page basis.
-    /// To preserve those regions, set `include_headers = true`, `include_footers = true`,
-    /// or both, in addition to disabling this flag.
+    /// classify page-header / page-footer / footnote regions as furniture on a
+    /// per-page basis. To preserve those regions, set `include_headers = true`,
+    /// `include_footers = true`, `include_footnotes = true`, or any combination,
+    /// in addition to disabling this flag.
     ///
     /// Primarily affects PDF extraction.
     ///
@@ -349,17 +451,19 @@ impl Default for ContentFilterConfig {
 impl ContentFilterConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (include_headers=Self::default().include_headers, include_footers=Self::default().include_footers, strip_repeating_text=Self::default().strip_repeating_text, include_watermarks=Self::default().include_watermarks))]
+    #[pyo3(signature = (include_headers=Self::default().include_headers, include_footers=Self::default().include_footers, include_footnotes=Self::default().include_footnotes, strip_repeating_text=Self::default().strip_repeating_text, include_watermarks=Self::default().include_watermarks))]
     #[new]
     pub fn new(
         include_headers: bool,
         include_footers: bool,
+        include_footnotes: bool,
         strip_repeating_text: bool,
         include_watermarks: bool,
     ) -> Self {
         Self {
             include_headers,
             include_footers,
+            include_footnotes,
             strip_repeating_text,
             include_watermarks,
         }
@@ -370,6 +474,54 @@ impl ContentFilterConfig {
     #[pyo3(signature = ())]
     pub fn default() -> ContentFilterConfig {
         xberg::ContentFilterConfig::default().into()
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct CsvConfig {
+    /// Field delimiter, as a single-character string (e.g. `","`, `";"`,
+    /// `"\t"`, `"|"`). When `None` (default), the delimiter is auto-detected
+    /// from a sample of the file.
+    ///
+    /// Must be exactly one ASCII byte when set — `ExtractionConfig.validate`
+    /// rejects an empty string or a multi-byte value with a helpful error.
+    /// The TSV MIME type (`text/tab-separated-values`) always forces `\t`
+    /// regardless of this setting.
+    #[pyo3(get)]
+    pub delimiter: Option<String>,
+    /// Line prefixes that mark a comment line to skip entirely during row
+    /// parsing (e.g. `["#"]`). A line is treated as a comment when its
+    /// trimmed start matches any of these prefixes exactly.
+    ///
+    /// Default: empty, meaning no line is treated as a comment (matches the
+    /// pre-existing extractor behavior).
+    #[pyo3(get)]
+    pub comment_prefixes: Vec<String>,
+}
+
+impl Default for CsvConfig {
+    fn default() -> Self {
+        <xberg::CsvConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl CsvConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (comment_prefixes=Self::default().comment_prefixes, delimiter=None))]
+    #[new]
+    pub fn new(comment_prefixes: Vec<String>, delimiter: Option<String>) -> Self {
+        Self {
+            delimiter,
+            comment_prefixes,
+        }
     }
 
     #[staticmethod]
@@ -435,13 +587,25 @@ pub struct ExtractionConfig {
     /// Enable quality post-processing
     #[pyo3(get)]
     pub enable_quality_processing: bool,
-    /// OCR configuration (undefined = OCR disabled)
+    /// OCR configuration.
+    ///
+    /// `None` does not run OCR for documents that already have usable text. Under
+    /// `OcrStrategy.Auto`, a PDF with no text layer at all (a scan) is still routed
+    /// to OCR with default settings so it is not returned empty (#1338). Set
+    /// `Self.disable_ocr` to hard-disable OCR regardless of the detected content.
     #[pyo3(get)]
     #[serde(skip)]
     pub ocr: Option<OcrConfig>,
     /// Force OCR even for searchable PDFs
     #[pyo3(get)]
     pub force_ocr: bool,
+    /// Which pages get OCR'd when neither `force_ocr` nor `force_ocr_pages` applies.
+    ///
+    /// Defaults to `OcrStrategy.Auto`, which OCRs only pages whose native text
+    /// fails a quality check. Only applies to PDF documents. Cannot be
+    /// `OcrStrategy.ScannedPages` while `disable_ocr` is `true`.
+    #[pyo3(get)]
+    pub ocr_strategy: OcrStrategy,
     /// Force OCR on specific pages only (1-indexed page numbers, must be >= 1).
     ///
     /// When set, only the listed pages are OCR'd regardless of text layer quality.
@@ -492,6 +656,12 @@ pub struct ExtractionConfig {
     /// Post-processor configuration (undefined = use defaults)
     #[pyo3(get)]
     pub postprocessor: Option<PostProcessorConfig>,
+    /// HTML to Markdown conversion options (undefined = use defaults)
+    ///
+    /// Configure how HTML documents are converted to Markdown, including heading styles,
+    /// list formatting, code block styles, and preprocessing options.
+    #[pyo3(get)]
+    pub html_options: Option<ConversionOptions>,
     /// Styled HTML output configuration.
     ///
     /// When set alongside `output_format = OutputFormat.Html`, the extraction
@@ -507,16 +677,19 @@ pub struct ExtractionConfig {
     /// When set, each file in a batch will be canceled after this duration
     /// unless overridden by `FileExtractionConfig.timeout_secs`.
     ///
-    /// Defaults to `Some(60)` to prevent pathological files (e.g. deeply
-    /// nested archives, documents with millions of cells) from running
-    /// indefinitely and exhausting caller resources. Set to `None` to
-    /// disable the timeout for trusted input or long-running workloads.
+    /// Defaults to `Some(600)` (10 minutes) to prevent pathological files
+    /// (e.g. deeply nested archives, documents with millions of cells) from
+    /// running indefinitely and exhausting caller resources, while still
+    /// giving slow paths (VLM-based OCR, large scanned documents) enough
+    /// headroom to finish. Set to `None` to disable the timeout for trusted
+    /// input or long-running workloads.
     #[pyo3(get)]
     pub extraction_timeout_secs: Option<u64>,
-    /// Maximum concurrent extractions in batch operations (undefined = (num_cpus × 1.5).ceil()).
+    /// Maximum concurrent document extractions in batch operations.
     ///
-    /// Limits parallelism to prevent resource exhaustion when processing
-    /// large batches. Defaults to (num_cpus × 1.5).ceil() when not set.
+    /// This is a ceiling within the configured total thread budget, not an
+    /// independent pool size. When unset, the scheduler derives document and
+    /// per-document concurrency from `ConcurrencyConfig.max_threads`.
     #[pyo3(get)]
     pub max_concurrent_extractions: Option<usize>,
     /// Result structure format
@@ -562,6 +735,47 @@ pub struct ExtractionConfig {
     /// when format conversion is applied.
     #[pyo3(get)]
     pub output_format: OutputFormat,
+    /// Escape Markdown special characters in rendered prose (default: `true`).
+    ///
+    /// When `output_format` is `Markdown` or `Djot`, the renderer backslash-escapes
+    /// CommonMark-significant leading characters (e.g. `-`, `#`) so that literal
+    /// text such as `#06-18` or `- clause` round-trips safely through a CommonMark
+    /// parser instead of being reinterpreted as a heading or list marker.
+    ///
+    /// Table cell text is never escaped, so escaped prose can look inconsistent
+    /// with table cells containing the same characters. Set this to `false` to
+    /// disable prose escaping and make `content`, `pages[].content`, and
+    /// `chunks[].content` read identically to table cell text — useful for LLM
+    /// prompts or search indexing where CommonMark round-tripping does not matter.
+    ///
+    /// Defaults to `true` to preserve existing behavior.
+    #[pyo3(get)]
+    pub escape_markdown: bool,
+    /// Emit an opt-in anchor marker before each table's rendered Markdown
+    /// block (default: `false`).
+    ///
+    /// When `output_format` is `Markdown` (or `Djot`) and this is `true`, the
+    /// renderer inserts a `[TABLE:{table_id}]` marker immediately before each
+    /// table's Markdown in `content`, `pages[].content`, and
+    /// `chunks[].content`, where `table_id` matches the corresponding
+    /// entry's `table_id`. This lets a consumer
+    /// reconcile a rendered Markdown table block with its structured
+    /// `tables[]` entry.
+    ///
+    /// Defaults to `false` so existing output is byte-identical unless
+    /// explicitly enabled.
+    #[pyo3(get)]
+    pub table_anchors: bool,
+    /// Controls how Jupyter notebook (`.ipynb`) code cells are rendered.
+    ///
+    /// - `Both` (default): code source plus the notebook's saved outputs
+    /// - `Source`: only the code source (fenced code blocks)
+    /// - `Outputs`: only the saved outputs
+    ///
+    /// Cells are never executed; `Outputs`/`Both` surface only outputs already
+    /// stored in the notebook.
+    #[pyo3(get)]
+    pub jupyter_cell_rendering: JupyterCellRendering,
     /// Layout detection configuration (undefined = layout detection disabled).
     ///
     /// When set, PDF pages and images are analyzed for document structure
@@ -588,12 +802,12 @@ pub struct ExtractionConfig {
     pub transcription: Option<TranscriptionConfig>,
     /// Run layout detection on the non-OCR PDF markdown path.
     ///
-    /// When `true` and `layout` is `Some(_)`, layout regions inform heading,
-    /// table, list, and figure detection in the structure pipeline that would
-    /// otherwise rely on font-clustering heuristics alone. Significantly
-    /// improves SF1 (structural F1) at the cost of inference latency
-    /// (~150-300ms/page CPU, ~20-50ms/page GPU). Default: `false`.
-    /// Requires the `layout-detection` feature.
+    /// When `true` and `layout` is `Some(_)`, layout regions inform reading
+    /// order, region grouping, and table detection while native font/tag
+    /// semantics remain authoritative for headings, lists, code, and formulas.
+    /// OCR layout classification is unchanged. This improves structural output
+    /// at the cost of inference latency (~150-300ms/page CPU, ~20-50ms/page
+    /// GPU). Default: `false`. Requires the `layout-detection` feature.
     #[pyo3(get)]
     pub use_layout_for_markdown: bool,
     /// Enable structured document tree output.
@@ -632,6 +846,13 @@ pub struct ExtractionConfig {
     /// that do not specify one. See `EmailConfig` for details.
     #[pyo3(get)]
     pub email: Option<EmailConfig>,
+    /// CSV/TSV extraction configuration (undefined = use defaults).
+    ///
+    /// Lets callers set an explicit delimiter and declare comment-line
+    /// prefixes to skip, instead of relying solely on delimiter
+    /// auto-detection. See `CsvConfig` for details.
+    #[pyo3(get)]
+    pub csv: Option<CsvConfig>,
     /// URL ingestion and crawl configuration.
     #[pyo3(get)]
     #[serde(skip)]
@@ -652,6 +873,7 @@ pub struct ExtractionConfig {
     /// provided JSON schema. The structured response is stored in
     /// `ExtractedDocument.structured_output`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub structured_extraction: Option<StructuredExtractionConfig>,
     /// Named-entity recognition configuration. When set, the NER post-processor runs at
     /// the Middle stage and populates `ExtractedDocument.entities`.
@@ -667,19 +889,29 @@ pub struct ExtractionConfig {
     /// Summarisation configuration. When set, the summarisation post-processor runs at
     /// the Middle stage and populates `ExtractedDocument.summary`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub summarization: Option<SummarizationConfig>,
     /// Translation configuration. When set, the translation post-processor runs at the
     /// Middle stage and populates `ExtractedDocument.translation`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub translation: Option<TranslationConfig>,
     /// Per-page classification configuration. When set, the classification post-processor
     /// runs at the Middle stage and populates `ExtractedDocument.page_classifications`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub page_classification: Option<PageClassificationConfig>,
+    /// Per-chunk multi-label classification configuration. When set, the
+    /// chunk-classification post-processor runs at the Middle stage (after
+    /// chunking) and populates `ChunkMetadata.classifications` on every chunk.
+    #[pyo3(get)]
+    #[serde(skip)]
+    pub chunk_classification: Option<ChunkClassificationConfig>,
     /// VLM captioning configuration for extracted images. When set, the captioning
     /// post-processor runs at the Middle stage and writes a caption into each
     /// `ExtractedImage.caption`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub captioning: Option<CaptioningConfig>,
     /// Enable QR-code detection in extracted images. When `true`, the QR post-processor
     /// runs at the Middle stage and populates `ExtractedImage.qr_codes`.
@@ -697,15 +929,19 @@ impl Default for ExtractionConfig {
 impl ExtractionConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (use_cache=Self::default().use_cache, enable_quality_processing=Self::default().enable_quality_processing, force_ocr=Self::default().force_ocr, disable_ocr=Self::default().disable_ocr, result_format=Self::default().result_format, output_format=None, use_layout_for_markdown=Self::default().use_layout_for_markdown, include_document_structure=Self::default().include_document_structure, url=None, max_archive_depth=Self::default().max_archive_depth, ocr=None, force_ocr_pages=None, chunking=None, content_filter=None, images=None, pdf_options=None, token_reduction=None, language_detection=None, pages=None, keywords=None, postprocessor=None, html_output=None, extraction_timeout_secs=None, max_concurrent_extractions=None, security_limits=None, max_embedded_file_bytes=None, layout=None, transcription=None, acceleration=None, cache_namespace=None, cache_ttl_secs=None, email=None, tree_sitter=None, structured_extraction=None, ner=None, redaction=None, summarization=None, translation=None, page_classification=None, captioning=None, qr_codes=None))]
+    #[pyo3(signature = (use_cache=Self::default().use_cache, enable_quality_processing=Self::default().enable_quality_processing, force_ocr=Self::default().force_ocr, ocr_strategy=None, disable_ocr=Self::default().disable_ocr, result_format=Self::default().result_format, output_format=None, escape_markdown=Self::default().escape_markdown, table_anchors=Self::default().table_anchors, jupyter_cell_rendering=Self::default().jupyter_cell_rendering, use_layout_for_markdown=Self::default().use_layout_for_markdown, include_document_structure=Self::default().include_document_structure, url=None, max_archive_depth=Self::default().max_archive_depth, ocr=None, force_ocr_pages=None, chunking=None, content_filter=None, images=None, pdf_options=None, token_reduction=None, language_detection=None, pages=None, keywords=None, postprocessor=None, html_options=None, html_output=None, extraction_timeout_secs=None, max_concurrent_extractions=None, security_limits=None, max_embedded_file_bytes=None, layout=None, transcription=None, acceleration=None, cache_namespace=None, cache_ttl_secs=None, email=None, csv=None, tree_sitter=None, structured_extraction=None, ner=None, redaction=None, summarization=None, translation=None, page_classification=None, chunk_classification=None, captioning=None, qr_codes=None))]
     #[new]
     pub fn new(
         use_cache: bool,
         enable_quality_processing: bool,
         force_ocr: bool,
+        ocr_strategy: Option<OcrStrategy>,
         disable_ocr: bool,
         result_format: ResultFormat,
         output_format: Option<OutputFormat>,
+        escape_markdown: bool,
+        table_anchors: bool,
+        jupyter_cell_rendering: JupyterCellRendering,
         use_layout_for_markdown: bool,
         include_document_structure: bool,
         url: Option<UrlExtractionConfig>,
@@ -721,6 +957,7 @@ impl ExtractionConfig {
         pages: Option<PageConfig>,
         keywords: Option<KeywordConfig>,
         postprocessor: Option<PostProcessorConfig>,
+        html_options: Option<ConversionOptions>,
         html_output: Option<HtmlOutputConfig>,
         extraction_timeout_secs: Option<u64>,
         max_concurrent_extractions: Option<usize>,
@@ -732,6 +969,7 @@ impl ExtractionConfig {
         cache_namespace: Option<String>,
         cache_ttl_secs: Option<u64>,
         email: Option<EmailConfig>,
+        csv: Option<CsvConfig>,
         tree_sitter: Option<TreeSitterConfig>,
         structured_extraction: Option<StructuredExtractionConfig>,
         ner: Option<NerConfig>,
@@ -739,6 +977,7 @@ impl ExtractionConfig {
         summarization: Option<SummarizationConfig>,
         translation: Option<TranslationConfig>,
         page_classification: Option<PageClassificationConfig>,
+        chunk_classification: Option<ChunkClassificationConfig>,
         captioning: Option<CaptioningConfig>,
         qr_codes: Option<bool>,
     ) -> Self {
@@ -747,6 +986,7 @@ impl ExtractionConfig {
             enable_quality_processing,
             ocr,
             force_ocr,
+            ocr_strategy: ocr_strategy.unwrap_or_else(|| Self::default().ocr_strategy),
             force_ocr_pages,
             disable_ocr,
             chunking,
@@ -758,6 +998,7 @@ impl ExtractionConfig {
             pages,
             keywords,
             postprocessor,
+            html_options,
             html_output,
             extraction_timeout_secs,
             max_concurrent_extractions,
@@ -765,6 +1006,9 @@ impl ExtractionConfig {
             security_limits,
             max_embedded_file_bytes,
             output_format: output_format.unwrap_or_else(|| Self::default().output_format),
+            escape_markdown,
+            table_anchors,
+            jupyter_cell_rendering,
             layout,
             transcription,
             use_layout_for_markdown,
@@ -773,6 +1017,7 @@ impl ExtractionConfig {
             cache_namespace,
             cache_ttl_secs,
             email,
+            csv,
             url: url.unwrap_or_else(|| Self::default().url),
             max_archive_depth,
             tree_sitter,
@@ -782,13 +1027,15 @@ impl ExtractionConfig {
             summarization,
             translation,
             page_classification,
+            chunk_classification,
             captioning,
             qr_codes,
         }
     }
 
+    #[allow(clippy::missing_errors_doc)]
     #[pyo3(signature = ())]
-    pub fn needs_image_data(&self) -> bool {
+    pub fn validate(&self) -> PyResult<()> {
         #[allow(clippy::needless_update)]
         let core_self = xberg::ExtractionConfig {
             use_cache: self.use_cache,
@@ -798,6 +1045,8 @@ impl ExtractionConfig {
             ocr: self.ocr.clone().map(Into::into),
 
             force_ocr: self.force_ocr,
+
+            ocr_strategy: self.ocr_strategy.clone().into(),
 
             force_ocr_pages: self.force_ocr_pages.clone(),
 
@@ -829,6 +1078,12 @@ impl ExtractionConfig {
 
             output_format: self.output_format.clone().into(),
 
+            escape_markdown: self.escape_markdown,
+
+            table_anchors: self.table_anchors,
+
+            jupyter_cell_rendering: self.jupyter_cell_rendering.clone().into(),
+
             use_layout_for_markdown: self.use_layout_for_markdown,
 
             include_document_structure: self.include_document_structure,
@@ -840,6 +1095,8 @@ impl ExtractionConfig {
             cache_ttl_secs: self.cache_ttl_secs,
 
             email: self.email.clone().map(Into::into),
+
+            csv: self.csv.clone().map(Into::into),
 
             url: self.url.clone().into(),
 
@@ -856,6 +1113,102 @@ impl ExtractionConfig {
             translation: self.translation.clone().map(Into::into),
 
             page_classification: self.page_classification.clone().map(Into::into),
+
+            chunk_classification: self.chunk_classification.clone().map(Into::into),
+
+            captioning: self.captioning.clone().map(Into::into),
+
+            qr_codes: self.qr_codes,
+
+            ..Default::default()
+        };
+        let result = core_self
+            .validate()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(result)
+    }
+
+    #[pyo3(signature = ())]
+    pub fn needs_image_data(&self) -> bool {
+        #[allow(clippy::needless_update)]
+        let core_self = xberg::ExtractionConfig {
+            use_cache: self.use_cache,
+
+            enable_quality_processing: self.enable_quality_processing,
+
+            ocr: self.ocr.clone().map(Into::into),
+
+            force_ocr: self.force_ocr,
+
+            ocr_strategy: self.ocr_strategy.clone().into(),
+
+            force_ocr_pages: self.force_ocr_pages.clone(),
+
+            disable_ocr: self.disable_ocr,
+
+            chunking: self.chunking.clone().map(Into::into),
+
+            content_filter: self.content_filter.clone().map(Into::into),
+
+            images: self.images.clone().map(Into::into),
+
+            token_reduction: self.token_reduction.clone().map(Into::into),
+
+            language_detection: self.language_detection.clone().map(Into::into),
+
+            pages: self.pages.clone().map(Into::into),
+
+            postprocessor: self.postprocessor.clone().map(Into::into),
+
+            extraction_timeout_secs: self.extraction_timeout_secs,
+
+            max_concurrent_extractions: self.max_concurrent_extractions,
+
+            result_format: self.result_format.clone().into(),
+
+            security_limits: self.security_limits.clone().map(Into::into),
+
+            max_embedded_file_bytes: self.max_embedded_file_bytes,
+
+            output_format: self.output_format.clone().into(),
+
+            escape_markdown: self.escape_markdown,
+
+            table_anchors: self.table_anchors,
+
+            jupyter_cell_rendering: self.jupyter_cell_rendering.clone().into(),
+
+            use_layout_for_markdown: self.use_layout_for_markdown,
+
+            include_document_structure: self.include_document_structure,
+
+            acceleration: self.acceleration.clone().map(Into::into),
+
+            cache_namespace: self.cache_namespace.clone(),
+
+            cache_ttl_secs: self.cache_ttl_secs,
+
+            email: self.email.clone().map(Into::into),
+
+            csv: self.csv.clone().map(Into::into),
+
+            url: self.url.clone().into(),
+
+            max_archive_depth: self.max_archive_depth,
+
+            structured_extraction: self.structured_extraction.clone().map(Into::into),
+
+            ner: self.ner.clone().map(Into::into),
+
+            redaction: self.redaction.clone().map(Into::into),
+
+            summarization: self.summarization.clone().map(Into::into),
+
+            translation: self.translation.clone().map(Into::into),
+
+            page_classification: self.page_classification.clone().map(Into::into),
+
+            chunk_classification: self.chunk_classification.clone().map(Into::into),
 
             captioning: self.captioning.clone().map(Into::into),
 
@@ -878,6 +1231,8 @@ impl ExtractionConfig {
 
             force_ocr: self.force_ocr,
 
+            ocr_strategy: self.ocr_strategy.clone().into(),
+
             force_ocr_pages: self.force_ocr_pages.clone(),
 
             disable_ocr: self.disable_ocr,
@@ -908,6 +1263,12 @@ impl ExtractionConfig {
 
             output_format: self.output_format.clone().into(),
 
+            escape_markdown: self.escape_markdown,
+
+            table_anchors: self.table_anchors,
+
+            jupyter_cell_rendering: self.jupyter_cell_rendering.clone().into(),
+
             use_layout_for_markdown: self.use_layout_for_markdown,
 
             include_document_structure: self.include_document_structure,
@@ -919,6 +1280,8 @@ impl ExtractionConfig {
             cache_ttl_secs: self.cache_ttl_secs,
 
             email: self.email.clone().map(Into::into),
+
+            csv: self.csv.clone().map(Into::into),
 
             url: self.url.clone().into(),
 
@@ -935,6 +1298,8 @@ impl ExtractionConfig {
             translation: self.translation.clone().map(Into::into),
 
             page_classification: self.page_classification.clone().map(Into::into),
+
+            chunk_classification: self.chunk_classification.clone().map(Into::into),
 
             captioning: self.captioning.clone().map(Into::into),
 
@@ -972,6 +1337,9 @@ pub struct FileExtractionConfig {
     /// Override force OCR for this file.
     #[pyo3(get)]
     pub force_ocr: Option<bool>,
+    /// Override the OCR page-selection strategy for this file.
+    #[pyo3(get)]
+    pub ocr_strategy: Option<OcrStrategy>,
     /// Override force OCR pages for this file (1-indexed page numbers).
     #[pyo3(get)]
     pub force_ocr_pages: Option<Vec<u32>>,
@@ -1041,6 +1409,7 @@ pub struct FileExtractionConfig {
     /// for this specific file. The extracted content is sent to a VLM/LLM
     /// and the response is parsed according to the provided schema.
     #[pyo3(get)]
+    #[serde(skip)]
     pub structured_extraction: Option<StructuredExtractionConfig>,
     /// Override URL ingestion and crawl configuration for this file.
     #[pyo3(get)]
@@ -1056,15 +1425,23 @@ pub struct FileExtractionConfig {
     pub redaction: Option<RedactionConfig>,
     /// Override summarization configuration for this file.
     #[pyo3(get)]
+    #[serde(skip)]
     pub summarization: Option<SummarizationConfig>,
     /// Override translation configuration for this file.
     #[pyo3(get)]
+    #[serde(skip)]
     pub translation: Option<TranslationConfig>,
     /// Override per-page classification configuration for this file.
     #[pyo3(get)]
+    #[serde(skip)]
     pub page_classification: Option<PageClassificationConfig>,
+    /// Override per-chunk classification configuration for this file.
+    #[pyo3(get)]
+    #[serde(skip)]
+    pub chunk_classification: Option<ChunkClassificationConfig>,
     /// Override VLM captioning configuration for this file.
     #[pyo3(get)]
+    #[serde(skip)]
     pub captioning: Option<CaptioningConfig>,
     /// Override QR-code detection for this file.
     #[pyo3(get)]
@@ -1081,12 +1458,13 @@ impl Default for FileExtractionConfig {
 impl FileExtractionConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (enable_quality_processing=None, ocr=None, force_ocr=None, force_ocr_pages=None, disable_ocr=None, chunking=None, content_filter=None, images=None, pdf_options=None, token_reduction=None, language_detection=None, pages=None, keywords=None, postprocessor=None, html_output=None, result_format=None, output_format=None, include_document_structure=None, layout=None, transcription=None, timeout_secs=None, tree_sitter=None, structured_extraction=None, url=None, ner=None, redaction=None, summarization=None, translation=None, page_classification=None, captioning=None, qr_codes=None))]
+    #[pyo3(signature = (enable_quality_processing=None, ocr=None, force_ocr=None, ocr_strategy=None, force_ocr_pages=None, disable_ocr=None, chunking=None, content_filter=None, images=None, pdf_options=None, token_reduction=None, language_detection=None, pages=None, keywords=None, postprocessor=None, html_output=None, result_format=None, output_format=None, include_document_structure=None, layout=None, transcription=None, timeout_secs=None, tree_sitter=None, structured_extraction=None, url=None, ner=None, redaction=None, summarization=None, translation=None, page_classification=None, chunk_classification=None, captioning=None, qr_codes=None))]
     #[new]
     pub fn new(
         enable_quality_processing: Option<bool>,
         ocr: Option<OcrConfig>,
         force_ocr: Option<bool>,
+        ocr_strategy: Option<OcrStrategy>,
         force_ocr_pages: Option<Vec<u32>>,
         disable_ocr: Option<bool>,
         chunking: Option<ChunkingConfig>,
@@ -1113,6 +1491,7 @@ impl FileExtractionConfig {
         summarization: Option<SummarizationConfig>,
         translation: Option<TranslationConfig>,
         page_classification: Option<PageClassificationConfig>,
+        chunk_classification: Option<ChunkClassificationConfig>,
         captioning: Option<CaptioningConfig>,
         qr_codes: Option<bool>,
     ) -> Self {
@@ -1120,6 +1499,7 @@ impl FileExtractionConfig {
             enable_quality_processing,
             ocr,
             force_ocr,
+            ocr_strategy,
             force_ocr_pages,
             disable_ocr,
             chunking,
@@ -1146,6 +1526,7 @@ impl FileExtractionConfig {
             summarization,
             translation,
             page_classification,
+            chunk_classification,
             captioning,
             qr_codes,
         }
@@ -1845,7 +2226,107 @@ impl HtmlOutputConfig {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
+pub struct LateInteractionConfig {
+    /// The late-interaction model to use (defaults to the "gte-moderncolbert" preset).
+    #[pyo3(get)]
+    pub model: LateInteractionModelType,
+    /// Batch size for local ONNX inference.
+    ///
+    /// ColBERT emits a `[seq, dim]` multi-vector embedding per document, so
+    /// memory scales with batch size — keep this modest.
+    #[pyo3(get)]
+    pub batch_size: usize,
+    /// Maximum token sequence length for the tokenizer (documents).
+    #[pyo3(get)]
+    pub max_length: usize,
+    /// Fixed padded length for query augmentation.
+    ///
+    /// ColBERT queries are padded (with the mask token, kept attention-live)
+    /// to exactly this many tokens rather than truncated/left as-is — this is
+    /// the "query augmentation" trick from the ColBERT paper.
+    #[pyo3(get)]
+    pub query_max_length: usize,
+    /// Show model download progress (local ONNX path only).
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). A warm
+    /// Hugging Face cache transfers nothing and so reports nothing. Ignored by
+    /// `LateInteractionModelType.Plugin`, which downloads no model.
+    #[pyo3(get)]
+    pub show_download_progress: bool,
+    /// Optional alternate Hugging Face cache root for model files.
+    ///
+    /// When unset, hf-hub follows the standard Hugging Face environment and
+    /// platform cache conventions.
+    #[pyo3(get)]
+    pub cache_dir: Option<String>,
+    /// Hardware acceleration for the late-interaction ONNX model.
+    #[pyo3(get)]
+    pub acceleration: Option<AccelerationConfig>,
+    /// Maximum wall-clock duration (in seconds) for a single embed call when
+    /// using `LateInteractionModelType.Plugin`. `None` disables the timeout.
+    #[pyo3(get)]
+    pub max_embed_duration_secs: Option<u64>,
+}
+
+impl Default for LateInteractionConfig {
+    fn default() -> Self {
+        <xberg::LateInteractionConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl LateInteractionConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (model=Self::default().model, batch_size=Self::default().batch_size, max_length=Self::default().max_length, query_max_length=Self::default().query_max_length, show_download_progress=Self::default().show_download_progress, cache_dir=None, acceleration=None, max_embed_duration_secs=None))]
+    #[new]
+    pub fn new(
+        model: LateInteractionModelType,
+        batch_size: usize,
+        max_length: usize,
+        query_max_length: usize,
+        show_download_progress: bool,
+        cache_dir: Option<String>,
+        acceleration: Option<AccelerationConfig>,
+        max_embed_duration_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            model,
+            batch_size,
+            max_length,
+            query_max_length,
+            show_download_progress,
+            cache_dir,
+            acceleration,
+            max_embed_duration_secs,
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    #[staticmethod]
+    #[pyo3(signature = ())]
+    pub fn default() -> LateInteractionConfig {
+        xberg::LateInteractionConfig::default().into()
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
 pub struct LayoutDetectionConfig {
+    /// Which pages the layout model runs on.
+    ///
+    /// Defaults to `LayoutStrategy.Always`, the historical behavior:
+    /// every page is rendered and inferred. `LayoutStrategy.Auto`
+    /// pre-screens pages with cheap signals and skips the model where it
+    /// cannot help.
+    #[pyo3(get)]
+    pub strategy: LayoutStrategy,
     /// Confidence threshold override (undefined = use model default).
     #[pyo3(get)]
     pub confidence_threshold: Option<f32>,
@@ -1893,9 +2374,10 @@ impl Default for LayoutDetectionConfig {
 impl LayoutDetectionConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (apply_heuristics=Self::default().apply_heuristics, table_model=Self::default().table_model, table_overlap_preference=Self::default().table_overlap_preference, enable_chart_understanding=Self::default().enable_chart_understanding, confidence_threshold=None, acceleration=None))]
+    #[pyo3(signature = (strategy=Self::default().strategy, apply_heuristics=Self::default().apply_heuristics, table_model=Self::default().table_model, table_overlap_preference=Self::default().table_overlap_preference, enable_chart_understanding=Self::default().enable_chart_understanding, confidence_threshold=None, acceleration=None))]
     #[new]
     pub fn new(
+        strategy: LayoutStrategy,
         apply_heuristics: bool,
         table_model: TableModel,
         table_overlap_preference: TableOverlapPreference,
@@ -1904,6 +2386,7 @@ impl LayoutDetectionConfig {
         acceleration: Option<AccelerationConfig>,
     ) -> Self {
         Self {
+            strategy,
             confidence_threshold,
             apply_heuristics,
             table_model,
@@ -1942,7 +2425,9 @@ pub struct LlmConfig {
     /// Custom base URL override for the provider endpoint.
     #[pyo3(get)]
     pub base_url: Option<String>,
-    /// Request timeout in seconds (default: 60).
+    /// Request timeout in seconds. When `None`, liter-llm's built-in 60s default
+    /// applies, except the VLM OCR path which uses a 300s default (a single page
+    /// image transcription routinely exceeds 60s). Set explicitly to override.
     #[pyo3(get)]
     pub timeout_secs: Option<u64>,
     /// Maximum retry attempts (default: 3).
@@ -1954,6 +2439,181 @@ pub struct LlmConfig {
     /// Maximum tokens to generate.
     #[pyo3(get)]
     pub max_tokens: Option<u64>,
+    /// Nucleus sampling parameter for generation tasks, applied to individual
+    /// requests built from this config. Restricts sampling to the smallest set of
+    /// tokens whose cumulative probability mass is at least this value; lower is
+    /// more focused. Validated to `[0.0, 1.0]` by `LlmConfig.validate`.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.top_p`. A request-time
+    /// parameter like `temperature`/`max_tokens` above, not a client-level
+    /// setting.
+    #[pyo3(get)]
+    pub top_p: Option<f64>,
+    /// Stop sequence(s) that halt token generation, applied to individual requests
+    /// built from this config.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.stop`
+    /// (`types.common.StopSequence`), which liter-llm represents as either a
+    /// single string or a list of strings via an untagged enum. Always expressed
+    /// here as a list — even one stop sequence is `["..."]` — so the field has a
+    /// single, FFI-friendly shape across every language binding instead of a
+    /// single-or-list union type. Converted to liter-llm's
+    /// `StopSequence.Multiple` at each request-building call site; see
+    /// `to_stop_sequence`.
+    #[pyo3(get)]
+    pub stop: Option<Vec<String>>,
+    /// Random seed for reproducible outputs, applied to individual requests built
+    /// from this config. Provider support varies — some silently ignore it.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.seed`.
+    #[pyo3(get)]
+    pub seed: Option<i64>,
+    /// Presence penalty for generation tasks, applied to individual requests
+    /// built from this config. Positive values discourage the model from
+    /// repeating topics already present in the conversation. Validated to
+    /// `[-2.0, 2.0]` by `LlmConfig.validate`.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.presence_penalty`.
+    #[pyo3(get)]
+    pub presence_penalty: Option<f64>,
+    /// Frequency penalty for generation tasks, applied to individual requests
+    /// built from this config. Positive values discourage the model from
+    /// repeating the same tokens verbatim. Validated to `[-2.0, 2.0]` by
+    /// `LlmConfig.validate`.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.frequency_penalty`.
+    #[pyo3(get)]
+    pub frequency_penalty: Option<f64>,
+    /// Reasoning effort level for extended-thinking models, applied to individual
+    /// requests built from this config.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.reasoning_effort`
+    /// (`types.chat.ReasoningEffort`). A request-time parameter like `temperature`/
+    /// `max_tokens` above, not a client-level setting — `into_client_builder` does not
+    /// map it. Accepted as a plain string — one of `"low"`, `"medium"`, `"high"`,
+    /// `"minimal"`, `"max"` (case-insensitive; liter-llm's own
+    /// `#[serde(rename_all = "lowercase")]` spelling) — rather than importing
+    /// liter-llm's enum, because this module compiles even when the `liter-llm`
+    /// feature is disabled. See `parse_reasoning_effort` for the
+    /// conversion into `liter_llm.ReasoningEffort`.
+    #[pyo3(get)]
+    pub reasoning_effort: Option<String>,
+    /// Provider-specific extra parameters merged into the request body (guardrails,
+    /// safety settings, grounding config, etc.), applied to individual requests built
+    /// from this config.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.extra_body`. A request-time
+    /// parameter like `temperature`/`max_tokens` above, not a client-level setting.
+    #[pyo3(get)]
+    #[serde(default, deserialize_with = "alef_json_str_opt::deserialize")]
+    pub extra_body: Option<String>,
+    /// Whether liter-llm should load provider credentials from environment variables.
+    ///
+    /// Mirrors liter-llm's `ClientConfigBuilder.load_env`. When `None`, liter-llm's
+    /// own default behavior applies.
+    #[pyo3(get)]
+    pub load_env: Option<bool>,
+    /// Extra HTTP headers sent with every request to the provider.
+    ///
+    /// Mirrors liter-llm's `ClientConfigBuilder.header`, for gateways or providers
+    /// that require custom auth/routing headers.
+    #[pyo3(get)]
+    pub headers: Option<HashMap<String, String>>,
+    /// Custom provider configurations, in addition to liter-llm's built-in providers.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.providers`, for OpenAI-compatible gateways
+    /// and self-hosted model servers that are not in the built-in provider catalog.
+    #[pyo3(get)]
+    pub providers: Option<Vec<LlmProviderConfig>>,
+    /// Response cache configuration.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.cache`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    ///
+    /// Boxed for the same reason as `bedrock` (a4579589ac): `LlmConfig` is the payload
+    /// of `EmbeddingModelType.Llm` and `RerankerModelType.Llm`, whose other variants
+    /// are tens of bytes. Inlining this and the two sub-configs below pushed that
+    /// variant to 480 bytes and tripped `clippy.large_enum_variant` on the
+    /// `--features full` leg. ~keep
+    #[pyo3(get)]
+    pub cache: Option<LlmCacheConfig>,
+    /// Budget enforcement configuration.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.budget`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    #[pyo3(get)]
+    pub budget: Option<LlmBudgetConfig>,
+    /// Per-model rate limiting configuration.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.rate_limit`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    #[pyo3(get)]
+    pub rate_limit: Option<LlmRateLimitConfig>,
+    /// Enable per-request cost tracking.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.cost_tracking`. Only takes effect when
+    /// liter-llm's `tower` feature is compiled in; otherwise the value is accepted
+    /// but unused.
+    #[pyo3(get)]
+    pub cost_tracking: Option<bool>,
+    /// Enable OpenTelemetry-compatible tracing spans.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.tracing`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    #[pyo3(get)]
+    pub tracing: Option<bool>,
+    /// Cooldown duration after transient errors, in seconds.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.cooldown_secs`. Only takes effect when
+    /// liter-llm's `tower` feature is compiled in; otherwise the value is accepted
+    /// but unused.
+    #[pyo3(get)]
+    pub cooldown_secs: Option<u64>,
+    /// Background health check interval, in seconds.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.health_check_secs`. Only takes effect when
+    /// liter-llm's `tower` feature is compiled in; otherwise the value is accepted
+    /// but unused.
+    #[pyo3(get)]
+    pub health_check_secs: Option<u64>,
+    /// AWS Bedrock settings (region, cross-region routing, explicit credentials).
+    ///
+    /// Only consulted for `bedrock/`-prefixed models. When `None` — or when an
+    /// individual field inside it is `None` — liter-llm falls back to the standard
+    /// AWS environment variables and the default credential chain.
+    #[pyo3(get)]
+    pub bedrock: Option<BedrockConfig>,
+    /// Managed OAuth2/STS credential provider for auth modes liter-llm cannot express via a
+    /// static `api_key` — Azure AD, Vertex AI OAuth2, Vertex AI Application Default
+    /// Credentials, and AWS STS Web Identity (EKS IRSA) for Bedrock.
+    ///
+    /// Mirrors liter-llm's `client.ClientConfigBuilder.credential_provider`, which takes an
+    /// `Arc<dyn liter_llm.auth.CredentialProvider>` trait object — that cannot appear in a
+    /// serde DTO. Every `CredentialProviderConfig` variant is plain data instead, so it
+    /// round-trips through TOML/JSON/YAML and every language binding like the rest of
+    /// `LlmConfig`.
+    ///
+    /// Inert on `wasm32`: `crate.llm` (the module that reads this field —
+    /// `build_credential_provider` and friends) is compiled out
+    /// entirely on that target, via the crate-root `#[cfg(all(feature = "liter-llm",
+    /// not(target_arch = "wasm32")))] pub mod llm;` gate in `lib.rs`. Every variant needs
+    /// liter-llm's `native-http`-backed auth modules, and wasm32 builds request only
+    /// `wasm-http` (see the `liter-llm` dependency comment in Cargo.toml), so there is no
+    /// code path left on that target to construct a provider from this field, or to reject
+    /// it. This type (`core.config.llm`) has no `liter-llm` dependency itself and compiles
+    /// on every target, so setting this field on a wasm32 build is accepted by serde and
+    /// silently ignored — a plain no-op, not a `Validation`. Reject a
+    /// wasm32 build that sets this field yourself if that silence is a problem for your use
+    /// case; xberg does not do it for you.
+    ///
+    /// GitHub Copilot's device-flow provider has no variant here: it takes no configuration at
+    /// all (`liter_llm.auth.github_copilot.GithubCopilotCredentialProvider.new` accepts only
+    /// an HTTP client) and drives an interactive terminal prompt, so it cannot be expressed as
+    /// data. A Rust embedder who needs it — or any other fully custom `CredentialProvider` — can
+    /// call `xberg.llm.client.create_client_with_credential_provider` directly with a
+    /// `liter-llm` dependency of their own.
+    #[pyo3(get)]
+    pub credential_provider: Option<CredentialProviderConfig>,
 }
 
 impl Default for LlmConfig {
@@ -1966,7 +2626,7 @@ impl Default for LlmConfig {
 impl LlmConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (model=Self::default().model, api_key=None, base_url=None, timeout_secs=None, max_retries=None, temperature=None, max_tokens=None))]
+    #[pyo3(signature = (model=Self::default().model, api_key=None, base_url=None, timeout_secs=None, max_retries=None, temperature=None, max_tokens=None, top_p=None, stop=None, seed=None, presence_penalty=None, frequency_penalty=None, reasoning_effort=None, extra_body=None, load_env=None, headers=None, providers=None, cache=None, budget=None, rate_limit=None, cost_tracking=None, tracing=None, cooldown_secs=None, health_check_secs=None, bedrock=None, credential_provider=None))]
     #[new]
     pub fn new(
         model: String,
@@ -1976,6 +2636,25 @@ impl LlmConfig {
         max_retries: Option<u32>,
         temperature: Option<f64>,
         max_tokens: Option<u64>,
+        top_p: Option<f64>,
+        stop: Option<Vec<String>>,
+        seed: Option<i64>,
+        presence_penalty: Option<f64>,
+        frequency_penalty: Option<f64>,
+        reasoning_effort: Option<String>,
+        extra_body: Option<String>,
+        load_env: Option<bool>,
+        headers: Option<HashMap<String, String>>,
+        providers: Option<Vec<LlmProviderConfig>>,
+        cache: Option<LlmCacheConfig>,
+        budget: Option<LlmBudgetConfig>,
+        rate_limit: Option<LlmRateLimitConfig>,
+        cost_tracking: Option<bool>,
+        tracing: Option<bool>,
+        cooldown_secs: Option<u64>,
+        health_check_secs: Option<u64>,
+        bedrock: Option<BedrockConfig>,
+        credential_provider: Option<CredentialProviderConfig>,
     ) -> Self {
         Self {
             model,
@@ -1985,6 +2664,325 @@ impl LlmConfig {
             max_retries,
             temperature,
             max_tokens,
+            top_p,
+            stop,
+            seed,
+            presence_penalty,
+            frequency_penalty,
+            reasoning_effort,
+            extra_body,
+            load_env,
+            headers,
+            providers,
+            cache,
+            budget,
+            rate_limit,
+            cost_tracking,
+            tracing,
+            cooldown_secs,
+            health_check_secs,
+            bedrock,
+            credential_provider,
+        }
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    #[pyo3(signature = ())]
+    pub fn validate(&self) -> PyResult<()> {
+        #[allow(clippy::needless_update)]
+        let core_self = xberg::LlmConfig {
+            model: self.model.clone(),
+
+            api_key: self.api_key.clone(),
+
+            base_url: self.base_url.clone(),
+
+            timeout_secs: self.timeout_secs,
+
+            max_retries: self.max_retries,
+
+            temperature: self.temperature,
+
+            max_tokens: self.max_tokens,
+
+            top_p: self.top_p,
+
+            stop: self.stop.clone(),
+
+            seed: self.seed,
+
+            presence_penalty: self.presence_penalty,
+
+            frequency_penalty: self.frequency_penalty,
+
+            reasoning_effort: self.reasoning_effort.clone(),
+
+            extra_body: self.extra_body.as_ref().and_then(|s| serde_json::from_str(s).ok()),
+
+            load_env: self.load_env,
+
+            headers: self
+                .headers
+                .clone()
+                .map(|m| m.into_iter().map(|(k, v)| (k.into(), v)).collect()),
+
+            providers: self.providers.clone().map(|v| v.into_iter().map(Into::into).collect()),
+
+            cache: self.cache.clone().map(|v| Box::new(v.into())),
+
+            budget: self.budget.clone().map(|v| Box::new(v.into())),
+
+            rate_limit: self.rate_limit.clone().map(|v| Box::new(v.into())),
+
+            cost_tracking: self.cost_tracking,
+
+            tracing: self.tracing,
+
+            cooldown_secs: self.cooldown_secs,
+
+            health_check_secs: self.health_check_secs,
+
+            bedrock: self.bedrock.clone().map(|v| Box::new(v.into())),
+
+            credential_provider: self.credential_provider.clone().map(|v| Box::new(v.into())),
+
+            ..Default::default()
+        };
+        let result = core_self
+            .validate()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(result)
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct LlmProviderConfig {
+    /// Provider name, used to key model prefix matching.
+    #[pyo3(get)]
+    pub name: String,
+    /// Base URL for the provider's OpenAI-compatible API.
+    #[pyo3(get)]
+    pub base_url: String,
+    /// Header name used to carry the API key (defaults to `Authorization` when unset).
+    #[pyo3(get)]
+    pub auth_header: Option<String>,
+    /// Model name prefixes routed to this provider (e.g. `["my-provider/"]`).
+    #[pyo3(get)]
+    pub model_prefixes: Vec<String>,
+}
+
+impl Default for LlmProviderConfig {
+    fn default() -> Self {
+        <xberg::core::config::LlmProviderConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl LlmProviderConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (name=Self::default().name, base_url=Self::default().base_url, model_prefixes=Self::default().model_prefixes, auth_header=None))]
+    #[new]
+    pub fn new(name: String, base_url: String, model_prefixes: Vec<String>, auth_header: Option<String>) -> Self {
+        Self {
+            name,
+            base_url,
+            auth_header,
+            model_prefixes,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct LlmCacheConfig {
+    /// Maximum number of cached entries.
+    #[pyo3(get)]
+    pub max_entries: Option<usize>,
+    /// Cache entry time-to-live, in seconds.
+    #[pyo3(get)]
+    pub ttl_seconds: Option<u64>,
+    /// Cache backend name (e.g. `"memory"`, or an `opendal` scheme).
+    #[pyo3(get)]
+    pub backend: Option<String>,
+    /// Backend-specific configuration key/value pairs.
+    #[pyo3(get)]
+    pub backend_config: Option<HashMap<String, String>>,
+}
+
+impl Default for LlmCacheConfig {
+    fn default() -> Self {
+        <xberg::core::config::LlmCacheConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl LlmCacheConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (max_entries=None, ttl_seconds=None, backend=None, backend_config=None))]
+    #[new]
+    pub fn new(
+        max_entries: Option<usize>,
+        ttl_seconds: Option<u64>,
+        backend: Option<String>,
+        backend_config: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            max_entries,
+            ttl_seconds,
+            backend,
+            backend_config,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct LlmBudgetConfig {
+    /// Global spend limit in USD.
+    #[pyo3(get)]
+    pub global_limit: Option<f64>,
+    /// Per-model spend limits in USD, keyed by model name.
+    #[pyo3(get)]
+    pub model_limits: Option<HashMap<String, f64>>,
+    /// Enforcement mode: `"hard"` (reject over-budget requests) or `"soft"` (log only).
+    #[pyo3(get)]
+    pub enforcement: Option<String>,
+}
+
+impl Default for LlmBudgetConfig {
+    fn default() -> Self {
+        <xberg::core::config::LlmBudgetConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl LlmBudgetConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (global_limit=None, model_limits=None, enforcement=None))]
+    #[new]
+    pub fn new(
+        global_limit: Option<f64>,
+        model_limits: Option<HashMap<String, f64>>,
+        enforcement: Option<String>,
+    ) -> Self {
+        Self {
+            global_limit,
+            model_limits,
+            enforcement,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+#[allow(clippy::similar_names)]
+pub struct LlmRateLimitConfig {
+    /// Requests per minute limit.
+    #[pyo3(get)]
+    pub rpm: Option<u32>,
+    /// Tokens per minute limit.
+    #[pyo3(get)]
+    pub tpm: Option<u64>,
+    /// Rate limit window, in seconds.
+    #[pyo3(get)]
+    pub window_seconds: Option<u64>,
+}
+
+impl Default for LlmRateLimitConfig {
+    fn default() -> Self {
+        <xberg::core::config::LlmRateLimitConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl LlmRateLimitConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (rpm=None, tpm=None, window_seconds=None))]
+    #[new]
+    pub fn new(rpm: Option<u32>, tpm: Option<u64>, window_seconds: Option<u64>) -> Self {
+        Self {
+            rpm,
+            tpm,
+            window_seconds,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct BedrockConfig {
+    /// AWS region (e.g. `"us-east-1"`).
+    #[pyo3(get)]
+    pub region: Option<String>,
+    /// Cross-region inference profile prefix (e.g. `"us"`).
+    #[pyo3(get)]
+    pub cross_region_prefix: Option<String>,
+    /// Explicit AWS access key ID. Secret — never logged.
+    #[pyo3(get)]
+    pub access_key_id: Option<String>,
+    /// Explicit AWS secret access key. Secret — never logged.
+    #[pyo3(get)]
+    pub secret_access_key: Option<String>,
+    /// Explicit AWS session token for temporary credentials. Secret — never logged.
+    #[pyo3(get)]
+    pub session_token: Option<String>,
+}
+
+impl Default for BedrockConfig {
+    fn default() -> Self {
+        <xberg::BedrockConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl BedrockConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (region=None, cross_region_prefix=None, access_key_id=None, secret_access_key=None, session_token=None))]
+    #[new]
+    pub fn new(
+        region: Option<String>,
+        cross_region_prefix: Option<String>,
+        access_key_id: Option<String>,
+        secret_access_key: Option<String>,
+        session_token: Option<String>,
+    ) -> Self {
+        Self {
+            region,
+            cross_region_prefix,
+            access_key_id,
+            secret_access_key,
+            session_token,
         }
     }
 
@@ -2021,6 +3019,7 @@ pub struct StructuredExtractionConfig {
     pub prompt: Option<String>,
     /// LLM configuration for the extraction.
     #[pyo3(get)]
+    #[serde(skip)]
     pub llm: LlmConfig,
 }
 
@@ -2071,6 +3070,7 @@ pub struct NerConfig {
     /// Optional LLM configuration — only used by `NerBackendKind.Llm`. Token usage
     /// for LLM backends is recorded in `ExtractedDocument.llm_usage`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub llm: Option<LlmConfig>,
     /// Arbitrary user-supplied entity labels for zero-shot detection.
     ///
@@ -2172,6 +3172,30 @@ pub struct OcrQualityThresholds {
     /// If the result from a backend scores below this, try the next backend.
     #[pyo3(get)]
     pub pipeline_min_quality: f64,
+    /// Minimum fraction of non-whitespace characters that are undecodable
+    /// (Unicode Private Use Area, replacement characters, or non-whitespace
+    /// control characters) before a page's text layer is treated as
+    /// unreadable and routed to OCR (issue #1254). Gated by
+    /// `min_total_non_whitespace` so short snippets with a stray symbol or
+    /// two do not trip this check.
+    #[pyo3(get)]
+    pub min_undecodable_ratio: f64,
+    /// Whether to route a page to OCR when pdf_oxide reports that a high
+    /// fraction of its text was fabricated rather than read from the file
+    /// (`MappingProvenance.Fallback`, pdf_oxide 0.3.75+, issue #1254). This is
+    /// a direct fact from the extractor's ISO 32000-1 §9.10.2 mapping cascade,
+    /// distinct from the character-heuristic proxy behind `min_undecodable_ratio`.
+    /// Defaults to `true`.
+    #[pyo3(get)]
+    pub enable_provenance_ocr_routing: bool,
+    /// Minimum fraction of a page's non-whitespace characters with
+    /// `MappingProvenance.Fallback` provenance before the page is treated as
+    /// having a fabricated text layer and routed to OCR (issue #1254). Gated by
+    /// `min_total_non_whitespace` so a short page with a stray fallback
+    /// character cannot trip it. Only used when `enable_provenance_ocr_routing`
+    /// is `true`.
+    #[pyo3(get)]
+    pub min_provenance_fallback_ratio: f64,
 }
 
 impl Default for OcrQualityThresholds {
@@ -2184,7 +3208,7 @@ impl Default for OcrQualityThresholds {
 impl OcrQualityThresholds {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (min_total_non_whitespace=Self::default().min_total_non_whitespace, min_non_whitespace_per_page=Self::default().min_non_whitespace_per_page, min_meaningful_word_len=Self::default().min_meaningful_word_len, min_meaningful_words=Self::default().min_meaningful_words, min_alnum_ratio=Self::default().min_alnum_ratio, min_garbage_chars=Self::default().min_garbage_chars, max_fragmented_word_ratio=Self::default().max_fragmented_word_ratio, critical_fragmented_word_ratio=Self::default().critical_fragmented_word_ratio, min_avg_word_length=Self::default().min_avg_word_length, min_words_for_avg_length_check=Self::default().min_words_for_avg_length_check, min_consecutive_repeat_ratio=Self::default().min_consecutive_repeat_ratio, min_words_for_repeat_check=Self::default().min_words_for_repeat_check, substantive_min_chars=Self::default().substantive_min_chars, non_text_min_chars=Self::default().non_text_min_chars, alnum_ws_ratio_threshold=Self::default().alnum_ws_ratio_threshold, pipeline_min_quality=Self::default().pipeline_min_quality))]
+    #[pyo3(signature = (min_total_non_whitespace=Self::default().min_total_non_whitespace, min_non_whitespace_per_page=Self::default().min_non_whitespace_per_page, min_meaningful_word_len=Self::default().min_meaningful_word_len, min_meaningful_words=Self::default().min_meaningful_words, min_alnum_ratio=Self::default().min_alnum_ratio, min_garbage_chars=Self::default().min_garbage_chars, max_fragmented_word_ratio=Self::default().max_fragmented_word_ratio, critical_fragmented_word_ratio=Self::default().critical_fragmented_word_ratio, min_avg_word_length=Self::default().min_avg_word_length, min_words_for_avg_length_check=Self::default().min_words_for_avg_length_check, min_consecutive_repeat_ratio=Self::default().min_consecutive_repeat_ratio, min_words_for_repeat_check=Self::default().min_words_for_repeat_check, substantive_min_chars=Self::default().substantive_min_chars, non_text_min_chars=Self::default().non_text_min_chars, alnum_ws_ratio_threshold=Self::default().alnum_ws_ratio_threshold, pipeline_min_quality=Self::default().pipeline_min_quality, min_undecodable_ratio=Self::default().min_undecodable_ratio, enable_provenance_ocr_routing=Self::default().enable_provenance_ocr_routing, min_provenance_fallback_ratio=Self::default().min_provenance_fallback_ratio))]
     #[new]
     pub fn new(
         min_total_non_whitespace: usize,
@@ -2203,6 +3227,9 @@ impl OcrQualityThresholds {
         non_text_min_chars: usize,
         alnum_ws_ratio_threshold: f64,
         pipeline_min_quality: f64,
+        min_undecodable_ratio: f64,
+        enable_provenance_ocr_routing: bool,
+        min_provenance_fallback_ratio: f64,
     ) -> Self {
         Self {
             min_total_non_whitespace,
@@ -2221,6 +3248,9 @@ impl OcrQualityThresholds {
             non_text_min_chars,
             alnum_ws_ratio_threshold,
             pipeline_min_quality,
+            min_undecodable_ratio,
+            enable_provenance_ocr_routing,
+            min_provenance_fallback_ratio,
         }
     }
 
@@ -2240,14 +3270,20 @@ impl OcrQualityThresholds {
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
 pub struct OcrPipelineStage {
-    /// Backend name: "tesseract", "paddleocr", "paddle-ocr", "vlm", or a custom registered name.
+    /// Backend name: "tesseract", "paddleocr", "paddle-ocr", "sceptre", "vlm", or a custom registered name.
+    /// Sceptre uses ONNX Runtime on desktop/server and tract on Android/iOS; browser WebAssembly has a separate
+    /// byte-fed engine because the normal async OCR registry assumes native model storage.
     #[pyo3(get)]
     pub backend: String,
     /// Priority weight (higher = tried first). Stages are sorted by priority descending.
     #[pyo3(get)]
     pub priority: u32,
     /// Language override for this stage (undefined = use parent OcrConfig.language).
-    /// Accepts either a single language code ("eng") or a list (["eng", "deu"]).
+    ///
+    /// A list is the canonical form and the only form accepted by the binding
+    /// object APIs: `["eng", "deu"]`. When deserializing from a config file,
+    /// JSON body, or the REST/MCP API, a single string is also accepted,
+    /// either as one code ("eng") or "+"-joined ("eng+deu").
     #[pyo3(get)]
     pub language: Option<Vec<String>>,
     /// Tesseract-specific config override for this stage.
@@ -2259,6 +3295,7 @@ pub struct OcrPipelineStage {
     pub paddle_ocr_config: Option<String>,
     /// VLM config override for this pipeline stage.
     #[pyo3(get)]
+    #[serde(skip)]
     pub vlm_config: Option<LlmConfig>,
     /// Arbitrary per-call options passed through to the backend unchanged.
     ///
@@ -2314,6 +3351,7 @@ impl OcrPipelineStage {
 pub struct OcrPipelineConfig {
     /// Ordered list of backends to try. Sorted by priority (descending) at runtime.
     #[pyo3(get)]
+    #[serde(skip)]
     pub stages: Vec<OcrPipelineStage>,
     /// Quality thresholds for deciding whether to accept a result or try the next backend.
     #[pyo3(get)]
@@ -2351,12 +3389,19 @@ pub struct OcrConfig {
     /// Defaults to `true`. When `false`, all other OCR settings are ignored.
     #[pyo3(get)]
     pub enabled: bool,
-    /// OCR backend: tesseract, paddleocr, paddle-ocr, or vlm
+    /// OCR backend: tesseract, paddleocr, paddle-ocr, sceptre, or vlm.
+    /// Sceptre uses ONNX Runtime on desktop/server and tract on supported mobile builds.
+    /// Browser WebAssembly uses the separate byte-fed Sceptre worker API.
     #[pyo3(get)]
     pub backend: String,
-    /// Language code(s) for OCR recognition.
-    /// Accepts either a single language code ("eng") or a list (["eng", "deu"]).
-    /// Defaults to ["eng"]. For Tesseract, languages are joined with "+".
+    /// Language code(s) for OCR recognition. Defaults to `["eng"]`. For Tesseract,
+    /// languages are joined with "+".
+    ///
+    /// A list is the canonical form and the only form accepted by the binding
+    /// object APIs (Python, Node, PHP, WASM, etc.): `["eng", "deu"]`. When
+    /// deserializing from a config file, JSON body, or the REST/MCP API, a
+    /// single string is also accepted, either as one code ("eng") or
+    /// "+"-joined ("eng+deu").
     #[pyo3(get)]
     pub language: Vec<String>,
     /// Tesseract-specific configuration (optional)
@@ -2365,7 +3410,20 @@ pub struct OcrConfig {
     /// Output format for OCR results (optional, for format conversion)
     #[pyo3(get)]
     pub output_format: Option<OutputFormat>,
-    /// PaddleOCR-specific configuration (optional, JSON passthrough)
+    /// PaddleOCR-specific configuration (optional, JSON passthrough).
+    ///
+    /// Deserialized into a `PaddleOcrConfig`, so any of its fields can be
+    /// overridden here — most notably `model_version` (`"pp-ocrv6"` default / `"pp-ocrv5"`) and
+    /// `model_tier`. In TOML:
+    ///
+    /// ```toml
+    /// [ocr.paddle_ocr_config]
+    /// model_version = "pp-ocrv5"
+    /// model_tier = "server"
+    /// ```
+    ///
+    /// The `XBERG_OCR_MODEL_VERSION` / `XBERG_OCR_MODEL_TIER` environment variables set the same two
+    /// keys for env-configured servers (issue #1279).
     #[pyo3(get)]
     #[serde(default, deserialize_with = "alef_json_str_opt::deserialize")]
     pub paddle_ocr_config: Option<String>,
@@ -2403,6 +3461,7 @@ pub struct OcrConfig {
     /// fallback across multiple OCR backends based on output quality.
     /// When undefined, uses the single `backend` field (same as today).
     #[pyo3(get)]
+    #[serde(skip)]
     pub pipeline: Option<OcrPipelineConfig>,
     /// Enable automatic page rotation based on orientation detection.
     ///
@@ -2432,6 +3491,7 @@ pub struct OcrConfig {
     /// `VlmFallbackPolicy.Disabled`. Uses liter-llm to send page images to a
     /// vision model for text extraction.
     #[pyo3(get)]
+    #[serde(skip)]
     pub vlm_config: Option<LlmConfig>,
     /// Custom Jinja2 prompt template for VLM OCR.
     ///
@@ -2644,8 +3704,17 @@ pub struct PdfConfig {
     ///
     /// When `true`, projects text spans onto layout-detected regions, performs
     /// column detection, and emits spans in natural reading order (important
-    /// for multi-column academic PDFs). Requires the `layout-detection`
-    /// feature; has no effect without it. Defaults to `false`.
+    /// for multi-column academic PDFs). It also repairs 90/180/270-degree
+    /// rotated text runs — sideways tables and captions — that otherwise read
+    /// word-reversed and glued (GH#1358); see
+    /// `crate.extractors.pdf.reading_order` for the rotation-handling
+    /// details and its limits. Requires the `layout-detection` feature and a
+    /// page for which layout detection actually produces hints: a page with
+    /// no detected regions falls back to the original, unrepaired extraction
+    /// order even with this enabled. Independent of
+    /// `LayoutStrategy`, which only
+    /// controls whether layout detection runs at all — enabling `Always` or
+    /// `Auto` alone does not turn reordering on. Defaults to `false`.
     #[pyo3(get)]
     pub reading_order: bool,
 }
@@ -2720,13 +3789,6 @@ pub struct HierarchyConfig {
     /// Include bounding box information in hierarchy blocks
     #[pyo3(get)]
     pub include_bbox: bool,
-    /// OCR coverage threshold for smart OCR triggering (0.0-1.0)
-    ///
-    /// Determines when OCR should be triggered based on text block coverage.
-    /// OCR is triggered when text blocks cover less than this fraction of the page.
-    /// Default: 0.5 (trigger OCR if less than 50% of page has text)
-    #[pyo3(get)]
-    pub ocr_coverage_threshold: Option<f32>,
 }
 
 impl Default for HierarchyConfig {
@@ -2739,14 +3801,13 @@ impl Default for HierarchyConfig {
 impl HierarchyConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (enabled=Self::default().enabled, k_clusters=Self::default().k_clusters, include_bbox=Self::default().include_bbox, ocr_coverage_threshold=None))]
+    #[pyo3(signature = (enabled=Self::default().enabled, k_clusters=Self::default().k_clusters, include_bbox=Self::default().include_bbox))]
     #[new]
-    pub fn new(enabled: bool, k_clusters: usize, include_bbox: bool, ocr_coverage_threshold: Option<f32>) -> Self {
+    pub fn new(enabled: bool, k_clusters: usize, include_bbox: bool) -> Self {
         Self {
             enabled,
             k_clusters,
             include_bbox,
-            ocr_coverage_threshold,
         }
     }
 
@@ -2856,6 +3917,29 @@ pub struct ChunkingConfig {
     #[pyo3(get)]
     #[serde(skip)]
     pub embedding: Option<EmbeddingConfig>,
+    /// Optional sparse (SPLADE) embedding configuration for chunk embeddings.
+    ///
+    /// When set, sparse vectors are generated for each chunk's content and attached
+    /// via `sparse_embedding`. Requires the `sparse-embeddings`
+    /// feature; without it, a warning is emitted and no sparse vectors are attached.
+    ///
+    /// Config-file only: like `RerankerConfig` and the local-ONNX branch of
+    /// `embedding`, this has no CLI flag and no environment variable. Only the secret/identity
+    /// fields of LLM-routed configs (model, API key, base URL) get that reach. ~keep
+    #[pyo3(get)]
+    #[serde(skip)]
+    pub sparse_embedding: Option<SparseEmbeddingConfig>,
+    /// Optional late-interaction (ColBERT) embedding configuration for chunk embeddings.
+    ///
+    /// When set, multi-vector embeddings are generated for each chunk's content and
+    /// attached via `late_interaction`. Requires the
+    /// `late-interaction` feature; without it, a warning is emitted and no
+    /// late-interaction vectors are attached.
+    ///
+    /// Config-file only, for the same reason as `sparse_embedding` above. ~keep
+    #[pyo3(get)]
+    #[serde(skip)]
+    pub late_interaction: Option<LateInteractionConfig>,
     /// Use a preset configuration (overrides individual settings if provided).
     #[pyo3(get)]
     pub preset: Option<String>,
@@ -2865,11 +3949,24 @@ pub struct ChunkingConfig {
     /// Enable `chunking-tiktoken` or `chunking-tokenizers` features for token-based sizing.
     #[pyo3(get)]
     pub sizing: ChunkSizing,
-    /// When `true` and `chunker_type` is `Markdown`, prepend the heading hierarchy
-    /// path (e.g. `"# Title > ## Section\n\n"`) to each chunk's content string.
+    /// **Deprecated and inert** (#1393): no longer prepends anything into
+    /// `content`. Setting this field has no observable effect on chunking output
+    /// any more.
     ///
-    /// This is useful for RAG pipelines where each chunk needs self-contained
-    /// context about its position in the document structure.
+    /// Previously, when `true` and `chunker_type` was `Markdown`, this prepended
+    /// the heading hierarchy path (e.g. `"# Title > ## Section\n\n"`) directly
+    /// into each chunk's `content` string. `content` now always equals the exact
+    /// `[byte_start, byte_end)` source span regardless of this flag — see
+    /// `BreadcrumbTarget` for
+    /// the full rationale. `heading_context`/`heading_path` on `ChunkMetadata` are
+    /// populated independently of this flag, so callers lose no information —
+    /// only the in-place mutation is gone.
+    ///
+    /// Call `render_heading_breadcrumb`
+    /// explicitly at index time instead, for the retrieval consumer that wants the
+    /// breadcrumb inline.
+    ///
+    /// Kept only so existing callers keep compiling.
     ///
     /// Default: `false`
     #[pyo3(get)]
@@ -2895,6 +3992,16 @@ pub struct ChunkingConfig {
     /// Default: `Split`
     #[pyo3(get)]
     pub table_chunking: TableChunkingMode,
+    /// **Deprecated and inert** (#1393): see
+    /// `BreadcrumbTarget` for
+    /// the full explanation. Neither variant has any effect on `content` any
+    /// more — call
+    /// `render_heading_breadcrumb`
+    /// explicitly at index time instead. Kept only for backward compatibility.
+    ///
+    /// Default: `Content`.
+    #[pyo3(get)]
+    pub breadcrumb_target: BreadcrumbTarget,
 }
 
 impl Default for ChunkingConfig {
@@ -2907,7 +4014,7 @@ impl Default for ChunkingConfig {
 impl ChunkingConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (max_chars=Self::default().max_characters, max_overlap=Self::default().overlap, trim=Self::default().trim, chunker_type=Self::default().chunker_type, sizing=None, prepend_heading_context=Self::default().prepend_heading_context, table_chunking=Self::default().table_chunking, embedding=None, preset=None, topic_threshold=None))]
+    #[pyo3(signature = (max_chars=Self::default().max_characters, max_overlap=Self::default().overlap, trim=Self::default().trim, chunker_type=Self::default().chunker_type, sizing=None, prepend_heading_context=Self::default().prepend_heading_context, table_chunking=Self::default().table_chunking, breadcrumb_target=Self::default().breadcrumb_target, embedding=None, sparse_embedding=None, late_interaction=None, preset=None, topic_threshold=None))]
     #[new]
     pub fn new(
         max_chars: usize,
@@ -2917,7 +4024,10 @@ impl ChunkingConfig {
         sizing: Option<ChunkSizing>,
         prepend_heading_context: bool,
         table_chunking: TableChunkingMode,
+        breadcrumb_target: BreadcrumbTarget,
         embedding: Option<EmbeddingConfig>,
+        sparse_embedding: Option<SparseEmbeddingConfig>,
+        late_interaction: Option<LateInteractionConfig>,
         preset: Option<String>,
         topic_threshold: Option<f32>,
     ) -> Self {
@@ -2927,11 +4037,14 @@ impl ChunkingConfig {
             trim,
             chunker_type,
             embedding,
+            sparse_embedding,
+            late_interaction,
             preset,
             sizing: sizing.unwrap_or_else(|| Self::default().sizing),
             prepend_heading_context,
             topic_threshold,
             table_chunking,
+            breadcrumb_target,
         }
     }
 
@@ -2951,7 +4064,7 @@ impl ChunkingConfig {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
 pub struct EmbeddingConfig {
-    /// The embedding model to use (defaults to "balanced" preset if not specified)
+    /// The embedding model to use (defaults to "gte-modernbert-base" preset if not specified)
     #[pyo3(get)]
     pub model: EmbeddingModelType,
     /// Whether to normalize embedding vectors (recommended for cosine similarity)
@@ -2960,13 +4073,20 @@ pub struct EmbeddingConfig {
     /// Batch size for embedding generation
     #[pyo3(get)]
     pub batch_size: usize,
-    /// Show model download progress
+    /// Show model download progress.
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). Covers both
+    /// local backends (ONNX and static/model2vec). A warm Hugging Face cache transfers nothing and
+    /// so reports nothing. Ignored by `EmbeddingModelType.Llm` and
+    /// `EmbeddingModelType.Plugin`, which download no model.
     #[pyo3(get)]
     pub show_download_progress: bool,
-    /// Custom cache directory for model files
+    /// Optional alternate Hugging Face cache root for model files.
     ///
-    /// Defaults to `~/.cache/xberg/embeddings/` if not specified.
-    /// Allows full customization of model download location.
+    /// When unset, hf-hub follows `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`,
+    /// `HF_HOME`, XDG, and platform defaults. Prefer those environment variables
+    /// when configuring the cache process-wide.
     #[pyo3(get)]
     pub cache_dir: Option<String>,
     /// Hardware acceleration for the embedding ONNX model.
@@ -2988,6 +4108,20 @@ pub struct EmbeddingConfig {
     /// hardware.
     #[pyo3(get)]
     pub max_embed_duration_secs: Option<u64>,
+    /// Maximum number of tokens fed to the tokenizer before truncation when
+    /// embedding a chunk with a local ONNX model (Preset/Custom).
+    ///
+    /// A chunk longer than this many tokens has its tail dropped before
+    /// inference, so only the prefix contributes to the stored vector. `None`
+    /// falls back to 512 (the historical default). The effective value is
+    /// always capped at the model's own `model_max_length`, so raising it past
+    /// what the model supports has no effect — set it to match a long-context
+    /// model (e.g. 8192 for Jina/Nomic) so long chunks embed in full.
+    ///
+    /// Ignored by the `Llm` and `Plugin` model types, which own their own
+    /// tokenization.
+    #[pyo3(get)]
+    pub max_sequence_length: Option<usize>,
 }
 
 impl Default for EmbeddingConfig {
@@ -3000,7 +4134,7 @@ impl Default for EmbeddingConfig {
 impl EmbeddingConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (model=Self::default().model, normalize=Self::default().normalize, batch_size=Self::default().batch_size, show_download_progress=Self::default().show_download_progress, cache_dir=None, acceleration=None, max_embed_duration_secs=None))]
+    #[pyo3(signature = (model=Self::default().model, normalize=Self::default().normalize, batch_size=Self::default().batch_size, show_download_progress=Self::default().show_download_progress, cache_dir=None, acceleration=None, max_embed_duration_secs=None, max_sequence_length=None))]
     #[new]
     pub fn new(
         model: EmbeddingModelType,
@@ -3010,6 +4144,7 @@ impl EmbeddingConfig {
         cache_dir: Option<String>,
         acceleration: Option<AccelerationConfig>,
         max_embed_duration_secs: Option<u64>,
+        max_sequence_length: Option<usize>,
     ) -> Self {
         Self {
             model,
@@ -3019,6 +4154,7 @@ impl EmbeddingConfig {
             cache_dir,
             acceleration,
             max_embed_duration_secs,
+            max_sequence_length,
         }
     }
 
@@ -3108,6 +4244,7 @@ impl RedactionConfig {
     #[allow(clippy::missing_errors_doc)]
     #[pyo3(signature = ())]
     pub fn validate(&self) -> PyResult<()> {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::RedactionConfig {
             categories: self.categories.clone().into_iter().map(Into::into).collect(),
 
@@ -3120,6 +4257,8 @@ impl RedactionConfig {
             custom_terms: self.custom_terms.clone().into_iter().map(Into::into).collect(),
 
             custom_patterns: self.custom_patterns.clone().into_iter().map(Into::into).collect(),
+
+            ..Default::default()
         };
         let result = core_self
             .validate()
@@ -3241,11 +4380,17 @@ pub struct RerankerConfig {
     #[pyo3(get)]
     pub batch_size: usize,
     /// Show model download progress (local ONNX path only).
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). A warm
+    /// Hugging Face cache transfers nothing and so reports nothing. Ignored by
+    /// `RerankerModelType.Llm` and `RerankerModelType.Plugin`, which download no model.
     #[pyo3(get)]
     pub show_download_progress: bool,
-    /// Custom cache directory for model files.
+    /// Optional alternate Hugging Face cache root for model files.
     ///
-    /// Defaults to `~/.cache/xberg/rerankers/` if not specified.
+    /// When unset, hf-hub follows the standard Hugging Face environment and
+    /// platform cache conventions.
     #[pyo3(get)]
     pub cache_dir: Option<String>,
     /// Hardware acceleration for the reranker ONNX model.
@@ -3315,6 +4460,89 @@ impl RerankerConfig {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
+pub struct SparseEmbeddingConfig {
+    /// The sparse-embedding model to use (defaults to the "opensearch-v3-distill" preset).
+    #[pyo3(get)]
+    pub model: SparseEmbeddingModelType,
+    /// Batch size for local ONNX inference.
+    ///
+    /// SPLADE emits a `[seq, vocab]` logit tensor per document, so memory scales
+    /// with batch size — keep this modest.
+    #[pyo3(get)]
+    pub batch_size: usize,
+    /// Maximum token sequence length for the tokenizer.
+    #[pyo3(get)]
+    pub max_length: usize,
+    /// Show model download progress (local ONNX path only).
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). A warm
+    /// Hugging Face cache transfers nothing and so reports nothing. Ignored by
+    /// `SparseEmbeddingModelType.Plugin`, which downloads no model.
+    #[pyo3(get)]
+    pub show_download_progress: bool,
+    /// Optional alternate Hugging Face cache root for model files.
+    ///
+    /// When unset, hf-hub follows the standard Hugging Face environment and
+    /// platform cache conventions.
+    #[pyo3(get)]
+    pub cache_dir: Option<String>,
+    /// Hardware acceleration for the sparse-embedding ONNX model.
+    #[pyo3(get)]
+    pub acceleration: Option<AccelerationConfig>,
+    /// Maximum wall-clock duration (in seconds) for a single embed call when
+    /// using `SparseEmbeddingModelType.Plugin`. `None` disables the timeout.
+    #[pyo3(get)]
+    pub max_embed_duration_secs: Option<u64>,
+}
+
+impl Default for SparseEmbeddingConfig {
+    fn default() -> Self {
+        <xberg::SparseEmbeddingConfig as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl SparseEmbeddingConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (model=Self::default().model, batch_size=Self::default().batch_size, max_length=Self::default().max_length, show_download_progress=Self::default().show_download_progress, cache_dir=None, acceleration=None, max_embed_duration_secs=None))]
+    #[new]
+    pub fn new(
+        model: SparseEmbeddingModelType,
+        batch_size: usize,
+        max_length: usize,
+        show_download_progress: bool,
+        cache_dir: Option<String>,
+        acceleration: Option<AccelerationConfig>,
+        max_embed_duration_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            model,
+            batch_size,
+            max_length,
+            show_download_progress,
+            cache_dir,
+            acceleration,
+            max_embed_duration_secs,
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    #[staticmethod]
+    #[pyo3(signature = ())]
+    pub fn default() -> SparseEmbeddingConfig {
+        xberg::SparseEmbeddingConfig::default().into()
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
 pub struct SummarizationConfig {
     /// Summarisation strategy.
     #[pyo3(get)]
@@ -3325,6 +4553,7 @@ pub struct SummarizationConfig {
     /// LLM configuration for the abstractive backend. Ignored when
     /// `strategy = Extractive`. Required when `strategy = Abstractive`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub llm: Option<LlmConfig>,
 }
 
@@ -3357,8 +4586,12 @@ impl SummarizationConfig {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
 pub struct TranscriptionConfig {
-    /// Master switch. When false the block is ignored and audio files fall back
-    /// to the normal "unsupported format" path.
+    /// Master switch. When `false`, the transcription pipeline is not run.
+    ///
+    /// The extractor is registered for audio/video MIME types whenever the `transcription`
+    /// feature is compiled in, independently of this flag, so an audio/video input with
+    /// `enabled = false` fails with an `XbergError.Transcription` explaining how to turn
+    /// transcription on — it does not fall through to another extractor.
     #[pyo3(get)]
     pub enabled: bool,
     /// Whisper model size to use.
@@ -3375,8 +4608,10 @@ pub struct TranscriptionConfig {
     pub language: Option<String>,
     /// Whether to request segment-level timestamps.
     ///
-    /// Accepted for forward compatibility. The current engine always uses
-    /// `<|notimestamps|>` and does not emit segment metadata yet.
+    /// When `true`, the decoder prompt omits `<|notimestamps|>` so the model emits
+    /// `<|x.xx|>` tokens, and each transcript segment becomes its own paragraph element
+    /// carrying `start_ms` / `end_ms` attributes. When `false` (default), all segment
+    /// text is joined into a single flat paragraph with no timing attributes.
     #[pyo3(get)]
     pub timestamps: bool,
     /// Hard safety limit on input duration (milliseconds).
@@ -3393,15 +4628,21 @@ pub struct TranscriptionConfig {
     pub max_bytes: Option<u64>,
     /// Wall-clock timeout for the entire transcription operation (ms).
     ///
-    /// Default: 10 minutes. Reserved for timeout enforcement; the current
-    /// extractor does not enforce this field yet.
+    /// Bounds audio decode, model resolution/download, and inference together. On expiry
+    /// the extraction fails with an `XbergError.Transcription`. `None` disables the bound
+    /// and lets the operation run unbounded (not recommended for untrusted input).
+    ///
+    /// Enforced on the async extraction path only; the size and duration caps
+    /// (`max_bytes`, `max_duration_ms`) are checked on every path.
+    ///
+    /// Default: 10 minutes.
     #[pyo3(get)]
     pub timeout_ms: Option<u64>,
-    /// Override the directory used for Whisper model cache.
+    /// Optional alternate Hugging Face cache root for Whisper models.
     ///
-    /// When `None`, uses the centralized resolver:
-    /// `XBERG_CACHE_DIR/whisper` or the platform default
-    /// (`~/.cache/xberg/whisper` on Linux, etc.).
+    /// When unset, hf-hub follows `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`,
+    /// `HF_HOME`, XDG, and platform defaults. Files remain in the standard
+    /// content-addressed snapshot layout and are not copied into an Xberg cache.
     #[pyo3(get)]
     pub model_cache_dir: Option<String>,
     /// Allow network access to download models from Hugging Face Hub.
@@ -3412,8 +4653,10 @@ pub struct TranscriptionConfig {
     pub allow_network: bool,
     /// Request SHA256 verification of downloaded model files.
     ///
-    /// Reserved for the checksum table follow-up. The current resolver logs a
-    /// warning and treats this as a no-op.
+    /// Defaults to `false` because the resolver downloads from mutable Hugging
+    /// Face refs unless callers pin and verify models out-of-band. Explicit
+    /// `true` requests are rejected by the model resolver until pinned checksum
+    /// metadata is available.
     #[pyo3(get)]
     pub verify_hash: bool,
 }
@@ -3484,6 +4727,7 @@ pub struct TranslationConfig {
     pub preserve_markup: bool,
     /// LLM configuration used for translation.
     #[pyo3(get)]
+    #[serde(skip)]
     pub llm: LlmConfig,
 }
 
@@ -3520,12 +4764,27 @@ pub struct TreeSitterConfig {
     /// Custom cache directory for downloaded grammars.
     ///
     /// When `None`, uses the default: `~/.cache/tree-sitter-language-pack/v{version}/libs/`.
+    ///
+    /// Consumed both by the CLI (`tree-sitter download --from-config`,
+    /// `cache warm`) and by `CodeExtractor` at
+    /// extraction time, so that a configured cache directory is honoured
+    /// wherever grammars are looked up or downloaded, not only during an
+    /// explicit CLI download.
     #[pyo3(get)]
     pub cache_dir: Option<String>,
     /// Languages to pre-download on init (e.g., `["python", "rust"]`).
+    ///
+    /// Consumed only by the CLI's `tree-sitter download --from-config` and
+    /// `cache warm` commands as a pre-download hint. Extraction itself does
+    /// not read this field: a given source file always processes with a
+    /// single, already auto-detected language, so there is nothing for a
+    /// language allowlist to gate at extraction time.
     #[pyo3(get)]
     pub languages: Option<Vec<String>>,
     /// Language groups to pre-download (e.g., `["web", "systems", "scripting"]`).
+    ///
+    /// Consumed only by the CLI's `tree-sitter download --from-config` and
+    /// `cache warm` commands, for the same reason as `languages` above.
     #[pyo3(get)]
     pub groups: Option<Vec<String>>,
     /// Processing options for code analysis.
@@ -3599,6 +4858,10 @@ pub struct TreeSitterProcessConfig {
     /// Include parse diagnostics. Default: false.
     #[pyo3(get)]
     pub diagnostics: bool,
+    /// Extract a hierarchical key/value data tree from data-format files
+    /// (JSON, YAML, TOML, XML, CSV, etc.). Default: false.
+    #[pyo3(get)]
+    pub data_extraction: bool,
     /// Maximum chunk size in bytes. `None` disables chunking.
     #[pyo3(get)]
     pub chunk_max_size: Option<usize>,
@@ -3617,7 +4880,7 @@ impl Default for TreeSitterProcessConfig {
 impl TreeSitterProcessConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (structure=Self::default().structure, imports=Self::default().imports, exports=Self::default().exports, comments=Self::default().comments, docstrings=Self::default().docstrings, symbols=Self::default().symbols, diagnostics=Self::default().diagnostics, content_mode=Self::default().content_mode, chunk_max_size=None))]
+    #[pyo3(signature = (structure=Self::default().structure, imports=Self::default().imports, exports=Self::default().exports, comments=Self::default().comments, docstrings=Self::default().docstrings, symbols=Self::default().symbols, diagnostics=Self::default().diagnostics, data_extraction=Self::default().data_extraction, content_mode=Self::default().content_mode, chunk_max_size=None))]
     #[new]
     pub fn new(
         structure: bool,
@@ -3627,6 +4890,7 @@ impl TreeSitterProcessConfig {
         docstrings: bool,
         symbols: bool,
         diagnostics: bool,
+        data_extraction: bool,
         content_mode: CodeContentMode,
         chunk_max_size: Option<usize>,
     ) -> Self {
@@ -3638,6 +4902,7 @@ impl TreeSitterProcessConfig {
             docstrings,
             symbols,
             diagnostics,
+            data_extraction,
             chunk_max_size,
             content_mode,
         }
@@ -3738,6 +5003,7 @@ impl ServerConfig {
 
     #[pyo3(signature = ())]
     pub fn listen_addr(&self) -> String {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::ServerConfig {
             host: self.host.clone(),
 
@@ -3748,12 +5014,15 @@ impl ServerConfig {
             max_request_body_bytes: self.max_request_body_bytes,
 
             max_multipart_field_bytes: self.max_multipart_field_bytes,
+
+            ..Default::default()
         };
         core_self.listen_addr()
     }
 
     #[pyo3(signature = ())]
     pub fn cors_allows_all(&self) -> bool {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::ServerConfig {
             host: self.host.clone(),
 
@@ -3764,12 +5033,15 @@ impl ServerConfig {
             max_request_body_bytes: self.max_request_body_bytes,
 
             max_multipart_field_bytes: self.max_multipart_field_bytes,
+
+            ..Default::default()
         };
         core_self.cors_allows_all()
     }
 
     #[pyo3(signature = (origin))]
     pub fn is_origin_allowed(&self, origin: String) -> bool {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::ServerConfig {
             host: self.host.clone(),
 
@@ -3780,12 +5052,15 @@ impl ServerConfig {
             max_request_body_bytes: self.max_request_body_bytes,
 
             max_multipart_field_bytes: self.max_multipart_field_bytes,
+
+            ..Default::default()
         };
         core_self.is_origin_allowed(&origin)
     }
 
     #[pyo3(signature = ())]
     pub fn max_request_body_mb(&self) -> usize {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::ServerConfig {
             host: self.host.clone(),
 
@@ -3796,12 +5071,15 @@ impl ServerConfig {
             max_request_body_bytes: self.max_request_body_bytes,
 
             max_multipart_field_bytes: self.max_multipart_field_bytes,
+
+            ..Default::default()
         };
         core_self.max_request_body_mb()
     }
 
     #[pyo3(signature = ())]
     pub fn max_multipart_field_mb(&self) -> usize {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::ServerConfig {
             host: self.host.clone(),
 
@@ -3812,6 +5090,8 @@ impl ServerConfig {
             max_request_body_bytes: self.max_request_body_bytes,
 
             max_multipart_field_bytes: self.max_multipart_field_bytes,
+
+            ..Default::default()
         };
         core_self.max_multipart_field_mb()
     }
@@ -3844,20 +5124,43 @@ pub struct StructuredDataResult {
     /// JSON paths of fields that were classified as text-bearing.
     #[pyo3(get)]
     pub text_fields: Vec<String>,
+    /// The parsed document as a canonical `serde_json.Value` tree, when the
+    /// source format could be represented as one. `None` only for TOML inputs
+    /// whose `toml.Value` fails to round-trip through `serde_json.Value`
+    /// (xberg-io/xberg#155): the extractor falls back to a raw code block in
+    /// that case.
+    #[pyo3(get)]
+    #[serde(default, deserialize_with = "alef_json_str_opt::deserialize")]
+    pub value: Option<String>,
+    /// Flattened `path: value` renderings for every leaf field, in traversal
+    /// order. Previously computed and discarded (xberg-io/xberg#166); now
+    /// surfaced so callers get a full-text view even when the structured
+    /// renderer only emits headings/lists for a subset of fields.
+    #[pyo3(get)]
+    pub flattened: Vec<String>,
 }
 
 #[pymethods]
 impl StructuredDataResult {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (content, format, metadata, text_fields))]
+    #[pyo3(signature = (content, format, metadata, text_fields, flattened, value=None))]
     #[new]
-    pub fn new(content: String, format: String, metadata: HashMap<String, String>, text_fields: Vec<String>) -> Self {
+    pub fn new(
+        content: String,
+        format: String,
+        metadata: HashMap<String, String>,
+        text_fields: Vec<String>,
+        flattened: Vec<String>,
+        value: Option<String>,
+    ) -> Self {
         Self {
             content,
             format,
             metadata,
             text_fields,
+            value,
+            flattened,
         }
     }
 
@@ -4380,6 +5683,16 @@ pub struct TokenReductionConfig {
     /// Group semantically similar sentences and emit only one per cluster.
     #[pyo3(get)]
     pub enable_semantic_clustering: bool,
+    /// Skip removal of words with "important" characteristics (all-caps
+    /// acronyms, words containing digits, mixed-case identifiers, very long
+    /// words) during the `Aggressive`/`Maximum` common-word removal pass.
+    ///
+    /// `true` (the default) protects those words even when they would
+    /// otherwise be dropped as low-value filler; `false` lets the frequency/
+    /// length heuristics apply uniformly to every word, including ones that
+    /// look like acronyms or technical terms (#269).
+    #[pyo3(get)]
+    pub preserve_important_words: bool,
 }
 
 impl Default for TokenReductionConfig {
@@ -4392,7 +5705,7 @@ impl Default for TokenReductionConfig {
 impl TokenReductionConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (level=Self::default().level, preserve_markdown=Self::default().preserve_markdown, preserve_code=Self::default().preserve_code, semantic_threshold=Self::default().semantic_threshold, enable_parallel=Self::default().enable_parallel, use_simd=Self::default().use_simd, preserve_patterns=Self::default().preserve_patterns, enable_semantic_clustering=Self::default().enable_semantic_clustering, language_hint=None, custom_stopwords=None, target_reduction=None))]
+    #[pyo3(signature = (level=Self::default().level, preserve_markdown=Self::default().preserve_markdown, preserve_code=Self::default().preserve_code, semantic_threshold=Self::default().semantic_threshold, enable_parallel=Self::default().enable_parallel, use_simd=Self::default().use_simd, preserve_patterns=Self::default().preserve_patterns, enable_semantic_clustering=Self::default().enable_semantic_clustering, preserve_important_words=Self::default().preserve_important_words, language_hint=None, custom_stopwords=None, target_reduction=None))]
     #[new]
     pub fn new(
         level: ReductionLevel,
@@ -4403,6 +5716,7 @@ impl TokenReductionConfig {
         use_simd: bool,
         preserve_patterns: Vec<String>,
         enable_semantic_clustering: bool,
+        preserve_important_words: bool,
         language_hint: Option<String>,
         custom_stopwords: Option<HashMap<String, Vec<String>>>,
         target_reduction: Option<f32>,
@@ -4419,6 +5733,7 @@ impl TokenReductionConfig {
             preserve_patterns,
             target_reduction,
             enable_semantic_clustering,
+            preserve_important_words,
         }
     }
 
@@ -4526,8 +5841,11 @@ impl FootnoteConfig {
 
     #[pyo3(signature = (enabled))]
     pub fn with_parse_citations(&self, enabled: bool) -> FootnoteConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::FootnoteConfig {
             parse_citations: self.parse_citations,
+
+            ..Default::default()
         };
         core_self.with_parse_citations(enabled).into()
     }
@@ -4655,25 +5973,62 @@ pub struct PdfAnnotation {
     /// Bounding box of the annotation on the page.
     #[pyo3(get)]
     pub bounding_box: Option<BoundingBox>,
+    /// Author/creator of the annotation (PDF `/T` entry).
+    #[pyo3(get)]
+    pub author: Option<String>,
+    /// Last modification date of the annotation (PDF `/M` entry), as a raw
+    /// PDF date string (e.g. `"D:20240115120000Z"`).
+    #[pyo3(get)]
+    pub modified: Option<String>,
+    /// Annotation colour (PDF `/C` entry), normalised to a CSS-compatible
+    /// `#rrggbb` hex string. Gray and CMYK colour spaces are converted to RGB.
+    #[pyo3(get)]
+    pub color: Option<String>,
+    /// Subject of the annotation (PDF `/Subj` entry).
+    #[pyo3(get)]
+    pub subject: Option<String>,
+    /// Per-line bounding boxes derived from the annotation's `/QuadPoints`
+    /// entry. Present for text markup annotations (Highlight, Underline,
+    /// StrikeOut, Squiggly), one box per marked line/run of text.
+    #[pyo3(get)]
+    pub quad_points: Option<Vec<BoundingBox>>,
+    /// The document text covered by `Self.quad_points`, recovered from the
+    /// page content underneath the marked-up region. Populated for
+    /// Highlight, Underline, StrikeOut, and Squiggly annotations when the
+    /// underlying text could be recovered.
+    #[pyo3(get)]
+    pub marked_text: Option<String>,
 }
 
 #[pymethods]
 impl PdfAnnotation {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (annotation_type, page_number, content=None, bounding_box=None))]
+    #[pyo3(signature = (annotation_type, page_number, content=None, bounding_box=None, author=None, modified=None, color=None, subject=None, quad_points=None, marked_text=None))]
     #[new]
     pub fn new(
         annotation_type: PdfAnnotationType,
         page_number: u32,
         content: Option<String>,
         bounding_box: Option<BoundingBox>,
+        author: Option<String>,
+        modified: Option<String>,
+        color: Option<String>,
+        subject: Option<String>,
+        quad_points: Option<Vec<BoundingBox>>,
+        marked_text: Option<String>,
     ) -> Self {
         Self {
             annotation_type,
             content,
             page_number,
             bounding_box,
+            author,
+            modified,
+            color,
+            subject,
+            quad_points,
+            marked_text,
         }
     }
 
@@ -5031,6 +6386,7 @@ impl DocumentStructure {
 
     #[pyo3(signature = ())]
     pub fn finalize_node_types(&self) -> Self {
+        #[allow(clippy::needless_update)]
         let mut core_self = xberg::DocumentStructure {
             nodes: self.nodes.clone().into_iter().map(Into::into).collect(),
 
@@ -5039,6 +6395,8 @@ impl DocumentStructure {
             relationships: self.relationships.clone().into_iter().map(Into::into).collect(),
 
             node_types: self.node_types.clone(),
+
+            ..Default::default()
         };
         core_self.finalize_node_types();
         core_self.into()
@@ -5046,6 +6404,7 @@ impl DocumentStructure {
 
     #[pyo3(signature = ())]
     pub fn is_empty(&self) -> bool {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::DocumentStructure {
             nodes: self.nodes.clone().into_iter().map(Into::into).collect(),
 
@@ -5054,6 +6413,8 @@ impl DocumentStructure {
             relationships: self.relationships.clone().into_iter().map(Into::into).collect(),
 
             node_types: self.node_types.clone(),
+
+            ..Default::default()
         };
         core_self.is_empty()
     }
@@ -5104,6 +6465,18 @@ impl DocumentRelationship {
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
 pub struct DocumentNode {
+    /// Deterministic identifier (hash of node type + text + page + position).
+    ///
+    /// Stable and unique within a single extraction response: every internal
+    /// construction path threads the node's position (its index in
+    /// `DocumentStructure.nodes`) into the hash, so identical
+    /// `(node_type, text, page)` tuples at different positions never collide.
+    /// Always serialised — `ChunkMetadata.node_ids` references it to join
+    /// chunks back to the nodes they were derived from.
+    /// `#[serde(default)]` covers the missing-field case on inbound JSON
+    /// (e.g. documents serialised before this field existed).
+    #[pyo3(get)]
+    pub id: String,
     /// Node content — tagged enum, type-specific data only.
     #[pyo3(get)]
     pub content: NodeContent,
@@ -5148,9 +6521,10 @@ pub struct DocumentNode {
 impl DocumentNode {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (content, children, content_layer, annotations, parent=None, page=None, page_end=None, bbox=None, attributes=None))]
+    #[pyo3(signature = (id, content, children, content_layer, annotations, parent=None, page=None, page_end=None, bbox=None, attributes=None))]
     #[new]
     pub fn new(
+        id: String,
         content: NodeContent,
         children: Vec<u32>,
         content_layer: ContentLayer,
@@ -5162,6 +6536,7 @@ impl DocumentNode {
         attributes: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
+            id,
             content,
             parent,
             children,
@@ -5351,6 +6726,99 @@ impl Entity {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
+pub struct DocumentCounts {
+    /// Total pages in the source document (`0` when not page-addressable).
+    #[pyo3(get)]
+    pub pages: usize,
+    /// Tables detected in the document.
+    #[pyo3(get)]
+    pub tables: usize,
+    /// Images detected in the document.
+    #[pyo3(get)]
+    pub images: usize,
+}
+
+impl Default for DocumentCounts {
+    fn default() -> Self {
+        <xberg::DocumentCounts as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl DocumentCounts {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (pages=Self::default().pages, tables=Self::default().tables, images=Self::default().images))]
+    #[new]
+    pub fn new(pages: usize, tables: usize, images: usize) -> Self {
+        Self { pages, tables, images }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct LanguageConfidence {
+    /// ISO 639-3 language code, matching the corresponding entry in `detected_languages`.
+    #[pyo3(get)]
+    pub language: String,
+    /// Confidence for this language, in `[0.0, 1.0]`.
+    ///
+    /// In single-language mode this is whatlang's `Info.confidence()` for the whole
+    /// document. In multi-language mode this is the average whatlang confidence across
+    /// the document's 200-character chunks that were classified as this language.
+    #[pyo3(get)]
+    pub confidence: f64,
+    /// Share of the document's analyzed content classified as this language, in `[0.0, 1.0]`.
+    ///
+    /// In single-language mode this is always `1.0`. In multi-language mode this is the
+    /// fraction of 200-character chunks classified as this language (chunks that did not
+    /// meet `min_confidence` for any language are excluded from the count but still count
+    /// toward the denominator).
+    #[pyo3(get)]
+    pub proportion: f64,
+    /// Writing system whatlang detected for this language (e.g. `"Latin"`, `"Cyrillic"`).
+    #[pyo3(get)]
+    pub script: String,
+    /// Whether this detection is considered reliable.
+    ///
+    /// In single-language mode this is whatlang's own `Info.is_reliable()` (confidence
+    /// above whatlang's internal 0.9 threshold). In multi-language mode this is the
+    /// chunk-averaged `confidence` above that same 0.9 threshold, since whatlang's
+    /// `is_reliable()` only applies to a single detection.
+    #[pyo3(get)]
+    pub reliable: bool,
+}
+
+#[pymethods]
+impl LanguageConfidence {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (language, confidence, proportion, script, reliable))]
+    #[new]
+    pub fn new(language: String, confidence: f64, proportion: f64, script: String, reliable: bool) -> Self {
+        Self {
+            language,
+            confidence,
+            proportion,
+            script,
+            reliable,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+#[allow(clippy::similar_names)]
 pub struct ExtractedDocument {
     /// Plain-text representation of the extracted document content.
     #[pyo3(get)]
@@ -5371,9 +6839,23 @@ pub struct ExtractedDocument {
     /// Tables extracted from the document, each with structured cell data.
     #[pyo3(get)]
     pub tables: Vec<Table>,
+    /// Cheap structural counts (pages, tables, images).
+    ///
+    /// Always populated by the extraction pipeline, even when the `pages` /
+    /// `images` collections are `None`. See `DocumentCounts`.
+    #[pyo3(get)]
+    pub counts: DocumentCounts,
     /// ISO 639-1 language codes detected in the document content.
     #[pyo3(get)]
     pub detected_languages: Option<Vec<String>>,
+    /// Structured per-language detection results: confidence, document share, script,
+    /// and reliability, alongside the ISO-code-only `detected_languages` (#261).
+    ///
+    /// One entry per language in `detected_languages`, in the same order. `None` under
+    /// the same conditions as `detected_languages`: detection disabled, empty input
+    /// text, or no language met the configured `min_confidence`.
+    #[pyo3(get)]
+    pub detected_language_confidences: Option<Vec<LanguageConfidence>>,
     /// Text chunks when chunking is enabled.
     ///
     /// When chunking configuration is provided, the content is split into
@@ -5588,13 +7070,6 @@ pub struct ExtractedDocument {
     /// enabled (default) and the document is a fillable form. Empty otherwise.
     #[pyo3(get)]
     pub form_fields: Vec<PdfFormField>,
-    /// Pre-rendered content in the requested output format.
-    ///
-    /// Populated during `derive_extraction_result` before tree derivation consumes
-    /// element data. `apply_output_format` swaps this into `content` at the end
-    /// of the pipeline, after post-processors have operated on plain text.
-    #[pyo3(get)]
-    pub formatted_content: Option<String>,
 }
 
 impl Default for ExtractedDocument {
@@ -5607,18 +7082,20 @@ impl Default for ExtractedDocument {
 impl ExtractedDocument {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (content=Self::default().content, mime_type=Self::default().mime_type, metadata=None, tables=Self::default().tables, processing_warnings=Self::default().processing_warnings, formulas=Self::default().formulas, form_fields=Self::default().form_fields, extraction_method=None, detected_languages=None, chunks=None, images=None, pages=None, elements=None, djot_content=None, ocr_elements=None, document=None, extracted_keywords=None, quality_score=None, annotations=None, children=None, uris=None, revisions=None, structured_output=None, code_intelligence=None, llm_usage=None, entities=None, summary=None, extraction_confidence=None, translation=None, page_classifications=None, redaction_report=None, formatted_content=None))]
+    #[pyo3(signature = (content=Self::default().content, mime_type=Self::default().mime_type, metadata=None, tables=Self::default().tables, counts=None, processing_warnings=Self::default().processing_warnings, formulas=Self::default().formulas, form_fields=Self::default().form_fields, extraction_method=None, detected_languages=None, detected_language_confidences=None, chunks=None, images=None, pages=None, elements=None, djot_content=None, ocr_elements=None, document=None, extracted_keywords=None, quality_score=None, annotations=None, children=None, uris=None, revisions=None, structured_output=None, code_intelligence=None, llm_usage=None, entities=None, summary=None, extraction_confidence=None, translation=None, page_classifications=None, redaction_report=None))]
     #[new]
     pub fn new(
         content: String,
         mime_type: String,
         metadata: Option<Metadata>,
         tables: Vec<Table>,
+        counts: Option<DocumentCounts>,
         processing_warnings: Vec<ProcessingWarning>,
         formulas: Vec<Formula>,
         form_fields: Vec<PdfFormField>,
         extraction_method: Option<ExtractionMethod>,
         detected_languages: Option<Vec<String>>,
+        detected_language_confidences: Option<Vec<LanguageConfidence>>,
         chunks: Option<Vec<Chunk>>,
         images: Option<Vec<ExtractedImage>>,
         pages: Option<Vec<PageContent>>,
@@ -5641,7 +7118,6 @@ impl ExtractedDocument {
         translation: Option<Translation>,
         page_classifications: Option<Vec<PageClassification>>,
         redaction_report: Option<RedactionReport>,
-        formatted_content: Option<String>,
     ) -> Self {
         Self {
             content,
@@ -5649,7 +7125,9 @@ impl ExtractedDocument {
             metadata: metadata.unwrap_or_else(|| Self::default().metadata),
             extraction_method,
             tables,
+            counts: counts.unwrap_or_else(|| Self::default().counts),
             detected_languages,
+            detected_language_confidences,
             chunks,
             images,
             pages,
@@ -5675,7 +7153,6 @@ impl ExtractedDocument {
             redaction_report,
             formulas,
             form_fields,
-            formatted_content,
         }
     }
 
@@ -5831,6 +7308,29 @@ pub struct Chunk {
     /// The dimensionality depends on the chosen embedding model.
     #[pyo3(get)]
     pub embedding: Option<Vec<f32>>,
+    /// Optional sparse (SPLADE) learned embedding for this chunk.
+    ///
+    /// Only populated when sparse-embedding generation is configured for chunking.
+    /// `None` otherwise, including on builds without the `sparse-embeddings` feature.
+    ///
+    /// Uses the crate-root `SparseEmbedding` alias rather than
+    /// `crate.sparse_embeddings.SparseEmbedding` directly: the `sparse_embeddings`
+    /// module itself only compiles under `sparse-embeddings`/`sparse-embedding-presets`,
+    /// while the crate-root alias is always defined (a field-compatible stub on builds
+    /// without either feature), so this field — and `Chunk` itself — compiles on every
+    /// feature combination, including the crate's default features.
+    #[pyo3(get)]
+    pub sparse_embedding: Option<SparseEmbedding>,
+    /// Optional ColBERT-style multi-vector (late-interaction) embedding for this chunk.
+    ///
+    /// Only populated when late-interaction embedding generation is configured for
+    /// chunking. `None` otherwise, including on builds without the `late-interaction`
+    /// feature.
+    ///
+    /// Uses the crate-root `MultiVectorEmbedding` alias for the same reason
+    /// `sparse_embedding` uses `SparseEmbedding` — see that field's docs.
+    #[pyo3(get)]
+    pub late_interaction: Option<MultiVectorEmbedding>,
     /// Metadata about this chunk's position and properties.
     #[pyo3(get)]
     pub metadata: ChunkMetadata,
@@ -5840,13 +7340,22 @@ pub struct Chunk {
 impl Chunk {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (content, chunk_type, metadata, embedding=None))]
+    #[pyo3(signature = (content, chunk_type, metadata, embedding=None, sparse_embedding=None, late_interaction=None))]
     #[new]
-    pub fn new(content: String, chunk_type: ChunkType, metadata: ChunkMetadata, embedding: Option<Vec<f32>>) -> Self {
+    pub fn new(
+        content: String,
+        chunk_type: ChunkType,
+        metadata: ChunkMetadata,
+        embedding: Option<Vec<f32>>,
+        sparse_embedding: Option<SparseEmbedding>,
+        late_interaction: Option<MultiVectorEmbedding>,
+    ) -> Self {
         Self {
             content,
             chunk_type,
             embedding,
+            sparse_embedding,
+            late_interaction,
             metadata,
         }
     }
@@ -5960,13 +7469,43 @@ pub struct ChunkMetadata {
     /// Empty when image extraction is disabled or the chunk spans no pages with images.
     #[pyo3(get)]
     pub image_indices: Vec<u32>,
+    /// Ids of the `DocumentNode`s
+    /// this chunk was derived from.
+    ///
+    /// Joins a chunk back to the structured document tree via
+    /// `DocumentNode.id`.
+    /// Empty until the node-to-rendered-offset mapping needed to compute the
+    /// intersection is implemented (tracked under #1294/#1295); this field is
+    /// the wire-format foundation for that follow-up.
+    #[pyo3(get)]
+    pub node_ids: Vec<String>,
+    /// Per-page bounding-box spans this chunk covers, for viewer highlighting (#1295).
+    ///
+    /// One entry per page the chunk overlaps, in page order — the first and last entries'
+    /// `page` fields equal `first_page`/`last_page`.
+    /// Populated whenever page-boundary provenance is available (the same condition under
+    /// which `first_page`/`last_page` are populated); each entry's `bbox` is additionally
+    /// populated when the document's structured node tree (`ExtractedDocument.document`) is
+    /// available, as the union of that page's body-layer node bounding boxes found within this
+    /// chunk. Empty when page-boundary provenance is unavailable (mirrors `first_page`/
+    /// `last_page` being `None`).
+    #[pyo3(get)]
+    pub page_spans: Vec<PageSpan>,
+    /// Multi-label classification result for this chunk.
+    ///
+    /// Populated by the chunk-classification post-processor when
+    /// `ExtractionConfig.chunk_classification`
+    /// is set. A chunk may match zero, one, or many of the configured label
+    /// definitions. Empty when chunk classification was not configured.
+    #[pyo3(get)]
+    pub classifications: Vec<ClassificationLabel>,
 }
 
 #[pymethods]
 impl ChunkMetadata {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (byte_start, byte_end, chunk_index, total_chunks, heading_path, image_indices, token_count=None, first_page=None, last_page=None, heading_context=None))]
+    #[pyo3(signature = (byte_start, byte_end, chunk_index, total_chunks, heading_path, image_indices, node_ids, page_spans, classifications, token_count=None, first_page=None, last_page=None, heading_context=None))]
     #[new]
     pub fn new(
         byte_start: usize,
@@ -5975,6 +7514,9 @@ impl ChunkMetadata {
         total_chunks: usize,
         heading_path: Vec<String>,
         image_indices: Vec<u32>,
+        node_ids: Vec<String>,
+        page_spans: Vec<PageSpan>,
+        classifications: Vec<ClassificationLabel>,
         token_count: Option<usize>,
         first_page: Option<u32>,
         last_page: Option<u32>,
@@ -5991,7 +7533,37 @@ impl ChunkMetadata {
             heading_context,
             heading_path,
             image_indices,
+            node_ids,
+            page_spans,
+            classifications,
         }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct PageSpan {
+    /// Page number (1-indexed).
+    #[pyo3(get)]
+    pub page: u32,
+    /// Bounding box on this page, if known.
+    #[pyo3(get)]
+    pub bbox: Option<BoundingBox>,
+}
+
+#[pymethods]
+impl PageSpan {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (page, bbox=None))]
+    #[new]
+    pub fn new(page: u32, bbox: Option<BoundingBox>) -> Self {
+        Self { page, bbox }
     }
 
     #[staticmethod]
@@ -6965,9 +8537,13 @@ impl ImagePreprocessingConfig {
 #[pyclass(frozen, from_py_object)]
 #[allow(clippy::similar_names)]
 pub struct TesseractConfig {
-    /// Language code(s) for OCR recognition.
-    /// Accepts either a single language code ("eng") or a list (["eng", "deu"]).
-    /// For Tesseract backend, languages are joined with "+".
+    /// Language code(s) for OCR recognition. For Tesseract, languages are joined with "+".
+    ///
+    /// A list is the canonical form and the only form accepted by the binding
+    /// object APIs (Python, Node, PHP, WASM, etc.): `["eng", "deu"]`. When
+    /// deserializing from a config file, JSON body, or the REST/MCP API, a
+    /// single string is also accepted, either as one code ("eng") or
+    /// "+"-joined ("eng+deu").
     #[pyo3(get)]
     pub language: Vec<String>,
     /// Page Segmentation Mode (0-13).
@@ -7229,6 +8805,188 @@ impl Formula {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
+pub struct CodeMetadata {
+    /// Structural code chunks (function/class/module boundaries).
+    #[pyo3(get)]
+    pub chunks: Vec<CodeChunkInfo>,
+    /// Hierarchical key/value data tree extracted from data-format source
+    /// (JSON, YAML, TOML, XML, CSV, etc.), when data extraction was enabled.
+    #[pyo3(get)]
+    pub data: Option<CodeDataNode>,
+}
+
+impl Default for CodeMetadata {
+    fn default() -> Self {
+        <xberg::CodeMetadata as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl CodeMetadata {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (chunks=Self::default().chunks, data=None))]
+    #[new]
+    pub fn new(chunks: Vec<CodeChunkInfo>, data: Option<CodeDataNode>) -> Self {
+        Self { chunks, data }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct CodeChunkInfo {
+    /// The raw source text of this chunk.
+    #[pyo3(get)]
+    pub text: String,
+    /// Hierarchical path of enclosing structural items (e.g. `["MyClass", "my_method"]`).
+    #[pyo3(get)]
+    pub context_path: Vec<String>,
+    /// Tree-sitter node kinds that appear at the top level of this chunk (e.g.
+    /// `"function_definition"`, `"class_definition"`).
+    #[pyo3(get)]
+    pub node_types: Vec<String>,
+    /// Inclusive start byte offset of this chunk in the original source.
+    #[pyo3(get)]
+    pub byte_start: usize,
+    /// Exclusive end byte offset of this chunk in the original source.
+    #[pyo3(get)]
+    pub byte_end: usize,
+}
+
+#[pymethods]
+impl CodeChunkInfo {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (text, context_path, node_types, byte_start, byte_end))]
+    #[new]
+    pub fn new(
+        text: String,
+        context_path: Vec<String>,
+        node_types: Vec<String>,
+        byte_start: usize,
+        byte_end: usize,
+    ) -> Self {
+        Self {
+            text,
+            context_path,
+            node_types,
+            byte_start,
+            byte_end,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct CodeDataAttribute {
+    /// Attribute name (e.g. `"class"`, `"href"`).
+    #[pyo3(get)]
+    pub name: String,
+    /// Attribute value as a raw string (quotes stripped).
+    #[pyo3(get)]
+    pub value: String,
+    /// Inclusive start byte offset of the `name="value"` attribute token.
+    #[pyo3(get)]
+    pub byte_start: usize,
+    /// Exclusive end byte offset of the `name="value"` attribute token.
+    #[pyo3(get)]
+    pub byte_end: usize,
+}
+
+#[pymethods]
+impl CodeDataAttribute {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (name, value, byte_start, byte_end))]
+    #[new]
+    pub fn new(name: String, value: String, byte_start: usize, byte_end: usize) -> Self {
+        Self {
+            name,
+            value,
+            byte_start,
+            byte_end,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct CodeDataNode {
+    /// Whether this node is a key/value pair, XML element, or sequence item.
+    #[pyo3(get)]
+    pub kind: CodeDataNodeKind,
+    /// Key, attribute name, tag name, or positional index (`"0"`, `"1"`, …).
+    /// `None` at the document root.
+    #[pyo3(get)]
+    pub key: Option<String>,
+    /// Leaf scalar value, if any. `None` for containers (objects, arrays, XML
+    /// elements with child elements).
+    #[pyo3(get)]
+    pub value: Option<String>,
+    /// Attributes on element-shape nodes (XML `STag` attributes). Empty for all
+    /// other kinds.
+    #[pyo3(get)]
+    pub attributes: Vec<CodeDataAttribute>,
+    /// Children for nested containers and XML element bodies.
+    #[pyo3(get)]
+    pub children: Vec<CodeDataNode>,
+    /// Inclusive start byte offset of this node in the original source.
+    #[pyo3(get)]
+    pub byte_start: usize,
+    /// Exclusive end byte offset of this node in the original source.
+    #[pyo3(get)]
+    pub byte_end: usize,
+}
+
+#[pymethods]
+impl CodeDataNode {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (kind, attributes, children, byte_start, byte_end, key=None, value=None))]
+    #[new]
+    pub fn new(
+        kind: CodeDataNodeKind,
+        attributes: Vec<CodeDataAttribute>,
+        children: Vec<CodeDataNode>,
+        byte_start: usize,
+        byte_end: usize,
+        key: Option<String>,
+        value: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            key,
+            value,
+            attributes,
+            children,
+            byte_start,
+            byte_end,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
 #[allow(clippy::similar_names)]
 pub struct Metadata {
     /// Document title
@@ -7380,6 +9138,7 @@ impl Metadata {
 
     #[pyo3(signature = ())]
     pub fn is_empty(&self) -> bool {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::Metadata {
             title: self.title.clone(),
 
@@ -7434,6 +9193,8 @@ impl Metadata {
                     )
                 })
                 .collect(),
+
+            ..Default::default()
         };
         core_self.is_empty()
     }
@@ -9440,6 +11201,37 @@ impl CellChange {
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
+pub struct PropertyChange {
+    /// Property name, such as `"bold"`, `"italic"`, `"font_size"`, or `"font_color"`.
+    #[pyo3(get)]
+    pub name: String,
+    /// Value before the change, when available.
+    #[pyo3(get, name = "from")]
+    #[serde(rename = "from")]
+    pub from_: Option<String>,
+    /// Value after the change, when available.
+    #[pyo3(get)]
+    pub to: Option<String>,
+}
+
+#[pymethods]
+impl PropertyChange {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (name, from_=None, to=None))]
+    #[new]
+    pub fn new(name: String, from_: Option<String>, to: Option<String>) -> Self {
+        Self { name, from_, to }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
 #[allow(clippy::similar_names)]
 pub struct DocumentRevision {
     /// Format-specific revision identifier.
@@ -9515,6 +11307,9 @@ pub struct RevisionDelta {
     /// Cell-level table changes for this revision.
     #[pyo3(get)]
     pub table_changes: Vec<CellChange>,
+    /// Formatting or metadata property changes for this revision.
+    #[pyo3(get)]
+    pub property_changes: Vec<PropertyChange>,
 }
 
 impl Default for RevisionDelta {
@@ -9527,10 +11322,14 @@ impl Default for RevisionDelta {
 impl RevisionDelta {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (content=Self::default().content, table_changes=Self::default().table_changes))]
+    #[pyo3(signature = (content=Self::default().content, table_changes=Self::default().table_changes, property_changes=Self::default().property_changes))]
     #[new]
-    pub fn new(content: Vec<DiffLine>, table_changes: Vec<CellChange>) -> Self {
-        Self { content, table_changes }
+    pub fn new(content: Vec<DiffLine>, table_changes: Vec<CellChange>, property_changes: Vec<PropertyChange>) -> Self {
+        Self {
+            content,
+            table_changes,
+            property_changes,
+        }
     }
 
     #[staticmethod]
@@ -9589,6 +11388,34 @@ pub struct Table {
     /// Only populated for PDF-extracted tables when position data is available.
     #[pyo3(get)]
     pub bounding_box: Option<BoundingBox>,
+    /// Stable identifier shared by every `tables[]` entry that represents a
+    /// fragment of the same physical table.
+    ///
+    /// Assigned deterministically by the extraction pipeline (e.g. a
+    /// sequential `"table-N"` in document order); never derived from
+    /// randomness or wall-clock time, so the same input document always
+    /// produces the same ids. Consumers can use it to reconcile the markdown
+    /// blocks in `content` / `pages[].content` / `chunks[].content` with the
+    /// structured entries in `tables[]`. `None` when the extractor did not
+    /// assign one.
+    ///
+    /// Today, same-page fragments of one physical table are already merged
+    /// into a single `tables[]` entry before ids are assigned (see PDF table
+    /// stitching), so in practice `table_id` is unique per entry rather than
+    /// shared across several. A table split across a page boundary is
+    /// intentionally *not* linked — its per-page pieces get separate ids.
+    /// Sharing one id across page-boundary fragments is a known possible
+    /// future extension, not implemented yet.
+    #[pyo3(get)]
+    pub table_id: Option<String>,
+    /// Header cells for this fragment, i.e. the first row of `cells`.
+    ///
+    /// Populated even when this fragment's own header row was merged away or
+    /// physically lives in a sibling fragment (see `table_id`), so a single
+    /// fragment is interpretable in isolation. `None` when no header row
+    /// could be determined.
+    #[pyo3(get)]
+    pub columns: Option<Vec<String>>,
 }
 
 impl Default for Table {
@@ -9601,14 +11428,23 @@ impl Default for Table {
 impl Table {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (cells=Self::default().cells, markdown=Self::default().markdown, page_number=Self::default().page_number, bounding_box=None))]
+    #[pyo3(signature = (cells=Self::default().cells, markdown=Self::default().markdown, page_number=Self::default().page_number, bounding_box=None, table_id=None, columns=None))]
     #[new]
-    pub fn new(cells: Vec<Vec<String>>, markdown: String, page_number: u32, bounding_box: Option<BoundingBox>) -> Self {
+    pub fn new(
+        cells: Vec<Vec<String>>,
+        markdown: String,
+        page_number: u32,
+        bounding_box: Option<BoundingBox>,
+        table_id: Option<String>,
+        columns: Option<Vec<String>>,
+    ) -> Self {
         Self {
             cells,
             markdown,
             page_number,
             bounding_box,
+            table_id,
+            columns,
         }
     }
 
@@ -10068,6 +11904,219 @@ impl RerankedDocument {
     }
 }
 
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct SparseEmbedding {
+    /// Vocabulary token ids with non-zero weight, ascending.
+    #[pyo3(get)]
+    pub indices: Vec<u32>,
+    /// Weights parallel to `SparseEmbedding.indices`.
+    #[pyo3(get)]
+    pub values: Vec<f32>,
+}
+
+#[pymethods]
+impl SparseEmbedding {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (indices, values))]
+    #[new]
+    pub fn new(indices: Vec<u32>, values: Vec<f32>) -> Self {
+        Self { indices, values }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct SparseEmbeddingPreset {
+    /// Stable preset name referenced from config.
+    #[pyo3(get)]
+    pub name: String,
+    /// HuggingFace repository hosting the ONNX model.
+    #[pyo3(get)]
+    pub model_repo: String,
+    /// Path to the ONNX file within the repo.
+    #[pyo3(get)]
+    pub model_file: String,
+    /// Sibling files that must be downloaded alongside `model_file`.
+    #[pyo3(get)]
+    pub additional_files: Vec<String>,
+    /// Maximum token sequence length.
+    #[pyo3(get)]
+    pub max_length: usize,
+    /// Human-readable description.
+    #[pyo3(get)]
+    pub description: String,
+}
+
+#[pymethods]
+impl SparseEmbeddingPreset {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (name, model_repo, model_file, additional_files, max_length, description))]
+    #[new]
+    pub fn new(
+        name: String,
+        model_repo: String,
+        model_file: String,
+        additional_files: Vec<String>,
+        max_length: usize,
+        description: String,
+    ) -> Self {
+        Self {
+            name,
+            model_repo,
+            model_file,
+            additional_files,
+            max_length,
+            description,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct MultiVectorEmbedding {
+    /// Number of attention-live token rows (padding rows are dropped, not
+    /// zeroed — see `engine.normalize_tokens`).
+    #[pyo3(get)]
+    pub num_tokens: u32,
+    /// Dimensionality of each per-token vector.
+    #[pyo3(get)]
+    pub dim: u32,
+    /// Flat row-major buffer, length `num_tokens * dim`.
+    #[pyo3(get)]
+    pub data: Vec<f32>,
+}
+
+#[pymethods]
+impl MultiVectorEmbedding {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (num_tokens, dim, data))]
+    #[new]
+    pub fn new(num_tokens: u32, dim: u32, data: Vec<f32>) -> Self {
+        Self { num_tokens, dim, data }
+    }
+
+    #[pyo3(signature = ())]
+    pub fn is_well_formed(&self) -> bool {
+        let core_self = xberg::MultiVectorEmbedding {
+            num_tokens: self.num_tokens,
+
+            dim: self.dim,
+
+            data: self.data.clone(),
+        };
+        core_self.is_well_formed()
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct LateInteractionPreset {
+    /// Stable preset name referenced from config.
+    #[pyo3(get)]
+    pub name: String,
+    /// HuggingFace repository hosting the ONNX model.
+    #[pyo3(get)]
+    pub model_repo: String,
+    /// Path to the ONNX file within the repo.
+    #[pyo3(get)]
+    pub model_file: String,
+    /// Sibling files that must be downloaded alongside `model_file`.
+    #[pyo3(get)]
+    pub additional_files: Vec<String>,
+    /// Maximum document token sequence length.
+    #[pyo3(get)]
+    pub max_length: usize,
+    /// Fixed padded query length (ColBERT query augmentation).
+    #[pyo3(get)]
+    pub query_max_length: usize,
+    /// Per-token embedding dimensionality.
+    #[pyo3(get)]
+    pub dim: usize,
+    /// Human-readable description.
+    #[pyo3(get)]
+    pub description: String,
+}
+
+#[pymethods]
+impl LateInteractionPreset {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (name, model_repo, model_file, additional_files, max_length, query_max_length, dim, description))]
+    #[new]
+    pub fn new(
+        name: String,
+        model_repo: String,
+        model_file: String,
+        additional_files: Vec<String>,
+        max_length: usize,
+        query_max_length: usize,
+        dim: usize,
+        description: String,
+    ) -> Self {
+        Self {
+            name,
+            model_repo,
+            model_file,
+            additional_files,
+            max_length,
+            query_max_length,
+            dim,
+            description,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct LateInteractionMatch {
+    /// Position of this document in the original input slice.
+    #[pyo3(get)]
+    pub index: usize,
+    /// MaxSim relevance score. Higher means more relevant to the query.
+    #[pyo3(get)]
+    pub score: f32,
+}
+
+#[pymethods]
+impl LateInteractionMatch {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (index, score))]
+    #[new]
+    pub fn new(index: usize, score: f32) -> Self {
+        Self { index, score }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
 pub struct YakeParams {
@@ -10513,6 +12562,7 @@ impl HeuristicsConfig {
     #[allow(clippy::missing_errors_doc)]
     #[pyo3(signature = ())]
     pub fn validate(&self) -> PyResult<()> {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::HeuristicsConfig {
             enable_pdf_text_heuristics: self.enable_pdf_text_heuristics,
 
@@ -10535,6 +12585,8 @@ impl HeuristicsConfig {
             max_xlsx_workbook_cells: self.max_xlsx_workbook_cells,
 
             max_pptx_embedded_count: self.max_pptx_embedded_count,
+
+            ..Default::default()
         };
         let result = core_self
             .validate()
@@ -11165,13 +13217,111 @@ impl PresetSummary {
     }
 }
 
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct DoctorCheck {
+    /// Check identifier, e.g. `ocr.tesseract` or `layout.rtdetr`.
+    #[pyo3(get)]
+    pub name: String,
+    /// Pass / warn / fail / skip verdict.
+    #[pyo3(get)]
+    pub status: ProbeStatus,
+    /// One-line reason or detail (e.g. missing language, resolved path, error).
+    #[pyo3(get)]
+    pub message: String,
+}
+
+#[pymethods]
+impl DoctorCheck {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (name, status, message))]
+    #[new]
+    pub fn new(name: String, status: ProbeStatus, message: String) -> Self {
+        Self { name, status, message }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (name, message))]
+    pub fn pass(name: String, message: String) -> DoctorCheck {
+        xberg::DoctorCheck::pass(name, message).into()
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (name, message))]
+    pub fn warn(name: String, message: String) -> DoctorCheck {
+        xberg::DoctorCheck::warn(name, message).into()
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (name, message))]
+    pub fn fail(name: String, message: String) -> DoctorCheck {
+        xberg::DoctorCheck::fail(name, message).into()
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (name, message))]
+    pub fn skip(name: String, message: String) -> DoctorCheck {
+        xberg::DoctorCheck::skip(name, message).into()
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct DoctorReport {
+    /// Individual check verdicts, in execution order.
+    #[pyo3(get)]
+    pub checks: Vec<DoctorCheck>,
+}
+
+impl Default for DoctorReport {
+    fn default() -> Self {
+        <xberg::DoctorReport as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl DoctorReport {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (checks=Self::default().checks))]
+    #[new]
+    pub fn new(checks: Vec<DoctorCheck>) -> Self {
+        Self { checks }
+    }
+
+    #[pyo3(signature = ())]
+    pub fn is_ok(&self) -> bool {
+        #[allow(clippy::needless_update)]
+        let core_self = xberg::DoctorReport {
+            checks: self.checks.clone().into_iter().map(Into::into).collect(),
+
+            ..Default::default()
+        };
+        core_self.is_ok()
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[pyclass(frozen, from_py_object)]
 pub struct PaddleOcrConfig {
     /// Language code (e.g., "en", "ch", "jpn", "kor", "deu", "fra")
     #[pyo3(get)]
     pub language: String,
-    /// Optional custom cache directory for model files
+    /// Optional Hugging Face Hub cache root for model files.
+    ///
+    /// When unset, the standard `HF_HUB_CACHE`, legacy
+    /// `HUGGINGFACE_HUB_CACHE`, and `HF_HOME` conventions are used.
     #[pyo3(get)]
     pub cache_dir: Option<String>,
     /// Enable angle classification for rotated text (default: false).
@@ -11193,7 +13343,7 @@ pub struct PaddleOcrConfig {
     /// Controls the expansion of detected text regions
     #[pyo3(get)]
     pub det_db_unclip_ratio: f32,
-    /// Maximum side length for detection image (default: 960)
+    /// Maximum side length for detection image (default: 1024)
     /// Larger images may be resized to this limit for faster inference
     #[pyo3(get)]
     pub det_limit_side_len: u32,
@@ -11212,10 +13362,35 @@ pub struct PaddleOcrConfig {
     #[pyo3(get)]
     pub drop_score: f32,
     /// Model tier controlling detection/recognition model size and accuracy trade-off.
+    ///
+    /// For PP-OCRv5 (`model_version = "pp-ocrv5"`):
     /// - `"mobile"` (default): Lightweight models (~4.5MB detection, ~16.5MB recognition), fast download and inference
     /// - `"server"`: Large, high-accuracy models (~88MB detection, ~84MB recognition), best for GPU or complex documents
+    ///
+    /// For PP-OCRv6 (`model_version = "pp-ocrv6"`): `"medium"` (default), `"small"`, or `"tiny"`.
+    /// A legacy `"mobile"`/`"server"` tier under v6 falls back to `"medium"`.
     #[pyo3(get)]
     pub model_tier: String,
+    /// Model generation: `"pp-ocrv6"` (default) or `"pp-ocrv5"`.
+    ///
+    /// PP-OCRv6 adds a unified CJK+Latin+JA/KO recognition model with `medium`/`small`/`tiny`
+    /// tiers (see `model_tier`). Scripts outside the v6 unified coverage (Arabic, Cyrillic,
+    /// Devanagari, Greek, Tamil, Telugu, Thai) transparently fall back to the PP-OCRv5
+    /// per-script recognition models. Defaults to `"pp-ocrv6"`; the default `model_tier`
+    /// (`"mobile"`) resolves to the v6 `"medium"` tier. Select `"pp-ocrv5"` to pin the
+    /// legacy per-script/unified fleet.
+    #[pyo3(get)]
+    pub model_version: String,
+    /// Explicit inference engine choice.
+    ///
+    /// `None` (the default) resolves to the compiled default: `ort` when the
+    /// `paddle-ocr-ort` feature is compiled in, otherwise `tract`. An explicit choice
+    /// is validated against the compiled features when the OCR engine is constructed
+    /// (see `crate.paddle_ocr.backend.effective_backend`); requesting an engine
+    /// whose feature is not compiled in is a clear configuration error rather than a
+    /// silent fallback.
+    #[pyo3(get)]
+    pub inference_backend: Option<PaddleInferenceBackend>,
 }
 
 impl Default for PaddleOcrConfig {
@@ -11228,7 +13403,7 @@ impl Default for PaddleOcrConfig {
 impl PaddleOcrConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (language=Self::default().language, use_angle_cls=Self::default().use_angle_cls, enable_table_detection=Self::default().enable_table_detection, det_db_thresh=Self::default().det_db_thresh, det_db_box_thresh=Self::default().det_db_box_thresh, det_db_unclip_ratio=Self::default().det_db_unclip_ratio, det_limit_side_len=Self::default().det_limit_side_len, rec_batch_num=Self::default().rec_batch_num, padding=Self::default().padding, drop_score=Self::default().drop_score, model_tier=Self::default().model_tier, cache_dir=None))]
+    #[pyo3(signature = (language=Self::default().language, use_angle_cls=Self::default().use_angle_cls, enable_table_detection=Self::default().enable_table_detection, det_db_thresh=Self::default().det_db_thresh, det_db_box_thresh=Self::default().det_db_box_thresh, det_db_unclip_ratio=Self::default().det_db_unclip_ratio, det_limit_side_len=Self::default().det_limit_side_len, rec_batch_num=Self::default().rec_batch_num, padding=Self::default().padding, drop_score=Self::default().drop_score, model_tier=Self::default().model_tier, model_version=Self::default().model_version, cache_dir=None, inference_backend=None))]
     #[new]
     pub fn new(
         language: String,
@@ -11242,7 +13417,9 @@ impl PaddleOcrConfig {
         padding: u32,
         drop_score: f32,
         model_tier: String,
+        model_version: String,
         cache_dir: Option<String>,
+        inference_backend: Option<PaddleInferenceBackend>,
     ) -> Self {
         Self {
             language,
@@ -11257,11 +13434,14 @@ impl PaddleOcrConfig {
             padding,
             drop_score,
             model_tier,
+            model_version,
+            inference_backend,
         }
     }
 
     #[pyo3(signature = (path))]
     pub fn with_cache_dir(&self, path: String) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11286,12 +13466,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_cache_dir(std::path::PathBuf::from(path)).into()
     }
 
     #[pyo3(signature = (enable))]
     pub fn with_table_detection(&self, enable: bool) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11316,12 +13503,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_table_detection(enable).into()
     }
 
     #[pyo3(signature = (enable))]
     pub fn with_angle_cls(&self, enable: bool) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11346,12 +13540,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_angle_cls(enable).into()
     }
 
     #[pyo3(signature = (threshold))]
     pub fn with_det_db_thresh(&self, threshold: f32) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11376,12 +13577,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_det_db_thresh(threshold).into()
     }
 
     #[pyo3(signature = (threshold))]
     pub fn with_det_db_box_thresh(&self, threshold: f32) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11406,12 +13614,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_det_db_box_thresh(threshold).into()
     }
 
     #[pyo3(signature = (ratio))]
     pub fn with_det_db_unclip_ratio(&self, ratio: f32) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11436,12 +13651,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_det_db_unclip_ratio(ratio).into()
     }
 
     #[pyo3(signature = (length))]
     pub fn with_det_limit_side_len(&self, length: u32) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11466,12 +13688,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_det_limit_side_len(length).into()
     }
 
     #[pyo3(signature = (batch_size))]
     pub fn with_rec_batch_num(&self, batch_size: u32) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11496,12 +13725,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_rec_batch_num(batch_size).into()
     }
 
     #[pyo3(signature = (score))]
     pub fn with_drop_score(&self, score: f32) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11526,12 +13762,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_drop_score(score).into()
     }
 
     #[pyo3(signature = (padding))]
     pub fn with_padding(&self, padding: u32) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11556,12 +13799,19 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_padding(padding).into()
     }
 
     #[pyo3(signature = (tier))]
     pub fn with_model_tier(&self, tier: String) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
         let core_self = xberg::PaddleOcrConfig {
             language: self.language.clone(),
 
@@ -11586,8 +13836,51 @@ impl PaddleOcrConfig {
             drop_score: self.drop_score,
 
             model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
         };
         core_self.with_model_tier(tier).into()
+    }
+
+    #[pyo3(signature = (version))]
+    pub fn with_model_version(&self, version: String) -> PaddleOcrConfig {
+        #[allow(clippy::needless_update)]
+        let core_self = xberg::PaddleOcrConfig {
+            language: self.language.clone(),
+
+            cache_dir: self.cache_dir.clone().map(Into::into),
+
+            use_angle_cls: self.use_angle_cls,
+
+            enable_table_detection: self.enable_table_detection,
+
+            det_db_thresh: self.det_db_thresh,
+
+            det_db_box_thresh: self.det_db_box_thresh,
+
+            det_db_unclip_ratio: self.det_db_unclip_ratio,
+
+            det_limit_side_len: self.det_limit_side_len,
+
+            rec_batch_num: self.rec_batch_num,
+
+            padding: self.padding,
+
+            drop_score: self.drop_score,
+
+            model_tier: self.model_tier.clone(),
+
+            model_version: self.model_version.clone(),
+
+            inference_backend: self.inference_backend.clone().map(Into::into),
+
+            ..Default::default()
+        };
+        core_self.with_model_version(version).into()
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -11607,13 +13900,13 @@ impl PaddleOcrConfig {
 #[pyclass(frozen, from_py_object)]
 #[allow(clippy::similar_names)]
 pub struct ModelPaths {
-    /// Path to the detection model directory.
+    /// Exact path to the detection ONNX model in the Hugging Face snapshot.
     #[pyo3(get)]
     pub det_model: String,
-    /// Path to the classification model directory.
+    /// Exact path to the classification ONNX model in the Hugging Face snapshot.
     #[pyo3(get)]
     pub cls_model: String,
-    /// Path to the recognition model directory.
+    /// Exact path to the recognition ONNX model in the Hugging Face snapshot.
     #[pyo3(get)]
     pub rec_model: String,
     /// Path to the character dictionary file.
@@ -11867,6 +14160,31 @@ pub struct PdfMetadata {
     /// Total number of pages in the PDF document
     #[pyo3(get)]
     pub page_count: Option<u32>,
+    /// How strongly the document's most scan-like page resembles a scan, in `[0.0, 1.0]`.
+    ///
+    /// `None` when the document could not be inspected. A full-page raster with no
+    /// visible text scores at least `0.85`; a born-digital slide with a full-bleed
+    /// background image scores `0.50`.
+    #[pyo3(get)]
+    pub scanned_confidence: Option<f32>,
+    /// Pages that look like scans (1-indexed), using the default confidence threshold.
+    ///
+    /// `None` when the document could not be inspected; empty when no page qualifies.
+    #[pyo3(get)]
+    pub scanned_pages: Option<Vec<u32>>,
+    /// Pages the `auto` layout strategy skipped (1-indexed).
+    ///
+    /// `None` unless layout detection ran with `LayoutStrategy.Auto`; empty
+    /// when the gate selected every page.
+    #[pyo3(get)]
+    pub layout_gated_pages: Option<Vec<u32>>,
+    /// Why the `auto` layout gate selected or skipped each page.
+    ///
+    /// Index `i` is page `i + 1`. Snake_case values such as `multi_column`,
+    /// `table_grid`, or `plain_text` (the skip reason). `None` unless layout
+    /// detection ran with `LayoutStrategy.Auto`.
+    #[pyo3(get)]
+    pub layout_gate_reasons: Option<Vec<String>>,
 }
 
 impl Default for PdfMetadata {
@@ -11879,7 +14197,7 @@ impl Default for PdfMetadata {
 impl PdfMetadata {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (pdf_version=None, producer=None, is_encrypted=None, width=None, height=None, page_count=None))]
+    #[pyo3(signature = (pdf_version=None, producer=None, is_encrypted=None, width=None, height=None, page_count=None, scanned_confidence=None, scanned_pages=None, layout_gated_pages=None, layout_gate_reasons=None))]
     #[new]
     pub fn new(
         pdf_version: Option<String>,
@@ -11888,6 +14206,10 @@ impl PdfMetadata {
         width: Option<i64>,
         height: Option<i64>,
         page_count: Option<u32>,
+        scanned_confidence: Option<f32>,
+        scanned_pages: Option<Vec<u32>>,
+        layout_gated_pages: Option<Vec<u32>>,
+        layout_gate_reasons: Option<Vec<String>>,
     ) -> Self {
         Self {
             pdf_version,
@@ -11896,7 +14218,36 @@ impl PdfMetadata {
             width,
             height,
             page_count,
+            scanned_confidence,
+            scanned_pages,
+            layout_gated_pages,
+            layout_gate_reasons,
         }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct ChunkClassificationEnrichmentConfig {
+    /// Label-definition set and LLM/batching settings for the chunk-classification stage.
+    #[pyo3(get)]
+    #[serde(skip)]
+    pub config: ChunkClassificationConfig,
+}
+
+#[pymethods]
+impl ChunkClassificationEnrichmentConfig {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (config))]
+    #[new]
+    pub fn new(config: ChunkClassificationConfig) -> Self {
+        Self { config }
     }
 
     #[staticmethod]
@@ -11965,7 +14316,7 @@ pub struct ContentConfig {
     #[pyo3(get)]
     pub remove_forms: bool,
     /// HTML tag names to strip (render children only, remove the tag wrapper).
-    /// Default: `["noscript"]`.
+    /// Default: `[]`.
     #[pyo3(get)]
     pub strip_tags: Vec<String>,
     /// HTML tag names to preserve as raw HTML in output.
@@ -11976,6 +14327,12 @@ pub struct ContentConfig {
     /// Unlike `strip_tags` (which removes the wrapper but keeps children),
     /// excluded elements and all descendants are dropped. Supports CSS selectors:
     /// `.class`, `#id`, `[attribute]`, compound selectors.
+    ///
+    /// Default: `["noscript"]`. `<noscript>` fallback content (no-JS notices,
+    /// tracking pixels, GTM iframes) is meant for browsers with JavaScript
+    /// disabled, not for a markdown reader, and `strip_tags` cannot drop it —
+    /// on `preprocessing_preset: "standard"` (crawlberg's only path) it only
+    /// removes the wrapper and still renders the children. ~keep
     ///
     /// Example: `[".cookie-banner", "#ad-container", "[role='complementary']"]`
     #[pyo3(get)]
@@ -12160,6 +14517,12 @@ pub struct CrawlConfig {
     /// Maximum number of pages to crawl.
     #[pyo3(get)]
     pub max_pages: Option<usize>,
+    /// Maximum links enqueued from a single page. Defaults to 10000.
+    ///
+    /// Bounds the work one hostile or pathological page can create; links past the
+    /// cap are dropped and a warning is logged.
+    #[pyo3(get)]
+    pub max_links_per_page: Option<usize>,
     /// Maximum number of concurrent requests.
     #[pyo3(get)]
     pub max_concurrent: Option<usize>,
@@ -12249,6 +14612,14 @@ pub struct CrawlConfig {
     #[pyo3(get)]
     pub user_agents: Vec<String>,
     /// Whether to capture a screenshot when using the browser.
+    ///
+    /// Only supported by `scrape()` with `BrowserBackend.Chromiumoxide` and
+    /// `BrowserMode.Always` or `Stealth`. A screenshot is 100–500 KB of PNG per page,
+    /// so `crawl()` does not carry screenshots in `CrawlPageResult`/`CrawlResult` at
+    /// all — a multi-thousand-page crawl holding one per page in memory is not a safe
+    /// default. Setting this with any other configuration (a different backend,
+    /// `BrowserMode.Auto`/`Never`, or during `crawl()`) has no effect and logs a
+    /// warning rather than silently doing nothing.
     #[pyo3(get)]
     pub capture_screenshot: bool,
     /// Re-enqueue discovered `LinkType.Document` URLs into the crawl frontier so
@@ -12263,6 +14634,7 @@ pub struct CrawlConfig {
     #[pyo3(get)]
     pub document_url_depth: Option<u32>,
     /// Whether to download non-HTML documents (PDF, DOCX, images, code, etc.) instead of skipping them.
+    /// Defaults to `true` — unlike `download_assets` and `capture_screenshot`, which default to `false`.
     #[pyo3(get)]
     pub download_documents: bool,
     /// Maximum size in bytes for document downloads. Defaults to 50 MB.
@@ -12271,10 +14643,30 @@ pub struct CrawlConfig {
     /// Allowlist of MIME types to download. If empty, uses built-in defaults.
     #[pyo3(get)]
     pub document_mime_types: Vec<String>,
+    /// Directory to stream downloaded document bytes into instead of holding them in
+    /// memory on `DownloadedDocument.content`. When set, `content` is left empty and
+    /// `DownloadedDocument.content_path` is populated with `<dir>/<content_hash>.<ext>`.
+    /// `None` (default) preserves today's in-memory-only behavior. Has no effect on
+    /// wasm32, which has no filesystem — use `document_content_encoding` there instead.
+    #[pyo3(get)]
+    pub document_output_dir: Option<String>,
+    /// Opt-in encoding that duplicates `DownloadedDocument.content` into a serializable
+    /// field for language bindings that need the bytes in-memory (`content` itself is
+    /// `alef(skip)`ed). `None` (default) means no encoding is produced. Independent of
+    /// `document_output_dir` — set both to get a file on disk and an in-memory copy.
+    #[pyo3(get)]
+    pub document_content_encoding: Option<DocumentContentEncoding>,
     /// Path to write WARC output. If `None`, WARC output is disabled.
     #[pyo3(get)]
     pub warc_output: Option<String>,
     /// Named browser profile for persistent sessions (cookies, localStorage).
+    ///
+    /// Chromiumoxide backend only. The native backend runs an in-process JavaScript
+    /// engine with no Chrome process and therefore no profile directory, so this is
+    /// ignored there and logs a warning. It is also ignored — with a warning — when a
+    /// shared browser pool is in use (the pool launches before any per-crawl config
+    /// exists) or when connecting to an external CDP endpoint whose process crawlberg
+    /// does not own.
     #[pyo3(get)]
     pub browser_profile: Option<String>,
     /// Whether to save changes back to the browser profile on exit.
@@ -12283,11 +14675,38 @@ pub struct CrawlConfig {
     /// SSRF policy for outbound network requests. Default: deny private networks,
     /// allow http/https only, max 5 redirects.
     ///
-    /// Phase 1: `deny_private` and `max_redirects` are exposed to all language
-    /// bindings. `allowlist` is skipped (see `SsrfPolicy` fields) and will be
-    /// added in a follow-up when `HostMatcher`'s tagged-enum FFI form is decided.
+    /// `deny_private`, `allowlist` and `max_redirects` are exposed to all language
+    /// bindings. `scheme_allowlist` stays Rust-only — see `SsrfPolicy`.
+    ///
+    /// **wasm32 (including Node.js): `deny_private` does not stop hostname-based
+    /// requests.** There is no DNS resolution on this target, so only a literal IP host is
+    /// checked against the policy — a domain name is always permitted, regardless of
+    /// `deny_private`. Under Node, where `fetch` enforces no CORS, this means a service
+    /// embedding the wasm binding can be driven to internal hosts by domain name even with
+    /// `deny_private = true`. Enforce egress restrictions at the network layer for that
+    /// deployment target; do not rely on this field. See `crawlberg.net.validate_url`.
     #[pyo3(get)]
+    #[serde(skip)]
     pub ssrf: SsrfPolicy,
+    /// Pins `SsrfPolicy.deny_private` to a caller-chosen value, bypassing the
+    /// `CRAWLBERG_ALLOW_PRIVATE_NETWORK` operator override entirely for this config.
+    ///
+    /// `ssrf.deny_private` is a plain, always-serialized `bool`: several alef-generated
+    /// bindings construct `SsrfPolicy.default()` (hardcoding `deny_private: true`)
+    /// whenever their caller never touches SSRF settings at all, so `true` on that field
+    /// alone cannot distinguish "the caller wants private networks denied" from "the
+    /// binding's own structural default landed on `true`". The environment variable
+    /// exists precisely to resolve that ambiguity in the common case by treating any
+    /// `true` as inconclusive and deferring to the operator.
+    ///
+    /// Set this field when that default-deferral is wrong for your call — e.g. a test
+    /// that must prove `deny_private: true` still denies even while the operator has set
+    /// `CRAWLBERG_ALLOW_PRIVATE_NETWORK` suite-wide for every other call. `None` (default)
+    /// preserves today's behavior: the environment variable may still flip
+    /// `ssrf.deny_private` to `false`. `Some(value)` pins `ssrf.deny_private` to `value`
+    /// and the environment variable is not consulted for this config.
+    #[pyo3(get)]
+    pub ssrf_deny_private_explicit: Option<bool>,
 }
 
 impl Default for CrawlConfig {
@@ -12300,7 +14719,7 @@ impl Default for CrawlConfig {
 impl CrawlConfig {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (respect_robots_txt=Self::default().respect_robots_txt, soft_http_errors=Self::default().soft_http_errors, stay_on_domain=Self::default().stay_on_domain, allow_subdomains=Self::default().allow_subdomains, include_paths=Self::default().include_paths, exclude_paths=Self::default().exclude_paths, custom_headers=Self::default().custom_headers, request_timeout=None, max_redirects=Self::default().max_redirects, retry_count=Self::default().retry_count, retry_codes=Self::default().retry_codes, cookies_enabled=Self::default().cookies_enabled, remove_tags=Self::default().remove_tags, content=None, download_assets=Self::default().download_assets, asset_types=Self::default().asset_types, browser=None, user_agents=Self::default().user_agents, capture_screenshot=Self::default().capture_screenshot, follow_document_urls=Self::default().follow_document_urls, download_documents=Self::default().download_documents, document_mime_types=Self::default().document_mime_types, save_browser_profile=Self::default().save_browser_profile, ssrf=None, max_depth=None, max_pages=None, max_concurrent=None, user_agent=None, rate_limit_ms=None, auth=None, max_body_size=None, map_limit=None, map_search=None, max_asset_size=None, proxy=None, document_url_depth=None, document_max_size=None, warc_output=None, browser_profile=None))]
+    #[pyo3(signature = (respect_robots_txt=Self::default().respect_robots_txt, soft_http_errors=Self::default().soft_http_errors, stay_on_domain=Self::default().stay_on_domain, allow_subdomains=Self::default().allow_subdomains, include_paths=Self::default().include_paths, exclude_paths=Self::default().exclude_paths, custom_headers=Self::default().custom_headers, request_timeout=None, max_redirects=Self::default().max_redirects, retry_count=Self::default().retry_count, retry_codes=Self::default().retry_codes, cookies_enabled=Self::default().cookies_enabled, remove_tags=Self::default().remove_tags, content=None, download_assets=Self::default().download_assets, asset_types=Self::default().asset_types, browser=None, user_agents=Self::default().user_agents, capture_screenshot=Self::default().capture_screenshot, follow_document_urls=Self::default().follow_document_urls, download_documents=Self::default().download_documents, document_mime_types=Self::default().document_mime_types, save_browser_profile=Self::default().save_browser_profile, ssrf=None, max_depth=None, max_pages=None, max_links_per_page=None, max_concurrent=None, user_agent=None, rate_limit_ms=None, auth=None, max_body_size=None, map_limit=None, map_search=None, max_asset_size=None, proxy=None, document_url_depth=None, document_max_size=None, document_output_dir=None, document_content_encoding=None, warc_output=None, browser_profile=None, ssrf_deny_private_explicit=None))]
     #[new]
     pub fn new(
         respect_robots_txt: bool,
@@ -12329,6 +14748,7 @@ impl CrawlConfig {
         ssrf: Option<SsrfPolicy>,
         max_depth: Option<usize>,
         max_pages: Option<usize>,
+        max_links_per_page: Option<usize>,
         max_concurrent: Option<usize>,
         user_agent: Option<String>,
         rate_limit_ms: Option<u64>,
@@ -12340,12 +14760,16 @@ impl CrawlConfig {
         proxy: Option<ProxyConfig>,
         document_url_depth: Option<u32>,
         document_max_size: Option<usize>,
+        document_output_dir: Option<String>,
+        document_content_encoding: Option<DocumentContentEncoding>,
         warc_output: Option<String>,
         browser_profile: Option<String>,
+        ssrf_deny_private_explicit: Option<bool>,
     ) -> Self {
         Self {
             max_depth,
             max_pages,
+            max_links_per_page,
             max_concurrent,
             respect_robots_txt,
             soft_http_errors,
@@ -12379,10 +14803,13 @@ impl CrawlConfig {
             download_documents,
             document_max_size,
             document_mime_types,
+            document_output_dir,
+            document_content_encoding,
             warc_output,
             browser_profile,
             save_browser_profile,
             ssrf: ssrf.unwrap_or_else(|| Self::default().ssrf),
+            ssrf_deny_private_explicit,
         }
     }
 
@@ -12472,6 +14899,23 @@ pub struct SsrfPolicy {
     /// If true, reject URLs that resolve to private/metadata IP ranges.
     #[pyo3(get)]
     pub deny_private: bool,
+    /// Hostnames and IP ranges permitted regardless of `deny_private`.
+    ///
+    /// The allowlist is an *override* of `deny_private`, not an intersection with it.
+    /// Precedence, in order:
+    ///
+    /// 1. `deny_private == false` permits everything; the allowlist is not consulted.
+    /// 2. A hostname matching an `Exact` or `Suffix` entry is permitted immediately,
+    ///    *before* DNS resolution — so the deny-list is never applied to it. This trusts
+    ///    the host string: a name that resolves into private space is still permitted.
+    /// 3. A literal or resolved IP inside a `Cidr` entry is permitted even though it is
+    ///    in the default deny-list.
+    /// 4. Otherwise the default deny-list decides.
+    ///
+    /// An empty allowlist therefore denies nothing by itself — it simply leaves
+    /// `deny_private` and the deny-list in sole control.
+    #[pyo3(get)]
+    pub allowlist: Vec<HostMatcher>,
     /// Maximum number of HTTP redirects to follow during validation.
     #[pyo3(get)]
     pub max_redirects: u8,
@@ -12487,12 +14931,332 @@ impl Default for SsrfPolicy {
 impl SsrfPolicy {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    #[pyo3(signature = (deny_private=Self::default().deny_private, max_redirects=Self::default().max_redirects))]
+    #[pyo3(signature = (deny_private=Self::default().deny_private, allowlist=Self::default().allowlist, max_redirects=Self::default().max_redirects))]
     #[new]
-    pub fn new(deny_private: bool, max_redirects: u8) -> Self {
+    pub fn new(deny_private: bool, allowlist: Vec<HostMatcher>, max_redirects: u8) -> Self {
         Self {
             deny_private,
+            allowlist,
             max_redirects,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+#[allow(clippy::similar_names)]
+pub struct ConversionOptions {
+    /// Heading style to use in Markdown output (ATX `#` or Setext underline).
+    #[pyo3(get)]
+    pub heading_style: HeadingStyle,
+    /// How to indent nested list items (spaces or tab).
+    #[pyo3(get)]
+    pub list_indent_type: ListIndentType,
+    /// Number of spaces (or tabs) to use for each level of list indentation.
+    #[pyo3(get)]
+    pub list_indent_width: usize,
+    /// Bullet character(s) to use for unordered list items (e.g. `"-"`, `"*"`).
+    #[pyo3(get)]
+    pub bullets: String,
+    /// Character used for bold/italic emphasis markers (`*` or `_`).
+    #[pyo3(get)]
+    pub strong_em_symbol: String,
+    /// Escape `*` characters in plain text to avoid unintended bold/italic.
+    #[pyo3(get)]
+    pub escape_asterisks: bool,
+    /// Escape `_` characters in plain text to avoid unintended bold/italic.
+    #[pyo3(get)]
+    pub escape_underscores: bool,
+    /// Escape miscellaneous Markdown metacharacters (`[]()#` etc.) in plain text.
+    #[pyo3(get)]
+    pub escape_misc: bool,
+    /// Escape ASCII characters that have special meaning in certain Markdown dialects.
+    #[pyo3(get)]
+    pub escape_ascii: bool,
+    /// Default language annotation for fenced code blocks that have no language hint.
+    #[pyo3(get)]
+    pub code_language: String,
+    /// Automatically convert bare URLs into Markdown autolinks.
+    #[pyo3(get)]
+    pub autolinks: bool,
+    /// Emit a default title when no `<title>` tag is present.
+    #[pyo3(get)]
+    pub default_title: bool,
+    /// Render `<br>` elements inside table cells as literal line breaks.
+    #[pyo3(get)]
+    pub br_in_tables: bool,
+    /// Emit tables without column padding (compact GFM format).
+    ///
+    /// When `true`, column widths are not computed and cells are emitted with
+    /// no trailing spaces. Separator rows use exactly `---` per column.
+    /// Produces token-efficient output suitable for RAG / LLM contexts.
+    ///
+    /// Default `false` (aligned padding preserved).
+    #[pyo3(get)]
+    pub compact_tables: bool,
+    /// Style used for `<mark>` / highlighted text (e.g. `==text==`).
+    #[pyo3(get)]
+    pub highlight_style: HighlightStyle,
+    /// Populate `result.metadata` with `<head>` / `<meta>` extraction
+    /// (title, description, Open Graph, Twitter Card, JSON-LD, …).
+    ///
+    /// Default `true`. Disabling skips the metadata pass only — table
+    /// extraction into `result.tables` runs unconditionally.
+    #[pyo3(get)]
+    pub extract_metadata: bool,
+    /// Controls how whitespace sequences are normalised in the converted output.
+    ///
+    /// - `WhitespaceMode.Normalized` (default) — collapses consecutive whitespace characters
+    ///   (spaces, tabs, newlines) to a single space, matching browser rendering behaviour.
+    /// - `WhitespaceMode.Strict` — preserves all whitespace exactly as it appears in the
+    ///   source HTML, including runs of spaces and embedded newlines.
+    ///
+    /// Choose `Strict` only when the source HTML uses deliberate whitespace (e.g. pre-formatted
+    /// content outside `<pre>` tags). For most documents `Normalized` produces cleaner output.
+    #[pyo3(get)]
+    pub whitespace_mode: WhitespaceMode,
+    /// Strip all newlines from the output, producing a single-line result.
+    #[pyo3(get)]
+    pub strip_newlines: bool,
+    /// Wrap long lines at `wrap_width` characters.
+    #[pyo3(get)]
+    pub wrap: bool,
+    /// Maximum output line width in characters when `wrap` is `true` (default `80`).
+    ///
+    /// Lines are broken at word boundaries so that no line exceeds this length. A value of `0`
+    /// is treated as "no limit" — equivalent to leaving `wrap` disabled. Has no
+    /// effect when `wrap` is `false`.
+    #[pyo3(get)]
+    pub wrap_width: usize,
+    /// Treat the entire document as inline content (no block-level wrappers).
+    #[pyo3(get)]
+    pub convert_as_inline: bool,
+    /// Markdown notation for subscript text (e.g. `"~"`).
+    #[pyo3(get)]
+    pub sub_symbol: String,
+    /// Markdown notation for superscript text (e.g. `"^"`).
+    #[pyo3(get)]
+    pub sup_symbol: String,
+    /// How to encode hard line breaks (`<br>`) in Markdown.
+    #[pyo3(get)]
+    pub newline_style: NewlineStyle,
+    /// Style used for fenced code blocks (backticks or tilde).
+    #[pyo3(get)]
+    pub code_block_style: CodeBlockStyle,
+    /// HTML tag names whose `<img>` children are kept inline instead of block.
+    #[pyo3(get)]
+    pub keep_inline_images_in: Vec<String>,
+    /// Options for the HTML pre-processing pass applied before conversion begins.
+    ///
+    /// Pre-processing runs before the HTML is handed to the converter and can perform operations
+    /// such as unwrapping redundant wrapper elements, removing tracking pixels, and normalising
+    /// vendor-specific markup. See `PreprocessingOptions` for the full set of knobs.
+    ///
+    /// Defaults to `PreprocessingOptions.default()`, which enables the standard cleaning
+    /// passes. Set individual fields on `PreprocessingOptions` (or construct via
+    /// `ConversionOptions.builder`) to opt in or out of specific passes.
+    #[pyo3(get)]
+    pub preprocessing: PreprocessingOptions,
+    /// Expected character encoding of the input HTML (default `"utf-8"`).
+    #[pyo3(get)]
+    pub encoding: String,
+    /// Emit debug information during conversion.
+    #[pyo3(get)]
+    pub debug: bool,
+    /// HTML tag names whose content is stripped from the output entirely.
+    #[pyo3(get)]
+    pub strip_tags: Vec<String>,
+    /// HTML tag names that are preserved verbatim in the output.
+    #[pyo3(get)]
+    pub preserve_tags: Vec<String>,
+    /// Skip conversion of `<img>` elements (omit images from output).
+    #[pyo3(get)]
+    pub skip_images: bool,
+    /// URL encoding strategy for link and image destinations.
+    ///
+    /// Controls how special characters in URL destinations are escaped:
+    /// - `UrlEscapeStyle.Angle` (default) — wraps the destination in angle brackets when it
+    ///   contains spaces or newlines. parsers misinterpret `>` inside such a destination.
+    /// - `UrlEscapeStyle.Percent` — percent-encodes every character that is not an RFC 3986
+    ///   unreserved character or `/`, producing a destination that all Markdown parsers handle
+    ///   correctly even when the URL contains `<`, `>`, spaces, or parentheses.
+    #[pyo3(get)]
+    pub url_escape_style: UrlEscapeStyle,
+    /// Link rendering style (inline or reference).
+    #[pyo3(get)]
+    pub link_style: LinkStyle,
+    /// Maximum decoded image size in bytes (default 5MB).
+    #[pyo3(get)]
+    pub max_image_size: u64,
+    /// Capture SVG elements as images.
+    #[pyo3(get)]
+    pub capture_svg: bool,
+    /// Infer image dimensions from data.
+    #[pyo3(get)]
+    pub infer_dimensions: bool,
+    /// Maximum DOM traversal depth.
+    ///
+    /// `None` uses the library's internal native-stack safety limit. Explicit
+    /// values above that safety limit are clamped to prevent process-aborting
+    /// stack overflows on pathologically deep DOM trees.
+    #[pyo3(get)]
+    pub max_depth: Option<usize>,
+    /// CSS selectors for elements to exclude entirely (element + all content).
+    ///
+    /// Unlike `strip_tags` (which removes the tag wrapper but keeps children),
+    /// excluded elements and all their descendants are dropped from the output.
+    /// Supports any CSS selector that `tl` supports: tag names, `.class`,
+    /// `#id`, `[attribute]`, etc.
+    ///
+    /// Invalid selectors are silently skipped at conversion time.
+    ///
+    /// Example: `vec![".cookie-banner".into(), "#ad-container".into(), "[role='complementary']".into()]`
+    #[pyo3(get)]
+    pub exclude_selectors: Vec<String>,
+}
+
+impl Default for ConversionOptions {
+    fn default() -> Self {
+        <html_to_markdown_rs::ConversionOptions as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl ConversionOptions {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (heading_style=Self::default().heading_style, list_indent_type=Self::default().list_indent_type, list_indent_width=Self::default().list_indent_width, bullets=Self::default().bullets, strong_em_symbol=Self::default().strong_em_symbol, escape_asterisks=Self::default().escape_asterisks, escape_underscores=Self::default().escape_underscores, escape_misc=Self::default().escape_misc, escape_ascii=Self::default().escape_ascii, code_language=Self::default().code_language, autolinks=Self::default().autolinks, default_title=Self::default().default_title, br_in_tables=Self::default().br_in_tables, compact_tables=Self::default().compact_tables, highlight_style=Self::default().highlight_style, extract_metadata=Self::default().extract_metadata, whitespace_mode=Self::default().whitespace_mode, strip_newlines=Self::default().strip_newlines, wrap=Self::default().wrap, wrap_width=Self::default().wrap_width, convert_as_inline=Self::default().convert_as_inline, sub_symbol=Self::default().sub_symbol, sup_symbol=Self::default().sup_symbol, newline_style=Self::default().newline_style, code_block_style=Self::default().code_block_style, keep_inline_images_in=Self::default().keep_inline_images_in, preprocessing=None, encoding=Self::default().encoding, debug=Self::default().debug, strip_tags=Self::default().strip_tags, preserve_tags=Self::default().preserve_tags, skip_images=Self::default().skip_images, url_escape_style=Self::default().url_escape_style, link_style=Self::default().link_style, max_image_size=Self::default().max_image_size, capture_svg=Self::default().capture_svg, infer_dimensions=Self::default().infer_dimensions, exclude_selectors=Self::default().exclude_selectors, max_depth=None))]
+    #[new]
+    pub fn new(
+        heading_style: HeadingStyle,
+        list_indent_type: ListIndentType,
+        list_indent_width: usize,
+        bullets: String,
+        strong_em_symbol: String,
+        escape_asterisks: bool,
+        escape_underscores: bool,
+        escape_misc: bool,
+        escape_ascii: bool,
+        code_language: String,
+        autolinks: bool,
+        default_title: bool,
+        br_in_tables: bool,
+        compact_tables: bool,
+        highlight_style: HighlightStyle,
+        extract_metadata: bool,
+        whitespace_mode: WhitespaceMode,
+        strip_newlines: bool,
+        wrap: bool,
+        wrap_width: usize,
+        convert_as_inline: bool,
+        sub_symbol: String,
+        sup_symbol: String,
+        newline_style: NewlineStyle,
+        code_block_style: CodeBlockStyle,
+        keep_inline_images_in: Vec<String>,
+        preprocessing: Option<PreprocessingOptions>,
+        encoding: String,
+        debug: bool,
+        strip_tags: Vec<String>,
+        preserve_tags: Vec<String>,
+        skip_images: bool,
+        url_escape_style: UrlEscapeStyle,
+        link_style: LinkStyle,
+        max_image_size: u64,
+        capture_svg: bool,
+        infer_dimensions: bool,
+        exclude_selectors: Vec<String>,
+        max_depth: Option<usize>,
+    ) -> Self {
+        Self {
+            heading_style,
+            list_indent_type,
+            list_indent_width,
+            bullets,
+            strong_em_symbol,
+            escape_asterisks,
+            escape_underscores,
+            escape_misc,
+            escape_ascii,
+            code_language,
+            autolinks,
+            default_title,
+            br_in_tables,
+            compact_tables,
+            highlight_style,
+            extract_metadata,
+            whitespace_mode,
+            strip_newlines,
+            wrap,
+            wrap_width,
+            convert_as_inline,
+            sub_symbol,
+            sup_symbol,
+            newline_style,
+            code_block_style,
+            keep_inline_images_in,
+            preprocessing: preprocessing.unwrap_or_else(|| Self::default().preprocessing),
+            encoding,
+            debug,
+            strip_tags,
+            preserve_tags,
+            skip_images,
+            url_escape_style,
+            link_style,
+            max_image_size,
+            capture_svg,
+            infer_dimensions,
+            max_depth,
+            exclude_selectors,
+        }
+    }
+
+    #[staticmethod]
+    fn from_json(json_str: String) -> pyo3::PyResult<Self> {
+        serde_json::from_str::<Self>(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[pyclass(frozen, from_py_object)]
+pub struct PreprocessingOptions {
+    /// Enable HTML preprocessing globally
+    #[pyo3(get)]
+    pub enabled: bool,
+    /// Preprocessing preset level (Minimal, Standard, Aggressive)
+    #[pyo3(get)]
+    pub preset: PreprocessingPreset,
+    /// Remove navigation elements (nav, breadcrumbs, menus, sidebars)
+    #[pyo3(get)]
+    pub remove_navigation: bool,
+    /// Remove form elements (forms, inputs, buttons, etc.)
+    #[pyo3(get)]
+    pub remove_forms: bool,
+}
+
+impl Default for PreprocessingOptions {
+    fn default() -> Self {
+        <html_to_markdown_rs::PreprocessingOptions as Default>::default().into()
+    }
+}
+
+#[pymethods]
+impl PreprocessingOptions {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    #[pyo3(signature = (enabled=Self::default().enabled, preset=Self::default().preset, remove_navigation=Self::default().remove_navigation, remove_forms=Self::default().remove_forms))]
+    #[new]
+    pub fn new(enabled: bool, preset: PreprocessingPreset, remove_navigation: bool, remove_forms: bool) -> Self {
+        Self {
+            enabled,
+            preset,
+            remove_navigation,
+            remove_forms,
         }
     }
 
@@ -12601,7 +15365,48 @@ fn __alef_coerce_dto_map<T: serde::de::DeserializeOwned>(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
-const __ALEF_WIRE_LLM_CONFIG: &[__AlefAlias] = &[];
+const __ALEF_WIRE_BEDROCK_CONFIG: &[__AlefAlias] = &[];
+
+const __ALEF_WIRE_LLM_BUDGET_CONFIG: &[__AlefAlias] = &[];
+
+const __ALEF_WIRE_LLM_CACHE_CONFIG: &[__AlefAlias] = &[];
+
+const __ALEF_WIRE_LLM_CONFIG: &[__AlefAlias] = &[
+    __AlefAlias {
+        rust: "providers",
+        wire: "providers",
+        kind: __AlefKind::Seq,
+        nested: __ALEF_WIRE_LLM_PROVIDER_CONFIG,
+    },
+    __AlefAlias {
+        rust: "cache",
+        wire: "cache",
+        kind: __AlefKind::Object,
+        nested: __ALEF_WIRE_LLM_CACHE_CONFIG,
+    },
+    __AlefAlias {
+        rust: "budget",
+        wire: "budget",
+        kind: __AlefKind::Object,
+        nested: __ALEF_WIRE_LLM_BUDGET_CONFIG,
+    },
+    __AlefAlias {
+        rust: "rate_limit",
+        wire: "rate_limit",
+        kind: __AlefKind::Object,
+        nested: __ALEF_WIRE_LLM_RATE_LIMIT_CONFIG,
+    },
+    __AlefAlias {
+        rust: "bedrock",
+        wire: "bedrock",
+        kind: __AlefKind::Object,
+        nested: __ALEF_WIRE_BEDROCK_CONFIG,
+    },
+];
+
+const __ALEF_WIRE_LLM_PROVIDER_CONFIG: &[__AlefAlias] = &[];
+
+const __ALEF_WIRE_LLM_RATE_LIMIT_CONFIG: &[__AlefAlias] = &[];
 
 const __ALEF_WIRE_TABLE_GRID: &[__AlefAlias] = &[];
 
@@ -13010,6 +15815,61 @@ impl UrlExtractionMode {
     }
 }
 
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum BreadcrumbTarget {
+    #[pyo3(name = "CONTENT")]
+    #[default]
+    Content = 0,
+    #[pyo3(name = "METADATA")]
+    Metadata = 1,
+}
+#[pymethods]
+impl BreadcrumbTarget {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "content" => return Ok(Self::Content),
+                "metadata" => return Ok(Self::Metadata),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Content),
+                1 => return Ok(Self::Metadata),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(BreadcrumbTarget);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize BreadcrumbTarget: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(frozen)]
 pub struct OutputFormat {
@@ -13168,6 +16028,23 @@ impl OutputFormat {
     }
 
     #[getter]
+    fn doc_tags(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "tag";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "doc_tags" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
     fn custom(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
         let json =
             serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -13213,6 +16090,65 @@ impl<'de> serde::Deserialize<'de> for OutputFormat {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let inner = xberg::OutputFormat::deserialize(deserializer)?;
         Ok(Self { inner })
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum JupyterCellRendering {
+    #[pyo3(name = "SOURCE")]
+    Source = 0,
+    #[pyo3(name = "OUTPUTS")]
+    Outputs = 1,
+    #[pyo3(name = "BOTH")]
+    #[default]
+    Both = 2,
+}
+#[pymethods]
+impl JupyterCellRendering {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "source" => return Ok(Self::Source),
+                "outputs" => return Ok(Self::Outputs),
+                "both" => return Ok(Self::Both),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Source),
+                1 => return Ok(Self::Outputs),
+                2 => return Ok(Self::Both),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(JupyterCellRendering);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize JupyterCellRendering: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
     }
 }
 
@@ -13278,6 +16214,191 @@ impl HtmlTheme {
 
     fn __repr__(&self) -> PyResult<String> {
         self.__str__()
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(frozen)]
+pub struct LateInteractionModelType {
+    pub(crate) inner: xberg::LateInteractionModelType,
+}
+
+#[pymethods]
+impl LateInteractionModelType {
+    #[new]
+    #[pyo3(signature = (value=None, **kwargs))]
+    fn new(
+        py: Python<'_>,
+        value: Option<&Bound<'_, pyo3::types::PyAny>>,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        // Accept three call shapes:
+        //   LateInteractionModelType("variant_name")                     -> unit variant
+        //   LateInteractionModelType({"type": "variant", ...})           -> dict positional
+        //   LateInteractionModelType(type="variant", field=...)          -> kwargs (idiomatic)
+        // Kwargs are assembled into a Python dict and re-serialized via json so
+        // serde_json can deserialize into the tagged enum.
+        let json_str: String = if let Some(v) = value {
+            if let Ok(s) = v.extract::<String>() {
+                serde_json::to_string(&serde_json::json!({ "type": s })).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid LateInteractionModelType: {e}"))
+                })?
+            } else {
+                let json_mod = py.import("json")?;
+                json_mod.call_method1("dumps", (v,))?.extract()?
+            }
+        } else if let Some(kw) = kwargs {
+            let json_mod = py.import("json")?;
+            json_mod.call_method1("dumps", (kw,))?.extract()?
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "LateInteractionModelType() requires a positional value or keyword arguments".to_string(),
+            ));
+        };
+        let inner: xberg::LateInteractionModelType = serde_json::from_str(&json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid LateInteractionModelType: {e}")))?;
+        Ok(Self { inner })
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(&self.inner)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize LateInteractionModelType: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+
+    #[getter]
+    fn preset(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "preset" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn custom(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "custom" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn plugin(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "plugin" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn r#type(&self) -> pyo3::PyResult<String> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        json.get("type")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("type not found in serialized enum"))
+    }
+    #[pyo3(name = "preset")]
+    #[staticmethod]
+    pub fn _factory_preset(name: String) -> Self {
+        Self {
+            inner: xberg::LateInteractionModelType::Preset { name },
+        }
+    }
+
+    #[pyo3(name = "custom")]
+    #[pyo3(signature = (model_id, model_file=None, additional_files=None, max_length=None))]
+    #[staticmethod]
+    pub fn _factory_custom(
+        model_id: String,
+        model_file: Option<String>,
+        additional_files: Option<Vec<String>>,
+        max_length: Option<i64>,
+    ) -> Self {
+        Self {
+            inner: xberg::LateInteractionModelType::Custom {
+                model_id,
+                model_file,
+                additional_files: additional_files.unwrap_or_default().into_iter().collect(),
+                max_length,
+            },
+        }
+    }
+
+    #[pyo3(name = "plugin")]
+    #[staticmethod]
+    pub fn _factory_plugin(name: String) -> Self {
+        Self {
+            inner: xberg::LateInteractionModelType::Plugin { name },
+        }
+    }
+}
+
+impl From<LateInteractionModelType> for xberg::LateInteractionModelType {
+    fn from(val: LateInteractionModelType) -> Self {
+        val.inner
+    }
+}
+
+impl From<xberg::LateInteractionModelType> for LateInteractionModelType {
+    fn from(val: xberg::LateInteractionModelType) -> Self {
+        Self { inner: val }
+    }
+}
+
+impl serde::Serialize for LateInteractionModelType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+impl Default for LateInteractionModelType {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for LateInteractionModelType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let inner = xberg::LateInteractionModelType::deserialize(deserializer)?;
+        Ok(Self { inner })
     }
 }
 
@@ -13410,6 +16531,278 @@ impl TableOverlapPreference {
 
     fn __repr__(&self) -> PyResult<String> {
         self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum LayoutStrategy {
+    #[pyo3(name = "ALWAYS")]
+    #[default]
+    Always = 0,
+    #[pyo3(name = "AUTO")]
+    Auto = 1,
+}
+#[pymethods]
+impl LayoutStrategy {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "always" => return Ok(Self::Always),
+                "auto" => return Ok(Self::Auto),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Always),
+                1 => return Ok(Self::Auto),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(LayoutStrategy);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize LayoutStrategy: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(frozen)]
+pub struct CredentialProviderConfig {
+    pub(crate) inner: xberg::CredentialProviderConfig,
+}
+
+#[pymethods]
+impl CredentialProviderConfig {
+    #[new]
+    #[pyo3(signature = (value=None, **kwargs))]
+    fn new(
+        py: Python<'_>,
+        value: Option<&Bound<'_, pyo3::types::PyAny>>,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        // Accept three call shapes:
+        //   CredentialProviderConfig("variant_name")                     -> unit variant
+        //   CredentialProviderConfig({"type": "variant", ...})           -> dict positional
+        //   CredentialProviderConfig(type="variant", field=...)          -> kwargs (idiomatic)
+        // Kwargs are assembled into a Python dict and re-serialized via json so
+        // serde_json can deserialize into the tagged enum.
+        let json_str: String = if let Some(v) = value {
+            if let Ok(s) = v.extract::<String>() {
+                serde_json::to_string(&serde_json::json!({ "type": s })).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid CredentialProviderConfig: {e}"))
+                })?
+            } else {
+                let json_mod = py.import("json")?;
+                json_mod.call_method1("dumps", (v,))?.extract()?
+            }
+        } else if let Some(kw) = kwargs {
+            let json_mod = py.import("json")?;
+            json_mod.call_method1("dumps", (kw,))?.extract()?
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "CredentialProviderConfig() requires a positional value or keyword arguments".to_string(),
+            ));
+        };
+        let inner: xberg::CredentialProviderConfig = serde_json::from_str(&json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid CredentialProviderConfig: {e}")))?;
+        Ok(Self { inner })
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(&self.inner)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize CredentialProviderConfig: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+
+    #[getter]
+    fn azure_ad(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "azure_ad" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn vertex_oauth2(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "vertex_oauth2" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn vertex_adc(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "vertex_adc" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn bedrock_web_identity(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "bedrock_web_identity" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn r#type(&self) -> pyo3::PyResult<String> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        json.get("type")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("type not found in serialized enum"))
+    }
+    #[pyo3(name = "azure_ad")]
+    #[pyo3(signature = (tenant_id, client_id, client_secret, scope=None))]
+    #[staticmethod]
+    pub fn _factory_azure_ad(
+        tenant_id: String,
+        client_id: String,
+        client_secret: String,
+        scope: Option<String>,
+    ) -> Self {
+        Self {
+            inner: xberg::CredentialProviderConfig::AzureAd {
+                tenant_id,
+                client_id,
+                client_secret,
+                scope,
+            },
+        }
+    }
+
+    #[pyo3(name = "vertex_oauth2")]
+    #[pyo3(signature = (service_account_key_file, scope=None))]
+    #[staticmethod]
+    pub fn _factory_vertex_oauth2(service_account_key_file: String, scope: Option<String>) -> Self {
+        Self {
+            inner: xberg::CredentialProviderConfig::VertexOauth2 {
+                service_account_key_file,
+                scope,
+            },
+        }
+    }
+
+    #[pyo3(name = "vertex_adc")]
+    #[pyo3(signature = (scope=None))]
+    #[staticmethod]
+    pub fn _factory_vertex_adc(scope: Option<String>) -> Self {
+        Self {
+            inner: xberg::CredentialProviderConfig::VertexAdc { scope },
+        }
+    }
+
+    #[pyo3(name = "bedrock_web_identity")]
+    #[pyo3(signature = (role_arn, token_file, session_name=None, region=None))]
+    #[staticmethod]
+    pub fn _factory_bedrock_web_identity(
+        role_arn: String,
+        token_file: String,
+        session_name: Option<String>,
+        region: Option<String>,
+    ) -> Self {
+        Self {
+            inner: xberg::CredentialProviderConfig::BedrockWebIdentity {
+                role_arn,
+                token_file,
+                session_name,
+                region,
+            },
+        }
+    }
+}
+
+impl From<CredentialProviderConfig> for xberg::CredentialProviderConfig {
+    fn from(val: CredentialProviderConfig) -> Self {
+        val.inner
+    }
+}
+
+impl From<xberg::CredentialProviderConfig> for CredentialProviderConfig {
+    fn from(val: xberg::CredentialProviderConfig) -> Self {
+        Self { inner: val }
+    }
+}
+
+impl serde::Serialize for CredentialProviderConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for CredentialProviderConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let inner = xberg::CredentialProviderConfig::deserialize(deserializer)?;
+        Ok(Self { inner })
     }
 }
 
@@ -13739,6 +17132,144 @@ impl Default for VlmFallbackPolicy {
 impl<'de> serde::Deserialize<'de> for VlmFallbackPolicy {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let inner = xberg::VlmFallbackPolicy::deserialize(deserializer)?;
+        Ok(Self { inner })
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(frozen)]
+pub struct OcrStrategy {
+    pub(crate) inner: xberg::OcrStrategy,
+}
+
+#[pymethods]
+impl OcrStrategy {
+    #[new]
+    #[pyo3(signature = (value=None, **kwargs))]
+    fn new(
+        py: Python<'_>,
+        value: Option<&Bound<'_, pyo3::types::PyAny>>,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        // Accept three call shapes:
+        //   OcrStrategy("variant_name")                     -> unit variant
+        //   OcrStrategy({"type": "variant", ...})           -> dict positional
+        //   OcrStrategy(type="variant", field=...)          -> kwargs (idiomatic)
+        // Kwargs are assembled into a Python dict and re-serialized via json so
+        // serde_json can deserialize into the tagged enum.
+        let json_str: String = if let Some(v) = value {
+            if let Ok(s) = v.extract::<String>() {
+                serde_json::to_string(&serde_json::json!({ "mode": s }))
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid OcrStrategy: {e}")))?
+            } else {
+                let json_mod = py.import("json")?;
+                json_mod.call_method1("dumps", (v,))?.extract()?
+            }
+        } else if let Some(kw) = kwargs {
+            let json_mod = py.import("json")?;
+            json_mod.call_method1("dumps", (kw,))?.extract()?
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "OcrStrategy() requires a positional value or keyword arguments".to_string(),
+            ));
+        };
+        let inner: xberg::OcrStrategy = serde_json::from_str(&json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid OcrStrategy: {e}")))?;
+        Ok(Self { inner })
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(&self.inner)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize OcrStrategy: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+
+    #[getter]
+    fn auto(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "mode";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "auto" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn scanned_pages(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "mode";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "scanned_pages" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn mode(&self) -> pyo3::PyResult<String> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        json.get("mode")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("mode not found in serialized enum"))
+    }
+    #[pyo3(name = "scanned_pages")]
+    #[staticmethod]
+    pub fn _factory_scanned_pages(min_confidence: f64) -> Self {
+        Self {
+            inner: xberg::OcrStrategy::ScannedPages { min_confidence },
+        }
+    }
+}
+
+impl From<OcrStrategy> for xberg::OcrStrategy {
+    fn from(val: OcrStrategy) -> Self {
+        val.inner
+    }
+}
+
+impl From<xberg::OcrStrategy> for OcrStrategy {
+    fn from(val: xberg::OcrStrategy) -> Self {
+        Self { inner: val }
+    }
+}
+
+impl serde::Serialize for OcrStrategy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+impl Default for OcrStrategy {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for OcrStrategy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let inner = xberg::OcrStrategy::deserialize(deserializer)?;
         Ok(Self { inner })
     }
 }
@@ -14202,6 +17733,61 @@ impl<'de> serde::Deserialize<'de> for EmbeddingModelType {
     }
 }
 
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum RerankerHead {
+    #[pyo3(name = "CROSS_ENCODER")]
+    #[default]
+    CrossEncoder = 0,
+    #[pyo3(name = "QWEN3_GENERATIVE")]
+    Qwen3Generative = 1,
+}
+#[pymethods]
+impl RerankerHead {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "crossencoder" => return Ok(Self::CrossEncoder),
+                "cross_encoder" => return Ok(Self::CrossEncoder),
+                "qwen3generative" => return Ok(Self::Qwen3Generative),
+                "qwen3_generative" => return Ok(Self::Qwen3Generative),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::CrossEncoder),
+                1 => return Ok(Self::Qwen3Generative),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(RerankerHead);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize RerankerHead: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(frozen)]
 pub struct RerankerModelType {
@@ -14345,13 +17931,14 @@ impl RerankerModelType {
     }
 
     #[pyo3(name = "custom")]
-    #[pyo3(signature = (model_id, model_file=None, additional_files=None, max_length=None))]
+    #[pyo3(signature = (model_id, model_file=None, additional_files=None, max_length=None, head=None))]
     #[staticmethod]
     pub fn _factory_custom(
         model_id: String,
         model_file: Option<String>,
         additional_files: Option<Vec<String>>,
         max_length: Option<i64>,
+        head: Option<RerankerHead>,
     ) -> Self {
         Self {
             inner: xberg::RerankerModelType::Custom {
@@ -14359,6 +17946,7 @@ impl RerankerModelType {
                 model_file,
                 additional_files: additional_files.unwrap_or_default().into_iter().collect(),
                 max_length,
+                head: head.unwrap_or_default().into(),
             },
         }
     }
@@ -14409,6 +17997,191 @@ impl Default for RerankerModelType {
 impl<'de> serde::Deserialize<'de> for RerankerModelType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let inner = xberg::RerankerModelType::deserialize(deserializer)?;
+        Ok(Self { inner })
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(frozen)]
+pub struct SparseEmbeddingModelType {
+    pub(crate) inner: xberg::SparseEmbeddingModelType,
+}
+
+#[pymethods]
+impl SparseEmbeddingModelType {
+    #[new]
+    #[pyo3(signature = (value=None, **kwargs))]
+    fn new(
+        py: Python<'_>,
+        value: Option<&Bound<'_, pyo3::types::PyAny>>,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        // Accept three call shapes:
+        //   SparseEmbeddingModelType("variant_name")                     -> unit variant
+        //   SparseEmbeddingModelType({"type": "variant", ...})           -> dict positional
+        //   SparseEmbeddingModelType(type="variant", field=...)          -> kwargs (idiomatic)
+        // Kwargs are assembled into a Python dict and re-serialized via json so
+        // serde_json can deserialize into the tagged enum.
+        let json_str: String = if let Some(v) = value {
+            if let Ok(s) = v.extract::<String>() {
+                serde_json::to_string(&serde_json::json!({ "type": s })).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid SparseEmbeddingModelType: {e}"))
+                })?
+            } else {
+                let json_mod = py.import("json")?;
+                json_mod.call_method1("dumps", (v,))?.extract()?
+            }
+        } else if let Some(kw) = kwargs {
+            let json_mod = py.import("json")?;
+            json_mod.call_method1("dumps", (kw,))?.extract()?
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "SparseEmbeddingModelType() requires a positional value or keyword arguments".to_string(),
+            ));
+        };
+        let inner: xberg::SparseEmbeddingModelType = serde_json::from_str(&json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid SparseEmbeddingModelType: {e}")))?;
+        Ok(Self { inner })
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(&self.inner)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize SparseEmbeddingModelType: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+
+    #[getter]
+    fn preset(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "preset" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn custom(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "custom" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn plugin(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "plugin" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn r#type(&self) -> pyo3::PyResult<String> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        json.get("type")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("type not found in serialized enum"))
+    }
+    #[pyo3(name = "preset")]
+    #[staticmethod]
+    pub fn _factory_preset(name: String) -> Self {
+        Self {
+            inner: xberg::SparseEmbeddingModelType::Preset { name },
+        }
+    }
+
+    #[pyo3(name = "custom")]
+    #[pyo3(signature = (model_id, model_file=None, additional_files=None, max_length=None))]
+    #[staticmethod]
+    pub fn _factory_custom(
+        model_id: String,
+        model_file: Option<String>,
+        additional_files: Option<Vec<String>>,
+        max_length: Option<i64>,
+    ) -> Self {
+        Self {
+            inner: xberg::SparseEmbeddingModelType::Custom {
+                model_id,
+                model_file,
+                additional_files: additional_files.unwrap_or_default().into_iter().collect(),
+                max_length,
+            },
+        }
+    }
+
+    #[pyo3(name = "plugin")]
+    #[staticmethod]
+    pub fn _factory_plugin(name: String) -> Self {
+        Self {
+            inner: xberg::SparseEmbeddingModelType::Plugin { name },
+        }
+    }
+}
+
+impl From<SparseEmbeddingModelType> for xberg::SparseEmbeddingModelType {
+    fn from(val: SparseEmbeddingModelType) -> Self {
+        val.inner
+    }
+}
+
+impl From<xberg::SparseEmbeddingModelType> for SparseEmbeddingModelType {
+    fn from(val: xberg::SparseEmbeddingModelType) -> Self {
+        Self { inner: val }
+    }
+}
+
+impl serde::Serialize for SparseEmbeddingModelType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+impl Default for SparseEmbeddingModelType {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for SparseEmbeddingModelType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let inner = xberg::SparseEmbeddingModelType::deserialize(deserializer)?;
         Ok(Self { inner })
     }
 }
@@ -14793,8 +18566,30 @@ pub enum PdfAnnotationType {
     Underline = 4,
     #[pyo3(name = "STRIKE_OUT")]
     StrikeOut = 5,
+    #[pyo3(name = "SQUIGGLY")]
+    Squiggly = 6,
+    #[pyo3(name = "INK")]
+    Ink = 7,
+    #[pyo3(name = "SQUARE")]
+    Square = 8,
+    #[pyo3(name = "CIRCLE")]
+    Circle = 9,
+    #[pyo3(name = "POLYGON")]
+    Polygon = 10,
+    #[pyo3(name = "POLY_LINE")]
+    PolyLine = 11,
+    #[pyo3(name = "LINE")]
+    Line = 12,
+    #[pyo3(name = "CARET")]
+    Caret = 13,
+    #[pyo3(name = "FILE_ATTACHMENT")]
+    FileAttachment = 14,
+    #[pyo3(name = "SOUND")]
+    Sound = 15,
+    #[pyo3(name = "MOVIE")]
+    Movie = 16,
     #[pyo3(name = "OTHER")]
-    Other = 6,
+    Other = 17,
 }
 #[pymethods]
 impl PdfAnnotationType {
@@ -14812,6 +18607,19 @@ impl PdfAnnotationType {
                 "underline" => return Ok(Self::Underline),
                 "strikeout" => return Ok(Self::StrikeOut),
                 "strike_out" => return Ok(Self::StrikeOut),
+                "squiggly" => return Ok(Self::Squiggly),
+                "ink" => return Ok(Self::Ink),
+                "square" => return Ok(Self::Square),
+                "circle" => return Ok(Self::Circle),
+                "polygon" => return Ok(Self::Polygon),
+                "polyline" => return Ok(Self::PolyLine),
+                "poly_line" => return Ok(Self::PolyLine),
+                "line" => return Ok(Self::Line),
+                "caret" => return Ok(Self::Caret),
+                "fileattachment" => return Ok(Self::FileAttachment),
+                "file_attachment" => return Ok(Self::FileAttachment),
+                "sound" => return Ok(Self::Sound),
+                "movie" => return Ok(Self::Movie),
                 "other" => return Ok(Self::Other),
                 _ => {}
             }
@@ -14825,7 +18633,18 @@ impl PdfAnnotationType {
                 3 => return Ok(Self::Stamp),
                 4 => return Ok(Self::Underline),
                 5 => return Ok(Self::StrikeOut),
-                6 => return Ok(Self::Other),
+                6 => return Ok(Self::Squiggly),
+                7 => return Ok(Self::Ink),
+                8 => return Ok(Self::Square),
+                9 => return Ok(Self::Circle),
+                10 => return Ok(Self::Polygon),
+                11 => return Ok(Self::PolyLine),
+                12 => return Ok(Self::Line),
+                13 => return Ok(Self::Caret),
+                14 => return Ok(Self::FileAttachment),
+                15 => return Ok(Self::Sound),
+                16 => return Ok(Self::Movie),
+                17 => return Ok(Self::Other),
                 _ => {}
             }
         }
@@ -15433,6 +19252,23 @@ impl NodeContent {
     }
 
     #[getter]
+    fn comment(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "node_type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "comment" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
     fn group(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
         let json =
             serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -15679,6 +19515,14 @@ impl NodeContent {
     pub fn _factory_footnote(text: String) -> Self {
         Self {
             inner: xberg::NodeContent::Footnote { text },
+        }
+    }
+
+    #[pyo3(name = "comment")]
+    #[staticmethod]
+    pub fn _factory_comment(text: String) -> Self {
+        Self {
+            inner: xberg::NodeContent::Comment { text },
         }
     }
 
@@ -16458,15 +20302,21 @@ pub enum ChunkType {
     Formula = 7,
     #[pyo3(name = "CODE_BLOCK")]
     CodeBlock = 8,
+    #[pyo3(name = "FUNCTION")]
+    Function = 9,
+    #[pyo3(name = "CLASS")]
+    Class = 10,
+    #[pyo3(name = "MODULE")]
+    Module = 11,
     #[pyo3(name = "IMAGE")]
-    Image = 9,
+    Image = 12,
     #[pyo3(name = "ORG_CHART")]
-    OrgChart = 10,
+    OrgChart = 13,
     #[pyo3(name = "DIAGRAM")]
-    Diagram = 11,
+    Diagram = 14,
     #[pyo3(name = "UNKNOWN")]
     #[default]
-    Unknown = 12,
+    Unknown = 15,
 }
 #[pymethods]
 impl ChunkType {
@@ -16491,6 +20341,9 @@ impl ChunkType {
                 "formula" => return Ok(Self::Formula),
                 "codeblock" => return Ok(Self::CodeBlock),
                 "code_block" => return Ok(Self::CodeBlock),
+                "function" => return Ok(Self::Function),
+                "class" => return Ok(Self::Class),
+                "module" => return Ok(Self::Module),
                 "image" => return Ok(Self::Image),
                 "orgchart" => return Ok(Self::OrgChart),
                 "org_chart" => return Ok(Self::OrgChart),
@@ -16511,10 +20364,13 @@ impl ChunkType {
                 6 => return Ok(Self::TableLike),
                 7 => return Ok(Self::Formula),
                 8 => return Ok(Self::CodeBlock),
-                9 => return Ok(Self::Image),
-                10 => return Ok(Self::OrgChart),
-                11 => return Ok(Self::Diagram),
-                12 => return Ok(Self::Unknown),
+                9 => return Ok(Self::Function),
+                10 => return Ok(Self::Class),
+                11 => return Ok(Self::Module),
+                12 => return Ok(Self::Image),
+                13 => return Ok(Self::OrgChart),
+                14 => return Ok(Self::Diagram),
+                15 => return Ok(Self::Unknown),
                 _ => {}
             }
         }
@@ -17072,20 +20928,11 @@ impl FormatMetadata {
     }
 
     #[getter]
-    fn code(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
-        let json =
-            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let tag_field = "format_type";
-        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
-        if tag_value != "code" {
-            return Ok(None);
+    fn code(&self) -> Option<CodeMetadata> {
+        match &self.inner {
+            xberg::FormatMetadata::Code(data) => Some(data.clone().into()),
+            _ => None,
         }
-        let json_str = json.to_string();
-        let json_mod = py.import("json")?;
-        let py_dict = json_mod
-            .call_method1("loads", (&json_str,))?
-            .cast_into::<pyo3::types::PyDict>()?;
-        Ok(Some(py_dict.unbind()))
     }
 
     #[getter]
@@ -17127,6 +20974,66 @@ impl<'de> serde::Deserialize<'de> for FormatMetadata {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let inner = xberg::FormatMetadata::deserialize(deserializer)?;
         Ok(Self { inner })
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum CodeDataNodeKind {
+    #[pyo3(name = "KEY_VALUE")]
+    #[default]
+    KeyValue = 0,
+    #[pyo3(name = "ELEMENT")]
+    Element = 1,
+    #[pyo3(name = "SEQUENCE")]
+    Sequence = 2,
+}
+#[pymethods]
+impl CodeDataNodeKind {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "keyvalue" => return Ok(Self::KeyValue),
+                "key_value" => return Ok(Self::KeyValue),
+                "element" => return Ok(Self::Element),
+                "sequence" => return Ok(Self::Sequence),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::KeyValue),
+                1 => return Ok(Self::Element),
+                2 => return Ok(Self::Sequence),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(CodeDataNodeKind);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize CodeDataNodeKind: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
     }
 }
 
@@ -18604,6 +22511,63 @@ impl RegionKind {
 }
 
 #[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum EmbeddingsEmbeddingBackend {
+    #[pyo3(name = "ONNX")]
+    #[default]
+    Onnx = 0,
+    #[pyo3(name = "STATIC")]
+    Static = 1,
+}
+#[pymethods]
+impl EmbeddingsEmbeddingBackend {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "onnx" => return Ok(Self::Onnx),
+                "static" => return Ok(Self::Static),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Onnx),
+                1 => return Ok(Self::Static),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(EmbeddingsEmbeddingBackend);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to serialize EmbeddingsEmbeddingBackend: {e}"
+                ))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[pyclass(eq, eq_int, from_py_object)]
 pub enum KeywordAlgorithm {
@@ -19387,6 +23351,122 @@ impl PSMMode {
 }
 
 #[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum ProbeStatus {
+    #[pyo3(name = "PASS")]
+    #[default]
+    Pass = 0,
+    #[pyo3(name = "WARN")]
+    Warn = 1,
+    #[pyo3(name = "FAIL")]
+    Fail = 2,
+    #[pyo3(name = "SKIP")]
+    Skip = 3,
+}
+#[pymethods]
+impl ProbeStatus {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "pass" => return Ok(Self::Pass),
+                "warn" => return Ok(Self::Warn),
+                "fail" => return Ok(Self::Fail),
+                "skip" => return Ok(Self::Skip),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Pass),
+                1 => return Ok(Self::Warn),
+                2 => return Ok(Self::Fail),
+                3 => return Ok(Self::Skip),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(ProbeStatus);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize ProbeStatus: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum PaddleInferenceBackend {
+    #[pyo3(name = "ORT")]
+    #[default]
+    Ort = 0,
+    #[pyo3(name = "TRACT")]
+    Tract = 1,
+}
+#[pymethods]
+impl PaddleInferenceBackend {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "ort" => return Ok(Self::Ort),
+                "tract" => return Ok(Self::Tract),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Ort),
+                1 => return Ok(Self::Tract),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(PaddleInferenceBackend);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize PaddleInferenceBackend: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[pyclass(eq, eq_int, from_py_object)]
 pub enum PaddleLanguage {
     #[pyo3(name = "ENGLISH")]
@@ -19791,6 +23871,55 @@ impl BrowserBackend {
     }
 }
 
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum DocumentContentEncoding {
+    #[pyo3(name = "BASE64")]
+    #[default]
+    Base64 = 0,
+}
+#[pymethods]
+impl DocumentContentEncoding {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            if matches!(s_lower.as_str(), "base64") {
+                return Ok(Self::Base64);
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            if n == 0 {
+                return Ok(Self::Base64);
+            }
+        }
+        let type_name = stringify!(DocumentContentEncoding);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize DocumentContentEncoding: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(frozen)]
 pub struct AuthConfig {
@@ -20047,6 +24176,637 @@ impl AssetCategory {
     }
 }
 
+#[derive(Clone)]
+#[pyclass(frozen)]
+pub struct HostMatcher {
+    pub(crate) inner: crawlberg::HostMatcher,
+}
+
+#[pymethods]
+impl HostMatcher {
+    #[new]
+    #[pyo3(signature = (value=None, **kwargs))]
+    fn new(
+        py: Python<'_>,
+        value: Option<&Bound<'_, pyo3::types::PyAny>>,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        // Accept three call shapes:
+        //   HostMatcher("variant_name")                     -> unit variant
+        //   HostMatcher({"type": "variant", ...})           -> dict positional
+        //   HostMatcher(type="variant", field=...)          -> kwargs (idiomatic)
+        // Kwargs are assembled into a Python dict and re-serialized via json so
+        // serde_json can deserialize into the tagged enum.
+        let json_str: String = if let Some(v) = value {
+            if let Ok(s) = v.extract::<String>() {
+                serde_json::to_string(&serde_json::json!({ "type": s }))
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid HostMatcher: {e}")))?
+            } else {
+                let json_mod = py.import("json")?;
+                json_mod.call_method1("dumps", (v,))?.extract()?
+            }
+        } else if let Some(kw) = kwargs {
+            let json_mod = py.import("json")?;
+            json_mod.call_method1("dumps", (kw,))?.extract()?
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "HostMatcher() requires a positional value or keyword arguments".to_string(),
+            ));
+        };
+        let inner: crawlberg::HostMatcher = serde_json::from_str(&json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid HostMatcher: {e}")))?;
+        Ok(Self { inner })
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(&self.inner)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize HostMatcher: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+
+    #[getter]
+    fn exact(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "exact" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn suffix(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "suffix" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn cidr(&self, py: Python<'_>) -> PyResult<Option<pyo3::Py<pyo3::types::PyDict>>> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let tag_field = "type";
+        let tag_value = json.get(tag_field).and_then(|v| v.as_str()).unwrap_or("");
+        if tag_value != "cidr" {
+            return Ok(None);
+        }
+        let json_str = json.to_string();
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod
+            .call_method1("loads", (&json_str,))?
+            .cast_into::<pyo3::types::PyDict>()?;
+        Ok(Some(py_dict.unbind()))
+    }
+
+    #[getter]
+    fn r#type(&self) -> pyo3::PyResult<String> {
+        let json =
+            serde_json::to_value(&self.inner).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        json.get("type")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("type not found in serialized enum"))
+    }
+}
+
+impl From<HostMatcher> for crawlberg::HostMatcher {
+    fn from(val: HostMatcher) -> Self {
+        val.inner
+    }
+}
+
+impl From<crawlberg::HostMatcher> for HostMatcher {
+    fn from(val: crawlberg::HostMatcher) -> Self {
+        Self { inner: val }
+    }
+}
+
+impl serde::Serialize for HostMatcher {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for HostMatcher {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let inner = crawlberg::HostMatcher::deserialize(deserializer)?;
+        Ok(Self { inner })
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum PreprocessingPreset {
+    #[pyo3(name = "MINIMAL")]
+    Minimal = 0,
+    #[pyo3(name = "STANDARD")]
+    #[default]
+    Standard = 1,
+    #[pyo3(name = "AGGRESSIVE")]
+    Aggressive = 2,
+}
+#[pymethods]
+impl PreprocessingPreset {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "minimal" => return Ok(Self::Minimal),
+                "standard" => return Ok(Self::Standard),
+                "aggressive" => return Ok(Self::Aggressive),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Minimal),
+                1 => return Ok(Self::Standard),
+                2 => return Ok(Self::Aggressive),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(PreprocessingPreset);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize PreprocessingPreset: {e}"))
+            })
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum HeadingStyle {
+    #[pyo3(name = "UNDERLINED")]
+    Underlined = 0,
+    #[pyo3(name = "ATX")]
+    #[default]
+    Atx = 1,
+    #[pyo3(name = "ATX_CLOSED")]
+    AtxClosed = 2,
+}
+#[pymethods]
+impl HeadingStyle {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "underlined" => return Ok(Self::Underlined),
+                "atx" => return Ok(Self::Atx),
+                "atxclosed" => return Ok(Self::AtxClosed),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Underlined),
+                1 => return Ok(Self::Atx),
+                2 => return Ok(Self::AtxClosed),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(HeadingStyle);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize HeadingStyle: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum ListIndentType {
+    #[pyo3(name = "SPACES")]
+    #[default]
+    Spaces = 0,
+    #[pyo3(name = "TABS")]
+    Tabs = 1,
+}
+#[pymethods]
+impl ListIndentType {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "spaces" => return Ok(Self::Spaces),
+                "tabs" => return Ok(Self::Tabs),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Spaces),
+                1 => return Ok(Self::Tabs),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(ListIndentType);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize ListIndentType: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum WhitespaceMode {
+    #[pyo3(name = "NORMALIZED")]
+    #[default]
+    Normalized = 0,
+    #[pyo3(name = "STRICT")]
+    Strict = 1,
+}
+#[pymethods]
+impl WhitespaceMode {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "normalized" => return Ok(Self::Normalized),
+                "strict" => return Ok(Self::Strict),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Normalized),
+                1 => return Ok(Self::Strict),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(WhitespaceMode);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize WhitespaceMode: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum NewlineStyle {
+    #[pyo3(name = "SPACES")]
+    #[default]
+    Spaces = 0,
+    #[pyo3(name = "BACKSLASH")]
+    Backslash = 1,
+}
+#[pymethods]
+impl NewlineStyle {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "spaces" => return Ok(Self::Spaces),
+                "backslash" => return Ok(Self::Backslash),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Spaces),
+                1 => return Ok(Self::Backslash),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(NewlineStyle);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize NewlineStyle: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum CodeBlockStyle {
+    #[pyo3(name = "INDENTED")]
+    Indented = 0,
+    #[pyo3(name = "BACKTICKS")]
+    #[default]
+    Backticks = 1,
+    #[pyo3(name = "TILDES")]
+    Tildes = 2,
+}
+#[pymethods]
+impl CodeBlockStyle {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "indented" => return Ok(Self::Indented),
+                "backticks" => return Ok(Self::Backticks),
+                "tildes" => return Ok(Self::Tildes),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Indented),
+                1 => return Ok(Self::Backticks),
+                2 => return Ok(Self::Tildes),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(CodeBlockStyle);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize CodeBlockStyle: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum HighlightStyle {
+    #[pyo3(name = "DOUBLE_EQUAL")]
+    #[default]
+    DoubleEqual = 0,
+    #[pyo3(name = "HTML")]
+    Html = 1,
+    #[pyo3(name = "BOLD")]
+    Bold = 2,
+    #[pyo3(name = "NONE")]
+    None = 3,
+}
+#[pymethods]
+impl HighlightStyle {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "doubleequal" => return Ok(Self::DoubleEqual),
+                "html" => return Ok(Self::Html),
+                "bold" => return Ok(Self::Bold),
+                "none" => return Ok(Self::None),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::DoubleEqual),
+                1 => return Ok(Self::Html),
+                2 => return Ok(Self::Bold),
+                3 => return Ok(Self::None),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(HighlightStyle);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize HighlightStyle: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum LinkStyle {
+    #[pyo3(name = "INLINE")]
+    #[default]
+    Inline = 0,
+    #[pyo3(name = "REFERENCE")]
+    Reference = 1,
+}
+#[pymethods]
+impl LinkStyle {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "inline" => return Ok(Self::Inline),
+                "reference" => return Ok(Self::Reference),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Inline),
+                1 => return Ok(Self::Reference),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(LinkStyle);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize LinkStyle: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[pyclass(eq, eq_int, from_py_object)]
+pub enum UrlEscapeStyle {
+    #[pyo3(name = "ANGLE")]
+    #[default]
+    Angle = 0,
+    #[pyo3(name = "PERCENT")]
+    Percent = 1,
+}
+#[pymethods]
+impl UrlEscapeStyle {
+    #[new]
+    fn __new__(value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::prelude::*;
+        // Try to extract as string first
+        if let Ok(s) = value.extract::<&str>() {
+            let s_lower = s.to_lowercase();
+            match s_lower.as_str() {
+                "angle" => return Ok(Self::Angle),
+                "percent" => return Ok(Self::Percent),
+                _ => {}
+            }
+        }
+        // Try to extract as integer (by discriminant value)
+        if let Ok(n) = value.extract::<i32>() {
+            match n {
+                0 => return Ok(Self::Angle),
+                1 => return Ok(Self::Percent),
+                _ => {}
+            }
+        }
+        let type_name = stringify!(UrlEscapeStyle);
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid value for {}: {:#?}. Expected variant name (str) or discriminant (int)",
+            type_name, value
+        )))
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        serde_json::to_value(self)
+            .map(|value| match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize UrlEscapeStyle: {e}")))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.__str__()
+    }
+}
+
 #[allow(clippy::missing_errors_doc)]
 #[pyfunction]
 #[pyo3(signature = (input, config))]
@@ -20107,6 +24867,14 @@ pub fn list_supported_formats(py: Python<'_>) -> Vec<SupportedFormat> {
         .into_iter()
         .map(Into::into)
         .collect()
+}
+
+#[allow(clippy::missing_errors_doc)]
+#[pyfunction]
+#[pyo3(signature = ())]
+pub fn ensure_initialized(py: Python<'_>) -> PyResult<()> {
+    py.detach(xberg::extractors::ensure_initialized)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -20237,6 +25005,26 @@ pub fn clear_validators(py: Python<'_>) -> PyResult<()> {
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
+#[allow(clippy::missing_errors_doc)]
+#[pyfunction]
+#[pyo3(signature = (result, config))]
+pub fn classify_chunks<'py>(
+    py: Python<'py>,
+    result: ExtractedDocument,
+    config: ChunkClassificationConfig,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let mut result_core: xberg::ExtractedDocument = result.into();
+
+        let config_core: xberg::ChunkClassificationConfig = config.into();
+
+        let result = xberg::text::classification::classify_chunks(&mut result_core, &config_core)
+            .await
+            .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string()))?;
+        Ok(result)
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (markdown))]
 pub fn find_unmarked_claims(py: Python<'_>, markdown: String) -> Vec<String> {
@@ -20247,6 +25035,83 @@ pub fn find_unmarked_claims(py: Python<'_>, markdown: String) -> Vec<String> {
 #[pyo3(signature = (excerpt, source_text))]
 pub fn verify_excerpt(py: Python<'_>, excerpt: String, source_text: String) -> bool {
     py.detach(|| xberg::verify_excerpt(&excerpt, &source_text))
+}
+
+#[pyfunction]
+#[pyo3(signature = (query, doc))]
+pub fn max_sim_score(py: Python<'_>, query: MultiVectorEmbedding, doc: MultiVectorEmbedding) -> f64 {
+    let query_core: xberg::MultiVectorEmbedding = query.into();
+
+    let doc_core: xberg::MultiVectorEmbedding = doc.into();
+
+    py.detach(|| xberg::max_sim_score(&query_core, &doc_core))
+}
+
+#[pyfunction]
+#[pyo3(signature = (query, docs))]
+pub fn max_sim_rank(
+    py: Python<'_>,
+    query: MultiVectorEmbedding,
+    docs: Vec<MultiVectorEmbedding>,
+) -> Vec<LateInteractionMatch> {
+    let query_core: xberg::MultiVectorEmbedding = query.into();
+
+    let docs_core: Vec<_> = docs.into_iter().map(Into::into).collect();
+
+    py.detach(|| xberg::max_sim_rank(&query_core, &docs_core))
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+#[pyfunction]
+#[pyo3(signature = (config))]
+pub fn doctor(py: Python<'_>, config: ExtractionConfig) -> DoctorReport {
+    let config_core: xberg::ExtractionConfig = config.into();
+
+    py.detach(|| xberg::doctor(&config_core)).into()
+}
+
+#[pyfunction]
+#[pyo3(signature = ())]
+pub fn install_pdf_render_diagnostics(py: Python<'_>) -> bool {
+    py.detach(xberg::pdf::render::install_pdf_render_diagnostics)
+}
+
+#[pyfunction]
+#[pyo3(signature = ())]
+pub fn take_pdf_oxide_render_warnings(py: Python<'_>) -> Vec<ProcessingWarning> {
+    py.detach(xberg::pdf::render::take_pdf_oxide_render_warnings)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+#[pyfunction]
+#[pyo3(signature = (start_of_transcript, lang_id, transcribe, no_timestamps, timestamps))]
+pub fn build_decoder_prompt_tokens(
+    py: Python<'_>,
+    start_of_transcript: u32,
+    lang_id: u32,
+    transcribe: u32,
+    no_timestamps: u32,
+    timestamps: bool,
+) -> Vec<i64> {
+    py.detach(|| {
+        xberg::transcription::engine::build_decoder_prompt_tokens(
+            start_of_transcript,
+            lang_id,
+            transcribe,
+            no_timestamps,
+            timestamps,
+        )
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (token_id, timestamp_begin_id))]
+pub fn timestamp_token_to_ms(py: Python<'_>, token_id: u32, timestamp_begin_id: u32) -> u32 {
+    py.detach(|| xberg::transcription::engine::timestamp_token_to_ms(token_id, timestamp_begin_id))
 }
 
 #[pyclass(name = "OcrBackend")]
@@ -20359,7 +25224,12 @@ impl xberg::plugins::Plugin for PyOcrBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyOcrBackendBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyOcrBackendBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -20511,7 +25381,12 @@ impl xberg::OcrBackend for PyOcrBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyOcrBackendBridge] host 'supports_language' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyOcrBackendBridge",
+                        method = "supports_language",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -20527,14 +25402,23 @@ impl xberg::OcrBackend for PyOcrBackendBridge {
                     ctx.call_method1("run", (bound_method,))
                 })
                 .and_then(|v| v.extract::<String>())
-                .and_then(|s| serde_json::from_str::<xberg::OcrBackendType>(&s).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("method 'backend_type' returned a value that does not match the expected return type `OcrBackendType`: {}. The returned value must be a mapping matching the fields of `OcrBackendType`.", e))))
+                .and_then(|s| {
+                    // Accept either the bare variant name (e.g. "Early", the natural thing for a host
+                    // to return from a plain Python string) or the JSON-quoted form (e.g. "\"Early\"").
+                    serde_json::from_str::<xberg::OcrBackendType>(&s)
+                        .or_else(|_| serde_json::from_value(serde_json::Value::String(s.clone())))
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("method 'backend_type' returned a value that does not match the expected return type `OcrBackendType`: {}. The returned value must be one of `OcrBackendType`'s variant names (e.g. \"Early\") or its JSON-quoted form.", e)))
+                })
                 .unwrap_or_else(|e| {
                     // This method's Rust signature is infallible, so a host exception
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!(
-                        "[PyOcrBackendBridge] host 'backend_type' raised; returning default: {e}"
+                    tracing::warn!(
+                        wrapper = "PyOcrBackendBridge",
+                        method = "backend_type",
+                        error = %e,
+                        "host callback raised; returning default"
                     );
                     Default::default()
                 })
@@ -20559,7 +25443,12 @@ impl xberg::OcrBackend for PyOcrBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyOcrBackendBridge] host 'supported_languages' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyOcrBackendBridge",
+                        method = "supported_languages",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -20583,7 +25472,12 @@ impl xberg::OcrBackend for PyOcrBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyOcrBackendBridge] host 'supports_table_detection' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyOcrBackendBridge",
+                        method = "supports_table_detection",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -20612,8 +25506,11 @@ impl xberg::OcrBackend for PyOcrBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!(
-                        "[PyOcrBackendBridge] host 'supports_document_processing' raised; returning default: {e}"
+                    tracing::warn!(
+                        wrapper = "PyOcrBackendBridge",
+                        method = "supports_document_processing",
+                        error = %e,
+                        "host callback raised; returning default"
                     );
                     Default::default()
                 })
@@ -20643,7 +25540,12 @@ impl xberg::OcrBackend for PyOcrBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyOcrBackendBridge] host 'emits_structured_markdown' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyOcrBackendBridge",
+                        method = "emits_structured_markdown",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21166,7 +26068,12 @@ impl xberg::plugins::Plugin for PyPostProcessorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyPostProcessorBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyPostProcessorBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21232,35 +26139,42 @@ impl xberg::PostProcessor for PyPostProcessorBridge {
         let result_owned = result.clone();
         let config_owned = config.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let __alef_updated: Option<xberg::ExtractedDocument> = tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 let obj = python_obj.bind(py);
-                let ctx = caller_ctx
-                    .map_err(|e| {
-                        xberg::XbergError::Other(format!("Plugin '{}' method 'process' failed: {}", cached_name, e))
-                    })?
-                    .into_bound(py);
+                let ctx = caller_ctx.map_err(|e| xberg::XbergError::Other(format!("Plugin '{}' method 'process' failed: {}", cached_name, e)))?.into_bound(py);
 
-                let bound_method = obj.getattr("process").map_err(|e| {
-                    xberg::XbergError::Other(format!("Plugin '{}' method 'process' failed: {}", cached_name, e))
-                })?;
-                ctx.call_method1(
-                    "run",
-                    (
-                        bound_method,
-                        ExtractedDocument::from(result_owned),
-                        ExtractionConfig::from(config_owned),
-                    ),
-                )
-                .map(|_| ())
-                .map_err(|e| {
-                    xberg::XbergError::Other(format!("Plugin '{}' method 'process' failed: {}", cached_name, e))
-                })
+                let bound_method = obj.getattr("process").map_err(|e| xberg::XbergError::Other(format!("Plugin '{}' method 'process' failed: {}", cached_name, e)))?;
+                let py_result = ctx.call_method1("run", (bound_method, ExtractedDocument::from(result_owned), ExtractionConfig::from(config_owned)))
+                    .map_err(|e| xberg::XbergError::Other(format!("Plugin '{}' method 'process' failed: {}", cached_name, e)))?;
+
+                // `None` means the host left the value unchanged — nothing to write back.
+                if py_result.is_none() {
+                    return Ok(None);
+                }
+                // Native fast-path: the host returned the (possibly modified) binding object directly.
+                if let Ok(native) = py_result.extract::<ExtractedDocument>() {
+                    return Ok(Some(<xberg::ExtractedDocument>::from(native)));
+                }
+                // Fallback: the host returned a plain mapping — round-trip through JSON.
+                let json_val: String = py
+                    .import("json")
+                    .and_then(|m| m.call_method1("dumps", (py_result,)))
+                    .and_then(|v| v.extract())
+                    .map_err(|e| xberg::XbergError::Other(format!("Plugin '{}': JSON serialization failed: {}", cached_name, e)))?;
+                serde_json::from_str::<xberg::ExtractedDocument>(&json_val)
+                    .map(Some)
+                    .map_err(|e| xberg::XbergError::Other(format!("Plugin '{}' method 'process' returned a value that does not match the expected type `ExtractedDocument`: {}. The returned value must be the (optionally modified) `ExtractedDocument`, or None to leave it unchanged.", cached_name, e)))
             })
         })
         .await
         .map_err(|e| xberg::XbergError::Other(format!("spawn_blocking failed: {}", e)))
-        .flatten()
+        .flatten()?;
+
+        if let Some(__alef_value) = __alef_updated {
+            *result = __alef_value;
+        }
+        Ok(())
     }
 
     fn processing_stage(&self) -> xberg::ProcessingStage {
@@ -21273,14 +26187,23 @@ impl xberg::PostProcessor for PyPostProcessorBridge {
                     ctx.call_method1("run", (bound_method,))
                 })
                 .and_then(|v| v.extract::<String>())
-                .and_then(|s| serde_json::from_str::<xberg::ProcessingStage>(&s).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("method 'processing_stage' returned a value that does not match the expected return type `ProcessingStage`: {}. The returned value must be a mapping matching the fields of `ProcessingStage`.", e))))
+                .and_then(|s| {
+                    // Accept either the bare variant name (e.g. "Early", the natural thing for a host
+                    // to return from a plain Python string) or the JSON-quoted form (e.g. "\"Early\"").
+                    serde_json::from_str::<xberg::ProcessingStage>(&s)
+                        .or_else(|_| serde_json::from_value(serde_json::Value::String(s.clone())))
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("method 'processing_stage' returned a value that does not match the expected return type `ProcessingStage`: {}. The returned value must be one of `ProcessingStage`'s variant names (e.g. \"Early\") or its JSON-quoted form.", e)))
+                })
                 .unwrap_or_else(|e| {
                     // This method's Rust signature is infallible, so a host exception
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!(
-                        "[PyPostProcessorBridge] host 'processing_stage' raised; returning default: {e}"
+                    tracing::warn!(
+                        wrapper = "PyPostProcessorBridge",
+                        method = "processing_stage",
+                        error = %e,
+                        "host callback raised; returning default"
                     );
                     Default::default()
                 })
@@ -21312,7 +26235,12 @@ impl xberg::PostProcessor for PyPostProcessorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyPostProcessorBridge] host 'should_process' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyPostProcessorBridge",
+                        method = "should_process",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21336,7 +26264,12 @@ impl xberg::PostProcessor for PyPostProcessorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyPostProcessorBridge] host 'estimated_duration_ms' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyPostProcessorBridge",
+                        method = "estimated_duration_ms",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21360,7 +26293,12 @@ impl xberg::PostProcessor for PyPostProcessorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyPostProcessorBridge] host 'priority' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyPostProcessorBridge",
+                        method = "priority",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21594,7 +26532,12 @@ impl xberg::plugins::Plugin for PyValidatorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyValidatorBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyValidatorBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21716,7 +26659,12 @@ impl xberg::Validator for PyValidatorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyValidatorBridge] host 'should_validate' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyValidatorBridge",
+                        method = "should_validate",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21740,7 +26688,12 @@ impl xberg::Validator for PyValidatorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyValidatorBridge] host 'priority' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyValidatorBridge",
+                        method = "priority",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -21925,7 +26878,12 @@ impl xberg::plugins::Plugin for PyDocumentExtractorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyDocumentExtractorBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyDocumentExtractorBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22032,8 +26990,11 @@ impl xberg::DocumentExtractor for PyDocumentExtractorBridge {
                         // cannot propagate. Log it before substituting the default value —
                         // a silent default is indistinguishable from a real result to the
                         // caller (e.g. a zero token count reads as "fits any budget").
-                        eprintln!(
-                            "[PyDocumentExtractorBridge] host 'supported_mime_types' raised; returning default: {e}"
+                        tracing::warn!(
+                            wrapper = "PyDocumentExtractorBridge",
+                            method = "supported_mime_types",
+                            error = %e,
+                            "host callback raised; returning default"
                         );
                         Default::default()
                     })
@@ -22064,7 +27025,12 @@ impl xberg::DocumentExtractor for PyDocumentExtractorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyDocumentExtractorBridge] host 'priority' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyDocumentExtractorBridge",
+                        method = "priority",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22088,7 +27054,12 @@ impl xberg::DocumentExtractor for PyDocumentExtractorBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyDocumentExtractorBridge] host 'can_handle' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyDocumentExtractorBridge",
+                        method = "can_handle",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22279,7 +27250,12 @@ impl xberg::plugins::Plugin for PyEmbeddingBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyEmbeddingBackendBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyEmbeddingBackendBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22344,7 +27320,12 @@ impl xberg::EmbeddingBackend for PyEmbeddingBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyEmbeddingBackendBridge] host 'dimensions' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyEmbeddingBackendBridge",
+                        method = "dimensions",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22482,7 +27463,12 @@ impl xberg::plugins::Plugin for PyRendererBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyRendererBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyRendererBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22668,7 +27654,12 @@ impl xberg::plugins::Plugin for PyRerankerBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyRerankerBackendBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyRerankerBackendBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22856,7 +27847,12 @@ impl xberg::plugins::Plugin for PyTokenizerBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyTokenizerBackendBridge] host 'version' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyTokenizerBackendBridge",
+                        method = "version",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -22920,7 +27916,12 @@ impl xberg::TokenizerBackend for PyTokenizerBackendBridge {
                     // cannot propagate. Log it before substituting the default value —
                     // a silent default is indistinguishable from a real result to the
                     // caller (e.g. a zero token count reads as "fits any budget").
-                    eprintln!("[PyTokenizerBackendBridge] host 'count_tokens' raised; returning default: {e}");
+                    tracing::warn!(
+                        wrapper = "PyTokenizerBackendBridge",
+                        method = "count_tokens",
+                        error = %e,
+                        "host callback raised; returning default"
+                    );
                     Default::default()
                 })
         })
@@ -23072,7 +28073,6 @@ fn resolve_error_to_py_err(e: xberg::ResolveError) -> pyo3::PyErr {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::CacheStats> for CacheStats {
     fn from(val: xberg::CacheStats) -> Self {
         Self {
@@ -23085,17 +28085,19 @@ impl From<xberg::CacheStats> for CacheStats {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<AccelerationConfig> for xberg::AccelerationConfig {
     fn from(val: AccelerationConfig) -> Self {
         Self {
             provider: val.provider.into(),
             device_id: val.device_id,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::AccelerationConfig> for AccelerationConfig {
     fn from(val: xberg::AccelerationConfig) -> Self {
         Self {
@@ -23105,7 +28107,7 @@ impl From<xberg::AccelerationConfig> for AccelerationConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<CaptioningConfig> for xberg::CaptioningConfig {
     fn from(val: CaptioningConfig) -> Self {
         Self {
@@ -23127,7 +28129,51 @@ impl From<xberg::CaptioningConfig> for CaptioningConfig {
     }
 }
 
+impl From<ChunkClassificationDefinition> for xberg::ChunkClassificationDefinition {
+    fn from(val: ChunkClassificationDefinition) -> Self {
+        Self {
+            label: val.label,
+            description: val.description,
+        }
+    }
+}
+
+impl From<xberg::ChunkClassificationDefinition> for ChunkClassificationDefinition {
+    fn from(val: xberg::ChunkClassificationDefinition) -> Self {
+        Self {
+            label: val.label.to_string(),
+            description: val.description.to_string(),
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<ChunkClassificationConfig> for xberg::ChunkClassificationConfig {
+    fn from(val: ChunkClassificationConfig) -> Self {
+        Self {
+            prompt_template: val.prompt_template,
+            definitions: val.definitions.into_iter().map(Into::into).collect(),
+            llm: val.llm.into(),
+            batch_size: val.batch_size,
+            max_concurrency: val.max_concurrency,
+        }
+    }
+}
+
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<xberg::ChunkClassificationConfig> for ChunkClassificationConfig {
+    fn from(val: xberg::ChunkClassificationConfig) -> Self {
+        Self {
+            prompt_template: val.prompt_template.map(|v| v.to_string()),
+            definitions: val.definitions.into_iter().map(Into::into).collect(),
+            llm: val.llm.into(),
+            batch_size: val.batch_size,
+            max_concurrency: val.max_concurrency,
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
 impl From<PageClassificationConfig> for xberg::PageClassificationConfig {
     fn from(val: PageClassificationConfig) -> Self {
         Self {
@@ -23151,40 +28197,63 @@ impl From<xberg::PageClassificationConfig> for PageClassificationConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<ContentFilterConfig> for xberg::ContentFilterConfig {
     fn from(val: ContentFilterConfig) -> Self {
         Self {
             include_headers: val.include_headers,
             include_footers: val.include_footers,
+            include_footnotes: val.include_footnotes,
             strip_repeating_text: val.strip_repeating_text,
             include_watermarks: val.include_watermarks,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ContentFilterConfig> for ContentFilterConfig {
     fn from(val: xberg::ContentFilterConfig) -> Self {
         Self {
             include_headers: val.include_headers,
             include_footers: val.include_footers,
+            include_footnotes: val.include_footnotes,
             strip_repeating_text: val.strip_repeating_text,
             include_watermarks: val.include_watermarks,
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
-impl From<EmailConfig> for xberg::EmailConfig {
-    fn from(val: EmailConfig) -> Self {
+#[allow(clippy::needless_update)]
+impl From<CsvConfig> for xberg::CsvConfig {
+    fn from(val: CsvConfig) -> Self {
         Self {
-            msg_fallback_codepage: val.msg_fallback_codepage,
+            delimiter: val.delimiter,
+            comment_prefixes: val.comment_prefixes.into_iter().collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
+impl From<xberg::CsvConfig> for CsvConfig {
+    fn from(val: xberg::CsvConfig) -> Self {
+        Self {
+            delimiter: val.delimiter.map(|v| v.to_string()),
+            comment_prefixes: val.comment_prefixes.into_iter().collect(),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<EmailConfig> for xberg::EmailConfig {
+    fn from(val: EmailConfig) -> Self {
+        Self {
+            msg_fallback_codepage: val.msg_fallback_codepage,
+            ..Default::default()
+        }
+    }
+}
+
 impl From<xberg::EmailConfig> for EmailConfig {
     fn from(val: xberg::EmailConfig) -> Self {
         Self {
@@ -23202,6 +28271,7 @@ impl From<ExtractionConfig> for xberg::ExtractionConfig {
             enable_quality_processing: val.enable_quality_processing,
             ocr: val.ocr.map(Into::into),
             force_ocr: val.force_ocr,
+            ocr_strategy: val.ocr_strategy.into(),
             force_ocr_pages: val.force_ocr_pages.map(|v| v.into_iter().collect()),
             disable_ocr: val.disable_ocr,
             chunking: val.chunking.map(Into::into),
@@ -23213,6 +28283,7 @@ impl From<ExtractionConfig> for xberg::ExtractionConfig {
             pages: val.pages.map(Into::into),
             keywords: val.keywords.map(Into::into),
             postprocessor: val.postprocessor.map(Into::into),
+            html_options: val.html_options.map(Into::into),
             html_output: val.html_output.map(Into::into),
             extraction_timeout_secs: val.extraction_timeout_secs,
             max_concurrent_extractions: val.max_concurrent_extractions,
@@ -23220,6 +28291,9 @@ impl From<ExtractionConfig> for xberg::ExtractionConfig {
             security_limits: val.security_limits.map(Into::into),
             max_embedded_file_bytes: val.max_embedded_file_bytes,
             output_format: val.output_format.into(),
+            escape_markdown: val.escape_markdown,
+            table_anchors: val.table_anchors,
+            jupyter_cell_rendering: val.jupyter_cell_rendering.into(),
             layout: val.layout.map(Into::into),
             transcription: val.transcription.map(Into::into),
             use_layout_for_markdown: val.use_layout_for_markdown,
@@ -23228,6 +28302,7 @@ impl From<ExtractionConfig> for xberg::ExtractionConfig {
             cache_namespace: val.cache_namespace,
             cache_ttl_secs: val.cache_ttl_secs,
             email: val.email.map(Into::into),
+            csv: val.csv.map(Into::into),
             url: val.url.into(),
             max_archive_depth: val.max_archive_depth,
             tree_sitter: val.tree_sitter.map(Into::into),
@@ -23237,6 +28312,7 @@ impl From<ExtractionConfig> for xberg::ExtractionConfig {
             summarization: val.summarization.map(Into::into),
             translation: val.translation.map(Into::into),
             page_classification: val.page_classification.map(Into::into),
+            chunk_classification: val.chunk_classification.map(Into::into),
             captioning: val.captioning.map(Into::into),
             qr_codes: val.qr_codes,
             ..Default::default()
@@ -23252,6 +28328,7 @@ impl From<xberg::ExtractionConfig> for ExtractionConfig {
             enable_quality_processing: val.enable_quality_processing,
             ocr: val.ocr.map(Into::into),
             force_ocr: val.force_ocr,
+            ocr_strategy: val.ocr_strategy.into(),
             force_ocr_pages: val.force_ocr_pages.map(|v| v.into_iter().collect()),
             disable_ocr: val.disable_ocr,
             chunking: val.chunking.map(Into::into),
@@ -23263,6 +28340,7 @@ impl From<xberg::ExtractionConfig> for ExtractionConfig {
             pages: val.pages.map(Into::into),
             keywords: val.keywords.map(Into::into),
             postprocessor: val.postprocessor.map(Into::into),
+            html_options: val.html_options.map(Into::into),
             html_output: val.html_output.map(Into::into),
             extraction_timeout_secs: val.extraction_timeout_secs,
             max_concurrent_extractions: val.max_concurrent_extractions,
@@ -23270,6 +28348,9 @@ impl From<xberg::ExtractionConfig> for ExtractionConfig {
             security_limits: val.security_limits.map(Into::into),
             max_embedded_file_bytes: val.max_embedded_file_bytes,
             output_format: val.output_format.into(),
+            escape_markdown: val.escape_markdown,
+            table_anchors: val.table_anchors,
+            jupyter_cell_rendering: val.jupyter_cell_rendering.into(),
             layout: val.layout.map(Into::into),
             transcription: val.transcription.map(Into::into),
             use_layout_for_markdown: val.use_layout_for_markdown,
@@ -23278,6 +28359,7 @@ impl From<xberg::ExtractionConfig> for ExtractionConfig {
             cache_namespace: val.cache_namespace.map(|v| v.to_string()),
             cache_ttl_secs: val.cache_ttl_secs,
             email: val.email.map(Into::into),
+            csv: val.csv.map(Into::into),
             url: val.url.into(),
             max_archive_depth: val.max_archive_depth,
             tree_sitter: val.tree_sitter.map(Into::into),
@@ -23287,6 +28369,7 @@ impl From<xberg::ExtractionConfig> for ExtractionConfig {
             summarization: val.summarization.map(Into::into),
             translation: val.translation.map(Into::into),
             page_classification: val.page_classification.map(Into::into),
+            chunk_classification: val.chunk_classification.map(Into::into),
             captioning: val.captioning.map(Into::into),
             qr_codes: val.qr_codes,
         }
@@ -23301,6 +28384,7 @@ impl From<FileExtractionConfig> for xberg::FileExtractionConfig {
             enable_quality_processing: val.enable_quality_processing,
             ocr: val.ocr.map(Into::into),
             force_ocr: val.force_ocr,
+            ocr_strategy: val.ocr_strategy.map(Into::into),
             force_ocr_pages: val.force_ocr_pages.map(|v| v.into_iter().collect()),
             disable_ocr: val.disable_ocr,
             chunking: val.chunking.map(Into::into),
@@ -23327,6 +28411,7 @@ impl From<FileExtractionConfig> for xberg::FileExtractionConfig {
             summarization: val.summarization.map(Into::into),
             translation: val.translation.map(Into::into),
             page_classification: val.page_classification.map(Into::into),
+            chunk_classification: val.chunk_classification.map(Into::into),
             captioning: val.captioning.map(Into::into),
             qr_codes: val.qr_codes,
             ..Default::default()
@@ -23341,6 +28426,7 @@ impl From<xberg::FileExtractionConfig> for FileExtractionConfig {
             enable_quality_processing: val.enable_quality_processing,
             ocr: val.ocr.map(Into::into),
             force_ocr: val.force_ocr,
+            ocr_strategy: val.ocr_strategy.map(Into::into),
             force_ocr_pages: val.force_ocr_pages.map(|v| v.into_iter().collect()),
             disable_ocr: val.disable_ocr,
             chunking: val.chunking.map(Into::into),
@@ -23367,23 +28453,24 @@ impl From<xberg::FileExtractionConfig> for FileExtractionConfig {
             summarization: val.summarization.map(Into::into),
             translation: val.translation.map(Into::into),
             page_classification: val.page_classification.map(Into::into),
+            chunk_classification: val.chunk_classification.map(Into::into),
             captioning: val.captioning.map(Into::into),
             qr_codes: val.qr_codes,
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<SvgOptions> for xberg::core::config::extraction::SvgOptions {
     fn from(val: SvgOptions) -> Self {
         Self {
             sanitize: val.sanitize,
             render_dpi: val.render_dpi,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::core::config::extraction::SvgOptions> for SvgOptions {
     fn from(val: xberg::core::config::extraction::SvgOptions) -> Self {
         Self {
@@ -23393,6 +28480,7 @@ impl From<xberg::core::config::extraction::SvgOptions> for SvgOptions {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ExtractInput> for xberg::ExtractInput {
     fn from(val: ExtractInput) -> Self {
@@ -23403,6 +28491,7 @@ impl From<ExtractInput> for xberg::ExtractInput {
             mime_type: val.mime_type,
             filename: val.filename,
             config: val.config.map(Into::into),
+            ..Default::default()
         }
     }
 }
@@ -23421,7 +28510,6 @@ impl From<xberg::ExtractInput> for ExtractInput {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ExtractionErrorItem> for xberg::ExtractionErrorItem {
     fn from(val: ExtractionErrorItem) -> Self {
         Self {
@@ -23434,7 +28522,6 @@ impl From<ExtractionErrorItem> for xberg::ExtractionErrorItem {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ExtractionErrorItem> for ExtractionErrorItem {
     fn from(val: xberg::ExtractionErrorItem) -> Self {
         Self {
@@ -23447,7 +28534,7 @@ impl From<xberg::ExtractionErrorItem> for ExtractionErrorItem {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<ExtractionSummary> for xberg::ExtractionSummary {
     fn from(val: ExtractionSummary) -> Self {
         Self {
@@ -23457,11 +28544,11 @@ impl From<ExtractionSummary> for xberg::ExtractionSummary {
             remote_urls: val.remote_urls,
             pages_crawled: val.pages_crawled,
             documents_downloaded: val.documents_downloaded,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ExtractionSummary> for ExtractionSummary {
     fn from(val: xberg::ExtractionSummary) -> Self {
         Self {
@@ -23475,7 +28562,8 @@ impl From<xberg::ExtractionSummary> for ExtractionSummary {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<ExtractionResult> for xberg::ExtractionResult {
     fn from(val: ExtractionResult) -> Self {
         Self {
@@ -23485,11 +28573,12 @@ impl From<ExtractionResult> for xberg::ExtractionResult {
             crawl_final_urls: val.crawl_final_urls.into_iter().collect(),
             crawl_redirect_count: val.crawl_redirect_count,
             crawl_unique_normalized_urls: val.crawl_unique_normalized_urls.into_iter().collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::ExtractionResult> for ExtractionResult {
     fn from(val: xberg::ExtractionResult) -> Self {
         Self {
@@ -23504,7 +28593,7 @@ impl From<xberg::ExtractionResult> for ExtractionResult {
 }
 
 #[allow(clippy::needless_update)]
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<UrlExtractionConfig> for xberg::UrlExtractionConfig {
     fn from(val: UrlExtractionConfig) -> Self {
         Self {
@@ -23536,7 +28625,7 @@ impl From<xberg::UrlExtractionConfig> for UrlExtractionConfig {
 }
 
 #[allow(clippy::needless_update)]
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<ImageExtractionConfig> for xberg::ImageExtractionConfig {
     fn from(val: ImageExtractionConfig) -> Self {
         Self {
@@ -23561,7 +28650,7 @@ impl From<ImageExtractionConfig> for xberg::ImageExtractionConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::ImageExtractionConfig> for ImageExtractionConfig {
     fn from(val: xberg::ImageExtractionConfig) -> Self {
         Self {
@@ -23585,17 +28674,17 @@ impl From<xberg::ImageExtractionConfig> for ImageExtractionConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<TokenReductionOptions> for xberg::TokenReductionOptions {
     fn from(val: TokenReductionOptions) -> Self {
         Self {
             mode: val.mode,
             preserve_important_words: val.preserve_important_words,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::TokenReductionOptions> for TokenReductionOptions {
     fn from(val: xberg::TokenReductionOptions) -> Self {
         Self {
@@ -23605,18 +28694,18 @@ impl From<xberg::TokenReductionOptions> for TokenReductionOptions {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<LanguageDetectionConfig> for xberg::LanguageDetectionConfig {
     fn from(val: LanguageDetectionConfig) -> Self {
         Self {
             enabled: val.enabled,
             min_confidence: val.min_confidence,
             detect_multiple: val.detect_multiple,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::LanguageDetectionConfig> for LanguageDetectionConfig {
     fn from(val: xberg::LanguageDetectionConfig) -> Self {
         Self {
@@ -23627,7 +28716,8 @@ impl From<xberg::LanguageDetectionConfig> for LanguageDetectionConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<HtmlOutputConfig> for xberg::HtmlOutputConfig {
     fn from(val: HtmlOutputConfig) -> Self {
         Self {
@@ -23636,6 +28726,7 @@ impl From<HtmlOutputConfig> for xberg::HtmlOutputConfig {
             theme: val.theme.into(),
             class_prefix: val.class_prefix,
             embed_css: val.embed_css,
+            ..Default::default()
         }
     }
 }
@@ -23653,24 +28744,62 @@ impl From<xberg::HtmlOutputConfig> for HtmlOutputConfig {
     }
 }
 
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<LateInteractionConfig> for xberg::LateInteractionConfig {
+    fn from(val: LateInteractionConfig) -> Self {
+        Self {
+            model: val.model.into(),
+            batch_size: val.batch_size,
+            max_length: val.max_length,
+            query_max_length: val.query_max_length,
+            show_download_progress: val.show_download_progress,
+            cache_dir: val.cache_dir.map(Into::into),
+            acceleration: val.acceleration.map(Into::into),
+            max_embed_duration_secs: val.max_embed_duration_secs,
+            ..Default::default()
+        }
+    }
+}
+
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<xberg::LateInteractionConfig> for LateInteractionConfig {
+    fn from(val: xberg::LateInteractionConfig) -> Self {
+        Self {
+            model: val.model.into(),
+            batch_size: val.batch_size,
+            max_length: val.max_length,
+            query_max_length: val.query_max_length,
+            show_download_progress: val.show_download_progress,
+            cache_dir: val.cache_dir.map(|p| p.to_string_lossy().to_string()),
+            acceleration: val.acceleration.map(Into::into),
+            max_embed_duration_secs: val.max_embed_duration_secs,
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<LayoutDetectionConfig> for xberg::LayoutDetectionConfig {
     fn from(val: LayoutDetectionConfig) -> Self {
         Self {
+            strategy: val.strategy.into(),
             confidence_threshold: val.confidence_threshold,
             apply_heuristics: val.apply_heuristics,
             table_model: val.table_model.into(),
             table_overlap_preference: val.table_overlap_preference.into(),
             acceleration: val.acceleration.map(Into::into),
             enable_chart_understanding: val.enable_chart_understanding,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::LayoutDetectionConfig> for LayoutDetectionConfig {
     fn from(val: xberg::LayoutDetectionConfig) -> Self {
         Self {
+            strategy: val.strategy.into(),
             confidence_threshold: val.confidence_threshold,
             apply_heuristics: val.apply_heuristics,
             table_model: val.table_model.into(),
@@ -23681,6 +28810,7 @@ impl From<xberg::LayoutDetectionConfig> for LayoutDetectionConfig {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<LlmConfig> for xberg::LlmConfig {
     fn from(val: LlmConfig) -> Self {
@@ -23692,6 +28822,28 @@ impl From<LlmConfig> for xberg::LlmConfig {
             max_retries: val.max_retries,
             temperature: val.temperature,
             max_tokens: val.max_tokens,
+            top_p: val.top_p,
+            stop: val.stop.map(|v| v.into_iter().collect()),
+            seed: val.seed,
+            presence_penalty: val.presence_penalty,
+            frequency_penalty: val.frequency_penalty,
+            reasoning_effort: val.reasoning_effort,
+            extra_body: val.extra_body.as_ref().and_then(|s| serde_json::from_str(s).ok()),
+            load_env: val.load_env,
+            headers: val
+                .headers
+                .map(|m| m.into_iter().map(|(k, v)| (k.into(), v.into())).collect()),
+            providers: val.providers.map(|v| v.into_iter().map(Into::into).collect()),
+            cache: val.cache.map(Into::into).map(Box::new),
+            budget: val.budget.map(Into::into).map(Box::new),
+            rate_limit: val.rate_limit.map(Into::into).map(Box::new),
+            cost_tracking: val.cost_tracking,
+            tracing: val.tracing,
+            cooldown_secs: val.cooldown_secs,
+            health_check_secs: val.health_check_secs,
+            bedrock: val.bedrock.map(Into::into).map(Box::new),
+            credential_provider: val.credential_provider.map(Into::into).map(Box::new),
+            ..Default::default()
         }
     }
 }
@@ -23707,11 +28859,160 @@ impl From<xberg::LlmConfig> for LlmConfig {
             max_retries: val.max_retries,
             temperature: val.temperature,
             max_tokens: val.max_tokens,
+            top_p: val.top_p,
+            stop: val.stop.map(|v| v.into_iter().collect()),
+            seed: val.seed,
+            presence_penalty: val.presence_penalty,
+            frequency_penalty: val.frequency_penalty,
+            reasoning_effort: val.reasoning_effort.map(|v| v.to_string()),
+            extra_body: val.extra_body.as_ref().map(ToString::to_string),
+            load_env: val.load_env,
+            headers: val
+                .headers
+                .map(|m| m.into_iter().map(|(k, v)| (k.into(), v.into())).collect()),
+            providers: val.providers.map(|v| v.into_iter().map(Into::into).collect()),
+            cache: val.cache.map(|v| (*v).into()),
+            budget: val.budget.map(|v| (*v).into()),
+            rate_limit: val.rate_limit.map(|v| (*v).into()),
+            cost_tracking: val.cost_tracking,
+            tracing: val.tracing,
+            cooldown_secs: val.cooldown_secs,
+            health_check_secs: val.health_check_secs,
+            bedrock: val.bedrock.map(|v| (*v).into()),
+            credential_provider: val.credential_provider.map(|v| (*v).into()),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<LlmProviderConfig> for xberg::core::config::LlmProviderConfig {
+    fn from(val: LlmProviderConfig) -> Self {
+        Self {
+            name: val.name,
+            base_url: val.base_url,
+            auth_header: val.auth_header,
+            model_prefixes: val.model_prefixes.into_iter().collect(),
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::redundant_closure)]
+impl From<xberg::core::config::LlmProviderConfig> for LlmProviderConfig {
+    fn from(val: xberg::core::config::LlmProviderConfig) -> Self {
+        Self {
+            name: val.name.to_string(),
+            base_url: val.base_url.to_string(),
+            auth_header: val.auth_header.map(|v| v.to_string()),
+            model_prefixes: val.model_prefixes.into_iter().collect(),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<LlmCacheConfig> for xberg::core::config::LlmCacheConfig {
+    fn from(val: LlmCacheConfig) -> Self {
+        Self {
+            max_entries: val.max_entries,
+            ttl_seconds: val.ttl_seconds,
+            backend: val.backend,
+            backend_config: val
+                .backend_config
+                .map(|m| m.into_iter().map(|(k, v)| (k.into(), v.into())).collect()),
+            ..Default::default()
         }
     }
 }
 
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<xberg::core::config::LlmCacheConfig> for LlmCacheConfig {
+    fn from(val: xberg::core::config::LlmCacheConfig) -> Self {
+        Self {
+            max_entries: val.max_entries,
+            ttl_seconds: val.ttl_seconds,
+            backend: val.backend.map(|v| v.to_string()),
+            backend_config: val
+                .backend_config
+                .map(|m| m.into_iter().map(|(k, v)| (k.into(), v.into())).collect()),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::redundant_closure)]
+impl From<LlmBudgetConfig> for xberg::core::config::LlmBudgetConfig {
+    fn from(val: LlmBudgetConfig) -> Self {
+        Self {
+            global_limit: val.global_limit,
+            model_limits: val.model_limits.map(|m| m.into_iter().collect()),
+            enforcement: val.enforcement,
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::redundant_closure)]
+impl From<xberg::core::config::LlmBudgetConfig> for LlmBudgetConfig {
+    fn from(val: xberg::core::config::LlmBudgetConfig) -> Self {
+        Self {
+            global_limit: val.global_limit,
+            model_limits: val.model_limits.map(|m| m.into_iter().collect()),
+            enforcement: val.enforcement.map(|v| v.to_string()),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<LlmRateLimitConfig> for xberg::core::config::LlmRateLimitConfig {
+    fn from(val: LlmRateLimitConfig) -> Self {
+        Self {
+            rpm: val.rpm,
+            tpm: val.tpm,
+            window_seconds: val.window_seconds,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<xberg::core::config::LlmRateLimitConfig> for LlmRateLimitConfig {
+    fn from(val: xberg::core::config::LlmRateLimitConfig) -> Self {
+        Self {
+            rpm: val.rpm,
+            tpm: val.tpm,
+            window_seconds: val.window_seconds,
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<BedrockConfig> for xberg::BedrockConfig {
+    fn from(val: BedrockConfig) -> Self {
+        Self {
+            region: val.region,
+            cross_region_prefix: val.cross_region_prefix,
+            access_key_id: val.access_key_id,
+            secret_access_key: val.secret_access_key,
+            session_token: val.session_token,
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::redundant_closure)]
+impl From<xberg::BedrockConfig> for BedrockConfig {
+    fn from(val: xberg::BedrockConfig) -> Self {
+        Self {
+            region: val.region.map(|v| v.to_string()),
+            cross_region_prefix: val.cross_region_prefix.map(|v| v.to_string()),
+            access_key_id: val.access_key_id.map(|v| v.to_string()),
+            secret_access_key: val.secret_access_key.map(|v| v.to_string()),
+            session_token: val.session_token.map(|v| v.to_string()),
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
 impl From<StructuredExtractionConfig> for xberg::StructuredExtractionConfig {
     fn from(val: StructuredExtractionConfig) -> Self {
         Self {
@@ -23739,7 +29040,8 @@ impl From<xberg::StructuredExtractionConfig> for StructuredExtractionConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<NerConfig> for xberg::NerConfig {
     fn from(val: NerConfig) -> Self {
         Self {
@@ -23748,6 +29050,7 @@ impl From<NerConfig> for xberg::NerConfig {
             model: val.model,
             llm: val.llm.map(Into::into),
             custom_labels: val.custom_labels.into_iter().collect(),
+            ..Default::default()
         }
     }
 }
@@ -23765,7 +29068,7 @@ impl From<xberg::NerConfig> for NerConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<OcrQualityThresholds> for xberg::OcrQualityThresholds {
     fn from(val: OcrQualityThresholds) -> Self {
         Self {
@@ -23785,11 +29088,14 @@ impl From<OcrQualityThresholds> for xberg::OcrQualityThresholds {
             non_text_min_chars: val.non_text_min_chars,
             alnum_ws_ratio_threshold: val.alnum_ws_ratio_threshold,
             pipeline_min_quality: val.pipeline_min_quality,
+            min_undecodable_ratio: val.min_undecodable_ratio,
+            enable_provenance_ocr_routing: val.enable_provenance_ocr_routing,
+            min_provenance_fallback_ratio: val.min_provenance_fallback_ratio,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::OcrQualityThresholds> for OcrQualityThresholds {
     fn from(val: xberg::OcrQualityThresholds) -> Self {
         Self {
@@ -23809,6 +29115,9 @@ impl From<xberg::OcrQualityThresholds> for OcrQualityThresholds {
             non_text_min_chars: val.non_text_min_chars,
             alnum_ws_ratio_threshold: val.alnum_ws_ratio_threshold,
             pipeline_min_quality: val.pipeline_min_quality,
+            min_undecodable_ratio: val.min_undecodable_ratio,
+            enable_provenance_ocr_routing: val.enable_provenance_ocr_routing,
+            min_provenance_fallback_ratio: val.min_provenance_fallback_ratio,
         }
     }
 }
@@ -23846,7 +29155,7 @@ impl From<xberg::OcrPipelineStage> for OcrPipelineStage {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<OcrPipelineConfig> for xberg::OcrPipelineConfig {
     fn from(val: OcrPipelineConfig) -> Self {
         Self {
@@ -23856,7 +29165,7 @@ impl From<OcrPipelineConfig> for xberg::OcrPipelineConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::OcrPipelineConfig> for OcrPipelineConfig {
     fn from(val: xberg::OcrPipelineConfig) -> Self {
         Self {
@@ -23866,6 +29175,7 @@ impl From<xberg::OcrPipelineConfig> for OcrPipelineConfig {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<OcrConfig> for xberg::OcrConfig {
     fn from(val: OcrConfig) -> Self {
@@ -23892,6 +29202,7 @@ impl From<OcrConfig> for xberg::OcrConfig {
                 .tessdata_bytes
                 .map(|m| m.into_iter().map(|(k, v)| (k, v.to_vec().into())).collect()),
             tessdata_path: val.tessdata_path.map(Into::into),
+            ..Default::default()
         }
     }
 }
@@ -23923,18 +29234,18 @@ impl From<xberg::OcrConfig> for OcrConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<PageConfig> for xberg::PageConfig {
     fn from(val: PageConfig) -> Self {
         Self {
             extract_pages: val.extract_pages,
             insert_page_markers: val.insert_page_markers,
             marker_format: val.marker_format,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::PageConfig> for PageConfig {
     fn from(val: xberg::PageConfig) -> Self {
         Self {
@@ -23945,6 +29256,7 @@ impl From<xberg::PageConfig> for PageConfig {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<PdfConfig> for xberg::PdfConfig {
     fn from(val: PdfConfig) -> Self {
@@ -23961,6 +29273,7 @@ impl From<PdfConfig> for xberg::PdfConfig {
             ocr_inline_images: val.ocr_inline_images,
             extract_form_fields: val.extract_form_fields,
             reading_order: val.reading_order,
+            ..Default::default()
         }
     }
 }
@@ -23985,31 +29298,30 @@ impl From<xberg::PdfConfig> for PdfConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<HierarchyConfig> for xberg::HierarchyConfig {
     fn from(val: HierarchyConfig) -> Self {
         Self {
             enabled: val.enabled,
             k_clusters: val.k_clusters,
             include_bbox: val.include_bbox,
-            ocr_coverage_threshold: val.ocr_coverage_threshold,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::HierarchyConfig> for HierarchyConfig {
     fn from(val: xberg::HierarchyConfig) -> Self {
         Self {
             enabled: val.enabled,
             k_clusters: val.k_clusters,
             include_bbox: val.include_bbox,
-            ocr_coverage_threshold: val.ocr_coverage_threshold,
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::redundant_closure)]
 impl From<PostProcessorConfig> for xberg::PostProcessorConfig {
     fn from(val: PostProcessorConfig) -> Self {
         Self {
@@ -24018,11 +29330,12 @@ impl From<PostProcessorConfig> for xberg::PostProcessorConfig {
             disabled_processors: val.disabled_processors.map(|v| v.into_iter().collect()),
             enabled_set: val.enabled_set.map(|v| v.into_iter().collect()),
             disabled_set: val.disabled_set.map(|v| v.into_iter().collect()),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::PostProcessorConfig> for PostProcessorConfig {
     fn from(val: xberg::PostProcessorConfig) -> Self {
         Self {
@@ -24035,7 +29348,8 @@ impl From<xberg::PostProcessorConfig> for PostProcessorConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<ChunkingConfig> for xberg::ChunkingConfig {
     fn from(val: ChunkingConfig) -> Self {
         Self {
@@ -24044,11 +29358,15 @@ impl From<ChunkingConfig> for xberg::ChunkingConfig {
             trim: val.trim,
             chunker_type: val.chunker_type.into(),
             embedding: val.embedding.map(Into::into),
+            sparse_embedding: val.sparse_embedding.map(Into::into),
+            late_interaction: val.late_interaction.map(Into::into),
             preset: val.preset,
             sizing: val.sizing.into(),
             prepend_heading_context: val.prepend_heading_context,
             topic_threshold: val.topic_threshold,
             table_chunking: val.table_chunking.into(),
+            breadcrumb_target: val.breadcrumb_target.into(),
+            ..Default::default()
         }
     }
 }
@@ -24062,16 +29380,20 @@ impl From<xberg::ChunkingConfig> for ChunkingConfig {
             trim: val.trim,
             chunker_type: val.chunker_type.into(),
             embedding: val.embedding.map(Into::into),
+            sparse_embedding: val.sparse_embedding.map(Into::into),
+            late_interaction: val.late_interaction.map(Into::into),
             preset: val.preset.map(|v| v.to_string()),
             sizing: val.sizing.into(),
             prepend_heading_context: val.prepend_heading_context,
             topic_threshold: val.topic_threshold,
             table_chunking: val.table_chunking.into(),
+            breadcrumb_target: val.breadcrumb_target.into(),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<EmbeddingConfig> for xberg::EmbeddingConfig {
     fn from(val: EmbeddingConfig) -> Self {
         Self {
@@ -24082,6 +29404,8 @@ impl From<EmbeddingConfig> for xberg::EmbeddingConfig {
             cache_dir: val.cache_dir.map(Into::into),
             acceleration: val.acceleration.map(Into::into),
             max_embed_duration_secs: val.max_embed_duration_secs,
+            max_sequence_length: val.max_sequence_length,
+            ..Default::default()
         }
     }
 }
@@ -24097,11 +29421,13 @@ impl From<xberg::EmbeddingConfig> for EmbeddingConfig {
             cache_dir: val.cache_dir.map(|p| p.to_string_lossy().to_string()),
             acceleration: val.acceleration.map(Into::into),
             max_embed_duration_secs: val.max_embed_duration_secs,
+            max_sequence_length: val.max_sequence_length,
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<RedactionConfig> for xberg::RedactionConfig {
     fn from(val: RedactionConfig) -> Self {
         Self {
@@ -24111,11 +29437,12 @@ impl From<RedactionConfig> for xberg::RedactionConfig {
             preserve_offsets: val.preserve_offsets,
             custom_terms: val.custom_terms.into_iter().map(Into::into).collect(),
             custom_patterns: val.custom_patterns.into_iter().map(Into::into).collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::RedactionConfig> for RedactionConfig {
     fn from(val: xberg::RedactionConfig) -> Self {
         Self {
@@ -24129,7 +29456,6 @@ impl From<xberg::RedactionConfig> for RedactionConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<RedactionTerm> for xberg::RedactionTerm {
     fn from(val: RedactionTerm) -> Self {
         Self {
@@ -24140,7 +29466,6 @@ impl From<RedactionTerm> for xberg::RedactionTerm {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::RedactionTerm> for RedactionTerm {
     fn from(val: xberg::RedactionTerm) -> Self {
         Self {
@@ -24151,7 +29476,6 @@ impl From<xberg::RedactionTerm> for RedactionTerm {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<RedactionPattern> for xberg::RedactionPattern {
     fn from(val: RedactionPattern) -> Self {
         Self {
@@ -24162,7 +29486,6 @@ impl From<RedactionPattern> for xberg::RedactionPattern {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::RedactionPattern> for RedactionPattern {
     fn from(val: xberg::RedactionPattern) -> Self {
         Self {
@@ -24173,7 +29496,8 @@ impl From<xberg::RedactionPattern> for RedactionPattern {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<RerankerConfig> for xberg::RerankerConfig {
     fn from(val: RerankerConfig) -> Self {
         Self {
@@ -24184,6 +29508,7 @@ impl From<RerankerConfig> for xberg::RerankerConfig {
             cache_dir: val.cache_dir.map(Into::into),
             acceleration: val.acceleration.map(Into::into),
             max_rerank_duration_secs: val.max_rerank_duration_secs,
+            ..Default::default()
         }
     }
 }
@@ -24203,18 +29528,52 @@ impl From<xberg::RerankerConfig> for RerankerConfig {
     }
 }
 
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<SparseEmbeddingConfig> for xberg::SparseEmbeddingConfig {
+    fn from(val: SparseEmbeddingConfig) -> Self {
+        Self {
+            model: val.model.into(),
+            batch_size: val.batch_size,
+            max_length: val.max_length,
+            show_download_progress: val.show_download_progress,
+            cache_dir: val.cache_dir.map(Into::into),
+            acceleration: val.acceleration.map(Into::into),
+            max_embed_duration_secs: val.max_embed_duration_secs,
+            ..Default::default()
+        }
+    }
+}
+
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<xberg::SparseEmbeddingConfig> for SparseEmbeddingConfig {
+    fn from(val: xberg::SparseEmbeddingConfig) -> Self {
+        Self {
+            model: val.model.into(),
+            batch_size: val.batch_size,
+            max_length: val.max_length,
+            show_download_progress: val.show_download_progress,
+            cache_dir: val.cache_dir.map(|p| p.to_string_lossy().to_string()),
+            acceleration: val.acceleration.map(Into::into),
+            max_embed_duration_secs: val.max_embed_duration_secs,
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<SummarizationConfig> for xberg::SummarizationConfig {
     fn from(val: SummarizationConfig) -> Self {
         Self {
             strategy: val.strategy.into(),
             max_tokens: val.max_tokens,
             llm: val.llm.map(Into::into),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::SummarizationConfig> for SummarizationConfig {
     fn from(val: xberg::SummarizationConfig) -> Self {
         Self {
@@ -24225,7 +29584,8 @@ impl From<xberg::SummarizationConfig> for SummarizationConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<TranscriptionConfig> for xberg::TranscriptionConfig {
     fn from(val: TranscriptionConfig) -> Self {
         Self {
@@ -24239,6 +29599,7 @@ impl From<TranscriptionConfig> for xberg::TranscriptionConfig {
             model_cache_dir: val.model_cache_dir.map(Into::into),
             allow_network: val.allow_network,
             verify_hash: val.verify_hash,
+            ..Default::default()
         }
     }
 }
@@ -24261,7 +29622,7 @@ impl From<xberg::TranscriptionConfig> for TranscriptionConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<TranslationConfig> for xberg::TranslationConfig {
     fn from(val: TranslationConfig) -> Self {
         Self {
@@ -24285,6 +29646,7 @@ impl From<xberg::TranslationConfig> for TranslationConfig {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<TreeSitterConfig> for xberg::TreeSitterConfig {
     fn from(val: TreeSitterConfig) -> Self {
@@ -24294,6 +29656,7 @@ impl From<TreeSitterConfig> for xberg::TreeSitterConfig {
             languages: val.languages.map(|v| v.into_iter().collect()),
             groups: val.groups.map(|v| v.into_iter().collect()),
             process: val.process.into(),
+            ..Default::default()
         }
     }
 }
@@ -24311,7 +29674,8 @@ impl From<xberg::TreeSitterConfig> for TreeSitterConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<TreeSitterProcessConfig> for xberg::TreeSitterProcessConfig {
     fn from(val: TreeSitterProcessConfig) -> Self {
         Self {
@@ -24322,13 +29686,15 @@ impl From<TreeSitterProcessConfig> for xberg::TreeSitterProcessConfig {
             docstrings: val.docstrings,
             symbols: val.symbols,
             diagnostics: val.diagnostics,
+            data_extraction: val.data_extraction,
             chunk_max_size: val.chunk_max_size,
             content_mode: val.content_mode.into(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::TreeSitterProcessConfig> for TreeSitterProcessConfig {
     fn from(val: xberg::TreeSitterProcessConfig) -> Self {
         Self {
@@ -24339,13 +29705,13 @@ impl From<xberg::TreeSitterProcessConfig> for TreeSitterProcessConfig {
             docstrings: val.docstrings,
             symbols: val.symbols,
             diagnostics: val.diagnostics,
+            data_extraction: val.data_extraction,
             chunk_max_size: val.chunk_max_size,
             content_mode: val.content_mode.into(),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<SupportedFormat> for xberg::SupportedFormat {
     fn from(val: SupportedFormat) -> Self {
         Self {
@@ -24355,7 +29721,6 @@ impl From<SupportedFormat> for xberg::SupportedFormat {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::SupportedFormat> for SupportedFormat {
     fn from(val: xberg::SupportedFormat) -> Self {
         Self {
@@ -24365,7 +29730,7 @@ impl From<xberg::SupportedFormat> for SupportedFormat {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<ServerConfig> for xberg::ServerConfig {
     fn from(val: ServerConfig) -> Self {
         Self {
@@ -24374,11 +29739,11 @@ impl From<ServerConfig> for xberg::ServerConfig {
             cors_origins: val.cors_origins.into_iter().collect(),
             max_request_body_bytes: val.max_request_body_bytes,
             max_multipart_field_bytes: val.max_multipart_field_bytes,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ServerConfig> for ServerConfig {
     fn from(val: xberg::ServerConfig) -> Self {
         Self {
@@ -24399,11 +29764,13 @@ impl From<xberg::extraction::structured::StructuredDataResult> for StructuredDat
             format: val.format.to_string(),
             metadata: val.metadata.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
             text_fields: val.text_fields.into_iter().collect(),
+            value: val.value.as_ref().map(ToString::to_string),
+            flattened: val.flattened.into_iter().collect(),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<DocxAppProperties> for xberg::DocxAppProperties {
     fn from(val: DocxAppProperties) -> Self {
         Self {
@@ -24423,11 +29790,12 @@ impl From<DocxAppProperties> for xberg::DocxAppProperties {
             links_up_to_date: val.links_up_to_date,
             shared_doc: val.shared_doc,
             hyperlinks_changed: val.hyperlinks_changed,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::DocxAppProperties> for DocxAppProperties {
     fn from(val: xberg::DocxAppProperties) -> Self {
         Self {
@@ -24451,7 +29819,7 @@ impl From<xberg::DocxAppProperties> for DocxAppProperties {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::extraction::office_metadata::app_properties::XlsxAppProperties> for XlsxAppProperties {
     fn from(val: xberg::extraction::office_metadata::app_properties::XlsxAppProperties) -> Self {
         Self {
@@ -24468,7 +29836,7 @@ impl From<xberg::extraction::office_metadata::app_properties::XlsxAppProperties>
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::extraction::office_metadata::app_properties::PptxAppProperties> for PptxAppProperties {
     fn from(val: xberg::extraction::office_metadata::app_properties::PptxAppProperties) -> Self {
         Self {
@@ -24491,7 +29859,7 @@ impl From<xberg::extraction::office_metadata::app_properties::PptxAppProperties>
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<CoreProperties> for xberg::CoreProperties {
     fn from(val: CoreProperties) -> Self {
         Self {
@@ -24510,11 +29878,12 @@ impl From<CoreProperties> for xberg::CoreProperties {
             identifier: val.identifier,
             version: val.version,
             last_printed: val.last_printed,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::CoreProperties> for CoreProperties {
     fn from(val: xberg::CoreProperties) -> Self {
         Self {
@@ -24537,7 +29906,7 @@ impl From<xberg::CoreProperties> for CoreProperties {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<SecurityLimits> for xberg::SecurityLimits {
     fn from(val: SecurityLimits) -> Self {
         Self {
@@ -24550,11 +29919,11 @@ impl From<SecurityLimits> for xberg::SecurityLimits {
             max_iterations: val.max_iterations,
             max_xml_depth: val.max_xml_depth,
             max_table_cells: val.max_table_cells,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::SecurityLimits> for SecurityLimits {
     fn from(val: xberg::SecurityLimits) -> Self {
         Self {
@@ -24571,6 +29940,7 @@ impl From<xberg::SecurityLimits> for SecurityLimits {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<TokenReductionConfig> for xberg::TokenReductionConfig {
     fn from(val: TokenReductionConfig) -> Self {
@@ -24586,6 +29956,8 @@ impl From<TokenReductionConfig> for xberg::TokenReductionConfig {
             preserve_patterns: val.preserve_patterns.into_iter().collect(),
             target_reduction: val.target_reduction,
             enable_semantic_clustering: val.enable_semantic_clustering,
+            preserve_important_words: val.preserve_important_words,
+            ..Default::default()
         }
     }
 }
@@ -24605,11 +29977,12 @@ impl From<xberg::TokenReductionConfig> for TokenReductionConfig {
             preserve_patterns: val.preserve_patterns.into_iter().collect(),
             target_reduction: val.target_reduction,
             enable_semantic_clustering: val.enable_semantic_clustering,
+            preserve_important_words: val.preserve_important_words,
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::text::redaction::patterns::PatternMatch> for PatternMatch {
     fn from(val: xberg::text::redaction::patterns::PatternMatch) -> Self {
         Self {
@@ -24621,16 +29994,16 @@ impl From<xberg::text::redaction::patterns::PatternMatch> for PatternMatch {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<FootnoteConfig> for xberg::FootnoteConfig {
     fn from(val: FootnoteConfig) -> Self {
         Self {
             parse_citations: val.parse_citations,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::FootnoteConfig> for FootnoteConfig {
     fn from(val: xberg::FootnoteConfig) -> Self {
         Self {
@@ -24639,7 +30012,6 @@ impl From<xberg::FootnoteConfig> for FootnoteConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::FootnoteAnchor> for FootnoteAnchor {
     fn from(val: xberg::FootnoteAnchor) -> Self {
         Self {
@@ -24649,7 +30021,6 @@ impl From<xberg::FootnoteAnchor> for FootnoteAnchor {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::FootnoteDefinition> for FootnoteDefinition {
     fn from(val: xberg::FootnoteDefinition) -> Self {
         Self {
@@ -24660,7 +30031,7 @@ impl From<xberg::FootnoteDefinition> for FootnoteDefinition {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::Citation> for Citation {
     fn from(val: xberg::Citation) -> Self {
         Self {
@@ -24680,6 +30051,12 @@ impl From<PdfAnnotation> for xberg::PdfAnnotation {
             content: val.content,
             page_number: val.page_number,
             bounding_box: val.bounding_box.map(Into::into),
+            author: val.author,
+            modified: val.modified,
+            color: val.color,
+            subject: val.subject,
+            quad_points: val.quad_points.map(|v| v.into_iter().map(Into::into).collect()),
+            marked_text: val.marked_text,
         }
     }
 }
@@ -24692,11 +30069,17 @@ impl From<xberg::PdfAnnotation> for PdfAnnotation {
             content: val.content.map(|v| v.to_string()),
             page_number: val.page_number,
             bounding_box: val.bounding_box.map(Into::into),
+            author: val.author.map(|v| v.to_string()),
+            modified: val.modified.map(|v| v.to_string()),
+            color: val.color.map(|v| v.to_string()),
+            subject: val.subject.map(|v| v.to_string()),
+            quad_points: val.quad_points.map(|v| v.into_iter().map(Into::into).collect()),
+            marked_text: val.marked_text.map(|v| v.to_string()),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<PageClassification> for xberg::PageClassification {
     fn from(val: PageClassification) -> Self {
         Self {
@@ -24706,7 +30089,7 @@ impl From<PageClassification> for xberg::PageClassification {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::PageClassification> for PageClassification {
     fn from(val: xberg::PageClassification) -> Self {
         Self {
@@ -24716,7 +30099,6 @@ impl From<xberg::PageClassification> for PageClassification {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ClassificationLabel> for xberg::ClassificationLabel {
     fn from(val: ClassificationLabel) -> Self {
         Self {
@@ -24726,7 +30108,6 @@ impl From<ClassificationLabel> for xberg::ClassificationLabel {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ClassificationLabel> for ClassificationLabel {
     fn from(val: xberg::ClassificationLabel) -> Self {
         Self {
@@ -24736,7 +30117,7 @@ impl From<xberg::ClassificationLabel> for ClassificationLabel {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<DjotContent> for xberg::DjotContent {
     fn from(val: DjotContent) -> Self {
         Self {
@@ -24752,7 +30133,7 @@ impl From<DjotContent> for xberg::DjotContent {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DjotContent> for DjotContent {
     fn from(val: xberg::DjotContent) -> Self {
         Self {
@@ -24767,7 +30148,7 @@ impl From<xberg::DjotContent> for DjotContent {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<FormattedBlock> for xberg::FormattedBlock {
     fn from(val: FormattedBlock) -> Self {
         Self {
@@ -24823,7 +30204,6 @@ impl From<xberg::InlineElement> for InlineElement {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<DjotImage> for xberg::DjotImage {
     fn from(val: DjotImage) -> Self {
         Self {
@@ -24835,7 +30215,7 @@ impl From<DjotImage> for xberg::DjotImage {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::DjotImage> for DjotImage {
     fn from(val: xberg::DjotImage) -> Self {
         Self {
@@ -24846,7 +30226,6 @@ impl From<xberg::DjotImage> for DjotImage {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<DjotLink> for xberg::DjotLink {
     fn from(val: DjotLink) -> Self {
         Self {
@@ -24858,7 +30237,7 @@ impl From<DjotLink> for xberg::DjotLink {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::DjotLink> for DjotLink {
     fn from(val: xberg::DjotLink) -> Self {
         Self {
@@ -24869,7 +30248,7 @@ impl From<xberg::DjotLink> for DjotLink {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<Footnote> for xberg::Footnote {
     fn from(val: Footnote) -> Self {
         Self {
@@ -24879,7 +30258,7 @@ impl From<Footnote> for xberg::Footnote {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::Footnote> for Footnote {
     fn from(val: xberg::Footnote) -> Self {
         Self {
@@ -24889,7 +30268,8 @@ impl From<xberg::Footnote> for Footnote {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<DocumentStructure> for xberg::DocumentStructure {
     fn from(val: DocumentStructure) -> Self {
         Self {
@@ -24897,6 +30277,7 @@ impl From<DocumentStructure> for xberg::DocumentStructure {
             source_format: val.source_format,
             relationships: val.relationships.into_iter().map(Into::into).collect(),
             node_types: val.node_types.into_iter().collect(),
+            ..Default::default()
         }
     }
 }
@@ -24913,7 +30294,7 @@ impl From<xberg::DocumentStructure> for DocumentStructure {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<DocumentRelationship> for xberg::DocumentRelationship {
     fn from(val: DocumentRelationship) -> Self {
         Self {
@@ -24924,7 +30305,7 @@ impl From<DocumentRelationship> for xberg::DocumentRelationship {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DocumentRelationship> for DocumentRelationship {
     fn from(val: xberg::DocumentRelationship) -> Self {
         Self {
@@ -24939,7 +30320,7 @@ impl From<xberg::DocumentRelationship> for DocumentRelationship {
 impl From<DocumentNode> for xberg::DocumentNode {
     fn from(val: DocumentNode) -> Self {
         Self {
-            id: Default::default(),
+            id: val.id,
             content: val.content.into(),
             parent: (val.parent).map(xberg::NodeIndex),
             children: (val.children.into_iter().collect::<Vec<_>>())
@@ -24962,6 +30343,7 @@ impl From<DocumentNode> for xberg::DocumentNode {
 impl From<xberg::DocumentNode> for DocumentNode {
     fn from(val: xberg::DocumentNode) -> Self {
         Self {
+            id: val.id.to_string(),
             content: val.content.into(),
             parent: val.parent.map(|v| v.0),
             children: val
@@ -24983,18 +30365,20 @@ impl From<xberg::DocumentNode> for DocumentNode {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<TableGrid> for xberg::TableGrid {
     fn from(val: TableGrid) -> Self {
         Self {
             rows: val.rows,
             cols: val.cols,
             cells: val.cells.into_iter().map(Into::into).collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::TableGrid> for TableGrid {
     fn from(val: xberg::TableGrid) -> Self {
         Self {
@@ -25005,7 +30389,7 @@ impl From<xberg::TableGrid> for TableGrid {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<GridCell> for xberg::GridCell {
     fn from(val: GridCell) -> Self {
         Self {
@@ -25020,7 +30404,7 @@ impl From<GridCell> for xberg::GridCell {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::GridCell> for GridCell {
     fn from(val: xberg::GridCell) -> Self {
         Self {
@@ -25035,7 +30419,7 @@ impl From<xberg::GridCell> for GridCell {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<TextAnnotation> for xberg::TextAnnotation {
     fn from(val: TextAnnotation) -> Self {
         Self {
@@ -25046,7 +30430,7 @@ impl From<TextAnnotation> for xberg::TextAnnotation {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::TextAnnotation> for TextAnnotation {
     fn from(val: xberg::TextAnnotation) -> Self {
         Self {
@@ -25057,7 +30441,7 @@ impl From<xberg::TextAnnotation> for TextAnnotation {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<Entity> for xberg::Entity {
     fn from(val: Entity) -> Self {
         Self {
@@ -25070,7 +30454,7 @@ impl From<Entity> for xberg::Entity {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::Entity> for Entity {
     fn from(val: xberg::Entity) -> Self {
         Self {
@@ -25079,6 +30463,52 @@ impl From<xberg::Entity> for Entity {
             start: val.start,
             end: val.end,
             confidence: val.confidence,
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<DocumentCounts> for xberg::DocumentCounts {
+    fn from(val: DocumentCounts) -> Self {
+        Self {
+            pages: val.pages,
+            tables: val.tables,
+            images: val.images,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<xberg::DocumentCounts> for DocumentCounts {
+    fn from(val: xberg::DocumentCounts) -> Self {
+        Self {
+            pages: val.pages,
+            tables: val.tables,
+            images: val.images,
+        }
+    }
+}
+
+impl From<LanguageConfidence> for xberg::LanguageConfidence {
+    fn from(val: LanguageConfidence) -> Self {
+        Self {
+            language: val.language,
+            confidence: val.confidence,
+            proportion: val.proportion,
+            script: val.script,
+            reliable: val.reliable,
+        }
+    }
+}
+
+impl From<xberg::LanguageConfidence> for LanguageConfidence {
+    fn from(val: xberg::LanguageConfidence) -> Self {
+        Self {
+            language: val.language.to_string(),
+            confidence: val.confidence,
+            proportion: val.proportion,
+            script: val.script.to_string(),
+            reliable: val.reliable,
         }
     }
 }
@@ -25093,7 +30523,11 @@ impl From<ExtractedDocument> for xberg::ExtractedDocument {
         __result.metadata = val.metadata.into();
         __result.extraction_method = val.extraction_method.map(Into::into);
         __result.tables = val.tables.into_iter().map(Into::into).collect();
+        __result.counts = val.counts.into();
         __result.detected_languages = val.detected_languages.map(|v| v.into_iter().collect());
+        __result.detected_language_confidences = val
+            .detected_language_confidences
+            .map(|v| v.into_iter().map(Into::into).collect());
         __result.chunks = val.chunks.map(|v| v.into_iter().map(Into::into).collect());
         __result.images = val.images.map(|v| v.into_iter().map(Into::into).collect());
         __result.pages = val.pages.map(|v| v.into_iter().map(Into::into).collect());
@@ -25127,7 +30561,6 @@ impl From<ExtractedDocument> for xberg::ExtractedDocument {
         __result.redaction_report = val.redaction_report.map(Into::into);
         __result.formulas = val.formulas.into_iter().map(Into::into).collect();
         __result.form_fields = val.form_fields.into_iter().map(Into::into).collect();
-        __result.formatted_content = val.formatted_content;
         __result
     }
 }
@@ -25141,7 +30574,11 @@ impl From<xberg::ExtractedDocument> for ExtractedDocument {
             metadata: val.metadata.into(),
             extraction_method: val.extraction_method.map(Into::into),
             tables: val.tables.into_iter().map(Into::into).collect(),
+            counts: val.counts.into(),
             detected_languages: val.detected_languages.map(|v| v.into_iter().collect()),
+            detected_language_confidences: val
+                .detected_language_confidences
+                .map(|v| v.into_iter().map(Into::into).collect()),
             chunks: val.chunks.map(|v| v.into_iter().map(Into::into).collect()),
             images: val.images.map(|v| v.into_iter().map(Into::into).collect()),
             pages: val.pages.map(|v| v.into_iter().map(Into::into).collect()),
@@ -25169,12 +30606,11 @@ impl From<xberg::ExtractedDocument> for ExtractedDocument {
             redaction_report: val.redaction_report.map(Into::into),
             formulas: val.formulas.into_iter().map(Into::into).collect(),
             form_fields: val.form_fields.into_iter().map(Into::into).collect(),
-            formatted_content: val.formatted_content.map(|v| v.to_string()),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<ArchiveEntry> for xberg::ArchiveEntry {
     fn from(val: ArchiveEntry) -> Self {
         Self {
@@ -25185,7 +30621,7 @@ impl From<ArchiveEntry> for xberg::ArchiveEntry {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::ArchiveEntry> for ArchiveEntry {
     fn from(val: xberg::ArchiveEntry) -> Self {
         Self {
@@ -25196,7 +30632,7 @@ impl From<xberg::ArchiveEntry> for ArchiveEntry {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<ProcessingWarning> for xberg::ProcessingWarning {
     fn from(val: ProcessingWarning) -> Self {
         Self {
@@ -25206,7 +30642,6 @@ impl From<ProcessingWarning> for xberg::ProcessingWarning {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ProcessingWarning> for ProcessingWarning {
     fn from(val: xberg::ProcessingWarning) -> Self {
         Self {
@@ -25216,7 +30651,7 @@ impl From<xberg::ProcessingWarning> for ProcessingWarning {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<LlmUsage> for xberg::LlmUsage {
     fn from(val: LlmUsage) -> Self {
         Self {
@@ -25227,11 +30662,12 @@ impl From<LlmUsage> for xberg::LlmUsage {
             total_tokens: val.total_tokens,
             estimated_cost: val.estimated_cost,
             finish_reason: val.finish_reason,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::LlmUsage> for LlmUsage {
     fn from(val: xberg::LlmUsage) -> Self {
         Self {
@@ -25253,6 +30689,8 @@ impl From<Chunk> for xberg::Chunk {
             content: val.content,
             chunk_type: val.chunk_type.into(),
             embedding: val.embedding.map(|v| v.into_iter().collect()),
+            sparse_embedding: val.sparse_embedding.map(Into::into),
+            late_interaction: val.late_interaction.map(Into::into),
             metadata: val.metadata.into(),
         }
     }
@@ -25265,12 +30703,14 @@ impl From<xberg::Chunk> for Chunk {
             content: val.content.to_string(),
             chunk_type: val.chunk_type.into(),
             embedding: val.embedding.map(|v| v.into_iter().collect()),
+            sparse_embedding: val.sparse_embedding.map(Into::into),
+            late_interaction: val.late_interaction.map(Into::into),
             metadata: val.metadata.into(),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<HeadingContext> for xberg::HeadingContext {
     fn from(val: HeadingContext) -> Self {
         Self {
@@ -25279,7 +30719,7 @@ impl From<HeadingContext> for xberg::HeadingContext {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::HeadingContext> for HeadingContext {
     fn from(val: xberg::HeadingContext) -> Self {
         Self {
@@ -25288,7 +30728,6 @@ impl From<xberg::HeadingContext> for HeadingContext {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<HeadingLevel> for xberg::HeadingLevel {
     fn from(val: HeadingLevel) -> Self {
         Self {
@@ -25298,7 +30737,6 @@ impl From<HeadingLevel> for xberg::HeadingLevel {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::HeadingLevel> for HeadingLevel {
     fn from(val: xberg::HeadingLevel) -> Self {
         Self {
@@ -25308,7 +30746,7 @@ impl From<xberg::HeadingLevel> for HeadingLevel {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<ChunkMetadata> for xberg::ChunkMetadata {
     fn from(val: ChunkMetadata) -> Self {
         Self {
@@ -25322,11 +30760,14 @@ impl From<ChunkMetadata> for xberg::ChunkMetadata {
             heading_context: val.heading_context.map(Into::into),
             heading_path: val.heading_path.into_iter().collect(),
             image_indices: val.image_indices.into_iter().collect(),
+            node_ids: val.node_ids.into_iter().collect(),
+            page_spans: val.page_spans.into_iter().map(Into::into).collect(),
+            classifications: val.classifications.into_iter().map(Into::into).collect(),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::ChunkMetadata> for ChunkMetadata {
     fn from(val: xberg::ChunkMetadata) -> Self {
         Self {
@@ -25340,10 +30781,34 @@ impl From<xberg::ChunkMetadata> for ChunkMetadata {
             heading_context: val.heading_context.map(Into::into),
             heading_path: val.heading_path.into_iter().collect(),
             image_indices: val.image_indices.into_iter().collect(),
+            node_ids: val.node_ids.into_iter().collect(),
+            page_spans: val.page_spans.into_iter().map(Into::into).collect(),
+            classifications: val.classifications.into_iter().map(Into::into).collect(),
         }
     }
 }
 
+#[allow(clippy::useless_conversion)]
+impl From<PageSpan> for xberg::PageSpan {
+    fn from(val: PageSpan) -> Self {
+        Self {
+            page: val.page,
+            bbox: val.bbox.map(Into::into),
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<xberg::PageSpan> for PageSpan {
+    fn from(val: xberg::PageSpan) -> Self {
+        Self {
+            page: val.page,
+            bbox: val.bbox.map(Into::into),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ExtractedImage> for xberg::ExtractedImage {
     fn from(val: ExtractedImage) -> Self {
@@ -25367,6 +30832,7 @@ impl From<ExtractedImage> for xberg::ExtractedImage {
             caption: val.caption,
             qr_codes: val.qr_codes.map(|v| v.into_iter().map(Into::into).collect()),
             data_base64: val.data_base64,
+            ..Default::default()
         }
     }
 }
@@ -25398,7 +30864,7 @@ impl From<xberg::ExtractedImage> for ExtractedImage {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<BoundingBox> for xberg::BoundingBox {
     fn from(val: BoundingBox) -> Self {
         Self {
@@ -25406,11 +30872,11 @@ impl From<BoundingBox> for xberg::BoundingBox {
             y0: val.y0,
             x1: val.x1,
             y1: val.y1,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::BoundingBox> for BoundingBox {
     fn from(val: xberg::BoundingBox) -> Self {
         Self {
@@ -25448,7 +30914,7 @@ impl From<xberg::ElementMetadata> for ElementMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<Element> for xberg::Element {
     fn from(val: Element) -> Self {
         Self {
@@ -25460,7 +30926,7 @@ impl From<Element> for xberg::Element {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::Element> for Element {
     fn from(val: xberg::Element) -> Self {
         Self {
@@ -25471,7 +30937,7 @@ impl From<xberg::Element> for Element {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<PdfFormField> for xberg::PdfFormField {
     fn from(val: PdfFormField) -> Self {
         Self {
@@ -25518,7 +30984,7 @@ impl From<xberg::ExcelWorkbook> for ExcelWorkbook {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::ExcelSheet> for ExcelSheet {
     fn from(val: xberg::ExcelSheet) -> Self {
         Self {
@@ -25532,7 +30998,6 @@ impl From<xberg::ExcelSheet> for ExcelSheet {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::XmlExtractionResult> for XmlExtractionResult {
     fn from(val: xberg::XmlExtractionResult) -> Self {
         Self {
@@ -25543,7 +31008,7 @@ impl From<xberg::XmlExtractionResult> for XmlExtractionResult {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::TextExtractionResult> for TextExtractionResult {
     fn from(val: xberg::TextExtractionResult) -> Self {
         Self {
@@ -25630,7 +31095,7 @@ impl From<xberg::OcrExtractionResult> for OcrExtractionResult {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::OcrTable> for OcrTable {
     fn from(val: xberg::OcrTable) -> Self {
         Self {
@@ -25642,7 +31107,6 @@ impl From<xberg::OcrTable> for OcrTable {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::OcrTableBoundingBox> for OcrTableBoundingBox {
     fn from(val: xberg::OcrTableBoundingBox) -> Self {
         Self {
@@ -25654,7 +31118,7 @@ impl From<xberg::OcrTableBoundingBox> for OcrTableBoundingBox {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<ImagePreprocessingConfig> for xberg::ImagePreprocessingConfig {
     fn from(val: ImagePreprocessingConfig) -> Self {
         Self {
@@ -25665,11 +31129,11 @@ impl From<ImagePreprocessingConfig> for xberg::ImagePreprocessingConfig {
             contrast_enhance: val.contrast_enhance,
             binarization_method: val.binarization_method,
             invert_colors: val.invert_colors,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ImagePreprocessingConfig> for ImagePreprocessingConfig {
     fn from(val: xberg::ImagePreprocessingConfig) -> Self {
         Self {
@@ -25684,7 +31148,8 @@ impl From<xberg::ImagePreprocessingConfig> for ImagePreprocessingConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<TesseractConfig> for xberg::TesseractConfig {
     fn from(val: TesseractConfig) -> Self {
         Self {
@@ -25709,11 +31174,12 @@ impl From<TesseractConfig> for xberg::TesseractConfig {
             tessedit_use_primary_params_model: val.tessedit_use_primary_params_model,
             textord_space_size_is_variable: val.textord_space_size_is_variable,
             thresholding_method: val.thresholding_method,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::TesseractConfig> for TesseractConfig {
     fn from(val: xberg::TesseractConfig) -> Self {
         Self {
@@ -25742,7 +31208,6 @@ impl From<xberg::TesseractConfig> for TesseractConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ImagePreprocessingMetadata> for xberg::ImagePreprocessingMetadata {
     fn from(val: ImagePreprocessingMetadata) -> Self {
         Self {
@@ -25762,7 +31227,7 @@ impl From<ImagePreprocessingMetadata> for xberg::ImagePreprocessingMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::ImagePreprocessingMetadata> for ImagePreprocessingMetadata {
     fn from(val: xberg::ImagePreprocessingMetadata) -> Self {
         Self {
@@ -25779,7 +31244,7 @@ impl From<xberg::ImagePreprocessingMetadata> for ImagePreprocessingMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<Formula> for xberg::Formula {
     fn from(val: Formula) -> Self {
         Self {
@@ -25790,7 +31255,7 @@ impl From<Formula> for xberg::Formula {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::Formula> for Formula {
     fn from(val: xberg::Formula) -> Self {
         Self {
@@ -25801,6 +31266,105 @@ impl From<xberg::Formula> for Formula {
     }
 }
 
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<CodeMetadata> for xberg::CodeMetadata {
+    fn from(val: CodeMetadata) -> Self {
+        Self {
+            chunks: val.chunks.into_iter().map(Into::into).collect(),
+            data: val.data.map(Into::into),
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<xberg::CodeMetadata> for CodeMetadata {
+    fn from(val: xberg::CodeMetadata) -> Self {
+        Self {
+            chunks: val.chunks.into_iter().map(Into::into).collect(),
+            data: val.data.map(Into::into),
+        }
+    }
+}
+
+impl From<CodeChunkInfo> for xberg::CodeChunkInfo {
+    fn from(val: CodeChunkInfo) -> Self {
+        Self {
+            text: val.text,
+            context_path: val.context_path.into_iter().collect(),
+            node_types: val.node_types.into_iter().collect(),
+            byte_start: val.byte_start,
+            byte_end: val.byte_end,
+        }
+    }
+}
+
+impl From<xberg::CodeChunkInfo> for CodeChunkInfo {
+    fn from(val: xberg::CodeChunkInfo) -> Self {
+        Self {
+            text: val.text.to_string(),
+            context_path: val.context_path.into_iter().collect(),
+            node_types: val.node_types.into_iter().collect(),
+            byte_start: val.byte_start,
+            byte_end: val.byte_end,
+        }
+    }
+}
+
+impl From<CodeDataAttribute> for xberg::CodeDataAttribute {
+    fn from(val: CodeDataAttribute) -> Self {
+        Self {
+            name: val.name,
+            value: val.value,
+            byte_start: val.byte_start,
+            byte_end: val.byte_end,
+        }
+    }
+}
+
+impl From<xberg::CodeDataAttribute> for CodeDataAttribute {
+    fn from(val: xberg::CodeDataAttribute) -> Self {
+        Self {
+            name: val.name.to_string(),
+            value: val.value.to_string(),
+            byte_start: val.byte_start,
+            byte_end: val.byte_end,
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<CodeDataNode> for xberg::CodeDataNode {
+    fn from(val: CodeDataNode) -> Self {
+        Self {
+            kind: val.kind.into(),
+            key: val.key,
+            value: val.value,
+            attributes: val.attributes.into_iter().map(Into::into).collect(),
+            children: val.children.into_iter().map(Into::into).collect(),
+            byte_start: val.byte_start,
+            byte_end: val.byte_end,
+        }
+    }
+}
+
+#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<xberg::CodeDataNode> for CodeDataNode {
+    fn from(val: xberg::CodeDataNode) -> Self {
+        Self {
+            kind: val.kind.into(),
+            key: val.key.map(|v| v.to_string()),
+            value: val.value.map(|v| v.to_string()),
+            attributes: val.attributes.into_iter().map(Into::into).collect(),
+            children: val.children.into_iter().map(Into::into).collect(),
+            byte_start: val.byte_start,
+            byte_end: val.byte_end,
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<Metadata> for xberg::Metadata {
     fn from(val: Metadata) -> Self {
@@ -25831,6 +31395,7 @@ impl From<Metadata> for xberg::Metadata {
                 .into_iter()
                 .map(|(k, v)| (k.into(), serde_json::from_str(&v).unwrap_or_default()))
                 .collect(),
+            ..Default::default()
         }
     }
 }
@@ -25869,17 +31434,19 @@ impl From<xberg::Metadata> for Metadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::redundant_closure)]
 impl From<ExcelMetadata> for xberg::ExcelMetadata {
     fn from(val: ExcelMetadata) -> Self {
         Self {
             sheet_count: val.sheet_count,
             sheet_names: val.sheet_names.map(|v| v.into_iter().collect()),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::ExcelMetadata> for ExcelMetadata {
     fn from(val: xberg::ExcelMetadata) -> Self {
         Self {
@@ -25889,7 +31456,7 @@ impl From<xberg::ExcelMetadata> for ExcelMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<EmailMetadata> for xberg::EmailMetadata {
     fn from(val: EmailMetadata) -> Self {
         Self {
@@ -25900,11 +31467,12 @@ impl From<EmailMetadata> for xberg::EmailMetadata {
             bcc_emails: val.bcc_emails.into_iter().collect(),
             message_id: val.message_id,
             attachments: val.attachments.into_iter().collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::EmailMetadata> for EmailMetadata {
     fn from(val: xberg::EmailMetadata) -> Self {
         Self {
@@ -25919,7 +31487,8 @@ impl From<xberg::EmailMetadata> for EmailMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<ArchiveMetadata> for xberg::ArchiveMetadata {
     fn from(val: ArchiveMetadata) -> Self {
         Self {
@@ -25928,11 +31497,11 @@ impl From<ArchiveMetadata> for xberg::ArchiveMetadata {
             file_list: val.file_list.into_iter().collect(),
             total_size: val.total_size,
             compressed_size: val.compressed_size,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ArchiveMetadata> for ArchiveMetadata {
     fn from(val: xberg::ArchiveMetadata) -> Self {
         Self {
@@ -25945,6 +31514,7 @@ impl From<xberg::ArchiveMetadata> for ArchiveMetadata {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ImageMetadata> for xberg::ImageMetadata {
     fn from(val: ImageMetadata) -> Self {
@@ -25953,6 +31523,7 @@ impl From<ImageMetadata> for xberg::ImageMetadata {
             height: val.height,
             format: val.format,
             exif: val.exif.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            ..Default::default()
         }
     }
 }
@@ -25969,17 +31540,17 @@ impl From<xberg::ImageMetadata> for ImageMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<XmlMetadata> for xberg::XmlMetadata {
     fn from(val: XmlMetadata) -> Self {
         Self {
             element_count: val.element_count,
             unique_elements: val.unique_elements.into_iter().collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::XmlMetadata> for XmlMetadata {
     fn from(val: xberg::XmlMetadata) -> Self {
         Self {
@@ -25990,7 +31561,7 @@ impl From<xberg::XmlMetadata> for XmlMetadata {
 }
 
 #[allow(clippy::needless_update)]
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<TextMetadata> for xberg::TextMetadata {
     fn from(val: TextMetadata) -> Self {
         Self {
@@ -26003,7 +31574,7 @@ impl From<TextMetadata> for xberg::TextMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::TextMetadata> for TextMetadata {
     fn from(val: xberg::TextMetadata) -> Self {
         Self {
@@ -26015,7 +31586,6 @@ impl From<xberg::TextMetadata> for TextMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<HeaderMetadata> for xberg::HeaderMetadata {
     fn from(val: HeaderMetadata) -> Self {
         Self {
@@ -26028,7 +31598,7 @@ impl From<HeaderMetadata> for xberg::HeaderMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::HeaderMetadata> for HeaderMetadata {
     fn from(val: xberg::HeaderMetadata) -> Self {
         Self {
@@ -26041,7 +31611,7 @@ impl From<xberg::HeaderMetadata> for HeaderMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<LinkMetadata> for xberg::LinkMetadata {
     fn from(val: LinkMetadata) -> Self {
         Self {
@@ -26068,7 +31638,7 @@ impl From<xberg::LinkMetadata> for LinkMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<ImageMetadataType> for xberg::ImageMetadataType {
     fn from(val: ImageMetadataType) -> Self {
         Self {
@@ -26094,7 +31664,7 @@ impl From<xberg::ImageMetadataType> for ImageMetadataType {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<StructuredData> for xberg::StructuredData {
     fn from(val: StructuredData) -> Self {
         Self {
@@ -26116,6 +31686,7 @@ impl From<xberg::StructuredData> for StructuredData {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<HtmlMetadata> for xberg::HtmlMetadata {
     fn from(val: HtmlMetadata) -> Self {
@@ -26139,6 +31710,7 @@ impl From<HtmlMetadata> for xberg::HtmlMetadata {
             links: val.links.into_iter().map(Into::into).collect(),
             images: val.images.into_iter().map(Into::into).collect(),
             structured_data: val.structured_data.into_iter().map(Into::into).collect(),
+            ..Default::default()
         }
     }
 }
@@ -26170,7 +31742,7 @@ impl From<xberg::HtmlMetadata> for HtmlMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<OcrMetadata> for xberg::OcrMetadata {
     fn from(val: OcrMetadata) -> Self {
         Self {
@@ -26180,11 +31752,11 @@ impl From<OcrMetadata> for xberg::OcrMetadata {
             table_count: val.table_count,
             table_rows: val.table_rows,
             table_cols: val.table_cols,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::OcrMetadata> for OcrMetadata {
     fn from(val: xberg::OcrMetadata) -> Self {
         Self {
@@ -26198,7 +31770,6 @@ impl From<xberg::OcrMetadata> for OcrMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ErrorMetadata> for xberg::ErrorMetadata {
     fn from(val: ErrorMetadata) -> Self {
         Self {
@@ -26208,7 +31779,6 @@ impl From<ErrorMetadata> for xberg::ErrorMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ErrorMetadata> for ErrorMetadata {
     fn from(val: xberg::ErrorMetadata) -> Self {
         Self {
@@ -26218,7 +31788,7 @@ impl From<xberg::ErrorMetadata> for ErrorMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<PptxMetadata> for xberg::PptxMetadata {
     fn from(val: PptxMetadata) -> Self {
         Self {
@@ -26226,11 +31796,11 @@ impl From<PptxMetadata> for xberg::PptxMetadata {
             slide_names: val.slide_names.into_iter().collect(),
             image_count: val.image_count,
             table_count: val.table_count,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::PptxMetadata> for PptxMetadata {
     fn from(val: xberg::PptxMetadata) -> Self {
         Self {
@@ -26242,6 +31812,7 @@ impl From<xberg::PptxMetadata> for PptxMetadata {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<DocxMetadata> for xberg::DocxMetadata {
     fn from(val: DocxMetadata) -> Self {
@@ -26253,6 +31824,7 @@ impl From<DocxMetadata> for xberg::DocxMetadata {
                     .map(|(k, v)| (k.into(), serde_json::from_str(&v).unwrap_or_default()))
                     .collect()
             }),
+            ..Default::default()
         }
     }
 }
@@ -26270,7 +31842,8 @@ impl From<xberg::DocxMetadata> for DocxMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::redundant_closure)]
 impl From<CsvMetadata> for xberg::CsvMetadata {
     fn from(val: CsvMetadata) -> Self {
         Self {
@@ -26279,11 +31852,12 @@ impl From<CsvMetadata> for xberg::CsvMetadata {
             delimiter: val.delimiter,
             has_header: val.has_header,
             column_types: val.column_types.map(|v| v.into_iter().collect()),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::CsvMetadata> for CsvMetadata {
     fn from(val: xberg::CsvMetadata) -> Self {
         Self {
@@ -26296,6 +31870,7 @@ impl From<xberg::CsvMetadata> for CsvMetadata {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<BibtexMetadata> for xberg::BibtexMetadata {
     fn from(val: BibtexMetadata) -> Self {
@@ -26305,6 +31880,7 @@ impl From<BibtexMetadata> for xberg::BibtexMetadata {
             authors: val.authors.into_iter().collect(),
             year_range: val.year_range.map(Into::into),
             entry_types: val.entry_types.map(|m| m.into_iter().collect()),
+            ..Default::default()
         }
     }
 }
@@ -26322,7 +31898,8 @@ impl From<xberg::BibtexMetadata> for BibtexMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<CitationMetadata> for xberg::CitationMetadata {
     fn from(val: CitationMetadata) -> Self {
         Self {
@@ -26332,6 +31909,7 @@ impl From<CitationMetadata> for xberg::CitationMetadata {
             year_range: val.year_range.map(Into::into),
             dois: val.dois.into_iter().collect(),
             keywords: val.keywords.into_iter().collect(),
+            ..Default::default()
         }
     }
 }
@@ -26350,7 +31928,6 @@ impl From<xberg::CitationMetadata> for CitationMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<YearRange> for xberg::YearRange {
     fn from(val: YearRange) -> Self {
         Self {
@@ -26361,7 +31938,6 @@ impl From<YearRange> for xberg::YearRange {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::YearRange> for YearRange {
     fn from(val: xberg::YearRange) -> Self {
         Self {
@@ -26372,18 +31948,19 @@ impl From<xberg::YearRange> for YearRange {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<FictionBookMetadata> for xberg::FictionBookMetadata {
     fn from(val: FictionBookMetadata) -> Self {
         Self {
             genres: val.genres.into_iter().collect(),
             sequences: val.sequences.into_iter().collect(),
             annotation: val.annotation,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::FictionBookMetadata> for FictionBookMetadata {
     fn from(val: xberg::FictionBookMetadata) -> Self {
         Self {
@@ -26394,18 +31971,20 @@ impl From<xberg::FictionBookMetadata> for FictionBookMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<DbfMetadata> for xberg::DbfMetadata {
     fn from(val: DbfMetadata) -> Self {
         Self {
             record_count: val.record_count,
             field_count: val.field_count,
             fields: val.fields.into_iter().map(Into::into).collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DbfMetadata> for DbfMetadata {
     fn from(val: xberg::DbfMetadata) -> Self {
         Self {
@@ -26416,7 +31995,6 @@ impl From<xberg::DbfMetadata> for DbfMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<DbfFieldInfo> for xberg::DbfFieldInfo {
     fn from(val: DbfFieldInfo) -> Self {
         Self {
@@ -26426,7 +32004,6 @@ impl From<DbfFieldInfo> for xberg::DbfFieldInfo {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::DbfFieldInfo> for DbfFieldInfo {
     fn from(val: xberg::DbfFieldInfo) -> Self {
         Self {
@@ -26436,6 +32013,7 @@ impl From<xberg::DbfFieldInfo> for DbfFieldInfo {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<JatsMetadata> for xberg::JatsMetadata {
     fn from(val: JatsMetadata) -> Self {
@@ -26448,6 +32026,7 @@ impl From<JatsMetadata> for xberg::JatsMetadata {
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
             contributor_roles: val.contributor_roles.into_iter().map(Into::into).collect(),
+            ..Default::default()
         }
     }
 }
@@ -26468,7 +32047,6 @@ impl From<xberg::JatsMetadata> for JatsMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<ContributorRole> for xberg::ContributorRole {
     fn from(val: ContributorRole) -> Self {
         Self {
@@ -26478,7 +32056,7 @@ impl From<ContributorRole> for xberg::ContributorRole {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::ContributorRole> for ContributorRole {
     fn from(val: xberg::ContributorRole) -> Self {
         Self {
@@ -26488,7 +32066,7 @@ impl From<xberg::ContributorRole> for ContributorRole {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<EpubMetadata> for xberg::EpubMetadata {
     fn from(val: EpubMetadata) -> Self {
         Self {
@@ -26498,11 +32076,12 @@ impl From<EpubMetadata> for xberg::EpubMetadata {
             source: val.source,
             dc_type: val.dc_type,
             cover_image: val.cover_image,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::EpubMetadata> for EpubMetadata {
     fn from(val: xberg::EpubMetadata) -> Self {
         Self {
@@ -26516,16 +32095,16 @@ impl From<xberg::EpubMetadata> for EpubMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<PstMetadata> for xberg::PstMetadata {
     fn from(val: PstMetadata) -> Self {
         Self {
             message_count: val.message_count,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::PstMetadata> for PstMetadata {
     fn from(val: xberg::PstMetadata) -> Self {
         Self {
@@ -26534,7 +32113,7 @@ impl From<xberg::PstMetadata> for PstMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<AudioMetadata> for xberg::AudioMetadata {
     fn from(val: AudioMetadata) -> Self {
         Self {
@@ -26544,11 +32123,12 @@ impl From<AudioMetadata> for xberg::AudioMetadata {
             sample_rate_hz: val.sample_rate_hz,
             channels: val.channels,
             bitrate: val.bitrate,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::AudioMetadata> for AudioMetadata {
     fn from(val: xberg::AudioMetadata) -> Self {
         Self {
@@ -26562,17 +32142,17 @@ impl From<xberg::AudioMetadata> for AudioMetadata {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<OcrConfidence> for xberg::OcrConfidence {
     fn from(val: OcrConfidence) -> Self {
         Self {
             detection: val.detection,
             recognition: val.recognition,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::OcrConfidence> for OcrConfidence {
     fn from(val: xberg::OcrConfidence) -> Self {
         Self {
@@ -26582,7 +32162,6 @@ impl From<xberg::OcrConfidence> for OcrConfidence {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<OcrRotation> for xberg::OcrRotation {
     fn from(val: OcrRotation) -> Self {
         Self {
@@ -26592,7 +32171,6 @@ impl From<OcrRotation> for xberg::OcrRotation {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::OcrRotation> for OcrRotation {
     fn from(val: xberg::OcrRotation) -> Self {
         Self {
@@ -26602,6 +32180,7 @@ impl From<xberg::OcrRotation> for OcrRotation {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<OcrElement> for xberg::OcrElement {
     fn from(val: OcrElement) -> Self {
@@ -26618,6 +32197,7 @@ impl From<OcrElement> for xberg::OcrElement {
                 .into_iter()
                 .map(|(k, v)| (k.into(), serde_json::from_str(&v).unwrap_or_default()))
                 .collect(),
+            ..Default::default()
         }
     }
 }
@@ -26642,7 +32222,8 @@ impl From<xberg::OcrElement> for OcrElement {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<OcrElementConfig> for xberg::OcrElementConfig {
     fn from(val: OcrElementConfig) -> Self {
         Self {
@@ -26650,11 +32231,12 @@ impl From<OcrElementConfig> for xberg::OcrElementConfig {
             min_level: val.min_level.into(),
             min_confidence: val.min_confidence,
             build_hierarchy: val.build_hierarchy,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::OcrElementConfig> for OcrElementConfig {
     fn from(val: xberg::OcrElementConfig) -> Self {
         Self {
@@ -26690,7 +32272,6 @@ impl From<xberg::PageStructure> for PageStructure {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<PageBoundary> for xberg::PageBoundary {
     fn from(val: PageBoundary) -> Self {
         Self {
@@ -26701,7 +32282,6 @@ impl From<PageBoundary> for xberg::PageBoundary {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::PageBoundary> for PageBoundary {
     fn from(val: xberg::PageBoundary) -> Self {
         Self {
@@ -26712,7 +32292,6 @@ impl From<xberg::PageBoundary> for PageBoundary {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<PageInfo> for xberg::PageInfo {
     fn from(val: PageInfo) -> Self {
         Self {
@@ -26728,7 +32307,7 @@ impl From<PageInfo> for xberg::PageInfo {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::PageInfo> for PageInfo {
     fn from(val: xberg::PageInfo) -> Self {
         Self {
@@ -26779,7 +32358,8 @@ impl From<xberg::PageContent> for PageContent {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<LayoutRegion> for xberg::LayoutRegion {
     fn from(val: LayoutRegion) -> Self {
         Self {
@@ -26787,11 +32367,12 @@ impl From<LayoutRegion> for xberg::LayoutRegion {
             confidence: val.confidence,
             bounding_box: val.bounding_box.into(),
             area_fraction: val.area_fraction,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::LayoutRegion> for LayoutRegion {
     fn from(val: xberg::LayoutRegion) -> Self {
         Self {
@@ -26803,7 +32384,7 @@ impl From<xberg::LayoutRegion> for LayoutRegion {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<PageHierarchy> for xberg::PageHierarchy {
     fn from(val: PageHierarchy) -> Self {
         Self {
@@ -26813,7 +32394,7 @@ impl From<PageHierarchy> for xberg::PageHierarchy {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::PageHierarchy> for PageHierarchy {
     fn from(val: xberg::PageHierarchy) -> Self {
         Self {
@@ -26823,7 +32404,6 @@ impl From<xberg::PageHierarchy> for PageHierarchy {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<HierarchicalBlock> for xberg::HierarchicalBlock {
     fn from(val: HierarchicalBlock) -> Self {
         Self {
@@ -26835,7 +32415,6 @@ impl From<HierarchicalBlock> for xberg::HierarchicalBlock {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::HierarchicalBlock> for HierarchicalBlock {
     fn from(val: xberg::HierarchicalBlock) -> Self {
         Self {
@@ -26846,7 +32425,7 @@ impl From<xberg::HierarchicalBlock> for HierarchicalBlock {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<QrCode> for xberg::QrCode {
     fn from(val: QrCode) -> Self {
         Self {
@@ -26857,7 +32436,7 @@ impl From<QrCode> for xberg::QrCode {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::QrCode> for QrCode {
     fn from(val: xberg::QrCode) -> Self {
         Self {
@@ -26868,7 +32447,6 @@ impl From<xberg::QrCode> for QrCode {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<QrBoundingBox> for xberg::QrBoundingBox {
     fn from(val: QrBoundingBox) -> Self {
         Self {
@@ -26880,7 +32458,6 @@ impl From<QrBoundingBox> for xberg::QrBoundingBox {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::QrBoundingBox> for QrBoundingBox {
     fn from(val: xberg::QrBoundingBox) -> Self {
         Self {
@@ -26892,7 +32469,7 @@ impl From<xberg::QrBoundingBox> for QrBoundingBox {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<RedactionReport> for xberg::RedactionReport {
     fn from(val: RedactionReport) -> Self {
         Self {
@@ -26902,7 +32479,7 @@ impl From<RedactionReport> for xberg::RedactionReport {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::RedactionReport> for RedactionReport {
     fn from(val: xberg::RedactionReport) -> Self {
         Self {
@@ -26912,7 +32489,7 @@ impl From<xberg::RedactionReport> for RedactionReport {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<RedactionFinding> for xberg::RedactionFinding {
     fn from(val: RedactionFinding) -> Self {
         Self {
@@ -26925,7 +32502,7 @@ impl From<RedactionFinding> for xberg::RedactionFinding {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::RedactionFinding> for RedactionFinding {
     fn from(val: xberg::RedactionFinding) -> Self {
         Self {
@@ -26938,7 +32515,6 @@ impl From<xberg::RedactionFinding> for RedactionFinding {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<CellChange> for xberg::CellChange {
     fn from(val: CellChange) -> Self {
         Self {
@@ -26950,7 +32526,6 @@ impl From<CellChange> for xberg::CellChange {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::CellChange> for CellChange {
     fn from(val: xberg::CellChange) -> Self {
         Self {
@@ -26962,7 +32537,28 @@ impl From<xberg::CellChange> for CellChange {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<PropertyChange> for xberg::PropertyChange {
+    fn from(val: PropertyChange) -> Self {
+        Self {
+            name: val.name,
+            from: val.from_,
+            to: val.to,
+        }
+    }
+}
+
+#[allow(clippy::redundant_closure)]
+impl From<xberg::PropertyChange> for PropertyChange {
+    fn from(val: xberg::PropertyChange) -> Self {
+        Self {
+            name: val.name.to_string(),
+            from_: val.from.map(|v| v.to_string()),
+            to: val.to.map(|v| v.to_string()),
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
 impl From<DocumentRevision> for xberg::DocumentRevision {
     fn from(val: DocumentRevision) -> Self {
         Self {
@@ -26990,27 +32586,31 @@ impl From<xberg::DocumentRevision> for DocumentRevision {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<RevisionDelta> for xberg::RevisionDelta {
     fn from(val: RevisionDelta) -> Self {
         Self {
             content: val.content.into_iter().map(Into::into).collect(),
             table_changes: val.table_changes.into_iter().map(Into::into).collect(),
+            property_changes: val.property_changes.into_iter().map(Into::into).collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::RevisionDelta> for RevisionDelta {
     fn from(val: xberg::RevisionDelta) -> Self {
         Self {
             content: val.content.into_iter().map(Into::into).collect(),
             table_changes: val.table_changes.into_iter().map(Into::into).collect(),
+            property_changes: val.property_changes.into_iter().map(Into::into).collect(),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<DocumentSummary> for xberg::DocumentSummary {
     fn from(val: DocumentSummary) -> Self {
         Self {
@@ -27021,7 +32621,7 @@ impl From<DocumentSummary> for xberg::DocumentSummary {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DocumentSummary> for DocumentSummary {
     fn from(val: xberg::DocumentSummary) -> Self {
         Self {
@@ -27032,6 +32632,7 @@ impl From<xberg::DocumentSummary> for DocumentSummary {
     }
 }
 
+#[allow(clippy::needless_update)]
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<Table> for xberg::Table {
     fn from(val: Table) -> Self {
@@ -27040,6 +32641,9 @@ impl From<Table> for xberg::Table {
             markdown: val.markdown,
             page_number: val.page_number,
             bounding_box: val.bounding_box.map(Into::into),
+            table_id: val.table_id,
+            columns: val.columns.map(|v| v.into_iter().collect()),
+            ..Default::default()
         }
     }
 }
@@ -27052,11 +32656,12 @@ impl From<xberg::Table> for Table {
             markdown: val.markdown.to_string(),
             page_number: val.page_number,
             bounding_box: val.bounding_box.map(Into::into),
+            table_id: val.table_id.map(|v| v.to_string()),
+            columns: val.columns.map(|v| v.into_iter().collect()),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::TableCell> for TableCell {
     fn from(val: xberg::TableCell) -> Self {
         Self {
@@ -27068,7 +32673,6 @@ impl From<xberg::TableCell> for TableCell {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<Translation> for xberg::Translation {
     fn from(val: Translation) -> Self {
         Self {
@@ -27080,7 +32684,7 @@ impl From<Translation> for xberg::Translation {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::Translation> for Translation {
     fn from(val: xberg::Translation) -> Self {
         Self {
@@ -27092,7 +32696,7 @@ impl From<xberg::Translation> for Translation {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<ExtractedUri> for xberg::ExtractedUri {
     fn from(val: ExtractedUri) -> Self {
         Self {
@@ -27116,7 +32720,7 @@ impl From<xberg::ExtractedUri> for ExtractedUri {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::api::DetectResponse> for DetectResponse {
     fn from(val: xberg::api::DetectResponse) -> Self {
         Self {
@@ -27126,18 +32730,18 @@ impl From<xberg::api::DetectResponse> for DetectResponse {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<DiffOptions> for xberg::DiffOptions {
     fn from(val: DiffOptions) -> Self {
         Self {
             include_metadata: val.include_metadata,
             include_embedded: val.include_embedded,
             max_content_chars: val.max_content_chars,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::DiffOptions> for DiffOptions {
     fn from(val: xberg::DiffOptions) -> Self {
         Self {
@@ -27148,7 +32752,7 @@ impl From<xberg::DiffOptions> for DiffOptions {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::ExtractionDiff> for ExtractionDiff {
     fn from(val: xberg::ExtractionDiff) -> Self {
         Self {
@@ -27162,7 +32766,7 @@ impl From<xberg::ExtractionDiff> for ExtractionDiff {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DiffHunk> for DiffHunk {
     fn from(val: xberg::DiffHunk) -> Self {
         Self {
@@ -27175,7 +32779,7 @@ impl From<xberg::DiffHunk> for DiffHunk {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::TableDiff> for TableDiff {
     fn from(val: xberg::TableDiff) -> Self {
         Self {
@@ -27186,7 +32790,7 @@ impl From<xberg::TableDiff> for TableDiff {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::EmbeddedChanges> for EmbeddedChanges {
     fn from(val: xberg::EmbeddedChanges) -> Self {
         Self {
@@ -27197,7 +32801,7 @@ impl From<xberg::EmbeddedChanges> for EmbeddedChanges {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::EmbeddedDiff> for EmbeddedDiff {
     fn from(val: xberg::EmbeddedDiff) -> Self {
         Self {
@@ -27207,7 +32811,6 @@ impl From<xberg::EmbeddedDiff> for EmbeddedDiff {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::RerankedDocument> for RerankedDocument {
     fn from(val: xberg::RerankedDocument) -> Self {
         Self {
@@ -27218,16 +32821,100 @@ impl From<xberg::RerankedDocument> for RerankedDocument {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
-impl From<YakeParams> for xberg::YakeParams {
-    fn from(val: YakeParams) -> Self {
+impl From<SparseEmbedding> for xberg::SparseEmbedding {
+    fn from(val: SparseEmbedding) -> Self {
         Self {
-            window_size: val.window_size,
+            indices: val.indices.into_iter().collect(),
+            values: val.values.into_iter().collect(),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+impl From<xberg::SparseEmbedding> for SparseEmbedding {
+    fn from(val: xberg::SparseEmbedding) -> Self {
+        Self {
+            indices: val.indices.into_iter().collect(),
+            values: val.values.into_iter().collect(),
+        }
+    }
+}
+
+impl From<xberg::SparseEmbeddingPreset> for SparseEmbeddingPreset {
+    fn from(val: xberg::SparseEmbeddingPreset) -> Self {
+        Self {
+            name: val.name.to_string(),
+            model_repo: val.model_repo.to_string(),
+            model_file: val.model_file.to_string(),
+            additional_files: val.additional_files.into_iter().collect(),
+            max_length: val.max_length,
+            description: val.description.to_string(),
+        }
+    }
+}
+
+impl From<MultiVectorEmbedding> for xberg::MultiVectorEmbedding {
+    fn from(val: MultiVectorEmbedding) -> Self {
+        Self {
+            num_tokens: val.num_tokens,
+            dim: val.dim,
+            data: val.data.into_iter().collect(),
+        }
+    }
+}
+
+impl From<xberg::MultiVectorEmbedding> for MultiVectorEmbedding {
+    fn from(val: xberg::MultiVectorEmbedding) -> Self {
+        Self {
+            num_tokens: val.num_tokens,
+            dim: val.dim,
+            data: val.data.into_iter().collect(),
+        }
+    }
+}
+
+impl From<xberg::LateInteractionPreset> for LateInteractionPreset {
+    fn from(val: xberg::LateInteractionPreset) -> Self {
+        Self {
+            name: val.name.to_string(),
+            model_repo: val.model_repo.to_string(),
+            model_file: val.model_file.to_string(),
+            additional_files: val.additional_files.into_iter().collect(),
+            max_length: val.max_length,
+            query_max_length: val.query_max_length,
+            dim: val.dim,
+            description: val.description.to_string(),
+        }
+    }
+}
+
+impl From<LateInteractionMatch> for xberg::LateInteractionMatch {
+    fn from(val: LateInteractionMatch) -> Self {
+        Self {
+            index: val.index,
+            score: val.score,
+        }
+    }
+}
+
+impl From<xberg::LateInteractionMatch> for LateInteractionMatch {
+    fn from(val: xberg::LateInteractionMatch) -> Self {
+        Self {
+            index: val.index,
+            score: val.score,
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<YakeParams> for xberg::YakeParams {
+    fn from(val: YakeParams) -> Self {
+        Self {
+            window_size: val.window_size,
+            ..Default::default()
+        }
+    }
+}
+
 impl From<xberg::YakeParams> for YakeParams {
     fn from(val: xberg::YakeParams) -> Self {
         Self {
@@ -27236,17 +32923,17 @@ impl From<xberg::YakeParams> for YakeParams {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<RakeParams> for xberg::RakeParams {
     fn from(val: RakeParams) -> Self {
         Self {
             min_word_length: val.min_word_length,
             max_words_per_phrase: val.max_words_per_phrase,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::RakeParams> for RakeParams {
     fn from(val: xberg::RakeParams) -> Self {
         Self {
@@ -27257,7 +32944,7 @@ impl From<xberg::RakeParams> for RakeParams {
 }
 
 #[allow(clippy::needless_update)]
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<KeywordConfig> for xberg::KeywordConfig {
     fn from(val: KeywordConfig) -> Self {
         Self {
@@ -27310,7 +32997,7 @@ impl From<xberg::Keyword> for Keyword {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DocumentMetadata> for DocumentMetadata {
     fn from(val: xberg::DocumentMetadata) -> Self {
         Self {
@@ -27336,8 +33023,8 @@ impl From<xberg::UserChunkConfig> for UserChunkConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
-impl From<ExtractionConfidence> for xberg::heuristics::ExtractionConfidence {
+#[allow(clippy::useless_conversion)]
+impl From<ExtractionConfidence> for xberg::ExtractionConfidence {
     fn from(val: ExtractionConfidence) -> Self {
         Self {
             text_coverage: val.text_coverage,
@@ -27348,9 +33035,9 @@ impl From<ExtractionConfidence> for xberg::heuristics::ExtractionConfidence {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
-impl From<xberg::heuristics::ExtractionConfidence> for ExtractionConfidence {
-    fn from(val: xberg::heuristics::ExtractionConfidence) -> Self {
+#[allow(clippy::useless_conversion)]
+impl From<xberg::ExtractionConfidence> for ExtractionConfidence {
+    fn from(val: xberg::ExtractionConfidence) -> Self {
         Self {
             text_coverage: val.text_coverage,
             ocr_aggregate: val.ocr_aggregate,
@@ -27360,7 +33047,7 @@ impl From<xberg::heuristics::ExtractionConfidence> for ExtractionConfidence {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<HeuristicsConfig> for xberg::HeuristicsConfig {
     fn from(val: HeuristicsConfig) -> Self {
         Self {
@@ -27375,11 +33062,11 @@ impl From<HeuristicsConfig> for xberg::HeuristicsConfig {
             max_xlsx_sheet_count: val.max_xlsx_sheet_count,
             max_xlsx_workbook_cells: val.max_xlsx_workbook_cells,
             max_pptx_embedded_count: val.max_pptx_embedded_count,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::HeuristicsConfig> for HeuristicsConfig {
     fn from(val: xberg::HeuristicsConfig) -> Self {
         Self {
@@ -27398,7 +33085,7 @@ impl From<xberg::HeuristicsConfig> for HeuristicsConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::ChunkInfo> for ChunkInfo {
     fn from(val: xberg::ChunkInfo) -> Self {
         Self {
@@ -27409,7 +33096,6 @@ impl From<xberg::ChunkInfo> for ChunkInfo {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::PageRange> for PageRange {
     fn from(val: xberg::PageRange) -> Self {
         Self {
@@ -27419,7 +33105,7 @@ impl From<xberg::PageRange> for PageRange {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::MultidocInput> for MultidocInput {
     fn from(val: xberg::MultidocInput) -> Self {
         Self {
@@ -27429,7 +33115,6 @@ impl From<xberg::MultidocInput> for MultidocInput {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<PageSignals> for xberg::PageSignals {
     fn from(val: PageSignals) -> Self {
         Self {
@@ -27443,7 +33128,6 @@ impl From<PageSignals> for xberg::PageSignals {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::PageSignals> for PageSignals {
     fn from(val: xberg::PageSignals) -> Self {
         Self {
@@ -27457,7 +33141,7 @@ impl From<xberg::PageSignals> for PageSignals {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DocumentBoundary> for DocumentBoundary {
     fn from(val: xberg::DocumentBoundary) -> Self {
         Self {
@@ -27469,17 +33153,17 @@ impl From<xberg::DocumentBoundary> for DocumentBoundary {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<MultidocThresholds> for xberg::MultidocThresholds {
     fn from(val: MultidocThresholds) -> Self {
         Self {
             density_shift_threshold: val.density_shift_threshold,
             bigram_overlap_min: val.bigram_overlap_min,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::MultidocThresholds> for MultidocThresholds {
     fn from(val: xberg::MultidocThresholds) -> Self {
         Self {
@@ -27489,7 +33173,7 @@ impl From<xberg::MultidocThresholds> for MultidocThresholds {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::ResolvedPreset> for ResolvedPreset {
     fn from(val: xberg::ResolvedPreset) -> Self {
         Self {
@@ -27506,7 +33190,6 @@ impl From<xberg::ResolvedPreset> for ResolvedPreset {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<PresetSample> for xberg::PresetSample {
     fn from(val: PresetSample) -> Self {
         Self {
@@ -27516,7 +33199,6 @@ impl From<PresetSample> for xberg::PresetSample {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::PresetSample> for PresetSample {
     fn from(val: xberg::PresetSample) -> Self {
         Self {
@@ -27526,7 +33208,7 @@ impl From<xberg::PresetSample> for PresetSample {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<Preset> for xberg::Preset {
     fn from(val: Preset) -> Self {
         Self {
@@ -27570,7 +33252,7 @@ impl From<xberg::Preset> for Preset {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<PresetSummary> for xberg::PresetSummary {
     fn from(val: PresetSummary) -> Self {
         Self {
@@ -27587,7 +33269,7 @@ impl From<PresetSummary> for xberg::PresetSummary {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::PresetSummary> for PresetSummary {
     fn from(val: xberg::PresetSummary) -> Self {
         Self {
@@ -27604,7 +33286,50 @@ impl From<xberg::PresetSummary> for PresetSummary {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
+impl From<DoctorCheck> for xberg::DoctorCheck {
+    fn from(val: DoctorCheck) -> Self {
+        Self {
+            name: val.name,
+            status: val.status.into(),
+            message: val.message,
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<xberg::DoctorCheck> for DoctorCheck {
+    fn from(val: xberg::DoctorCheck) -> Self {
+        Self {
+            name: val.name.to_string(),
+            status: val.status.into(),
+            message: val.message.to_string(),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<DoctorReport> for xberg::DoctorReport {
+    fn from(val: DoctorReport) -> Self {
+        Self {
+            checks: val.checks.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<xberg::DoctorReport> for DoctorReport {
+    fn from(val: xberg::DoctorReport) -> Self {
+        Self {
+            checks: val.checks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<PaddleOcrConfig> for xberg::PaddleOcrConfig {
     fn from(val: PaddleOcrConfig) -> Self {
         Self {
@@ -27620,6 +33345,9 @@ impl From<PaddleOcrConfig> for xberg::PaddleOcrConfig {
             padding: val.padding,
             drop_score: val.drop_score,
             model_tier: val.model_tier,
+            model_version: val.model_version,
+            inference_backend: val.inference_backend.map(Into::into),
+            ..Default::default()
         }
     }
 }
@@ -27640,11 +33368,12 @@ impl From<xberg::PaddleOcrConfig> for PaddleOcrConfig {
             padding: val.padding,
             drop_score: val.drop_score,
             model_tier: val.model_tier.to_string(),
+            model_version: val.model_version.to_string(),
+            inference_backend: val.inference_backend.map(Into::into),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::ModelPaths> for ModelPaths {
     fn from(val: xberg::ModelPaths) -> Self {
         Self {
@@ -27656,7 +33385,6 @@ impl From<xberg::ModelPaths> for ModelPaths {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::OrientationResult> for OrientationResult {
     fn from(val: xberg::OrientationResult) -> Self {
         Self {
@@ -27666,7 +33394,6 @@ impl From<xberg::OrientationResult> for OrientationResult {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::BBox> for BBox {
     fn from(val: xberg::BBox) -> Self {
         Self {
@@ -27678,7 +33405,7 @@ impl From<xberg::BBox> for BBox {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::LayoutDetection> for LayoutDetection {
     fn from(val: xberg::LayoutDetection) -> Self {
         Self {
@@ -27689,7 +33416,7 @@ impl From<xberg::LayoutDetection> for LayoutDetection {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::RecognizedTable> for RecognizedTable {
     fn from(val: xberg::RecognizedTable) -> Self {
         Self {
@@ -27700,7 +33427,7 @@ impl From<xberg::RecognizedTable> for RecognizedTable {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<xberg::DetectionResult> for DetectionResult {
     fn from(val: xberg::DetectionResult) -> Self {
         Self {
@@ -27723,7 +33450,8 @@ impl From<xberg::pdf::embedded_files::EmbeddedFile> for EmbeddedFile {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::redundant_closure)]
 impl From<PdfMetadata> for xberg::pdf::metadata::PdfMetadata {
     fn from(val: PdfMetadata) -> Self {
         Self {
@@ -27733,11 +33461,16 @@ impl From<PdfMetadata> for xberg::pdf::metadata::PdfMetadata {
             width: val.width,
             height: val.height,
             page_count: val.page_count,
+            scanned_confidence: val.scanned_confidence,
+            scanned_pages: val.scanned_pages.map(|v| v.into_iter().collect()),
+            layout_gated_pages: val.layout_gated_pages.map(|v| v.into_iter().collect()),
+            layout_gate_reasons: val.layout_gate_reasons.map(|v| v.into_iter().collect()),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<xberg::pdf::metadata::PdfMetadata> for PdfMetadata {
     fn from(val: xberg::pdf::metadata::PdfMetadata) -> Self {
         Self {
@@ -27747,22 +33480,36 @@ impl From<xberg::pdf::metadata::PdfMetadata> for PdfMetadata {
             width: val.width,
             height: val.height,
             page_count: val.page_count,
+            scanned_confidence: val.scanned_confidence,
+            scanned_pages: val.scanned_pages.map(|v| v.into_iter().collect()),
+            layout_gated_pages: val.layout_gated_pages.map(|v| v.into_iter().collect()),
+            layout_gate_reasons: val.layout_gate_reasons.map(|v| v.into_iter().collect()),
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
+impl From<xberg::enrich::ChunkClassificationEnrichmentConfig> for ChunkClassificationEnrichmentConfig {
+    fn from(val: xberg::enrich::ChunkClassificationEnrichmentConfig) -> Self {
+        Self {
+            config: val.config.into(),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
 impl From<ProxyConfig> for crawlberg::ProxyConfig {
     fn from(val: ProxyConfig) -> Self {
         Self {
             url: val.url,
             username: val.username,
             password: val.password,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<crawlberg::ProxyConfig> for ProxyConfig {
     fn from(val: crawlberg::ProxyConfig) -> Self {
         Self {
@@ -27773,7 +33520,7 @@ impl From<crawlberg::ProxyConfig> for ProxyConfig {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<ContentConfig> for crawlberg::ContentConfig {
     fn from(val: ContentConfig) -> Self {
         Self {
@@ -27789,11 +33536,11 @@ impl From<ContentConfig> for crawlberg::ContentConfig {
             wrap: val.wrap,
             wrap_width: val.wrap_width,
             include_document_structure: val.include_document_structure,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<crawlberg::ContentConfig> for ContentConfig {
     fn from(val: crawlberg::ContentConfig) -> Self {
         Self {
@@ -27814,7 +33561,7 @@ impl From<crawlberg::ContentConfig> for ContentConfig {
 }
 
 #[allow(clippy::field_reassign_with_default, clippy::let_and_return)]
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<BrowserConfig> for crawlberg::BrowserConfig {
     fn from(val: BrowserConfig) -> Self {
         let mut __result = crawlberg::BrowserConfig::default();
@@ -27866,6 +33613,7 @@ impl From<CrawlConfig> for crawlberg::CrawlConfig {
         let mut __result = crawlberg::CrawlConfig::default();
         __result.max_depth = val.max_depth;
         __result.max_pages = val.max_pages;
+        __result.max_links_per_page = val.max_links_per_page;
         __result.max_concurrent = val.max_concurrent;
         __result.respect_robots_txt = val.respect_robots_txt;
         __result.soft_http_errors = val.soft_http_errors;
@@ -27905,10 +33653,13 @@ impl From<CrawlConfig> for crawlberg::CrawlConfig {
         __result.download_documents = val.download_documents;
         __result.document_max_size = val.document_max_size;
         __result.document_mime_types = val.document_mime_types.into_iter().collect();
+        __result.document_output_dir = val.document_output_dir.map(Into::into);
+        __result.document_content_encoding = val.document_content_encoding.map(Into::into);
         __result.warc_output = val.warc_output.map(Into::into);
         __result.browser_profile = val.browser_profile;
         __result.save_browser_profile = val.save_browser_profile;
         __result.ssrf = val.ssrf.into();
+        __result.ssrf_deny_private_explicit = val.ssrf_deny_private_explicit;
         __result
     }
 }
@@ -27919,6 +33670,7 @@ impl From<crawlberg::CrawlConfig> for CrawlConfig {
         Self {
             max_depth: val.max_depth,
             max_pages: val.max_pages,
+            max_links_per_page: val.max_links_per_page,
             max_concurrent: val.max_concurrent,
             respect_robots_txt: val.respect_robots_txt,
             soft_http_errors: val.soft_http_errors,
@@ -27956,15 +33708,18 @@ impl From<crawlberg::CrawlConfig> for CrawlConfig {
             download_documents: val.download_documents,
             document_max_size: val.document_max_size,
             document_mime_types: val.document_mime_types.into_iter().collect(),
+            document_output_dir: val.document_output_dir.map(|p| p.to_string_lossy().to_string()),
+            document_content_encoding: val.document_content_encoding.map(Into::into),
             warc_output: val.warc_output.map(|p| p.to_string_lossy().to_string()),
             browser_profile: val.browser_profile.map(|v| v.to_string()),
             save_browser_profile: val.save_browser_profile,
             ssrf: val.ssrf.into(),
+            ssrf_deny_private_explicit: val.ssrf_deny_private_explicit,
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
 impl From<SitemapUrl> for crawlberg::SitemapUrl {
     fn from(val: SitemapUrl) -> Self {
         Self {
@@ -27972,11 +33727,12 @@ impl From<SitemapUrl> for crawlberg::SitemapUrl {
             lastmod: val.lastmod,
             changefreq: val.changefreq,
             priority: val.priority,
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::redundant_closure)]
 impl From<crawlberg::SitemapUrl> for SitemapUrl {
     fn from(val: crawlberg::SitemapUrl) -> Self {
         Self {
@@ -27988,16 +33744,18 @@ impl From<crawlberg::SitemapUrl> for SitemapUrl {
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
 impl From<MapResult> for crawlberg::MapResult {
     fn from(val: MapResult) -> Self {
         Self {
             urls: val.urls.into_iter().map(Into::into).collect(),
+            ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<crawlberg::MapResult> for MapResult {
     fn from(val: crawlberg::MapResult) -> Self {
         Self {
@@ -28007,23 +33765,147 @@ impl From<crawlberg::MapResult> for MapResult {
 }
 
 #[allow(clippy::needless_update)]
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<SsrfPolicy> for crawlberg::SsrfPolicy {
     fn from(val: SsrfPolicy) -> Self {
         Self {
             deny_private: val.deny_private,
+            allowlist: val.allowlist.into_iter().map(Into::into).collect(),
             max_redirects: val.max_redirects,
             ..Default::default()
         }
     }
 }
 
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
+#[allow(clippy::useless_conversion)]
 impl From<crawlberg::SsrfPolicy> for SsrfPolicy {
     fn from(val: crawlberg::SsrfPolicy) -> Self {
         Self {
             deny_private: val.deny_private,
+            allowlist: val.allowlist.into_iter().map(Into::into).collect(),
             max_redirects: val.max_redirects,
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<ConversionOptions> for html_to_markdown_rs::ConversionOptions {
+    fn from(val: ConversionOptions) -> Self {
+        Self {
+            heading_style: val.heading_style.into(),
+            list_indent_type: val.list_indent_type.into(),
+            list_indent_width: val.list_indent_width,
+            bullets: val.bullets,
+            strong_em_symbol: val.strong_em_symbol.chars().next().unwrap_or('*'),
+            escape_asterisks: val.escape_asterisks,
+            escape_underscores: val.escape_underscores,
+            escape_misc: val.escape_misc,
+            escape_ascii: val.escape_ascii,
+            code_language: val.code_language,
+            autolinks: val.autolinks,
+            default_title: val.default_title,
+            br_in_tables: val.br_in_tables,
+            compact_tables: val.compact_tables,
+            highlight_style: val.highlight_style.into(),
+            extract_metadata: val.extract_metadata,
+            whitespace_mode: val.whitespace_mode.into(),
+            strip_newlines: val.strip_newlines,
+            wrap: val.wrap,
+            wrap_width: val.wrap_width,
+            convert_as_inline: val.convert_as_inline,
+            sub_symbol: val.sub_symbol,
+            sup_symbol: val.sup_symbol,
+            newline_style: val.newline_style.into(),
+            code_block_style: val.code_block_style.into(),
+            keep_inline_images_in: val.keep_inline_images_in.into_iter().collect(),
+            preprocessing: val.preprocessing.into(),
+            encoding: val.encoding,
+            debug: val.debug,
+            strip_tags: val.strip_tags.into_iter().collect(),
+            preserve_tags: val.preserve_tags.into_iter().collect(),
+            skip_images: val.skip_images,
+            url_escape_style: val.url_escape_style.into(),
+            link_style: val.link_style.into(),
+            max_image_size: val.max_image_size,
+            capture_svg: val.capture_svg,
+            infer_dimensions: val.infer_dimensions,
+            max_depth: val.max_depth,
+            exclude_selectors: val.exclude_selectors.into_iter().collect(),
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<html_to_markdown_rs::ConversionOptions> for ConversionOptions {
+    fn from(val: html_to_markdown_rs::ConversionOptions) -> Self {
+        Self {
+            heading_style: val.heading_style.into(),
+            list_indent_type: val.list_indent_type.into(),
+            list_indent_width: val.list_indent_width,
+            bullets: val.bullets.to_string(),
+            strong_em_symbol: val.strong_em_symbol.to_string(),
+            escape_asterisks: val.escape_asterisks,
+            escape_underscores: val.escape_underscores,
+            escape_misc: val.escape_misc,
+            escape_ascii: val.escape_ascii,
+            code_language: val.code_language.to_string(),
+            autolinks: val.autolinks,
+            default_title: val.default_title,
+            br_in_tables: val.br_in_tables,
+            compact_tables: val.compact_tables,
+            highlight_style: val.highlight_style.into(),
+            extract_metadata: val.extract_metadata,
+            whitespace_mode: val.whitespace_mode.into(),
+            strip_newlines: val.strip_newlines,
+            wrap: val.wrap,
+            wrap_width: val.wrap_width,
+            convert_as_inline: val.convert_as_inline,
+            sub_symbol: val.sub_symbol.to_string(),
+            sup_symbol: val.sup_symbol.to_string(),
+            newline_style: val.newline_style.into(),
+            code_block_style: val.code_block_style.into(),
+            keep_inline_images_in: val.keep_inline_images_in.into_iter().collect(),
+            preprocessing: val.preprocessing.into(),
+            encoding: val.encoding.to_string(),
+            debug: val.debug,
+            strip_tags: val.strip_tags.into_iter().collect(),
+            preserve_tags: val.preserve_tags.into_iter().collect(),
+            skip_images: val.skip_images,
+            url_escape_style: val.url_escape_style.into(),
+            link_style: val.link_style.into(),
+            max_image_size: val.max_image_size,
+            capture_svg: val.capture_svg,
+            infer_dimensions: val.infer_dimensions,
+            max_depth: val.max_depth,
+            exclude_selectors: val.exclude_selectors.into_iter().collect(),
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<PreprocessingOptions> for html_to_markdown_rs::PreprocessingOptions {
+    fn from(val: PreprocessingOptions) -> Self {
+        Self {
+            enabled: val.enabled,
+            preset: val.preset.into(),
+            remove_navigation: val.remove_navigation,
+            remove_forms: val.remove_forms,
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+impl From<html_to_markdown_rs::PreprocessingOptions> for PreprocessingOptions {
+    fn from(val: html_to_markdown_rs::PreprocessingOptions) -> Self {
+        Self {
+            enabled: val.enabled,
+            preset: val.preset.into(),
+            remove_navigation: val.remove_navigation,
+            remove_forms: val.remove_forms,
         }
     }
 }
@@ -28086,6 +33968,44 @@ impl From<xberg::UrlExtractionMode> for UrlExtractionMode {
             xberg::UrlExtractionMode::Auto => Self::Auto,
             xberg::UrlExtractionMode::Document => Self::Document,
             xberg::UrlExtractionMode::Crawl => Self::Crawl,
+        }
+    }
+}
+
+impl From<BreadcrumbTarget> for xberg::BreadcrumbTarget {
+    fn from(val: BreadcrumbTarget) -> Self {
+        match val {
+            BreadcrumbTarget::Content => Self::Content,
+            BreadcrumbTarget::Metadata => Self::Metadata,
+        }
+    }
+}
+
+impl From<xberg::BreadcrumbTarget> for BreadcrumbTarget {
+    fn from(val: xberg::BreadcrumbTarget) -> Self {
+        match val {
+            xberg::BreadcrumbTarget::Content => Self::Content,
+            xberg::BreadcrumbTarget::Metadata => Self::Metadata,
+        }
+    }
+}
+
+impl From<JupyterCellRendering> for xberg::JupyterCellRendering {
+    fn from(val: JupyterCellRendering) -> Self {
+        match val {
+            JupyterCellRendering::Source => Self::Source,
+            JupyterCellRendering::Outputs => Self::Outputs,
+            JupyterCellRendering::Both => Self::Both,
+        }
+    }
+}
+
+impl From<xberg::JupyterCellRendering> for JupyterCellRendering {
+    fn from(val: xberg::JupyterCellRendering) -> Self {
+        match val {
+            xberg::JupyterCellRendering::Source => Self::Source,
+            xberg::JupyterCellRendering::Outputs => Self::Outputs,
+            xberg::JupyterCellRendering::Both => Self::Both,
         }
     }
 }
@@ -28156,6 +34076,24 @@ impl From<xberg::core::config::layout::TableOverlapPreference> for TableOverlapP
             xberg::core::config::layout::TableOverlapPreference::Content => Self::Content,
             xberg::core::config::layout::TableOverlapPreference::Native => Self::Native,
             xberg::core::config::layout::TableOverlapPreference::Layout => Self::Layout,
+        }
+    }
+}
+
+impl From<LayoutStrategy> for xberg::LayoutStrategy {
+    fn from(val: LayoutStrategy) -> Self {
+        match val {
+            LayoutStrategy::Always => Self::Always,
+            LayoutStrategy::Auto => Self::Auto,
+        }
+    }
+}
+
+impl From<xberg::LayoutStrategy> for LayoutStrategy {
+    fn from(val: xberg::LayoutStrategy) -> Self {
+        match val {
+            xberg::LayoutStrategy::Always => Self::Always,
+            xberg::LayoutStrategy::Auto => Self::Auto,
         }
     }
 }
@@ -28254,6 +34192,24 @@ impl From<xberg::ChunkerType> for ChunkerType {
             xberg::ChunkerType::Markdown => Self::Markdown,
             xberg::ChunkerType::Yaml => Self::Yaml,
             xberg::ChunkerType::Semantic => Self::Semantic,
+        }
+    }
+}
+
+impl From<RerankerHead> for xberg::RerankerHead {
+    fn from(val: RerankerHead) -> Self {
+        match val {
+            RerankerHead::CrossEncoder => Self::CrossEncoder,
+            RerankerHead::Qwen3Generative => Self::Qwen3Generative,
+        }
+    }
+}
+
+impl From<xberg::RerankerHead> for RerankerHead {
+    fn from(val: xberg::RerankerHead) -> Self {
+        match val {
+            xberg::RerankerHead::CrossEncoder => Self::CrossEncoder,
+            xberg::RerankerHead::Qwen3Generative => Self::Qwen3Generative,
         }
     }
 }
@@ -28367,6 +34323,17 @@ impl From<PdfAnnotationType> for xberg::PdfAnnotationType {
             PdfAnnotationType::Stamp => Self::Stamp,
             PdfAnnotationType::Underline => Self::Underline,
             PdfAnnotationType::StrikeOut => Self::StrikeOut,
+            PdfAnnotationType::Squiggly => Self::Squiggly,
+            PdfAnnotationType::Ink => Self::Ink,
+            PdfAnnotationType::Square => Self::Square,
+            PdfAnnotationType::Circle => Self::Circle,
+            PdfAnnotationType::Polygon => Self::Polygon,
+            PdfAnnotationType::PolyLine => Self::PolyLine,
+            PdfAnnotationType::Line => Self::Line,
+            PdfAnnotationType::Caret => Self::Caret,
+            PdfAnnotationType::FileAttachment => Self::FileAttachment,
+            PdfAnnotationType::Sound => Self::Sound,
+            PdfAnnotationType::Movie => Self::Movie,
             PdfAnnotationType::Other => Self::Other,
         }
     }
@@ -28381,6 +34348,17 @@ impl From<xberg::PdfAnnotationType> for PdfAnnotationType {
             xberg::PdfAnnotationType::Stamp => Self::Stamp,
             xberg::PdfAnnotationType::Underline => Self::Underline,
             xberg::PdfAnnotationType::StrikeOut => Self::StrikeOut,
+            xberg::PdfAnnotationType::Squiggly => Self::Squiggly,
+            xberg::PdfAnnotationType::Ink => Self::Ink,
+            xberg::PdfAnnotationType::Square => Self::Square,
+            xberg::PdfAnnotationType::Circle => Self::Circle,
+            xberg::PdfAnnotationType::Polygon => Self::Polygon,
+            xberg::PdfAnnotationType::PolyLine => Self::PolyLine,
+            xberg::PdfAnnotationType::Line => Self::Line,
+            xberg::PdfAnnotationType::Caret => Self::Caret,
+            xberg::PdfAnnotationType::FileAttachment => Self::FileAttachment,
+            xberg::PdfAnnotationType::Sound => Self::Sound,
+            xberg::PdfAnnotationType::Movie => Self::Movie,
             xberg::PdfAnnotationType::Other => Self::Other,
         }
     }
@@ -28560,6 +34538,9 @@ impl From<ChunkType> for xberg::ChunkType {
             ChunkType::TableLike => Self::TableLike,
             ChunkType::Formula => Self::Formula,
             ChunkType::CodeBlock => Self::CodeBlock,
+            ChunkType::Function => Self::Function,
+            ChunkType::Class => Self::Class,
+            ChunkType::Module => Self::Module,
             ChunkType::Image => Self::Image,
             ChunkType::OrgChart => Self::OrgChart,
             ChunkType::Diagram => Self::Diagram,
@@ -28580,6 +34561,9 @@ impl From<xberg::ChunkType> for ChunkType {
             xberg::ChunkType::TableLike => Self::TableLike,
             xberg::ChunkType::Formula => Self::Formula,
             xberg::ChunkType::CodeBlock => Self::CodeBlock,
+            xberg::ChunkType::Function => Self::Function,
+            xberg::ChunkType::Class => Self::Class,
+            xberg::ChunkType::Module => Self::Module,
             xberg::ChunkType::Image => Self::Image,
             xberg::ChunkType::OrgChart => Self::OrgChart,
             xberg::ChunkType::Diagram => Self::Diagram,
@@ -28704,6 +34688,26 @@ impl From<xberg::FormFieldType> for FormFieldType {
             xberg::FormFieldType::Signature => Self::Signature,
             xberg::FormFieldType::Button => Self::Button,
             xberg::FormFieldType::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<CodeDataNodeKind> for xberg::CodeDataNodeKind {
+    fn from(val: CodeDataNodeKind) -> Self {
+        match val {
+            CodeDataNodeKind::KeyValue => Self::KeyValue,
+            CodeDataNodeKind::Element => Self::Element,
+            CodeDataNodeKind::Sequence => Self::Sequence,
+        }
+    }
+}
+
+impl From<xberg::CodeDataNodeKind> for CodeDataNodeKind {
+    fn from(val: xberg::CodeDataNodeKind) -> Self {
+        match val {
+            xberg::CodeDataNodeKind::KeyValue => Self::KeyValue,
+            xberg::CodeDataNodeKind::Element => Self::Element,
+            xberg::CodeDataNodeKind::Sequence => Self::Sequence,
         }
     }
 }
@@ -28937,6 +34941,15 @@ impl From<xberg::RegionKind> for RegionKind {
     }
 }
 
+impl From<xberg::embeddings::EmbeddingBackend> for EmbeddingsEmbeddingBackend {
+    fn from(val: xberg::embeddings::EmbeddingBackend) -> Self {
+        match val {
+            xberg::embeddings::EmbeddingBackend::Onnx => Self::Onnx,
+            xberg::embeddings::EmbeddingBackend::Static => Self::Static,
+        }
+    }
+}
+
 impl From<KeywordAlgorithm> for xberg::KeywordAlgorithm {
     fn from(val: KeywordAlgorithm) -> Self {
         match val {
@@ -29029,6 +35042,46 @@ impl From<xberg::PSMMode> for PSMMode {
             xberg::PSMMode::SingleWord => Self::SingleWord,
             xberg::PSMMode::CircleWord => Self::CircleWord,
             xberg::PSMMode::SingleChar => Self::SingleChar,
+        }
+    }
+}
+
+impl From<ProbeStatus> for xberg::ProbeStatus {
+    fn from(val: ProbeStatus) -> Self {
+        match val {
+            ProbeStatus::Pass => Self::Pass,
+            ProbeStatus::Warn => Self::Warn,
+            ProbeStatus::Fail => Self::Fail,
+            ProbeStatus::Skip => Self::Skip,
+        }
+    }
+}
+
+impl From<xberg::ProbeStatus> for ProbeStatus {
+    fn from(val: xberg::ProbeStatus) -> Self {
+        match val {
+            xberg::ProbeStatus::Pass => Self::Pass,
+            xberg::ProbeStatus::Warn => Self::Warn,
+            xberg::ProbeStatus::Fail => Self::Fail,
+            xberg::ProbeStatus::Skip => Self::Skip,
+        }
+    }
+}
+
+impl From<PaddleInferenceBackend> for xberg::PaddleInferenceBackend {
+    fn from(val: PaddleInferenceBackend) -> Self {
+        match val {
+            PaddleInferenceBackend::Ort => Self::Ort,
+            PaddleInferenceBackend::Tract => Self::Tract,
+        }
+    }
+}
+
+impl From<xberg::PaddleInferenceBackend> for PaddleInferenceBackend {
+    fn from(val: xberg::PaddleInferenceBackend) -> Self {
+        match val {
+            xberg::PaddleInferenceBackend::Ort => Self::Ort,
+            xberg::PaddleInferenceBackend::Tract => Self::Tract,
         }
     }
 }
@@ -29141,6 +35194,22 @@ impl From<crawlberg::BrowserBackend> for BrowserBackend {
     }
 }
 
+impl From<DocumentContentEncoding> for crawlberg::DocumentContentEncoding {
+    fn from(val: DocumentContentEncoding) -> Self {
+        match val {
+            DocumentContentEncoding::Base64 => Self::Base64,
+        }
+    }
+}
+
+impl From<crawlberg::DocumentContentEncoding> for DocumentContentEncoding {
+    fn from(val: crawlberg::DocumentContentEncoding) -> Self {
+        match val {
+            crawlberg::DocumentContentEncoding::Base64 => Self::Base64,
+        }
+    }
+}
+
 impl From<AssetCategory> for crawlberg::AssetCategory {
     fn from(val: AssetCategory) -> Self {
         match val {
@@ -29175,6 +35244,178 @@ impl From<crawlberg::AssetCategory> for AssetCategory {
     }
 }
 
+impl From<PreprocessingPreset> for html_to_markdown_rs::PreprocessingPreset {
+    fn from(val: PreprocessingPreset) -> Self {
+        match val {
+            PreprocessingPreset::Minimal => Self::Minimal,
+            PreprocessingPreset::Standard => Self::Standard,
+            PreprocessingPreset::Aggressive => Self::Aggressive,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::PreprocessingPreset> for PreprocessingPreset {
+    fn from(val: html_to_markdown_rs::PreprocessingPreset) -> Self {
+        match val {
+            html_to_markdown_rs::PreprocessingPreset::Minimal => Self::Minimal,
+            html_to_markdown_rs::PreprocessingPreset::Standard => Self::Standard,
+            html_to_markdown_rs::PreprocessingPreset::Aggressive => Self::Aggressive,
+        }
+    }
+}
+
+impl From<HeadingStyle> for html_to_markdown_rs::HeadingStyle {
+    fn from(val: HeadingStyle) -> Self {
+        match val {
+            HeadingStyle::Underlined => Self::Underlined,
+            HeadingStyle::Atx => Self::Atx,
+            HeadingStyle::AtxClosed => Self::AtxClosed,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::HeadingStyle> for HeadingStyle {
+    fn from(val: html_to_markdown_rs::HeadingStyle) -> Self {
+        match val {
+            html_to_markdown_rs::HeadingStyle::Underlined => Self::Underlined,
+            html_to_markdown_rs::HeadingStyle::Atx => Self::Atx,
+            html_to_markdown_rs::HeadingStyle::AtxClosed => Self::AtxClosed,
+        }
+    }
+}
+
+impl From<ListIndentType> for html_to_markdown_rs::ListIndentType {
+    fn from(val: ListIndentType) -> Self {
+        match val {
+            ListIndentType::Spaces => Self::Spaces,
+            ListIndentType::Tabs => Self::Tabs,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::ListIndentType> for ListIndentType {
+    fn from(val: html_to_markdown_rs::ListIndentType) -> Self {
+        match val {
+            html_to_markdown_rs::ListIndentType::Spaces => Self::Spaces,
+            html_to_markdown_rs::ListIndentType::Tabs => Self::Tabs,
+        }
+    }
+}
+
+impl From<WhitespaceMode> for html_to_markdown_rs::WhitespaceMode {
+    fn from(val: WhitespaceMode) -> Self {
+        match val {
+            WhitespaceMode::Normalized => Self::Normalized,
+            WhitespaceMode::Strict => Self::Strict,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::WhitespaceMode> for WhitespaceMode {
+    fn from(val: html_to_markdown_rs::WhitespaceMode) -> Self {
+        match val {
+            html_to_markdown_rs::WhitespaceMode::Normalized => Self::Normalized,
+            html_to_markdown_rs::WhitespaceMode::Strict => Self::Strict,
+        }
+    }
+}
+
+impl From<NewlineStyle> for html_to_markdown_rs::NewlineStyle {
+    fn from(val: NewlineStyle) -> Self {
+        match val {
+            NewlineStyle::Spaces => Self::Spaces,
+            NewlineStyle::Backslash => Self::Backslash,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::NewlineStyle> for NewlineStyle {
+    fn from(val: html_to_markdown_rs::NewlineStyle) -> Self {
+        match val {
+            html_to_markdown_rs::NewlineStyle::Spaces => Self::Spaces,
+            html_to_markdown_rs::NewlineStyle::Backslash => Self::Backslash,
+        }
+    }
+}
+
+impl From<CodeBlockStyle> for html_to_markdown_rs::CodeBlockStyle {
+    fn from(val: CodeBlockStyle) -> Self {
+        match val {
+            CodeBlockStyle::Indented => Self::Indented,
+            CodeBlockStyle::Backticks => Self::Backticks,
+            CodeBlockStyle::Tildes => Self::Tildes,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::CodeBlockStyle> for CodeBlockStyle {
+    fn from(val: html_to_markdown_rs::CodeBlockStyle) -> Self {
+        match val {
+            html_to_markdown_rs::CodeBlockStyle::Indented => Self::Indented,
+            html_to_markdown_rs::CodeBlockStyle::Backticks => Self::Backticks,
+            html_to_markdown_rs::CodeBlockStyle::Tildes => Self::Tildes,
+        }
+    }
+}
+
+impl From<HighlightStyle> for html_to_markdown_rs::HighlightStyle {
+    fn from(val: HighlightStyle) -> Self {
+        match val {
+            HighlightStyle::DoubleEqual => Self::DoubleEqual,
+            HighlightStyle::Html => Self::Html,
+            HighlightStyle::Bold => Self::Bold,
+            HighlightStyle::None => Self::None,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::HighlightStyle> for HighlightStyle {
+    fn from(val: html_to_markdown_rs::HighlightStyle) -> Self {
+        match val {
+            html_to_markdown_rs::HighlightStyle::DoubleEqual => Self::DoubleEqual,
+            html_to_markdown_rs::HighlightStyle::Html => Self::Html,
+            html_to_markdown_rs::HighlightStyle::Bold => Self::Bold,
+            html_to_markdown_rs::HighlightStyle::None => Self::None,
+        }
+    }
+}
+
+impl From<LinkStyle> for html_to_markdown_rs::LinkStyle {
+    fn from(val: LinkStyle) -> Self {
+        match val {
+            LinkStyle::Inline => Self::Inline,
+            LinkStyle::Reference => Self::Reference,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::LinkStyle> for LinkStyle {
+    fn from(val: html_to_markdown_rs::LinkStyle) -> Self {
+        match val {
+            html_to_markdown_rs::LinkStyle::Inline => Self::Inline,
+            html_to_markdown_rs::LinkStyle::Reference => Self::Reference,
+        }
+    }
+}
+
+impl From<UrlEscapeStyle> for html_to_markdown_rs::UrlEscapeStyle {
+    fn from(val: UrlEscapeStyle) -> Self {
+        match val {
+            UrlEscapeStyle::Angle => Self::Angle,
+            UrlEscapeStyle::Percent => Self::Percent,
+        }
+    }
+}
+
+impl From<html_to_markdown_rs::UrlEscapeStyle> for UrlEscapeStyle {
+    fn from(val: html_to_markdown_rs::UrlEscapeStyle) -> Self {
+        match val {
+            html_to_markdown_rs::UrlEscapeStyle::Angle => Self::Angle,
+            html_to_markdown_rs::UrlEscapeStyle::Percent => Self::Percent,
+        }
+    }
+}
+
 #[pyfunction]
 pub fn init_async_runtime() -> PyResult<()> {
     // Tokio runtime auto-initializes on first future_into_py call
@@ -29193,8 +35434,11 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CacheStats>()?;
     m.add_class::<AccelerationConfig>()?;
     m.add_class::<CaptioningConfig>()?;
+    m.add_class::<ChunkClassificationDefinition>()?;
+    m.add_class::<ChunkClassificationConfig>()?;
     m.add_class::<PageClassificationConfig>()?;
     m.add_class::<ContentFilterConfig>()?;
+    m.add_class::<CsvConfig>()?;
     m.add_class::<EmailConfig>()?;
     m.add_class::<ExtractionConfig>()?;
     m.add_class::<FileExtractionConfig>()?;
@@ -29208,8 +35452,14 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TokenReductionOptions>()?;
     m.add_class::<LanguageDetectionConfig>()?;
     m.add_class::<HtmlOutputConfig>()?;
+    m.add_class::<LateInteractionConfig>()?;
     m.add_class::<LayoutDetectionConfig>()?;
     m.add_class::<LlmConfig>()?;
+    m.add_class::<LlmProviderConfig>()?;
+    m.add_class::<LlmCacheConfig>()?;
+    m.add_class::<LlmBudgetConfig>()?;
+    m.add_class::<LlmRateLimitConfig>()?;
+    m.add_class::<BedrockConfig>()?;
     m.add_class::<StructuredExtractionConfig>()?;
     m.add_class::<NerConfig>()?;
     m.add_class::<OcrQualityThresholds>()?;
@@ -29226,6 +35476,7 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RedactionTerm>()?;
     m.add_class::<RedactionPattern>()?;
     m.add_class::<RerankerConfig>()?;
+    m.add_class::<SparseEmbeddingConfig>()?;
     m.add_class::<SummarizationConfig>()?;
     m.add_class::<TranscriptionConfig>()?;
     m.add_class::<TranslationConfig>()?;
@@ -29262,6 +35513,8 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GridCell>()?;
     m.add_class::<TextAnnotation>()?;
     m.add_class::<Entity>()?;
+    m.add_class::<DocumentCounts>()?;
+    m.add_class::<LanguageConfidence>()?;
     m.add_class::<ExtractedDocument>()?;
     m.add_class::<ArchiveEntry>()?;
     m.add_class::<ProcessingWarning>()?;
@@ -29270,6 +35523,7 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HeadingContext>()?;
     m.add_class::<HeadingLevel>()?;
     m.add_class::<ChunkMetadata>()?;
+    m.add_class::<PageSpan>()?;
     m.add_class::<ExtractedImage>()?;
     m.add_class::<BoundingBox>()?;
     m.add_class::<ElementMetadata>()?;
@@ -29289,6 +35543,10 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TesseractConfig>()?;
     m.add_class::<ImagePreprocessingMetadata>()?;
     m.add_class::<Formula>()?;
+    m.add_class::<CodeMetadata>()?;
+    m.add_class::<CodeChunkInfo>()?;
+    m.add_class::<CodeDataAttribute>()?;
+    m.add_class::<CodeDataNode>()?;
     m.add_class::<Metadata>()?;
     m.add_class::<ExcelMetadata>()?;
     m.add_class::<EmailMetadata>()?;
@@ -29333,6 +35591,7 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RedactionReport>()?;
     m.add_class::<RedactionFinding>()?;
     m.add_class::<CellChange>()?;
+    m.add_class::<PropertyChange>()?;
     m.add_class::<DocumentRevision>()?;
     m.add_class::<RevisionDelta>()?;
     m.add_class::<DocumentSummary>()?;
@@ -29348,6 +35607,11 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EmbeddedChanges>()?;
     m.add_class::<EmbeddedDiff>()?;
     m.add_class::<RerankedDocument>()?;
+    m.add_class::<SparseEmbedding>()?;
+    m.add_class::<SparseEmbeddingPreset>()?;
+    m.add_class::<MultiVectorEmbedding>()?;
+    m.add_class::<LateInteractionPreset>()?;
+    m.add_class::<LateInteractionMatch>()?;
     m.add_class::<YakeParams>()?;
     m.add_class::<RakeParams>()?;
     m.add_class::<KeywordConfig>()?;
@@ -29368,6 +35632,8 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PresetSample>()?;
     m.add_class::<Preset>()?;
     m.add_class::<PresetSummary>()?;
+    m.add_class::<DoctorCheck>()?;
+    m.add_class::<DoctorReport>()?;
     m.add_class::<PaddleOcrConfig>()?;
     m.add_class::<ModelPaths>()?;
     m.add_class::<OrientationResult>()?;
@@ -29377,6 +35643,7 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DetectionResult>()?;
     m.add_class::<EmbeddedFile>()?;
     m.add_class::<PdfMetadata>()?;
+    m.add_class::<ChunkClassificationEnrichmentConfig>()?;
     m.add_class::<ProxyConfig>()?;
     m.add_class::<ContentConfig>()?;
     m.add_class::<BrowserConfig>()?;
@@ -29384,23 +35651,33 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SitemapUrl>()?;
     m.add_class::<MapResult>()?;
     m.add_class::<SsrfPolicy>()?;
+    m.add_class::<ConversionOptions>()?;
+    m.add_class::<PreprocessingOptions>()?;
     m.add_class::<ExecutionProviderType>()?;
     m.add_class::<ImageOutputFormat>()?;
     m.add_class::<ExtractInputKind>()?;
     m.add_class::<UrlExtractionMode>()?;
+    m.add_class::<BreadcrumbTarget>()?;
     m.add_class::<OutputFormat>()?;
+    m.add_class::<JupyterCellRendering>()?;
     m.add_class::<HtmlTheme>()?;
+    m.add_class::<LateInteractionModelType>()?;
     m.add_class::<TableModel>()?;
     m.add_class::<TableOverlapPreference>()?;
+    m.add_class::<LayoutStrategy>()?;
+    m.add_class::<CredentialProviderConfig>()?;
     m.add_class::<CallMode>()?;
     m.add_class::<MergeMode>()?;
     m.add_class::<NerBackendKind>()?;
     m.add_class::<VlmFallbackPolicy>()?;
+    m.add_class::<OcrStrategy>()?;
     m.add_class::<TableChunkingMode>()?;
     m.add_class::<ChunkerType>()?;
     m.add_class::<ChunkSizing>()?;
     m.add_class::<EmbeddingModelType>()?;
+    m.add_class::<RerankerHead>()?;
     m.add_class::<RerankerModelType>()?;
+    m.add_class::<SparseEmbeddingModelType>()?;
     m.add_class::<WhisperModel>()?;
     m.add_class::<CodeContentMode>()?;
     m.add_class::<ListType>()?;
@@ -29422,6 +35699,7 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ElementType>()?;
     m.add_class::<FormFieldType>()?;
     m.add_class::<FormatMetadata>()?;
+    m.add_class::<CodeDataNodeKind>()?;
     m.add_class::<TextDirection>()?;
     m.add_class::<LinkType>()?;
     m.add_class::<ImageType>()?;
@@ -29437,6 +35715,7 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SummaryStrategy>()?;
     m.add_class::<UriKind>()?;
     m.add_class::<RegionKind>()?;
+    m.add_class::<EmbeddingsEmbeddingBackend>()?;
     m.add_class::<KeywordAlgorithm>()?;
     m.add_class::<SchemaCompliance>()?;
     m.add_class::<NoChunkingReason>()?;
@@ -29444,13 +35723,26 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BoundaryReason>()?;
     m.add_class::<PresetCategory>()?;
     m.add_class::<PSMMode>()?;
+    m.add_class::<ProbeStatus>()?;
+    m.add_class::<PaddleInferenceBackend>()?;
     m.add_class::<PaddleLanguage>()?;
     m.add_class::<LayoutClass>()?;
     m.add_class::<BrowserMode>()?;
     m.add_class::<BrowserWait>()?;
     m.add_class::<BrowserBackend>()?;
+    m.add_class::<DocumentContentEncoding>()?;
     m.add_class::<AuthConfig>()?;
     m.add_class::<AssetCategory>()?;
+    m.add_class::<HostMatcher>()?;
+    m.add_class::<PreprocessingPreset>()?;
+    m.add_class::<HeadingStyle>()?;
+    m.add_class::<ListIndentType>()?;
+    m.add_class::<WhitespaceMode>()?;
+    m.add_class::<NewlineStyle>()?;
+    m.add_class::<CodeBlockStyle>()?;
+    m.add_class::<HighlightStyle>()?;
+    m.add_class::<LinkStyle>()?;
+    m.add_class::<UrlEscapeStyle>()?;
     m.add_class::<PyOcrBackendMarker>()?;
     m.add_class::<PyPostProcessorMarker>()?;
     m.add_class::<PyValidatorMarker>()?;
@@ -29463,6 +35755,7 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_batch, m)?)?;
     m.add_function(wrap_pyfunction!(map_url, m)?)?;
     m.add_function(wrap_pyfunction!(list_supported_formats, m)?)?;
+    m.add_function(wrap_pyfunction!(ensure_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(clear_embedding_backends, m)?)?;
     m.add_function(wrap_pyfunction!(list_embedding_backends, m)?)?;
     m.add_function(wrap_pyfunction!(list_document_extractors, m)?)?;
@@ -29479,8 +35772,16 @@ pub fn _xberg(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(list_tokenizer_backends, m)?)?;
     m.add_function(wrap_pyfunction!(list_validators, m)?)?;
     m.add_function(wrap_pyfunction!(clear_validators, m)?)?;
+    m.add_function(wrap_pyfunction!(classify_chunks, m)?)?;
     m.add_function(wrap_pyfunction!(find_unmarked_claims, m)?)?;
     m.add_function(wrap_pyfunction!(verify_excerpt, m)?)?;
+    m.add_function(wrap_pyfunction!(max_sim_score, m)?)?;
+    m.add_function(wrap_pyfunction!(max_sim_rank, m)?)?;
+    m.add_function(wrap_pyfunction!(doctor, m)?)?;
+    m.add_function(wrap_pyfunction!(install_pdf_render_diagnostics, m)?)?;
+    m.add_function(wrap_pyfunction!(take_pdf_oxide_render_warnings, m)?)?;
+    m.add_function(wrap_pyfunction!(build_decoder_prompt_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(timestamp_token_to_ms, m)?)?;
     m.add_function(wrap_pyfunction!(register_ocr_backend, m)?)?;
     m.add_function(wrap_pyfunction!(register_post_processor, m)?)?;
     m.add_function(wrap_pyfunction!(register_validator, m)?)?;

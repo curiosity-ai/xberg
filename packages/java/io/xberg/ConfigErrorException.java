@@ -5,15 +5,13 @@ package io.xberg;
  * Invalid configuration value.
  */
 public class ConfigErrorException extends HeuristicsErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new ConfigErrorException with the given message. */
-    public ConfigErrorException(final String message) {
-        super(message);
-    }
+  /** Creates a new ConfigErrorException with the given message. */
+  public ConfigErrorException(final String message) { super(message); }
 
-    /** Creates a new ConfigErrorException with the given message and cause. */
-    public ConfigErrorException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new ConfigErrorException with the given message and cause. */
+  public ConfigErrorException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

@@ -4,6 +4,7 @@
 //! the tables are inlined into `result.content` at their correct positions
 //! rather than only appearing in `result.tables`.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "ocr")]
 
 mod helpers;
@@ -54,7 +55,6 @@ fn test_ocr_markdown_inlines_table_into_content() {
 
     assert_non_empty_content(&result);
 
-    // If tables were detected, the content must include pipe table syntax
     if !result.tables.is_empty() {
         assert!(
             result.content.contains('|'),
@@ -81,11 +81,9 @@ fn test_ocr_markdown_differs_from_plain_when_tables_found() {
     let md_result = extract_uri_document_blocking(&file_path, None, &ocr_markdown_config())
         .expect("Should extract with markdown output");
 
-    // Both should have content
     assert_non_empty_content(&plain_result);
     assert_non_empty_content(&md_result);
 
-    // If tables were detected in the markdown result, content should differ from plain
     if !md_result.tables.is_empty() {
         assert_ne!(
             plain_result.content,
@@ -141,7 +139,6 @@ fn test_issue_421_balance_sheet_markdown() {
 
     assert_non_empty_content(&result);
 
-    // If tables are detected, markdown content should include them
     if !result.tables.is_empty() {
         assert!(
             result.content.contains('|'),
@@ -152,7 +149,6 @@ fn test_issue_421_balance_sheet_markdown() {
             &result.content[..result.content.len().min(500)]
         );
 
-        // Bounding box should be populated
         for table in &result.tables {
             assert!(table.bounding_box.is_some(), "OCR table should have bounding_box");
         }
@@ -196,7 +192,6 @@ fn test_ocr_markdown_sets_output_format_metadata() {
     let result = extract_uri_document_blocking(&file_path, None, &ocr_markdown_config())
         .expect("Should extract table image with OCR");
 
-    // output_format should be set to "markdown" by the pipeline
     assert_eq!(
         result.metadata.output_format,
         Some("markdown".to_string()),

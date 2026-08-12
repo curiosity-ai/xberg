@@ -2,6 +2,12 @@
 	"id": "tokenizer_backends_clear",
 	"category": "tokenizer_backend_management",
 	"description": "Clear all tokenizer backends and verify list is empty",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "Clear all tokenizer backends and verify list is empty",
+		"description": "Clear all tokenizer backends and verify list is empty",
+		"side_effects": "safe"
+	},
 	"tags": ["tokenizer", "plugin_management", "clear", "trait-bridge"],
 	"call": "clear_tokenizer_backends",
 	"assertions": [

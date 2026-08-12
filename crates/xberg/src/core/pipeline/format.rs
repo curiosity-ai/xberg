@@ -29,18 +29,40 @@ use std::borrow::Cow;
 #[cfg_attr(alef, alef(skip))]
 pub fn apply_output_format(result: ExtractedDocument, output_format: OutputFormat) -> ExtractedDocument {
     let mut result = result;
+
+    // #208: a `Custom(name)` format with no matching renderer plugin falls back to
+    // plain text during derivation (`extraction::derive::derive_extraction_result`),
+    // leaving `formatted_content` unset. That is the only way a `Custom` format can
+    // reach this function with no pre-rendered content — every successful custom
+    // render always produces `Some(_)`. Detect that fallback here so metadata does
+    // not claim a format that was never actually produced. ~keep
+    let custom_fallback_to_plain =
+        matches!(output_format, OutputFormat::Custom(_)) && result.formatted_content.is_none();
+
     let format_name = match output_format {
         OutputFormat::Plain => "plain",
         OutputFormat::Markdown => "markdown",
         OutputFormat::Djot => "djot",
         OutputFormat::Html => "html",
         OutputFormat::Json => "json",
+        // `Structured` has no dedicated renderer: `derive_extraction_result` never
+        // populates `formatted_content` for it (see
+        // `extraction::derive::derive_extraction_result`), so this arm only swaps
+        // the metadata label. The `content` field stays whatever plain text the
+        // extractor and post-processors produced — identical to `Plain` — until a
+        // real structured (OCR element / bounding-box) renderer is implemented. ~keep
         OutputFormat::Structured => "structured",
-        OutputFormat::Custom(ref name) => name.as_str(),
+        OutputFormat::DocTags => "doctags",
+        OutputFormat::Custom(ref name) => {
+            if custom_fallback_to_plain {
+                "plain"
+            } else {
+                name.as_str()
+            }
+        }
     };
     result.metadata.output_format = Some(format_name.to_string());
 
-    // Swap in pre-rendered content if available (populated by derive_extraction_result).
     if let Some(formatted) = result.formatted_content.take() {
         result.content = formatted;
     }
@@ -76,7 +98,6 @@ mod tests {
 
         let result = apply_output_format(result, OutputFormat::Markdown);
 
-        // Without pre-rendered content, content stays as-is
         assert_eq!(result.content, "Hello World");
         assert_eq!(result.metadata.output_format, Some("markdown".to_string()));
     }
@@ -125,6 +146,24 @@ mod tests {
 
         assert_eq!(result.content, "# Djot heading");
         assert_eq!(result.metadata.output_format, Some("djot".to_string()));
+    }
+
+    /// `DocTags` must get its own "doctags" metadata label, not be mislabeled by
+    /// the `Custom` fallback logic — it is a first-class variant with a renderer
+    /// that always exists, unlike `Custom`, which can legitimately have none.
+    #[test]
+    fn should_label_doctags_metadata_with_its_own_format_name() {
+        let result = ExtractedDocument {
+            content: "plain text".to_string(),
+            mime_type: Cow::Borrowed("text/plain"),
+            formatted_content: Some("<doctag><text>Hello</text></doctag>".to_string()),
+            ..Default::default()
+        };
+
+        let result = apply_output_format(result, OutputFormat::DocTags);
+
+        assert_eq!(result.content, "<doctag><text>Hello</text></doctag>");
+        assert_eq!(result.metadata.output_format, Some("doctags".to_string()));
     }
 
     #[test]
@@ -177,6 +216,7 @@ mod tests {
             markdown: "| A | B |".to_string(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         };
 
         let result = ExtractedDocument {
@@ -190,6 +230,46 @@ mod tests {
 
         assert_eq!(result.tables.len(), 1);
         assert_eq!(result.tables[0].cells[0][0], "A");
+    }
+
+    /// #208: an unknown/renderer-less `Custom` format must not be mislabeled in
+    /// metadata as the requested (unproduced) format. `formatted_content` being
+    /// `None` for a `Custom` format only ever happens via the derivation
+    /// fallback-to-plain path, so metadata must say "plain", not the typo'd name.
+    #[test]
+    fn test_apply_output_format_custom_without_renderer_reports_plain_not_the_requested_name() {
+        let result = ExtractedDocument {
+            content: "plain text".to_string(),
+            mime_type: Cow::Borrowed("text/plain"),
+            formatted_content: None,
+            ..Default::default()
+        };
+
+        let result = apply_output_format(result, OutputFormat::Custom("markdwon".to_string()));
+
+        assert_eq!(result.content, "plain text");
+        assert_eq!(
+            result.metadata.output_format,
+            Some("plain".to_string()),
+            "metadata must not claim the requested custom format was produced when it was not"
+        );
+    }
+
+    /// A `Custom` format that *did* render successfully must still be labelled
+    /// with the requested name, not overridden to "plain".
+    #[test]
+    fn test_apply_output_format_custom_with_renderer_reports_the_requested_name() {
+        let result = ExtractedDocument {
+            content: "plain text".to_string(),
+            mime_type: Cow::Borrowed("text/plain"),
+            formatted_content: Some("<custom/>".to_string()),
+            ..Default::default()
+        };
+
+        let result = apply_output_format(result, OutputFormat::Custom("my-xml".to_string()));
+
+        assert_eq!(result.content, "<custom/>");
+        assert_eq!(result.metadata.output_format, Some("my-xml".to_string()));
     }
 
     #[test]

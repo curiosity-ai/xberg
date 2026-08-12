@@ -10,18 +10,18 @@
 //!
 //! This module is engine-internal and not part of the binding surface.
 
-#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime"))]
+#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use crawlberg::{CrawlConfig, CrawlEngine};
 
-#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime"))]
+#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use crate::Result;
-#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime"))]
+#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use crate::engine::EngineInner;
-#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime"))]
+#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use crate::engine::extract_impl::map_crawl_error;
 
 /// Memoized crawl engine keyed by a stable fingerprint of its [`CrawlConfig`].
-#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime"))]
+#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub(crate) struct CrawlHandleMemo {
     fingerprint: u64,
     engine: CrawlEngine,
@@ -35,7 +35,7 @@ pub(crate) struct CrawlHandleMemo {
 /// payloads; a fingerprint *mismatch* for equal configs (e.g. nondeterministic
 /// map ordering) only causes a harmless rebuild. Serialization failure falls
 /// back to hashing the `Debug` representation.
-#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime"))]
+#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub(crate) fn crawl_fingerprint(config: &CrawlConfig) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -48,7 +48,7 @@ pub(crate) fn crawl_fingerprint(config: &CrawlConfig) -> u64 {
     hasher.finish()
 }
 
-#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime"))]
+#[cfg(all(feature = "url-ingestion", feature = "tokio-runtime", not(target_arch = "wasm32")))]
 impl EngineInner {
     /// Return a crawl engine for `config`, reusing the memoized engine when its
     /// fingerprint matches, otherwise validating and building a fresh one

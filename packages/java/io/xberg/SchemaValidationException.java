@@ -5,15 +5,16 @@ package io.xberg;
  * The file parses as JSON but does not validate against the meta-schema.
  */
 public class SchemaValidationException extends LoadErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new SchemaValidationException with the given message. */
-    public SchemaValidationException(final String message) {
-        super(message);
-    }
+  /** Creates a new SchemaValidationException with the given message. */
+  public SchemaValidationException(final String message) { super(message); }
 
-    /** Creates a new SchemaValidationException with the given message and cause. */
-    public SchemaValidationException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /**
+   * Creates a new SchemaValidationException with the given message and cause.
+   */
+  public SchemaValidationException(final String message,
+                                   final Throwable cause) {
+    super(message, cause);
+  }
 }

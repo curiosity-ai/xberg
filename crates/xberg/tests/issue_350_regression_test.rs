@@ -3,6 +3,8 @@
 //! Tests with real DOCX files that were reported to be detected as ZIP.
 //! If the test files don't exist, the test is skipped.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+
 use std::path::Path;
 
 #[test]

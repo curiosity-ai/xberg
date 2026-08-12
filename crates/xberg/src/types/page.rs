@@ -5,7 +5,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-// Import serde helper and types from sibling modules
 use super::extraction::BoundingBox;
 use super::serde_helpers::serde_vec_arc;
 use super::tables::Table;

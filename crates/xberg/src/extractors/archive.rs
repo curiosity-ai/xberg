@@ -17,6 +17,9 @@ use async_trait::async_trait;
 use std::borrow::Cow;
 use std::io::Cursor;
 
+/// `ProcessingWarning::source` used for every degradation reported by the archive extractors.
+const ARCHIVE_WARNING_SOURCE: &str = "archive";
+
 /// Build an `InternalDocument` from archive metadata and text contents.
 ///
 /// Shared inner function — takes pre-computed children and warnings.
@@ -62,12 +65,10 @@ fn build_archive_doc_inner(
         ..Default::default()
     };
 
-    // Build InternalDocument with archive content as elements
     let mut doc = InternalDocument::new(format_name.to_lowercase());
     doc.mime_type = mime_type.to_string();
     doc.metadata = metadata;
 
-    // Add archive summary as a paragraph element
     let mut idx = 0u32;
     let summary = format!(
         "{} Archive ({} files, {} bytes)",
@@ -76,7 +77,6 @@ fn build_archive_doc_inner(
     doc.push_element(InternalElement::text(ElementKind::Paragraph, &summary, 0).with_index(idx));
     idx += 1;
 
-    // Add file listing
     let mut file_list = String::from("Files:\n");
     for entry in &extraction_metadata.file_list {
         file_list.push_str(&format!("- {} ({} bytes)\n", entry.path, entry.size));
@@ -84,14 +84,29 @@ fn build_archive_doc_inner(
     doc.push_element(InternalElement::text(ElementKind::Paragraph, &file_list, 0).with_index(idx));
     idx += 1;
 
-    // Add text file contents
-    for (path, content) in &text_contents {
+    // `text_contents` is an `AHashMap`, and aHash randomizes iteration order per process, so
+    // extracting the same archive twice produced the members in a different order each run.
+    // Emit them in the archive's own order instead, which also makes the bodies agree with the
+    // "Files:" listing printed just above. Members the listing does not cover sort after it by
+    // path, so the ordering stays total even if the two disagree (#121).
+    let listing_order: AHashMap<&str, usize> = extraction_metadata
+        .file_list
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.path.as_str(), position))
+        .collect();
+    let mut members: Vec<(&String, &String)> = text_contents.iter().collect();
+    members.sort_by(|(left, _), (right, _)| {
+        let rank = |path: &String| listing_order.get(path.as_str()).copied().unwrap_or(usize::MAX);
+        rank(left).cmp(&rank(right)).then_with(|| left.cmp(right))
+    });
+
+    for (path, content) in members {
         let text = format!("=== {} ===\n{}", path, content);
         doc.push_element(InternalElement::text(ElementKind::Paragraph, &text, 0).with_index(idx));
         idx += 1;
     }
 
-    // Store children (recursively extracted archive entries)
     doc.children = if children.is_empty() { None } else { Some(children) };
     doc.processing_warnings = processing_warnings;
 
@@ -115,6 +130,33 @@ fn build_archive_doc_sync(
     )
 }
 
+/// Returns true if `path` names an archive/tooling bookkeeping file (macOS `.DS_Store`,
+/// `__MACOSX/` AppleDouble resource forks, `._`-prefixed AppleDouble sidecars, Python
+/// `__pycache__/`/`.pyc`/`.pyo` bytecode, or Windows `Thumbs.db`/`desktop.ini`) rather than
+/// a real document, so it can be filtered out of archive `children` before extraction.
+fn is_archive_metadata_path(path: &str) -> bool {
+    let components: Vec<&str> = path.split(['/', '\\']).collect();
+    let basename = components.last().copied().unwrap_or(path);
+
+    let has_bookkeeping_dir = components
+        .iter()
+        .any(|component| *component == "__MACOSX" || *component == "__pycache__");
+    if has_bookkeeping_dir {
+        return true;
+    }
+
+    if basename == ".DS_Store" || basename == "Thumbs.db" || basename == "desktop.ini" {
+        return true;
+    }
+
+    if basename.starts_with("._") {
+        return true;
+    }
+
+    let lower = basename.to_ascii_lowercase();
+    lower.ends_with(".pyc") || lower.ends_with(".pyo")
+}
+
 /// Async version with recursive extraction of archive children.
 ///
 /// When `config.max_archive_depth > current_depth`, extracts each file in `file_bytes`
@@ -130,21 +172,56 @@ async fn build_archive_doc(
 ) -> InternalDocument {
     let mut children = Vec::new();
     let mut processing_warnings = Vec::new();
+    let mut filtered_paths: Vec<String> = Vec::new();
+
+    // A non-directory entry that the archive index lists but whose bytes never made it
+    // into `file_bytes` failed to decompress (bad CRC, truncated deflate stream, ...).
+    // It is absent from the text contents *and* from `children`, so name it instead of
+    // letting the document look complete (#114, #115).
+    let unreadable_entries: Vec<String> = extraction_metadata
+        .file_list
+        .iter()
+        .filter(|entry| !entry.is_dir && !file_bytes.contains_key(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect();
+    if !unreadable_entries.is_empty() {
+        let message = format!(
+            "Skipped {} archive entr{} that could not be read: {}",
+            unreadable_entries.len(),
+            if unreadable_entries.len() == 1 { "y" } else { "ies" },
+            crate::core::diagnostics::format_entry_list(&unreadable_entries)
+        );
+        crate::core::diagnostics::push_warning(&mut processing_warnings, ARCHIVE_WARNING_SOURCE, message);
+    }
 
     if config.max_archive_depth > current_depth && !file_bytes.is_empty() {
         for (path, bytes) in &file_bytes {
-            let detected_mime = crate::core::mime::detect_mime_type_from_bytes(bytes).ok().or_else(|| {
-                std::path::Path::new(path)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .and_then(|ext| mime_guess::from_ext(ext).first())
-                    .map(|m| m.to_string())
-            });
+            if is_archive_metadata_path(path) {
+                filtered_paths.push(path.clone());
+                continue;
+            }
 
-            let file_mime = match detected_mime {
-                Some(m) if m != "application/octet-stream" => m,
-                _ => continue,
+            let sniffed_mime = crate::core::mime::detect_mime_type_from_bytes(bytes).ok();
+
+            // Sniffing sees markdown/CSV/YAML as plain UTF-8 and returns `text/plain`,
+            // so fall back to the extension (as the top-level path does) to reach their
+            // real extractors; a concrete sniff (PDF, DOCX, ...) still wins. Only default
+            // to plain text when the extension itself maps to a textual type — an
+            // unsniffable, extensionless (or unknown-extension) file is treated as
+            // `application/octet-stream` so the skip below fires instead of misreporting
+            // binary garbage as `text/plain`. ~keep
+            let file_mime = match sniffed_mime {
+                Some(m) if m != crate::core::mime::PLAIN_TEXT_MIME_TYPE => m,
+                sniffed => crate::core::mime::detect_mime_type(path, false)
+                    .ok()
+                    .or(sniffed)
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
             };
+
+            if file_mime == "application/octet-stream" {
+                filtered_paths.push(path.clone());
+                continue;
+            }
 
             let mut child_config = config.clone();
             child_config.max_archive_depth = config.max_archive_depth.saturating_sub(current_depth + 1);
@@ -165,6 +242,20 @@ async fn build_archive_doc(
                 }
             }
         }
+    }
+
+    if !filtered_paths.is_empty() {
+        // `file_bytes` is a hash map, so its iteration order is not stable; sort so the
+        // warning text is deterministic for a given archive.
+        filtered_paths.sort();
+        let message = format!(
+            "Filtered {} bookkeeping/binary entr{} (e.g. .DS_Store, __MACOSX, __pycache__, .pyc) \
+             from archive children: {}",
+            filtered_paths.len(),
+            if filtered_paths.len() == 1 { "y" } else { "ies" },
+            crate::core::diagnostics::format_entry_list(&filtered_paths)
+        );
+        crate::core::diagnostics::push_warning(&mut processing_warnings, ARCHIVE_WARNING_SOURCE, message);
     }
 
     build_archive_doc_inner(
@@ -232,7 +323,6 @@ impl InternalDocumentExtractor for ZipExtractor {
     ) -> Result<InternalDocument> {
         let limits = config.security_limits.clone().unwrap_or_default();
 
-        // Validate ZIP archive for bomb attacks before extraction
         let cursor = Cursor::new(content);
         let mut archive = zip::ZipArchive::new(cursor)
             .map_err(|e| crate::error::XbergError::parsing(format!("Failed to read ZIP archive: {}", e)))?;
@@ -608,6 +698,166 @@ mod tests {
         };
         assert_eq!(archive_meta.format, "ZIP");
         assert_eq!(archive_meta.file_count, 1);
+    }
+
+    /// Regression test for #121: member bodies were emitted by iterating an `AHashMap`, whose
+    /// order aHash randomizes per process, so the same archive rendered differently on every run.
+    ///
+    /// The member names below are deliberately anti-alphabetical, so this also pins *which*
+    /// deterministic order was chosen: archive order, matching the "Files:" listing — a plain
+    /// `sort()` would have produced alpha/middle/zebra and failed here.
+    #[tokio::test]
+    async fn should_emit_archive_members_in_archive_order_not_hash_order() {
+        let extractor = ZipExtractor::new();
+
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+
+            for (name, body) in [
+                ("zebra.txt", "zebra body"),
+                ("alpha.txt", "alpha body"),
+                ("middle.txt", "middle body"),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+
+            zip.finish().unwrap();
+        }
+
+        let bytes = cursor.into_inner();
+        let config = ExtractionConfig::default();
+
+        let result = extractor
+            .extract_content(&bytes, "application/zip", &config)
+            .await
+            .unwrap();
+        let result =
+            crate::extraction::derive::derive_extraction_result(result, true, crate::core::config::OutputFormat::Plain);
+
+        let positions: Vec<usize> = ["=== zebra.txt ===", "=== alpha.txt ===", "=== middle.txt ==="]
+            .iter()
+            .map(|marker| {
+                result
+                    .content
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("{marker} missing from {:?}", result.content))
+            })
+            .collect();
+
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "members must appear in archive order (zebra, alpha, middle); got offsets {positions:?} in {:?}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zip_filters_bookkeeping_and_binary_junk_from_children() {
+        let extractor = ZipExtractor::new();
+
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+
+            zip.start_file("report.txt", options).unwrap();
+            zip.write_all(b"Quarterly report body.").unwrap();
+
+            // macOS Finder bookkeeping file (binary "Bud1..." header).
+            zip.start_file(".DS_Store", options).unwrap();
+            zip.write_all(&[0x00, 0x00, 0x00, 0x01, b'B', b'u', b'd', b'1'])
+                .unwrap();
+
+            // AppleDouble resource fork sidecar under the macOS archive-utility folder.
+            zip.start_file("__MACOSX/._report.txt", options).unwrap();
+            zip.write_all(&[
+                0x00, 0x05, 0x16, 0x07, 0x00, 0x02, b'M', b'a', b'c', b' ', b'O', b'S', b' ', b'X',
+            ])
+            .unwrap();
+
+            // AppleDouble sidecar at the top level (same file, no __MACOSX wrapper).
+            zip.start_file("._report.txt", options).unwrap();
+            zip.write_all(&[
+                0x00, 0x05, 0x16, 0x07, 0x00, 0x02, b'M', b'a', b'c', b' ', b'O', b'S', b' ', b'X',
+            ])
+            .unwrap();
+
+            // Python bytecode cache.
+            zip.start_file("__pycache__/mod.cpython-311.pyc", options).unwrap();
+            zip.write_all(&[0x42, 0x0d, 0x0d, 0x0a, 0x00, 0x00, 0x00, 0x00])
+                .unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let bytes = cursor.into_inner();
+        let config = ExtractionConfig::default();
+
+        let result = extractor
+            .extract_content(&bytes, "application/zip", &config)
+            .await
+            .unwrap();
+
+        let children = result.children.expect("archive should extract the real document");
+        assert_eq!(
+            children.len(),
+            1,
+            "only report.txt should survive filtering: {children:?}"
+        );
+        assert_eq!(children[0].path, "report.txt");
+        assert_eq!(children[0].mime_type, "text/plain");
+
+        assert!(
+            !result.processing_warnings.is_empty(),
+            "expected a ProcessingWarning about filtered bookkeeping/binary entries"
+        );
+        let warning = &result.processing_warnings[0];
+        assert_eq!(warning.source, "archive");
+        assert!(
+            warning.message.contains("Filtered"),
+            "warning message should mention filtering: {}",
+            warning.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zip_markdown_member_routes_to_markdown_extractor() {
+        let markdown = "# Title\n\nBody paragraph.\n\n## Section\n\n- a\n- b\n";
+
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+            zip.start_file("doc.md", options).unwrap();
+            zip.write_all(markdown.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let bytes = cursor.into_inner();
+        let config = ExtractionConfig {
+            output_format: crate::core::config::OutputFormat::Markdown,
+            ..Default::default()
+        };
+
+        let result = ZipExtractor::new()
+            .extract_content(&bytes, "application/zip", &config)
+            .await
+            .unwrap();
+
+        let children = result.children.expect("archive should extract its member");
+        let member = children.iter().find(|c| c.path == "doc.md").unwrap();
+        assert_eq!(member.mime_type, "text/markdown");
+
+        let rendered = member
+            .result
+            .formatted_content
+            .as_ref()
+            .unwrap_or(&member.result.content);
+        assert!(rendered.contains("# Title"), "heading lost: {rendered:?}");
+        assert!(!rendered.contains("\\#"), "heading was escaped as prose: {rendered:?}");
     }
 
     #[tokio::test]

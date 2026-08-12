@@ -10,13 +10,7 @@ import resource
 import sys
 import time
 
-# Suppress MuPDF C-level error/warning messages that can corrupt the
-# persistent server's line-based JSON protocol on stdout.
-# See: https://github.com/pymupdf/PyMuPDF/issues/606
 import pymupdf
-
-# Import pymupdf.layout BEFORE pymupdf4llm to enable improved layout analysis
-# and suppress the "Consider using the pymupdf_layout package" info message.
 import pymupdf.layout
 import pymupdf4llm
 
@@ -97,7 +91,6 @@ def _run_with_timeout(fn, args, timeout):
         parent_conn.close()
         return result
     except Exception:
-        # Fork not available — fall back to in-process extraction
         try:
             return fn(*args)
         except Exception as e:
@@ -171,7 +164,6 @@ def main() -> None:
             print(f"Error extracting with PyMuPDF4LLM: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        # Legacy fallback for direct file path
         try:
             payload = extract_sync(args[0])
             print(json.dumps(payload), end="")

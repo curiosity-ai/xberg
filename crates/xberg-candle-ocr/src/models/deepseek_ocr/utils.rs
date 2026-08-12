@@ -36,8 +36,6 @@ pub fn interpolate_bicubic(
     _align_corner: Option<bool>,
     _half_pixel: Option<bool>,
 ) -> Result<Tensor> {
-    // Simplified bicubic: use bilinear fallback
-    // Full bicubic interpolation is complex; use linear approximation
     let (_, _, h, w) = input.dims4()?;
     let (target_h, target_w) = target_size;
 
@@ -45,7 +43,6 @@ pub fn interpolate_bicubic(
         return Ok(input.clone());
     }
 
-    // Simple nearest-neighbor resize for now (can be improved)
     let h_ratio = (h - 1) as f32 / (target_h - 1).max(1) as f32;
     let w_ratio = (w - 1) as f32 / (target_w - 1).max(1) as f32;
 
@@ -182,8 +179,8 @@ pub fn masked_scatter_dim0(dst: &Tensor, src: &Tensor, mask: &Tensor) -> Result<
     if output_rows.is_empty() {
         return Ok(if batched { dst.unsqueeze(0)? } else { dst });
     }
-    let out = Tensor::stack(&output_rows, 0)
-        .map_err(|e| CandleOcrError::InferenceFailed(format!("stack failed: {e}")))?;
+    let out =
+        Tensor::stack(&output_rows, 0).map_err(|e| CandleOcrError::InferenceFailed(format!("stack failed: {e}")))?;
     if batched { Ok(out.unsqueeze(0)?) } else { Ok(out) }
 }
 

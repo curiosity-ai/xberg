@@ -95,11 +95,17 @@ impl ApiSizeLimits {
     ///
     /// # Examples
     ///
+    /// This helper is test-only. Outside the crate, build the same limits from the
+    /// struct's public fields:
+    ///
     /// ```
     /// use xberg::api::ApiSizeLimits;
     ///
     /// // 50 MB limits
-    /// let limits = ApiSizeLimits::from_mb(50, 50);
+    /// let limits = ApiSizeLimits {
+    ///     max_request_body_bytes: 50 * 1024 * 1024,
+    ///     max_multipart_field_bytes: 50 * 1024 * 1024,
+    /// };
     /// ```
     #[cfg(test)]
     pub(crate) fn from_mb(max_request_body_mb: usize, max_multipart_field_mb: usize) -> Self {
@@ -189,6 +195,12 @@ pub struct ApiState {
     /// In-memory job store for async extraction polling.
     #[cfg(feature = "api")]
     pub job_store: Arc<super::jobs::JobStore>,
+    /// Prometheus registry backing `GET /metrics`.
+    ///
+    /// Installed by [`crate::telemetry::init_prometheus`] as the global OTel meter
+    /// provider before this state is constructed — see `create_router_with_limits_and_server_config`.
+    #[cfg(feature = "prometheus")]
+    pub prometheus_registry: prometheus::Registry,
 }
 
 /// Response from `POST /extract-async`: a job identifier the client polls.
@@ -212,6 +224,8 @@ pub enum JobState {
     Completed,
     /// The job terminated with an error.
     Failed,
+    /// The job was cancelled via `DELETE /jobs/{job_id}`.
+    Cancelled,
 }
 
 /// The status of an async extraction job returned by `GET /jobs/{id}`.
@@ -257,12 +271,14 @@ pub struct CacheStatsResponse {
     pub newest_file_age_days: f64,
 }
 
-/// Cache clear response.
+/// Xberg-managed cache clear response.
+///
+/// Shared Hugging Face Hub cache files are not included in this operation.
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct CacheClearResponse {
-    /// Cache directory path
+    /// Xberg-managed cache directory path
     #[cfg_attr(feature = "api", schema(example = "/tmp/xberg-cache"))]
     pub directory: String,
     /// Number of files removed
@@ -352,17 +368,16 @@ pub struct WarmRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct WarmResponse {
-    /// Cache directory used
+    /// Xberg-managed cache directory used.
+    ///
+    /// Hugging Face artifacts remain in the standard HF cache, and their
+    /// resolved paths are included in `downloaded`.
     pub cache_dir: String,
     /// Models that were downloaded
     pub downloaded: Vec<String>,
     /// Models that were already cached
     pub already_cached: Vec<String>,
 }
-
-// ---------------------------------------------------------------------------
-// OpenWebUI compatibility types
-// ---------------------------------------------------------------------------
 
 /// OpenWebUI "External" engine response format.
 ///

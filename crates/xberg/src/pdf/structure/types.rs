@@ -30,6 +30,12 @@ pub(crate) struct PdfParagraph {
     pub is_formula: bool,
     pub is_page_furniture: bool,
     pub layout_class: Option<LayoutHintClass>,
+    /// Stable page-local layout ancestry assigned by the region planner.
+    ///
+    /// `None` preserves the legacy no-layout path byte-for-byte. A populated
+    /// path is carried through document-level classification and consumed only
+    /// during final assembly, where it becomes invisible `Group` containers.
+    pub layout_region_path: Option<LayoutRegionPath>,
     /// Index of the parent element this caption is associated with (tables/pictures).
     pub caption_for: Option<usize>,
     /// Block-level bounding box from structure tree extraction.
@@ -65,8 +71,8 @@ impl PdfParagraph {
 ///
 /// Decoupled from `crate::layout::LayoutClass` so the markdown module
 /// compiles without the `layout-detection` feature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants constructed via layout-detection feature
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub(crate) enum LayoutHintClass {
     Title,
     SectionHeader,
@@ -79,8 +85,62 @@ pub(crate) enum LayoutHintClass {
     PageFooter,
     Table,
     Picture,
+    DocumentIndex,
+    Form,
+    KeyValueRegion,
     Text,
     Other,
+}
+
+impl LayoutHintClass {
+    pub(crate) const fn is_wrapper(self) -> bool {
+        matches!(
+            self,
+            Self::Table | Self::Picture | Self::DocumentIndex | Self::Form | Self::KeyValueRegion
+        )
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::SectionHeader => "section_header",
+            Self::Code => "code",
+            Self::Formula => "formula",
+            Self::ListItem => "list_item",
+            Self::Caption => "caption",
+            Self::Footnote => "footnote",
+            Self::PageHeader => "page_header",
+            Self::PageFooter => "page_footer",
+            Self::Table => "table",
+            Self::Picture => "picture",
+            Self::DocumentIndex => "document_index",
+            Self::Form => "form",
+            Self::KeyValueRegion => "key_value_region",
+            Self::Text => "text",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One stable component of a page-local layout region path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LayoutRegionTag {
+    pub(crate) id: usize,
+    pub(crate) class_name: Option<LayoutHintClass>,
+}
+
+/// Layout ancestry is at most two levels: a top-level wrapper/root and an
+/// optional semantic child region contained by that wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LayoutRegionPath {
+    pub(crate) root: LayoutRegionTag,
+    pub(crate) child: Option<LayoutRegionTag>,
+}
+
+impl LayoutRegionPath {
+    pub(crate) fn tags(self) -> impl Iterator<Item = LayoutRegionTag> {
+        std::iter::once(self.root).chain(self.child)
+    }
 }
 
 /// A layout hint for paragraph classification.

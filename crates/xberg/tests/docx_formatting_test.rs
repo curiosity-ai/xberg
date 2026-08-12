@@ -12,10 +12,6 @@ use helpers::extract_uri_document;
 use helpers::{assert_non_empty_content, get_test_file_path};
 use xberg::{ExtractionConfig, OutputFormat};
 
-// ---------------------------------------------------------------------------
-// Formatting tests
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_docx_bold_rendered_as_markdown() {
     let path = get_test_file_path("docx/unit_test_formatting.docx");
@@ -106,8 +102,6 @@ async fn test_docx_mixed_formatting_on_same_line() {
         .expect("Should extract DOCX");
 
     assert_non_empty_content(&result);
-    // The document has a line: "Normal italic bold underline and hyperlink on the same line"
-    // Where "italic" is italic, "bold" is bold, "underline" is underlined, "hyperlink" is a link
     let content = &result.content;
     assert!(
         content.contains("Normal ") && content.contains("*italic*") && content.contains("**bold**"),
@@ -115,10 +109,6 @@ async fn test_docx_mixed_formatting_on_same_line() {
         content
     );
 }
-
-// ---------------------------------------------------------------------------
-// Heading hierarchy tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_docx_title_rendered_as_h1() {
@@ -161,21 +151,18 @@ async fn test_docx_heading_hierarchy() {
     assert_non_empty_content(&result);
     let content = &result.content;
 
-    // Heading1 → # (outline_level 0 maps to h1, same as standard converters)
     assert!(
         content.contains("# Section 1"),
         "Heading1 should be rendered as #. Got:\n{}",
         content
     );
 
-    // Heading2 → ##
     assert!(
         content.contains("## Section 1.1"),
         "Heading2 should be rendered as ##. Got:\n{}",
         content
     );
 
-    // Heading3 → ###
     assert!(
         content.contains("### Section 1.2.3"),
         "Heading3 should be rendered as ###. Got:\n{}",
@@ -195,17 +182,12 @@ async fn test_docx_paragraphs_separated_by_blank_lines() {
         .expect("Should extract DOCX");
 
     assert_non_empty_content(&result);
-    // Paragraphs should be separated by blank lines
     assert!(
         result.content.contains("Paragraph 1.1\n\nParagraph 1.2"),
         "Paragraphs should be separated by blank lines. Got:\n{}",
         result.content
     );
 }
-
-// ---------------------------------------------------------------------------
-// List tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_docx_bullet_list_rendered() {
@@ -276,10 +258,6 @@ async fn test_docx_nested_list_indentation() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Document structure tests
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_docx_document_structure_populated() {
     let path = get_test_file_path("docx/unit_test_headers.docx");
@@ -305,10 +283,6 @@ async fn test_docx_document_structure_populated() {
     assert!(!doc.nodes.is_empty(), "DocumentStructure should have nodes");
 }
 
-// ---------------------------------------------------------------------------
-// Table tests
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_docx_tables_in_markdown_output() {
     let path = get_test_file_path("docx/docx_tables.docx");
@@ -325,13 +299,11 @@ async fn test_docx_tables_in_markdown_output() {
         .expect("Should extract DOCX");
 
     assert_non_empty_content(&result);
-    // Tables should be rendered as markdown tables with pipe separators
     assert!(
         result.content.contains('|'),
         "Tables should be rendered as markdown tables with | separators. Got:\n{}",
         result.content
     );
-    // Should have header separator row
     assert!(
         result.content.contains("---"),
         "Tables should have header separator row with ---. Got:\n{}",
@@ -351,16 +323,11 @@ async fn test_docx_table_cell_formatting_preserved() {
         .expect("Should extract DOCX");
 
     assert_non_empty_content(&result);
-    // The tables field should have table data
     assert!(
         !result.tables.is_empty(),
         "DOCX with tables should have tables in result"
     );
 }
-
-// ---------------------------------------------------------------------------
-// MIME type test
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_docx_produces_markdown_mime_type() {

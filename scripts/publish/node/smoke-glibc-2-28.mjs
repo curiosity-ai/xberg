@@ -1,18 +1,5 @@
-// Glibc-2.28 loadability smoke test for the @xberg-io/xberg prebuilds.
-//
-// Runs inside redhat/ubi8 (glibc 2.28) against an extracted node-bindings-*.tar.gz.
-// Loads the .node directly via process.dlopen so this script has no
-// dependency on the alef-generated TS wrapper or any other tooling.
-//
-// We're not testing feature parity — that's covered by ci-e2e.yaml. We're
-// testing that the prebuilt .node loads on glibc 2.28 and that its core napi
-// surface is reachable. If glibc/glibcxx ever silently drift past 2.28, this
-// smoke fails before publish.
-//
-// Required env: NODE_PATH — absolute path to the .node file inside the unpacked tar.
-
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
+import {existsSync} from "node:fs";
+import {createRequire} from "node:module";
 
 const nodePath = process.env.NODE_PATH;
 if (!nodePath) {
@@ -53,7 +40,7 @@ check("module is an object", () => {
   }
 });
 
-const required = ["extract", "extractBatch", "listSupportedFormats"];
+const required = [ "extract", "extractBatch", "listSupportedFormats" ];
 for (const name of required) {
   check(`export ${name} is function`, () => {
     if (typeof native[name] !== "function") {
@@ -65,7 +52,8 @@ for (const name of required) {
 check("listSupportedFormats returns non-empty array", () => {
   const formats = native.listSupportedFormats();
   if (!Array.isArray(formats) || formats.length === 0) {
-    throw new Error(`got ${typeof formats} length=${Array.isArray(formats) ? formats.length : "n/a"}`);
+    throw new Error(`got ${typeof formats} length=${
+        Array.isArray(formats) ? formats.length : "n/a"}`);
   }
 });
 
@@ -74,6 +62,7 @@ if (failures.length === 0) {
   console.log(`OK: ${nodePath} loads and responds on glibc 2.28.`);
   process.exit(0);
 } else {
-  console.error(`FAIL: ${failures.length} smoke check(s) failed: ${failures.join(", ")}`);
+  console.error(
+      `FAIL: ${failures.length} smoke check(s) failed: ${failures.join(", ")}`);
   process.exit(1);
 }

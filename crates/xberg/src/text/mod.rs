@@ -1,6 +1,10 @@
 /// UTF-8 validation and safe decoding helpers.
 pub mod utf8_validation;
 
+#[cfg(any(feature = "office", feature = "email"))]
+/// Windows codepage number to `encoding_rs` encoding mapping.
+pub(crate) mod windows_codepage;
+
 #[cfg(feature = "quality")]
 /// OCR quality scoring: noise detection, confidence aggregation, and artifact removal.
 pub mod quality;
@@ -22,16 +26,13 @@ pub use quality_processor::QualityProcessor;
 #[cfg(feature = "quality")]
 pub use token_reduction::{ReductionLevel, TokenReductionConfig};
 
-// OSS v5 follow-up text-analysis modules. Each subsystem is feature-gated so the
-// non-OSS targets (no-ort-target, wasm-target, android-target) compile out cleanly.
 #[cfg(feature = "classification")]
 pub mod classification;
 
-// Stub module when classification feature is disabled (wasm-target, android-target have no ORT).
 #[cfg(not(feature = "classification"))]
 /// Page-classification API stub (classification feature not enabled on this target).
 pub mod classification {
-    use crate::{ClassificationLabel, ExtractedDocument, PageClassificationConfig, Result};
+    use crate::{ChunkClassificationConfig, ClassificationLabel, ExtractedDocument, PageClassificationConfig, Result};
 
     /// Classify pages in an extraction result.
     pub async fn classify_pages(_result: &mut ExtractedDocument, _config: &PageClassificationConfig) -> Result<()> {
@@ -49,13 +50,20 @@ pub mod classification {
             "classification feature not available on this target".into(),
         ))
     }
+
+    /// Classify chunks in an extraction result. Stub form mirrors the real
+    /// `classify_chunks` signature so language bindings keep compiling on
+    /// targets without the `classification` feature.
+    pub async fn classify_chunks(_result: &mut ExtractedDocument, _config: &ChunkClassificationConfig) -> Result<()> {
+        Err(crate::XbergError::Other(
+            "classification feature not available on this target".into(),
+        ))
+    }
 }
 
 #[cfg(feature = "ner")]
 pub mod ner;
 
-// Stub module for Android x86_64 when ner feature is disabled (android-target has no ORT prebuilt).
-// Allows alef-generated bindings to reference types and functions without compilation errors.
 #[cfg(not(feature = "ner"))]
 /// Named-entity recognition API stub (ner feature not enabled on this target).
 pub mod ner {
@@ -91,7 +99,6 @@ pub mod summarization;
 #[cfg(feature = "translation")]
 pub mod translation;
 
-// Stub module when translation feature is disabled (wasm-target, android-target have no ORT).
 #[cfg(not(feature = "translation"))]
 /// Translation API stub (translation feature not enabled on this target).
 pub mod translation {

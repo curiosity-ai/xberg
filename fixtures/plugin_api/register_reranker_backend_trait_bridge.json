@@ -2,6 +2,12 @@
 	"id": "register_reranker_backend_trait_bridge",
 	"category": "plugin_api",
 	"description": "register_reranker_backend: trait bridge",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "register_reranker_backend: trait bridge",
+		"description": "register_reranker_backend: trait bridge",
+		"side_effects": "safe"
+	},
 	"tags": ["trait-bridge"],
 	"call": "register_reranker_backend",
 	"input": {

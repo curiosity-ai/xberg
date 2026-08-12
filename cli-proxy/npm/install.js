@@ -1,12 +1,10 @@
-// postinstall: download, verify, and extract the native xberg binary
-// into ./bin so the launcher can exec it. All diagnostics go to stderr.
+import {execFileSync, spawnSync} from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
-import https from "node:https";
-import crypto from "node:crypto";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawnSync, execFileSync } from "node:child_process";
+import {fileURLToPath, pathToFileURL} from "node:url";
 
 const REPO = "xberg-io/xberg";
 const BIN_NAME = "xberg";
@@ -14,23 +12,27 @@ const PKG_NAME = "xberg-cli";
 const VERSION_ENV = "XBERG_CLI_VERSION";
 const USER_AGENT = "xberg-cli-npm-proxy";
 
-// Map Node's platform/arch to the Rust target triple embedded in asset names.
 function targetTriple() {
   const type = os.type();
   const arch = os.arch();
 
   if (type === "Windows_NT") {
-    if (arch === "x64") return "x86_64-pc-windows-msvc";
+    if (arch === "x64")
+      return "x86_64-pc-windows-msvc";
     throw new Error(`unsupported Windows arch: ${arch}`);
   }
   if (type === "Linux") {
-    if (arch === "x64") return "x86_64-unknown-linux-gnu";
-    if (arch === "arm64") return "aarch64-unknown-linux-gnu";
+    if (arch === "x64")
+      return "x86_64-unknown-linux-gnu";
+    if (arch === "arm64")
+      return "aarch64-unknown-linux-gnu";
     throw new Error(`unsupported Linux arch: ${arch}`);
   }
   if (type === "Darwin") {
-    if (arch === "arm64") return "aarch64-apple-darwin";
-    if (arch === "x64") return "x86_64-apple-darwin";
+    if (arch === "arm64")
+      return "aarch64-apple-darwin";
+    if (arch === "x64")
+      return "x86_64-apple-darwin";
     throw new Error(`unsupported macOS arch: ${arch}`);
   }
   throw new Error(`unsupported platform: ${type} ${arch}`);
@@ -40,33 +42,35 @@ function binaryName() {
   return os.type() === "Windows_NT" ? `${BIN_NAME}.exe` : BIN_NAME;
 }
 
-// GET a URL following redirects, returning the response body as a Buffer.
-// Every hop (initial request and every redirect target) MUST be https; any
-// other scheme is rejected to prevent downgrade/SSRF via a malicious Location.
-function httpGetBuffer(url, { headers = {} } = {}, maxRedirects = 5) {
+function httpGetBuffer(url, {headers = {}} = {}, maxRedirects = 5) {
   return new Promise((resolve, reject) => {
-    if (maxRedirects < 0) return reject(new Error("too many redirects"));
+    if (maxRedirects < 0)
+      return reject(new Error("too many redirects"));
     if (!/^https:\/\//i.test(url)) {
       return reject(new Error(`refusing non-https URL: ${url}`));
     }
-    const req = https.get(url, { headers: { "User-Agent": USER_AGENT, ...headers } }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        const next = res.headers.location;
-        if (!/^https:\/\//i.test(next)) {
-          return reject(new Error(`refusing non-https redirect to: ${next}`));
-        }
-        return httpGetBuffer(next, { headers }, maxRedirects - 1).then(resolve, reject);
-      }
-      if (res.statusCode !== 200) {
-        res.resume();
-        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-      }
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => resolve(Buffer.concat(chunks)));
-      res.on("error", reject);
-    });
+    const req = https.get(
+        url, {headers : {"User-Agent" : USER_AGENT, ...headers}}, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 &&
+              res.headers.location) {
+            res.resume();
+            const next = res.headers.location;
+            if (!/^https:\/\//i.test(next)) {
+              return reject(
+                  new Error(`refusing non-https redirect to: ${next}`));
+            }
+            return httpGetBuffer(next, {headers}, maxRedirects - 1)
+                .then(resolve, reject);
+          }
+          if (res.statusCode !== 200) {
+            res.resume();
+            return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+          }
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => resolve(Buffer.concat(chunks)));
+          res.on("error", reject);
+        });
     req.on("error", reject);
     req.setTimeout(60000, () => {
       req.destroy();
@@ -76,13 +80,11 @@ function httpGetBuffer(url, { headers = {} } = {}, maxRedirects = 5) {
 }
 
 async function httpGetJson(url) {
-  const buf = await httpGetBuffer(url, { headers: { Accept: "application/vnd.github+json" } });
+  const buf = await httpGetBuffer(
+      url, {headers : {Accept : "application/vnd.github+json"}});
   return JSON.parse(buf.toString("utf8"));
 }
 
-// Signals that the release carries no standalone CLI for this platform (only
-// bindings/native-lib/brew-bottle artifacts). The launcher catches this by name
-// and prints a graceful install hint instead of a raw stack trace.
 export class CliUnavailableError extends Error {
   constructor(message) {
     super(message);
@@ -90,8 +92,6 @@ export class CliUnavailableError extends Error {
   }
 }
 
-// Substrings that mark an asset as a binding/native-lib/brew-bottle artifact —
-// never the standalone CLI. Matched case-insensitively anywhere in the name.
 const NON_CLI_PATTERNS = [
   "-ffi",
   "_ffi",
@@ -109,7 +109,6 @@ const NON_CLI_PATTERNS = [
   "napi",
 ];
 
-// True if the asset name matches any non-CLI artifact pattern.
 export function isNonCliArtifact(name) {
   const n = (name || "").toLowerCase();
   return NON_CLI_PATTERNS.some((pat) => n.includes(pat));
@@ -118,46 +117,42 @@ export function isNonCliArtifact(name) {
 export function assetScore(name) {
   const n = (name || "").toLowerCase();
   let score = 0;
-  if (n.includes("cli")) score += 2;
-  if (n.includes(BIN_NAME.toLowerCase())) score += 1;
+  if (n.includes("cli"))
+    score += 2;
+  if (n.includes(BIN_NAME.toLowerCase()))
+    score += 1;
   return score;
 }
 
-// Pure asset-selection core: from a list of asset names, keep only triple-matched
-// .tar.gz/.zip archives that are NOT binding/native-lib/bottle artifacts, then
-// return the best (cli/bin-name preferred). Returns null when none qualify.
 export function selectArchiveName(names, triple) {
   const survivors = (names || []).filter((name) => {
     const n = (name || "").toLowerCase();
-    if (!n.includes(triple)) return false;
-    if (!(n.endsWith(".tar.gz") || n.endsWith(".zip"))) return false;
+    if (!n.includes(triple))
+      return false;
+    if (!(n.endsWith(".tar.gz") || n.endsWith(".zip")))
+      return false;
     return !isNonCliArtifact(n);
   });
-  if (survivors.length === 0) return null;
+  if (survivors.length === 0)
+    return null;
   survivors.sort((a, b) => assetScore(b) - assetScore(a));
   return survivors[0];
 }
 
-// Resolve the release (honoring XBERG_CLI_VERSION to pin a tag) and pick the
-// archive asset for this platform plus an optional SHA256SUMS asset.
-//
-// Selection: among assets whose name contains the target triple, ends in
-// .tar.gz/.zip, and is NOT a binding/native-lib/bottle artifact, prefer one
-// whose name contains "cli" or the bin name. If none survive, the release has
-// no standalone CLI for this platform (CliUnavailableError).
 async function resolveRelease() {
   const triple = targetTriple();
   const pinned = process.env[VERSION_ENV];
   const apiUrl = pinned
-    ? `https://api.github.com/repos/${REPO}/releases/tags/${encodeURIComponent(pinned)}`
-    : `https://api.github.com/repos/${REPO}/releases/latest`;
+                     ? `https://api.github.com/repos/${REPO}/releases/tags/${
+                           encodeURIComponent(pinned)}`
+                     : `https://api.github.com/repos/${REPO}/releases/latest`;
 
   let release;
   try {
     release = await httpGetJson(apiUrl);
   } catch (err) {
     if (pinned && /HTTP 404/.test(err.message)) {
-      throw new Error(`release tag '${pinned}' not found`, { cause: err });
+      throw new Error(`release tag '${pinned}' not found`, {cause : err});
     }
     throw err;
   }
@@ -165,30 +160,34 @@ async function resolveRelease() {
   const tag = release.tag_name || pinned || "latest";
 
   const chosenName = selectArchiveName(
-    assets.map((a) => a.name),
-    triple,
+      assets.map((a) => a.name),
+      triple,
   );
   if (!chosenName) {
-    throw new CliUnavailableError(`no standalone CLI asset for target triple "${triple}" in ${REPO} release ${tag}`);
+    throw new CliUnavailableError(`no standalone CLI asset for target triple "${
+        triple}" in ${REPO} release ${tag}`);
   }
   const archive = assets.find((a) => a.name === chosenName);
-  const checksums = assets.find((a) => (a.name || "").toUpperCase().includes("SHA256SUMS"));
+  const checksums =
+      assets.find((a) => (a.name || "").toUpperCase().includes("SHA256SUMS"));
 
-  return { tag, triple, archive, checksums };
+  return {tag, triple, archive, checksums};
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BIN_DIR = path.join(__dirname, "bin");
 
-// Parse a `sha256<space>filename` checksums file; return the digest for name.
 function expectedDigest(text, assetName) {
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
-    if (!line) continue;
+    if (!line)
+      continue;
     const parts = line.split(/\s+/);
-    if (parts.length < 2) continue;
+    if (parts.length < 2)
+      continue;
     const name = parts[parts.length - 1].replace(/^\*/, "");
-    if (name === assetName) return parts[0].toLowerCase();
+    if (name === assetName)
+      return parts[0].toLowerCase();
   }
   return null;
 }
@@ -196,89 +195,91 @@ function expectedDigest(text, assetName) {
 async function verifyOrWarn(archiveBuf, archiveName, checksums) {
   if (!checksums) {
     process.stderr.write(
-      `WARNING: no SHA256SUMS asset found for ${archiveName}; ` +
-        `installing over HTTPS without checksum verification.\n`,
+        `WARNING: no SHA256SUMS asset found for ${archiveName}; ` +
+            `installing over HTTPS without checksum verification.\n`,
     );
     return;
   }
-  const sumsText = (await httpGetBuffer(checksums.browser_download_url)).toString("utf8");
+  const sumsText =
+      (await httpGetBuffer(checksums.browser_download_url)).toString("utf8");
   const expected = expectedDigest(sumsText, archiveName);
   if (!expected) {
     throw new Error(
-      `no checksum entry for ${archiveName} in ${checksums.name} — refusing to install unverified binary`,
+        `no checksum entry for ${archiveName} in ${
+            checksums.name} — refusing to install unverified binary`,
     );
   }
-  const actual = crypto.createHash("sha256").update(archiveBuf).digest("hex").toLowerCase();
+  const actual = crypto.createHash("sha256")
+                     .update(archiveBuf)
+                     .digest("hex")
+                     .toLowerCase();
   if (actual !== expected) {
-    throw new Error(`checksum mismatch for ${archiveName} (expected ${expected}, got ${actual})`);
+    throw new Error(`checksum mismatch for ${archiveName} (expected ${
+        expected}, got ${actual})`);
   }
   process.stderr.write(`Checksum verified for ${archiveName}.\n`);
 }
 
-// Reject archive entry names that could escape the extraction directory:
-// absolute paths (POSIX or Windows drive/UNC) or any component equal to "..".
 function isUnsafeEntry(name) {
   const entry = String(name).replace(/\\/g, "/").trim();
-  if (!entry) return false;
-  if (entry.startsWith("/")) return true;
-  if (/^[a-zA-Z]:/.test(entry)) return true; // Windows drive letter
-  if (entry.startsWith("//")) return true; // UNC
+  if (!entry)
+    return false;
+  if (entry.startsWith("/"))
+    return true;
+  if (/^[a-zA-Z]:/.test(entry))
+    return true;
+  if (entry.startsWith("//"))
+    return true;
   return entry.split("/").some((part) => part === "..");
 }
 
-// List the entries of a gzipped tar without extracting (`tar -tzf`).
 function listTarEntries(archivePath) {
-  const result = spawnSync("tar", ["-tzf", archivePath]);
+  const result = spawnSync("tar", [ "-tzf", archivePath ]);
   if (result.status !== 0) {
     const stderr = result.stderr ? result.stderr.toString() : "";
     throw new Error(`tar listing failed: ${stderr || result.error}`);
   }
-  return result.stdout
-    .toString()
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return result.stdout.toString()
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
 }
 
 function extractTarGz(archivePath, destDir) {
-  const result = spawnSync("tar", ["-xzf", archivePath, "-C", destDir]);
+  const result = spawnSync("tar", [ "-xzf", archivePath, "-C", destDir ]);
   if (result.status !== 0) {
     const stderr = result.stderr ? result.stderr.toString() : "";
     throw new Error(`tar extraction failed: ${stderr || result.error}`);
   }
 }
 
-// List the entries of a zip without extracting (`unzip -Z1`, or PowerShell on Windows).
 function listZipEntries(archivePath) {
   if (os.type() === "Windows_NT") {
     const script =
-      "$ErrorActionPreference='Stop';" +
-      "Add-Type -AssemblyName System.IO.Compression.FileSystem;" +
-      "[System.IO.Compression.ZipFile]::OpenRead($args[0]).Entries |" +
-      " ForEach-Object { $_.FullName }";
-    const out = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script, archivePath], {
-      encoding: "utf8",
-    });
-    return out
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+        "$ErrorActionPreference='Stop';" +
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem;" +
+        "[System.IO.Compression.ZipFile]::OpenRead($args[0]).Entries |" +
+        " ForEach-Object { $_.FullName }";
+    const out = execFileSync(
+        "powershell",
+        [ "-NoProfile", "-NonInteractive", "-Command", script, archivePath ], {
+          encoding : "utf8",
+        });
+    return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   }
-  const result = spawnSync("unzip", ["-Z1", archivePath]);
+  const result = spawnSync("unzip", [ "-Z1", archivePath ]);
   if (result.status !== 0) {
     const stderr = result.stderr ? result.stderr.toString() : "";
     throw new Error(`zip listing failed: ${stderr || result.error}`);
   }
-  return result.stdout
-    .toString()
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return result.stdout.toString()
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
 }
 
 function extractZip(archivePath, destDir) {
   if (os.type() === "Windows_NT") {
-    // No string interpolation into a -Command: all path data passed as literal args.
     const result = spawnSync("powershell", [
       "-NoProfile",
       "-NonInteractive",
@@ -296,20 +297,20 @@ function extractZip(archivePath, destDir) {
     }
     return;
   }
-  const result = spawnSync("unzip", ["-o", archivePath, "-d", destDir]);
+  const result = spawnSync("unzip", [ "-o", archivePath, "-d", destDir ]);
   if (result.status !== 0) {
     const stderr = result.stderr ? result.stderr.toString() : "";
     throw new Error(`zip extraction failed: ${stderr || result.error}`);
   }
 }
 
-// Locate the binary anywhere under dir (archives may nest it in a subdir).
 function findBinary(dir, name) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+  for (const entry of fs.readdirSync(dir, {withFileTypes : true})) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       const found = findBinary(full, name);
-      if (found) return found;
+      if (found)
+        return found;
     } else if (entry.name === name) {
       return full;
     }
@@ -317,24 +318,23 @@ function findBinary(dir, name) {
   return null;
 }
 
-// Find a directory named `name` anywhere under dir.
 function findDir(dir, name) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    if (entry.name === name) return path.join(dir, entry.name);
+  for (const entry of fs.readdirSync(dir, {withFileTypes : true})) {
+    if (!entry.isDirectory())
+      continue;
+    if (entry.name === name)
+      return path.join(dir, entry.name);
     const found = findDir(path.join(dir, entry.name), name);
-    if (found) return found;
+    if (found)
+      return found;
   }
   return null;
 }
 
-// Validate every archive entry, extract into an isolated temp dir, then copy
-// out ONLY the expected binary (by basename) plus an optional sibling lib/ dir.
-// Nothing else from the archive is honored, so a malicious member can never
-// land outside dest even if extraction tooling mishandled it.
 function safeExtract(archivePath, archiveName, dest) {
   const isZip = archiveName.toLowerCase().endsWith(".zip");
-  const entries = isZip ? listZipEntries(archivePath) : listTarEntries(archivePath);
+  const entries =
+      isZip ? listZipEntries(archivePath) : listTarEntries(archivePath);
   for (const entry of entries) {
     if (isUnsafeEntry(entry)) {
       throw new Error(`refusing unsafe archive entry: ${entry}`);
@@ -352,22 +352,19 @@ function safeExtract(archivePath, archiveName, dest) {
     const binName = binaryName();
     const extractedBin = findBinary(tmpDir, binName);
     if (!extractedBin) {
-      // The chosen asset did not actually contain the CLI binary — treat the
-      // release as having no valid CLI for this platform rather than leaving a
-      // bad/partial install behind.
-      throw new CliUnavailableError(`archive ${archiveName} did not contain expected CLI binary ${binName}`);
+      throw new CliUnavailableError(`archive ${
+          archiveName} did not contain expected CLI binary ${binName}`);
     }
     const finalBin = path.join(dest, binName);
     fs.copyFileSync(extractedBin, finalBin);
 
-    // Copy a sibling lib/ directory if present (some platforms ship shared libs).
     const libDir = findDir(tmpDir, "lib");
     if (libDir) {
-      fs.cpSync(libDir, path.join(dest, "lib"), { recursive: true });
+      fs.cpSync(libDir, path.join(dest, "lib"), {recursive : true});
     }
     return finalBin;
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, {recursive : true, force : true});
   }
 }
 
@@ -379,28 +376,28 @@ export async function main() {
       const stat = fs.statSync(finalPath);
       const sizeOk = stat.size > 0;
       const execOk = os.type() === "Windows_NT" || (stat.mode & 0o111) !== 0;
-      if (sizeOk && execOk) return;
+      if (sizeOk && execOk)
+        return;
     } catch {
-      // fall through and re-download
     }
   }
 
-  fs.mkdirSync(BIN_DIR, { recursive: true });
+  fs.mkdirSync(BIN_DIR, {recursive : true});
 
-  const { tag, archive, checksums } = await resolveRelease();
-  process.stderr.write(`Downloading ${BIN_NAME} ${tag} asset ${archive.name}...\n`);
+  const {tag, archive, checksums} = await resolveRelease();
+  process.stderr.write(
+      `Downloading ${BIN_NAME} ${tag} asset ${archive.name}...\n`);
 
   const archiveBuf = await httpGetBuffer(archive.browser_download_url);
   await verifyOrWarn(archiveBuf, archive.name, checksums);
 
-  // Stage the archive in an isolated temp dir; never extract straight into BIN_DIR.
   const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), `${PKG_NAME}-dl-`));
   try {
     const archivePath = path.join(stageDir, path.basename(archive.name));
     fs.writeFileSync(archivePath, archiveBuf);
     safeExtract(archivePath, archive.name, BIN_DIR);
   } finally {
-    fs.rmSync(stageDir, { recursive: true, force: true });
+    fs.rmSync(stageDir, {recursive : true, force : true});
   }
 
   if (os.type() !== "Windows_NT") {
@@ -409,9 +406,6 @@ export async function main() {
   process.stderr.write(`${BIN_NAME} installed.\n`);
 }
 
-// Run automatically only when invoked directly (npm postinstall: `node install.js`).
-// When imported by the launcher, the launcher calls main() explicitly instead of
-// relying on import side-effects (ESM caches modules, so a second import is a no-op).
 if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
   main().catch((err) => {
     process.stderr.write(`Error installing ${BIN_NAME}: ${err.message}\n`);

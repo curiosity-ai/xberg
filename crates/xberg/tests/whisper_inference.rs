@@ -30,7 +30,6 @@ fn load_tiny() -> WhisperEngine {
 
 #[test]
 fn engine_load_resolves_special_tokens() {
-    // If this test passes, the tokenizer found all required special tokens.
     let _engine = load_tiny();
 }
 
@@ -78,12 +77,10 @@ fn chunks_audio_longer_than_30s() {
     let path = helpers::get_test_file_path("audio/long-35s.wav");
     let bytes = std::fs::read(&path).expect("fixture missing: audio/long-35s.wav");
     let pcm = decode_audio_to_pcm(&bytes, None).expect("decode failed");
-    // Sanity: the fixture is silence, so we just verify no panic and a valid string.
     assert!(pcm.samples.len() > 480_000, "fixture must be > 30 s");
     let engine = load_tiny();
     let text = engine.transcribe(&pcm, None, false).expect("transcribe must not error");
-    // Silence typically produces an empty or near-empty transcript.
-    let _ = text; // result consumed without assertion on content
+    let _ = text;
 }
 
 #[test]

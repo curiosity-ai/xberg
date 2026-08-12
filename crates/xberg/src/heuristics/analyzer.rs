@@ -77,7 +77,6 @@ pub fn analyze_document(
 ) -> Result<ChunkingDecision> {
     info!("Analyzing document for chunking decision");
 
-    // Step 1: Check for user disable / overrides.
     if let Some(user_config) = &metadata.user_chunk_config {
         if user_config.disable_chunking {
             debug!("Chunking disabled by user configuration");
@@ -94,7 +93,6 @@ pub fn analyze_document(
         }
     }
 
-    // Step 2: Check if chunking is enabled for this job.
     if !metadata.chunking_enabled {
         debug!("Chunking not enabled for this job");
         return Ok(ChunkingDecision::NoChunking {
@@ -102,7 +100,6 @@ pub fn analyze_document(
         });
     }
 
-    // Step 3: Check if the format supports chunking.
     if !supports_chunking(&metadata.mime_type) {
         debug!(
             mime_type = %metadata.mime_type,
@@ -115,7 +112,6 @@ pub fn analyze_document(
         });
     }
 
-    // Step 4: Check size/page thresholds (unless force_chunking).
     let force_chunking = metadata.user_chunk_config.as_ref().is_some_and(|c| c.force_chunking);
 
     if !force_chunking && metadata.size_bytes < config.file_size_threshold_bytes {
@@ -148,18 +144,11 @@ pub fn analyze_document(
         }
     }
 
-    // Step 5: For PDFs, optionally check text layer when `heuristics-pdf` is active.
-    // When the feature is absent this branch compiles out and we proceed to chunking.
-    // The `document_bytes` parameter is reserved for that future feature path.
     let is_pdf = is_pdf_mime_type(&metadata.mime_type);
     let page_count = metadata.page_count;
 
-    // `document_bytes` is accepted for API compatibility with the `heuristics-pdf` path
-    // that will use it for PDF text-layer analysis.  Silence the unused-variable lint
-    // without the feature.
     let _ = document_bytes;
 
-    // Step 6: Calculate chunking plan.
     let page_count = page_count.unwrap_or_else(|| estimate_page_count(metadata.size_bytes));
     let needs_ocr = metadata.force_ocr || !is_pdf;
 
@@ -213,7 +202,7 @@ fn is_pdf_mime_type(mime_type: &str) -> bool {
 ///
 /// Assumes ~50 KiB per page for PDFs (a reasonable average).
 fn estimate_page_count(size_bytes: u64) -> u32 {
-    const BYTES_PER_PAGE: u64 = 50 * 1024; // 50 KiB
+    const BYTES_PER_PAGE: u64 = 50 * 1024;
     ((size_bytes / BYTES_PER_PAGE) as u32).max(1)
 }
 
@@ -253,7 +242,7 @@ mod tests {
         let config = test_config();
         let metadata = DocumentMetadata {
             mime_type: "application/pdf".to_string(),
-            size_bytes: 1024 * 1024, // 1MB
+            size_bytes: 1024 * 1024,
             page_count: Some(10),
             force_ocr: false,
             user_chunk_config: None,
@@ -370,11 +359,9 @@ mod tests {
 
     #[test]
     fn test_estimate_page_count() {
-        // 5MB file should estimate ~100 pages
         let pages = estimate_page_count(5 * 1024 * 1024);
-        assert_eq!(pages, 102); // 5MB / 50KB
+        assert_eq!(pages, 102);
 
-        // Very small file should be at least 1 page
         let small = estimate_page_count(1000);
         assert_eq!(small, 1);
     }
@@ -417,8 +404,8 @@ mod tests {
         let config = test_config();
         let metadata = DocumentMetadata {
             mime_type: "application/pdf".to_string(),
-            size_bytes: 1024 * 1024, // 1MB - below threshold
-            page_count: Some(10),    // Below page threshold
+            size_bytes: 1024 * 1024,
+            page_count: Some(10),
             force_ocr: false,
             user_chunk_config: Some(UserChunkConfig {
                 force_chunking: true,
@@ -491,7 +478,7 @@ mod tests {
             force_ocr: false,
             user_chunk_config: Some(UserChunkConfig {
                 disable_chunking: true,
-                force_chunking: true, // Both set — disable should win.
+                force_chunking: true,
                 ..Default::default()
             }),
             chunking_enabled: true,

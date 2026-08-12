@@ -1,5 +1,3 @@
-#![allow(clippy::len_zero, clippy::unnecessary_get_then_check, clippy::single_match)]
-#![cfg(feature = "office")]
 //! Comprehensive behavioral tests for Typst extractor against Pandoc baselines.
 //!
 //! These tests expose the critical bugs found in code review:
@@ -13,11 +11,17 @@
 //! The tests are designed to FAIL initially, exposing real bugs that need fixing.
 //! They compare extracted output against Pandoc baseline outputs for behavioral parity.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+#![allow(clippy::len_zero, clippy::unnecessary_get_then_check, clippy::single_match)]
+#![cfg(feature = "office")]
+
 mod helpers;
 use helpers::extract_bytes_document;
 
 use std::{fs, path::PathBuf};
-use xberg::core::config::ExtractionConfig;
+use xberg::ExtractedDocument;
+use xberg::core::config::{ExtractionConfig, OutputFormat};
+use xberg::types::document_structure::{DocumentNode, NodeContent};
 
 fn typst_doc_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/typst")
@@ -35,31 +39,74 @@ fn load_pandoc_baseline(filename_base: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|_| panic!("Failed to read baseline: {}", filename_base))
 }
 
-/// Load Pandoc metadata JSON for comparison
-fn load_pandoc_metadata(filename_base: &str) -> String {
+/// Load Pandoc metadata JSON for comparison.
+///
+/// `test_documents/` is a bucket-fetched corpus (see
+/// `test_documents/scripts/fetch_corpus.py`), and no `*_pandoc_meta.json` has ever
+/// been published to it. Returns `None` — after printing a greppable skip message
+/// naming the missing path — so the caller skips cleanly instead of panicking. A
+/// `None` is "not run", never "passed".
+fn load_pandoc_metadata(filename_base: &str) -> Option<String> {
     let path = typst_doc_root().join(format!("{filename_base}_pandoc_meta.json"));
-    fs::read_to_string(&path).unwrap_or_else(|_| panic!("Failed to read metadata: {}", filename_base))
+    match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) => {
+            eprintln!(
+                "SKIP: fixture {} not available ({e}); \
+                 run `python3 test_documents/scripts/fetch_corpus.py` to fetch it",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
-/// Count specific heading levels (= for level 1, == for level 2, etc.)
-fn count_heading_level(content: &str, level: usize) -> usize {
-    let exact_marker = format!("{} ", "=".repeat(level));
-    content
-        .lines()
-        .filter(|l| l.trim_start().starts_with(&exact_marker))
-        .count()
+/// Extraction config that also returns the structured document tree.
+///
+/// Heading levels live on `NodeContent::Heading`, never in the extracted text: the
+/// extractor records headings as structural elements and no renderer re-emits the
+/// Typst `=` markers (see `should_render_heading_text_without_typst_markers` in
+/// `crates/xberg/src/extractors/typst.rs`). Asserting on the structure is both the
+/// only honest way to check levels and strictly stronger than string matching,
+/// which cannot tell a level from a prefix.
+fn structure_config() -> ExtractionConfig {
+    ExtractionConfig {
+        include_document_structure: true,
+        ..Default::default()
+    }
 }
 
-/// Extract all headings from content
-fn extract_all_headings(content: &str) -> Vec<String> {
-    content
-        .lines()
-        .filter(|l| {
-            let trimmed = l.trim_start();
-            trimmed.starts_with('=') && !trimmed.starts_with("#set")
+/// Structured nodes of an extraction produced with [`structure_config`].
+fn nodes(result: &ExtractedDocument) -> &[DocumentNode] {
+    result
+        .document
+        .as_ref()
+        .expect("include_document_structure should populate `document`")
+        .nodes
+        .as_slice()
+}
+
+/// Every heading as a `(level, text)` pair, in document order.
+fn headings(result: &ExtractedDocument) -> Vec<(u8, &str)> {
+    nodes(result)
+        .iter()
+        .filter_map(|node| match &node.content {
+            NodeContent::Heading { level, text } => Some((*level, text.as_str())),
+            _ => None,
         })
-        .map(|l| l.to_string())
         .collect()
+}
+
+/// Text of a body node, or `None` for headings and for containers that carry none.
+///
+/// Headings are excluded deliberately: callers use this to find the content a
+/// heading owns, and a heading is the boundary of that content, not part of it.
+fn body_text(node: &DocumentNode) -> Option<&str> {
+    match &node.content {
+        NodeContent::Paragraph { text } | NodeContent::ListItem { text } | NodeContent::Formula { text } => Some(text),
+        NodeContent::Code { text, .. } => Some(text),
+        _ => None,
+    }
 }
 
 /// Count lines that are pure metadata/directives (not content)
@@ -73,44 +120,24 @@ fn count_directive_lines(content: &str) -> usize {
         .count()
 }
 
-/// Count empty headings (headings with just `= ` and no text)
-fn count_empty_headings(content: &str) -> usize {
-    content
-        .lines()
-        .filter(|l| {
-            let trimmed = l.trim_start();
-            trimmed == "="
-                || trimmed == "=="
-                || trimmed == "==="
-                || trimmed == "===="
-                || trimmed == "====="
-                || trimmed == "======"
-        })
-        .count()
-}
+/// Content each heading owns: `(heading text, body texts up to the next heading)`.
+///
+/// Headings with no content of their own (a section that opens directly with a
+/// subsection) get an empty vector rather than being dropped, so a caller can tell
+/// "this heading has no content" from "this heading was lost". `Group` nodes are
+/// skipped: derivation wraps each heading in a `Group` that carries its section, so
+/// a `Group` belongs to the heading that follows it, never to the one before.
+fn heading_content_blocks(result: &ExtractedDocument) -> Vec<(&str, Vec<&str>)> {
+    let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
 
-/// Extract all text between headings (content blocks)
-fn extract_content_blocks(content: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut current_block = String::new();
-    let mut in_block = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('=') && !trimmed.starts_with("#set") {
-            if !current_block.is_empty() {
-                blocks.push(current_block.trim().to_string());
-                current_block.clear();
-            }
-            in_block = true;
-        } else if in_block && !trimmed.is_empty() {
-            current_block.push_str(line);
-            current_block.push('\n');
+    for node in nodes(result) {
+        if let NodeContent::Heading { text, .. } = &node.content {
+            blocks.push((text.as_str(), Vec::new()));
+            continue;
         }
-    }
-
-    if !current_block.is_empty() {
-        blocks.push(current_block.trim().to_string());
+        if let (Some(text), Some(current)) = (body_text(node), blocks.last_mut()) {
+            current.1.push(text);
+        }
     }
 
     blocks
@@ -136,41 +163,34 @@ fn content_parity_check(extracted: &str, baseline: &str, tolerance_percent: f64)
 
 /// TEST 1: CRITICAL - 62% heading loss bug
 ///
-/// The extractor only matches single `=` headings, completely skipping
-/// `==`, `===`, and higher levels. This causes catastrophic data loss
-/// in hierarchical documents.
+/// The extractor once matched only single `=` headings, completely skipping
+/// `==`, `===`, and higher levels. That caused catastrophic data loss in
+/// hierarchical documents.
 ///
-/// Expected: All heading levels should be extracted
-/// Current behavior: Only level 1 headings extracted
-/// WILL FAIL: Exposing the heading loss bug
+/// Expected: every heading level survives, at its own level, in document order.
 #[tokio::test]
 async fn test_typst_all_heading_levels_not_lost() {
     let content = load_test_document("headings.typ");
     let _baseline = load_pandoc_baseline("headings");
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let result = extract_bytes_document(&content, "application/x-typst", &config)
         .await
         .expect("Extraction failed");
 
-    let extracted_all_headings = extract_all_headings(&result.content);
-
-    assert!(
-        extracted_all_headings.len() >= 6,
-        "CRITICAL BUG: Only extracted {} headings, should have extracted 6+ heading levels. \
-         This is the 62% heading loss bug - extractor only matches '=' but skips '==', '===', etc.",
-        extracted_all_headings.len()
+    assert_eq!(
+        headings(&result),
+        vec![
+            (1, "Level 1 Heading"),
+            (2, "Level 2 Heading"),
+            (3, "Level 3 Heading"),
+            (4, "Level 4 Heading"),
+            (5, "Level 5 Heading"),
+            (6, "Level 6 Heading"),
+        ],
+        "every `=`-run length must become a heading at the matching level, in document order. \
+         A short or mis-levelled list is the heading loss bug: levels beyond '=' being skipped."
     );
-
-    for level in 1..=6 {
-        let count = count_heading_level(&result.content, level);
-        assert_eq!(
-            count, 1,
-            "Heading level {} should appear exactly once (found {}). \
-             Missing heading levels cause data loss in hierarchical documents.",
-            level, count
-        );
-    }
 }
 
 /// TEST 2: Display math not extracted
@@ -219,40 +239,31 @@ async fn test_typst_display_math_preserved() {
 
 /// TEST 3: Empty headings output
 ///
-/// When heading text is missing or malformed, extractor outputs
-/// just the marker like "= " with no text, polluting the output.
+/// A `=` run with no text after it must not become a heading at all. It used to be
+/// emitted as a bare `= ` marker, polluting the output with a textless heading.
 ///
-/// Expected: Either full heading text or no heading at all
-/// Current behavior: "= " with no content
-/// WILL FAIL: Exposing empty heading bug
+/// Expected: every heading that exists carries text.
 #[tokio::test]
 async fn test_typst_no_empty_headings_output() {
     let content = load_test_document("headings.typ");
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let result = extract_bytes_document(&content, "application/x-typst", &config)
         .await
         .expect("Extraction failed");
 
-    let empty_headings = count_empty_headings(&result.content);
+    let textless: Vec<(u8, &str)> = headings(&result)
+        .into_iter()
+        .filter(|(_, text)| text.trim().is_empty())
+        .collect();
 
-    assert_eq!(
-        empty_headings, 0,
-        "Found {} empty heading lines (just '=' with no text). \
-         Extractor outputs malformed headings like '= ' with no text, \
-         corrupting the document structure.",
-        empty_headings
+    assert!(
+        textless.is_empty(),
+        "Found {} heading(s) with no text: {:?}. A textless `=` run must be dropped, \
+         not emitted as an empty heading that corrupts the document structure.",
+        textless.len(),
+        textless
     );
-
-    for heading in extract_all_headings(&result.content) {
-        let trimmed = heading.trim_start();
-        let after_marker = trimmed.trim_start_matches('=').trim();
-        assert!(
-            !after_marker.is_empty(),
-            "Heading '{}' has no text after marker. Should not output empty headings.",
-            trimmed
-        );
-    }
 }
 
 /// TEST 4: Metadata extraction fails with regex silently
@@ -267,7 +278,9 @@ async fn test_typst_no_empty_headings_output() {
 #[tokio::test]
 async fn test_typst_metadata_extraction_completeness() {
     let content = load_test_document("metadata.typ");
-    let _baseline_meta = load_pandoc_metadata("metadata");
+    let Some(_baseline_meta) = load_pandoc_metadata("metadata") else {
+        return;
+    };
     let config = ExtractionConfig::default();
 
     let result = extract_bytes_document(&content, "application/x-typst", &config)
@@ -661,26 +674,70 @@ async fn test_typst_multiple_paragraphs() {
 
 /// TEST 18: Heading-content association
 ///
-/// Content should follow its heading logically in the output.
+/// Content must stay attached to the heading it follows, in document order.
 ///
-/// Expected: Each heading followed by its content
-/// Current behavior: May be scrambled
+/// Expected: each heading owns exactly the body that follows it up to the next
+/// heading — no scrambling, no empty content, nothing orphaned.
 #[tokio::test]
 async fn test_typst_heading_content_association() {
     let content = load_test_document("advanced.typ");
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let result = extract_bytes_document(&content, "application/x-typst", &config)
         .await
         .expect("Extraction failed");
 
-    let blocks = extract_content_blocks(&result.content);
+    let blocks = heading_content_blocks(&result);
 
-    assert!(blocks.len() > 0, "Content blocks should be associated with headings.");
+    let heading_order: Vec<&str> = blocks.iter().map(|(heading, _)| *heading).collect();
+    assert_eq!(
+        heading_order,
+        vec![
+            "Mathematical Notation",
+            "Formatting Showcase",
+            "Structured Content",
+            "Code Blocks",
+            "Nested Headings",
+            "Level 3 heading",
+            "Level 4 heading",
+            "Tables and Data",
+            "Multiple Paragraphs",
+            "Conclusion",
+        ],
+        "headings must appear in document order"
+    );
 
-    for block in &blocks {
-        assert!(block.len() > 0, "Content blocks should not be empty.");
+    for (heading, body) in &blocks {
+        for text in body {
+            assert!(
+                !text.trim().is_empty(),
+                "content associated with heading '{}' must not be empty",
+                heading
+            );
+        }
     }
+
+    // `=== Level 3 heading` and `==== Level 4 heading` each own exactly one
+    // paragraph, so their association is unambiguous and pins the ordering: a
+    // scrambled walk would hand these paragraphs to a different heading. ~keep
+    let block_for = |wanted: &str| {
+        blocks
+            .iter()
+            .find(|(heading, _)| *heading == wanted)
+            .unwrap_or_else(|| panic!("heading '{}' should be extracted", wanted))
+            .1
+            .clone()
+    };
+    assert_eq!(
+        block_for("Level 3 heading"),
+        vec!["This is under a level 3 heading."],
+        "a level-3 heading must own the paragraph that follows it"
+    );
+    assert_eq!(
+        block_for("Level 4 heading"),
+        vec!["And this is level 4."],
+        "a level-4 heading must own the paragraph that follows it"
+    );
 }
 
 /// TEST 19: Whitespace normalization
@@ -862,48 +919,90 @@ async fn test_typst_empty_heading_edge_case() {
 async fn test_typst_basic_heading_regression() {
     let test_content = b"= Main Heading\n\nContent here";
 
-    let config = ExtractionConfig::default();
+    let config = structure_config();
     let result = extract_bytes_document(test_content, "application/x-typst", &config)
         .await
         .expect("Extraction failed");
 
-    assert!(
-        result.content.contains("= Main Heading"),
+    assert_eq!(
+        headings(&result),
+        vec![(1, "Main Heading")],
         "Basic level-1 heading should be extracted."
+    );
+
+    assert!(
+        result.content.contains("Main Heading"),
+        "Heading text should reach the extracted text."
     );
 
     assert!(result.content.contains("Content"), "Content should be extracted.");
 }
 
 /// TEST 27: Regression - Level 2 heading extraction
+///
+/// Also pins the rendered form: Markdown is where a heading's level becomes a
+/// visible prefix, and it is `##`, not the Typst `==` of the source.
 #[tokio::test]
 async fn test_typst_level2_heading_regression() {
     let test_content = b"= Main\n\n== Subsection\n\nMore content";
 
-    let config = ExtractionConfig::default();
+    let config = structure_config();
     let result = extract_bytes_document(test_content, "application/x-typst", &config)
+        .await
+        .expect("Extraction failed");
+
+    assert_eq!(
+        headings(&result),
+        vec![(1, "Main"), (2, "Subsection")],
+        "Level 2 headings must be extracted, at level 2."
+    );
+
+    let markdown_config = ExtractionConfig {
+        output_format: OutputFormat::Markdown,
+        ..Default::default()
+    };
+    let markdown = extract_bytes_document(test_content, "application/x-typst", &markdown_config)
         .await
         .expect("Extraction failed");
 
     assert!(
-        result.content.contains("== Subsection"),
-        "Level 2 headings must be extracted."
+        markdown.content.contains("## Subsection"),
+        "Markdown rendering must emit a level-2 heading, got: {:?}",
+        markdown.content
     );
 }
 
 /// TEST 28: Regression - Basic metadata
+///
+/// Covers the keyword-tuple form inline as well: `test_typst_metadata_extraction_completeness`
+/// asserts the same three fields against `metadata.typ`, but skips whenever its Pandoc
+/// metadata baseline is absent from the bucket-fetched corpus — which it always is.
 #[tokio::test]
 async fn test_typst_basic_metadata_regression() {
-    let test_content = b"#set document(title: \"Test\", author: \"Me\")\n\n= Heading";
+    let test_content = b"#set document(title: \"Test\", author: \"Me\", keywords: (\"alpha\", \"beta\"))\n\n= Heading";
 
     let config = ExtractionConfig::default();
     let result = extract_bytes_document(test_content, "application/x-typst", &config)
         .await
         .expect("Extraction failed");
 
-    assert!(result.metadata.title.is_some(), "Title metadata must be extracted.");
+    assert_eq!(
+        result.metadata.title.as_deref(),
+        Some("Test"),
+        "Title metadata must be extracted."
+    );
 
-    assert!(result.metadata.authors.is_some(), "Author metadata must be extracted.");
+    assert_eq!(
+        result.metadata.authors.as_deref(),
+        Some(&["Me".to_string()][..]),
+        "Author metadata must be extracted."
+    );
+
+    assert_eq!(
+        result.metadata.keywords.as_deref(),
+        Some(&["alpha".to_string(), "beta".to_string()][..]),
+        "Keyword tuples must be extracted."
+    );
 }
 
 /// TEST 29: Regression - Bold formatting
@@ -1037,16 +1136,22 @@ async fn test_typst_large_document_stress() {
         large_content.push_str(&format!("Content for section {}.\n\n", i));
     }
 
-    let config = ExtractionConfig::default();
+    let config = structure_config();
     let result = extract_bytes_document(large_content.as_bytes(), "application/x-typst", &config)
         .await
         .expect("Extraction failed");
 
-    let heading_count = extract_all_headings(&result.content).len();
-    assert!(
-        heading_count >= 40,
-        "Large documents should extract all headings. Found {} of 50.",
-        heading_count
+    let expected: Vec<(u8, String)> = (1..=50).map(|i| (1, format!("Heading {}", i))).collect();
+    let extracted: Vec<(u8, String)> = headings(&result)
+        .into_iter()
+        .map(|(level, text)| (level, text.to_string()))
+        .collect();
+
+    assert_eq!(
+        extracted,
+        expected,
+        "Large documents should extract all 50 headings, in order, at level 1. Found {}.",
+        extracted.len()
     );
 }
 
@@ -1060,19 +1165,23 @@ async fn test_typst_deep_nesting_stress() {
         nested.push_str(&format!("Content at level {}.\n\n", level));
     }
 
-    let config = ExtractionConfig::default();
+    let config = structure_config();
     let result = extract_bytes_document(nested.as_bytes(), "application/x-typst", &config)
         .await
         .expect("Extraction failed");
 
-    for level in 1..=6 {
-        let count = count_heading_level(&result.content, level);
-        assert!(
-            count >= 1,
-            "Level {} heading should be extracted in deep nesting test.",
-            level
-        );
-    }
+    assert_eq!(
+        headings(&result),
+        vec![
+            (1, "Level 1 Heading"),
+            (2, "Level 2 Heading"),
+            (3, "Level 3 Heading"),
+            (4, "Level 4 Heading"),
+            (5, "Level 5 Heading"),
+            (6, "Level 6 Heading"),
+        ],
+        "Every level must survive deep nesting, at its own level."
+    );
 }
 
 /// TEST 38: Mixed formatting stress
@@ -1130,7 +1239,7 @@ async fn test_typst_pathological_whitespace() {
 async fn test_typst_full_simple_document_comparison() {
     let content = load_test_document("simple.typ");
     let _baseline = load_pandoc_baseline("simple");
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let result = extract_bytes_document(&content, "application/x-typst", &config)
         .await
@@ -1141,8 +1250,20 @@ async fn test_typst_full_simple_document_comparison() {
         "simple.typ should extract substantial content"
     );
 
-    let heading_count = extract_all_headings(&result.content).len();
-    assert!(heading_count > 2, "simple.typ should have multiple sections");
+    assert_eq!(
+        headings(&result),
+        vec![
+            (1, "Introduction"),
+            (2, "Subsection"),
+            (1, "Features"),
+            (2, "Lists"),
+            (2, "Code"),
+            (2, "Tables"),
+            (2, "Links"),
+            (1, "Conclusion"),
+        ],
+        "simple.typ's section structure must survive intact"
+    );
 }
 
 /// TEST 42: Full document comparison - advanced.typ
@@ -1150,7 +1271,7 @@ async fn test_typst_full_simple_document_comparison() {
 async fn test_typst_full_advanced_document_comparison() {
     let content = load_test_document("advanced.typ");
     let _baseline = load_pandoc_baseline("advanced");
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let result = extract_bytes_document(&content, "application/x-typst", &config)
         .await
@@ -1161,8 +1282,22 @@ async fn test_typst_full_advanced_document_comparison() {
         "advanced.typ should extract comprehensive content"
     );
 
-    let heading_count = extract_all_headings(&result.content).len();
-    assert!(heading_count >= 5, "advanced.typ should preserve heading structure");
+    assert_eq!(
+        headings(&result),
+        vec![
+            (1, "Mathematical Notation"),
+            (1, "Formatting Showcase"),
+            (1, "Structured Content"),
+            (2, "Code Blocks"),
+            (2, "Nested Headings"),
+            (3, "Level 3 heading"),
+            (4, "Level 4 heading"),
+            (1, "Tables and Data"),
+            (1, "Multiple Paragraphs"),
+            (1, "Conclusion"),
+        ],
+        "advanced.typ should preserve heading structure, including the nested levels 3 and 4"
+    );
 }
 
 /// TEST 43: MIME type consistency
@@ -1219,7 +1354,7 @@ async fn test_typst_config_parameter_handling() {
 async fn test_typst_heading_loss_bug_analysis() {
     let content = load_test_document("headings.typ");
     let baseline = load_pandoc_baseline("headings");
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let result = extract_bytes_document(&content, "application/x-typst", &config)
         .await
@@ -1231,18 +1366,18 @@ async fn test_typst_heading_loss_bug_analysis() {
     println!("\nExtracted content:");
     println!("{}", result.content);
 
-    let extracted_headings = extract_all_headings(&result.content);
+    let extracted_headings = headings(&result);
     println!("\nExtracted headings: {}", extracted_headings.len());
-    for (i, h) in extracted_headings.iter().enumerate() {
-        println!("  {}: {}", i + 1, h);
+    for (i, (level, text)) in extracted_headings.iter().enumerate() {
+        println!("  {}: level {} — {}", i + 1, level, text);
     }
 
-    assert!(
-        extracted_headings.len() >= 6,
-        "BUG CONFIRMED: Heading loss detected. \
-         Expected 6 headings (1-6 levels), found {}. \
-         This is the 62% heading loss bug - only single '=' is matched, \
-         all '==' and higher are skipped entirely.",
-        extracted_headings.len()
+    let levels: Vec<u8> = extracted_headings.iter().map(|(level, _)| *level).collect();
+    assert_eq!(
+        levels,
+        vec![1, 2, 3, 4, 5, 6],
+        "Heading loss detected: expected one heading per level 1-6, found {:?}. \
+         The historical bug matched only a single '=', skipping '==' and deeper entirely.",
+        extracted_headings
     );
 }

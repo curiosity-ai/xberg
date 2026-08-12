@@ -5,15 +5,16 @@ package io.xberg;
  * PDF analysis step failed (only when `heuristics-pdf` feature is active).
  */
 public class PdfAnalysisErrorException extends HeuristicsErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new PdfAnalysisErrorException with the given message. */
-    public PdfAnalysisErrorException(final String message) {
-        super(message);
-    }
+  /** Creates a new PdfAnalysisErrorException with the given message. */
+  public PdfAnalysisErrorException(final String message) { super(message); }
 
-    /** Creates a new PdfAnalysisErrorException with the given message and cause. */
-    public PdfAnalysisErrorException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /**
+   * Creates a new PdfAnalysisErrorException with the given message and cause.
+   */
+  public PdfAnalysisErrorException(final String message,
+                                   final Throwable cause) {
+    super(message, cause);
+  }
 }

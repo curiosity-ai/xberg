@@ -57,8 +57,6 @@ fn markdown_chunk_config() -> ChunkingConfig {
 #[test]
 fn markdown_chunker_never_panics_on_malformed_nested_list() {
     let result = chunk_text(MALFORMED_NESTED_LIST_MD, &markdown_chunk_config(), None);
-    // We don't assert the content — just that no panic occurred.
-    // Both Ok and Err are acceptable; a panic is not.
     let _ = result;
 }
 
@@ -154,11 +152,8 @@ mod html_extraction {
         )
         .expect("first extraction must not error");
 
-        // Pass result.content back as Markdown bytes — this is the exact
-        // scenario from the issue that triggered the panic.
         let second =
             extract_bytes_document_blocking(first.content.as_bytes(), "text/plain", &config_with_markdown_chunking());
-        // Must not panic; Ok or Err are both acceptable.
         let _ = second;
     }
 }

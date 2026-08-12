@@ -3,7 +3,9 @@
   "compilerOptions": {
     "ignoreDeprecations": "6.0",
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "module": "ESNext",
     "moduleResolution": "bundler",
 
@@ -37,5 +39,12 @@
     "noEmit": true
   },
   "files": [],
-  "references": [{ "path": "./e2e/node" }, { "path": "./e2e/wasm" }]
+  "references": [
+    {
+      "path": "./e2e/node"
+    },
+    {
+      "path": "./e2e/wasm"
+    }
+  ]
 }

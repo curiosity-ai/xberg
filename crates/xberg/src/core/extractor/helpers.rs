@@ -3,12 +3,12 @@
 //! This module provides shared utilities used across extraction modules.
 
 use crate::Result;
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use crate::XbergError;
 use crate::plugins::InternalDocumentExtractor;
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use crate::types::{ErrorMetadata, ExtractedDocument, Metadata};
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -70,8 +70,13 @@ pub(in crate::core::extractor) fn get_extractor(mime_type: &str) -> Result<Arc<d
 /// Build an error `ExtractedDocument` for failed batch items.
 ///
 /// Used by the tokio-based concurrent batch functions to construct a uniform
-/// error result for a single failed input.
-#[cfg(feature = "tokio-runtime")]
+/// error result for a single failed input. Its sole caller is `collect_batch`
+/// (`batch.rs`), which is native-only — JoinSet needs `Send` futures + OS
+/// threads — so this carries the exact same gate to stay name-resolvable there.
+/// The batch machinery is currently reachable only from tests, so mirror the
+/// module-level `#![allow(dead_code)]` on `batch.rs` to keep non-test builds warning-free.
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[allow(dead_code)]
 pub(crate) fn error_extraction_result(e: &XbergError, elapsed_ms: Option<u64>) -> ExtractedDocument {
     let metadata = Metadata {
         error: Some(ErrorMetadata {

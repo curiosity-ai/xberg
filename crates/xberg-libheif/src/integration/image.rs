@@ -10,9 +10,7 @@ use crate::{ColorSpace, HeifContext, HeifError, ImageHandle, LibHeif, RgbChroma,
 macro_rules! magick {
     ($v1:literal, $v2:literal, $v3:literal, $v4:literal) => {
         [
-            // As a major brand
             &[0, 0, 0, 0, b'f', b't', b'y', b'p', $v1, $v2, $v3, $v4, 0, 0, 0, 0],
-            // As a minor brand
             &[0, 0, 0, 0, b'f', b't', b'y', b'p', 0, 0, 0, 0, $v1, $v2, $v3, $v4],
         ]
     };

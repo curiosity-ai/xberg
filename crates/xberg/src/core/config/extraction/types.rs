@@ -7,7 +7,7 @@
 //! - Batch extraction items
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use std::path::PathBuf;
 
 use crate::types::ExtractedDocument;
@@ -349,8 +349,61 @@ fn default_xberg_crawl_config() -> crawlberg::CrawlConfig {
     }
 }
 
+/// **Deprecated and inert.** Chunking no longer writes a heading breadcrumb into
+/// `content` for either variant of this enum — see the revised design adopted in
+/// <https://github.com/xberg-io/xberg/issues/1393>. Setting this field has no
+/// effect on chunking output any more. It is kept only so the ~15 alef-generated
+/// binding packages that construct it keep compiling; removing it outright is a
+/// separate, coordinated breaking change.
+///
+/// # Why this became inert
+///
+/// The original design (this enum, plus
+/// [`ChunkingConfig::prepend_heading_context`](super::super::processing::ChunkingConfig::prepend_heading_context))
+/// let `Content` mode prepend the heading breadcrumb directly into a chunk's
+/// `content`. GH#1393's follow-up discussion argued that a single flag on the
+/// chunker cannot serve all three retrieval consumers of the same chunk: dense/
+/// embedding retrieval wants the breadcrumb inline, but lexical (BM25/TF-IDF) and
+/// sparse learned (SPLADE) retrieval are actively harmed by it — SPLADE worse
+/// than BM25, because its term-expansion pulls each heading's whole learned
+/// neighbourhood (e.g. `"Authentication"` → `auth`, `login`, `credential`,
+/// `oauth`) into every chunk of that section, and that damage cannot be
+/// corrected by re-indexing since the expansion comes from a pretrained encoder,
+/// not the collection being indexed. Mutating `content` also desynced it from
+/// `byte_start`/`byte_end` (#1294): `chunk.content.len() != byte_end - byte_start`
+/// whenever a breadcrumb had been prepended, so slicing the source document by a
+/// chunk's own offsets silently returned different text than `content`.
+///
+/// The revised design removes the mutation entirely: `chunk.content` now always
+/// equals the exact `[byte_start, byte_end)` source span, regardless of this
+/// enum's value or `prepend_heading_context`.
+///
+/// # What to do instead
+///
+/// Call [`render_heading_breadcrumb`](crate::chunking::render_heading_breadcrumb)
+/// explicitly at index time, with a chunk's (always-clean) `content` and its
+/// [`heading_context`](crate::types::ChunkMetadata::heading_context) — only for
+/// the consumer that wants the breadcrumb inline (typically dense/embedding).
+/// BM25 and SPLADE consumers need no special handling: index `chunk.content` as
+/// returned. See the [`rag`](crate::chunking::rag) module docs for the full
+/// per-consumer guidance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BreadcrumbTarget {
+    /// Inert (#1393). Previously prepended the heading breadcrumb into chunk
+    /// `content`; no longer has any effect — `content` is left untouched, exactly
+    /// like `Metadata`. Kept as the default only for wire/API compatibility.
+    #[default]
+    Content,
+    /// Inert (#1393), and was already a no-op on `content` before this change.
+    /// Kept only for backward compatibility, since `Content` is no longer
+    /// distinguishable from it.
+    Metadata,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub(crate) struct BatchBytesItem {
     /// The content bytes to extract from
     pub content: Vec<u8>,
@@ -364,7 +417,7 @@ pub(crate) struct BatchBytesItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub(crate) struct BatchFileItem {
     /// Path to the file to extract from
     pub path: PathBuf,
@@ -559,7 +612,6 @@ impl Default for LanguageDetectionConfig {
     }
 }
 
-// Default value functions
 fn default_true() -> bool {
     true
 }
@@ -711,8 +763,6 @@ mod tests {
         assert!(back.include_page_rasters);
     }
 
-    // --- ImageOutputFormat tests ---
-
     #[test]
     fn test_image_output_format_default_is_native() {
         assert_eq!(ImageOutputFormat::default(), ImageOutputFormat::Native);
@@ -758,7 +808,6 @@ mod tests {
 
     #[test]
     fn test_output_format_jpeg_default_quality_applied_when_field_absent() {
-        // Omitting "quality" from the JSON object should yield the default (85).
         let json = r#"{"type":"jpeg"}"#;
         let fmt: ImageOutputFormat = serde_json::from_str(json).unwrap();
         assert_eq!(fmt, ImageOutputFormat::Jpeg { quality: 85 });
@@ -774,7 +823,6 @@ mod tests {
 
     #[test]
     fn test_output_format_webp_default_quality_applied_when_field_absent() {
-        // Omitting "quality" from the JSON object should yield the default (80).
         let json = r#"{"type":"webp"}"#;
         let fmt: ImageOutputFormat = serde_json::from_str(json).unwrap();
         assert_eq!(fmt, ImageOutputFormat::Webp { quality: 80 });
@@ -782,10 +830,6 @@ mod tests {
 
     #[test]
     fn test_output_format_webp_wire_value_is_lowercase_webp() {
-        // The variant is spelled `Webp` (not `WebP`) so serde's default
-        // snake_case rendering produces the industry-standard single-word
-        // `"webp"` wire tag, and alef-derived binding method/constant names
-        // (`fn webp`, `Webp`, `WEBP`) match.
         let fmt = ImageOutputFormat::Webp { quality: 80 };
         let json = serde_json::to_string(&fmt).unwrap();
         assert_eq!(json, r#"{"type":"webp","quality":80}"#);

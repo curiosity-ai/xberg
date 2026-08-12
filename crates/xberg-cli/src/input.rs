@@ -35,14 +35,22 @@ pub(crate) fn apply_json_overrides(
 
 pub(crate) fn resolve_extract_input(
     uri: Option<String>,
-    url: Option<String>,
+    #[cfg(feature = "url-surface")] url: Option<String>,
     stdin: bool,
 ) -> Result<ExtractInputSource> {
+    #[cfg(feature = "url-surface")]
     match (uri, url, stdin) {
         (Some(uri), None, false) => Ok(ExtractInputSource::Uri(uri)),
         (None, Some(url), false) => Ok(ExtractInputSource::Uri(url)),
         (None, None, true) => Ok(ExtractInputSource::Stdin),
         _ => anyhow::bail!("Provide exactly one extraction input: URI, --url, or --stdin."),
+    }
+
+    #[cfg(not(feature = "url-surface"))]
+    match (uri, stdin) {
+        (Some(uri), false) => Ok(ExtractInputSource::Uri(uri)),
+        (None, true) => Ok(ExtractInputSource::Stdin),
+        _ => anyhow::bail!("Provide exactly one extraction input: URI or --stdin."),
     }
 }
 
@@ -51,7 +59,12 @@ pub(crate) fn validate_extract_input(input: &ExtractInputSource) -> Result<()> {
         ExtractInputSource::Stdin => Ok(()),
         ExtractInputSource::Uri(uri) => {
             if is_remote_uri(uri) {
+                #[cfg(feature = "url-surface")]
                 return Ok(());
+                #[cfg(not(feature = "url-surface"))]
+                anyhow::bail!(
+                    "HTTP(S) input requires the url-ingestion feature. Rebuild with --features url-ingestion"
+                );
             }
             let path = uri_to_local_path(uri)?;
             validate_file_exists(&path)
@@ -82,6 +95,13 @@ pub(crate) fn resolve_batch_inputs(
 }
 
 pub(crate) fn validate_batch_input_uris(uris: &[String]) -> Result<()> {
+    #[cfg(not(feature = "url-surface"))]
+    if let Some(uri) = uris.iter().find(|uri| is_remote_uri(uri)) {
+        anyhow::bail!(
+            "HTTP(S) batch input '{uri}' requires the url-ingestion feature. Rebuild with --features url-ingestion"
+        );
+    }
+
     let local_paths: Vec<PathBuf> = uris
         .iter()
         .filter(|uri| !is_remote_uri(uri))

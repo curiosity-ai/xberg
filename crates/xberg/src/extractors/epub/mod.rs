@@ -34,6 +34,9 @@ use crate::extractors::security::SecurityBudget;
 use content::{extract_text_from_xhtml, extract_text_from_xhtml_budgeted, looks_like_navigation_document};
 use metadata::{build_additional_metadata, parse_opf};
 use parsing::{parse_container_xml, read_file_from_zip, resolve_path};
+
+const MARKUP_SWITCH_NAMESPACES: &[&str] = &[content::XHTML_NAMESPACE, content::MATHML_NAMESPACE];
+const PLAIN_SWITCH_NAMESPACES: &[&str] = &[content::XHTML_NAMESPACE];
 #[cfg_attr(alef, alef(skip))]
 /// EPUB format extractor using permissive-licensed dependencies.
 ///
@@ -42,6 +45,26 @@ use parsing::{parse_container_xml, read_file_from_zip, resolve_path};
 pub struct EpubExtractor;
 
 impl EpubExtractor {
+    fn spine_references_asset(spine_documents: &[content::EpubSpineDocument], asset_path: &str) -> bool {
+        spine_documents.iter().any(|document| {
+            let Ok(parsed) = roxmltree::Document::parse(&document.xhtml) else {
+                return false;
+            };
+            let document_dir = document
+                .file_path
+                .rsplit_once('/')
+                .map(|(directory, _)| directory)
+                .unwrap_or("");
+
+            parsed.descendants().filter(|node| node.is_element()).any(|node| {
+                node.tag_name().name().eq_ignore_ascii_case("img")
+                    && node.attribute("src").is_some_and(|source| {
+                        resolve_path(document_dir, source).is_ok_and(|resolved| resolved.path == asset_path)
+                    })
+            })
+        })
+    }
+
     /// Create a new EPUB extractor.
     pub(crate) fn new() -> Self {
         Self
@@ -73,17 +96,16 @@ fn trim_trailing_newlines(s: &str) -> &str {
 #[allow(dead_code)]
 impl EpubExtractor {
     fn build_fallback_document_structure(
-        document: &content::EpubSpineDocument,
+        xhtml: &str,
         index: usize,
     ) -> crate::types::document_structure::DocumentStructure {
         use crate::types::builder::DocumentStructureBuilder;
 
         let mut builder = DocumentStructureBuilder::new().source_format("epub");
-        let chapter_title =
-            extract_title_from_xhtml(&document.xhtml).unwrap_or_else(|| format!("Chapter {}", index + 1));
+        let chapter_title = extract_title_from_xhtml(xhtml).unwrap_or_else(|| format!("Chapter {}", index + 1));
         builder.push_heading(1, &chapter_title, None, None);
 
-        let text = extract_text_from_xhtml(&document.xhtml);
+        let text = extract_text_from_xhtml(xhtml);
         for paragraph in text.split("\n\n") {
             let trimmed = paragraph.trim();
             if !trimmed.is_empty() {
@@ -97,20 +119,23 @@ impl EpubExtractor {
     /// Render a spine document once.
     fn render_spine_document(
         document: &content::EpubSpineDocument,
+        xhtml: &str,
         index: usize,
         config: &ExtractionConfig,
     ) -> RenderedSpineDocument {
-        let wants_markup = matches!(config.output_format, OutputFormat::Markdown | OutputFormat::Djot);
+        let wants_markup = matches!(
+            config.output_format,
+            OutputFormat::Markdown | OutputFormat::Djot | OutputFormat::DocTags
+        );
         let mut warnings = Vec::new();
 
         let (content_fragment, content_fully_converted) = if wants_markup {
-            // Apply content filter to HTML options for EPUB chapter conversion.
             let html_options = super::html::apply_content_filter_to_html_options(
                 config.html_options.clone(),
                 config.content_filter.as_ref(),
             );
             match crate::extraction::html::convert_html_to_markdown_with_metadata(
-                &document.xhtml,
+                xhtml,
                 html_options,
                 Some(config.output_format.clone()),
             ) {
@@ -123,15 +148,15 @@ impl EpubExtractor {
                             document.file_path, err
                         )),
                     });
-                    (extract_text_from_xhtml(&document.xhtml).trim_end().to_string(), false)
+                    (extract_text_from_xhtml(xhtml).trim_end().to_string(), false)
                 }
             }
         } else {
-            (extract_text_from_xhtml(&document.xhtml).trim_end().to_string(), true)
+            (extract_text_from_xhtml(xhtml).trim_end().to_string(), true)
         };
 
         let document = if config.include_document_structure {
-            let chapter_structure = crate::extraction::html::structure::build_document_structure(&document.xhtml);
+            let chapter_structure = crate::extraction::html::structure::build_document_structure(xhtml);
 
             if chapter_structure.nodes.is_empty() {
                 warnings.push(ProcessingWarning {
@@ -141,7 +166,7 @@ impl EpubExtractor {
                         document.file_path
                     )),
                 });
-                Some(Self::build_fallback_document_structure(document, index))
+                Some(Self::build_fallback_document_structure(xhtml, index))
             } else {
                 Some(chapter_structure)
             }
@@ -204,13 +229,16 @@ impl EpubExtractor {
 
         let mut builder = InternalDocumentBuilder::new("epub");
 
-        // Accumulate pre-rendered markdown/djot when all chapters convert successfully
-        let wants_markup = matches!(config.output_format, OutputFormat::Markdown | OutputFormat::Djot);
+        let wants_markup = matches!(
+            config.output_format,
+            OutputFormat::Markdown | OutputFormat::Djot | OutputFormat::DocTags
+        );
         let mut pre_rendered_fragments = Vec::new();
         let mut all_converted_successfully = wants_markup;
 
-        // Emit cover image as the first element if present
-        if let Some(cover_path) = cover_image_path {
+        if let Some(cover_path) = cover_image_path
+            && !Self::spine_references_asset(spine_documents, cover_path)
+        {
             let mut buf = Vec::new();
             if let Ok(mut entry) = archive.by_name(cover_path) {
                 let _ = entry.read_to_end(&mut buf);
@@ -230,7 +258,6 @@ impl EpubExtractor {
                     })
                     .unwrap_or("png");
 
-                // Classify image based on metadata and visual properties
                 let (image_kind, kind_confidence) =
                     crate::extraction::image_kind::classify(&buf, fmt, None, None, None, None, false);
 
@@ -265,11 +292,16 @@ impl EpubExtractor {
             }
 
             let file_path = &spine_doc.file_path;
-            let sanitized = &spine_doc.xhtml;
+            let supported_namespaces = if wants_markup {
+                MARKUP_SWITCH_NAMESPACES
+            } else {
+                PLAIN_SWITCH_NAMESPACES
+            };
+            let resolved_xhtml = content::resolve_epub_switch_elements(&spine_doc.xhtml, supported_namespaces);
+            let sanitized = resolved_xhtml.as_str();
 
-            // If markdown/djot output requested, try to pre-render this chapter
             if wants_markup {
-                let rendered = Self::render_spine_document(spine_doc, index, config);
+                let rendered = Self::render_spine_document(spine_doc, sanitized, index, config);
                 if rendered.content_fully_converted {
                     pre_rendered_fragments.push(rendered.content_fragment);
                 } else {
@@ -277,15 +309,12 @@ impl EpubExtractor {
                 }
             }
 
-            // Skip navigation documents (TOC pages, etc.)
             if looks_like_navigation_document(sanitized) {
                 continue;
             }
 
-            // Account for chapter content size
             let _ = budget.account_text(sanitized.len());
 
-            // Skip empty chapters
             if extract_text_from_xhtml_budgeted(sanitized, budget).is_empty() {
                 continue;
             }
@@ -293,7 +322,6 @@ impl EpubExtractor {
             let chapter_structure = crate::extraction::html::structure::build_document_structure(sanitized);
 
             if chapter_structure.nodes.is_empty() {
-                // Fallback: extract plain text
                 let chapter_title =
                     extract_title_from_xhtml(sanitized).unwrap_or_else(|| format!("Chapter {}", index + 1));
                 builder.push_heading(1, &chapter_title, None, None);
@@ -301,26 +329,53 @@ impl EpubExtractor {
                 let text = extract_text_from_xhtml_budgeted(sanitized, budget);
                 for paragraph in text.split("\n\n") {
                     let trimmed = paragraph.trim();
-                    if !trimmed.is_empty() {
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    // MathML subtrees are converted to LaTeX and isolated as their
+                    // own `$$...$$` block by `content::render_math_element`; route
+                    // those through `push_formula` instead of `push_paragraph`. ~keep
+                    if let Some(latex) = trimmed.strip_prefix("$$").and_then(|rest| rest.strip_suffix("$$")) {
+                        builder.push_formula(latex, None, None);
+                    } else {
                         builder.push_paragraph(trimmed, vec![], None, None);
                     }
                 }
             } else {
-                // Convert DocumentStructure nodes to InternalDocument elements
                 let mut first_heading_idx: Option<u32> = None;
                 let mut in_list = false;
-                for node in chapter_structure.nodes.iter() {
+                // Tracks the highest direct-child index of the most recently opened
+                // blockquote, so `push_quote_end()` can be emitted once that child has been
+                // processed. This is a one-level approximation (direct children only, not the
+                // full subtree) — correct for the common case of a blockquote with no nested
+                // blockquote inside it, which covers the overwhelming majority of EPUB content. ~keep
+                let mut quote_close_after: Option<u32> = None;
+                for (node_index, node) in chapter_structure.nodes.iter().enumerate() {
                     use crate::types::document_structure::NodeContent;
 
-                    // Close an open list if the current node is not a ListItem
+                    if let Some(close_after) = quote_close_after
+                        && node_index as u32 > close_after
+                    {
+                        builder.push_quote_end();
+                        quote_close_after = None;
+                    }
+
                     if in_list && !matches!(&node.content, NodeContent::ListItem { .. }) {
                         builder.end_list();
                         in_list = false;
                     }
 
                     match &node.content {
-                        // Skip Quote container nodes — we handle them via parent tracking
-                        NodeContent::Quote => continue,
+                        // The blockquote container itself is recorded (issue #127): its
+                        // children still follow as ordinary flat entries in `nodes`, so the
+                        // quote markers just need to bracket them.
+                        NodeContent::Quote => {
+                            builder.push_quote_start();
+                            quote_close_after = node.children.iter().map(|c| c.0).max();
+                            if quote_close_after.is_none() {
+                                builder.push_quote_end();
+                            }
+                        }
                         NodeContent::Heading { level, text } => {
                             let idx = builder.push_heading(*level, text, None, None);
                             if first_heading_idx.is_none() {
@@ -358,8 +413,10 @@ impl EpubExtractor {
                         NodeContent::Code { text, language } => {
                             builder.push_code(text, language.as_deref(), None, None);
                         }
+                        NodeContent::Formula { text } => {
+                            builder.push_formula(text, None, None);
+                        }
                         NodeContent::Image { description, src, .. } => {
-                            // Collect image URI
                             if let Some(img_src) = src
                                 && !img_src.is_empty()
                             {
@@ -370,8 +427,6 @@ impl EpubExtractor {
                                     kind: UriKind::Image,
                                 });
                             }
-                            // Try to extract image binary from the EPUB ZIP.
-                            // Image src is relative to the XHTML file, not the manifest dir.
                             let xhtml_dir = file_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                             let image_data = src.as_ref().and_then(|img_src| {
                                 let resolved = resolve_path(xhtml_dir, img_src).ok()?;
@@ -397,7 +452,6 @@ impl EpubExtractor {
                             });
 
                             if let Some((data, format)) = image_data {
-                                // Classify image based on metadata and visual properties
                                 let (image_kind, kind_confidence) = crate::extraction::image_kind::classify(
                                     &data, &format, None, None, None, None, false,
                                 );
@@ -425,7 +479,6 @@ impl EpubExtractor {
                                 };
                                 builder.push_image(description.as_deref(), image, None, None);
                             } else {
-                                // No image data — emit placeholder
                                 let text_val = description.as_deref().unwrap_or("");
                                 let elem =
                                     InternalElement::text(ElementKind::Image { image_index: u32::MAX }, text_val, 0);
@@ -434,40 +487,55 @@ impl EpubExtractor {
                         }
                         NodeContent::Group {
                             heading_text: Some(_), ..
-                        } => {
-                            // Skip: the heading text is already emitted by the
-                            // Heading node that follows this Group wrapper.
+                        } => {}
+                        // Issue #127: these kinds used to fall into the catch-all below and
+                        // be dropped entirely, even though the upstream HTML structure
+                        // walker (`extraction::html::structure`) does produce them (e.g.
+                        // `DefinitionItem` for `<dl>/<dt>/<dd>`). ~keep
+                        NodeContent::DefinitionList | NodeContent::List { .. } => {}
+                        NodeContent::DefinitionItem { term, definition } => {
+                            builder.push_definition_term(term, None);
+                            builder.push_definition_description(definition, None);
                         }
-                        _ => {
-                            // Other node types: skip or handle generically
+                        NodeContent::Citation { key, text } => {
+                            builder.push_citation(text, key, None);
                         }
+                        NodeContent::Admonition { kind, title } => {
+                            builder.push_admonition(kind, title.as_deref(), None);
+                        }
+                        NodeContent::Footnote { text } => {
+                            builder.push_footnote_definition(text, "footnote", None);
+                        }
+                        NodeContent::Title { text } => {
+                            builder.push_heading(1, text, None, None);
+                        }
+                        NodeContent::PageBreak => {
+                            builder.push_page_break();
+                        }
+                        NodeContent::RawBlock { format, content } => {
+                            builder.push_raw_block(format, content, None);
+                        }
+                        _ => {}
                     }
                 }
 
-                // Close any trailing open list
+                if quote_close_after.is_some() {
+                    builder.push_quote_end();
+                }
+
                 if in_list {
                     builder.end_list();
                 }
 
-                // Chapter headings get automatic slug-based anchors from push_heading,
-                // enabling TOC entry resolution in the derivation step.
                 let _ = first_heading_idx;
             }
         }
 
-        // TOC→chapter relationships: each chapter heading is a TOC target.
-        // These anchors are set automatically by push_heading (slug-based),
-        // so the derivation step can resolve TOC entries to headings by key.
-
         let mut doc = builder.build();
 
-        // If markdown format was requested and all chapters converted successfully,
-        // store the pre-rendered content and mark output format
         if all_converted_successfully && !pre_rendered_fragments.is_empty() {
             let mut combined = pre_rendered_fragments.join("\n\n");
 
-            // Normalize the combined markdown: trim trailing whitespace from each line
-            // and ensure a single trailing newline (matching markdown renderer behavior)
             combined = combined
                 .lines()
                 .map(|line| line.trim_end())
@@ -480,6 +548,13 @@ impl EpubExtractor {
             }
 
             doc.pre_rendered_content = Some(combined);
+            // Deliberately not `OutputFormat::DocTags => "doctags"`: `combined` came from
+            // `convert_html_to_markdown_with_metadata`, which has no DocTags mode and falls
+            // back to Markdown-flavored text for it (`extraction::html::converter::map_output_format`).
+            // Tagging that text "doctags" would make `derive_extraction_result`'s DocTags arm
+            // take it verbatim instead of rendering the (correctly structured) element tree
+            // via `render_doctags`. Falling through to "plain" here is intentional: it makes
+            // the tag mismatch so the DocTags arm always renders from `doc.elements` instead. ~keep
             let format_name = match config.output_format {
                 OutputFormat::Markdown => "markdown",
                 OutputFormat::Djot => "djot",
@@ -635,7 +710,6 @@ impl InternalDocumentExtractor for EpubExtractor {
             .map(|(k, v)| (Cow::Owned(k), v))
             .collect();
 
-        // Build InternalDocument from spine chapters
         let cover_image_path = package.metadata.cover_image_href.as_deref();
         let mut doc =
             Self::build_internal_document(&mut archive, &spine_documents, cover_image_path, &mut budget, config)
@@ -643,7 +717,6 @@ impl InternalDocumentExtractor for EpubExtractor {
         doc.mime_type = mime_type.to_string();
         doc.processing_warnings.extend(processing_warnings);
 
-        // Preserve output_format if it was set by build_internal_document (for markdown/djot pre-rendering)
         let output_format = doc.metadata.output_format.take();
         doc.metadata = Metadata {
             title: package.metadata.title,
@@ -713,6 +786,23 @@ mod tests {
     }
 
     #[test]
+    fn should_detect_cover_asset_already_rendered_by_spine() {
+        let documents = vec![content::EpubSpineDocument {
+            file_path: "OEBPS/text/cover.xhtml".to_string(),
+            xhtml: r#"<html><body><img src="../images/cover.jpg" alt="Cover"/></body></html>"#.to_string(),
+        }];
+
+        assert!(EpubExtractor::spine_references_asset(
+            &documents,
+            "OEBPS/images/cover.jpg"
+        ));
+        assert!(!EpubExtractor::spine_references_asset(
+            &documents,
+            "OEBPS/images/other.jpg"
+        ));
+    }
+
+    #[test]
     fn test_epub_full_dublin_core_metadata() {
         let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
@@ -750,7 +840,6 @@ mod tests {
         assert_eq!(epub_meta.dc_type, Some("Text".to_string()));
         assert_eq!(epub_meta.cover_image_href, Some("images/cover.jpg".to_string()));
 
-        // Verify Dublin Core extension fields go into FormatMetadata::Epub
         let format_meta = FormatMetadata::Epub(EpubMetadata {
             coverage: epub_meta.coverage.clone(),
             dc_format: epub_meta.format.clone(),
@@ -771,12 +860,10 @@ mod tests {
             _ => panic!("Expected FormatMetadata::Epub variant"),
         }
 
-        // Standard Dublin Core fields still go into additional
         let additional = metadata::build_additional_metadata(epub_meta);
         assert!(additional.contains_key("publisher"));
         assert!(additional.contains_key("description"));
         assert!(additional.contains_key("rights"));
-        // These should NOT be in additional anymore
         assert!(!additional.contains_key("coverage"));
         assert!(!additional.contains_key("format"));
         assert!(!additional.contains_key("relation"));

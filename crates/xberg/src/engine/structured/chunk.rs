@@ -66,8 +66,6 @@ pub fn batch_pages(pages: Vec<PageImage>, user_text: Option<String>, config: &Ch
         }];
     }
 
-    // Guard the divisor: `chars_per_token` is a caller-settable field, and a 0
-    // would panic the integer divisions below. Clamp to at least 1.
     let chars_per_token = config.chars_per_token.max(1);
 
     let user_text_tokens = user_text
@@ -111,13 +109,6 @@ pub fn batch_pages(pages: Vec<PageImage>, user_text: Option<String>, config: &Ch
             is_first_batch = false;
         } else {
             current_batch.push(page);
-            // Update the running total incrementally rather than assigning
-            // `new_total`. `new_total` was computed before the flush branch
-            // above may have reset `current_text_tokens` to 0; reusing it here
-            // would carry the just-flushed batch's tokens into the new batch and
-            // over-split subsequent pages. Adding `page_tokens` yields
-            // `page_tokens` after a flush and the correct cumulative total
-            // otherwise.
             current_text_tokens += page_tokens;
         }
     }
@@ -263,8 +254,6 @@ mod tests {
 
     #[test]
     fn zero_chars_per_token_does_not_panic() {
-        // `chars_per_token` is a public, caller-settable field; a 0 must not
-        // panic the internal `len / chars_per_token` divisions.
         let config = ChunkerConfig {
             max_input_tokens: 100_000,
             avg_tokens_per_image: 1500,
@@ -272,47 +261,21 @@ mod tests {
         };
         let pages = vec![stub_page(1, 5000), stub_page(2, 5000)];
         let batches = batch_pages(pages, Some("user context".to_string()), &config);
-        // The divisor clamps to 1, so packing proceeds normally rather than panicking.
         assert!(!batches.is_empty());
         assert!(batches[0].user_text.is_some());
     }
 
     #[test]
     fn post_flush_total_does_not_carry_flushed_batch_tokens() {
-        // Regression test for the running-total bug in `batch_pages`. After a
-        // flush resets `current_text_tokens` to 0, the post-flush page must
-        // start the new batch's running total from `page_tokens` alone. The
-        // pre-fix code reused the pre-flush `new_total`, inflating the new
-        // batch's total by the just-flushed batch's tokens and over-splitting
-        // later pages into extra batches (extra vision-LLM calls).
-        //
-        // Config note: this uses `avg_tokens_per_image = 1500` and
-        // `chars_per_token = 4` (the historical defaults) but `max_input_tokens
-        // = 4000` rather than 3000. With a 3000 budget the bug is unobservable:
-        // every page costs `1500 + (len/4).max(1) >= 1501` tokens, so any two
-        // pages total >= 3002 > 3000 and never share a batch in EITHER version
-        // — each batch holds exactly one page and the counts are identical. A
-        // 4000 budget gives just enough slack for two pages to pack, which is
-        // the only situation in which the over-split is visible.
         let config = ChunkerConfig {
             max_input_tokens: 4000,
             avg_tokens_per_image: 1500,
             chars_per_token: 4,
         };
 
-        // user_text: 4000 bytes / 4 = 1000 text tokens.
         let user_text = Some("u".repeat(4000));
-        // Each page: png 4 bytes -> (4/4).max(1) = 1, + 1500 image = 1501 tokens.
         let pages = vec![stub_page(1, 4), stub_page(2, 4), stub_page(3, 4)];
 
-        // Token arithmetic (budget 4000):
-        //   page1: 1000 + 1501 = 2501  <= 4000  -> stays in batch1 (with user_text)
-        //   page2: 2501 + 1501 = 4002  >  4000  -> flush batch1 = [page1]; reset to 0
-        //          fixed: running total becomes 1501 (page2 alone)
-        //          buggy: running total becomes 4002 (carries flushed batch1 + page2)
-        //   page3: fixed: 1501 + 1501 = 3002 <= 4000 -> packs with page2 => batch2 = [page2, page3]
-        //          buggy: 4002 + 1501 = 5503 >  4000 -> flush batch2 = [page2]; batch3 = [page3]
-        // => fixed code: 2 batches; pre-fix code: 3 batches.
         let batches = batch_pages(pages, user_text, &config);
 
         assert_eq!(batches.len(), 2, "page2 and page3 must share one post-flush batch");

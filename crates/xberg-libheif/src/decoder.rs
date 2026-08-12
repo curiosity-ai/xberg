@@ -22,7 +22,6 @@ pub struct DecodingOptions {
 #[allow(unsafe_code)]
 impl DecodingOptions {
     pub fn new() -> Option<Self> {
-        // SAFETY: libheif C API; returns a heap-allocated decoding options or null.
         let inner_ptr = unsafe { lh::heif_decoding_options_alloc() };
         ptr::NonNull::new(inner_ptr).map(|inner| Self {
             inner,
@@ -39,12 +38,10 @@ impl Drop for DecodingOptions {
         {
             let inner_mut = self.inner_mut();
             if !inner_mut.color_conversion_options_ext.is_null() {
-                // SAFETY: libheif C API; color_conversion_options_ext is non-null and owned.
                 unsafe { lh::heif_color_conversion_options_ext_free(inner_mut.color_conversion_options_ext) };
                 inner_mut.color_conversion_options_ext = ptr::null_mut();
             }
         }
-        // SAFETY: self.inner is non-null and owned by this DecodingOptions; freeing it completes our ownership.
         unsafe {
             lh::heif_decoding_options_free(self.inner.as_ptr());
         }
@@ -56,14 +53,12 @@ impl DecodingOptions {
     #[inline(always)]
     #[allow(unsafe_code)]
     fn inner_ref(&self) -> &lh::heif_decoding_options {
-        // SAFETY: self.inner is a valid NonNull; we have shared access.
         unsafe { self.inner.as_ref() }
     }
 
     #[inline(always)]
     #[allow(unsafe_code)]
     pub(crate) fn inner_mut(&mut self) -> &mut lh::heif_decoding_options {
-        // SAFETY: self.inner is a valid NonNull; we have exclusive access.
         unsafe { self.inner.as_mut() }
     }
 
@@ -145,7 +140,6 @@ impl DecodingOptions {
     pub fn set_alpha_composition_mode(&mut self, v: AlphaCompositionMode) {
         let inner = self.inner_mut();
         if inner.color_conversion_options_ext.is_null() {
-            // SAFETY: libheif C API; returns a heap-allocated color conversion options ext or null.
             inner.color_conversion_options_ext = unsafe { lh::heif_color_conversion_options_ext_alloc() };
         }
         v.fill_libheif_cc_options_ext(inner.color_conversion_options_ext);
@@ -185,14 +179,14 @@ impl DecodingOptions {
     }
 
     #[cfg(feature = "v1_21")]
-    /// 0 = let libheif decide (TODO, currently ignored)
+    /// 0 lets libheif decide.
     pub fn num_library_threads(&self) -> u32 {
         let inner = self.inner_ref();
         inner.num_library_threads.max(0) as _
     }
 
     #[cfg(feature = "v1_21")]
-    /// 0 = let libheif decide (TODO, currently ignored)
+    /// 0 lets libheif decide.
     pub fn set_num_library_threads(&mut self, v: u32) {
         let inner = self.inner_mut();
         inner.num_library_threads = v.min(i32::MAX as u32) as _;
@@ -240,7 +234,6 @@ impl Default for ColorConversionOptions {
         };
         #[cfg(feature = "v1_19")]
         {
-            // SAFETY: libheif C API; cc_options is valid mutable struct.
             unsafe { lh::heif_color_conversion_options_set_defaults(&mut cc_options) };
         }
         Self::from_cc_options(&cc_options)
@@ -289,7 +282,6 @@ impl<'a> DecoderDescriptor<'a> {
     /// This name should stay constant over different decoder versions.
     #[allow(unsafe_code)]
     pub fn id(&self) -> &str {
-        // SAFETY: libheif C API; self.inner is non-null; returns a static c string or null.
         let name = unsafe { lh::heif_decoder_descriptor_get_id_name(self.inner) };
         cstr_to_str(name).unwrap_or_default()
     }
@@ -298,10 +290,7 @@ impl<'a> DecoderDescriptor<'a> {
     /// (including version information).
     #[allow(unsafe_code)]
     pub fn name(&self) -> String {
-        // Name of decoder in `libheif` is mutable static array of chars.
-        // So we must use mutex to get access this array.
         let _lock = DECODER_MUTEX.lock();
-        // SAFETY: libheif C API; self.inner is non-null; protected by mutex.
         let name = unsafe { lh::heif_decoder_descriptor_get_name(self.inner) };
         cstr_to_str(name).unwrap_or_default().to_owned()
     }

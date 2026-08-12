@@ -163,9 +163,6 @@ pub fn choose_call_mode(input: &StructuredInput, t: &StructuredThresholds) -> St
         raw
     };
 
-    // When the thresholds enable it, promote TextOnly → TextOnlyWithVisionFallback
-    // so the orchestrator runs the confidence-gated escalation path.  Does NOT
-    // upgrade TextPlusVision (user already opted into vision) or Skip.
     if t.enable_vision_fallback && mode == StructuredCallMode::TextOnly {
         StructuredCallMode::TextOnlyWithVisionFallback
     } else {
@@ -213,9 +210,6 @@ mod tests {
 
     #[test]
     fn pdf_low_coverage_chooses_text_only() {
-        // Scanned-looking PDFs route to TextOnly — xberg's OCR fills the
-        // text layer for us. The orchestrator's confidence gate handles any
-        // vision escalation.
         let mut i = input("application/pdf");
         i.text_coverage = 0.05;
         assert_eq!(choose_call_mode(&i, &t()), StructuredCallMode::TextOnly);
@@ -231,8 +225,6 @@ mod tests {
 
     #[test]
     fn pdf_high_coverage_with_images_chooses_text_only() {
-        // Embedded images no longer escalate at the heuristic layer — the
-        // orchestrator's TextOnlyWithVisionFallback path drives any vision pass.
         let mut i = input("application/pdf");
         i.text_coverage = 0.95;
         i.embedded_image_count = 3;
@@ -356,8 +348,6 @@ mod tests {
 
     #[test]
     fn enable_vision_fallback_does_not_upgrade_text_plus_vision() {
-        // user_force_vision wins first, producing TextPlusVision;
-        // enable_vision_fallback must not demote it back to TextOnlyWithVisionFallback.
         let mut i = input("application/pdf");
         i.user_force_vision = true;
         let thresholds = StructuredThresholds {

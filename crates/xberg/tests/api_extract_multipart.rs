@@ -1,5 +1,6 @@
-#![cfg(feature = "api")]
 //! Integration test for the `/extract` API handler using multipart uploads.
+
+#![cfg(feature = "api")]
 
 use axum::{
     body::{Body, to_bytes},

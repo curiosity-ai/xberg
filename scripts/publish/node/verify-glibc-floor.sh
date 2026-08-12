@@ -2,16 +2,6 @@
 
 set -euo pipefail
 
-# Post-build symbol audit for the linux-gnu .node prebuilds. cargo-zigbuild
-# 0.22.2 does not pin a glibc minor at link time unless the rust target
-# carries a `.<major>.<minor>` suffix — and napi-rs's parseTriple mangles
-# such a suffix into the artifact name. So zig will happily emit symbols
-# from any glibc up to its own ceiling (2.41 in zig 0.14) if a transitive
-# dep references them. We pin the floor here, post-build.
-#
-# Mirrors the Python pipeline's C23-symbol check at publish.yaml ~697-735,
-# extended to also catch GLIBC > 2.28 and any GLIBCXX_* (zig should bundle
-# libstdc++ statically; presence of GLIBCXX_* means the packaging changed).
 
 target="${TARGET:?TARGET not set}"
 
@@ -40,13 +30,8 @@ failed=0
 
 echo "=== Symbol audit: ${node_path} ==="
 
-# Cache objdump output once. The regexes below (GLIBC_<digit>...) are deliberately
-# anchored on a digit so non-versioned tags like GLIBC_PRIVATE are not captured.
 dynsyms=$(objdump -T "$node_path")
 
-# Max GLIBC version used. We compare against MAX_FLOOR via sort -V; a value
-# higher than MAX_FLOOR means a transitive dep pulled in a newer libc symbol
-# and silently raised the floor of the prebuild.
 max_glibc=$(printf '%s\n' "$dynsyms" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -uV | tail -1 || true)
 if [ -z "$max_glibc" ]; then
   echo "  FAIL: no GLIBC_* version symbols found in ${node_file}."
@@ -67,7 +52,6 @@ else
   fi
 fi
 
-# GLIBCXX_* should be empty: zig statically links its bundled libstdc++.
 glibcxx=$(printf '%s\n' "$dynsyms" | grep -oE 'GLIBCXX_[0-9]+(\.[0-9]+)*' | sort -uV || true)
 if [ -n "$glibcxx" ]; then
   echo "  FAIL: ${node_file} references GLIBCXX symbols:"
@@ -79,9 +63,6 @@ else
   echo "  OK: no GLIBCXX_* references (libstdc++ bundled by zig)"
 fi
 
-# C23 strtoll/strtoul/etc. variants live in glibc 2.38+ and are emitted by
-# GCC 14 when -std=gnu23 is the default. They should never appear under
-# zig's clang at -std=gnu17, but verify cheap.
 isoc23=$(printf '%s\n' "$dynsyms" | grep -E '__isoc23_' || true)
 if [ -n "$isoc23" ]; then
   echo "  FAIL: ${node_file} references C23 glibc helpers:"

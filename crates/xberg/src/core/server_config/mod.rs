@@ -105,7 +105,6 @@ impl Default for ServerConfig {
     }
 }
 
-// Default value functions for serde
 fn default_host() -> String {
     DEFAULT_HOST.to_string()
 }
@@ -126,6 +125,21 @@ impl ServerConfig {
     /// Create a new `ServerConfig` with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Validate every network-facing field of this configuration.
+    ///
+    /// This runs automatically on each load path ([`Self::from_file`], [`Self::from_toml_file`],
+    /// [`Self::from_yaml_file`], [`Self::from_json_file`]) and after [`Self::apply_env_overrides`],
+    /// so a configuration that reaches the server has already been checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns `XbergError::Validation` if `host` is neither an IP address nor a hostname,
+    /// if `port` is outside 1-65535, if any `cors_origins` entry is neither `*` nor an
+    /// HTTP(S) URL, or if either upload limit is zero.
+    pub(crate) fn validate(&self) -> Result<()> {
+        validation::validate(self)
     }
 
     /// Get the server listen address (host:port).
@@ -226,12 +240,17 @@ impl ServerConfig {
     /// - `XBERG_MAX_REQUEST_BODY_BYTES` - Max request body size in bytes
     /// - `XBERG_MAX_MULTIPART_FIELD_BYTES` - Max multipart field size in bytes
     ///
+    /// The resulting configuration is validated with [`Self::validate`] before it is returned,
+    /// so an override that supplies a malformed host, port, CORS origin or upload limit is
+    /// rejected here rather than when the server binds.
+    ///
     /// # Errors
     ///
     /// Returns `XbergError::Validation` if:
     /// - `XBERG_PORT` cannot be parsed as u16
     /// - `XBERG_MAX_REQUEST_BODY_BYTES` cannot be parsed as usize
     /// - `XBERG_MAX_MULTIPART_FIELD_BYTES` cannot be parsed as usize
+    /// - the overridden configuration fails [`Self::validate`]
     ///
     /// # Example
     ///
@@ -261,6 +280,8 @@ impl ServerConfig {
             &mut self.max_request_body_bytes,
             &mut self.max_multipart_field_bytes,
         )?;
+
+        self.validate()?;
 
         Ok(())
     }
@@ -299,7 +320,9 @@ impl ServerConfig {
     /// ```
     #[cfg_attr(alef, alef(skip))]
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        loader::from_file(path)
+        let config = loader::from_file(path)?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load server configuration from a TOML file.
@@ -324,7 +347,9 @@ impl ServerConfig {
     /// ```
     #[cfg_attr(alef, alef(skip))]
     pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self> {
-        loader::from_toml_file(path)
+        let config = loader::from_toml_file(path)?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load server configuration from a YAML file.
@@ -338,7 +363,9 @@ impl ServerConfig {
     /// Returns `XbergError::Validation` if the file doesn't exist or is invalid YAML.
     #[cfg_attr(alef, alef(skip))]
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
-        loader::from_yaml_file(path)
+        let config = loader::from_yaml_file(path)?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load server configuration from a JSON file.
@@ -352,6 +379,8 @@ impl ServerConfig {
     /// Returns `XbergError::Validation` if the file doesn't exist or is invalid JSON.
     #[cfg_attr(alef, alef(skip))]
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self> {
-        loader::from_json_file(path)
+        let config = loader::from_json_file(path)?;
+        config.validate()?;
+        Ok(config)
     }
 }

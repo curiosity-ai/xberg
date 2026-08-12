@@ -34,6 +34,9 @@ pub mod batch_mode;
 pub mod batch_optimizations;
 pub mod config;
 pub mod config_validation;
+// Unconditional: every extractor that reports partial extraction goes through
+// these helpers, not just the pdf/ocr pipelines that first needed them (#171).
+pub(crate) mod diagnostics;
 pub mod extract;
 pub(crate) mod extractor;
 pub mod formats;
@@ -46,6 +49,10 @@ pub mod pipeline;
 pub(crate) mod runtime;
 #[cfg(feature = "api-types")]
 pub mod server_config;
+/// Split-and-extract for multi-document PDFs. Core-only, not part of the
+/// binding surface (see `alef.toml` `[crates.exclude]`).
+#[cfg(feature = "pdf")]
+pub mod split;
 
 #[cfg(feature = "pdf")]
 pub use config::HierarchyConfig;

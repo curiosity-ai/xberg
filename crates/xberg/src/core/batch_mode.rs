@@ -19,14 +19,7 @@ task_local! {
 /// Check if we're currently in batch processing mode.
 ///
 /// Returns `false` if the task-local is not set (single-file mode).
-#[cfg(any(
-    feature = "pdf",
-    feature = "office",
-    feature = "excel",
-    feature = "excel-wasm",
-    feature = "archives"
-))]
-#[allow(dead_code)]
+#[cfg(any(feature = "office", feature = "excel", feature = "excel-wasm", feature = "iwork"))]
 pub(crate) fn is_batch_mode() -> bool {
     BATCH_MODE.try_with(|cell| cell.get()).unwrap_or(false)
 }
@@ -34,6 +27,7 @@ pub(crate) fn is_batch_mode() -> bool {
 /// Run a future with batch mode enabled.
 ///
 /// This sets the task-local BATCH_MODE flag for the duration of the future.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn with_batch_mode<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -43,13 +37,8 @@ where
 
 #[cfg(all(
     test,
-    any(
-        feature = "pdf",
-        feature = "office",
-        feature = "excel",
-        feature = "excel-wasm",
-        feature = "archives"
-    )
+    not(target_arch = "wasm32"),
+    any(feature = "office", feature = "excel", feature = "excel-wasm", feature = "iwork")
 ))]
 mod tests {
     use super::*;

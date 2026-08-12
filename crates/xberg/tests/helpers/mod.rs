@@ -292,7 +292,6 @@ pub fn test_config_with_ocr() -> xberg::core::config::ExtractionConfig {
     }
 }
 
-// PDF-specific test helpers (only available with pdf feature)
 #[cfg(feature = "pdf")]
 pub mod pdf_helpers {
     use xberg::core::config::ExtractionConfig;

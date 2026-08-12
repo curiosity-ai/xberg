@@ -5,12 +5,10 @@ use ahash::{AHashMap, AHashSet};
 use regex::Regex;
 use std::sync::Arc;
 
-// Import filter modules
 mod general;
 mod html;
 mod markdown;
 
-// Re-export all filter functions for backward compatibility
 pub(crate) use crate::utils::markdown_utils::is_markdown_header;
 pub(crate) use general::{normalize_newlines, normalize_spaces, remove_stopwords};
 pub(crate) use html::remove_html_comments;
@@ -96,7 +94,6 @@ impl FilterPipeline {
 
         let mut result = Cow::Borrowed(text);
 
-        // Preserve markdown code blocks if configured
         let mut preserved_blocks: Option<AHashMap<String, String>> = None;
         if self.config.preserve_markdown {
             let mut blocks = AHashMap::new();
@@ -104,21 +101,17 @@ impl FilterPipeline {
             preserved_blocks = Some(blocks);
         }
 
-        // Remove HTML comments
         result = Cow::Owned(remove_html_comments(&result));
 
-        // Normalize whitespace
         let normalized = normalize_spaces(&result);
         result = Cow::Owned(normalized.into_owned());
         let normalized = normalize_newlines(&result);
         result = Cow::Owned(normalized.into_owned());
 
-        // Preserve markdown structure if configured
         if self.config.preserve_markdown {
             result = Cow::Owned(preserve_markdown_structure(&result));
         }
 
-        // Restore preserved code blocks
         if let Some(blocks) = &preserved_blocks {
             result = Cow::Owned(restore_preserved_blocks(&result, blocks));
         }
@@ -140,7 +133,6 @@ impl FilterPipeline {
     pub(crate) fn apply_moderate_filters(&self, text: &str) -> String {
         let mut result = self.apply_light_filters(text);
 
-        // Preserve code blocks during stopword removal if configured
         let mut preserved_blocks: Option<AHashMap<String, String>> = None;
         if self.config.preserve_code {
             let mut blocks = AHashMap::new();
@@ -148,14 +140,12 @@ impl FilterPipeline {
             preserved_blocks = Some(blocks);
         }
 
-        // Remove stopwords with markdown awareness if configured
         if self.config.preserve_markdown {
             result = self.remove_stopwords_preserving_markdown(&result);
         } else {
             result = remove_stopwords(&result, &self.stopwords, &self.preserve_patterns);
         }
 
-        // Restore preserved code blocks
         if let Some(blocks) = &preserved_blocks {
             result = restore_preserved_blocks(&result, blocks);
         }
@@ -179,25 +169,21 @@ impl FilterPipeline {
         let mut processed_lines = Vec::new();
 
         for line in text.lines() {
-            // Preserve markdown headers
             if is_markdown_header(line) {
                 processed_lines.push(line.to_string());
                 continue;
             }
 
-            // Preserve markdown list items
             if is_markdown_list(line) {
                 processed_lines.push(line.to_string());
                 continue;
             }
 
-            // Preserve markdown table rows
             if is_markdown_table(line) {
                 processed_lines.push(line.to_string());
                 continue;
             }
 
-            // Apply stopword removal to regular text lines
             let processed_line = remove_stopwords(line, &self.stopwords, &self.preserve_patterns);
             processed_lines.push(processed_line);
         }
@@ -216,7 +202,6 @@ impl FilterPipeline {
 
 #[cfg(all(test, feature = "stopwords"))]
 mod tests {
-    use super::general::split_word_boundaries;
     use super::*;
 
     #[test]
@@ -692,57 +677,6 @@ mod tests {
 
         assert!(!result.contains(" the "));
         assert!(result.contains("quick"));
-    }
-
-    #[test]
-    fn test_split_word_boundaries() {
-        let (prefix, core, suffix) = split_word_boundaries("(hello)");
-        assert_eq!(prefix, "(");
-        assert_eq!(core, "hello");
-        assert_eq!(suffix, ")");
-
-        let (prefix2, core2, suffix2) = split_word_boundaries("world!");
-        assert_eq!(prefix2, "");
-        assert_eq!(core2, "world");
-        assert_eq!(suffix2, "!");
-
-        let (prefix3, core3, suffix3) = split_word_boundaries("'test");
-        assert_eq!(prefix3, "'");
-        assert_eq!(core3, "test");
-        assert_eq!(suffix3, "");
-
-        let (prefix4, core4, suffix4) = split_word_boundaries("simple");
-        assert_eq!(prefix4, "");
-        assert_eq!(core4, "simple");
-        assert_eq!(suffix4, "");
-
-        let (prefix5, core5, suffix5) = split_word_boundaries("\"example!!!\"");
-        assert_eq!(prefix5, "\"");
-        assert_eq!(core5, "example");
-        assert_eq!(suffix5, "!!!\"");
-    }
-
-    #[test]
-    fn test_split_word_boundaries_edge_cases() {
-        let (prefix, core, suffix) = split_word_boundaries("!!!");
-        assert_eq!(prefix, "!!!");
-        assert_eq!(core, "");
-        assert_eq!(suffix, "");
-
-        let (prefix2, core2, suffix2) = split_word_boundaries("");
-        assert_eq!(prefix2, "");
-        assert_eq!(core2, "");
-        assert_eq!(suffix2, "");
-
-        let (prefix3, core3, suffix3) = split_word_boundaries("a");
-        assert_eq!(prefix3, "");
-        assert_eq!(core3, "a");
-        assert_eq!(suffix3, "");
-
-        let (prefix4, core4, suffix4) = split_word_boundaries("(café)");
-        assert_eq!(prefix4, "(");
-        assert_eq!(core4, "café");
-        assert_eq!(suffix4, ")");
     }
 
     #[test]

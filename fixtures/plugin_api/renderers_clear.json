@@ -2,6 +2,12 @@
 	"id": "renderers_clear",
 	"category": "renderer_management",
 	"description": "Clear all renderers and verify list is empty",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "Clear all renderers and verify list is empty",
+		"description": "Clear all renderers and verify list is empty",
+		"side_effects": "safe"
+	},
 	"tags": ["renderer", "plugin_management", "clear", "trait-bridge"],
 	"call": "clear_renderers",
 	"assertions": [

@@ -21,10 +21,6 @@ from generate_test_fixtures import (
     xlsx_revisions,
 )
 
-# (module, expected_minimum_files). Each generator must emit at least one
-# binary + one sidecar. Stubs return 0, so we relax the floor to 0 for any
-# generator that hasn't been implemented yet — the smoke test still asserts
-# shape of whatever it does produce.
 GENERATORS = [
     docx_revisions,
     odt_revisions,
@@ -54,8 +50,6 @@ def test_generator_runs_and_emits_well_formed_outputs(module, tmp_path: Path, re
 
     written = module.generate(output_root, repo_root)
 
-    # Stubs may legitimately write nothing while still being valid. We only
-    # assert structure on files that ARE written.
     assert isinstance(written, list)
     for path in written:
         assert path.exists(), f"{module.__name__} reported {path} but it does not exist"

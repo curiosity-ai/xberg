@@ -6,8 +6,8 @@
 //! Safe wrapper around the `libheif-sys` crate for parsing HEIF / HEIC / AVIF
 //! files. The public API mirrors upstream libheif-rs v2.7.0.
 
-// only enables the `doc_cfg` feature when
-// the `docsrs` configuration attribute is defined
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(test, allow(clippy::print_stdout, clippy::print_stderr))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 extern crate core;
 

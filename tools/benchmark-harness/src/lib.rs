@@ -36,38 +36,48 @@
 //! | [`types`] | Core data types (`BenchmarkResult`, `QualityMetrics`, etc.). |
 
 #![allow(missing_docs)]
+// Internal dev tool: stdout IS this harness's report output, so raw printing is intentional. ~keep
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod adapter;
 pub mod adapters;
 pub mod aggregate;
+pub mod batch_diagnostic;
+pub mod bench_matrix;
+pub mod cohort;
 pub mod comparison;
 pub mod config;
 pub mod consolidate;
 pub mod corpus;
-pub mod datasets;
 pub mod diagnostics;
 pub mod embed_benchmark;
 pub mod error;
-pub mod field_quality;
 pub mod fixture;
+pub mod gap_report;
 pub mod groups;
 pub mod json_quality;
 pub mod markdown_quality;
 pub mod model_benchmark;
 pub mod monitoring;
 pub mod noise_detection;
+pub mod ocr_preflight;
 pub mod output;
 pub mod pipeline_benchmark;
 pub mod pool_metrics;
 pub mod profile_report;
 pub mod profiling;
+pub mod provenance;
 pub mod quality;
 pub mod registry;
 pub mod runner;
+pub mod runtime_responsiveness;
 pub mod sizes;
+pub mod split_benchmark;
 pub mod stats;
 pub mod survey;
+pub mod system_load;
 pub mod types;
+pub mod validate_artifacts;
 pub mod validate_gt;
 
 use std::path::Path;
@@ -110,14 +120,16 @@ pub use aggregate::{
     FrameworkModeAggregation, NewConsolidatedResults, PerFixtureRow, Percentiles, PerformancePercentiles,
     QualityPercentiles, RankedFramework, aggregate_new_format,
 };
+pub use cohort::CohortManifest;
 pub use config::{BenchmarkConfig, BenchmarkMode, ProfilingConfig, load_framework_sizes};
-pub use consolidate::load_run_results;
+pub use consolidate::{RunProvenanceRecord, load_run_provenance, load_run_results};
 pub use error::{Error, Result};
 pub use fixture::{Fixture, FixtureManager};
 pub use monitoring::{ResourceMonitor, ResourceSample, ResourceStats};
 pub use output::{write_by_extension_analysis, write_json};
 pub use pool_metrics::{FilePoolMetrics, PoolMetricsReport};
 pub use profile_report::{Hotspot, MemorySnapshot, ProfileReport};
+pub use provenance::{ModelProvenance, RunProvenance, write_run_provenance};
 pub use quality::{compute_quality, compute_quality_with_structure};
 pub use registry::AdapterRegistry;
 pub use runner::BenchmarkRunner;

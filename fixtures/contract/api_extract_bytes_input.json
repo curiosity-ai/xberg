@@ -1,6 +1,20 @@
 {
 	"id": "api_extract_bytes_input",
 	"description": "Tests bytes input extraction API (extract)",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests bytes input extraction API (extract)",
+		"description": "Tests bytes input extraction API (extract)",
+		"presentation": {
+			"files": [
+				{
+					"field": "/bytes",
+					"path": "test_documents/pdf/fake_memo.pdf"
+				}
+			]
+		},
+		"side_effects": "safe"
+	},
 	"tags": ["contract", "api"],
 	"call": "extract",
 	"input": {
@@ -586,9 +600,5 @@
 			"field": "results[0].content",
 			"values": ["May 5, 2023", "Mallori"]
 		}
-	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM e2e uses dedicated browser-safe fixtures for bytes input"
-	}
+	]
 }

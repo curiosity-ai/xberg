@@ -76,7 +76,6 @@ pub(super) fn repair_contextual_ligatures(text: &str) -> Cow<'_, str> {
         };
 
         match ch {
-            // f-ligatures (standard)
             '!' if prev_is_alpha && next_is_vowel => {
                 result.push_str("ff");
                 repaired = true;
@@ -86,8 +85,6 @@ pub(super) fn repair_contextual_ligatures(text: &str) -> Cow<'_, str> {
                 repaired = true;
             }
             // NOTE: deliberately NO letter+'!'+end-of-string repair. A sentence-final
-            // exclamation mark after a letter ("Thank you!") is overwhelmingly more
-            // common than a word-final broken fi ligature at the end of an element.
             '"' if prev_is_alpha && next_is_alpha => {
                 result.push_str("ffi");
                 repaired = true;
@@ -104,22 +101,15 @@ pub(super) fn repair_contextual_ligatures(text: &str) -> Cow<'_, str> {
                 result.push_str("fi");
                 repaired = true;
             }
-            // tt/ti/tti ligatures (European fonts)
             '*' if prev_is_alpha && next_is_alpha => {
                 result.push_str("tt");
                 repaired = true;
             }
             // NOTE: deliberately NO letter+'*'+end/non-alpha repair — that pattern is a
-            // footnote marker ("value*") or emphasis far more often than a broken tt.
             ':' if prev_is_alpha && next_is_lower => {
-                // ':' mid-word: letter immediately before AND lowercase letter immediately after
-                // e.g., "ges:one" → "gestione". Safe because real colons have a space after.
                 result.push_str("ti");
                 repaired = true;
             }
-            // Uppercase M between lowercase letters → "tti" (e.g., "progeMvi" fragments).
-            // Mid-word only: word-final 'M' after a lowercase letter is legitimate far
-            // too often ("50 µM", stylised names) to repair.
             'M' if prev_is_alpha && !prev_is_space_or_start => {
                 let prev_was_lower = if byte_idx > 0 {
                     bytes.get(byte_idx - 1).is_some_and(|&b| (b as char).is_lowercase())
@@ -168,14 +158,12 @@ pub(in crate::pdf::structure) fn repair_broken_word_spacing(text: &str) -> Cow<'
         return Cow::Borrowed(text);
     }
 
-    // Skip pipe-table markdown — split_whitespace destroys table formatting.
     if text.contains("| --- |") || text.starts_with('|') {
         return Cow::Borrowed(text);
     }
 
     let words: Vec<&str> = text.split_whitespace().collect();
 
-    // Quick pre-scan: check if any joins would be made before allocating.
     let has_joinable = words.windows(2).any(|window| {
         is_joinable_fragment(window[0], window[1])
             || (window[0].chars().all(|c| c.is_alphabetic())
@@ -196,9 +184,6 @@ pub(in crate::pdf::structure) fn repair_broken_word_spacing(text: &str) -> Cow<'
 
         let w = words[i];
 
-        // Pattern 1a: Single-char fragment followed by a lowercase word.
-        // Directly joins "s" + "hall" → "shall", "M" + "ust" → "Must".
-        // Only one word consumed (no chaining).
         if w.len() == 1
             && w.chars().next().is_some_and(|c| c.is_alphabetic())
             && !is_common_short_word(w)
@@ -211,9 +196,6 @@ pub(in crate::pdf::structure) fn repair_broken_word_spacing(text: &str) -> Cow<'
             continue;
         }
 
-        // Pattern 1b: Short fragment (2-3 chars) starts a run of short
-        // fragments. Joins "dd ress", "sen d er" patterns by chaining
-        // consecutive short (<=3 char) pieces.
         if i + 1 < words.len() && is_joinable_fragment(w, words[i + 1]) {
             result.push_str(w);
             i += 1;
@@ -225,7 +207,6 @@ pub(in crate::pdf::structure) fn repair_broken_word_spacing(text: &str) -> Cow<'
                 if !next_starts_lower {
                     break;
                 }
-                // Both pieces short — keep joining the fragment run.
                 if last_consumed_len <= 3 && next.len() <= 3 {
                     result.push_str(next);
                     last_consumed_len = next.len();
@@ -233,8 +214,6 @@ pub(in crate::pdf::structure) fn repair_broken_word_spacing(text: &str) -> Cow<'
                     i += 1;
                     continue;
                 }
-                // If accumulated so far is still short (<=3 chars), allow
-                // one longer word to complete it. E.g., "dd" + "ress" → "ddress".
                 if total_consumed <= 3 {
                     result.push_str(next);
                     i += 1;
@@ -245,9 +224,6 @@ pub(in crate::pdf::structure) fn repair_broken_word_spacing(text: &str) -> Cow<'
             continue;
         }
 
-        // Pattern 2: An alphabetic word (not a common short word) followed
-        // by a trailing short fragment (1-2 chars, lowercase, not common).
-        // Handles "reques t" → "request", "sen der" patterns.
         if i + 1 < words.len()
             && w.chars().all(|c| c.is_alphabetic())
             && !is_common_short_word(w)
@@ -289,7 +265,7 @@ fn is_joinable_fragment(word: &str, next: &str) -> bool {
     word.len() <= 3
         && !word.is_empty()
         && word.chars().all(|c| c.is_alphabetic())
-        && !word.chars().all(|c| c.is_uppercase()) // exclude abbreviations like "PDF", "AI"
+        && !word.chars().all(|c| c.is_uppercase())
         && !is_common_short_word(word)
         && next.chars().next().is_some_and(|c| c.is_lowercase())
 }
@@ -303,30 +279,164 @@ fn is_joinable_fragment(word: &str, next: &str) -> bool {
 fn is_common_short_word(word: &str) -> bool {
     matches!(
         word,
-        // 1-char
-        "a" | "A" | "I"
-        // 2-char
-        | "an" | "am" | "as" | "at" | "be" | "by" | "do" | "go" | "he"
-        | "if" | "in" | "is" | "it" | "me" | "my" | "no" | "of" | "oh"
-        | "on" | "or" | "so" | "to" | "up" | "us" | "we"
-        | "An" | "Am" | "As" | "At" | "Be" | "By" | "Do" | "Go" | "He"
-        | "If" | "In" | "Is" | "It" | "Me" | "My" | "No" | "Of" | "Oh"
-        | "On" | "Or" | "So" | "To" | "Up" | "Us" | "We"
-        // 3-char
-        | "the" | "and" | "are" | "but" | "can" | "did" | "for" | "got"
-        | "had" | "has" | "her" | "him" | "his" | "how" | "its" | "let"
-        | "may" | "new" | "nor" | "not" | "now" | "old" | "one" | "our"
-        | "out" | "own" | "ran" | "say" | "she" | "too" | "two" | "use"
-        | "was" | "way" | "who" | "why" | "yet" | "you" | "all" | "any"
-        | "big" | "day" | "end" | "far" | "few" | "put" | "run"
-        | "saw" | "set" | "top" | "try" | "win" | "yes"
-        | "The" | "And" | "Are" | "But" | "Can" | "Did" | "For" | "Got"
-        | "Had" | "Has" | "Her" | "Him" | "His" | "How" | "Its" | "Let"
-        | "May" | "New" | "Nor" | "Not" | "Now" | "Old" | "One" | "Our"
-        | "Out" | "Own" | "Ran" | "Say" | "She" | "Too" | "Two" | "Use"
-        | "Was" | "Way" | "Who" | "Why" | "Yet" | "You" | "All" | "Any"
-        | "Big" | "Day" | "End" | "Far" | "Few" | "Put" | "Run"
-        | "Saw" | "Set" | "Top" | "Try" | "Win" | "Yes"
+        "a" | "A"
+            | "I"
+            | "an"
+            | "am"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "do"
+            | "go"
+            | "he"
+            | "if"
+            | "in"
+            | "is"
+            | "it"
+            | "me"
+            | "my"
+            | "no"
+            | "of"
+            | "oh"
+            | "on"
+            | "or"
+            | "so"
+            | "to"
+            | "up"
+            | "us"
+            | "we"
+            | "An"
+            | "Am"
+            | "As"
+            | "At"
+            | "Be"
+            | "By"
+            | "Do"
+            | "Go"
+            | "He"
+            | "If"
+            | "In"
+            | "Is"
+            | "It"
+            | "Me"
+            | "My"
+            | "No"
+            | "Of"
+            | "Oh"
+            | "On"
+            | "Or"
+            | "So"
+            | "To"
+            | "Up"
+            | "Us"
+            | "We"
+            | "the"
+            | "and"
+            | "are"
+            | "but"
+            | "can"
+            | "did"
+            | "for"
+            | "got"
+            | "had"
+            | "has"
+            | "her"
+            | "him"
+            | "his"
+            | "how"
+            | "its"
+            | "let"
+            | "may"
+            | "new"
+            | "nor"
+            | "not"
+            | "now"
+            | "old"
+            | "one"
+            | "our"
+            | "out"
+            | "own"
+            | "ran"
+            | "say"
+            | "she"
+            | "too"
+            | "two"
+            | "use"
+            | "was"
+            | "way"
+            | "who"
+            | "why"
+            | "yet"
+            | "you"
+            | "all"
+            | "any"
+            | "big"
+            | "day"
+            | "end"
+            | "far"
+            | "few"
+            | "put"
+            | "run"
+            | "saw"
+            | "set"
+            | "top"
+            | "try"
+            | "win"
+            | "yes"
+            | "The"
+            | "And"
+            | "Are"
+            | "But"
+            | "Can"
+            | "Did"
+            | "For"
+            | "Got"
+            | "Had"
+            | "Has"
+            | "Her"
+            | "Him"
+            | "His"
+            | "How"
+            | "Its"
+            | "Let"
+            | "May"
+            | "New"
+            | "Nor"
+            | "Not"
+            | "Now"
+            | "Old"
+            | "One"
+            | "Our"
+            | "Out"
+            | "Own"
+            | "Ran"
+            | "Say"
+            | "She"
+            | "Too"
+            | "Two"
+            | "Use"
+            | "Was"
+            | "Way"
+            | "Who"
+            | "Why"
+            | "Yet"
+            | "You"
+            | "All"
+            | "Any"
+            | "Big"
+            | "Day"
+            | "End"
+            | "Far"
+            | "Few"
+            | "Put"
+            | "Run"
+            | "Saw"
+            | "Set"
+            | "Top"
+            | "Try"
+            | "Win"
+            | "Yes"
     )
 }
 
@@ -345,8 +455,6 @@ fn is_common_short_word(word: &str) -> bool {
 ///
 /// Uses `Cow<str>` for zero-alloc fast path when no ligatures are present.
 pub(super) fn expand_ligatures_with_space_absorption(text: &str) -> Cow<'_, str> {
-    // Fast path: check if any byte could start a ligature codepoint (U+FB00–U+FB06).
-    // These encode as 0xEF 0xBC 0x80..0x86 in UTF-8.
     if !text.contains([
         '\u{FB00}', '\u{FB01}', '\u{FB02}', '\u{FB03}', '\u{FB04}', '\u{FB05}', '\u{FB06}',
     ]) {
@@ -373,14 +481,11 @@ pub(super) fn expand_ligatures_with_space_absorption(text: &str) -> Cow<'_, str>
 
         result.push_str(expansion);
 
-        // Absorb a trailing space if followed by a word character.
-        // This handles the "ﬁ eld" → "field" pattern.
         if chars.peek() == Some(&' ') {
-            // Clone the iterator to peek two ahead (space + next char).
             let mut lookahead = chars.clone();
-            lookahead.next(); // consume the space
+            lookahead.next();
             if lookahead.peek().is_some_and(|c| c.is_alphanumeric() || *c == '_') {
-                chars.next(); // absorb the space
+                chars.next();
             }
         }
     }
@@ -399,33 +504,33 @@ pub(super) fn expand_ligatures_with_space_absorption(text: &str) -> Cow<'_, str>
 /// `f` (or `ff`) followed by space followed by lowercase letter that would form a
 /// common ligature combination (fi, fl, ff).
 pub(super) fn repair_ligature_spaces(text: &str) -> Cow<'_, str> {
-    // Fast path: no "f " pattern
     if !text.contains("f ") {
         return Cow::Borrowed(text);
     }
 
     let mut result = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
+    let mut chars = text.char_indices().peekable();
+    let mut word_start = 0;
 
-    while i < len {
-        // Look for 'f' followed by ' ' followed by a lowercase letter
-        // that would form a ligature: fi, fl, ff, ffi, ffl
-        if bytes[i] == b'f' && i + 2 < len && bytes[i + 1] == b' ' {
-            let next = bytes[i + 2];
-            // Check if this is a ligature break: f + space + {i, l, f, e, o, a, ...}
-            // Only absorb if preceded by a word character (not start of word "for", "from")
-            // and the preceding context suggests mid-word break.
-            if (next == b'i' || next == b'l' || next == b'f') && i > 0 && bytes[i - 1].is_ascii_alphabetic() {
-                // This looks like a ligature break: "eff iciently" → "efficiently"
-                result.push('f');
-                i += 2; // skip the space
+    while let Some((index, ch)) = chars.next() {
+        if ch == 'f' && chars.peek().is_some_and(|(_, next)| *next == ' ') {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            let continuation = lookahead.next().map(|(_, next)| next);
+            let current_word = &text[word_start..index + ch.len_utf8()];
+            let is_ligature_continuation = matches!(continuation, Some('i' | 'l' | 'f'));
+
+            if is_ligature_continuation && !is_common_short_word(current_word) {
+                result.push(ch);
+                chars.next();
                 continue;
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+
+        result.push(ch);
+        if !ch.is_alphabetic() {
+            word_start = index + ch.len_utf8();
+        }
     }
 
     if result == text {
@@ -441,18 +546,14 @@ pub(super) fn repair_ligature_spaces(text: &str) -> Cow<'_, str> {
 /// slash, and bullet characters. This improves TF1 by ensuring extracted text
 /// matches ground truth tokenization.
 pub(super) fn normalize_unicode_text(text: &str) -> Cow<'_, str> {
-    // U+2010/U+2011 hyphens are deliberately NOT mapped to ASCII here: the
-    // per-segment pass runs before line assembly, and `finalize_hyphens` needs
-    // the Unicode form intact to distinguish run-splitting artifacts from
-    // legitimate spaced ASCII hyphens after segments are joined.
     if !text.contains(['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2044}', '\u{2022}']) {
         return Cow::Borrowed(text);
     }
     Cow::Owned(
-        text.replace(['\u{2018}', '\u{2019}'], "'") // curly single quotes
-            .replace(['\u{201C}', '\u{201D}'], "\"") // curly double quotes
-            .replace('\u{2044}', "/") // fraction slash
-            .replace('\u{2022}', "\u{00B7}"), // bullet → middle dot
+        text.replace(['\u{2018}', '\u{2019}'], "'")
+            .replace(['\u{201C}', '\u{201D}'], "\"")
+            .replace('\u{2044}', "/")
+            .replace('\u{2022}', "\u{00B7}"),
     )
 }
 
@@ -490,18 +591,11 @@ pub(super) fn collapse_spaced_hyphens(text: &str) -> Cow<'_, str> {
         return Cow::Borrowed(text);
     }
 
-    // Newlines count as gaps: a heading rendered as separate PDF text runs
-    // arrives as newline-joined lines ("DARPA\n‐\nBAA"), and a lone hyphen on
-    // its own line is never legitimate typography (line-break hyphenation
-    // attaches the hyphen to the preceding word, which this pattern excludes).
     let is_gap = |c: char| matches!(c, ' ' | '\u{00A0}' | '\n' | '\r' | '\t');
     let chars: Vec<char> = text.chars().collect();
     let mut result = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
-        // Match: <alnum> <gaps> <hyphen> <gaps> <alnum> → collapse the gaps.
-        // Gap runs can be multiple chars: a segment's own trailing space plus
-        // the join space produce doubles.
         if chars[i].is_alphanumeric() {
             let mut j = i + 1;
             while j < chars.len() && is_gap(chars[j]) {
@@ -515,7 +609,7 @@ pub(super) fn collapse_spaced_hyphens(text: &str) -> Cow<'_, str> {
                 if k > j + 1 && k < chars.len() && chars[k].is_alphanumeric() {
                     result.push(chars[i]);
                     result.push('-');
-                    i = k; // continue at the trailing alnum so chains ("A ‐ B ‐ C") collapse fully
+                    i = k;
                     continue;
                 }
             }
@@ -544,13 +638,10 @@ pub(super) fn collapse_spaced_hyphens(text: &str) -> Cow<'_, str> {
 /// - `; ;` → `;`
 /// - `: :` → `:`
 pub(super) fn clean_duplicate_punctuation(text: &str) -> Cow<'_, str> {
-    // Fast path: check for any duplicate punctuation pattern before allocating.
     if !has_duplicate_punctuation(text) {
         return Cow::Borrowed(text);
     }
 
-    // Apply iteratively until no more duplicate punctuation remains.
-    // Handles chains like `, , ,` which need two passes (`, , ,` -> `, ,` -> `,`).
     let mut current = collapse_duplicate_punctuation_once(text);
     while has_duplicate_punctuation(&current) {
         current = collapse_duplicate_punctuation_once(&current);
@@ -568,11 +659,9 @@ fn collapse_duplicate_punctuation_once(text: &str) -> String {
 
     while i < len {
         let b = bytes[i];
-        // Check for "X Y X" pattern where X is punctuation and Y is a space.
         if is_dup_punct_byte(b) && i + 2 < len && bytes[i + 1] == b' ' && bytes[i + 2] == b {
-            // Found "X X" with space between — emit just the first punctuation.
             result.push(b as char);
-            i += 3; // skip "X X"
+            i += 3;
         } else {
             result.push(b as char);
             i += 1;
@@ -610,7 +699,6 @@ fn is_dup_punct_byte(b: u8) -> bool {
 ///   character was discarded by the PDF producer.
 /// - Other C0 control characters (U+0000–U+001F except `\t`, `\n`, `\r`) → removed.
 pub(super) fn normalize_text_encoding(text: &str) -> Cow<'_, str> {
-    // Fast path: no special characters present
     if !text.contains('\u{00AD}') && !text.bytes().any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') {
         return Cow::Borrowed(text);
     }
@@ -621,25 +709,17 @@ pub(super) fn normalize_text_encoding(text: &str) -> Cow<'_, str> {
     while let Some(ch) = chars.next() {
         match ch {
             '\u{00AD}' => {
-                // Soft hyphen at end of text (or before whitespace): convert to regular
-                // hyphen so rendering code can rejoin word fragments.
                 let at_end = chars.peek().is_none_or(|c| c.is_whitespace());
                 if at_end {
                     result.push('-');
                 }
-                // Mid-word soft hyphen: drop (invisible break hint)
             }
             '\x02' => {
-                // Pdfium soft-hyphen word-break marker. Strip the marker and any
-                // immediately following whitespace to rejoin the word fragments.
-                // e.g., "soft\x02 ware" → "software", "recog\x02\nnition" → "recognition"
                 while chars.peek().is_some_and(|c| *c == ' ' || *c == '\n') {
                     chars.next();
                 }
             }
-            c if c.is_control() && c != '\n' && c != '\r' && c != '\t' => {
-                // Strip other control characters
-            }
+            c if c.is_control() && c != '\n' && c != '\r' && c != '\t' => {}
             _ => result.push(ch),
         }
     }
@@ -656,8 +736,6 @@ pub(super) fn apply_to_all_segments(paragraphs: &mut [PdfParagraph], repair_fn: 
     for para in paragraphs {
         for line in &mut para.lines {
             for seg in &mut line.segments {
-                // Borrow directly — only allocate when the repair actually modifies text.
-                // Previously this cloned every segment's text unconditionally.
                 if let Cow::Owned(s) = repair_fn(&seg.text) {
                     seg.text = s;
                 }
@@ -740,7 +818,6 @@ mod tests {
     fn test_repair_joins_multi_char_fragments() {
         let broken = "rom ance and m arriage";
         let repaired = repair_broken_word_spacing(broken);
-        // "rom" (3 chars) before lowercase "ance" → joined. "m" before "arriage" → joined.
         assert_eq!(repaired, "romance and marriage");
     }
 
@@ -748,8 +825,6 @@ mod tests {
     fn test_repair_joins_shall_be_active() {
         let broken = "s hall a b e active";
         let repaired = repair_broken_word_spacing(broken);
-        // "s"+"hall" → "shall" (1-char + lowercase), "a" preserved (common),
-        // "b"+"e" → "be" (1-char + lowercase), "active" stays separate.
         assert_eq!(repaired, "shall a be active");
     }
 
@@ -757,7 +832,6 @@ mod tests {
     fn test_repair_joins_address_fragments() {
         let broken = "a dd ress";
         let repaired = repair_broken_word_spacing(broken);
-        // "a" is common standalone word, "dd" (2 chars) + "ress" → "ddress"
         assert_eq!(repaired, "a ddress");
     }
 
@@ -765,20 +839,17 @@ mod tests {
     fn test_repair_joins_sender() {
         let broken = "sen d er hardware";
         let repaired = repair_broken_word_spacing(broken);
-        // "sen" (3 chars) + "d" + "er" → "sender"
         assert_eq!(repaired, "sender hardware");
     }
 
     #[test]
     fn test_pipe_table_guard_standard() {
-        // Lines starting with '|' are pipe-table rows — must not be modified.
         let table = "| CTC_ARP | s hall be | active |";
         assert_eq!(repair_broken_word_spacing(table), table);
     }
 
     #[test]
     fn test_pipe_table_separator_guard() {
-        // Pipe-table separator lines must also be left untouched.
         let sep = "| --- | --- |";
         assert_eq!(repair_broken_word_spacing(sep), sep);
     }
@@ -800,12 +871,10 @@ mod tests {
             "DARPA-BAA-15-58 September"
         );
         assert_eq!(collapse_spaced_hyphens("VA 22203 \u{2010} 2114"), "VA 22203-2114");
-        // Newline-joined runs (heading assembled from separate PDF text runs).
         assert_eq!(
             collapse_spaced_hyphens("DARPA\n\u{2010}\nBAA\n\u{2010}\n15\n\u{2010}\n58"),
             "DARPA-BAA-15-58"
         );
-        // Line-break hyphenation (hyphen attached to the word) is untouched.
         assert_eq!(collapse_spaced_hyphens("multi\u{2010}\nline"), "multi\u{2010}\nline");
     }
 
@@ -844,25 +913,21 @@ mod tests {
 
     #[test]
     fn test_normalize_stx_word_break_with_space() {
-        // Pdfium soft-hyphen marker: \x02 followed by space → rejoin word
         assert_eq!(normalize_text_encoding("soft\x02 ware"), "software");
     }
 
     #[test]
     fn test_normalize_stx_word_break_with_newline() {
-        // Pdfium soft-hyphen marker: \x02 followed by newline → rejoin word
         assert_eq!(normalize_text_encoding("recog\x02\nnition"), "recognition");
     }
 
     #[test]
     fn test_normalize_stx_at_end() {
-        // \x02 at end of text → just stripped
         assert_eq!(normalize_text_encoding("hello\x02"), "hello");
     }
 
     #[test]
     fn test_normalize_stx_no_trailing_space() {
-        // \x02 not followed by space → just stripped (rejoin adjacent chars)
         assert_eq!(normalize_text_encoding("soft\x02ware"), "software");
     }
 
@@ -870,8 +935,6 @@ mod tests {
     fn test_normalize_preserves_tabs_newlines() {
         assert_eq!(normalize_text_encoding("a\tb\nc\r"), "a\tb\nc\r");
     }
-
-    // --- expand_ligatures_with_space_absorption ---
 
     #[test]
     fn test_expand_ligatures_no_ligatures() {
@@ -914,49 +977,41 @@ mod tests {
 
     #[test]
     fn test_expand_ligatures_space_absorption_fi() {
-        // "ﬁ eld" → "field" (space absorbed before word char)
         assert_eq!(expand_ligatures_with_space_absorption("\u{FB01} eld"), "field");
     }
 
     #[test]
     fn test_expand_ligatures_space_absorption_fl() {
-        // "ﬂ oor" → "floor"
         assert_eq!(expand_ligatures_with_space_absorption("\u{FB02} oor"), "floor");
     }
 
     #[test]
     fn test_expand_ligatures_space_absorption_ff() {
-        // "e ﬀ ect" → "e effect" (space before ligature preserved, space after absorbed)
         assert_eq!(expand_ligatures_with_space_absorption("e \u{FB00} ect"), "e ffect");
     }
 
     #[test]
     fn test_expand_ligatures_space_not_absorbed_before_punctuation() {
-        // "ﬁ ." → "fi ." (space before punctuation not absorbed)
         assert_eq!(expand_ligatures_with_space_absorption("\u{FB01} ."), "fi .");
     }
 
     #[test]
     fn test_expand_ligatures_space_not_absorbed_before_space() {
-        // "ﬁ  word" → "fi  word" (double space: first space not absorbed because next is space)
         assert_eq!(expand_ligatures_with_space_absorption("\u{FB01}  word"), "fi  word");
     }
 
     #[test]
     fn test_expand_ligatures_at_end_of_string() {
-        // Ligature at end with no trailing chars
         assert_eq!(expand_ligatures_with_space_absorption("pro\u{FB01}"), "profi");
     }
 
     #[test]
     fn test_expand_ligatures_space_at_end_not_absorbed() {
-        // "ﬁ " at end → "fi " (space not absorbed because no following word char)
         assert_eq!(expand_ligatures_with_space_absorption("\u{FB01} "), "fi ");
     }
 
     #[test]
     fn test_expand_ligatures_multiple_in_sentence() {
-        // "the ﬁ rst ﬂ oor" → "the first floor"
         assert_eq!(
             expand_ligatures_with_space_absorption("the \u{FB01} rst \u{FB02} oor"),
             "the first floor"
@@ -973,8 +1028,24 @@ mod tests {
 
     #[test]
     fn test_expand_ligatures_no_space_no_absorption() {
-        // Ligature directly adjacent to word char — no space to absorb
         assert_eq!(expand_ligatures_with_space_absorption("\u{FB01}nally"), "finally");
+    }
+
+    #[test]
+    fn test_repair_ligature_spaces_preserves_short_word_boundary() {
+        let text = "café kinetics of inhibitor adsorption if flow changes";
+        let repaired = repair_ligature_spaces(text);
+
+        assert_eq!(repaired, text);
+        assert!(matches!(repaired, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_repair_ligature_spaces_repairs_intra_word_breaks() {
+        assert_eq!(
+            repair_ligature_spaces("f irst eff iciently signif icant"),
+            "first efficiently significant"
+        );
     }
 
     #[test]
@@ -1002,7 +1073,6 @@ mod tests {
 
     #[test]
     fn test_clean_duplicate_punctuation_no_change() {
-        // Normal text without duplicate punctuation should pass through unchanged.
         let text = "Hello, world. This is normal; right: yes";
         assert!(matches!(clean_duplicate_punctuation(text), Cow::Borrowed(_)));
     }
@@ -1014,7 +1084,6 @@ mod tests {
 
     #[test]
     fn test_clean_duplicate_punctuation_triple() {
-        // Triple comma `, , ,` collapses iteratively: `, , ,` -> `, ,` -> `,`
         assert_eq!(
             clean_duplicate_punctuation("[12, 13, 9]. Docling is designed as a simple, , , self-contained"),
             "[12, 13, 9]. Docling is designed as a simple, self-contained"
@@ -1051,7 +1120,6 @@ mod overreach_regression_tests {
 
     #[test]
     fn mid_word_repairs_still_fire() {
-        // The legitimate mid-word encodings must keep working.
         assert_eq!(repair_contextual_ligatures("di!erent"), "different");
         assert_eq!(repair_contextual_ligatures("speci!c"), "specific");
         assert_eq!(repair_contextual_ligatures("aMb"), "attib");

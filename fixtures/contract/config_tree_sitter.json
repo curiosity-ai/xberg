@@ -1,6 +1,12 @@
 {
 	"id": "config_tree_sitter",
 	"description": "Tests tree-sitter configuration round-trip",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests tree-sitter configuration round-trip",
+		"description": "Tests tree-sitter configuration round-trip",
+		"side_effects": "server"
+	},
 	"tags": ["contract", "config", "tree-sitter"],
 	"call": "extract",
 	"input": {
@@ -33,7 +39,7 @@
 	],
 	"skip": {
 		"languages": ["wasm"],
-		"reason": "WASM cannot access filesystem; use bytes input with file content instead"
+		"reason": "The wasm binding has no tree_sitter config field: tree-sitter is excluded from the `wasm-target` feature (crates/xberg/Cargo.toml) because the 371-grammar static pack pushes the .wasm past jsDelivr's 50 MB per-file limit, so neither TreeSitterConfig nor ExtractionConfig.tree_sitter is generated in crates/xberg-wasm. Unblocking this needs a curated tree-sitter-wasm-lite grammar set, not a fixture change."
 	},
 	"config": {
 		"tree_sitter": {

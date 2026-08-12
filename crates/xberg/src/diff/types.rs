@@ -10,9 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{extraction::ArchiveEntry, tables::Table};
 
-// Re-export from the unconditional types module so the `diff` feature's
-// public path (`xberg::diff::DiffLine`, `xberg::diff::CellChange`)
-// remains stable. The canonical definitions are in `crate::types::revisions`.
 pub use crate::types::revisions::{CellChange, DiffLine};
 
 /// Options controlling how two `ExtractedDocument` values are compared.

@@ -30,7 +30,6 @@ AUTHORS = [
     (1, "Bob"),
 ]
 
-# Each row: (slide_index_zero_based, idx, author_id, dt, text)
 COMMENTS = [
     (0, 1, 0, "2024-06-01T10:00:00Z", "Alice: opening question on slide 1"),
     (0, 2, 1, "2024-06-01T10:15:00Z", "Bob: follow-up on slide 1"),
@@ -41,11 +40,9 @@ COMMENTS = [
 def _build_baseline_pptx() -> bytes:
     """Author a vanilla 3-slide deck with one text shape each."""
     prs = Presentation()
-    blank_layout = prs.slide_layouts[6]  # blank layout
+    blank_layout = prs.slide_layouts[6]
     for i in range(3):
         slide = prs.slides.add_slide(blank_layout)
-        # python-pptx writes deterministic slideN.xml; add a minimal text
-        # frame so each slide carries body text.
         textbox = slide.shapes.add_textbox(left=914400, top=914400, width=914400 * 4, height=914400)
         textbox.text_frame.text = f"Slide {i + 1} body"
     buf = io.BytesIO()
@@ -89,8 +86,10 @@ def _patch_content_types(original: bytes, comment_slide_indices: list[int]) -> b
     """Register commentAuthors + per-slide comments content-types."""
     text = original.decode("utf-8")
     overrides: list[str] = [
-        '<Override PartName="/ppt/commentAuthors.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.commentAuthors+xml"/>'
+        (
+            '<Override PartName="/ppt/commentAuthors.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.presentationml.commentAuthors+xml"/>'
+        )
     ]
     for slide_idx in comment_slide_indices:
         overrides.append(
@@ -135,7 +134,7 @@ def generate(output_root: Path, repo_root: Path) -> list[Path]:
     additions: dict[str, bytes] = {"ppt/commentAuthors.xml": _comment_authors_xml()}
     for slide_idx in comment_slide_indices:
         payload = _comments_for_slide(slide_idx)
-        assert payload is not None  # by construction
+        assert payload is not None
         additions[f"ppt/comments/comment{slide_idx + 1}.xml"] = payload
 
     with zipfile.ZipFile(io.BytesIO(base), "r") as zf:

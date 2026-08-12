@@ -201,6 +201,47 @@ impl Validator for StrictValidator {
     }
 }
 
+/// Extractor test double with a caller-chosen priority.
+///
+/// The registry keys extractors by `(MIME type, priority)` and only one extractor can
+/// occupy a slot, so tests that register several extractors for the same MIME type must
+/// give each one a distinct priority to keep them all reachable.
+struct PriorityExtractor {
+    name: String,
+    priority: i32,
+}
+
+impl Plugin for PriorityExtractor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn version(&self) -> String {
+        "1.0.0".to_string()
+    }
+    fn initialize(&self) -> Result<()> {
+        Ok(())
+    }
+    fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DocumentExtractor for PriorityExtractor {
+    async fn extract(&self, input: ExtractInput, _: &ExtractionConfig) -> Result<ExtractedDocument> {
+        Ok(extracted_text_document(
+            "test",
+            input.mime_type.map(Cow::Owned).unwrap_or(Cow::Borrowed("text/plain")),
+        ))
+    }
+    fn supported_mime_types(&self) -> &[&str] {
+        &["text/plain"]
+    }
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+}
+
 #[test]
 fn test_extractor_registration_failure() {
     let mut registry = DocumentExtractorRegistry::new();
@@ -270,10 +311,11 @@ fn test_extractor_concurrent_registration() {
     for i in 0..10 {
         let registry_clone = StdArc::clone(&registry);
         let handle = thread::spawn(move || {
-            let extractor = Arc::new(FailingExtractor {
+            // Distinct priorities so the ten extractors occupy ten distinct
+            // (MIME type, priority) slots instead of colliding on one.
+            let extractor = Arc::new(PriorityExtractor {
                 name: format!("extractor-{}", i),
-                should_fail_init: false,
-                should_fail_extract: false,
+                priority: i,
             });
 
             let mut reg = registry_clone
@@ -297,42 +339,6 @@ fn test_extractor_concurrent_registration() {
 #[test]
 fn test_extractor_priority_ordering_complex() {
     let mut registry = DocumentExtractorRegistry::new();
-
-    struct PriorityExtractor {
-        name: String,
-        priority: i32,
-    }
-
-    impl Plugin for PriorityExtractor {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn version(&self) -> String {
-            "1.0.0".to_string()
-        }
-        fn initialize(&self) -> Result<()> {
-            Ok(())
-        }
-        fn shutdown(&self) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl DocumentExtractor for PriorityExtractor {
-        async fn extract(&self, input: ExtractInput, _: &ExtractionConfig) -> Result<ExtractedDocument> {
-            Ok(extracted_text_document(
-                "test",
-                input.mime_type.map(Cow::Owned).unwrap_or(Cow::Borrowed("text/plain")),
-            ))
-        }
-        fn supported_mime_types(&self) -> &[&str] {
-            &["text/plain"]
-        }
-        fn priority(&self) -> i32 {
-            self.priority
-        }
-    }
 
     for priority in [10, 50, 100, 25, 75] {
         let extractor = Arc::new(PriorityExtractor {
@@ -431,10 +437,11 @@ fn test_extractor_list_after_partial_removal() {
     let mut registry = DocumentExtractorRegistry::new();
 
     for i in 0..5 {
-        let extractor = Arc::new(FailingExtractor {
+        // Distinct priorities so all five stay reachable rather than displacing
+        // one another from a shared (MIME type, priority) slot.
+        let extractor = Arc::new(PriorityExtractor {
             name: format!("extractor-{}", i),
-            should_fail_init: false,
-            should_fail_extract: false,
+            priority: i,
         });
         registry.register(extractor).expect("Operation failed");
     }

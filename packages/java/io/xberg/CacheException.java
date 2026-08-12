@@ -5,15 +5,13 @@ package io.xberg;
  * A cache read or write operation failed.
  */
 public class CacheException extends XbergErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new CacheException with the given message. */
-    public CacheException(final String message) {
-        super(message);
-    }
+  /** Creates a new CacheException with the given message. */
+  public CacheException(final String message) { super(message); }
 
-    /** Creates a new CacheException with the given message and cause. */
-    public CacheException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new CacheException with the given message and cause. */
+  public CacheException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

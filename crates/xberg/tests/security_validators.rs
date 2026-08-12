@@ -122,8 +122,6 @@ fn xml_oversize_attribute_fires_security_error() {
 /// trips `StringGrowthValidator`.
 #[test]
 fn xml_string_growth_fires_security_error() {
-    // 256 text nodes × 30 bytes each = 7680 bytes total content (> 4 KiB cap)
-    // each individual node is 30 bytes (< max_entity_length = 32).
     let mut payload = String::from("<root>");
     for _ in 0..256 {
         payload.push_str("<n>");
@@ -152,8 +150,6 @@ fn xml_string_growth_fires_security_error() {
 /// is one Start + one End event, so 6 000 empties = 12 000 events.
 #[test]
 fn xml_iteration_bomb_fires_security_error() {
-    // Use empty self-closing elements to maximise event count per byte.
-    // Each `<n/>` is 4 bytes and produces exactly one Empty event.
     let mut payload = String::from("<root>");
     for _ in 0..15_000 {
         payload.push_str("<n/>");

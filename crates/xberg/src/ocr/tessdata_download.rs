@@ -28,7 +28,6 @@ use std::path::Path;
 pub(crate) fn download_language_pack(lang: &str, output_dir: &Path) -> Result<(), OcrError> {
     let traineddata_path = output_dir.join(format!("{}.traineddata", lang));
 
-    // Skip if already exists
     if traineddata_path.exists() {
         tracing::debug!(
             "Language pack '{}' already exists at {}",
@@ -49,7 +48,14 @@ pub(crate) fn download_language_pack(lang: &str, output_dir: &Path) -> Result<()
         ),
     ];
 
+    tracing::info!(
+        "Downloading Tesseract language pack '{}' to {} (source: tessdata_fast)",
+        lang,
+        traineddata_path.display()
+    );
+
     for url in &urls {
+        tracing::info!("Fetching language pack '{}' from {}", lang, url);
         match download_file(url, &traineddata_path) {
             Ok(_) => {
                 tracing::info!(
@@ -61,7 +67,6 @@ pub(crate) fn download_language_pack(lang: &str, output_dir: &Path) -> Result<()
             }
             Err(e) => {
                 tracing::warn!("Failed to download from {}: {}", url, e);
-                // Try next URL
                 continue;
             }
         }

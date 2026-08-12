@@ -100,7 +100,6 @@ fn render_context(template: &str, ctx: &BTreeMap<String, String>) -> String {
                 rest = &after_open[close + 2..];
             }
             None => {
-                // Unterminated `{{` — emit verbatim and stop scanning.
                 out.push_str("{{");
                 rest = after_open;
                 break;

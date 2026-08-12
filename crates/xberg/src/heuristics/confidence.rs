@@ -147,7 +147,6 @@ pub fn score_confidence(signals: ConfidenceSignals, weights: ConfidenceWeights) 
                 + schema_score * weights.schema_compliance
         }
         None => {
-            // No OCR ran — fold ocr weight into text_coverage so we still sum to 1.0.
             let merged_text_weight = weights.text_coverage + weights.ocr_aggregate;
             signals.text_coverage * merged_text_weight + schema_score * weights.schema_compliance
         }
@@ -166,10 +165,6 @@ mod tests {
     use crate::types::extraction::ExtractedDocument;
     use crate::types::ocr_elements::{OcrBoundingGeometry, OcrConfidence, OcrElement};
 
-    // -----------------------------------------------------------------------
-    // ConfidenceSignals::from_extraction_result
-    // -----------------------------------------------------------------------
-
     fn make_ocr_element(recognition: f64) -> OcrElement {
         OcrElement {
             text: "word".to_string(),
@@ -184,7 +179,6 @@ mod tests {
 
     #[test]
     fn from_extraction_result_computes_mean_recognition_confidence() {
-        // Three OCR elements with known recognition scores → mean should be (0.7 + 0.8 + 0.9) / 3 = 0.8
         let result = ExtractedDocument {
             ocr_elements: Some(vec![
                 make_ocr_element(0.7),
@@ -240,10 +234,6 @@ mod tests {
         assert!((ocr_agg as f64 - 0.95).abs() < 0.001, "expected ~0.95, got {}", ocr_agg);
     }
 
-    // -----------------------------------------------------------------------
-    // Ported cloud unit tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn default_weights_are_normalized() {
         let w = ConfidenceWeights::default();
@@ -287,7 +277,6 @@ mod tests {
             schema_compliance: SchemaCompliance::AllInvalid,
         };
         let conf = score_confidence(signals, ConfidenceWeights::default());
-        // 0.95*0.30 + 0.95*0.30 + 0.0*0.40 = 0.57
         assert!(
             conf.combined > 0.4 && conf.combined < 0.65,
             "schema_invalid dominates: got {}",
@@ -303,7 +292,6 @@ mod tests {
             schema_compliance: SchemaCompliance::AllValid,
         };
         let conf = score_confidence(signals, ConfidenceWeights::default());
-        // text weight becomes 0.60; combined = 0.8*0.60 + 1.0*0.40 = 0.88
         assert!(
             (conf.combined - 0.88).abs() < 0.01,
             "no OCR: combined should be ~0.88, got {}",
@@ -319,7 +307,6 @@ mod tests {
             schema_compliance: SchemaCompliance::AllValid,
         };
         let conf = score_confidence(signals, ConfidenceWeights::default());
-        // combined = 0.2*0.60 + 1.0*0.40 = 0.52
         assert!(
             (conf.combined - 0.52).abs() < 0.01,
             "low text but valid schema: combined should be ~0.52, got {}",
@@ -330,7 +317,7 @@ mod tests {
     #[test]
     fn confidence_clamps_to_valid_range() {
         let signals = ConfidenceSignals {
-            text_coverage: 1.5, // impossible but let's verify clamping
+            text_coverage: 1.5,
             ocr_aggregate: Some(1.5),
             schema_compliance: SchemaCompliance::AllValid,
         };
@@ -368,13 +355,8 @@ mod tests {
         assert!(conf_partial.combined > conf_none.combined);
     }
 
-    // -----------------------------------------------------------------------
-    // Exact-value scoring tests (hand-computed expected values)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn should_return_zero_combined_when_all_signals_are_zero_with_ocr() {
-        // text=0.0 * 0.30 + ocr=0.0 * 0.30 + schema_invalid=0.0 * 0.40 = 0.0
         let signals = ConfidenceSignals {
             text_coverage: 0.0,
             ocr_aggregate: Some(0.0),
@@ -386,7 +368,6 @@ mod tests {
 
     #[test]
     fn should_return_one_combined_when_all_signals_are_max_with_ocr() {
-        // text=1.0 * 0.30 + ocr=1.0 * 0.30 + schema_valid=1.0 * 0.40 = 1.0
         let signals = ConfidenceSignals {
             text_coverage: 1.0,
             ocr_aggregate: Some(1.0),
@@ -398,27 +379,18 @@ mod tests {
 
     #[test]
     fn should_compute_exact_combined_for_mixed_realistic_signals_with_ocr() {
-        // text=0.6 * 0.30 = 0.18
-        // ocr=0.7 * 0.30  = 0.21
-        // schema=PartialValid(0.5) * 0.40 = 0.20
-        // combined = 0.59
         let signals = ConfidenceSignals {
             text_coverage: 0.6,
             ocr_aggregate: Some(0.7),
             schema_compliance: SchemaCompliance::PartialValid,
         };
         let result = score_confidence(signals, ConfidenceWeights::default());
-        // f32 arithmetic: check within float precision
         let expected: f32 = 0.6 * 0.30 + 0.7 * 0.30 + 0.5 * 0.40;
         assert_eq!(result.combined, expected, "combined should be exactly {expected}");
     }
 
     #[test]
     fn should_compute_exact_combined_for_mixed_signals_without_ocr() {
-        // merged_text_weight = 0.30 + 0.30 = 0.60
-        // text=0.75 * 0.60 = 0.45
-        // schema=AllValid(1.0) * 0.40 = 0.40
-        // combined = 0.85
         let signals = ConfidenceSignals {
             text_coverage: 0.75,
             ocr_aggregate: None,
@@ -431,12 +403,6 @@ mod tests {
 
     #[test]
     fn should_produce_different_combined_when_weights_are_overridden() {
-        // Default weights: text=0.30, ocr=0.30, schema=0.40
-        // Override: text=0.50, ocr=0.10, schema=0.40
-        // signals: text=0.9, ocr=Some(0.2), schema=AllValid(1.0)
-        //
-        // default: 0.9*0.30 + 0.2*0.30 + 1.0*0.40 = 0.27 + 0.06 + 0.40 = 0.73
-        // custom:  0.9*0.50 + 0.2*0.10 + 1.0*0.40 = 0.45 + 0.02 + 0.40 = 0.87
         let signals = ConfidenceSignals {
             text_coverage: 0.9,
             ocr_aggregate: Some(0.2),
@@ -461,16 +427,11 @@ mod tests {
             custom_result.combined, expected_custom,
             "custom weights: expected {expected_custom}"
         );
-        // The two must differ — this confirms weights actually affect the result.
         assert_ne!(
             default_result.combined, custom_result.combined,
             "custom weights must produce a different combined score"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Default weight field values
-    // -----------------------------------------------------------------------
 
     #[test]
     fn should_have_exact_default_weight_fields() {
@@ -503,10 +464,6 @@ mod tests {
         assert!(!w.is_normalized(), "weights summing to 0.3 should not be normalized");
     }
 
-    // -----------------------------------------------------------------------
-    // ExtractionConfidence field pass-through
-    // -----------------------------------------------------------------------
-
     #[test]
     fn should_thread_signal_fields_into_extraction_confidence() {
         let signals = ConfidenceSignals {
@@ -531,13 +488,8 @@ mod tests {
         assert!(result.ocr_aggregate.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // Clamping boundary
-    // -----------------------------------------------------------------------
-
     #[test]
     fn should_clamp_combined_to_zero_when_inputs_are_negative() {
-        // Negative inputs are outside documented range but clamping must hold.
         let signals = ConfidenceSignals {
             text_coverage: -1.0,
             ocr_aggregate: Some(-1.0),
@@ -557,10 +509,6 @@ mod tests {
         let result = score_confidence(signals, ConfidenceWeights::default());
         assert_eq!(result.combined, 1.0, "inputs > 1.0 must clamp to 1.0");
     }
-
-    // -----------------------------------------------------------------------
-    // Serde round-trips
-    // -----------------------------------------------------------------------
 
     #[test]
     fn should_serialize_schema_compliance_variants_with_snake_case_names() {

@@ -108,8 +108,6 @@ mod tests {
     #[tokio::test]
     async fn extract_from_tempfile() {
         let mut svc = ExtractionService::new();
-        // Give the tempfile a `.txt` suffix: plain ASCII has no magic bytes, so
-        // MIME detection relies on the extension for extension-less paths.
         let mut tmp = tempfile::Builder::new()
             .suffix(".txt")
             .tempfile()

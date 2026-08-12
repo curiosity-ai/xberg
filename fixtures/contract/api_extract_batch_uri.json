@@ -1,6 +1,12 @@
 {
 	"id": "api_extract_batch_uri",
 	"description": "Tests batch URI extraction API (extract_batch)",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests batch URI extraction API (extract_batch)",
+		"description": "Tests batch URI extraction API (extract_batch)",
+		"side_effects": "server"
+	},
 	"tags": ["contract", "api", "batch"],
 	"call": "extract_batch",
 	"input": {
@@ -37,9 +43,5 @@
 			"field": "results[0].content",
 			"values": ["May 5, 2023", "Mallori"]
 		}
-	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM cannot access filesystem; use bytes input with file content instead"
-	}
+	]
 }

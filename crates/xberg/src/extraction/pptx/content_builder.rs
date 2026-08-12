@@ -99,7 +99,6 @@ impl ContentBuilder {
 
     pub(super) fn add_text(&mut self, text: &str) {
         if !text.trim().is_empty() {
-            // Ensure a blank-line separator between consecutive text blocks
             if !self.content.is_empty() && !self.content.ends_with("\n\n") {
                 if !self.content.ends_with('\n') {
                     self.content.push('\n');
@@ -136,11 +135,9 @@ impl ContentBuilder {
         self.content.push('\n');
 
         if self.plain {
-            // Plain text: tab-separated cells
             let owned: Vec<Vec<String>> = rows.to_vec();
             self.content.push_str(&crate::extraction::cells_to_text(&owned));
         } else {
-            // Calculate column widths
             let mut col_widths = vec![3usize; num_cols];
             for row in rows {
                 for (i, cell) in row.iter().enumerate() {
@@ -148,21 +145,18 @@ impl ContentBuilder {
                 }
             }
 
-            // Render rows as markdown pipe table
             for (row_idx, row) in rows.iter().enumerate() {
                 self.content.push('|');
                 for (i, cell) in row.iter().enumerate() {
                     let width = col_widths.get(i).copied().unwrap_or(3);
                     self.content.push_str(&format!(" {:width$} |", cell, width = width));
                 }
-                // Pad missing columns
                 for i in row.len()..num_cols {
                     let width = col_widths.get(i).copied().unwrap_or(3);
                     self.content.push_str(&format!(" {:width$} |", "", width = width));
                 }
                 self.content.push('\n');
 
-                // Insert separator after header row (first row)
                 if row_idx == 0 {
                     self.content.push('|');
                     for i in 0..num_cols {
@@ -192,7 +186,6 @@ impl ContentBuilder {
 
     pub(super) fn add_image_with_desc(&mut self, _image_id: &str, description: Option<&str>, target: &str) {
         if !self.plain {
-            // Normalize alt text: replace newlines with spaces for valid markdown
             let alt = description
                 .map(|d| d.replace('\n', " ").replace('\r', ""))
                 .unwrap_or_default();

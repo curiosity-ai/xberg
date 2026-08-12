@@ -1,6 +1,12 @@
 {
 	"id": "config_extraction_timeout",
 	"description": "Tests that extraction_timeout_secs config field is accepted and does not affect fast extractions",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests that extraction_timeout_secs config field is accepted and does not affect fast extractions",
+		"description": "Tests that extraction_timeout_secs config field is accepted and does not affect fast extractions",
+		"side_effects": "server"
+	},
 	"tags": ["contract", "config", "timeout"],
 	"call": "extract",
 	"input": {
@@ -31,10 +37,6 @@
 			"value": 10
 		}
 	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM cannot access filesystem; use bytes input with file content instead"
-	},
 	"config": {
 		"extraction_timeout_secs": 300
 	}

@@ -3,9 +3,9 @@
 //! Produces an `InternalDocument` from per-page `PdfParagraph` data with tables
 //! interleaved at their correct reading-order positions.
 
-use super::lines::needs_space_between;
+use super::lines::{needs_space_between, segments_need_space};
 use super::text_repair::finalize_hyphens;
-use super::types::{LayoutHintClass, PdfParagraph};
+use super::types::{LayoutHintClass, LayoutRegionPath, LayoutRegionTag, PdfParagraph};
 use crate::types::document_structure::{AnnotationKind, ContentLayer, TextAnnotation};
 use crate::types::extraction::BoundingBox;
 use crate::types::internal::{ElementKind, InternalDocument, RelationshipKind, RelationshipTarget};
@@ -19,7 +19,7 @@ pub(crate) fn assemble_internal_document(
     pages: Vec<Vec<PdfParagraph>>,
     tables: &[crate::types::Table],
     images: Option<&[crate::types::ExtractedImage]>,
-    image_positions: &[(u32, u32)], // (page_idx, image_index) for image placeholders
+    image_positions: &[(u32, u32)],
 ) -> InternalDocument {
     tracing::debug!(
         page_count = pages.len(),
@@ -30,14 +30,12 @@ pub(crate) fn assemble_internal_document(
     );
     let mut builder = InternalDocumentBuilder::new("pdf");
 
-    // Group tables by page number (1-indexed → 0-indexed)
     let mut tables_by_page: std::collections::BTreeMap<u32, Vec<&crate::types::Table>> =
         std::collections::BTreeMap::new();
     for table in tables {
         tables_by_page.entry(table.page_number).or_default().push(table);
     }
 
-    // Group image positions by page
     let mut images_by_page: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
     for &(page_idx, image_index) in image_positions {
         images_by_page.entry(page_idx).or_default().push(image_index);
@@ -48,15 +46,12 @@ pub(crate) fn assemble_internal_document(
         let page_num = Some((page_idx + 1) as u32);
         let page_tables = tables_by_page.remove(&((page_idx + 1) as u32));
 
-        // Check whether this page has any content (paragraphs, tables, or images).
         let page_has_content = !paragraphs.is_empty()
             || page_tables
                 .as_ref()
                 .is_some_and(|t| t.iter().any(|tb| !tb.markdown.trim().is_empty()))
             || images_by_page.contains_key(&((page_idx + 1) as u32));
 
-        // Insert page break only between pages that both have content, so that
-        // blank leading/trailing pages do not produce spurious thematic breaks.
         if page_has_content && has_emitted_content {
             builder.push_page_break();
         }
@@ -70,37 +65,31 @@ pub(crate) fn assemble_internal_document(
             );
         }
 
-        if let Some(page_tables) = page_tables {
-            assemble_page_elements_with_tables(&mut builder, paragraphs, &page_tables, page_num);
+        let (paragraph_elem_map, page_end_transition_index) = if let Some(page_tables) = page_tables {
+            assemble_page_elements_with_tables(&mut builder, paragraphs, &page_tables, page_num)
         } else {
-            assemble_page_elements(&mut builder, paragraphs, page_num);
-        }
+            assemble_page_elements(&mut builder, paragraphs, page_num)
+        };
 
         if page_has_content {
             has_emitted_content = true;
         }
 
-        // Inject image placeholders for this page
         if let Some(image_indices) = images_by_page.get(&((page_idx + 1) as u32)) {
-            for &image_index in image_indices {
-                // Determine text content from OCR result if available
-                let ocr_text = images
-                    .and_then(|imgs| imgs.get(image_index as usize))
-                    .and_then(|img| img.ocr_result.as_ref())
-                    .map(|res| res.content.as_str())
-                    .unwrap_or("");
-
-                let elem =
-                    crate::types::internal::InternalElement::text(ElementKind::Image { image_index }, ocr_text, 0)
-                        .with_page((page_idx + 1) as u32);
-                builder.push_element(elem);
-            }
+            interleave_images_into_page(
+                &mut builder,
+                paragraphs,
+                &paragraph_elem_map,
+                page_end_transition_index,
+                image_indices,
+                images,
+                (page_idx + 1) as u32,
+            );
         }
     }
 
-    // Append tables for pages beyond what we have paragraphs for
     for (&page_idx, page_tables) in &tables_by_page {
-        let page_num = Some(page_idx + 1);
+        let page_num = Some(page_idx);
         for &table in page_tables {
             if !table.markdown.trim().is_empty() {
                 let bbox = table.bounding_box.map(|bb| BoundingBox {
@@ -114,7 +103,6 @@ pub(crate) fn assemble_internal_document(
         }
     }
 
-    // Inject image placeholders for page 0 (unknown page)
     if let Some(image_indices) = images_by_page.get(&0) {
         for &image_index in image_indices {
             let elem = crate::types::internal::InternalElement::text(ElementKind::Image { image_index }, "", 0);
@@ -130,17 +118,40 @@ pub(crate) fn assemble_internal_document(
     doc
 }
 
+#[derive(Clone, Copy)]
+struct ParagraphElementPosition {
+    paragraph_index: usize,
+    element_index: u32,
+    transition_index: u32,
+}
+
 /// Push paragraph elements for a page without tables.
-fn assemble_page_elements(builder: &mut InternalDocumentBuilder, paragraphs: &[PdfParagraph], page: Option<u32>) {
+///
+/// Returns the element and structural-transition positions for every non-caption
+/// paragraph in page order, used by [`interleave_images_into_page`].
+fn assemble_page_elements(
+    builder: &mut InternalDocumentBuilder,
+    paragraphs: &[PdfParagraph],
+    page: Option<u32>,
+) -> (Vec<ParagraphElementPosition>, u32) {
     let mut in_list = false;
+    let mut open_regions = Vec::new();
+    let mut paragraph_elem_map = Vec::new();
 
     for (para_idx, para) in paragraphs.iter().enumerate() {
-        // Skip captions — they are emitted after their parent element
         if para.caption_for.is_some() {
             continue;
         }
 
-        // Manage list container markers
+        let transition_index = builder.element_count();
+        transition_layout_path(
+            builder,
+            &mut open_regions,
+            effective_layout_path(para),
+            &mut in_list,
+            page,
+        );
+
         if para.is_list_item && !in_list {
             builder.push_list(list_item_is_ordered(para));
             in_list = true;
@@ -150,24 +161,146 @@ fn assemble_page_elements(builder: &mut InternalDocumentBuilder, paragraphs: &[P
         }
 
         let elem_idx = push_paragraph_element(builder, para, page);
+        paragraph_elem_map.push(ParagraphElementPosition {
+            paragraph_index: para_idx,
+            element_index: elem_idx,
+            transition_index,
+        });
 
-        // Emit captions as relationships
         emit_caption_elements(builder, paragraphs, para_idx, page, elem_idx);
     }
 
-    if in_list {
-        builder.end_list();
+    let page_end_transition_index = builder.element_count();
+    close_list(builder, &mut in_list);
+    close_layout_path(builder, &mut open_regions);
+
+    (paragraph_elem_map, page_end_transition_index)
+}
+
+/// Insert each page image at its correct reading-order position among the page's
+/// already-pushed paragraph elements, so VLM captions and OCR text render inline
+/// instead of trailing the whole page.
+///
+/// For every image with a `bounding_box` on a page that has at least one
+/// positioned paragraph (`block_bbox.is_some()`), the image is inserted before the
+/// first horizontally-overlapping paragraph whose top-y is below the image's top-y.
+/// If no such paragraph exists, vertical order alone is used as a fallback. Images
+/// without a `bounding_box`, or on pages with no positioned paragraphs, retain the
+/// pre-existing append-after-text behavior.
+fn interleave_images_into_page(
+    builder: &mut InternalDocumentBuilder,
+    paragraphs: &[PdfParagraph],
+    paragraph_elem_map: &[ParagraphElementPosition],
+    page_end_transition_index: u32,
+    image_indices: &[u32],
+    images: Option<&[crate::types::ExtractedImage]>,
+    page_number: u32,
+) {
+    let page_has_positioned_paragraph = paragraph_elem_map
+        .iter()
+        .any(|position| paragraphs[position.paragraph_index].block_bbox.is_some());
+
+    let mut positioned: Vec<(u32, usize, u32)> = Vec::new();
+    let mut appended: Vec<u32> = Vec::new();
+
+    for (source_order, &image_index) in image_indices.iter().enumerate() {
+        let image_bbox = images
+            .and_then(|imgs| imgs.get(image_index as usize))
+            .and_then(|img| img.bounding_box);
+
+        let target = image_bbox
+            .filter(|_| page_has_positioned_paragraph)
+            .and_then(|bbox| image_target_element(paragraphs, paragraph_elem_map, page_end_transition_index, bbox));
+
+        match target {
+            Some(elem_idx) => positioned.push((elem_idx, source_order, image_index)),
+            None => appended.push(image_index),
+        }
+    }
+
+    // Insert from the highest target index down so earlier insertions never shift
+    // pending target indices. For an equal target, reverse source order preserves
+    // the original image order despite repeated insert-before operations.
+    positioned.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    for (elem_idx, _, image_index) in positioned {
+        let elem = image_element(images, image_index, page_number);
+        builder.insert_element_before(elem_idx, elem);
+    }
+
+    for image_index in appended {
+        let elem = image_element(images, image_index, page_number);
+        builder.push_element(elem);
     }
 }
 
-/// Push paragraph elements interleaved with tables sorted by vertical position.
+fn image_target_element(
+    paragraphs: &[PdfParagraph],
+    paragraph_elem_map: &[ParagraphElementPosition],
+    page_end_transition_index: u32,
+    image_bbox: crate::types::BoundingBox,
+) -> Option<u32> {
+    let image_top = image_bbox.y1 as f32;
+    let below_image = |para_idx: usize| {
+        paragraphs[para_idx]
+            .block_bbox
+            .is_some_and(|(_, _, _, top)| top < image_top)
+    };
+    let horizontally_overlaps = |para_idx: usize| {
+        paragraphs[para_idx]
+            .block_bbox
+            .is_some_and(|(left, _, right, _)| left < image_bbox.x1 as f32 && right > image_bbox.x0 as f32)
+    };
+
+    if let Some(position) = paragraph_elem_map
+        .iter()
+        .find(|position| horizontally_overlaps(position.paragraph_index) && below_image(position.paragraph_index))
+    {
+        return Some(position.element_index);
+    }
+
+    if let Some(position) = paragraph_elem_map
+        .iter()
+        .rposition(|position| horizontally_overlaps(position.paragraph_index))
+    {
+        return Some(
+            paragraph_elem_map
+                .get(position + 1)
+                .map_or(page_end_transition_index, |next| next.transition_index),
+        );
+    }
+
+    paragraph_elem_map
+        .iter()
+        .find(|position| below_image(position.paragraph_index))
+        .map(|position| position.element_index)
+}
+
+/// Build the `ElementKind::Image` element for an image, carrying its OCR text (if any).
+fn image_element(
+    images: Option<&[crate::types::ExtractedImage]>,
+    image_index: u32,
+    page_number: u32,
+) -> crate::types::internal::InternalElement {
+    let ocr_text = images
+        .and_then(|imgs| imgs.get(image_index as usize))
+        .and_then(|img| img.ocr_result.as_ref())
+        .map(|res| res.content.as_str())
+        .unwrap_or("");
+
+    crate::types::internal::InternalElement::text(ElementKind::Image { image_index }, ocr_text, 0)
+        .with_page(page_number)
+}
+
+/// Push paragraph elements in their established reading order, with tables interleaved.
+///
+/// Returns the element and structural-transition positions for every non-caption
+/// paragraph in page order, used by [`interleave_images_into_page`].
 fn assemble_page_elements_with_tables(
     builder: &mut InternalDocumentBuilder,
     paragraphs: &[PdfParagraph],
     tables: &[&crate::types::Table],
     page: Option<u32>,
-) {
-    // Split tables into positioned (have bounding box) and unpositioned
+) -> (Vec<ParagraphElementPosition>, u32) {
     let mut positioned: Vec<(f32, &crate::types::Table)> = Vec::new();
     let mut unpositioned: Vec<&crate::types::Table> = Vec::new();
 
@@ -177,99 +310,297 @@ fn assemble_page_elements_with_tables(
             continue;
         }
         if let Some(ref bbox) = table.bounding_box {
-            positioned.push((bbox.y1 as f32, *table));
-        } else {
-            unpositioned.push(*table);
+            let top = bbox.y1 as f32;
+            if top.is_finite() {
+                positioned.push((top, *table));
+                continue;
+            }
         }
+        unpositioned.push(*table);
     }
 
-    // Sort positioned tables by y-position descending (top of page first in PDF coords)
     positioned.sort_by(|a, b| b.0.total_cmp(&a.0));
 
-    // Build interleaved elements list
-    enum PageElement<'a> {
-        Paragraph(usize, &'a PdfParagraph),
-        Table(&'a crate::types::Table),
-    }
+    let ordered_paragraphs: Vec<(usize, &PdfParagraph)> = paragraphs
+        .iter()
+        .enumerate()
+        .filter(|(_, para)| para.caption_for.is_none())
+        .collect();
+    let mut tables_at_slot: Vec<Vec<&crate::types::Table>> =
+        (0..=ordered_paragraphs.len()).map(|_| Vec::new()).collect();
 
-    // Index-tagged elements to preserve input order on fallback (category F bug fix).
-    let mut elements: Vec<(usize, f32, PageElement)> = Vec::new();
-    let mut insertion_index = 0usize;
-
-    for (idx, para) in paragraphs.iter().enumerate() {
-        if para.caption_for.is_some() {
-            continue;
-        }
-        let y_pos = para.lines.first().map(|l| l.baseline_y).unwrap_or(0.0);
-        elements.push((insertion_index, y_pos, PageElement::Paragraph(idx, para)));
-        insertion_index += 1;
-    }
-
-    for (y_pos, table) in &positioned {
-        elements.push((insertion_index, *y_pos, PageElement::Table(table)));
-        insertion_index += 1;
-    }
-
-    // Sort by y descending (top of page first in PDF coordinates)
-    elements.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-    // Validate sort consistency: if sorted order is visually inconsistent
-    // (e.g., second region's Y-top > first region's Y-bottom by threshold),
-    // fall back to natural input order to prevent layout reordering (category F).
-    // This avoids scrambling tabular data sequences on OCR-rendered pages.
-    if !is_sort_visually_consistent_with_y_index(&elements) {
-        tracing::debug!("Sort order is visually inconsistent; falling back to natural input order");
-        // Revert to unsorted order (input order) by sorting on insertion index
-        elements.sort_by_key(|e| e.0);
+    for (table_y, table) in positioned {
+        let geometric_slot = table_insertion_slot(&ordered_paragraphs, table, table_y);
+        let slot = top_level_table_slot(&ordered_paragraphs, geometric_slot, table_y);
+        tables_at_slot[slot].push(table);
     }
 
     let mut in_list = false;
+    let mut open_regions = Vec::new();
+    let mut paragraph_elem_map = Vec::new();
 
-    for (_, _, elem) in &elements {
-        match elem {
-            PageElement::Paragraph(para_idx, para) => {
-                // Manage list container markers
-                if para.is_list_item && !in_list {
-                    builder.push_list(list_item_is_ordered(para));
-                    in_list = true;
-                } else if !para.is_list_item && in_list {
-                    builder.end_list();
-                    in_list = false;
-                }
+    for (slot, slot_tables) in tables_at_slot.into_iter().enumerate() {
+        for table in slot_tables {
+            close_list(builder, &mut in_list);
+            close_layout_path(builder, &mut open_regions);
+            push_table_element(builder, table, page);
+        }
 
-                let elem_idx = push_paragraph_element(builder, para, page);
-                emit_caption_elements(builder, paragraphs, *para_idx, page, elem_idx);
-            }
-            PageElement::Table(table) => {
-                if in_list {
-                    builder.end_list();
-                    in_list = false;
-                }
-                let bbox = table.bounding_box.map(|bb| BoundingBox {
-                    x0: bb.x0,
-                    y0: bb.y0,
-                    x1: bb.x1,
-                    y1: bb.y1,
-                });
-                builder.push_table((*table).clone(), page, bbox);
-            }
+        let Some(&(para_idx, para)) = ordered_paragraphs.get(slot) else {
+            continue;
+        };
+
+        let transition_index = builder.element_count();
+        transition_layout_path(
+            builder,
+            &mut open_regions,
+            effective_layout_path(para),
+            &mut in_list,
+            page,
+        );
+
+        if para.is_list_item && !in_list {
+            builder.push_list(list_item_is_ordered(para));
+            in_list = true;
+        } else if !para.is_list_item && in_list {
+            builder.end_list();
+            in_list = false;
+        }
+
+        let elem_idx = push_paragraph_element(builder, para, page);
+        paragraph_elem_map.push(ParagraphElementPosition {
+            paragraph_index: para_idx,
+            element_index: elem_idx,
+            transition_index,
+        });
+        emit_caption_elements(builder, paragraphs, para_idx, page, elem_idx);
+    }
+
+    let page_end_transition_index = builder.element_count();
+    close_list(builder, &mut in_list);
+    close_layout_path(builder, &mut open_regions);
+
+    for table in unpositioned {
+        push_table_element(builder, table, page);
+    }
+
+    (paragraph_elem_map, page_end_transition_index)
+}
+
+fn close_list(builder: &mut InternalDocumentBuilder, in_list: &mut bool) {
+    if *in_list {
+        builder.end_list();
+        *in_list = false;
+    }
+}
+
+fn close_layout_path(builder: &mut InternalDocumentBuilder, open_regions: &mut Vec<LayoutRegionTag>) {
+    for _ in 0..open_regions.len() {
+        builder.push_group_end();
+    }
+    open_regions.clear();
+}
+
+/// List structure already groups adjacent list items. Per-item `ListItem`
+/// detections must not break that list into one-item containers. Remove only
+/// that per-item region while preserving Text and wrapper ancestry, since those
+/// regions distinguish independent lists in separate columns or containers.
+fn effective_layout_path(paragraph: &PdfParagraph) -> Option<LayoutRegionPath> {
+    let path = paragraph.layout_region_path?;
+    if !paragraph.is_list_item {
+        return Some(path);
+    }
+
+    if path.root.class_name == Some(LayoutHintClass::ListItem) {
+        return path.child.map(|root| LayoutRegionPath { root, child: None });
+    }
+    if path
+        .child
+        .is_some_and(|child| child.class_name == Some(LayoutHintClass::ListItem))
+    {
+        return Some(LayoutRegionPath {
+            root: path.root,
+            child: None,
+        });
+    }
+    Some(path)
+}
+
+fn transition_layout_path(
+    builder: &mut InternalDocumentBuilder,
+    open_regions: &mut Vec<LayoutRegionTag>,
+    next_path: Option<LayoutRegionPath>,
+    in_list: &mut bool,
+    page: Option<u32>,
+) {
+    let next_regions = next_path
+        .into_iter()
+        .flat_map(LayoutRegionPath::tags)
+        .collect::<Vec<_>>();
+    let common_prefix = open_regions
+        .iter()
+        .zip(&next_regions)
+        .take_while(|(open, next)| open == next)
+        .count();
+    if common_prefix == open_regions.len() && common_prefix == next_regions.len() {
+        return;
+    }
+
+    close_list(builder, in_list);
+    for _ in common_prefix..open_regions.len() {
+        builder.push_group_end();
+    }
+    open_regions.truncate(common_prefix);
+
+    for region in &next_regions[common_prefix..] {
+        let class_label = region.class_name.map_or("uncovered", LayoutHintClass::label);
+        let label = format!("pdf-layout:p{}:r{}:{class_label}", page.unwrap_or_default(), region.id);
+        builder.push_group_start(Some(&label), page);
+        open_regions.push(*region);
+    }
+}
+
+/// Keep tables as top-level roots in the final page plan.
+///
+/// A geometric insertion point can fall between paragraphs that share one
+/// layout root. Emitting there would duplicate that root around the table. Move
+/// the table to the cheaper edge of the root run so every detected region and
+/// table is emitted exactly once at the top level.
+fn top_level_table_slot(paragraphs: &[(usize, &PdfParagraph)], slot: usize, table_y: f32) -> usize {
+    if slot == 0 || slot >= paragraphs.len() {
+        return slot;
+    }
+    let root_before = effective_layout_path(paragraphs[slot - 1].1).map(|path| path.root);
+    let root_after = effective_layout_path(paragraphs[slot].1).map(|path| path.root);
+    let Some(root) = root_before.filter(|before| Some(*before) == root_after) else {
+        return slot;
+    };
+
+    let mut run_start = slot;
+    while run_start > 0 && effective_layout_path(paragraphs[run_start - 1].1).map(|path| path.root) == Some(root) {
+        run_start -= 1;
+    }
+    let mut run_end = slot;
+    while run_end < paragraphs.len() && effective_layout_path(paragraphs[run_end].1).map(|path| path.root) == Some(root)
+    {
+        run_end += 1;
+    }
+
+    let before_cost = table_slot_displacement(&paragraphs[run_start..slot], table_y);
+    let after_cost = table_slot_displacement(&paragraphs[slot..run_end], table_y);
+    if before_cost <= after_cost { run_start } else { run_end }
+}
+
+fn table_slot_displacement(paragraphs: &[(usize, &PdfParagraph)], table_y: f32) -> f32 {
+    paragraphs
+        .iter()
+        .filter_map(|(_, paragraph)| paragraph_vertical_anchor(paragraph))
+        .map(|paragraph_y| (paragraph_y - table_y).abs())
+        .sum()
+}
+
+/// Pick a reading-order boundary immediately before text below the table.
+///
+/// When every paragraph has horizontal geometry and the table overlaps only a
+/// subset, the subset identifies the table's column. Full-width tables and pages
+/// with incomplete geometry fall back to the complete paragraph sequence. Neither
+/// path changes the established paragraph subsequence.
+fn table_insertion_slot(paragraphs: &[(usize, &PdfParagraph)], table: &crate::types::Table, table_y: f32) -> usize {
+    let fallback = || {
+        vertical_insertion_slot(
+            paragraphs
+                .iter()
+                .enumerate()
+                .map(|(slot, &(_, paragraph))| (slot, paragraph)),
+            table_y,
+            paragraphs.len(),
+        )
+    };
+    let Some(table_bbox) = table.bounding_box else {
+        return fallback();
+    };
+
+    let mut overlapping = Vec::new();
+    let mut has_non_overlapping_paragraph = false;
+    for (slot, &(_, paragraph)) in paragraphs.iter().enumerate() {
+        let Some((left, right)) = paragraph_horizontal_bounds(paragraph) else {
+            return fallback();
+        };
+        if horizontal_ranges_overlap(table_bbox.x0 as f32, table_bbox.x1 as f32, left, right) {
+            overlapping.push((slot, paragraph));
+        } else {
+            has_non_overlapping_paragraph = true;
         }
     }
 
-    if in_list {
-        builder.end_list();
+    if overlapping.is_empty() || !has_non_overlapping_paragraph {
+        return fallback();
     }
 
-    // Append unpositioned tables at end of page
-    for table in &unpositioned {
-        let bbox = table.bounding_box.map(|bb| BoundingBox {
-            x0: bb.x0,
-            y0: bb.y0,
-            x1: bb.x1,
-            y1: bb.y1,
-        });
-        builder.push_table((*table).clone(), page, bbox);
+    let end_slot = overlapping.last().map_or(paragraphs.len(), |(slot, _)| slot + 1);
+    vertical_insertion_slot(
+        overlapping.iter().map(|(slot, paragraph)| (*slot, *paragraph)),
+        table_y,
+        end_slot,
+    )
+}
+
+fn vertical_insertion_slot<'a>(
+    mut paragraphs: impl Iterator<Item = (usize, &'a PdfParagraph)>,
+    table_y: f32,
+    end_slot: usize,
+) -> usize {
+    paragraphs
+        .find_map(|(slot, paragraph)| {
+            paragraph_vertical_anchor(paragraph)
+                .is_some_and(|paragraph_y| paragraph_y < table_y)
+                .then_some(slot)
+        })
+        .unwrap_or(end_slot)
+}
+
+fn paragraph_horizontal_bounds(paragraph: &PdfParagraph) -> Option<(f32, f32)> {
+    if let Some((left, _, right, _)) = paragraph.block_bbox
+        && left.is_finite()
+        && right.is_finite()
+        && right > left
+    {
+        return Some((left, right));
     }
+
+    let mut left = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    for segment in paragraph.lines.iter().flat_map(|line| &line.segments) {
+        left = left.min(segment.x);
+        right = right.max(segment.x + segment.width);
+    }
+    (left.is_finite() && right.is_finite() && right > left).then_some((left, right))
+}
+
+fn horizontal_ranges_overlap(first_left: f32, first_right: f32, second_left: f32, second_right: f32) -> bool {
+    first_left.is_finite()
+        && first_right.is_finite()
+        && first_right > first_left
+        && first_left < second_right
+        && first_right > second_left
+}
+
+fn paragraph_vertical_anchor(paragraph: &PdfParagraph) -> Option<f32> {
+    paragraph
+        .block_bbox
+        .map(|(_, _, _, top)| top)
+        .or_else(|| paragraph.lines.first().map(|line| line.baseline_y))
+        .filter(|anchor| anchor.is_finite())
+}
+
+fn push_table_element(builder: &mut InternalDocumentBuilder, table: &crate::types::Table, page: Option<u32>) -> u32 {
+    let bbox = table.bounding_box.map(|bb| BoundingBox {
+        x0: bb.x0,
+        y0: bb.y0,
+        x1: bb.x1,
+        y1: bb.y1,
+    });
+    builder.push_table(table.clone(), page, bbox)
 }
 
 /// Convert a single PdfParagraph to the appropriate InternalElement and push it.
@@ -282,7 +613,6 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
         y1: bb.3 as f64,
     });
 
-    // Log element classification for debugging.
     tracing::debug!(
         heading = ?para.heading_level,
         list = para.is_list_item,
@@ -296,9 +626,6 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
         "emitting element"
     );
 
-    // Get text: prefer para.text (full-text path) over segment joining.
-    // Hyphen finalization runs post-join: the spaced-hyphen artifact only
-    // exists once separate hyphen text runs are joined with spaces.
     let get_text = |para: &PdfParagraph| -> String {
         let text = if !para.text.is_empty() {
             para.text.clone()
@@ -310,7 +637,11 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
 
     if let Some(level) = para.heading_level {
         let text = get_text(para);
-        return builder.push_heading(level, &text, page, bbox);
+        return if para.layout_region_path.is_some() {
+            builder.push_heading_in_current_container(level, &text, page, bbox)
+        } else {
+            builder.push_heading(level, &text, page, bbox)
+        };
     }
 
     if para.is_code_block {
@@ -335,25 +666,28 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
     }
 
     if para.is_list_item {
-        let text = get_text(para);
-        // Numbered markers ("1." / "3)") make this an ordered list item so the
-        // renderer emits "1." markers instead of degrading to bullets.
         let ordered = list_item_is_ordered(para);
-        let normalized = normalize_list_text(&text);
-        // For full-text path, block-level bold annotation; for structure tree, extract inline annotations
-        let annotations = if !para.text.is_empty() && para.is_bold {
-            vec![TextAnnotation {
-                start: 0,
-                end: normalized.len() as u32,
-                kind: AnnotationKind::Bold,
-            }]
-        } else if para.text.is_empty() {
-            let (_, anns) = extract_text_and_annotations(para);
-            anns
+        let text = get_text(para);
+        let annotations = if para.text.is_empty() {
+            let (annotated_text, annotations) = extract_text_and_annotations(para);
+            if annotated_text == text {
+                annotations
+            } else {
+                Vec::new()
+            }
         } else {
-            vec![]
+            para.is_bold
+                .then_some(TextAnnotation {
+                    start: 0,
+                    end: text.len() as u32,
+                    kind: AnnotationKind::Bold,
+                })
+                .into_iter()
+                .collect()
         };
-        return builder.push_list_item(&normalized, ordered, annotations, page, bbox);
+        let (normalized, removed_prefix_len) = normalize_list_text(&text);
+        let annotations = shift_annotations_after_prefix_removal(annotations, removed_prefix_len, normalized.len());
+        return builder.push_list_item(normalized, ordered, annotations, page, bbox);
     }
 
     if para.is_page_furniture {
@@ -374,9 +708,7 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
         return builder.push_paragraph(&text, annotations, page, bbox);
     }
 
-    // Default: body paragraph
     if !para.text.is_empty() {
-        // Full-text path: text is already correct, add block-level bold if applicable
         let annotations = if para.is_bold {
             vec![TextAnnotation {
                 start: 0,
@@ -388,7 +720,6 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
         };
         builder.push_paragraph(&para.text, annotations, page, bbox)
     } else {
-        // Structure tree path: extract inline annotations from segments
         let (text, annotations) = extract_text_and_annotations(para);
         builder.push_paragraph(&text, annotations, page, bbox)
     }
@@ -454,46 +785,44 @@ fn extract_text_and_annotations(para: &PdfParagraph) -> (String, Vec<TextAnnotat
         let bold = all_segments[i].is_bold;
         let italic = all_segments[i].is_italic;
 
-        // Find run of segments with the same formatting
         let run_start = i;
         while i < all_segments.len() && all_segments[i].is_bold == bold && all_segments[i].is_italic == italic {
             i += 1;
         }
 
-        // Collect words for this run
-        let mut run_words: Vec<&str> = Vec::new();
-        for seg in &all_segments[run_start..i] {
+        let mut run_words: Vec<(&str, usize)> = Vec::new();
+        for (seg_offset, seg) in all_segments[run_start..i].iter().enumerate() {
+            let seg_idx = run_start + seg_offset;
             for word in seg.text.split_whitespace() {
-                run_words.push(word);
+                run_words.push((word, seg_idx));
             }
         }
 
-        // Add space between previous text and this run
         if !text.is_empty() && !run_words.is_empty() {
-            let prev_last = all_segments[run_start - 1]
-                .text
-                .split_whitespace()
-                .next_back()
-                .unwrap_or("");
-            let next_first = all_segments[run_start].text.split_whitespace().next().unwrap_or("");
+            let prev_seg = all_segments[run_start - 1];
+            let next_seg = all_segments[run_start];
+            let prev_last = prev_seg.text.split_whitespace().next_back().unwrap_or("");
+            let next_first = next_seg.text.split_whitespace().next().unwrap_or("");
 
             if should_dehyphenate(prev_last, next_first) {
-                // Remove trailing hyphen
                 text.pop();
-            } else if needs_space_between(prev_last, next_first) {
+            } else if segments_need_space(prev_seg, prev_last, next_seg, next_first) {
                 text.push(' ');
             }
         }
 
         let span_start = text.len();
 
-        // Build run text with CJK-aware joining
-        for (wi, &word) in run_words.iter().enumerate() {
+        for (wi, &(word, seg_idx)) in run_words.iter().enumerate() {
             if wi > 0 {
-                let prev = run_words[wi - 1];
+                let (prev, prev_seg_idx) = run_words[wi - 1];
                 if should_dehyphenate(prev, word) {
-                    text.pop(); // remove '-'
-                } else if needs_space_between(prev, word) {
+                    text.pop();
+                } else if prev_seg_idx == seg_idx {
+                    if needs_space_between(prev, word) {
+                        text.push(' ');
+                    }
+                } else if segments_need_space(all_segments[prev_seg_idx], prev, all_segments[seg_idx], word) {
                     text.push(' ');
                 }
             }
@@ -502,7 +831,6 @@ fn extract_text_and_annotations(para: &PdfParagraph) -> (String, Vec<TextAnnotat
 
         let span_end = text.len();
 
-        // Add annotations for this run
         if span_start < span_end {
             if bold {
                 annotations.push(TextAnnotation {
@@ -530,38 +858,53 @@ fn join_line_texts_plain(lines: &[super::types::PdfLine]) -> String {
         return String::new();
     }
 
-    let words_per_line: Vec<Vec<&str>> = lines
+    let words_per_line: Vec<Vec<(&str, &crate::pdf::hierarchy::SegmentData)>> = lines
         .iter()
-        .map(|l| l.segments.iter().flat_map(|s| s.text.split_whitespace()).collect())
+        .map(|line| {
+            line.segments
+                .iter()
+                .flat_map(|segment| segment.text.split_whitespace().map(move |word| (word, segment)))
+                .collect()
+        })
         .collect();
 
     let mut result = String::new();
     for (line_idx, line_words) in words_per_line.iter().enumerate() {
-        for (word_idx, &word) in line_words.iter().enumerate() {
+        for (word_idx, &(word, seg)) in line_words.iter().enumerate() {
             if result.is_empty() {
                 result.push_str(word);
                 continue;
             }
 
-            let prev_word = if word_idx > 0 {
-                line_words[word_idx - 1]
+            let prev = if word_idx > 0 {
+                Some(line_words[word_idx - 1])
             } else {
                 words_per_line[..line_idx]
                     .iter()
                     .rev()
                     .find_map(|lw| lw.last().copied())
-                    .unwrap_or("")
+            };
+
+            let Some((prev_word, prev_seg)) = prev else {
+                result.push_str(word);
+                continue;
             };
 
             if should_dehyphenate(prev_word, word) {
                 result.pop();
                 result.push_str(word);
-            } else if needs_space_between(prev_word, word) {
-                result.push(' ');
-                result.push_str(word);
-            } else {
-                result.push_str(word);
+                continue;
             }
+
+            let insert_space = if std::ptr::eq(prev_seg, seg) {
+                needs_space_between(prev_word, word)
+            } else {
+                segments_need_space(prev_seg, prev_word, seg, word)
+            };
+            if insert_space {
+                result.push(' ');
+            }
+            result.push_str(word);
         }
     }
     result
@@ -622,141 +965,89 @@ fn list_item_is_ordered(para: &PdfParagraph) -> bool {
             .unwrap_or_default();
         first_line_text.as_str()
     };
-    let t = text.trim_start();
-    let digit_end = t.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(0);
-    digit_end > 0 && matches!(t.as_bytes().get(digit_end), Some(b'.') | Some(b')'))
+    super::list_marker::parse_ordered_list_marker(text).is_some()
 }
 
-/// Normalize list item text: strip bullet/number prefixes and return clean text.
-fn normalize_list_text(text: &str) -> String {
+/// Strip a bullet/number prefix and return the clean suffix plus its byte offset.
+fn normalize_list_text(text: &str) -> (&str, usize) {
+    if let Some(marker) = super::list_marker::parse_ordered_list_marker(text) {
+        let normalized = &text[marker.content_start..];
+        return (normalized, marker.content_start);
+    }
     let trimmed = text.trim_start();
-    const BULLET_CHARS: &[char] = &[
-        '\u{2022}', // • BULLET
-        '\u{00B7}', // · MIDDLE DOT
-    ];
+    const BULLET_CHARS: &[char] = &['\u{2022}', '\u{00B7}'];
+    let mut normalized = trimmed;
     for &ch in BULLET_CHARS {
         if trimmed.starts_with(ch) {
-            return trimmed[ch.len_utf8()..].trim_start().to_string();
+            normalized = trimmed[ch.len_utf8()..].trim_start();
+            return (normalized, text.len() - normalized.len());
         }
     }
     if let Some(stripped) = trimmed.strip_prefix("* ") {
-        return stripped.trim_start().to_string();
+        normalized = stripped.trim_start();
+        return (normalized, text.len() - normalized.len());
     }
     if let Some(stripped) = trimmed.strip_prefix("- ") {
-        return stripped.to_string();
+        normalized = stripped;
+        return (normalized, text.len() - normalized.len());
     }
     const DASH_BULLETS: &[char] = &['–', '—', '−', '‐', '‑', '‒', '―', '➤', '►', '▶', '○', '●', '◦'];
     for &ch in DASH_BULLETS {
         if trimmed.starts_with(ch) {
-            return trimmed[ch.len_utf8()..].trim_start().to_string();
+            normalized = trimmed[ch.len_utf8()..].trim_start();
+            return (normalized, text.len() - normalized.len());
         }
     }
-    // Numbered prefix: strip "1. " or "1) "
     let bytes = trimmed.as_bytes();
     let digit_end = bytes.iter().position(|&b| !b.is_ascii_digit()).unwrap_or(0);
     if digit_end > 0 && digit_end < bytes.len() {
         let suffix = bytes[digit_end];
         if suffix == b'.' || suffix == b')' {
             let after = &trimmed[digit_end + 1..];
-            return after.trim_start().to_string();
+            normalized = after.trim_start();
+            return (normalized, text.len() - normalized.len());
         }
     }
-    trimmed.to_string()
+    (normalized, text.len() - normalized.len())
+}
+
+fn shift_annotations_after_prefix_removal(
+    annotations: Vec<TextAnnotation>,
+    removed_prefix_len: usize,
+    normalized_len: usize,
+) -> Vec<TextAnnotation> {
+    let removed_prefix_len = removed_prefix_len.min(u32::MAX as usize) as u32;
+    let normalized_len = normalized_len.min(u32::MAX as usize) as u32;
+    annotations
+        .into_iter()
+        .filter_map(|mut annotation| {
+            annotation.start = annotation.start.saturating_sub(removed_prefix_len).min(normalized_len);
+            annotation.end = annotation.end.saturating_sub(removed_prefix_len).min(normalized_len);
+            (annotation.start < annotation.end).then_some(annotation)
+        })
+        .collect()
 }
 
 /// Guess whether page furniture is a header or footer based on vertical position.
 fn guess_furniture_layer(para: &PdfParagraph) -> ContentLayer {
-    // Use the layout class hint if available
     match para.layout_class {
         Some(LayoutHintClass::PageHeader) => ContentLayer::Header,
         Some(LayoutHintClass::PageFooter) => ContentLayer::Footer,
         Some(LayoutHintClass::Footnote) => ContentLayer::Footnote,
         _ => {
-            // Heuristic: if baseline_y is high on the page (>700 in PDF coords),
-            // it's likely a header. If low (<100), it's a footer.
             if let Some(first_line) = para.lines.first() {
                 if first_line.baseline_y > 700.0 {
                     ContentLayer::Header
                 } else if first_line.baseline_y < 100.0 {
                     ContentLayer::Footer
                 } else {
-                    ContentLayer::Header // default for furniture
+                    ContentLayer::Header
                 }
             } else {
                 ContentLayer::Header
             }
         }
     }
-}
-
-/// Check if the sorted element order is visually consistent.
-///
-/// Validates that consecutive elements don't have significant vertical overlap
-/// in a way that would indicate reordering (category F: layout reordering).
-/// If sorted order places an element's Y-position far below (or above in PDF coords)
-/// a previous element's position in a way that seems out-of-order, returns false.
-///
-/// This is a heuristic: if Y-positions are within ~50 points of each other,
-/// consider them "visually consistent" (could be columns or wrapped text).
-/// If they diverge significantly, it indicates potential scrambling.
-#[cfg(test)]
-fn is_sort_visually_consistent<T>(elements: &[(f32, T)]) -> bool {
-    if elements.len() <= 1 {
-        return true;
-    }
-
-    // Check for significant jumps in Y position that would indicate reordering.
-    // In PDF coordinates, descending sort means: elements with higher Y come first.
-    // If we have Y = [900, 850, 910], the second jump (850 → 910) is a violation.
-    const REORDER_THRESHOLD: f32 = 50.0; // ~half a typical line height
-
-    for i in 1..elements.len() {
-        let prev_y = elements[i - 1].0;
-        let curr_y = elements[i].0;
-
-        // In descending sort, we expect curr_y <= prev_y (with some tolerance for columns).
-        // A violation is when curr_y > prev_y by more than the threshold.
-        if curr_y > prev_y + REORDER_THRESHOLD {
-            tracing::debug!(
-                prev_y,
-                curr_y,
-                violation_size = curr_y - prev_y,
-                "Sort order violation detected at index {i}: element jumps backward by {:.1} points",
-                curr_y - prev_y
-            );
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Check if sorted elements with insertion-index tagging are visually consistent.
-/// This variant operates on tuples where the Y-position is at index 1.
-fn is_sort_visually_consistent_with_y_index<T>(elements: &[(usize, f32, T)]) -> bool {
-    if elements.len() <= 1 {
-        return true;
-    }
-
-    const REORDER_THRESHOLD: f32 = 50.0; // ~half a typical line height
-
-    for i in 1..elements.len() {
-        let prev_y = elements[i - 1].1;
-        let curr_y = elements[i].1;
-
-        if curr_y > prev_y + REORDER_THRESHOLD {
-            tracing::debug!(
-                prev_y,
-                curr_y,
-                violation_size = curr_y - prev_y,
-                "Sort order violation detected at index {i}: element jumps backward by {:.1} points",
-                curr_y - prev_y
-            );
-            return false;
-        }
-    }
-
-    true
 }
 
 #[cfg(test)]
@@ -778,6 +1069,7 @@ mod tests {
             is_italic: false,
             is_monospace: false,
             baseline_y: 700.0,
+            rotation_degrees: 0.0,
             assigned_role: None,
         }
     }
@@ -809,10 +1101,249 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
         }
+    }
+
+    fn make_paragraph_in_box(text: &str, baseline_y: f32, left: f32, right: f32) -> PdfParagraph {
+        let mut paragraph = make_paragraph_at(text, None, baseline_y);
+        paragraph.block_bbox = Some((left, baseline_y - 12.0, right, baseline_y));
+        paragraph
+    }
+
+    fn make_table_at(markdown: &str, top_y: f64) -> crate::types::Table {
+        make_table_in_box(markdown, 40.0, 560.0, top_y)
+    }
+
+    fn make_table_in_box(markdown: &str, left: f64, right: f64, top_y: f64) -> crate::types::Table {
+        crate::types::Table {
+            cells: vec![],
+            markdown: markdown.to_string(),
+            page_number: 1,
+            bounding_box: Some(crate::types::BoundingBox {
+                x0: left,
+                y0: top_y - 80.0,
+                x1: right,
+                y1: top_y,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn page_element_labels(document: &InternalDocument) -> Vec<&str> {
+        document
+            .elements
+            .iter()
+            .filter_map(|element| match &element.kind {
+                ElementKind::Paragraph => Some(element.text.as_str()),
+                ElementKind::Table { .. } => Some("<table>"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn nested_layout_path() -> LayoutRegionPath {
+        LayoutRegionPath {
+            root: LayoutRegionTag {
+                id: 3,
+                class_name: Some(LayoutHintClass::Form),
+            },
+            child: Some(LayoutRegionTag {
+                id: 7,
+                class_name: Some(LayoutHintClass::Text),
+            }),
+        }
+    }
+
+    #[test]
+    fn layout_paths_emit_balanced_nested_groups() {
+        let mut first = make_paragraph("first", None);
+        first.layout_region_path = Some(nested_layout_path());
+        let mut second = make_paragraph("second", None);
+        second.layout_region_path = Some(nested_layout_path());
+
+        let document = assemble_internal_document(vec![vec![first, second]], &[], None, &[]);
+        let starts = document
+            .elements
+            .iter()
+            .filter(|element| element.kind == ElementKind::GroupStart)
+            .collect::<Vec<_>>();
+        let ends = document
+            .elements
+            .iter()
+            .filter(|element| element.kind == ElementKind::GroupEnd)
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(ends.len(), 2);
+        assert_eq!(starts[0].depth, 0);
+        assert_eq!(starts[1].depth, 1);
+        assert_eq!(page_element_labels(&document), ["first", "second"]);
+    }
+
+    #[test]
+    fn heading_levels_remain_relative_inside_nested_layout_groups() {
+        let paragraphs = [
+            make_paragraph("h1", Some(1)),
+            make_paragraph("h2", Some(2)),
+            make_paragraph("h3", Some(3)),
+        ]
+        .into_iter()
+        .map(|mut paragraph| {
+            paragraph.layout_region_path = Some(nested_layout_path());
+            paragraph
+        })
+        .collect::<Vec<_>>();
+
+        let document = assemble_internal_document(vec![paragraphs], &[], None, &[]);
+        let heading_depths = document
+            .elements
+            .iter()
+            .filter_map(|element| matches!(element.kind, ElementKind::Heading { .. }).then_some(element.depth))
+            .collect::<Vec<_>>();
+        assert_eq!(heading_depths, [2, 3, 4]);
+    }
+
+    #[test]
+    fn adjacent_layout_list_items_share_one_list() {
+        let mut first = make_paragraph("- first", None);
+        first.is_list_item = true;
+        first.layout_region_path = Some(LayoutRegionPath {
+            root: LayoutRegionTag {
+                id: 10,
+                class_name: Some(LayoutHintClass::ListItem),
+            },
+            child: None,
+        });
+        let mut second = make_paragraph("- second", None);
+        second.is_list_item = true;
+        second.layout_region_path = Some(LayoutRegionPath {
+            root: LayoutRegionTag {
+                id: 11,
+                class_name: Some(LayoutHintClass::ListItem),
+            },
+            child: None,
+        });
+
+        let document = assemble_internal_document(vec![vec![first, second]], &[], None, &[]);
+        assert_eq!(
+            document
+                .elements
+                .iter()
+                .filter(|element| matches!(element.kind, ElementKind::ListStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            document
+                .elements
+                .iter()
+                .filter(|element| element.kind == ElementKind::ListEnd)
+                .count(),
+            1
+        );
+        assert_eq!(
+            document
+                .elements
+                .iter()
+                .filter(|element| matches!(element.kind, ElementKind::ListItem { .. }))
+                .count(),
+            2
+        );
+        assert!(
+            document
+                .elements
+                .iter()
+                .all(|element| !matches!(element.kind, ElementKind::GroupStart | ElementKind::GroupEnd))
+        );
+    }
+
+    #[test]
+    fn distinct_text_regions_keep_layout_lists_separate() {
+        let paragraphs = [("- left", 20), ("- right", 21)]
+            .into_iter()
+            .map(|(text, id)| {
+                let mut paragraph = make_paragraph(text, None);
+                paragraph.is_list_item = true;
+                paragraph.layout_region_path = Some(LayoutRegionPath {
+                    root: LayoutRegionTag {
+                        id: 3,
+                        class_name: Some(LayoutHintClass::Form),
+                    },
+                    child: Some(LayoutRegionTag {
+                        id,
+                        class_name: Some(LayoutHintClass::Text),
+                    }),
+                });
+                paragraph
+            })
+            .collect::<Vec<_>>();
+
+        let document = assemble_internal_document(vec![paragraphs], &[], None, &[]);
+        assert_eq!(
+            document
+                .elements
+                .iter()
+                .filter(|element| matches!(element.kind, ElementKind::ListStart { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            document
+                .elements
+                .iter()
+                .filter(|element| element.kind == ElementKind::ListEnd)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn table_is_an_exact_once_root_beside_a_repeated_region_path() {
+        let mut above = make_paragraph_at("above", None, 700.0);
+        above.layout_region_path = Some(nested_layout_path());
+        let mut below = make_paragraph_at("below", None, 400.0);
+        below.layout_region_path = Some(nested_layout_path());
+        let table = make_table_at("| a |\n|---|", 600.0);
+
+        let document = assemble_internal_document(vec![vec![above, below]], &[table], None, &[]);
+        assert_eq!(page_element_labels(&document), ["<table>", "above", "below"]);
+        let table_element = document
+            .elements
+            .iter()
+            .find(|element| matches!(element.kind, ElementKind::Table { .. }))
+            .unwrap();
+        assert_eq!(table_element.depth, 0);
+        assert_eq!(
+            document
+                .elements
+                .iter()
+                .filter(|element| element.kind == ElementKind::GroupStart)
+                .count(),
+            2
+        );
+        assert_eq!(
+            document
+                .elements
+                .iter()
+                .filter(|element| element.kind == ElementKind::GroupEnd)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn no_layout_path_emits_no_group_markers() {
+        let document = assemble_internal_document(vec![vec![make_paragraph("legacy", None)]], &[], None, &[]);
+        assert!(
+            document
+                .elements
+                .iter()
+                .all(|element| !matches!(element.kind, ElementKind::GroupStart | ElementKind::GroupEnd))
+        );
+        assert_eq!(page_element_labels(&document), ["legacy"]);
     }
 
     #[test]
@@ -842,7 +1373,6 @@ mod tests {
             vec![make_paragraph("Page 2", None)],
         ];
         let doc = assemble_internal_document(pages, &[], None, &[]);
-        // Should have page break between pages + 2 paragraphs
         let paragraphs: Vec<_> = doc
             .elements
             .iter()
@@ -861,6 +1391,7 @@ mod tests {
             markdown: "| A | B |\n|---|---|\n| 1 | 2 |".to_string(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         }];
         let doc = assemble_internal_document(pages, &tables, None, &[]);
         assert!(doc.elements.iter().any(|e| e.text == "Before"));
@@ -878,11 +1409,79 @@ mod tests {
             markdown: "| Table |".to_string(),
             page_number: 2,
             bounding_box: None,
+            ..Default::default()
         }];
         let doc = assemble_internal_document(pages, &tables, None, &[]);
         assert!(doc.elements.iter().any(|e| e.text == "Page 1"));
         assert!(doc.elements.iter().any(|e| e.text == "Page 2"));
         assert!(doc.tables.iter().any(|t| t.markdown.contains("| Table |")));
+    }
+
+    #[test]
+    fn test_single_column_table_is_interleaved_by_vertical_position() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Before", 900.0, 40.0, 560.0),
+            make_paragraph_in_box("After", 700.0, 40.0, 560.0),
+        ]];
+        let tables = vec![make_table_in_box("| Between |", 80.0, 520.0, 800.0)];
+
+        let document = assemble_internal_document(pages, &tables, None, &[]);
+
+        assert_eq!(page_element_labels(&document), ["Before", "<table>", "After"]);
+    }
+
+    #[test]
+    fn test_full_width_table_preserves_two_column_paragraph_order() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Left top", 900.0, 40.0, 260.0),
+            make_paragraph_in_box("Left bottom", 700.0, 40.0, 260.0),
+            make_paragraph_in_box("Right top", 880.0, 340.0, 560.0),
+            make_paragraph_in_box("Right bottom", 680.0, 340.0, 560.0),
+        ]];
+        let tables = vec![make_table_at("| Full width |", 800.0)];
+
+        let document = assemble_internal_document(pages, &tables, None, &[]);
+
+        assert_eq!(
+            page_element_labels(&document),
+            ["Left top", "<table>", "Left bottom", "Right top", "Right bottom"]
+        );
+    }
+
+    #[test]
+    fn test_right_column_table_uses_right_column_vertical_boundary() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Left top", 900.0, 40.0, 260.0),
+            make_paragraph_in_box("Left bottom", 700.0, 40.0, 260.0),
+            make_paragraph_in_box("Right top", 880.0, 340.0, 560.0),
+            make_paragraph_in_box("Right bottom", 680.0, 340.0, 560.0),
+        ]];
+        let tables = vec![make_table_in_box("| Right column |", 350.0, 550.0, 800.0)];
+
+        let document = assemble_internal_document(pages, &tables, None, &[]);
+
+        assert_eq!(
+            page_element_labels(&document),
+            ["Left top", "Left bottom", "Right top", "<table>", "Right bottom"]
+        );
+    }
+
+    #[test]
+    fn test_incomplete_paragraph_geometry_uses_conservative_page_boundary() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Left top", 900.0, 40.0, 260.0),
+            make_paragraph_at("Left bottom", None, 700.0),
+            make_paragraph_in_box("Right top", 880.0, 340.0, 560.0),
+            make_paragraph_in_box("Right bottom", 680.0, 340.0, 560.0),
+        ]];
+        let tables = vec![make_table_in_box("| Right column |", 350.0, 550.0, 800.0)];
+
+        let document = assemble_internal_document(pages, &tables, None, &[]);
+
+        assert_eq!(
+            page_element_labels(&document),
+            ["Left top", "<table>", "Left bottom", "Right top", "Right bottom"]
+        );
     }
 
     #[test]
@@ -893,6 +1492,7 @@ mod tests {
             markdown: "| Extra |".to_string(),
             page_number: 5,
             bounding_box: None,
+            ..Default::default()
         }];
         let doc = assemble_internal_document(pages, &tables, None, &[]);
         assert!(doc.elements.iter().any(|e| e.text == "Page 1"));
@@ -904,22 +1504,18 @@ mod tests {
         let pages = vec![vec![make_paragraph("Text", None)]];
         let tables = vec![crate::types::Table {
             cells: vec![],
-            markdown: "   ".to_string(), // Whitespace-only markdown
+            markdown: "   ".to_string(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         }];
         let doc = assemble_internal_document(pages, &tables, None, &[]);
-        // Table with whitespace-only markdown should be skipped
         assert!(doc.tables.is_empty() || doc.tables.iter().all(|t| t.markdown.trim().is_empty()));
     }
 
     #[test]
     fn test_no_page_break_when_leading_page_empty() {
-        // Blank first page, content on second page — no PageBreak should be emitted.
-        let pages = vec![
-            vec![], // empty page 1
-            vec![make_paragraph("Content on page 2", None)],
-        ];
+        let pages = vec![vec![], vec![make_paragraph("Content on page 2", None)]];
         let doc = assemble_internal_document(pages, &[], None, &[]);
         assert!(
             !doc.elements.iter().any(|e| matches!(e.kind, ElementKind::PageBreak)),
@@ -936,11 +1532,7 @@ mod tests {
 
     #[test]
     fn test_no_page_break_when_trailing_page_empty() {
-        // Content on first page, blank second page — no PageBreak should be emitted.
-        let pages = vec![
-            vec![make_paragraph("Content on page 1", None)],
-            vec![], // empty page 2
-        ];
+        let pages = vec![vec![make_paragraph("Content on page 1", None)], vec![]];
         let doc = assemble_internal_document(pages, &[], None, &[]);
         assert!(
             !doc.elements.iter().any(|e| matches!(e.kind, ElementKind::PageBreak)),
@@ -950,7 +1542,6 @@ mod tests {
 
     #[test]
     fn test_page_break_between_content_pages() {
-        // Both pages have content — PageBreak should be inserted between them.
         let pages = vec![
             vec![make_paragraph("Page 1", None)],
             vec![make_paragraph("Page 2", None)],
@@ -964,7 +1555,6 @@ mod tests {
 
     #[test]
     fn test_no_page_break_single_page() {
-        // Single page with content — no PageBreak.
         let pages = vec![vec![make_paragraph("Only page", None)]];
         let doc = assemble_internal_document(pages, &[], None, &[]);
         assert!(
@@ -976,7 +1566,6 @@ mod tests {
     #[test]
     fn test_image_elements_injected_with_positions() {
         let pages = vec![vec![make_paragraph("Page with image", None)]];
-        // Image at page 1 (1-indexed), image_index = 0
         let image_positions = vec![(1u32, 0u32)];
         let doc = assemble_internal_document(pages, &[], None, &image_positions);
 
@@ -1048,22 +1637,318 @@ mod tests {
         assert_eq!(image_count, 0, "no image elements when positions is empty");
     }
 
+    /// Build a minimal `ExtractedImage` with (or without) a bounding box, for
+    /// exercising `interleave_images_into_page` via `assemble_internal_document`.
+    fn make_image_at(
+        image_index: u32,
+        page_number: u32,
+        bounding_box: Option<crate::types::BoundingBox>,
+    ) -> crate::types::ExtractedImage {
+        crate::types::ExtractedImage {
+            data: bytes::Bytes::new(),
+            format: std::borrow::Cow::Borrowed("png"),
+            image_index,
+            page_number: Some(page_number),
+            width: None,
+            height: None,
+            colorspace: None,
+            bits_per_component: None,
+            is_mask: false,
+            description: None,
+            ocr_result: None,
+            bounding_box,
+            source_path: None,
+            cluster_id: None,
+            caption: None,
+            qr_codes: None,
+            image_kind: None,
+            kind_confidence: None,
+            data_base64: None,
+        }
+    }
+
+    /// Element sequence including images, in reading order.
+    fn page_elements_with_images(document: &InternalDocument) -> Vec<&str> {
+        document
+            .elements
+            .iter()
+            .filter_map(|element| match &element.kind {
+                ElementKind::Paragraph => Some(element.text.as_str()),
+                ElementKind::Image { .. } => Some("<image>"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_positioned_image_is_interleaved_between_paragraphs_by_bbox() {
+        // "Top" paragraph sits high on the page (top-y 900), "Bottom" sits low (top-y 300).
+        // The image's top-y (600) falls strictly between them, so it must land between
+        // the two paragraph elements in the assembled sequence, not after both.
+        let pages = vec![vec![
+            make_paragraph_in_box("Top", 900.0, 40.0, 560.0),
+            make_paragraph_in_box("Bottom", 300.0, 40.0, 560.0),
+        ]];
+        let image_bbox = crate::types::BoundingBox {
+            x0: 40.0,
+            y0: 550.0,
+            x1: 560.0,
+            y1: 600.0,
+        };
+        let images = vec![make_image_at(0, 1, Some(image_bbox))];
+        let image_positions = vec![(1u32, 0u32)];
+
+        let document = assemble_internal_document(pages, &[], Some(&images), &image_positions);
+
+        let labels = page_elements_with_images(&document);
+        assert_eq!(
+            labels,
+            vec!["Top", "<image>", "Bottom"],
+            "image must be interleaved strictly between the two paragraphs, got {labels:?}"
+        );
+
+        let top_idx = document
+            .elements
+            .iter()
+            .position(|e| e.text == "Top")
+            .expect("Top paragraph must be present");
+        let image_idx = document
+            .elements
+            .iter()
+            .position(|e| matches!(e.kind, ElementKind::Image { .. }))
+            .expect("image element must be present");
+        let bottom_idx = document
+            .elements
+            .iter()
+            .position(|e| e.text == "Bottom")
+            .expect("Bottom paragraph must be present");
+        assert!(
+            top_idx < image_idx && image_idx < bottom_idx,
+            "image index ({image_idx}) must be strictly between Top ({top_idx}) and Bottom ({bottom_idx})"
+        );
+    }
+
+    #[test]
+    fn test_image_without_bbox_falls_back_to_append_after_text() {
+        // No bounding_box on the image (as when pdf_oxide's capped fast path is used, or on
+        // the pure-heuristic path with no spatial data) must reproduce the pre-existing
+        // append-after-text behavior exactly, and must never panic.
+        let pages = vec![vec![
+            make_paragraph_in_box("Top", 900.0, 40.0, 560.0),
+            make_paragraph_in_box("Bottom", 300.0, 40.0, 560.0),
+        ]];
+        let images = vec![make_image_at(0, 1, None)];
+        let image_positions = vec![(1u32, 0u32)];
+
+        let document = assemble_internal_document(pages, &[], Some(&images), &image_positions);
+
+        let labels = page_elements_with_images(&document);
+        assert_eq!(
+            labels,
+            vec!["Top", "Bottom", "<image>"],
+            "image without a bounding_box must append after all page text, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn test_positioned_image_prefers_paragraph_in_same_column() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Left top", 900.0, 40.0, 280.0),
+            make_paragraph_in_box("Left bottom", 300.0, 40.0, 280.0),
+            make_paragraph_in_box("Right top", 880.0, 320.0, 560.0),
+            make_paragraph_in_box("Right bottom", 280.0, 320.0, 560.0),
+        ]];
+        let image_bbox = crate::types::BoundingBox {
+            x0: 320.0,
+            y0: 550.0,
+            x1: 560.0,
+            y1: 600.0,
+        };
+        let images = vec![make_image_at(0, 1, Some(image_bbox))];
+
+        let document = assemble_internal_document(pages, &[], Some(&images), &[(1, 0)]);
+
+        assert_eq!(
+            page_elements_with_images(&document),
+            vec!["Left top", "Left bottom", "Right top", "<image>", "Right bottom"]
+        );
+    }
+
+    #[test]
+    fn test_positioned_images_preserve_source_order_at_same_target() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Top", 900.0, 40.0, 560.0),
+            make_paragraph_in_box("Bottom", 300.0, 40.0, 560.0),
+        ]];
+        let image_bbox = crate::types::BoundingBox {
+            x0: 40.0,
+            y0: 550.0,
+            x1: 560.0,
+            y1: 600.0,
+        };
+        let images = vec![
+            make_image_at(0, 1, Some(image_bbox)),
+            make_image_at(1, 1, Some(image_bbox)),
+        ];
+
+        let document = assemble_internal_document(pages, &[], Some(&images), &[(1, 0), (1, 1)]);
+        let image_indices: Vec<u32> = document
+            .elements
+            .iter()
+            .filter_map(|element| match element.kind {
+                ElementKind::Image { image_index } => Some(image_index),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(image_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_image_below_left_column_stays_before_next_column() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Left top", 900.0, 40.0, 280.0),
+            make_paragraph_in_box("Left bottom", 500.0, 40.0, 280.0),
+            make_paragraph_in_box("Right top", 880.0, 320.0, 560.0),
+            make_paragraph_in_box("Right bottom", 480.0, 320.0, 560.0),
+        ]];
+        let image_bbox = crate::types::BoundingBox {
+            x0: 40.0,
+            y0: 320.0,
+            x1: 280.0,
+            y1: 380.0,
+        };
+        let images = vec![make_image_at(0, 1, Some(image_bbox))];
+
+        let document = assemble_internal_document(pages, &[], Some(&images), &[(1, 0)]);
+
+        assert_eq!(
+            page_elements_with_images(&document),
+            vec!["Left top", "Left bottom", "<image>", "Right top", "Right bottom"]
+        );
+    }
+
+    #[test]
+    fn test_image_below_right_column_appends_after_that_column() {
+        let pages = vec![vec![
+            make_paragraph_in_box("Left top", 900.0, 40.0, 280.0),
+            make_paragraph_in_box("Left bottom", 500.0, 40.0, 280.0),
+            make_paragraph_in_box("Right top", 880.0, 320.0, 560.0),
+            make_paragraph_in_box("Right bottom", 480.0, 320.0, 560.0),
+        ]];
+        let image_bbox = crate::types::BoundingBox {
+            x0: 320.0,
+            y0: 320.0,
+            x1: 560.0,
+            y1: 380.0,
+        };
+        let images = vec![make_image_at(0, 1, Some(image_bbox))];
+
+        let document = assemble_internal_document(pages, &[], Some(&images), &[(1, 0)]);
+
+        assert_eq!(
+            page_elements_with_images(&document),
+            vec!["Left top", "Left bottom", "Right top", "Right bottom", "<image>"]
+        );
+    }
+
+    #[test]
+    fn test_image_between_layout_columns_stays_outside_next_group() {
+        let column_path = |id| LayoutRegionPath {
+            root: LayoutRegionTag {
+                id,
+                class_name: Some(LayoutHintClass::Text),
+            },
+            child: None,
+        };
+        let mut left_top = make_paragraph_in_box("Left top", 900.0, 40.0, 280.0);
+        left_top.layout_region_path = Some(column_path(1));
+        let mut left_bottom = make_paragraph_in_box("Left bottom", 500.0, 40.0, 280.0);
+        left_bottom.layout_region_path = Some(column_path(1));
+        let mut right_top = make_paragraph_in_box("Right top", 880.0, 320.0, 560.0);
+        right_top.layout_region_path = Some(column_path(2));
+        let mut right_bottom = make_paragraph_in_box("Right bottom", 480.0, 320.0, 560.0);
+        right_bottom.layout_region_path = Some(column_path(2));
+        let pages = vec![vec![left_top, left_bottom, right_top, right_bottom]];
+        let left_image_bbox = crate::types::BoundingBox {
+            x0: 40.0,
+            y0: 320.0,
+            x1: 280.0,
+            y1: 380.0,
+        };
+        let right_image_bbox = crate::types::BoundingBox {
+            x0: 320.0,
+            y0: 320.0,
+            x1: 560.0,
+            y1: 380.0,
+        };
+        let images = vec![
+            make_image_at(0, 1, Some(left_image_bbox)),
+            make_image_at(1, 1, Some(right_image_bbox)),
+        ];
+
+        let document = assemble_internal_document(pages, &[], Some(&images), &[(1, 0), (1, 1)]);
+        let index_of_text = |text: &str| {
+            document
+                .elements
+                .iter()
+                .position(|element| element.text == text)
+                .expect("paragraph must be present")
+        };
+        let image_element_index = |expected_image_index| {
+            document
+                .elements
+                .iter()
+                .position(|element| {
+                    matches!(
+                        element.kind,
+                        ElementKind::Image { image_index } if image_index == expected_image_index
+                    )
+                })
+                .expect("image must be present")
+        };
+        let left_image_index = image_element_index(0);
+        let right_image_index = image_element_index(1);
+        let group_ends = document
+            .elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| (element.kind == ElementKind::GroupEnd).then_some(index))
+            .collect::<Vec<_>>();
+        let group_starts = document
+            .elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| (element.kind == ElementKind::GroupStart).then_some(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(group_starts.len(), 2);
+        assert_eq!(group_ends.len(), 2);
+        assert!(
+            index_of_text("Left bottom") < left_image_index
+                && left_image_index < group_ends[0]
+                && group_ends[0] < group_starts[1]
+                && group_starts[1] < index_of_text("Right top"),
+            "left-column image must remain inside the left group and before the right group: {:?}",
+            document.elements.iter().map(|element| element.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            index_of_text("Right bottom") < right_image_index && right_image_index < group_ends[1],
+            "right-column image must remain inside the final group: {:?}",
+            document.elements.iter().map(|element| element.kind).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_caption_skipped_in_main_flow() {
         let para1 = make_paragraph("Main text", None);
         let mut caption = make_paragraph("Caption text", None);
-        caption.caption_for = Some(0); // Caption for para at index 0
+        caption.caption_for = Some(0);
         let pages = vec![vec![para1, caption]];
         let doc = assemble_internal_document(pages, &[], None, &[]);
-        // Main text paragraph should be present
         assert!(doc.elements.iter().any(|e| e.text == "Main text"));
-        // Caption should be present as a separate element with italic annotation
         assert!(doc.elements.iter().any(|e| e.text == "Caption text"));
     }
-
-    // ========================================================================
-    // W2.A: Inline emphasis (bold/italic) preservation tests
-    // ========================================================================
 
     fn bold_segment(text: &str) -> SegmentData {
         SegmentData {
@@ -1080,9 +1965,106 @@ mod tests {
     }
 
     #[test]
+    fn test_bold_list_annotation_is_shifted_after_unicode_bullet() {
+        let lines = vec![PdfLine {
+            segments: vec![bold_segment("• Bold item")],
+            baseline_y: 700.0,
+            dominant_font_size: 12.0,
+            is_bold: true,
+            is_monospace: false,
+        }];
+        let word_count = PdfParagraph::compute_word_count("", &lines);
+        let paragraph = PdfParagraph {
+            text: String::new(),
+            lines,
+            dominant_font_size: 12.0,
+            heading_level: None,
+            is_bold: true,
+            is_list_item: true,
+            is_code_block: false,
+            is_formula: false,
+            is_page_furniture: false,
+            layout_class: None,
+            layout_region_path: None,
+            caption_for: None,
+            block_bbox: None,
+            word_count,
+        };
+
+        let document = assemble_internal_document(vec![vec![paragraph]], &[], None, &[]);
+        let item = document
+            .elements
+            .iter()
+            .find(|element| matches!(element.kind, ElementKind::ListItem { .. }))
+            .expect("list item should be emitted");
+
+        assert_eq!(item.text, "Bold item");
+        assert!(!item.annotations.is_empty(), "bold annotation should be preserved");
+        for annotation in &item.annotations {
+            let start = annotation.start as usize;
+            let end = annotation.end as usize;
+            assert!(
+                start < end && end <= item.text.len(),
+                "invalid annotation: {annotation:?}"
+            );
+            assert!(item.text.is_char_boundary(start) && item.text.is_char_boundary(end));
+        }
+        let bold = item
+            .annotations
+            .iter()
+            .find(|annotation| matches!(annotation.kind, AnnotationKind::Bold))
+            .expect("bold annotation should be present");
+        assert_eq!(&item.text[bold.start as usize..bold.end as usize], "Bold item");
+    }
+
+    #[test]
+    fn ordered_marker_families_render_without_source_prefixes() {
+        for (source, expected) in [
+            ("a. alpha item", "alpha item"),
+            ("I. Roman item", "Roman item"),
+            ("(1) parenthesized item", "parenthesized item"),
+            ("[1] bracketed item", "bracketed item"),
+        ] {
+            let mut paragraph = make_paragraph(source, None);
+            paragraph.is_list_item = true;
+            let document = assemble_internal_document(vec![vec![paragraph]], &[], None, &[]);
+            let item = document
+                .elements
+                .iter()
+                .find(|element| matches!(element.kind, ElementKind::ListItem { .. }))
+                .expect("list item should be emitted");
+
+            assert_eq!(item.kind, ElementKind::ListItem { ordered: true }, "source: {source}");
+            assert_eq!(item.text, expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn split_ordered_marker_and_body_render_as_one_clean_item() {
+        let lines = vec![PdfLine {
+            segments: vec![plain_segment("I."), plain_segment("Split body")],
+            baseline_y: 700.0,
+            dominant_font_size: 12.0,
+            is_bold: false,
+            is_monospace: false,
+        }];
+        let mut paragraph = make_paragraph("", None);
+        paragraph.lines = lines;
+        paragraph.is_list_item = true;
+
+        let document = assemble_internal_document(vec![vec![paragraph]], &[], None, &[]);
+        let item = document
+            .elements
+            .iter()
+            .find(|element| matches!(element.kind, ElementKind::ListItem { .. }))
+            .expect("list item should be emitted");
+
+        assert_eq!(item.kind, ElementKind::ListItem { ordered: true });
+        assert_eq!(item.text, "Split body");
+    }
+
+    #[test]
     fn test_w2a_inline_bold_and_italic_annotations_preserved() {
-        // Create a paragraph with mixed bold/italic/regular segments.
-        // Expected: annotations should mark bold and italic spans.
         let segments = vec![
             plain_segment("Normal "),
             bold_segment("bold"),
@@ -1102,7 +2084,7 @@ mod tests {
         let lines = vec![line];
         let word_count = PdfParagraph::compute_word_count("", &lines);
         let para = PdfParagraph {
-            text: String::new(), // Use structure tree path (empty text)
+            text: String::new(),
             lines,
             dominant_font_size: 12.0,
             heading_level: None,
@@ -1112,6 +2094,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -1123,7 +2106,6 @@ mod tests {
         let elem = &doc.elements[0];
         assert!(!elem.text.is_empty(), "Paragraph text should be populated");
 
-        // Check that annotations are present for bold and italic
         let has_bold = elem.annotations.iter().any(|a| matches!(a.kind, AnnotationKind::Bold));
         let has_italic = elem
             .annotations
@@ -1144,7 +2126,6 @@ mod tests {
 
     #[test]
     fn test_w2a_consecutive_bold_segments_grouped() {
-        // Multiple consecutive bold segments should produce a single bold annotation covering all of them.
         let segments = vec![bold_segment("This"), bold_segment(" is"), bold_segment(" bold")];
 
         let line = PdfLine {
@@ -1168,6 +2149,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -1176,7 +2158,6 @@ mod tests {
         let doc = assemble_internal_document(vec![vec![para]], &[], None, &[]);
         let elem = &doc.elements[0];
 
-        // Should have bold annotation covering the full text (or most of it)
         let bold_anns: Vec<_> = elem
             .annotations
             .iter()
@@ -1190,7 +2171,6 @@ mod tests {
             elem.annotations
         );
 
-        // The bold annotation should cover a significant portion of the text
         if !bold_anns.is_empty() {
             let bold = bold_anns[0];
             let coverage = (bold.end - bold.start) as usize;
@@ -1203,10 +2183,6 @@ mod tests {
             );
         }
     }
-
-    // ========================================================================
-    // Regression tests for issue #966 — merged H1 must not drop content
-    // ========================================================================
 
     /// Build a heading paragraph that mirrors the production pipeline: both `text`
     /// and `lines` are populated.  `push_paragraph_element` prefers `para.text` when
@@ -1228,6 +2204,7 @@ mod tests {
                     is_italic: false,
                     is_monospace: false,
                     baseline_y: 700.0,
+                    rotation_degrees: 0.0,
                     assigned_role: None,
                 }],
                 baseline_y: 700.0,
@@ -1248,6 +2225,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -1256,9 +2234,6 @@ mod tests {
 
     #[test]
     fn test_merged_h1_text_appears_in_assembled_document() {
-        // Regression for issue #966.  Simulates the state after merge_consecutive_h1s
-        // has run and correctly synced para.text to "KAISUN HOLDINGS LIMITED".
-        // Verifies that push_paragraph_element emits both words — not just the first.
         let merged_para = make_production_h1("KAISUN HOLDINGS LIMITED");
         let pages = vec![vec![merged_para]];
         let doc = assemble_internal_document(pages, &[], None, &[]);
@@ -1284,9 +2259,6 @@ mod tests {
 
     #[test]
     fn test_separate_h1s_each_appear_in_assembled_document() {
-        // Verifies that assemble_internal_document emits one heading element per
-        // received paragraph — it never calls merge_consecutive_h1s, so this
-        // tests assembly non-dropping, not the continuation guard itself.
         let pages = vec![vec![
             make_production_h1("HR 22"),
             make_production_h1("HR 28"),
@@ -1306,144 +2278,5 @@ mod tests {
         assert!(texts.contains(&"HR 28"), "HR 28 missing; headings: {texts:?}");
         assert!(texts.contains(&"HR 28/24"), "HR 28/24 missing; headings: {texts:?}");
         assert!(texts.contains(&"HR 36/30"), "HR 36/30 missing; headings: {texts:?}");
-    }
-
-    #[test]
-    fn test_sort_consistency_detects_reordering() {
-        // Test that sort consistency check detects when Y-positions jump backward
-        // (category F: layout reordering on OCR pages).
-
-        // Enum to mimic PageElement without importing it
-        enum TestElement {
-            A,
-            B,
-            C,
-        }
-
-        // Consistent sort (Y descending): 900, 850, 800 — no violations
-        let consistent: Vec<(f32, TestElement)> = vec![
-            (900.0, TestElement::A),
-            (850.0, TestElement::B),
-            (800.0, TestElement::C),
-        ];
-        assert!(
-            is_sort_visually_consistent(&consistent),
-            "Descending Y-order should be visually consistent"
-        );
-
-        // Inconsistent sort: 900, 750, 810 — violation at index 2 (750 → 810)
-        let inconsistent: Vec<(f32, TestElement)> = vec![
-            (900.0, TestElement::A),
-            (750.0, TestElement::B),
-            (810.0, TestElement::C), // Jump backward > 50 points
-        ];
-        assert!(
-            !is_sort_visually_consistent(&inconsistent),
-            "Y-order with backward jump should be detected as inconsistent"
-        );
-
-        // Edge case: small gaps within threshold are OK (columns)
-        let columns: Vec<(f32, TestElement)> = vec![
-            (900.0, TestElement::A),
-            (880.0, TestElement::B), // 20 points below threshold
-            (870.0, TestElement::C), // 10 points below threshold
-        ];
-        assert!(
-            is_sort_visually_consistent(&columns),
-            "Small gaps within threshold (columns) should be consistent"
-        );
-    }
-
-    #[test]
-    fn test_indexed_sort_fallback_restores_input_order() {
-        // Verify that indexed elements can be sorted by Y descending, and then
-        // restored to input order via insertion index when sort is inconsistent.
-        // This tests the category F bug fix: the fallback must actually restore order.
-
-        enum TestElement {
-            A,
-            B,
-            C,
-        }
-
-        // Create elements in input order with scrambled Y-positions that will
-        // trigger inconsistent sort detection after Y-descending sort.
-        // Example: Y = [100, 800, 300] in input order. After descending sort:
-        // [800, 300, 100]. This produces a violation: 300 < 800, then 100 < 300 is OK,
-        // but we need 300 to jump back past 100 to trigger the check.
-        // Better: Y = [100, 900, 200] → after desc sort [900, 200, 100] → 200 < 900 OK,
-        // 100 < 200 OK. We need the reverse: [100, 900, 950] → after desc sort [950, 900, 100]
-        // → 900 < 950 OK, but then 100 < 900 OK. Let's use 1000, 50, 100 instead.
-        // After desc sort: [1000, 100, 50]. Check: 100 vs 1000 is -900 (OK, descending).
-        // Then 50 vs 100 is -50 (OK). We need an actual jump FORWARD.
-        // Try: [100, 900, 850] → desc sort gives [900, 850, 100] → 850 < 900 OK (20 point drop),
-        // then 100 < 850 OK (-750 is not > +50, it's negative so passes).
-        // We need curr_y > prev_y, which means ascending in PDF coords within descending order.
-        // Try: [1000, 100, 110] → desc sort [1000, 110, 100] → prev=1000, curr=110 (OK, -890),
-        // then prev=110, curr=100 (OK, -10). Still not triggering.
-        // The key: "curr_y > prev_y + REORDER_THRESHOLD" means curr_y jumps UP in PDF coords
-        // after descending sort. Example: [900, 500, 700] → desc [900, 700, 500] → OK.
-        // We need [900, 750, 810] but verify the issue: desc sort [900, 810, 750].
-        // Index 1: prev=900, curr=810 → 810 > 900+50? NO. 810 not > 950. OK.
-        // Index 2: prev=810, curr=750 → 750 > 810+50? NO. Not > 860. OK. This is consistent!
-        // To trigger inconsistency: need curr_y > prev_y + 50 AFTER descending sort.
-        // Example: [100, 900, 400] → desc [900, 400, 100]. Index 1: 400 > 900+50? NO.
-        // Index 2: 100 > 400+50? NO. Still consistent.
-        // We need input that when desc-sorted produces a forward jump > 50.
-        // Example: [900, 100, 950] → desc [950, 900, 100]. Index 1: 900 > 950+50? NO.
-        // Let me think differently: input [50, 950, 900, 100] → desc [950, 900, 100, 50].
-        // Index 1: 900 > 950+50? NO. Index 2: 100 > 900+50? NO. Index 3: 50 > 100+50? NO.
-        // Actually, to get curr_y > prev_y when sorted descending, we'd need elements
-        // to be *out of order* after sorting, which shouldn't happen. The issue is that
-        // the test is checking the POST-SORT order for consistency. Let me re-read the code:
-        // After desc sort on Y, if inconsistent, we sort by input index to restore order.
-        // So the test should create an input, sort it, detect it's inconsistent, then restore.
-        // For the sort to be inconsistent post-Y-sort, we need Y values that when sorted
-        // descending produce a sequence with a big forward jump. That's actually impossible
-        // by definition—descending sort always produces descending values.
-        // Wait: I think the real issue is the input itself has the problem. The function
-        // receives unsorted input, sorts by Y desc, then checks if the result is consistent.
-        // In real-world PDFs, if OCR scrambles Y positions, sorting by Y descending might
-        // produce a wildly inconsistent order that violates the threshold check.
-        // Let me create a real scenario: paragraphs with Y = [700, 100, 650] (scrambled OCR).
-        // After sort by Y desc: [(100, _), (650, _), (700, _)]. Wait, that's ascending.
-        // Sort BY DESCENDING means: sort_by(|a, b| b.cmp(a)), which sorts 700, 650, 100.
-        // After sorting: Y = [700, 650, 100]. Consistency check: 650 > 700+50? NO. 100 > 650+50? NO.
-        // Still consistent. The threshold is 50 points, so we need a jump > 50 in the descending order.
-        // To get a backward jump in descending order, we'd need input like [600, 100, 700].
-        // Desc sort: [700, 600, 100]. Check: 600 > 700+50? NO. 100 > 600+50? NO. Consistent.
-        // The algorithm seems to only trigger on inputs that have a very specific scramble.
-        // Let me check the original test case in the code: (900, 750, 810).
-        // After desc sort: (900, 810, 750). Check: 810 > 900+50? NO. Consistent.
-        // But the original test in the function uses input [900, 750, 810] and expects inconsistent!
-        // Oh wait, that test uses the UNINDEXED version. Let me recheck the real logic.
-        // Re-reading test at line 1270: input is (900, 750, 810) which is ALREADY SORTED (supposed to be desc),
-        // but 750 < 810 is an inconsistency in a descending sequence.
-        // The test directly creates a (f32, T) vec representing post-sort state, not pre-sort.
-        // So my indexed test should do the same: create post-sort state that is inconsistent.
-        let mut elements: Vec<(usize, f32, TestElement)> = vec![
-            (0, 900.0, TestElement::A), // Already-sorted (desc) at input index 0
-            (1, 750.0, TestElement::B), // Already-sorted (desc) at input index 1
-            (2, 810.0, TestElement::C), // Jump FORWARD from 750 to 810: inconsistent at input index 2
-        ];
-
-        // Verify inconsistent (this is the post-sort state, so no sort call needed)
-        assert!(
-            !is_sort_visually_consistent_with_y_index(&elements),
-            "Scrambled Y positions (900, 750, 810) should be detected as inconsistent (750→810 jumps forward)"
-        );
-
-        // Apply fallback: restore to input order (index 0, 1, 2)
-        elements.sort_by_key(|e| e.0);
-
-        // Verify restoration
-        assert_eq!(elements[0].0, 0, "First element should be at insertion index 0");
-        assert_eq!(elements[1].0, 1, "Second element should be at insertion index 1");
-        assert_eq!(elements[2].0, 2, "Third element should be at insertion index 2");
-
-        // Verify that Y-positions are now in input order, not sorted order
-        assert_eq!(elements[0].1, 900.0, "First element in input order should have Y=900");
-        assert_eq!(elements[1].1, 750.0, "Second element in input order should have Y=750");
-        assert_eq!(elements[2].1, 810.0, "Third element in input order should have Y=810");
     }
 }

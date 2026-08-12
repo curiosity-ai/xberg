@@ -12,7 +12,6 @@ use crate::types::{HierarchicalBlock, PageContent, PageHierarchy};
 ///
 /// Only processes ElementKind::Heading elements and ignores other element types.
 pub(crate) fn assign_hierarchy_to_pages(pages: &mut [PageContent], doc: &InternalDocument) {
-    // Group heading/block elements by page number
     let mut page_hierarchies: std::collections::HashMap<u32, Vec<HierarchicalBlock>> = std::collections::HashMap::new();
 
     for element in &doc.elements {
@@ -25,7 +24,7 @@ pub(crate) fn assign_hierarchy_to_pages(pages: &mut [PageContent], doc: &Interna
             ElementKind::Heading { level } => {
                 let block = HierarchicalBlock {
                     text: element.text.clone(),
-                    font_size: 12.0, // Default font size (not available in InternalElement)
+                    font_size: 12.0,
                     level: format!("h{}", level),
                     bbox: element
                         .bbox
@@ -48,7 +47,6 @@ pub(crate) fn assign_hierarchy_to_pages(pages: &mut [PageContent], doc: &Interna
         }
     }
 
-    // Assign hierarchy to each page
     for page in pages.iter_mut() {
         if let Some(blocks) = page_hierarchies.remove(&page.page_number) {
             let block_count = blocks.len() as u32;
@@ -100,7 +98,6 @@ pub(crate) fn assign_tables_and_images_to_pages(
         }
     }
 
-    // Refine is_blank: pages that gained tables or images are not blank
     for page in &mut updated_pages {
         if !page.tables.is_empty() || !page.image_indices.is_empty() {
             page.is_blank = Some(false);

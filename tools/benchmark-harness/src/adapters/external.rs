@@ -1,15 +1,23 @@
-use crate::{adapters::subprocess::SubprocessAdapter, error::Result};
+use crate::{
+    adapters::subprocess::SubprocessAdapter,
+    error::Result,
+    types::{BatchCapability, BatchEntryPoint, BatchTimingScope},
+};
 use std::time::Duration;
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use super::ocr_flag;
 
 /// Maximum per-extraction timeout for persistent adapters (seconds).
 const PERSISTENT_MAX_TIMEOUT_SECS: u64 = 180;
 
-/// Higher timeout for slow ML frameworks (mineru, pymupdf4llm) that load
-/// large models and can take significantly longer on first extractions.
-const SLOW_ML_TIMEOUT_SECS: u64 = 300;
+/// Higher timeout for PyMuPDF4LLM, which can take longer on first extraction.
+const PYMUPDF4LLM_MAX_TIMEOUT_SECS: u64 = 300;
+/// MinerU can spend several minutes loading model weights on CPU-only runners.
+const MINERU_MAX_TIMEOUT_SECS: u64 = 900;
 
 /// Margin between the Python-side and Rust-side timeouts.
 /// The Python script handles timeouts internally (via multiprocessing fork),
@@ -19,6 +27,17 @@ const PYTHON_TIMEOUT_MARGIN_SECS: u64 = 30;
 
 /// Python-side extraction timeout passed via `--timeout=N` CLI arg.
 const PYTHON_EXTRACTION_TIMEOUT_SECS: u64 = PERSISTENT_MAX_TIMEOUT_SECS - PYTHON_TIMEOUT_MARGIN_SECS;
+const MINERU_EXTRACTION_TIMEOUT_SECS: u64 = MINERU_MAX_TIMEOUT_SECS - PYTHON_TIMEOUT_MARGIN_SECS;
+const _: () = assert!(MINERU_EXTRACTION_TIMEOUT_SECS + PYTHON_TIMEOUT_MARGIN_SECS == MINERU_MAX_TIMEOUT_SECS);
+const _: () = assert!(MINERU_MAX_TIMEOUT_SECS > PYMUPDF4LLM_MAX_TIMEOUT_SECS);
+const LITEPARSE_BINARY: &str = "lit";
+const LITEPARSE_VERSION_PREFIX: &str = "lit ";
+const LITEPARSE_REQUIRED_BATCH_OPTIONS: [&str; 3] = ["--format", "--no-ocr", "--num-workers"];
+const MINERU_BATCH_CAPABILITY: BatchCapability = BatchCapability {
+    entry_point: BatchEntryPoint::MineruDoParse,
+    timing_scope: BatchTimingScope::ColdEndToEndSubprocess,
+    per_item_timing: false,
+};
 
 /// Helper function to define supported file types for each framework
 ///
@@ -27,111 +46,72 @@ const PYTHON_EXTRACTION_TIMEOUT_SECS: u64 = PERSISTENT_MAX_TIMEOUT_SECS - PYTHON
 /// Format lists are based on comprehensive research of each framework's actual capabilities.
 fn get_supported_formats(framework_name: &str) -> Vec<String> {
     match framework_name {
-        // LiteParse (run-llama/liteparse): PDF-only Rust CLI (`lit parse`).
-        // Supports both plaintext and markdown output formats.
         "liteparse" => vec!["pdf".to_string()],
 
-        // PyMuPDF4LLM: PDF + formats via PyMuPDF/fitz
-        // See: https://pymupdf.readthedocs.io/en/latest/how-to-open-a-file.html
-        // Note: many non-PDF formats return empty content — tracked as EmptyContent errors
         "pymupdf4llm" => vec![
-            // Documents
-            "pdf",  // E-books
-            "epub", // Vector/text
-            "svg", "txt", // Images (for OCR) - gif and webp NOT supported by PyMuPDF
-            "png", "jpg", "jpeg", "bmp", "tiff", "tif",
+            "pdf", "epub", "fb2", "svg", "txt", "png", "jpg", "jpeg", "bmp", "tiff", "tif",
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect(),
 
-        // Docling: 15+ format types, 38+ extensions
-        // See: https://docling-project.github.io/docling/usage/supported_formats/
         "docling" => vec![
-            // Office documents
-            "pdf", "docx", "pptx", "xlsx", // Web/markup
-            "html", "htm", "md", "markdown", "asciidoc", // Data formats
-            "csv",      // Scientific/publishing
-            "jats",     // Subtitles
-            "vtt",      // Images (converted to PDF internally for layout analysis)
-            "png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp",
+            "pdf", "docx", "pptx", "xlsx", "html", "htm", "md", "markdown", "asciidoc", "csv", "jats", "vtt", "png",
+            "jpg", "jpeg", "tiff", "tif", "bmp", "webp",
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect(),
 
-        // Tika: 1500+ formats for detection, extensive text extraction
-        // See: https://tika.apache.org/ and tika-mimetypes.xml
         "tika" => vec![
-            // Office documents (Microsoft)
-            "pdf", "docx", "doc", "pptx", "ppt", "ppsx", "pptm", "xlsx", "xls", "xlsm", "xlsb",
-            // Office documents (OpenDocument)
-            "odt", "ods", // Other documents
-            "rtf", "epub", // Web/markup
-            "html", "htm", "xml", "svg", "md", "txt", // Data formats
-            "csv", "tsv", "json", "yaml", "yml", "toml", // Email
-            "eml", "msg", // Scientific/technical (typst not supported - too new)
-            "tex", "latex", "bib", "rst", "org", "ipynb", // Images (metadata + OCR)
-            "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp", "jp2", // Archives
-            "zip", "tar", "gz", "7z",
+            "pdf", "docx", "doc", "pptx", "ppt", "ppsx", "pptm", "xlsx", "xls", "xlsm", "xlsb", "odt", "ods", "rtf",
+            "epub", "html", "htm", "xml", "svg", "md", "txt", "csv", "tsv", "json", "yaml", "yml", "toml", "eml",
+            "msg", "tex", "latex", "bib", "rst", "org", "ipynb", "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif",
+            "webp", "jp2", "zip", "tar", "gz", "7z", "wpd", "wp",
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect(),
 
-        // MarkItDown: 25+ formats with optional dependencies
-        // See: https://github.com/microsoft/markitdown
-        // Note: MarkItDown OUTPUTS markdown, so md/txt are not conversion inputs
         "markitdown" => vec![
-            // Office documents
-            "pdf", "docx", "pptx", "xlsx", "xls", // Web/markup (md, txt not valid - outputs markdown)
-            "html", "htm", "xml", // Data formats
-            "csv", "json", // E-books & notebooks
-            "epub", "ipynb", // Email
-            "msg",   // Images (with Azure Document Intelligence)
-            "png", "jpg", "jpeg", "bmp", "tiff", "tif", // Archives
-            "zip",
+            "pdf", "docx", "pptx", "xlsx", "xls", "html", "htm", "xml", "md", "markdown", "txt", "csv", "json", "epub",
+            "ipynb", "msg", "png", "jpg", "jpeg", "bmp", "tiff", "tif", "zip",
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect(),
 
-        // Unstructured: 31+ partitionable formats
-        // See: https://docs.unstructured.io/ui/supported-file-types
         "unstructured" => vec![
-            // Office documents (Microsoft)
-            "pdf", "docx", "doc", "pptx", "ppt", "xlsx", "xls", // Office documents (OpenDocument)
-            "odt", // Other documents
-            "rtf", "epub", // Web/markup
-            "html", "htm", "xml", "md", "rst", "org", "txt",
-            // Data formats (json NOT supported for partitioning)
-            "csv", "tsv", // Email
-            "eml", "msg", // Images (requires hi_res strategy)
-            "png", "jpg", "jpeg", "tiff", "tif", "bmp",
+            "pdf", "docx", "doc", "pptx", "ppt", "xlsx", "xls", "odt", "rtf", "epub", "html", "htm", "xml", "md",
+            "rst", "org", "txt", "csv", "tsv", "eml", "msg", "png", "jpg", "jpeg", "tiff", "tif", "bmp",
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect(),
 
-        // MinerU: PDF and PNG/JPG images ONLY
-        // See: https://github.com/opendatalab/MinerU - cli/common.py defines actual formats
-        "mineru" => vec![
-            // Documents
-            "pdf", // Images (only png, jpg confirmed in source)
-            "png", "jpg",
-        ]
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect(),
+        "mineru" => vec!["pdf", "png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect(),
 
-        // Default: common document formats for unknown frameworks
         _ => vec![
-            "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "txt", "md", "html", "xml", "json",
+            "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "txt", "md", "html", "xml", "json", "wpd", "wp",
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect(),
     }
+}
+
+/// Declared format support for a competitor framework, exposed for capability-aware aggregation.
+///
+/// This is the same authoritative capability table the runner uses to route fixtures
+/// ([`get_supported_formats`]); the aggregation layer consults it to mark a (framework, format)
+/// pair as structurally unsupported rather than merely absent or failed. xberg is the subject
+/// under test and supports the full corpus, so callers treat it as universal instead of calling
+/// this (its name has no arm here and would fall through to the generic default).
+pub(crate) fn declared_supported_formats(framework_name: &str) -> Vec<String> {
+    get_supported_formats(framework_name)
 }
 
 /// Creates a subprocess adapter for Docling.
@@ -143,16 +123,31 @@ pub fn create_docling_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter> {
     args.push(script_path.to_string_lossy().to_string());
     args.push(format!("--timeout={}", PYTHON_EXTRACTION_TIMEOUT_SECS));
     args.push(ocr_flag(ocr_enabled));
-    args.push("sync".to_string());
+    let mut single_file_args = args.clone();
+    single_file_args.push("sync".to_string());
+    args.push("batch".to_string());
 
     let supported_formats = get_supported_formats("docling");
-    Ok(
-        SubprocessAdapter::new("docling", command, args, vec![], supported_formats)
-            // docling_extract.py honors `--format=`; pass the requested format so
-            // plaintext vs markdown is real, not the script's default (markdown).
-            .with_format_aware(true)
-            .with_max_timeout(Duration::from_secs(PERSISTENT_MAX_TIMEOUT_SECS)),
+    Ok(SubprocessAdapter::with_batch_capability(
+        "docling",
+        command,
+        args,
+        vec![],
+        supported_formats,
+        BatchCapability {
+            entry_point: BatchEntryPoint::DoclingJobkit,
+            timing_scope: BatchTimingScope::ColdEndToEndSubprocess,
+            per_item_timing: false,
+        },
     )
+    .with_configured_ocr(ocr_enabled)
+    .with_format_aware(true)
+    .with_single_file_args(single_file_args)
+    // Docling maps the forwarded Tesseract codes to EasyOCR (kor->ko, jpn->ja); the ~keep
+    // ko/ja EasyOCR weights are prefetched and cached in the docling job.
+    .with_ocr_language_arg("--ocr-lang")
+    .with_ocr_language_policy(crate::adapter::declared_ocr_language_policy("docling"))
+    .with_max_timeout(Duration::from_secs(PERSISTENT_MAX_TIMEOUT_SECS)))
 }
 
 /// Creates a subprocess adapter for Unstructured.
@@ -169,9 +164,12 @@ pub fn create_unstructured_adapter(ocr_enabled: bool) -> Result<SubprocessAdapte
     let supported_formats = get_supported_formats("unstructured");
     Ok(
         SubprocessAdapter::new("unstructured", command, args, vec![], supported_formats)
-            // unstructured_extract.py honors `--format=`; pass it for real
-            // plaintext vs markdown parity instead of the script default.
+            .with_configured_ocr(ocr_enabled)
             .with_format_aware(true)
+            .with_supported_output_formats(vec![crate::types::OutputFormat::Plaintext])
+            // unstructured's partition(languages=[...]) forwards Tesseract codes directly; ~keep
+            // so forward the fixture's OCR language instead of its hardcoded ["eng"].
+            .with_ocr_language_arg("--ocr-lang")
             .with_max_timeout(Duration::from_secs(PERSISTENT_MAX_TIMEOUT_SECS)),
     )
 }
@@ -188,6 +186,7 @@ pub fn create_markitdown_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter>
     let supported_formats = get_supported_formats("markitdown");
     Ok(
         SubprocessAdapter::new("markitdown", command, args, vec![], supported_formats)
+            .with_configured_ocr(ocr_enabled)
             .with_max_timeout(Duration::from_secs(PERSISTENT_MAX_TIMEOUT_SECS)),
     )
 }
@@ -201,9 +200,10 @@ pub fn create_markitdown_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter>
 /// - Batch mode: `lit batch-parse <input_dir> <output_dir> --format text|markdown`
 /// - Both plaintext and markdown output formats
 pub fn create_liteparse_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter> {
-    which::which("lit").map_err(|_| {
+    let liteparse_command = which::which(LITEPARSE_BINARY).map_err(|_| {
         crate::Error::Config("lit (liteparse) not found. Install with: cargo install liteparse".to_string())
     })?;
+    verify_liteparse_cli(&liteparse_command)?;
 
     let script_path = get_script_path("liteparse_extract.sh")?;
     let command = PathBuf::from("bash");
@@ -211,18 +211,73 @@ pub fn create_liteparse_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter> 
     args.push(ocr_flag(ocr_enabled));
 
     let supported_formats = get_supported_formats("liteparse");
-    Ok(
-        SubprocessAdapter::with_batch_support("liteparse", command, args, vec![], supported_formats)
-            .with_max_timeout(Duration::from_secs(PERSISTENT_MAX_TIMEOUT_SECS))
-            .with_format_aware(true)
-            .with_native_batch(true),
+    Ok(SubprocessAdapter::with_batch_capability(
+        "liteparse",
+        command,
+        args,
+        vec![],
+        supported_formats,
+        BatchCapability {
+            entry_point: BatchEntryPoint::LiteparseBatchParse,
+            timing_scope: BatchTimingScope::ColdEndToEndSubprocess,
+            per_item_timing: false,
+        },
     )
+    .with_configured_ocr(ocr_enabled)
+    .with_max_timeout(Duration::from_secs(PERSISTENT_MAX_TIMEOUT_SECS))
+    .with_native_batch_command(liteparse_command)
+    .with_format_aware(true))
+}
+
+fn verify_liteparse_cli(command: &Path) -> Result<()> {
+    let version = std::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .map_err(|error| crate::Error::Config(format!("failed to run '{} --version': {error}", command.display())))?;
+    let version_text = String::from_utf8_lossy(&version.stdout);
+    let valid_version = version.status.success()
+        && version_text
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim().starts_with(LITEPARSE_VERSION_PREFIX));
+    if !valid_version {
+        return Err(crate::Error::Config(format!(
+            "'{}' is not the LiteParse CLI: expected a successful 'lit <version>' identity probe",
+            command.display()
+        )));
+    }
+
+    let batch_help = std::process::Command::new(command)
+        .args(["batch-parse", "--help"])
+        .output()
+        .map_err(|error| {
+            crate::Error::Config(format!(
+                "failed to probe LiteParse native batch capability at '{}': {error}",
+                command.display()
+            ))
+        })?;
+    let help_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&batch_help.stdout),
+        String::from_utf8_lossy(&batch_help.stderr)
+    );
+    if !batch_help.status.success()
+        || LITEPARSE_REQUIRED_BATCH_OPTIONS
+            .iter()
+            .any(|required| !help_text.contains(required))
+    {
+        return Err(crate::Error::Config(format!(
+            "LiteParse CLI '{}' does not expose the required native batch-parse interface",
+            command.display()
+        )));
+    }
+
+    Ok(())
 }
 
 /// Helper function to get the path to a wrapper script
 /// Handles both development (source tree) and CI (downloaded artifact) environments
 fn get_script_path(script_name: &str) -> Result<PathBuf> {
-    // Priority 1: Check if CARGO_MANIFEST_DIR is set (development build)
     if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
         let script_path = PathBuf::from(manifest_dir).join("scripts").join(script_name);
         if script_path.exists() {
@@ -230,21 +285,14 @@ fn get_script_path(script_name: &str) -> Result<PathBuf> {
         }
     }
 
-    // Priority 2: Check relative to current working directory (development)
     let script_path = PathBuf::from("tools/benchmark-harness/scripts").join(script_name);
     if script_path.exists() {
         return Ok(script_path);
     }
 
-    // Priority 3: Check relative to the running binary's parent directory (CI artifact)
-    // When the harness is downloaded as an artifact in CI, it's placed in target/release/
-    // but the scripts are still in the checkout at tools/benchmark-harness/scripts/
-    // Try to find the source tree by going up from the binary location
     if let Ok(exe_path) = std::env::current_exe()
         && let Some(exe_dir) = exe_path.parent()
     {
-        // exe_dir is typically target/release, go up to find the root
-        // Try: exe_dir/../../scripts/ (relative to target/release/)
         let script_path = exe_dir
             .join("..")
             .join("..")
@@ -257,7 +305,6 @@ fn get_script_path(script_name: &str) -> Result<PathBuf> {
         }
     }
 
-    // Priority 4: Check via BENCHMARK_HARNESS_SCRIPTS_DIR environment variable (CI override)
     if let Ok(scripts_dir) = env::var("BENCHMARK_HARNESS_SCRIPTS_DIR") {
         let script_path = PathBuf::from(scripts_dir).join(script_name);
         if script_path.exists() {
@@ -273,37 +320,109 @@ fn get_script_path(script_name: &str) -> Result<PathBuf> {
     )))
 }
 
-/// Helper function to find Python interpreter with a specific open source extraction framework installed
-///
-/// Returns (command, args) where command is the executable and args are the base arguments
-fn find_python_with_framework(framework: &str) -> Result<(PathBuf, Vec<String>)> {
-    if which::which("uv").is_ok() {
-        // Use `uv run <script>` which runs the script with the project's
-        // Python environment (.venv). Framework dependencies are installed
-        // via pyproject.toml dependency groups (bench-*).
-        return Ok((PathBuf::from("uv"), vec!["run".to_string()]));
+/// Environment override for the Python interpreter used by external benchmarks.
+const BENCH_PYTHON_ENV: &str = "XBERG_BENCH_PYTHON";
+
+fn python_imports_framework(python: &PathBuf, framework: &str) -> bool {
+    std::process::Command::new(python)
+        .arg("-c")
+        .arg(format!("import {framework}"))
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn direct_python_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(virtual_env) = env::var_os("VIRTUAL_ENV") {
+        let virtual_env = PathBuf::from(virtual_env);
+        candidates.push(virtual_env.join("bin/python"));
+        candidates.push(virtual_env.join("Scripts/python.exe"));
+    }
+    candidates.push(PathBuf::from(".venv/bin/python"));
+    candidates.push(PathBuf::from(".venv/Scripts/python.exe"));
+    for executable in ["python3", "python"] {
+        if let Ok(path) = which::which(executable) {
+            candidates.push(path);
+        }
+    }
+    candidates
+}
+
+fn resolve_uv_python(framework: &str) -> Result<Option<PathBuf>> {
+    let Ok(uv) = which::which("uv") else {
+        return Ok(None);
+    };
+    let dependency_group = format!("bench-{framework}");
+    let probe_script = format!("import {framework}, sys; print(sys.executable)");
+    let probe = std::process::Command::new(uv)
+        .args([
+            "run",
+            "--locked",
+            "--no-sync",
+            "--group",
+            &dependency_group,
+            "python",
+            "-c",
+            &probe_script,
+        ])
+        .output()
+        .map_err(|error| crate::error::Error::Config(format!("failed to run uv probe for {framework}: {error}")))?;
+    if !probe.status.success() {
+        return Err(crate::error::Error::Config(format!(
+            "uv environment cannot import {framework}: {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        )));
     }
 
-    let python_candidates = vec!["python3", "python"];
+    let python = String::from_utf8(probe.stdout).map_err(|error| {
+        crate::error::Error::Config(format!(
+            "uv returned a non-UTF-8 interpreter path for {framework}: {error}"
+        ))
+    })?;
+    let Some(interpreter) = python.lines().last().map(str::trim).filter(|line| !line.is_empty()) else {
+        return Err(crate::error::Error::Config(format!(
+            "uv returned no interpreter path for {framework}"
+        )));
+    };
+    let path = PathBuf::from(interpreter);
+    if !path.is_file() || !python_imports_framework(&path, framework) {
+        return Err(crate::error::Error::Config(format!(
+            "uv resolved {} but it cannot import {framework}",
+            path.display()
+        )));
+    }
+    Ok(Some(path))
+}
 
-    for candidate in python_candidates {
-        if let Ok(python_path) = which::which(candidate) {
-            let check = std::process::Command::new(&python_path)
-                .arg("-c")
-                .arg(format!("import {}", framework))
-                .output();
+/// Helper function to find Python interpreter with a specific open source extraction framework installed.
+///
+/// Returns a direct interpreter path so per-document timings never include `uv`
+/// dependency resolution, project synchronization, or editable-wheel builds.
+fn find_python_with_framework(framework: &str) -> Result<(PathBuf, Vec<String>)> {
+    if let Some(path) = env::var_os(BENCH_PYTHON_ENV) {
+        let python = PathBuf::from(path);
+        if python_imports_framework(&python, framework) {
+            return Ok((python, Vec::new()));
+        }
+        return Err(crate::error::Error::Config(format!(
+            "{BENCH_PYTHON_ENV}={} cannot import {framework}",
+            python.display()
+        )));
+    }
 
-            if let Ok(output) = check
-                && output.status.success()
-            {
-                return Ok((python_path, vec![]));
-            }
+    for python in direct_python_candidates() {
+        if python_imports_framework(&python, framework) {
+            return Ok((python, Vec::new()));
         }
     }
 
+    if let Some(python) = resolve_uv_python(framework)? {
+        return Ok((python, Vec::new()));
+    }
+
     Err(crate::error::Error::Config(format!(
-        "No Python interpreter found with {} installed. Install with: pip install {}",
-        framework, framework
+        "No Python interpreter can import {framework}. Run `uv sync --locked --group \
+         bench-{framework}` or set {BENCH_PYTHON_ENV} to a prepared interpreter"
     )))
 }
 
@@ -360,7 +479,6 @@ fn get_tika_jar_path() -> Result<PathBuf> {
 fn ensure_tika_extract_compiled(java_path: &PathBuf, tika_jar_path: &PathBuf) -> Result<PathBuf> {
     let script_path = get_script_path("TikaExtract.java")?;
 
-    // Create a temp directory for compiled classes if it doesn't exist
     let compile_dir = PathBuf::from("target").join("tika-extract-classes");
     std::fs::create_dir_all(&compile_dir)
         .map_err(|e| crate::Error::Config(format!("Failed to create compile directory: {}", e)))?;
@@ -371,7 +489,6 @@ fn ensure_tika_extract_compiled(java_path: &PathBuf, tika_jar_path: &PathBuf) ->
         .join("benchmark")
         .join("TikaExtract.class");
 
-    // Only compile if the class file doesn't exist
     if !class_path.exists() {
         let output = std::process::Command::new(java_path)
             .arg("-version")
@@ -411,8 +528,6 @@ pub fn create_tika_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter> {
     let command = find_java()?;
     let compile_dir = ensure_tika_extract_compiled(&command, &jar_path)?;
 
-    // Build classpath: compiled classes directory + tika-app JAR
-    // Use the platform-appropriate Java classpath separator (: on Unix, ; on Windows)
     #[cfg(target_os = "windows")]
     let classpath = format!("{};{}", compile_dir.display(), jar_path.display());
     #[cfg(not(target_os = "windows"))]
@@ -432,6 +547,11 @@ pub fn create_tika_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter> {
 
     let supported_formats = get_supported_formats("tika");
     Ok(SubprocessAdapter::new("tika", command, args, vec![], supported_formats)
+        .with_configured_ocr(ocr_enabled)
+        .with_supported_output_formats(vec![crate::types::OutputFormat::Plaintext])
+        // Tika's TesseractOCRConfig.setLanguage takes Tesseract codes directly,
+        // so forward the fixture's OCR language instead of its hardcoded "eng".
+        .with_ocr_language_arg("--ocr-lang")
         .with_max_timeout(Duration::from_secs(180)))
 }
 
@@ -447,34 +567,134 @@ pub fn create_pymupdf4llm_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter
     let supported_formats = get_supported_formats("pymupdf4llm");
     Ok(
         SubprocessAdapter::new("pymupdf4llm", command, args, vec![], supported_formats)
-            .with_max_timeout(Duration::from_secs(SLOW_ML_TIMEOUT_SECS)),
+            .with_configured_ocr(ocr_enabled)
+            .with_max_timeout(Duration::from_secs(PYMUPDF4LLM_MAX_TIMEOUT_SECS)),
     )
 }
 
-/// Creates a subprocess adapter for MinerU (persistent server mode)
+/// Creates a subprocess adapter for MinerU 3.4.4.
 ///
-/// Uses wrapper script approach for extraction.
+/// Batch mode invokes `mineru.cli.common.do_parse` once, which delegates to
+/// `doc_analyze_streaming` for cross-document model batching.
 pub fn create_mineru_adapter(ocr_enabled: bool) -> Result<SubprocessAdapter> {
     let script_path = get_script_path("mineru_extract.py")?;
     let (command, mut args) = find_python_with_framework("mineru")?;
     args.push(script_path.to_string_lossy().to_string());
-    args.push(format!("--timeout={}", PYTHON_EXTRACTION_TIMEOUT_SECS));
+    args.push(format!("--timeout={}", MINERU_EXTRACTION_TIMEOUT_SECS));
     args.push(ocr_flag(ocr_enabled));
-    args.push("sync".to_string());
+    let mut single_file_args = args.clone();
+    single_file_args.push("sync".to_string());
+    args.push("batch".to_string());
 
     let supported_formats = get_supported_formats("mineru");
-    Ok(
-        SubprocessAdapter::new("mineru", command, args, vec![], supported_formats)
-            // mineru_extract.py honors `--format=`; pass it for real plaintext vs
-            // markdown parity instead of the script default.
-            .with_format_aware(true)
-            .with_max_timeout(Duration::from_secs(SLOW_ML_TIMEOUT_SECS)),
+    Ok(SubprocessAdapter::with_batch_capability(
+        "mineru",
+        command,
+        args,
+        vec![],
+        supported_formats,
+        MINERU_BATCH_CAPABILITY,
     )
+    .with_configured_ocr(ocr_enabled)
+    .with_format_aware(true)
+    .with_single_file_args(single_file_args)
+    // MinerU maps the forwarded Tesseract codes to its PaddleOCR model (kor->korean, ~keep
+    // jpn->japan); the Korean/Japanese weights are prefetched in the model-cache job.
+    .with_ocr_language_arg("--ocr-lang")
+    .with_ocr_language_policy(crate::adapter::declared_ocr_language_policy("mineru"))
+    .with_max_timeout(Duration::from_secs(MINERU_MAX_TIMEOUT_SECS)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::FrameworkAdapter;
+
+    #[cfg(unix)]
+    fn fake_liteparse(script_body: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let command = temp.path().join("lit");
+        std::fs::write(&command, format!("#!/bin/sh\n{script_body}\n")).expect("write fake LiteParse CLI");
+        let mut permissions = std::fs::metadata(&command).expect("fake CLI metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&command, permissions).expect("make fake CLI executable");
+        (temp, command)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn liteparse_probe_requires_identity_and_native_batch_options() {
+        let (_temp, command) = fake_liteparse(
+            r#"
+if [ "$1" = "--version" ]; then
+  echo "lit 2.8.0"
+  exit 0
+fi
+if [ "$1" = "batch-parse" ] && [ "$2" = "--help" ]; then
+  echo "--format --no-ocr --num-workers"
+  exit 0
+fi
+exit 2
+"#,
+        );
+
+        assert!(verify_liteparse_cli(&command).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn liteparse_probe_rejects_version_only_cli() {
+        let (_temp, command) = fake_liteparse(
+            r#"
+if [ "$1" = "--version" ]; then
+  echo "lit 2.8.0"
+  exit 0
+fi
+exit 2
+"#,
+        );
+
+        let error = verify_liteparse_cli(&command).expect_err("batch capability must be verified");
+        assert!(error.to_string().contains("native batch-parse interface"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn liteparse_probe_rejects_unrelated_lit_binary() {
+        let (_temp, command) = fake_liteparse(
+            r#"
+if [ "$1" = "--version" ]; then
+  echo "literal-tool 1.0.0"
+  exit 0
+fi
+exit 2
+"#,
+        );
+
+        let error = verify_liteparse_cli(&command).expect_err("identity must be verified");
+        assert!(error.to_string().contains("not the LiteParse CLI"));
+    }
+
+    #[test]
+    fn docling_batch_wrapper_conformance_runs_with_cargo_tests() {
+        let python = std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into());
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("test_docling_extract.py");
+        let output = std::process::Command::new(python)
+            .arg(script)
+            .output()
+            .expect("Python is required to validate the Docling benchmark wrapper");
+
+        assert!(
+            output.status.success(),
+            "Docling wrapper conformance failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn test_get_script_path() {
@@ -484,12 +704,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_adapter_creation() {
-        let _ = create_docling_adapter(true);
-        let _ = create_unstructured_adapter(true);
+        if let Ok(docling) = create_docling_adapter(true) {
+            assert_eq!(
+                docling.batch_capability(),
+                Some(BatchCapability {
+                    entry_point: BatchEntryPoint::DoclingJobkit,
+                    timing_scope: BatchTimingScope::ColdEndToEndSubprocess,
+                    per_item_timing: false,
+                })
+            );
+        }
+        if let Ok(mineru) = create_mineru_adapter(true) {
+            assert_eq!(mineru.batch_capability(), Some(MINERU_BATCH_CAPABILITY));
+        }
+        if let Ok(unstructured) = create_unstructured_adapter(true) {
+            assert_eq!(
+                unstructured.supported_output_formats(),
+                vec![crate::types::OutputFormat::Plaintext]
+            );
+        }
         let _ = create_markitdown_adapter(true);
         let _ = create_tika_adapter(true);
         let _ = create_pymupdf4llm_adapter(true);
-        let _ = create_mineru_adapter(true);
         let _ = create_liteparse_adapter(true);
+    }
+
+    #[test]
+    fn python_resolver_returns_direct_importing_interpreter() {
+        let (python, args) = find_python_with_framework("sys").expect("Python must import sys");
+        assert_ne!(python.file_name().and_then(|name| name.to_str()), Some("uv"));
+        assert!(args.is_empty());
+        assert!(python_imports_framework(&python, "sys"));
+    }
+
+    #[test]
+    fn python_resolver_rejects_missing_framework() {
+        let result = find_python_with_framework("xberg_benchmark_missing_framework");
+        assert!(result.is_err());
     }
 }

@@ -14,18 +14,22 @@ pub struct ExtractionResult {
     #[schemars(description = "Extraction results in discovery order")]
     pub results: Vec<serde_json::Value>,
     /// Non-fatal per-input errors.
+    #[serde(default)]
     #[schemars(description = "Non-fatal per-input errors")]
     pub errors: Vec<serde_json::Value>,
     /// Aggregate extraction counts.
     #[schemars(description = "Aggregate extraction counts")]
     pub summary: ExtractionSummaryOutput,
     /// Final URLs reached after redirects during URL ingestion.
+    #[serde(default)]
     #[schemars(description = "Final URLs reached after redirects during URL ingestion")]
     pub crawl_final_urls: Vec<String>,
     /// Total redirects followed while fetching or crawling URLs.
+    #[serde(default)]
     #[schemars(description = "Total redirects followed while fetching or crawling URLs")]
     pub crawl_redirect_count: usize,
     /// Unique normalized URLs discovered by crawls.
+    #[serde(default)]
     #[schemars(description = "Unique normalized URLs discovered by crawls")]
     pub crawl_unique_normalized_urls: Vec<String>,
 }
@@ -86,6 +90,67 @@ pub struct CacheStatsOutput {
     /// Available disk space in megabytes.
     #[schemars(description = "Available disk space in megabytes")]
     pub available_space_mb: f64,
+}
+
+/// Structured output for cache clearing.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CacheClearOutput {
+    /// Absolute path to the cache directory that was cleared.
+    #[schemars(description = "Absolute path to the cache directory that was cleared")]
+    pub directory: String,
+    /// Number of files removed.
+    #[schemars(description = "Number of files removed")]
+    pub removed_files: u64,
+    /// Disk space freed in megabytes.
+    #[schemars(description = "Disk space freed in megabytes")]
+    pub freed_mb: f64,
+}
+
+/// Structured output for model cache warming.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CacheWarmOutput {
+    /// Absolute path to the Xberg-managed cache directory.
+    #[schemars(description = "Absolute path to the Xberg-managed cache directory")]
+    pub cache_dir: String,
+    /// Labels of models confirmed available after this call.
+    #[schemars(description = "Labels of models confirmed available after this call")]
+    pub available: Vec<String>,
+    /// Labels of models confirmed to have been newly downloaded during this call.
+    ///
+    /// Some model managers expose only an idempotent warm operation, not whether it
+    /// performed network I/O. Those models appear in `available` but not here.
+    #[schemars(description = "Labels of models confirmed newly downloaded during this call")]
+    pub downloaded: Vec<String>,
+    /// Labels of models confirmed to have already been present in the cache.
+    ///
+    /// Some model managers cannot distinguish a cache hit from a download. Those
+    /// models appear in `available` but not here.
+    #[schemars(description = "Labels of models confirmed already present in the cache")]
+    pub already_cached: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::ExtractionResult;
+
+    #[test]
+    fn should_not_require_optional_extraction_fields_in_output_schema() {
+        let schema = rmcp::handler::server::common::schema_for_output::<ExtractionResult>();
+
+        let required: BTreeSet<String> = schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .expect("schema must declare a top-level `required` array")
+            .iter()
+            .map(|entry| entry.as_str().expect("required entries must be strings").to_string())
+            .collect();
+
+        let expected: BTreeSet<String> = ["results", "summary"].into_iter().map(String::from).collect();
+
+        assert_eq!(required, expected);
+    }
 }
 
 /// Structured output for the model manifest.

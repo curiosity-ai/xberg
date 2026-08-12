@@ -23,8 +23,8 @@
   <a href="https://github.com/xberg-io/xberg/tree/main/packages/go">
     <img src="https://img.shields.io/github/v/tag/xberg-io/xberg?label=Go&color=007ec6&filter=v1*" alt="Go">
   </a>
-  <a href="https://www.nuget.org/packages/Xberg/">
-    <img src="https://img.shields.io/nuget/v/Xberg?label=C%23&color=007ec6" alt="C#">
+  <a href="https://www.nuget.org/packages/XbergIo.Xberg/">
+    <img src="https://img.shields.io/nuget/v/XbergIo.Xberg?label=C%23&color=007ec6" alt="C#">
   </a>
   <a href="https://packagist.org/packages/xberg-io/xberg">
     <img src="https://img.shields.io/packagist/v/xberg-io/xberg?label=PHP&color=007ec6" alt="PHP">
@@ -53,6 +53,9 @@
   <a href="https://github.com/xberg-io/xberg/pkgs/container/xberg">
     <img src="https://img.shields.io/badge/Docker-ghcr.io-007ec6?logo=docker&logoColor=white" alt="Docker">
   </a>
+  <a href="https://docs.xberg.io/guides/kubernetes/">
+    <img src="https://img.shields.io/badge/Helm-chart-007ec6?logo=helm&logoColor=white" alt="Helm chart">
+  </a>
   <!-- Project Info -->
   <a href="https://github.com/xberg-io/xberg/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-007ec6" alt="License">
@@ -77,7 +80,7 @@
   </a>
 </div>
 
-Extract text, tables, images, metadata, and code intelligence from 96 file formats and 306 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Java bindings with type-safe API, Foreign Function & Memory API integration, and native performance.
+Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Java bindings with type-safe API, Foreign Function & Memory API integration, and native performance.
 
 ## What This Package Provides
 
@@ -97,20 +100,20 @@ Add to your `pom.xml`:
 <dependency>
     <groupId>io.xberg</groupId>
     <artifactId>xberg</artifactId>
-    <version>1.0.0-rc.9</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
 Kotlin DSL (`build.gradle.kts`):
 
 ```kotlin
-implementation("io.xberg:xberg:1.0.0-rc.9")
+implementation("io.xberg:xberg:1.1.0")
 ```
 
 Groovy DSL (`build.gradle`):
 
 ```groovy
-implementation 'io.xberg:xberg:1.0.0-rc.9'
+implementation 'io.xberg:xberg:1.1.0'
 ```
 
 ### System Requirements
@@ -262,23 +265,23 @@ System.out.println(output.results().get(0).content());
 ### Next Steps
 
 - **[Installation Guide](https://docs.xberg.io/getting-started/installation/)** - Platform-specific setup
-- **[API Documentation](https://docs.xberg.io/reference/api-python/)** - Complete API reference
+- **[API Documentation](https://docs.xberg.io/reference/api-java/)** - Complete API reference
 - **[Examples & Guides](https://docs.xberg.io/)** - Full code examples and usage guides
 - **[Configuration Guide](https://docs.xberg.io/guides/configuration/)** - Advanced configuration options
 
 ## Features
 
-### Supported File Formats (96)
+### Supported File Formats (100 formats · 120 file extensions)
 
-96 file formats across 8 major categories with intelligent format detection and comprehensive metadata extraction.
+100 formats across 120 file extensions in 8 major categories with intelligent format detection and comprehensive metadata extraction.
 
 #### Office Documents
 
 | Category | Formats | Capabilities |
 |----------|---------|--------------|
-| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages` | Full text, tables, images, metadata, styles |
+| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages`, `.wpd`, `.wp`, `.wp5`, `.wp6` | Full text, tables, images, metadata, styles |
 | **Spreadsheets** | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xla`, `.xlam`, `.xltm`, `.xltx`, `.xlt`, `.ods`, `.numbers` | Sheet data, formulas, cell metadata, charts |
-| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.key` | Slides, speaker notes, images, metadata |
+| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.odp`, `.key` | Slides, speaker notes, images, metadata |
 | **PDF** | `.pdf` | Text, tables, images, metadata, OCR support |
 | **eBooks** | `.epub`, `.fb2` | Chapters, metadata, embedded resources |
 | **Database** | `.dbf` | Table data extraction, field type support |
@@ -313,7 +316,7 @@ System.out.println(output.results().get(0).content());
 | Category | Formats | Features |
 |----------|---------|----------|
 | **Email** | `.eml`, `.msg`, `.pst` | Headers, body (HTML/plain), attachments, threading |
-| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | File listing, nested archives, metadata |
+| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | Recursive extraction of nested archives, file listing, metadata, zip-bomb protection |
 
 #### Academic & Scientific
 
@@ -324,7 +327,7 @@ System.out.println(output.results().get(0).content());
 | **Publishing** | `.fb2`, `.docbook`, `.dbk`, `.docbook4`, `.docbook5`, `.opml` | FictionBook, DocBook XML, OPML outlines |
 | **Documentation** | MIME-only POD, mdoc, troff | Technical documentation formats |
 
-#### Code Intelligence (306 Languages)
+#### Code Intelligence (371 Languages)
 
 | Feature | Description |
 |---------|-------------|
@@ -353,9 +356,9 @@ Powered by [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-l
 - **Batch Processing** - Efficiently process multiple documents in parallel
 - **Memory Efficient** - Stream large files without loading entirely into memory
 - **Language Detection** - Detect and support multiple languages in documents
-- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [306 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
+- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [371 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
 - **Configuration** - Fine-grained control over extraction behavior
-- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured JSON with OCR metadata
+- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured (same text as Plain with a `structured` metadata label)
 
 ## OCR Support
 
@@ -364,6 +367,8 @@ Xberg supports multiple OCR backends for extracting text from scanned documents 
 - **Tesseract**
 
 - **Paddleocr**
+
+- **Sceptre**
 
 ### OCR Configuration Example
 
@@ -475,7 +480,7 @@ For advanced configuration options including language detection, table extractio
 ## Documentation
 
 - **[Official Documentation](https://docs.xberg.io/)**
-- **[API Reference](https://docs.xberg.io/reference/api-python/)**
+- **[API Reference](https://docs.xberg.io/reference/api-java/)**
 - **[Examples & Guides](https://docs.xberg.io/)**
 
 ## Contributing
@@ -486,7 +491,7 @@ Contributions are welcome! See [Contributing Guide](https://github.com/xberg-io/
 
 - [crawlberg](https://github.com/xberg-io/crawlberg) — web crawling and scraping with HTML→Markdown and headless-Chrome fallback.
 - [html-to-markdown](https://github.com/xberg-io/html-to-markdown) — fast, lossless HTML→Markdown engine.
-- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 143 providers.
+- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 165 providers.
 - [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-language-pack) — tree-sitter grammars and code-intelligence primitives.
 - [alef](https://github.com/xberg-io/alef) — the polyglot binding generator that produces this README and all per-language bindings.
 - [Discord](https://discord.gg/xt9WY3GnKR) — community, roadmap, announcements.

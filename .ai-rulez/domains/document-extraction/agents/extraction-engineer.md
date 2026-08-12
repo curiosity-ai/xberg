@@ -1,7 +1,7 @@
 ---
 name: extraction-engineer
 description: Document extraction pipeline development and maintenance
-model: haiku
+model: sonnet
 ---
 
 When working on document extraction code:

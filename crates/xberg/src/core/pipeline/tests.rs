@@ -180,6 +180,7 @@ async fn test_pipeline_preserves_tables() {
         markdown: "| A | B |".to_string(),
         page_number: 0,
         bounding_box: None,
+        ..Default::default()
     };
 
     let mut doc = make_doc("test", "text/plain");
@@ -254,7 +255,6 @@ async fn test_pipeline_with_keyword_extraction() {
         .shutdown_all()
         .unwrap();
 
-    // Register keyword processor directly (bypasses Lazy which only runs once per process)
     let _ = crate::keywords::register_keyword_processor();
     clear_processor_cache().unwrap();
 
@@ -711,7 +711,6 @@ async fn test_multiple_postprocessors_run_before_validator() {
         registry.register(Arc::new(OrderValidator)).unwrap();
     }
 
-    // Clear the cache after registering new processors so it rebuilds with the test processors
     clear_processor_cache().unwrap();
 
     let doc = make_doc("test", "text/plain");
@@ -805,6 +804,288 @@ async fn test_middle_postprocessors_run_after_explicit_chunking() {
 
 #[tokio::test]
 #[serial]
+#[cfg(all(feature = "captioning", feature = "redaction", feature = "chunking"))]
+async fn captioning_prepass_keeps_redaction_and_chunks_consistent() {
+    use crate::core::config::{CaptioningConfig, LlmConfig, RedactionConfig};
+    use crate::plugins::{Plugin, PostProcessor, ProcessingStage};
+    use crate::types::ExtractedImage;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    const ORIGINAL_PII: &str = "alice@example.com";
+    const CAPTION_PREFIX: &str = "Photo owned by";
+
+    struct StubCaptioningProcessor;
+
+    impl Plugin for StubCaptioningProcessor {
+        fn name(&self) -> &str {
+            CAPTIONING_PROCESSOR_NAME
+        }
+
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+
+        fn initialize(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PostProcessor for StubCaptioningProcessor {
+        async fn process(&self, result: &mut ExtractedDocument, _config: &ExtractionConfig) -> Result<()> {
+            for image in result.images.iter_mut().flatten() {
+                let caption = format!("{CAPTION_PREFIX} {ORIGINAL_PII}");
+                image.description = Some(caption.clone());
+                image.caption = Some(caption);
+            }
+            result.processing_warnings.push(crate::types::ProcessingWarning {
+                source: Cow::Borrowed("captioning"),
+                message: Cow::Borrowed("synthetic caption warning"),
+            });
+            result.llm_usage.get_or_insert_default().push(crate::types::LlmUsage {
+                model: "synthetic-caption-model".to_string(),
+                source: "captioning".to_string(),
+                ..Default::default()
+            });
+            Ok(())
+        }
+
+        fn processing_stage(&self) -> ProcessingStage {
+            ProcessingStage::Middle
+        }
+
+        fn priority(&self) -> i32 {
+            50
+        }
+    }
+
+    initialize_features();
+    crate::plugins::processor::builtin::redaction::register().unwrap();
+    let registry = crate::plugins::registry::get_post_processor_registry();
+    registry.write().register(Arc::new(StubCaptioningProcessor)).unwrap();
+    clear_processor_cache().unwrap();
+
+    let mut doc = make_doc(&format!("Contact {ORIGINAL_PII}."), "application/pdf");
+    doc.processing_warnings.push(crate::types::ProcessingWarning {
+        source: Cow::Borrowed("extraction"),
+        message: Cow::Borrowed("synthetic extraction warning"),
+    });
+    doc.llm_usage = Some(vec![crate::types::LlmUsage {
+        model: "synthetic-extraction-model".to_string(),
+        source: "extraction".to_string(),
+        ..Default::default()
+    }]);
+    let image_index = doc.push_image(ExtractedImage {
+        data: Bytes::from_static(b"synthetic image"),
+        format: Cow::Borrowed("png"),
+        image_index: 0,
+        width: Some(100),
+        height: Some(100),
+        ..Default::default()
+    });
+    doc.push_element(InternalElement::text(ElementKind::Image { image_index }, "", 0));
+
+    let config = ExtractionConfig {
+        captioning: Some(CaptioningConfig {
+            llm: LlmConfig::default(),
+            prompt: None,
+            min_image_area: 1,
+        }),
+        redaction: Some(RedactionConfig::default()),
+        chunking: Some(crate::ChunkingConfig {
+            max_characters: 500,
+            overlap: 0,
+            ..Default::default()
+        }),
+        output_format: OutputFormat::Markdown,
+        ..Default::default()
+    };
+
+    let processed = run_pipeline(doc, &config).await;
+
+    crate::plugins::processor::builtin::captioning::register().unwrap();
+    clear_processor_cache().unwrap();
+
+    let processed = processed.unwrap();
+    assert!(
+        processed.content.contains(CAPTION_PREFIX),
+        "redacted output must retain the generated caption: {}",
+        processed.content
+    );
+    assert!(
+        !processed.content.contains(ORIGINAL_PII),
+        "redacted output must not restore original PII: {}",
+        processed.content
+    );
+    if let Some(formatted_content) = processed.formatted_content.as_deref() {
+        assert!(
+            formatted_content.contains(CAPTION_PREFIX),
+            "formatted output must retain the generated caption: {formatted_content}"
+        );
+        assert!(
+            !formatted_content.contains(ORIGINAL_PII),
+            "formatted output must not restore original PII: {formatted_content}"
+        );
+    }
+
+    let caption = processed
+        .images
+        .as_deref()
+        .and_then(|images| images.first())
+        .and_then(|image| image.caption.as_deref())
+        .expect("captioning must retain the image caption");
+    assert!(caption.contains(CAPTION_PREFIX), "image caption was lost: {caption}");
+    assert!(
+        !caption.contains(ORIGINAL_PII),
+        "image caption must be redacted: {caption}"
+    );
+
+    let chunk_text = processed
+        .chunks
+        .as_ref()
+        .expect("chunking must produce chunks")
+        .iter()
+        .map(|chunk| chunk.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        chunk_text.contains(CAPTION_PREFIX),
+        "chunks must include the generated caption: {chunk_text}"
+    );
+    assert!(
+        !chunk_text.contains(ORIGINAL_PII),
+        "redacted chunks must not contain original PII: {chunk_text}"
+    );
+    assert_eq!(
+        processed
+            .processing_warnings
+            .iter()
+            .map(|warning| warning.source.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["extraction", "captioning"],
+        "captioning prepass must preserve existing warnings and append its own"
+    );
+    assert_eq!(
+        processed
+            .llm_usage
+            .as_ref()
+            .expect("prepass must preserve LLM usage")
+            .iter()
+            .map(|usage| usage.source.as_str())
+            .collect::<Vec<_>>(),
+        vec!["extraction", "captioning"],
+        "captioning prepass must preserve existing usage and append its own"
+    );
+}
+
+/// #355: the captioning prepass derives a full `ExtractedDocument` from `doc`
+/// before the pipeline's main (second) derivation runs on the same `doc`. That
+/// first derivation destructively `.remove()`s `CODE_INTELLIGENCE_SCRATCH_KEY`
+/// from `metadata.additional` (see `derive::derive_extraction_result`), and the
+/// prepass then overwrites `doc.metadata` wholesale with the already-stripped
+/// copy. Without carrying the computed payload back onto `doc`, the second
+/// derivation finds no scratch key and silently falls back to a degraded
+/// `CodeMetadata`-only `code_intelligence` (losing metrics, structure, imports,
+/// exports, etc. — see #259). Assert the exact full payload survives.
+#[tokio::test]
+#[serial]
+#[cfg(all(feature = "captioning", feature = "tree-sitter"))]
+async fn captioning_prepass_preserves_full_code_intelligence_scratch_payload() {
+    use crate::core::config::{CaptioningConfig, LlmConfig};
+    use crate::plugins::{Plugin, PostProcessor, ProcessingStage};
+    use crate::types::metadata::{CodeMetadata, FormatMetadata};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct NoopCaptioningProcessor;
+
+    impl Plugin for NoopCaptioningProcessor {
+        fn name(&self) -> &str {
+            CAPTIONING_PROCESSOR_NAME
+        }
+
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+
+        fn initialize(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PostProcessor for NoopCaptioningProcessor {
+        async fn process(&self, _result: &mut ExtractedDocument, _config: &ExtractionConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn processing_stage(&self) -> ProcessingStage {
+            ProcessingStage::Middle
+        }
+
+        fn priority(&self) -> i32 {
+            50
+        }
+    }
+
+    initialize_features();
+    let registry = crate::plugins::registry::get_post_processor_registry();
+    registry.write().register(Arc::new(NoopCaptioningProcessor)).unwrap();
+    clear_processor_cache().unwrap();
+
+    let expected_code_intelligence = serde_json::json!({
+        "language": "python",
+        "metrics": {"total_lines": 1},
+    });
+
+    let mut doc = make_doc("def f(): pass", "text/x-python");
+    doc.metadata.format = Some(FormatMetadata::Code(CodeMetadata::default()));
+    doc.metadata.additional.insert(
+        Cow::Borrowed(crate::extractors::code::CODE_INTELLIGENCE_SCRATCH_KEY),
+        expected_code_intelligence.clone(),
+    );
+
+    let config = ExtractionConfig {
+        captioning: Some(CaptioningConfig {
+            llm: LlmConfig::default(),
+            prompt: None,
+            min_image_area: 1,
+        }),
+        ..Default::default()
+    };
+
+    let processed = run_pipeline(doc, &config).await.unwrap();
+
+    // Restore the real captioning processor for subsequent tests in this module.
+    crate::plugins::processor::builtin::captioning::register().unwrap();
+    clear_processor_cache().unwrap();
+
+    assert_eq!(
+        processed.code_intelligence,
+        Some(expected_code_intelligence),
+        "captioning prepass must not degrade code_intelligence on the pipeline's second derivation"
+    );
+    assert!(
+        !processed
+            .metadata
+            .additional
+            .contains_key(crate::extractors::code::CODE_INTELLIGENCE_SCRATCH_KEY),
+        "scratch key must never leak into final metadata"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_run_pipeline_with_output_format_plain() {
     let doc = make_doc("test content", "text/plain");
 
@@ -829,7 +1110,6 @@ async fn test_run_pipeline_with_output_format_djot() {
     };
 
     let processed = run_pipeline(doc, &config).await.unwrap();
-    // The content should still be present
     assert!(!processed.content.is_empty());
     assert_eq!(processed.metadata.output_format, Some("djot".to_string()));
 }
@@ -845,7 +1125,6 @@ async fn test_run_pipeline_with_output_format_html() {
     };
 
     let processed = run_pipeline(doc, &config).await.unwrap();
-    // HTML renderer produces semantic tags from InternalDocument
     assert!(processed.content.contains("test content"));
     assert_eq!(processed.metadata.output_format, Some("html".to_string()));
 }
@@ -854,9 +1133,7 @@ async fn test_run_pipeline_with_output_format_html() {
 #[serial]
 #[cfg(feature = "quality")]
 async fn test_nfc_normalization_decomposes_to_composed() {
-    // NFC normalization should convert decomposed characters to composed form.
-    // "e\u{0301}" (e + combining acute accent) → "\u{00e9}" (é precomposed)
-    let doc = make_doc("caf\u{0065}\u{0301}", "text/plain"); // "café" with decomposed é
+    let doc = make_doc("caf\u{0065}\u{0301}", "text/plain");
     let config = ExtractionConfig {
         postprocessor: Some(crate::core::config::PostProcessorConfig {
             enabled: false,
@@ -866,15 +1143,14 @@ async fn test_nfc_normalization_decomposes_to_composed() {
     };
 
     let processed = run_pipeline(doc, &config).await.unwrap();
-    assert_eq!(processed.content, "caf\u{00e9}"); // composed é
-    assert!(!processed.content.contains('\u{0301}')); // no combining accent
+    assert_eq!(processed.content, "caf\u{00e9}");
+    assert!(!processed.content.contains('\u{0301}'));
 }
 
 #[tokio::test]
 #[serial]
 #[cfg(feature = "quality")]
 async fn test_nfc_normalization_idempotent_on_ascii() {
-    // NFC on already-normalized/ASCII text should be a no-op.
     let doc = make_doc("Hello, world! 123", "text/plain");
     let config = ExtractionConfig {
         postprocessor: Some(crate::core::config::PostProcessorConfig {
@@ -892,7 +1168,6 @@ async fn test_nfc_normalization_idempotent_on_ascii() {
 #[serial]
 #[cfg(feature = "quality")]
 async fn test_nfc_normalization_applies_to_page_content() {
-    // Create a doc with a page-1 element containing decomposed characters
     let mut doc = InternalDocument::new("plain");
     doc.mime_type = "text/plain".to_string();
     doc.push_element(InternalElement::text(ElementKind::Paragraph, "re\u{0301}sume\u{0301}", 0).with_page(1));
@@ -905,7 +1180,6 @@ async fn test_nfc_normalization_applies_to_page_content() {
     };
 
     let processed = run_pipeline(doc, &config).await.unwrap();
-    // Content derived from page element
     assert!(processed.content.contains("r\u{00e9}sum\u{00e9}"));
     let pages = processed.pages.unwrap();
     assert_eq!(pages[0].content, "r\u{00e9}sum\u{00e9}");
@@ -914,18 +1188,15 @@ async fn test_nfc_normalization_applies_to_page_content() {
 #[tokio::test]
 #[serial]
 async fn test_run_pipeline_applies_output_format_last() {
-    // This test verifies that output format is applied after all other processing
     let doc = make_doc("test", "text/plain");
 
     let config = crate::core::config::ExtractionConfig {
         output_format: OutputFormat::Djot,
-        // Disable other processing to ensure pipeline runs cleanly
         enable_quality_processing: false,
         ..Default::default()
     };
 
     let processed = run_pipeline(doc, &config).await.unwrap();
-    // The result should have gone through the pipeline successfully
     assert_eq!(processed.metadata.output_format, Some("djot".to_string()));
 }
 
@@ -939,13 +1210,11 @@ async fn test_chunking_populates_page_numbers_for_pdf() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/pdf/issue-636-chunk-pages.pdf");
 
     if !pdf_path.exists() {
-        // Skip if test document not available
         return;
     }
 
     let pdf_bytes = std::fs::read(&pdf_path).unwrap();
 
-    // Configure chunking WITHOUT explicit pages config (the default user scenario)
     let config = ExtractionConfig {
         chunking: Some(ChunkingConfig {
             max_characters: 500,
@@ -958,12 +1227,10 @@ async fn test_chunking_populates_page_numbers_for_pdf() {
         .await
         .unwrap();
 
-    // Chunks should exist
     assert!(result.chunks.is_some(), "Chunks should be produced");
     let chunks = result.chunks.as_ref().unwrap();
     assert!(!chunks.is_empty(), "Should have at least one chunk");
 
-    // At least some chunks should have page numbers
     let chunks_with_pages = chunks.iter().filter(|c| c.metadata.first_page.is_some()).count();
     assert!(
         chunks_with_pages > 0,
@@ -976,15 +1243,11 @@ async fn test_chunking_populates_page_numbers_for_pdf() {
 #[serial]
 #[cfg(feature = "chunking")]
 async fn test_pipeline_chunks_content_matches_output_format_markdown() {
-    // Integration-level proof for #1073: run_pipeline with output_format=Markdown must
-    // produce chunks whose content contains markdown syntax, not plain text.
-    // Exercises the chunker_only_markdown=false path and apply_output_format interaction.
     use crate::core::config::{ChunkerType, ChunkingConfig};
     use crate::types::internal::ElementKind;
 
     let mut doc = InternalDocument::new("plain");
     doc.mime_type = "text/plain".to_string();
-    // Heading + body — render_markdown will produce "# Section\n\nBody text …"
     doc.push_element(InternalElement::text(ElementKind::Heading { level: 1 }, "Section", 0));
     doc.push_element(InternalElement::text(
         ElementKind::Paragraph,
@@ -1010,7 +1273,6 @@ async fn test_pipeline_chunks_content_matches_output_format_markdown() {
 
     let result = run_pipeline(doc, &config).await.unwrap();
 
-    // Top-level content must be markdown
     assert_eq!(result.metadata.output_format, Some("markdown".to_string()));
     assert!(
         result.content.contains('#'),
@@ -1018,7 +1280,6 @@ async fn test_pipeline_chunks_content_matches_output_format_markdown() {
         &result.content[..result.content.len().min(120)]
     );
 
-    // Chunks must also carry markdown content (#1073)
     let chunks = result.chunks.expect("chunks must be produced");
     assert!(!chunks.is_empty(), "at least one chunk must be produced");
     let all_chunk_content: String = chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("\n");
@@ -1218,7 +1479,6 @@ mod output_format_pass_tests {
 
         let images = result.images.as_ref().expect("images must be present");
         assert_eq!(images[0].format.as_ref(), "png", "jpeg must be re-encoded to png");
-        // SVG is rasterized to PNG when the svg feature is active — no warning.
         assert_eq!(images[1].format.as_ref(), "png", "svg must be rasterized to png");
         assert!(
             result.processing_warnings.is_empty(),
@@ -1337,9 +1597,6 @@ mod data_base64_pass_tests {
 #[tokio::test]
 #[serial]
 async fn test_pdf_run_fallback_not_suppressed_without_images_config() {
-    // When config.images is None, run_ocr_on_images must default to false so
-    // the PDF document-level OCR fallback is NOT silently suppressed for
-    // existing callers that never configured ImageExtractionConfig.
     use crate::core::config::ImageExtractionConfig;
 
     let default_no_images = crate::core::config::ExtractionConfig::default();
@@ -1374,4 +1631,91 @@ async fn test_pdf_run_fallback_not_suppressed_without_images_config() {
         skip_fallback_opted_in,
         "RunFallback must be suppressed when images.run_ocr_on_images=true"
     );
+}
+
+mod document_counts {
+    use super::super::populate_document_counts;
+    use crate::types::page::{PageContent, PageStructure, PageUnitType};
+    use crate::types::{ExtractedDocument, ExtractedImage, Metadata, Table};
+
+    fn page_structure(total_count: u32) -> PageStructure {
+        PageStructure {
+            total_count,
+            unit_type: PageUnitType::Page,
+            boundaries: None,
+            pages: None,
+        }
+    }
+
+    fn page(page_number: u32) -> PageContent {
+        PageContent {
+            page_number,
+            content: String::new(),
+            tables: Vec::new(),
+            image_indices: Vec::new(),
+            hierarchy: None,
+            is_blank: None,
+            layout_regions: None,
+            speaker_notes: None,
+            section_name: None,
+            sheet_name: None,
+        }
+    }
+
+    #[test]
+    fn pages_come_from_metadata_page_count() {
+        let mut result = ExtractedDocument {
+            metadata: Metadata {
+                pages: Some(page_structure(5)),
+                ..Default::default()
+            },
+            tables: vec![Table::default(), Table::default()],
+            images: Some(vec![ExtractedImage::default()]),
+            pages: None,
+            ..Default::default()
+        };
+        populate_document_counts(&mut result);
+        assert_eq!(result.counts.pages, 5, "pages must read metadata.total_count");
+        assert_eq!(result.counts.tables, 2);
+        assert_eq!(result.counts.images, 1);
+    }
+
+    #[test]
+    fn pages_fall_back_to_materialized_pages_len() {
+        let mut result = ExtractedDocument {
+            metadata: Metadata::default(),
+            pages: Some(vec![page(1), page(2), page(3)]),
+            ..Default::default()
+        };
+        populate_document_counts(&mut result);
+        assert_eq!(result.counts.pages, 3);
+        assert_eq!(result.counts.tables, 0);
+        assert_eq!(result.counts.images, 0);
+    }
+
+    #[test]
+    fn non_paginated_input_reports_zero_pages() {
+        let mut result = ExtractedDocument {
+            content: "plain text".to_string(),
+            ..Default::default()
+        };
+        populate_document_counts(&mut result);
+        assert_eq!(result.counts.pages, 0);
+        assert_eq!(result.counts.tables, 0);
+        assert_eq!(result.counts.images, 0);
+    }
+
+    #[test]
+    fn zero_metadata_page_count_falls_back_to_pages_len() {
+        let mut result = ExtractedDocument {
+            metadata: Metadata {
+                pages: Some(page_structure(0)),
+                ..Default::default()
+            },
+            pages: Some(vec![page(1), page(2)]),
+            ..Default::default()
+        };
+        populate_document_counts(&mut result);
+        assert_eq!(result.counts.pages, 2);
+    }
 }

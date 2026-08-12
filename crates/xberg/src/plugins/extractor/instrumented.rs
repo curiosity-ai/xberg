@@ -32,10 +32,6 @@ impl InstrumentedExtractor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Plugin delegation
-// ---------------------------------------------------------------------------
-
 impl Plugin for InstrumentedExtractor {
     fn name(&self) -> &str {
         self.inner.name()
@@ -61,10 +57,6 @@ impl Plugin for InstrumentedExtractor {
         self.inner.author()
     }
 }
-
-// ---------------------------------------------------------------------------
-// DocumentExtractor with instrumentation
-// ---------------------------------------------------------------------------
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -100,7 +92,6 @@ impl InternalDocumentExtractor for InstrumentedExtractor {
 
         let span = crate::telemetry::spans::extractor_span(&extractor_name, mime_type, size_bytes);
 
-        // Also record the sanitized filename on the span.
         let filename = crate::telemetry::spans::sanitize_path(path);
         span.record(conventions::DOCUMENT_FILENAME, &*filename);
 
@@ -131,10 +122,6 @@ impl InternalDocumentExtractor for InstrumentedExtractor {
         self.inner.can_handle(path, mime_type)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn record_span_status(span: &tracing::Span, result: &Result<InternalDocument>) {
     let _entered = span.enter();

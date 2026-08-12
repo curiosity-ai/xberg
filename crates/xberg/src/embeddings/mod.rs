@@ -37,6 +37,15 @@
 //! **Windows MinGW builds are not supported**. ONNX Runtime requires the MSVC toolchain on Windows.
 //! Please use Windows MSVC builds or disable the embeddings feature.
 //!
+//! # Static (model2vec) Embeddings
+//!
+//! The `"lightweight"` preset (and any future `Static`-backend preset) runs
+//! through a pure-Rust model2vec engine instead of ONNX Runtime, gated behind
+//! the `static-embeddings` feature. It requires no native ONNX dependency and is
+//! the only dense-embedding backend available on `no-ort-target` (WASM, Android
+//! x86_64 emulator). Select it the same way as any other preset:
+//! `EmbeddingConfig { model: EmbeddingModelType::Preset { name: "lightweight".into() }, .. }`.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -64,6 +73,11 @@
 /// Core ONNX embedding inference engine with thread-safe concurrent inference.
 pub mod engine;
 
+/// Pure-Rust static (model2vec) embedding inference engine — no ONNX Runtime.
+/// The only dense-embedding backend available on `no-ort-target` (WASM/Android).
+#[cfg(feature = "static-embeddings")]
+pub mod static_engine;
+
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
@@ -71,8 +85,13 @@ use std::sync::LazyLock;
 use ahash::AHashMap;
 #[cfg(feature = "embeddings")]
 use engine::EmbeddingEngine;
+#[cfg(any(
+    feature = "embeddings",
+    all(feature = "static-embeddings", feature = "tokio-runtime")
+))]
+use std::sync::Arc;
 #[cfg(feature = "embeddings")]
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 #[cfg(feature = "embeddings")]
 type CachedEngine = Arc<EmbeddingEngine>;
@@ -83,16 +102,38 @@ static ENGINE_CACHE: LazyLock<RwLock<AHashMap<String, CachedEngine>>> = LazyLock
 /// Global semaphore that limits concurrent ONNX embedding inference calls.
 ///
 /// Prevents resource exhaustion when many async callers invoke `embed_texts_async`
-/// against the ONNX path (Preset/Custom variants) simultaneously. The Llm and
-/// Plugin variants short-circuit out of `embed_texts_async` before reaching the
-/// semaphore — they don't share the local-inference resource pool. The permit
+/// against the local (Preset/Custom, ONNX or static) path simultaneously. The Llm
+/// and Plugin variants short-circuit out of `embed_texts_async` before reaching
+/// the semaphore — they don't share the local-inference resource pool. The permit
 /// count is set once on first access using the thread budget, matching the pattern
 /// used elsewhere (e.g., image OCR, batch extraction).
-#[cfg(all(feature = "embeddings", feature = "tokio-runtime"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "static-embeddings"),
+    feature = "tokio-runtime"
+))]
 static EMBED_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
     let budget = crate::core::config::concurrency::resolve_thread_budget(None);
     Arc::new(tokio::sync::Semaphore::new(budget))
 });
+
+/// Inference backend that an [`EmbeddingPreset`] runs on.
+///
+/// `Onnx` presets require the `embeddings` feature (ONNX Runtime, not available on
+/// WASM/Android x86_64 emulator). `Static` presets require `static-embeddings`
+/// (pure-Rust model2vec inference, no ORT — the only dense-embedding backend
+/// available on `no-ort-target`).
+///
+/// Defaults to `Onnx` via `#[serde(default)]` so every existing preset payload
+/// (which predates this field) keeps deserializing without change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingBackend {
+    /// ONNX Runtime transformer inference (the historical, default backend).
+    #[default]
+    Onnx,
+    /// Pure-Rust static (model2vec) inference — no ONNX Runtime.
+    Static,
+}
 
 /// Preset configurations for common RAG use cases.
 ///
@@ -111,58 +152,151 @@ pub struct EmbeddingPreset {
     pub overlap: usize,
     /// HuggingFace repository name for the model.
     pub model_repo: String,
-    /// Pooling strategy: "cls" or "mean".
+    /// Pooling strategy: "cls" or "mean". Static (model2vec) presets always mean-pool.
     pub pooling: String,
-    /// Path to the ONNX model file within the repo.
+    /// Path to the model file within the repo (ONNX file for `Onnx`, model2vec
+    /// `model.safetensors` for `Static`).
     pub model_file: String,
     /// Embedding vector dimension produced by this model.
     pub dimensions: usize,
     /// Human-readable description of the preset's intended use case.
     pub description: String,
+    /// Which inference backend this preset runs on. Defaults to `Onnx` for
+    /// back-compat with presets/payloads that predate this field.
+    #[serde(default)]
+    pub backend: EmbeddingBackend,
+    /// Sibling files downloaded alongside `model_file`. Large fp32 ONNX exports
+    /// (Qwen3-Embedding, Arctic-Embed-v2.0) store weights in an external-data
+    /// `model.onnx.data` blob that ORT loads by relative path; single-file
+    /// models leave this empty.
+    #[serde(default)]
+    pub additional_files: Vec<String>,
+    /// Instruction prefix prepended to *query-side* text before encoding.
+    /// Asymmetric retrieval models (Arctic-Embed, E5) are trained with a
+    /// `"query: "`-style prefix on queries only; document text is never
+    /// prefixed. `None` for symmetric models.
+    #[serde(default)]
+    pub query_prefix: Option<String>,
 }
 
 /// All available embedding presets.
+/// SHA-256 manifest pinning every hosted embedding preset file, verified at
+/// download time by [`crate::onnx::download_model_files`].
+#[cfg(any(
+    feature = "embeddings",
+    all(feature = "static-embeddings", not(target_arch = "wasm32")),
+    test
+))]
+pub(crate) const EMBEDDING_SHA256_MANIFEST: &str = include_str!("presets.sha256sum");
+
+#[cfg(any(feature = "embeddings", feature = "static-embeddings"))]
+pub(crate) const EMBEDDING_MODEL_REVISION: &str = "4b127809f88a5aa1569d1238032b5ff40e5879bc";
+
 pub static EMBEDDING_PRESETS: LazyLock<Vec<EmbeddingPreset>> = LazyLock::new(|| {
     vec![
         EmbeddingPreset {
             name: "fast".to_string(),
             chunk_size: 512,
             overlap: 50,
-            model_repo: "Xenova/all-MiniLM-L6-v2".to_string(),
+            model_repo: "xberg-io/embedding-models".to_string(),
             pooling: "mean".to_string(),
-            model_file: "onnx/model_quantized.onnx".to_string(),
+            model_file: "all-MiniLM-L6-v2/model_quantized.onnx".to_string(),
             dimensions: 384,
             description: "Fast embedding with quantized model (384 dims, ~22M params). Best for: Quick prototyping, development, resource-constrained environments.".to_string(),
+            backend: EmbeddingBackend::Onnx,
+            additional_files: Vec::new(),
+            query_prefix: None,
         },
         EmbeddingPreset {
             name: "balanced".to_string(),
             chunk_size: 1024,
             overlap: 100,
-            model_repo: "Xenova/bge-base-en-v1.5".to_string(),
+            model_repo: "xberg-io/embedding-models".to_string(),
             pooling: "cls".to_string(),
-            model_file: "onnx/model.onnx".to_string(),
+            model_file: "bge-base-en-v1.5/model.onnx".to_string(),
             dimensions: 768,
             description: "Balanced quality and speed (768 dims, ~109M params). Best for: General-purpose RAG, production deployments, English documents.".to_string(),
+            backend: EmbeddingBackend::Onnx,
+            additional_files: Vec::new(),
+            query_prefix: None,
         },
         EmbeddingPreset {
             name: "quality".to_string(),
             chunk_size: 2000,
             overlap: 200,
-            model_repo: "Xenova/bge-large-en-v1.5".to_string(),
+            model_repo: "xberg-io/embedding-models".to_string(),
             pooling: "cls".to_string(),
-            model_file: "onnx/model.onnx".to_string(),
+            model_file: "bge-large-en-v1.5/model.onnx".to_string(),
             dimensions: 1024,
             description: "High quality with larger context (1024 dims, ~335M params). Best for: Complex documents, maximum accuracy, sufficient compute resources.".to_string(),
+            backend: EmbeddingBackend::Onnx,
+            additional_files: Vec::new(),
+            query_prefix: None,
         },
         EmbeddingPreset {
             name: "multilingual".to_string(),
             chunk_size: 1024,
             overlap: 100,
-            model_repo: "intfloat/multilingual-e5-base".to_string(),
+            model_repo: "xberg-io/embedding-models".to_string(),
             pooling: "mean".to_string(),
-            model_file: "onnx/model.onnx".to_string(),
+            model_file: "multilingual-e5-base/model.onnx".to_string(),
             dimensions: 768,
             description: "Multilingual support (768 dims, 100+ languages). Best for: International documents, mixed-language content, global applications.".to_string(),
+            backend: EmbeddingBackend::Onnx,
+            additional_files: Vec::new(),
+            query_prefix: None,
+        },
+        EmbeddingPreset {
+            name: "gte-modernbert-base".to_string(),
+            chunk_size: 1024,
+            overlap: 100,
+            model_repo: "xberg-io/embedding-models".to_string(),
+            pooling: "cls".to_string(),
+            model_file: "gte-modernbert-base/model.onnx".to_string(),
+            dimensions: 768,
+            description: "GTE ModernBERT base (768 dims, 2026-gen, 8192 context). Best for: general-purpose English RAG with long-context ModernBERT tokenization.".to_string(),
+            backend: EmbeddingBackend::Onnx,
+            additional_files: Vec::new(),
+            query_prefix: None,
+        },
+        EmbeddingPreset {
+            name: "lightweight".to_string(),
+            chunk_size: 512,
+            overlap: 50,
+            model_repo: "xberg-io/embedding-models".to_string(),
+            pooling: "mean".to_string(),
+            model_file: "potion-base-8m/model.safetensors".to_string(),
+            dimensions: 256,
+            description: "Static (model2vec) embedding — pure Rust, no ONNX Runtime (256 dims, ~7.5M params). Best for: WASM, Android, and other no-ORT targets; extremely fast CPU-only inference.".to_string(),
+            backend: EmbeddingBackend::Static,
+            additional_files: Vec::new(),
+            query_prefix: None,
+        },
+        EmbeddingPreset {
+            name: "arctic-embed-m-v2.0".to_string(),
+            chunk_size: 1024,
+            overlap: 100,
+            model_repo: "xberg-io/embedding-models".to_string(),
+            pooling: "cls".to_string(),
+            model_file: "arctic-embed-m-v2.0/model.onnx".to_string(),
+            dimensions: 768,
+            description: "Snowflake Arctic-Embed-M v2.0 (768 dims, multilingual, 2026-gen). Asymmetric retrieval: queries are prefixed with \"query: \". Best for: multilingual RAG where query/document roles are known.".to_string(),
+            backend: EmbeddingBackend::Onnx,
+            additional_files: vec!["arctic-embed-m-v2.0/model.onnx.data".to_string()],
+            query_prefix: Some("query: ".to_string()),
+        },
+        EmbeddingPreset {
+            name: "qwen3-embedding-0.6b".to_string(),
+            chunk_size: 2000,
+            overlap: 200,
+            model_repo: "xberg-io/embedding-models".to_string(),
+            pooling: "last".to_string(),
+            model_file: "qwen3-embedding-0.6b/model.onnx".to_string(),
+            dimensions: 1024,
+            description: "Qwen3-Embedding 0.6B (1024 dims, decoder-style last-token pooling, 32k context, multilingual, 2026-gen). Best for: highest-quality multilingual/long-context retrieval when compute allows.".to_string(),
+            backend: EmbeddingBackend::Onnx,
+            additional_files: vec!["qwen3-embedding-0.6b/model.onnx.data".to_string()],
+            query_prefix: None,
         },
     ]
 });
@@ -170,6 +304,21 @@ pub static EMBEDDING_PRESETS: LazyLock<Vec<EmbeddingPreset>> = LazyLock::new(|| 
 /// Get a preset by name (returns an owned clone for FFI compatibility).
 pub(crate) fn get_preset(name: &str) -> Option<EmbeddingPreset> {
     EMBEDDING_PRESETS.iter().find(|p| p.name == name).cloned()
+}
+
+/// Query-side instruction prefix for the given embedding config, if the
+/// resolved preset defines one.
+///
+/// Asymmetric retrieval models (e.g. Arctic-Embed) are trained with a
+/// `"query: "`-style prefix on the query only — the RAG query path prepends
+/// this before embedding, while document text is embedded verbatim. Returns
+/// `None` for symmetric presets, custom models, and non-preset backends.
+#[cfg_attr(alef, alef(skip))]
+pub fn embedding_query_prefix(config: &crate::core::config::EmbeddingConfig) -> Option<String> {
+    match &config.model {
+        crate::core::config::EmbeddingModelType::Preset { name } => get_preset(name).and_then(|p| p.query_prefix),
+        _ => None,
+    }
 }
 
 /// Get the chunk_size for a preset by name.
@@ -183,63 +332,49 @@ pub(crate) fn list_presets() -> Vec<String> {
     EMBEDDING_PRESETS.iter().map(|p| p.name.clone()).collect()
 }
 
-/// Returns installation instructions for ONNX Runtime.
-///
-/// `pub(crate)` so sibling ONNX modules can reference the same install instructions.
+/// Module-tagged error constructor threaded into the shared onnx helpers.
 #[cfg(feature = "embeddings")]
-pub(crate) fn onnx_runtime_install_message() -> String {
-    #[cfg(all(windows, target_env = "gnu"))]
-    {
-        return "ONNX Runtime embeddings are not supported on Windows MinGW builds. \
-        ONNX Runtime requires MSVC toolchain. \
-        Please use Windows MSVC builds or disable embeddings feature."
-            .to_string();
-    }
-
-    #[cfg(not(all(windows, target_env = "gnu")))]
-    {
-        "ONNX Runtime is required for embeddings functionality. \
-        Install: \
-        macOS: 'brew install onnxruntime', \
-        Linux (Ubuntu/Debian): 'apt install libonnxruntime libonnxruntime-dev', \
-        Linux (Fedora): 'dnf install onnxruntime onnxruntime-devel', \
-        Linux (Arch): 'pacman -S onnxruntime', \
-        Windows (MSVC): Download from https://github.com/microsoft/onnxruntime/releases and add to PATH. \
-        \
-        Alternatively, set ORT_DYLIB_PATH environment variable to the ONNX Runtime library path. \
-        \
-        For Docker/containers: Install via package manager in your base image. \
-        Verified packages: Ubuntu 22.04+, Fedora 38+, Arch Linux."
-            .to_string()
-    }
+fn embed_err(msg: String) -> crate::XbergError {
+    crate::XbergError::embedding(msg)
 }
 
-/// Resolve the cache directory for embedding models.
+/// Default tokenizer truncation length when `EmbeddingConfig.max_sequence_length`
+/// is unset. Matches the historical hardcoded value; the effective length is still
+/// capped at the model's own `model_max_length` in [`load_tokenizer`].
 #[cfg(feature = "embeddings")]
-fn resolve_cache_dir(cache_dir: Option<std::path::PathBuf>) -> std::path::PathBuf {
-    cache_dir.unwrap_or_else(|| crate::cache_dir::resolve_cache_dir("embeddings"))
-}
+const DEFAULT_EMBEDDING_MAX_SEQUENCE_LENGTH: usize = 512;
 
 /// Resolve model info (repo, model file, pooling) from an EmbeddingModelType config.
+///
+/// Only handles the ONNX path — callers must reject `Static`-backend presets
+/// before calling this (see [`embed_texts`]'s dispatch, which branches on
+/// `preset.backend` first).
 #[cfg(feature = "embeddings")]
 fn resolve_model_info(
     model_type: &crate::core::config::EmbeddingModelType,
-) -> crate::Result<(String, String, engine::Pooling)> {
+) -> crate::Result<(String, String, Vec<String>, engine::Pooling)> {
     match model_type {
         crate::core::config::EmbeddingModelType::Preset { name } => {
             let preset = get_preset(name)
                 .ok_or_else(|| crate::XbergError::embedding(format!("Unknown embedding preset: {name}")))?;
+            if preset.backend == EmbeddingBackend::Static {
+                return Err(crate::XbergError::embedding(format!(
+                    "Preset '{name}' uses the static (model2vec) backend, which has no ONNX model to warm or download. Rebuild with --features static-embeddings and call embed_texts directly."
+                )));
+            }
             let pooling = match preset.pooling.as_str() {
                 "cls" => engine::Pooling::Cls,
+                "last" => engine::Pooling::Last,
                 _ => engine::Pooling::Mean,
             };
-            Ok((preset.model_repo, preset.model_file, pooling))
+            Ok((preset.model_repo, preset.model_file, preset.additional_files, pooling))
         }
-        crate::core::config::EmbeddingModelType::Custom { model_id, .. } => {
-            // For custom models, default to mean pooling and standard model path.
-            // Users providing custom HF models should ensure the repo has the expected layout.
-            Ok((model_id.clone(), "onnx/model.onnx".to_string(), engine::Pooling::Mean))
-        }
+        crate::core::config::EmbeddingModelType::Custom { model_id, .. } => Ok((
+            model_id.clone(),
+            "onnx/model.onnx".to_string(),
+            Vec::new(),
+            engine::Pooling::Mean,
+        )),
         crate::core::config::EmbeddingModelType::Llm { .. } => Err(crate::XbergError::embedding(
             "LLM embeddings have no local model to warm or download — the provider serves them over HTTP at embed time.",
         )),
@@ -249,378 +384,29 @@ fn resolve_model_info(
     }
 }
 
-/// Load a tokenizer from HuggingFace model files.
-///
-/// Adapted from the vendored embedding engine's tokenizer initialization.
-#[cfg(feature = "embeddings")]
-fn load_tokenizer(
-    tokenizer_path: &std::path::Path,
-    config_path: &std::path::Path,
-    special_tokens_path: &std::path::Path,
-    tokenizer_config_path: &std::path::Path,
-    max_length: usize,
-) -> crate::Result<tokenizers::Tokenizer> {
-    use tokenizers::{AddedToken, PaddingParams, PaddingStrategy, TruncationParams};
-
-    let config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(config_path)
-            .map_err(|e| crate::XbergError::embedding(format!("Failed to read config.json: {e}")))?,
-    )
-    .map_err(|e| crate::XbergError::embedding(format!("Failed to parse config.json: {e}")))?;
-
-    let tokenizer_config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(tokenizer_config_path)
-            .map_err(|e| crate::XbergError::embedding(format!("Failed to read tokenizer_config.json: {e}")))?,
-    )
-    .map_err(|e| crate::XbergError::embedding(format!("Failed to parse tokenizer_config.json: {e}")))?;
-
-    let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| crate::XbergError::embedding(format!("Failed to load tokenizer: {e}")))?;
-
-    let model_max_length = tokenizer_config["model_max_length"].as_f64().unwrap_or(512.0) as usize;
-    let max_length = max_length.min(model_max_length);
-    let pad_id = config["pad_token_id"].as_u64().unwrap_or(0) as u32;
-    let pad_token = tokenizer_config["pad_token"].as_str().unwrap_or("[PAD]").to_string();
-
-    tokenizer
-        .with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            pad_token,
-            pad_id,
-            ..Default::default()
-        }))
-        .with_truncation(Some(TruncationParams {
-            max_length,
-            ..Default::default()
-        }))
-        .map_err(|e| crate::XbergError::embedding(format!("Failed to configure tokenizer: {e}")))?;
-
-    // Add special tokens from special_tokens_map.json
-    if let Ok(special_tokens_data) = std::fs::read(special_tokens_path)
-        && let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&special_tokens_data)
-    {
-        for (_, value) in &map {
-            if let Some(content) = value.as_str() {
-                let _ = tokenizer.add_special_tokens([AddedToken {
-                    content: content.to_string(),
-                    special: true,
-                    ..Default::default()
-                }]);
-            } else if value.is_object()
-                && let (Some(content), Some(single_word), Some(lstrip), Some(rstrip), Some(normalized)) = (
-                    value["content"].as_str(),
-                    value["single_word"].as_bool(),
-                    value["lstrip"].as_bool(),
-                    value["rstrip"].as_bool(),
-                    value["normalized"].as_bool(),
-                )
-            {
-                let _ = tokenizer.add_special_tokens([AddedToken {
-                    content: content.to_string(),
-                    special: true,
-                    single_word,
-                    lstrip,
-                    rstrip,
-                    normalized,
-                }]);
-            }
-        }
-    }
-
-    Ok(tokenizer)
-}
-
-/// How long a partial download must be idle before it is considered stale.
-///
-/// hf-hub writes to the `.part` file continuously during an active download.
-/// If the file has not been modified in this window, no live process is writing
-/// to it and the corresponding lock is safe to remove.
-#[cfg(feature = "embeddings")]
-const STALE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-/// Remove stale `.lock` and `.part` files left behind by interrupted downloads.
-///
-/// hf-hub coordinates concurrent downloads with `flock(LOCK_EX)`. The OS
-/// releases the flock when the owning process exits, but the `.lock` and
-/// `.part` files remain on disk. In practice this causes permanent
-/// `LockAcquisition` failures in two scenarios:
-///
-/// - A CI job or Docker container is killed mid-download; the next invocation
-///   cannot acquire the lock because the file still exists (even though no
-///   process holds it — the flock was released).
-/// - Two concurrent first-time invocations race; the loser exits with an
-///   error and the `.lock` / `.part` files are never cleaned up if the winner
-///   also fails later.
-///
-/// Staleness is detected via the modification time of the `.part` file (or
-/// the `.lock` file when no `.part` exists): if neither has been written in
-/// [`STALE_DOWNLOAD_TIMEOUT`], no live process is actively downloading and
-/// it is safe to remove both files so that the next `repo.get()` can proceed.
-#[cfg(feature = "embeddings")]
-fn cleanup_stale_locks(cache_dir: &std::path::Path, repo_name: &str) {
-    // hf-hub folder_name(): "models--" + repo_id.replace('/', "--")
-    let folder = format!("models--{}", repo_name.replace('/', "--"));
-    let blobs_dir = cache_dir.join(folder).join("blobs");
-
-    let entries = match std::fs::read_dir(&blobs_dir) {
-        Ok(e) => e,
-        Err(_) => return, // blobs dir doesn't exist yet — nothing to clean
-    };
-
-    let now = std::time::SystemTime::now();
-
-    for entry in entries.flatten() {
-        let lock_path = entry.path();
-        if lock_path.extension().is_some_and(|ext| ext == "lock") {
-            let part_path = lock_path.with_extension("part");
-
-            // Prefer the .part file's mtime: an active download writes bytes
-            // continuously, so a stale mtime there is the strongest signal.
-            // Fall back to the .lock file's mtime when no .part exists.
-            let probe_path = if part_path.exists() { &part_path } else { &lock_path };
-
-            let age = probe_path
-                .metadata()
-                .and_then(|m| m.modified())
-                .and_then(|modified| now.duration_since(modified).map_err(std::io::Error::other))
-                .unwrap_or(std::time::Duration::ZERO);
-
-            if age >= STALE_DOWNLOAD_TIMEOUT {
-                if std::fs::remove_file(&lock_path).is_ok() {
-                    tracing::info!(
-                        path = ?lock_path,
-                        idle_minutes = age.as_secs() / 60,
-                        "Removed stale download lock file",
-                    );
-                }
-                if part_path.exists() && std::fs::remove_file(&part_path).is_ok() {
-                    tracing::info!(path = ?part_path, "Removed stale partial download");
-                }
-            }
-        }
-    }
-}
-
-/// Build a human-readable hint to attach to a LockAcquisition error.
-#[cfg(feature = "embeddings")]
-fn lock_acquisition_hint(cache_dir: &std::path::Path, repo_name: &str) -> String {
-    let folder = format!("models--{}", repo_name.replace('/', "--"));
-    format!(
-        "\n\nAnother process may be downloading this model. \
-        If no download is in progress, remove the stale files and retry:\n  \
-        rm -f {cache}/{folder}/blobs/*.lock\n  \
-        rm -f {cache}/{folder}/blobs/*.part",
-        cache = cache_dir.display(),
-        folder = folder,
-    )
-}
-
-/// A held cross-process advisory lock that serializes model downloads.
-///
-/// `hf-hub` coordinates concurrent downloads with a *non-blocking* `flock`
-/// that retries only 5 times at 1-second intervals (see `lock_file` in
-/// `hf_hub::api::sync`). A sentence-transformer ONNX model is 100 MB+, so the
-/// download routinely takes far longer than 5 seconds — any second process
-/// that races the first one exhausts its retries and fails outright with
-/// `ApiError::LockAcquisition` instead of waiting for the download to finish.
-///
-/// This guard wraps a *blocking* `flock(LOCK_EX)` (or `LockFileEx` on Windows)
-/// on a xberg-owned lock file. The first process to enter `download_model_files`
-/// holds the lock for the full duration of the download; every other process
-/// blocks at acquisition until the lock is released, then proceeds and finds
-/// the model already present in the `hf-hub` cache (so `Repo::get()` returns
-/// the cached path without ever touching `hf-hub`'s own lock).
-///
-/// The lock is released when the guard is dropped, or by the OS if the owning
-/// process exits — so a killed process never permanently wedges the lock.
-#[cfg(feature = "embeddings")]
-struct ProcessDownloadLock {
-    file: std::fs::File,
-}
-
-#[cfg(feature = "embeddings")]
-impl ProcessDownloadLock {
-    /// Acquire the cross-process download lock for `repo_name`, blocking until
-    /// it is available.
-    ///
-    /// The lock file lives at `<cache_dir>/models--<repo>/.kbz-download.lock`.
-    /// Returns `None` (rather than failing) if the lock file cannot be created
-    /// or locked — callers fall back to the unsynchronized `hf-hub` path, which
-    /// is no worse than the previous behavior.
-    fn acquire(cache_dir: &std::path::Path, repo_name: &str) -> Option<Self> {
-        let folder = format!("models--{}", repo_name.replace('/', "--"));
-        let model_dir = cache_dir.join(folder);
-        if let Err(error) = std::fs::create_dir_all(&model_dir) {
-            tracing::debug!(?error, "Could not create model dir for download lock");
-            return None;
-        }
-        let lock_path = model_dir.join(".kbz-download.lock");
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::debug!(?error, path = ?lock_path, "Could not open download lock file");
-                return None;
-            }
-        };
-
-        if !blocking_lock_exclusive(&file) {
-            tracing::debug!(path = ?lock_path, "Could not acquire cross-process download lock");
-            return None;
-        }
-
-        tracing::debug!(path = ?lock_path, "Acquired cross-process download lock");
-        Some(Self { file })
-    }
-}
-
-#[cfg(feature = "embeddings")]
-impl Drop for ProcessDownloadLock {
-    fn drop(&mut self) {
-        unlock_file(&self.file);
-    }
-}
-
-/// Acquire a blocking exclusive advisory lock on `file`. Returns `true` on success.
-#[cfg(all(feature = "embeddings", target_family = "unix"))]
-fn blocking_lock_exclusive(file: &std::fs::File) -> bool {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `file` is a live, open file owned by the caller for the duration
-    // of the call; `as_raw_fd()` yields a valid descriptor. `flock` with
-    // `LOCK_EX` (no `LOCK_NB`) blocks until the advisory lock is granted and
-    // mutates no Rust-visible state. The lock is released by `unlock_file` on
-    // drop or by the kernel when the process exits.
-    #[allow(unsafe_code)]
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    result == 0
-}
-
-/// Release an advisory lock held on `file`.
-#[cfg(all(feature = "embeddings", target_family = "unix"))]
-fn unlock_file(file: &std::fs::File) {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `file` is a live, open file owned by the caller; `flock` with
-    // `LOCK_UN` releases any advisory lock and mutates no Rust-visible state.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-    }
-}
-
-/// Fallback for non-unix targets (Windows): no cross-process lock is taken.
-///
-/// `hf-hub` retains its own (best-effort, non-blocking) lock on these targets,
-/// so behavior is unchanged from before this guard existed. Returning `false`
-/// makes [`ProcessDownloadLock::acquire`] yield `None` and the caller proceeds
-/// straight to the `hf-hub` download path.
-#[cfg(all(feature = "embeddings", not(target_family = "unix")))]
-fn blocking_lock_exclusive(_file: &std::fs::File) -> bool {
-    false
-}
-
-/// Fallback unlock for non-unix targets — no-op since no lock was taken.
-#[cfg(all(feature = "embeddings", not(target_family = "unix")))]
-fn unlock_file(_file: &std::fs::File) {}
-
-/// Download model files from HuggingFace and return their local paths.
-///
-/// Returns `(model_path, tokenizer_path, config_path, special_tokens_path, tokenizer_config_path)`.
-///
-/// Before downloading, stale lock/part files left by interrupted or concurrent
-/// invocations are removed automatically so that the download can proceed
-/// without requiring manual intervention.
-#[cfg(feature = "embeddings")]
-fn download_model_files(
-    repo_name: &str,
-    model_file: &str,
-    cache_directory: &std::path::Path,
-) -> crate::Result<(
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-)> {
-    // Serialize concurrent first-time downloads across processes. hf-hub's own
-    // lock is non-blocking and retries for only ~5s, which is far shorter than
-    // a 100MB+ model download — racing processes would otherwise fail outright
-    // with LockAcquisition. Holding this blocking lock means exactly one process
-    // downloads while the rest wait, then find the model already cached.
-    //
-    // The guard is held for the entire function body via `_download_lock`.
-    let _download_lock = ProcessDownloadLock::acquire(cache_directory, repo_name);
-
-    // Self-heal any stale .lock/.part files from a previous interrupted download
-    // before hf-hub's own lock_file() runs and fails on them.
-    cleanup_stale_locks(cache_directory, repo_name);
-
-    let api = hf_hub::api::sync::ApiBuilder::from_env()
-        .with_cache_dir(cache_directory.to_path_buf())
-        .with_progress(true)
-        .build()
-        .map_err(|e| crate::XbergError::embedding(format!("Failed to create HF API client: {e}")))?;
-
-    let repo = api.model(repo_name.to_string());
-
-    let model_path = repo.get(model_file).map_err(|e| {
-        let hint = if matches!(e, hf_hub::api::sync::ApiError::LockAcquisition(_)) {
-            lock_acquisition_hint(cache_directory, repo_name)
-        } else {
-            String::new()
-        };
-        crate::XbergError::embedding(format!("Failed to download {model_file}: {e}{hint}"))
-    })?;
-
-    let tokenizer_path = repo
-        .get("tokenizer.json")
-        .map_err(|e| crate::XbergError::embedding(format!("Failed to download tokenizer.json: {e}")))?;
-
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| crate::XbergError::embedding(format!("Failed to download config.json: {e}")))?;
-
-    // These are optional — fall back to empty paths that load_tokenizer handles gracefully
-    let special_tokens_path = repo
-        .get("special_tokens_map.json")
-        .unwrap_or_else(|_| std::path::PathBuf::new());
-
-    let tokenizer_config_path = repo
-        .get("tokenizer_config.json")
-        .unwrap_or_else(|_| std::path::PathBuf::new());
-
-    Ok((
-        model_path,
-        tokenizer_path,
-        config_path,
-        special_tokens_path,
-        tokenizer_config_path,
-    ))
-}
-
 /// Get or initialize an embedding engine from cache.
 ///
 /// Downloads model files from HuggingFace if needed, loads the tokenizer,
 /// creates an ORT session, and caches the engine for reuse.
 #[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_arguments)]
 fn get_or_init_engine(
     repo_name: &str,
     model_file: &str,
+    additional_files: &[String],
     pooling: engine::Pooling,
+    max_sequence_length: usize,
     cache_dir: Option<std::path::PathBuf>,
+    progress: crate::core::config::DownloadProgress,
     accel: Option<crate::core::config::acceleration::AccelerationConfig>,
 ) -> crate::Result<Arc<EmbeddingEngine>> {
-    let cache_directory = resolve_cache_dir(cache_dir);
+    let revision = (repo_name == "xberg-io/embedding-models").then_some(EMBEDDING_MODEL_REVISION);
+    let cache_key = crate::model_download::hf_cache_key(cache_dir.as_deref());
     let engine_key = format!(
-        "{repo_name}_{model_file}_{cache_directory}",
-        cache_directory = cache_directory.display()
+        "{repo_name}_{model_file}_{}_{max_sequence_length}_{cache_key}",
+        revision.unwrap_or("main")
     );
 
-    // Fast path: read lock
     {
         match ENGINE_CACHE.read() {
             Ok(cache) => {
@@ -637,109 +423,35 @@ fn get_or_init_engine(
         }
     }
 
-    // Slow path: write lock + initialization
     {
         let mut cache = match ENGINE_CACHE.write() {
             Ok(guard) => guard,
             Err(poison_error) => poison_error.into_inner(),
         };
 
-        // Double-check after acquiring write lock
         if let Some(cached) = cache.get(&engine_key) {
             return Ok(Arc::clone(cached));
         }
 
         crate::ort_discovery::ensure_ort_available();
 
-        // Download model files
-        let (model_path, tokenizer_path, config_path, special_tokens_path, tokenizer_config_path) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                download_model_files(repo_name, model_file, &cache_directory)
-            }))
-            .map_err(|panic_payload| {
-                let panic_msg = panic_to_string(panic_payload);
-                if looks_like_ort_error(&panic_msg) {
-                    crate::XbergError::MissingDependency(format!("ONNX Runtime - {}", onnx_runtime_install_message()))
-                } else {
-                    crate::XbergError::embedding(format!("Model download panicked: {panic_msg}"))
-                }
-            })??;
-
-        // Load tokenizer
-        let tokenizer = load_tokenizer(
-            &tokenizer_path,
-            &config_path,
-            &special_tokens_path,
-            &tokenizer_config_path,
-            512, // default max_length
+        let files = crate::onnx::download_model_files(
+            repo_name,
+            model_file,
+            additional_files,
+            revision,
+            cache_dir.as_deref(),
+            progress,
+            Some(EMBEDDING_SHA256_MANIFEST),
+            embed_err,
         )?;
-
-        // Create ORT session
-        let thread_budget = crate::core::config::concurrency::resolve_thread_budget(None);
-        let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut builder = ort::session::Session::builder()?;
-            builder = builder
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
-                .map_err(|e| ort::Error::new(e.message()))?;
-            builder = builder
-                .with_intra_threads(thread_budget)
-                .map_err(|e| ort::Error::new(e.message()))?;
-            builder = builder
-                .with_inter_threads(1)
-                .map_err(|e| ort::Error::new(e.message()))?;
-            builder = crate::ort_discovery::apply_execution_providers(builder, accel.as_ref())?;
-            builder.commit_from_file(&model_path)
-        }))
-        .map_err(|panic_payload| {
-            let panic_msg = panic_to_string(panic_payload);
-            if looks_like_ort_error(&panic_msg) {
-                crate::XbergError::MissingDependency(format!("ONNX Runtime - {}", onnx_runtime_install_message()))
-            } else {
-                crate::XbergError::embedding(format!("ONNX Runtime initialization panicked: {panic_msg}"))
-            }
-        })?
-        .map_err(|e| {
-            let error_msg = e.to_string();
-            if looks_like_ort_error(&error_msg) {
-                crate::XbergError::MissingDependency(format!("ONNX Runtime - {}", onnx_runtime_install_message()))
-            } else {
-                crate::XbergError::embedding(format!("Failed to create ONNX session: {e}"))
-            }
-        })?;
+        let tokenizer = crate::onnx::load_tokenizer(&files, max_sequence_length, embed_err)?;
+        let session = crate::onnx::build_session(&files.model, accel.as_ref(), embed_err)?;
 
         let new_engine = Arc::new(EmbeddingEngine::new(tokenizer, session, pooling));
         cache.insert(engine_key, Arc::clone(&new_engine));
 
         Ok(new_engine)
-    }
-}
-
-/// Check if an error message looks like an ONNX Runtime missing dependency.
-///
-/// `pub(crate)` for possible reuse by sibling ONNX modules.
-#[cfg(feature = "embeddings")]
-pub(crate) fn looks_like_ort_error(msg: &str) -> bool {
-    msg.contains("onnxruntime")
-        || msg.contains("ORT")
-        || msg.contains("libonnxruntime")
-        || msg.contains("onnxruntime.dll")
-        || msg.contains("Unable to load")
-        || msg.contains("library load failed")
-        || msg.contains("attempting to load")
-        || msg.contains("An error occurred while")
-}
-
-/// Convert a panic payload to a string message.
-///
-/// `pub(crate)` for possible reuse by sibling ONNX modules.
-#[cfg(feature = "embeddings")]
-pub(crate) fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "Unknown panic".to_string()
     }
 }
 
@@ -756,12 +468,24 @@ pub fn warm_model(
     model_type: &crate::core::config::EmbeddingModelType,
     cache_dir: Option<std::path::PathBuf>,
 ) -> crate::Result<()> {
-    let (repo, model_file, pooling) = resolve_model_info(model_type)?;
-    get_or_init_engine(&repo, &model_file, pooling, cache_dir, None).map(|_| ())
+    let (repo, model_file, additional_files, pooling) = resolve_model_info(model_type)?;
+    get_or_init_engine(
+        &repo,
+        &model_file,
+        &additional_files,
+        pooling,
+        DEFAULT_EMBEDDING_MAX_SEQUENCE_LENGTH,
+        cache_dir,
+        // Cache warming takes an `EmbeddingModelType`, not a full config, so there is no
+        // `show_download_progress` to honour here. ~keep
+        crate::core::config::DownloadProgress::SILENT,
+        None,
+    )
+    .map(|_| ())
 }
 
 /// Normalize an embedding vector in-place (L2 normalization).
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "static-embeddings"))]
 fn normalize_in_place(embedding: &mut [f32]) {
     let magnitude: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
     if magnitude > f32::EPSILON {
@@ -782,7 +506,7 @@ fn normalize_in_place(embedding: &mut [f32]) {
 ///
 /// - [`crate::XbergError::Validation`] if `embeddings.len() != expected_count`.
 /// - [`crate::XbergError::Validation`] if any `embeddings[i].len() != expected_dim`.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "static-embeddings"))]
 fn validate_embedding_shape(
     embeddings: &[Vec<f32>],
     expected_count: usize,
@@ -816,15 +540,17 @@ fn validate_embedding_shape(
 }
 
 /// Apply normalization to a batch of embeddings (parallel for large batches).
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "static-embeddings"))]
 fn normalize_embeddings(embeddings: &mut [Vec<f32>]) {
+    #[cfg(not(target_arch = "wasm32"))]
     const PARALLEL_THRESHOLD: usize = 64;
+    #[cfg(not(target_arch = "wasm32"))]
     if embeddings.len() >= PARALLEL_THRESHOLD {
         use rayon::prelude::*;
         embeddings.par_iter_mut().for_each(|v| normalize_in_place(v));
-    } else {
-        embeddings.iter_mut().for_each(|v| normalize_in_place(v));
+        return;
     }
+    embeddings.iter_mut().for_each(|v| normalize_in_place(v));
 }
 
 /// Generate embeddings for text chunks using the specified configuration.
@@ -853,7 +579,18 @@ pub(crate) fn generate_embeddings_for_chunks(
     let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
     let embeddings_result = embed_texts(&texts, config)?;
 
-    // Assign embeddings to chunks.
+    if embeddings_result.len() != chunks.len() {
+        return Err(crate::XbergError::Validation {
+            message: format!(
+                "Embedding generation returned {got} vectors for {expected} chunks; refusing to attach \
+                 embeddings because a positional zip would misalign vectors with the wrong chunks",
+                got = embeddings_result.len(),
+                expected = chunks.len(),
+            ),
+            source: None,
+        });
+    }
+
     for (chunk, embedding) in chunks.iter_mut().zip(embeddings_result) {
         chunk.embedding = Some(embedding);
     }
@@ -896,7 +633,7 @@ pub(crate) fn generate_embeddings_for_chunks(
 /// assert_eq!(embeddings.len(), 2);
 /// assert_eq!(embeddings[0].len(), 768); // balanced preset = 768 dims
 /// ```
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "static-embeddings"))]
 #[doc(hidden)]
 pub fn embed_texts<T: AsRef<str>>(
     texts: &[T],
@@ -906,8 +643,6 @@ pub fn embed_texts<T: AsRef<str>>(
         return Ok(Vec::new());
     }
 
-    // Validate that no individual text is empty — empty strings produce
-    // meaningless embeddings and can cause tokenizer edge-cases.
     for (i, t) in texts.iter().enumerate() {
         if t.as_ref().is_empty() {
             return Err(crate::XbergError::embedding(format!(
@@ -917,41 +652,35 @@ pub fn embed_texts<T: AsRef<str>>(
         }
     }
 
-    // Dispatch: LLM-hosted embeddings bypass the local ONNX engine entirely.
     match &config.model {
-        // TODO(wasm-llm): liter-llm has a wasm-http backend, but embedding
-        // dispatch still needs a wasm runtime path before this cfg can include wasm32.
-        #[cfg(all(feature = "liter-llm", not(target_arch = "wasm32")))]
+        #[cfg(all(feature = "liter-llm", feature = "tokio-runtime", not(target_arch = "wasm32")))]
         crate::core::config::EmbeddingModelType::Llm { llm } => {
             let normalize = config.normalize;
-            // If we're already inside an async runtime (e.g. server mode),
-            // use block_in_place to avoid the "cannot block inside runtime" panic.
-            // Otherwise, create a dedicated single-threaded runtime for the sync path.
             let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 tokio::task::block_in_place(|| {
                     handle.block_on(crate::llm::vlm_embeddings::embed_via_llm(texts, llm, normalize))
                 })
             } else {
-                // No ambient runtime: drive the future on the shared, never-dropped
-                // global runtime. Building a per-call runtime here would panic on
-                // drop when this sync path runs inside a caller's blocking context.
                 crate::core::runtime::global_runtime()?
                     .block_on(crate::llm::vlm_embeddings::embed_via_llm(texts, llm, normalize))
             };
             result.map(|(embeddings, _usage)| embeddings)
         }
-        // TODO(wasm-llm): keep wasm in the MissingDependency branch until hosted
-        // embedding calls are wired for wasm runtimes.
-        #[cfg(any(not(feature = "liter-llm"), target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
         crate::core::config::EmbeddingModelType::Llm { .. } => Err(crate::XbergError::MissingDependency(
-            "LLM embeddings require the 'liter-llm' feature. Rebuild with --features liter-llm".into(),
+            "LLM embeddings are not available on wasm builds".into(),
         )),
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            any(not(feature = "liter-llm"), not(feature = "tokio-runtime"))
+        ))]
+        crate::core::config::EmbeddingModelType::Llm { .. } => Err(crate::XbergError::MissingDependency(
+            "LLM embeddings require the 'liter-llm' and 'tokio-runtime' features. Rebuild with --features liter-llm"
+                .into(),
+        )),
+        #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
         crate::core::config::EmbeddingModelType::Plugin { name } => {
             let registry = crate::plugins::get_embedding_backend_registry();
-            // Clone the Arc out of the lock along with the dimensions captured
-            // at registration (the trait contract requires stability, but we
-            // don't re-ask the backend on every dispatch — that would let a
-            // buggy backend drift past shape validation silently).
             let (backend, expected_dim) = {
                 let guard = registry.read();
                 guard.get_with_dimensions(name)?
@@ -959,12 +688,6 @@ pub fn embed_texts<T: AsRef<str>>(
             let expected_count = texts.len();
             let owned_texts: Vec<String> = texts.iter().map(|t| t.as_ref().to_string()).collect();
 
-            // Dispatch the async `embed` call. Same pattern as the `Llm` arm:
-            // if we're already in a tokio runtime, `block_in_place` to avoid
-            // starving workers; otherwise spin up a single-threaded runtime.
-            // `Some(0)` is treated as "no timeout" rather than "timeout immediately" — a
-            // zero-duration `tokio::time::timeout` fires before the backend gets a chance
-            // to run, which is a surprising config interpretation users rarely intend.
             let timeout = config
                 .max_embed_duration_secs
                 .filter(|&s| s > 0)
@@ -983,9 +706,6 @@ pub fn embed_texts<T: AsRef<str>>(
             let embed_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 tokio::task::block_in_place(|| handle.block_on(embed_future))
             } else {
-                // No ambient runtime: drive the future on the shared, never-dropped
-                // global runtime. Building a per-call runtime here would panic on
-                // drop when this sync path runs inside a caller's blocking context.
                 crate::core::runtime::global_runtime()?.block_on(embed_future)
             };
             let mut embeddings = embed_result?;
@@ -998,34 +718,211 @@ pub fn embed_texts<T: AsRef<str>>(
 
             Ok(embeddings)
         }
+        #[cfg(target_arch = "wasm32")]
+        crate::core::config::EmbeddingModelType::Plugin { .. } => Err(crate::XbergError::MissingDependency(
+            "Synchronous plugin embeddings are not available on wasm builds; use embed_texts_async instead".into(),
+        )),
+        #[cfg(all(not(feature = "tokio-runtime"), not(target_arch = "wasm32")))]
+        crate::core::config::EmbeddingModelType::Plugin { .. } => Err(crate::XbergError::MissingDependency(
+            "Plugin embedding backends require the 'tokio-runtime' feature. Rebuild with --features tokio-runtime"
+                .into(),
+        )),
         crate::core::config::EmbeddingModelType::Preset { .. }
-        | crate::core::config::EmbeddingModelType::Custom { .. } => {
-            // Local ONNX path for Preset and Custom model types.
-            let chunk_count = texts.len();
-            let (repo, model_file, pooling) = resolve_model_info(&config.model)?;
-            let engine = get_or_init_engine(
-                &repo,
-                &model_file,
-                pooling,
-                config.cache_dir.clone(),
-                config.acceleration.clone(),
-            )?;
+        | crate::core::config::EmbeddingModelType::Custom { .. } => embed_texts_local(texts, config),
+    }
+}
 
-            let text_refs: Vec<&str> = texts.iter().map(|t| t.as_ref()).collect();
-            let mut embeddings = engine.embed(&text_refs, config.batch_size).map_err(|e| {
-                crate::XbergError::embedding(format!(
-                    "Failed to generate embeddings for {chunk_count} texts (model={:?}, batch_size={}): {e}",
-                    config.model, config.batch_size
-                ))
-            })?;
+/// Local (non-hosted) dispatch for `Preset`/`Custom` model types: resolves the
+/// preset's [`EmbeddingBackend`] and routes to either the ONNX engine or the
+/// pure-Rust static (model2vec) engine.
+///
+/// Split out of [`embed_texts`] so each backend's `#[cfg]` block stays a single
+/// self-contained arm instead of interleaving `cfg` attributes mid-match.
+#[cfg(any(feature = "embeddings", feature = "static-embeddings"))]
+fn embed_texts_local<T: AsRef<str>>(
+    texts: &[T],
+    config: &crate::core::config::EmbeddingConfig,
+) -> crate::Result<Vec<Vec<f32>>> {
+    let backend = resolve_local_backend(&config.model)?;
 
-            if config.normalize {
-                normalize_embeddings(&mut embeddings);
-            }
+    match backend {
+        #[cfg(feature = "embeddings")]
+        EmbeddingBackend::Onnx => embed_texts_onnx(texts, config),
+        #[cfg(not(feature = "embeddings"))]
+        EmbeddingBackend::Onnx => Err(crate::XbergError::MissingDependency(
+            "ONNX-backed embedding presets require the 'embeddings' feature. Rebuild with --features embeddings".into(),
+        )),
+        #[cfg(feature = "static-embeddings")]
+        EmbeddingBackend::Static => embed_texts_static(texts, config),
+        #[cfg(not(feature = "static-embeddings"))]
+        EmbeddingBackend::Static => Err(crate::XbergError::MissingDependency(
+            "Static (model2vec) embedding presets require the 'static-embeddings' feature. \
+             Rebuild with --features static-embeddings"
+                .into(),
+        )),
+    }
+}
 
-            Ok(embeddings)
+/// Resolve which [`EmbeddingBackend`] a `Preset`/`Custom` model type runs on.
+///
+/// `Custom` model types have no preset metadata to consult — they always
+/// target the ONNX path (matches the historical behavior of `resolve_model_info`
+/// / `get_or_init_engine`, which assume an ONNX-shaped custom HF repo).
+#[cfg(any(feature = "embeddings", feature = "static-embeddings"))]
+fn resolve_local_backend(model_type: &crate::core::config::EmbeddingModelType) -> crate::Result<EmbeddingBackend> {
+    match model_type {
+        crate::core::config::EmbeddingModelType::Preset { name } => get_preset(name)
+            .map(|p| p.backend)
+            .ok_or_else(|| crate::XbergError::embedding(format!("Unknown embedding preset: {name}"))),
+        crate::core::config::EmbeddingModelType::Custom { .. } => Ok(EmbeddingBackend::Onnx),
+        crate::core::config::EmbeddingModelType::Llm { .. }
+        | crate::core::config::EmbeddingModelType::Plugin { .. } => {
+            unreachable!("Llm and Plugin model types are dispatched before embed_texts_local is called")
         }
     }
+}
+
+/// ONNX-backed local embedding path (the historical `Preset`/`Custom` behavior).
+#[cfg(feature = "embeddings")]
+fn embed_texts_onnx<T: AsRef<str>>(
+    texts: &[T],
+    config: &crate::core::config::EmbeddingConfig,
+) -> crate::Result<Vec<Vec<f32>>> {
+    let chunk_count = texts.len();
+    let (repo, model_file, additional_files, pooling) = resolve_model_info(&config.model)?;
+    let engine = get_or_init_engine(
+        &repo,
+        &model_file,
+        &additional_files,
+        pooling,
+        config
+            .max_sequence_length
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_SEQUENCE_LENGTH),
+        config.cache_dir.clone(),
+        config.into(),
+        config.acceleration.clone(),
+    )?;
+
+    let text_refs: Vec<&str> = texts.iter().map(|t| t.as_ref()).collect();
+    let mut embeddings = engine.embed(&text_refs, config.batch_size).map_err(|e| {
+        crate::XbergError::embedding(format!(
+            "Failed to generate embeddings for {chunk_count} texts (model={:?}, batch_size={}): {e}",
+            config.model, config.batch_size
+        ))
+    })?;
+
+    if config.normalize {
+        normalize_embeddings(&mut embeddings);
+    }
+
+    Ok(embeddings)
+}
+
+/// Pure-Rust static (model2vec) local embedding path — no ONNX Runtime. The
+/// only dense-embedding backend available on `no-ort-target` (WASM, Android
+/// x86_64 emulator).
+#[cfg(feature = "static-embeddings")]
+fn embed_texts_static<T: AsRef<str>>(
+    texts: &[T],
+    config: &crate::core::config::EmbeddingConfig,
+) -> crate::Result<Vec<Vec<f32>>> {
+    let crate::core::config::EmbeddingModelType::Preset { name } = &config.model else {
+        return Err(crate::XbergError::embedding(
+            "Static embedding backend only supports EmbeddingModelType::Preset, not Custom".to_string(),
+        ));
+    };
+    let preset =
+        get_preset(name).ok_or_else(|| crate::XbergError::embedding(format!("Unknown embedding preset: {name}")))?;
+
+    let cache_directory = static_engine_cache_dir(config.cache_dir.clone());
+    let engine = get_or_init_static_engine(
+        &preset.model_repo,
+        &preset.model_file,
+        cache_directory.as_deref(),
+        config.into(),
+    )?;
+
+    let text_refs: Vec<&str> = texts.iter().map(|t| t.as_ref()).collect();
+    let mut embeddings = engine.embed(&text_refs, config.batch_size, config.max_sequence_length);
+
+    validate_embedding_shape(&embeddings, texts.len(), preset.dimensions, &preset.name)?;
+
+    if config.normalize {
+        normalize_embeddings(&mut embeddings);
+    }
+
+    Ok(embeddings)
+}
+
+/// Preserve an explicit alternate Hugging Face cache root. `None` delegates
+/// standard cache discovery to hf-hub.
+#[cfg(feature = "static-embeddings")]
+fn static_engine_cache_dir(cache_dir: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    cache_dir
+}
+
+#[cfg(all(feature = "static-embeddings", not(target_arch = "wasm32")))]
+fn static_engine_cache_key(cache_dir: Option<&std::path::Path>) -> String {
+    crate::model_download::hf_cache_key(cache_dir)
+}
+
+#[cfg(all(feature = "static-embeddings", target_arch = "wasm32"))]
+fn static_engine_cache_key(cache_dir: Option<&std::path::Path>) -> String {
+    cache_dir
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "wasm-no-hf-cache".to_string())
+}
+
+#[cfg(feature = "static-embeddings")]
+type CachedStaticEngine = std::sync::Arc<static_engine::StaticEmbeddingEngine>;
+
+#[cfg(feature = "static-embeddings")]
+static STATIC_ENGINE_CACHE: LazyLock<std::sync::RwLock<ahash::AHashMap<String, CachedStaticEngine>>> =
+    LazyLock::new(|| std::sync::RwLock::new(ahash::AHashMap::new()));
+
+/// Get or initialize a static-embedding engine from cache, downloading model
+/// files on first use (native/Android only — see [`static_engine`]).
+#[cfg(feature = "static-embeddings")]
+fn get_or_init_static_engine(
+    repo_name: &str,
+    model_file: &str,
+    cache_directory: Option<&std::path::Path>,
+    progress: crate::core::config::DownloadProgress,
+) -> crate::Result<CachedStaticEngine> {
+    let cache_key = static_engine_cache_key(cache_directory);
+    let engine_key = format!("{repo_name}_{model_file}_{EMBEDDING_MODEL_REVISION}_{cache_key}");
+
+    {
+        match STATIC_ENGINE_CACHE.read() {
+            Ok(cache) => {
+                if let Some(cached) = cache.get(&engine_key) {
+                    return Ok(std::sync::Arc::clone(cached));
+                }
+            }
+            Err(poison) => {
+                if let Some(cached) = poison.get_ref().get(&engine_key) {
+                    return Ok(std::sync::Arc::clone(cached));
+                }
+            }
+        }
+    }
+
+    let mut cache = match STATIC_ENGINE_CACHE.write() {
+        Ok(guard) => guard,
+        Err(poison) => poison.into_inner(),
+    };
+    if let Some(cached) = cache.get(&engine_key) {
+        return Ok(std::sync::Arc::clone(cached));
+    }
+
+    let engine = std::sync::Arc::new(static_engine::download_and_build(
+        repo_name,
+        model_file,
+        cache_directory,
+        progress,
+    )?);
+    cache.insert(engine_key, std::sync::Arc::clone(&engine));
+    Ok(engine)
 }
 
 /// Generate embeddings asynchronously for a list of text strings.
@@ -1057,7 +954,10 @@ pub fn embed_texts<T: AsRef<str>>(
 ///     &EmbeddingConfig::default(),
 /// ).await?;
 /// ```
-#[cfg(all(feature = "tokio-runtime", feature = "embeddings"))]
+#[cfg(all(
+    feature = "tokio-runtime",
+    any(feature = "embeddings", feature = "static-embeddings")
+))]
 #[cfg_attr(alef, alef(skip))]
 pub async fn embed_texts_async<T: AsRef<str> + Send + 'static>(
     texts: Vec<T>,
@@ -1067,10 +967,6 @@ pub async fn embed_texts_async<T: AsRef<str> + Send + 'static>(
         return Ok(Vec::new());
     }
 
-    // Reject empty-string inputs here so every dispatch path (Llm fast path,
-    // Plugin fast path, ONNX via spawn_blocking) rejects them the same way.
-    // The sync `embed_texts` has this check; the async fast paths used to skip
-    // it.
     for (i, t) in texts.iter().enumerate() {
         if t.as_ref().is_empty() {
             return Err(crate::XbergError::embedding(format!(
@@ -1080,21 +976,20 @@ pub async fn embed_texts_async<T: AsRef<str> + Send + 'static>(
         }
     }
 
-    // Dispatch is exhaustive over EmbeddingModelType so a future variant must add an arm here.
-    // Llm is cfg-gated; Plugin awaits the host-language backend directly (no spawn_blocking
-    // round-trip since the trait is async); Preset/Custom fall through to the local ONNX path.
     match &config.model {
-        // TODO(wasm-llm): liter-llm has a wasm-http backend, but embedding
-        // dispatch still needs a wasm runtime path before this cfg can include wasm32.
         #[cfg(all(feature = "liter-llm", not(target_arch = "wasm32")))]
         crate::core::config::EmbeddingModelType::Llm { llm } => {
             return crate::llm::vlm_embeddings::embed_via_llm(&texts, llm, config.normalize)
                 .await
                 .map(|(embeddings, _usage)| embeddings);
         }
-        // TODO(wasm-llm): keep wasm in the MissingDependency branch until hosted
-        // embedding calls are wired for wasm runtimes.
-        #[cfg(any(not(feature = "liter-llm"), target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
+        crate::core::config::EmbeddingModelType::Llm { .. } => {
+            return Err(crate::XbergError::MissingDependency(
+                "LLM embeddings are not available on wasm builds".into(),
+            ));
+        }
+        #[cfg(all(not(feature = "liter-llm"), not(target_arch = "wasm32")))]
         crate::core::config::EmbeddingModelType::Llm { .. } => {
             return Err(crate::XbergError::MissingDependency(
                 "LLM embeddings require the 'liter-llm' feature. Rebuild with --features liter-llm".into(),
@@ -1108,9 +1003,6 @@ pub async fn embed_texts_async<T: AsRef<str> + Send + 'static>(
             };
             let expected_count = texts.len();
             let owned_texts: Vec<String> = texts.iter().map(|t| t.as_ref().to_string()).collect();
-            // `Some(0)` is treated as "no timeout" rather than "timeout immediately" — a
-            // zero-duration `tokio::time::timeout` fires before the backend gets a chance
-            // to run, which is a surprising config interpretation users rarely intend.
             let timeout = config
                 .max_embed_duration_secs
                 .filter(|&s| s > 0)
@@ -1131,29 +1023,73 @@ pub async fn embed_texts_async<T: AsRef<str> + Send + 'static>(
             return Ok(embeddings);
         }
         crate::core::config::EmbeddingModelType::Preset { .. }
-        | crate::core::config::EmbeddingModelType::Custom { .. } => {
-            // Fall through to ONNX path below.
-        }
+        | crate::core::config::EmbeddingModelType::Custom { .. } => {}
     }
 
-    // Acquire a permit from the global semaphore to limit concurrent ONNX
-    // inference calls, preventing resource exhaustion under high fan-out.
     let _permit = EMBED_SEMAPHORE
         .acquire()
         .await
         .map_err(|_| crate::XbergError::embedding("Embedding semaphore closed".to_string()))?;
 
-    // Wrap config in Arc to avoid cloning the entire struct (strings, PathBuf)
-    // into the blocking closure.
-    let config = Arc::new(config.clone());
-    tokio::task::spawn_blocking(move || embed_texts(&texts, &config))
-        .await
-        .map_err(|e| crate::XbergError::embedding(format!("Embedding task panicked: {e}")))?
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let config = Arc::new(config.clone());
+        tokio::task::spawn_blocking(move || embed_texts(&texts, &config))
+            .await
+            .map_err(|e| crate::XbergError::embedding(format!("Embedding task panicked: {e}")))?
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        embed_texts(&texts, config)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fail-closed guarantee: every hosted preset's weight file (and any external-data
+    /// sibling) must be pinned in `presets.sha256sum`, so `download_model_files` can
+    /// verify it. Guards against a preset being added without a matching manifest entry.
+    #[test]
+    fn every_preset_file_is_pinned_in_manifest() {
+        let manifest = crate::model_download::parse_sha256_manifest(EMBEDDING_SHA256_MANIFEST).unwrap();
+        let pinned: std::collections::HashSet<&str> = manifest.iter().map(|(p, _)| p.as_str()).collect();
+        for preset in EMBEDDING_PRESETS.iter() {
+            assert!(
+                pinned.contains(preset.model_file.as_str()),
+                "preset {} model_file {} is not pinned in presets.sha256sum",
+                preset.name,
+                preset.model_file
+            );
+            for sibling in &preset.additional_files {
+                assert!(
+                    pinned.contains(sibling.as_str()),
+                    "preset {} additional file {} is not pinned in presets.sha256sum",
+                    preset.name,
+                    sibling
+                );
+            }
+
+            let model_dir = std::path::Path::new(&preset.model_file)
+                .parent()
+                .and_then(|p| p.to_str())
+                .filter(|s| !s.is_empty());
+            let companion_path = |name: &str| match model_dir {
+                Some(dir) => format!("{dir}/{name}"),
+                None => name.to_string(),
+            };
+            for required in ["tokenizer.json", "config.json"] {
+                let path = companion_path(required);
+                assert!(
+                    pinned.contains(path.as_str()),
+                    "preset {} companion {} is not pinned in presets.sha256sum",
+                    preset.name,
+                    path
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_get_preset() {
@@ -1161,17 +1097,81 @@ mod tests {
         assert!(get_preset("fast").is_some());
         assert!(get_preset("quality").is_some());
         assert!(get_preset("multilingual").is_some());
+        assert!(get_preset("gte-modernbert-base").is_some());
+        assert!(get_preset("lightweight").is_some());
         assert!(get_preset("nonexistent").is_none());
     }
 
     #[test]
     fn test_list_presets() {
         let presets = list_presets();
-        assert_eq!(presets.len(), 4);
+        assert_eq!(presets.len(), 8, "expected exactly 8 presets, got: {presets:?}");
         assert!(presets.iter().any(|n| n == "fast"));
         assert!(presets.iter().any(|n| n == "balanced"));
         assert!(presets.iter().any(|n| n == "quality"));
         assert!(presets.iter().any(|n| n == "multilingual"));
+        assert!(presets.iter().any(|n| n == "gte-modernbert-base"));
+        assert!(presets.iter().any(|n| n == "lightweight"));
+        assert!(presets.iter().any(|n| n == "arctic-embed-m-v2.0"));
+        assert!(presets.iter().any(|n| n == "qwen3-embedding-0.6b"));
+    }
+
+    #[test]
+    fn asymmetric_presets_carry_query_prefix_and_external_data() {
+        let arctic = get_preset("arctic-embed-m-v2.0").expect("arctic preset must exist");
+        assert_eq!(arctic.query_prefix.as_deref(), Some("query: "));
+        assert_eq!(arctic.pooling, "cls");
+        assert_eq!(arctic.dimensions, 768);
+        assert_eq!(
+            arctic.additional_files,
+            vec!["arctic-embed-m-v2.0/model.onnx.data".to_string()]
+        );
+
+        let qwen3 = get_preset("qwen3-embedding-0.6b").expect("qwen3-embedding preset must exist");
+        assert_eq!(qwen3.query_prefix, None);
+        assert_eq!(qwen3.pooling, "last");
+        assert_eq!(qwen3.dimensions, 1024);
+        assert_eq!(
+            qwen3.additional_files,
+            vec!["qwen3-embedding-0.6b/model.onnx.data".to_string()]
+        );
+    }
+
+    #[test]
+    fn lightweight_preset_uses_static_backend() {
+        let preset = get_preset("lightweight").expect("lightweight preset must exist");
+        assert_eq!(preset.backend, EmbeddingBackend::Static);
+        assert_eq!(preset.dimensions, 256);
+        assert_eq!(preset.model_repo, "xberg-io/embedding-models");
+    }
+
+    #[test]
+    fn every_onnx_preset_defaults_to_onnx_backend() {
+        for preset in EMBEDDING_PRESETS.iter().filter(|p| p.name != "lightweight") {
+            assert_eq!(
+                preset.backend,
+                EmbeddingBackend::Onnx,
+                "preset '{}' should default to the Onnx backend",
+                preset.name
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_backend_deserializes_missing_field_as_onnx() {
+        // deserialize, defaulting to Onnx via #[serde(default)].
+        let json = r#"{
+            "name": "custom",
+            "chunk_size": 512,
+            "overlap": 50,
+            "model_repo": "org/repo",
+            "pooling": "mean",
+            "model_file": "model.onnx",
+            "dimensions": 384,
+            "description": "test"
+        }"#;
+        let preset: EmbeddingPreset = serde_json::from_str(json).expect("should deserialize without backend field");
+        assert_eq!(preset.backend, EmbeddingBackend::Onnx);
     }
 
     #[test]
@@ -1200,12 +1200,12 @@ mod tests {
     #[test]
     fn test_preset_model_repos() {
         let fast = get_preset("fast").unwrap();
-        assert_eq!(fast.model_repo, "Xenova/all-MiniLM-L6-v2");
+        assert_eq!(fast.model_repo, "xberg-io/embedding-models");
         assert_eq!(fast.pooling, "mean");
-        assert_eq!(fast.model_file, "onnx/model_quantized.onnx");
+        assert_eq!(fast.model_file, "all-MiniLM-L6-v2/model_quantized.onnx");
 
         let balanced = get_preset("balanced").unwrap();
-        assert_eq!(balanced.model_repo, "Xenova/bge-base-en-v1.5");
+        assert_eq!(balanced.model_repo, "xberg-io/embedding-models");
         assert_eq!(balanced.pooling, "cls");
     }
 
@@ -1247,201 +1247,17 @@ mod tests {
     async fn test_embed_texts_llm_inside_runtime_does_not_panic() {
         let config = crate::core::config::EmbeddingConfig {
             model: crate::core::config::EmbeddingModelType::Llm {
-                llm: crate::core::config::LlmConfig {
+                llm: Box::new(crate::core::config::LlmConfig {
                     model: "openai/text-embedding-3-small".to_string(),
                     api_key: Some("invalid-key-for-test".to_string()),
-                    base_url: None,
-                    timeout_secs: None,
-                    max_retries: None,
-                    temperature: None,
-                    max_tokens: None,
-                },
+                    ..Default::default()
+                }),
             },
             ..Default::default()
         };
-        // This should return an error (bad API key), NOT panic.
         let result = tokio::task::spawn_blocking(move || embed_texts(&["test text"], &config)).await;
         assert!(result.is_ok(), "spawn_blocking should not panic");
-        // The inner result should be an error (auth failure), not a panic
         assert!(result.unwrap().is_err(), "Expected auth error, not success");
-    }
-
-    // ── Stale lock cleanup tests ──────────────────────────────────────────────
-
-    /// Helper: write a file with a modified-time set to `age` seconds in the past.
-    fn write_file_aged(path: &std::path::Path, age_secs: u64) {
-        std::fs::write(path, b"").unwrap();
-        let mtime = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(age_secs))
-            .unwrap();
-        let ft = filetime::FileTime::from_system_time(mtime);
-        filetime::set_file_mtime(path, ft).unwrap();
-    }
-
-    #[test]
-    fn test_cleanup_stale_locks_nonexistent_dir_is_noop() {
-        // Should not panic when the blobs dir does not exist.
-        let tmp = tempfile::tempdir().unwrap();
-        cleanup_stale_locks(tmp.path(), "org/model");
-    }
-
-    #[test]
-    fn test_cleanup_stale_locks_removes_old_lock_and_part() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blobs = tmp.path().join("models--org--model").join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
-
-        let lock = blobs.join("abc123.lock");
-        let part = blobs.join("abc123.part");
-
-        // Write files aged beyond the timeout.
-        let old_secs = STALE_DOWNLOAD_TIMEOUT.as_secs() + 60;
-        write_file_aged(&lock, old_secs);
-        write_file_aged(&part, old_secs);
-
-        cleanup_stale_locks(tmp.path(), "org/model");
-
-        assert!(!lock.exists(), ".lock should have been removed");
-        assert!(!part.exists(), ".part should have been removed");
-    }
-
-    #[test]
-    fn test_cleanup_stale_locks_leaves_recent_files_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blobs = tmp.path().join("models--org--model").join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
-
-        let lock = blobs.join("def456.lock");
-        let part = blobs.join("def456.part");
-
-        // Write files that are only 60 seconds old — well within the timeout.
-        write_file_aged(&lock, 60);
-        write_file_aged(&part, 60);
-
-        cleanup_stale_locks(tmp.path(), "org/model");
-
-        assert!(lock.exists(), ".lock for active download must not be removed");
-        assert!(part.exists(), ".part for active download must not be removed");
-    }
-
-    #[test]
-    fn test_cleanup_stale_locks_removes_lock_when_no_part() {
-        // When only a .lock file exists (download killed before first byte),
-        // staleness is assessed from the .lock file's own mtime.
-        let tmp = tempfile::tempdir().unwrap();
-        let blobs = tmp.path().join("models--org--model").join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
-
-        let lock = blobs.join("ghi789.lock");
-        let old_secs = STALE_DOWNLOAD_TIMEOUT.as_secs() + 60;
-        write_file_aged(&lock, old_secs);
-
-        cleanup_stale_locks(tmp.path(), "org/model");
-
-        assert!(!lock.exists(), "stale .lock with no .part should be removed");
-    }
-
-    #[test]
-    fn test_lock_acquisition_hint_contains_recovery_commands() {
-        let cache = std::path::Path::new("/tmp/xberg/embeddings");
-        let hint = lock_acquisition_hint(cache, "intfloat/multilingual-e5-base");
-
-        assert!(hint.contains("rm -f"), "hint must include rm command");
-        assert!(
-            hint.contains("models--intfloat--multilingual-e5-base"),
-            "hint must include the repo folder name"
-        );
-        assert!(hint.contains("*.lock"), "hint must mention .lock pattern");
-        assert!(hint.contains("*.part"), "hint must mention .part pattern");
-    }
-
-    /// The process download lock can be acquired and creates its lock file in
-    /// the expected `models--<repo>` directory.
-    #[test]
-    fn test_process_download_lock_acquire_creates_lock_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let guard = ProcessDownloadLock::acquire(tmp.path(), "org/model");
-
-        // On unix the lock is acquired; on other targets acquisition is a
-        // graceful no-op (returns None) and behavior falls back to hf-hub.
-        if cfg!(target_family = "unix") {
-            assert!(guard.is_some(), "lock should be acquired on unix");
-            let lock_path = tmp.path().join("models--org--model").join(".kbz-download.lock");
-            assert!(lock_path.exists(), "lock file must be created at {lock_path:?}");
-        }
-        drop(guard);
-    }
-
-    /// Two concurrent acquisitions of the same model's download lock serialize:
-    /// the second blocks until the first is released, so their critical
-    /// sections never overlap. This is the regression guard for the e2e
-    /// `LockAcquisition` failure across parallel worker processes/threads.
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn test_process_download_lock_serializes_concurrent_acquirers() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::time::Duration;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let cache_dir: Arc<std::path::PathBuf> = Arc::new(tmp.path().to_path_buf());
-
-        // Tracks whether two critical sections were ever observed concurrently.
-        let inside = Arc::new(AtomicUsize::new(0));
-        let overlap_detected = Arc::new(AtomicBool::new(false));
-
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            let cache_dir = Arc::clone(&cache_dir);
-            let inside = Arc::clone(&inside);
-            let overlap_detected = Arc::clone(&overlap_detected);
-            handles.push(std::thread::spawn(move || {
-                let guard = ProcessDownloadLock::acquire(&cache_dir, "org/model")
-                    .expect("lock acquisition must succeed on unix");
-
-                // Simulate the download critical section. If the lock truly
-                // serializes callers, the in-flight count never exceeds 1.
-                let count = inside.fetch_add(1, Ordering::SeqCst) + 1;
-                if count > 1 {
-                    overlap_detected.store(true, Ordering::SeqCst);
-                }
-                std::thread::sleep(Duration::from_millis(20));
-                inside.fetch_sub(1, Ordering::SeqCst);
-
-                drop(guard);
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        assert!(
-            !overlap_detected.load(Ordering::SeqCst),
-            "download lock must serialize concurrent acquirers — critical sections overlapped"
-        );
-        assert_eq!(
-            inside.load(Ordering::SeqCst),
-            0,
-            "all critical sections must have exited"
-        );
-    }
-
-    /// The lock is released when the guard is dropped, so a subsequent acquirer
-    /// of the same model proceeds without blocking forever.
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn test_process_download_lock_released_on_drop() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let first = ProcessDownloadLock::acquire(tmp.path(), "org/model");
-        assert!(first.is_some(), "first acquisition must succeed");
-        drop(first);
-
-        // After the first guard is dropped the lock is free; re-acquiring it
-        // must succeed promptly rather than deadlock.
-        let second = ProcessDownloadLock::acquire(tmp.path(), "org/model");
-        assert!(second.is_some(), "lock must be re-acquirable after release");
     }
 
     /// Regression test for #683: GraphOptimizationLevel::Level3 maps to
@@ -1458,8 +1274,8 @@ mod tests {
         assert_ne!(level3_repr, "All", "Level3 must not be the same variant as All");
     }
 
-    // --- Plugin variant dispatch tests -----------------------------------
-
+    // uses `#[tokio::test]` throughout. A `static-embeddings`-only build (no
+    #[cfg(feature = "tokio-runtime")]
     mod plugin_dispatch {
         use crate::plugins::embedding::{register_embedding_backend, unregister_embedding_backend};
         use crate::plugins::{EmbeddingBackend, Plugin};
@@ -1478,7 +1294,7 @@ mod tests {
             name: String,
             reported_dimensions: usize,
             vector_dimensions: usize,
-            response_count: Option<usize>, // None → one vector per input (correct); Some(n) → force n
+            response_count: Option<usize>,
             panic_on_embed: bool,
             fill_value: f32,
         }
@@ -1590,7 +1406,7 @@ mod tests {
                 name: name.clone(),
                 reported_dimensions: 3,
                 vector_dimensions: 3,
-                response_count: Some(2), // 2 vectors for 3 inputs
+                response_count: Some(2),
                 panic_on_embed: false,
                 fill_value: 0.0,
             }))
@@ -1613,7 +1429,7 @@ mod tests {
             register_embedding_backend(Arc::new(ConfigurableBackend {
                 name: name.clone(),
                 reported_dimensions: 4,
-                vector_dimensions: 5, // wrong
+                vector_dimensions: 5,
                 response_count: None,
                 panic_on_embed: false,
                 fill_value: 0.0,
@@ -1636,7 +1452,7 @@ mod tests {
                 reported_dimensions: 3,
                 vector_dimensions: 3,
                 response_count: None,
-                panic_on_embed: true, // flag now means "return Plugin error"
+                panic_on_embed: true,
                 fill_value: 0.0,
             }))
             .unwrap();
@@ -1650,8 +1466,6 @@ mod tests {
 
         #[test]
         fn empty_texts_short_circuits_before_backend_call() {
-            // No backend registered under this name — if we don't short-circuit,
-            // the dispatch would fail with a Plugin-not-registered error.
             let config = config_for("never-looked-up", false);
             let texts: Vec<&str> = vec![];
             let vectors = super::super::embed_texts(&texts, &config).unwrap();
@@ -1661,9 +1475,6 @@ mod tests {
         #[test]
         fn concurrent_registration_stress() {
             use std::thread;
-            // Stress-test the registry under concurrent registrations.
-            // 8 threads each register 10 uniquely-named backends. Assert final
-            // list() contains all 80 + each dispatch still resolves cleanly.
             let mut handles = Vec::new();
             let prefix = unique_name("stress");
             for t in 0..8 {
@@ -1691,12 +1502,10 @@ mod tests {
             let registered = list.iter().filter(|n| n.starts_with(&prefix)).count();
             assert_eq!(registered, 80, "expected 80 registrations, got {registered}");
 
-            // Dispatch should still resolve any of them.
             let sample = format!("{prefix}-t0-i0");
             let vectors = super::super::embed_texts(&["probe"], &config_for(&sample, false)).unwrap();
             assert_eq!(vectors.len(), 1);
 
-            // Clean up the 80 we created.
             for t in 0..8 {
                 for i in 0..10 {
                     let name = format!("{prefix}-t{t}-i{i}");
@@ -1742,7 +1551,6 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn timeout_fires_when_backend_exceeds_duration() {
             let name = unique_name("timeout");
-            // Backend sleeps 2 seconds; timeout is 1 second.
             register_embedding_backend(Arc::new(SlowBackend {
                 name: name.clone(),
                 sleep_duration: std::time::Duration::from_secs(2),
@@ -1771,10 +1579,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn async_dispatch_applies_normalization_when_enabled() {
-            // Complements normalization_applied_when_enabled (sync path): makes
-            // sure the async fast path calls normalize_embeddings too. Any
-            // refactor that drops the normalize step only on one path gets
-            // caught.
             let name = unique_name("async-normalize");
             register_embedding_backend(Arc::new(ConfigurableBackend {
                 name: name.clone(),
@@ -1782,7 +1586,7 @@ mod tests {
                 vector_dimensions: 2,
                 response_count: None,
                 panic_on_embed: false,
-                fill_value: 3.0, // non-unit-norm — must be normalized to unit length
+                fill_value: 3.0,
             }))
             .unwrap();
 
@@ -1802,12 +1606,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn async_dispatch_smoke_test() {
-            // Smoke-test embed_texts_async for the Plugin variant — routes
-            // through the async fast path, returns the expected shape. A
-            // regression that silently re-routed Plugin through spawn_blocking
-            // would still pass this test (it only checks output); keep that
-            // stronger property enforced by code review + the normalize +
-            // timeout tests above.
             let name = unique_name("async-path");
             register_embedding_backend(Arc::new(ConfigurableBackend {
                 name: name.clone(),
@@ -1832,8 +1630,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn disabled_timeout_allows_slow_backend_to_complete() {
-            // Complement to the timeout test: with None, a slow backend must
-            // still succeed (sleep under test threshold).
             let name = unique_name("no-timeout");
             register_embedding_backend(Arc::new(SlowBackend {
                 name: name.clone(),
@@ -1855,9 +1651,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn zero_max_duration_treated_as_disabled() {
-            // `Some(0)` is a config nonsense value — a zero-duration timeout would
-            // fire before the backend ever runs. Dispatch should treat it as
-            // equivalent to `None` (no timeout) instead of erroring on every call.
             let name = unique_name("zero-timeout");
             register_embedding_backend(Arc::new(SlowBackend {
                 name: name.clone(),
@@ -1889,7 +1682,7 @@ mod tests {
                 vector_dimensions: 2,
                 response_count: None,
                 panic_on_embed: false,
-                fill_value: 3.0, // non-unit-norm input
+                fill_value: 3.0,
             }))
             .unwrap();
 
@@ -1904,8 +1697,6 @@ mod tests {
             unregister_embedding_backend(&name).unwrap();
         }
     }
-
-    // --- validate_embedding_shape direct tests ---------------------------
 
     #[test]
     fn validate_shape_accepts_correct_response() {

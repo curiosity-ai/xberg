@@ -1,12 +1,14 @@
 //! Render an `InternalDocument` to Djot markup.
 
+use crate::types::annotations::PdfAnnotation;
 use crate::types::document_structure::AnnotationKind;
 use crate::types::internal::{ElementKind, InternalDocument};
 
 use super::common::{
-    FootnoteCollector, NestingKind, RenderState, ensure_trailing_newline, finalize_output, get_admonition_kind,
-    get_admonition_title, get_language, handle_container_end, is_body_element, is_container_end, normalize_inline_text,
-    parse_metadata_entries, push_with_bq, render_annotated_text_with_plain, render_table_djot,
+    FootnoteCollector, NestingKind, RenderState, annotation_display_text, annotation_type_label,
+    ensure_trailing_newline, finalize_output, get_admonition_kind, get_admonition_title, get_language,
+    handle_container_end, is_body_element, is_container_end, normalize_inline_text, parse_metadata_entries,
+    push_with_bq, render_annotated_text_with_plain, render_table_djot,
 };
 
 /// Render an `InternalDocument` to Djot markup.
@@ -82,6 +84,12 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
             }
             ElementKind::Table { table_index } => {
                 if let Some(table) = doc.tables.get(table_index as usize) {
+                    if doc.table_anchors
+                        && let Some(table_id) = table.table_id.as_deref()
+                    {
+                        let anchor = format!("[TABLE:{table_id}]\n\n");
+                        push_with_bq(&mut out, &anchor, bq_depth);
+                    }
                     let table_str = if !table.cells.is_empty() {
                         render_table_djot(&table.cells)
                     } else {
@@ -99,7 +107,6 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
                     .and_then(|img| img.description.as_deref())
                     .unwrap_or(elem.text.as_str());
 
-                // Skip orphaned elements only when they carry no descriptive text
                 if image.is_none() && desc.is_empty() {
                     continue;
                 }
@@ -116,8 +123,8 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
                 let block = format!("![{}]({})\n\n", desc, url);
                 push_with_bq(&mut out, &block, bq_depth);
 
-                // If the image has an OCR result, append its content
-                if let Some(ocr_result) = image.and_then(|img| img.ocr_result.as_ref())
+                if elem.should_render_image_ocr()
+                    && let Some(ocr_result) = image.and_then(|img| img.ocr_result.as_ref())
                     && !ocr_result.content.is_empty()
                 {
                     let block = format!("{}\n\n", ocr_result.content);
@@ -131,15 +138,11 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
                     out.push(']');
                 }
             }
-            ElementKind::FootnoteDefinition => {
-                // Skip in body pass
-            }
-            ElementKind::Citation => {
-                // Rendered at end
-            }
-            ElementKind::PageBreak => {
-                // Structural metadata — paragraph breaks provide separation.
-            }
+            ElementKind::FootnoteDefinition => {}
+            ElementKind::CommentRef => {}
+            ElementKind::CommentDefinition => {}
+            ElementKind::Citation => {}
+            ElementKind::PageBreak => {}
             ElementKind::Slide { number: _ } => {
                 if elem.text.is_empty() {
                     push_with_bq(&mut out, "\n---\n\n", bq_depth);
@@ -226,7 +229,6 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
         }
     }
 
-    // Footnote definitions
     let defs = footnotes.definitions();
     if !defs.is_empty() {
         out.push('\n');
@@ -239,7 +241,6 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
         }
     }
 
-    // Citations
     for elem in &doc.elements {
         if elem.kind == ElementKind::Citation {
             let key = elem.anchor.as_deref().unwrap_or("?");
@@ -251,7 +252,64 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
         }
     }
 
+    // Comment definitions (#300) aren't tracked by `FootnoteCollector`, so surface
+    // them the same way `Citation` is above — keyed by anchor rather than assigned
+    // a sequential number — instead of silently dropping the comment body.
+    for elem in &doc.elements {
+        if elem.kind == ElementKind::CommentDefinition {
+            let key = elem.anchor.as_deref().unwrap_or("?");
+            out.push_str("[^");
+            out.push_str(key);
+            out.push_str("]: ");
+            out.push_str(&elem.text);
+            out.push_str("\n\n");
+        }
+    }
+
+    if let Some(annotations) = doc.annotations.as_deref() {
+        let block = render_annotations_djot(annotations);
+        if !block.is_empty() {
+            if !out.trim_end().is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&block);
+        }
+    }
+
     finalize_output(out)
+}
+
+/// Render the document-level PDF annotations (issue #63) as a Djot section:
+/// a `## Annotations` heading followed by one bullet per annotation.
+///
+/// Returns an empty string when `annotations` is empty.
+fn render_annotations_djot(annotations: &[PdfAnnotation]) -> String {
+    if annotations.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("## Annotations\n\n");
+    for annotation in annotations {
+        out.push_str("- _");
+        out.push_str(annotation_type_label(annotation.annotation_type));
+        out.push_str("_ (page ");
+        out.push_str(&annotation.page_number.to_string());
+        out.push(')');
+
+        if let Some(author) = annotation.author.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(" by ");
+            out.push_str(author);
+        }
+
+        if let Some(text) = annotation_display_text(annotation) {
+            out.push_str(": ");
+            out.push_str(text);
+        }
+
+        out.push('\n');
+    }
+    out.push('\n');
+    out
 }
 
 /// Render text with djot inline annotations, normalizing inline text.
@@ -268,7 +326,7 @@ fn render_djot_annotated(text: &str, annotations: &[crate::types::document_struc
             match kind {
                 AnnotationKind::Bold => format!("*{}*", normalized),
                 AnnotationKind::Italic => format!("_{}_", normalized),
-                AnnotationKind::Code => format!("`{}`", span), // Don't normalize code spans
+                AnnotationKind::Code => format!("`{}`", span),
                 AnnotationKind::Strikethrough => format!("{{-{}-}}", normalized),
                 AnnotationKind::Underline => format!("[{}]{{.underline}}", normalized),
                 AnnotationKind::Subscript => format!("~{}~", normalized),
@@ -295,10 +353,6 @@ mod tests {
     use super::*;
     use crate::types::document_structure::{AnnotationKind, ContentLayer, TextAnnotation};
     use crate::types::internal_builder::InternalDocumentBuilder;
-
-    // ========================================================================
-    // 1. Element rendering tests
-    // ========================================================================
 
     #[test]
     fn test_render_djot_title() {
@@ -382,7 +436,6 @@ mod tests {
         b.push_code("print('hi')", Some("python"), None, None);
         let doc = b.build();
         let out = render_djot(&doc);
-        // No space between fence and language specifier (parity with markdown)
         assert!(out.contains("```python\n"), "got: {}", out);
         assert!(out.contains("print('hi')"), "got: {}", out);
     }
@@ -443,7 +496,6 @@ mod tests {
 
     #[test]
     fn test_render_djot_page_break() {
-        // PageBreak is structural metadata — not rendered as thematic break.
         let mut b = InternalDocumentBuilder::new("test");
         b.push_page_break();
         let doc = b.build();
@@ -508,7 +560,6 @@ mod tests {
         b.push_metadata_block(&entries, None);
         let doc = b.build();
         let out = render_djot(&doc);
-        // Djot uses single * for emphasis in metadata
         assert!(out.contains("*Author*: Bob"), "got: {}", out);
     }
 
@@ -519,10 +570,6 @@ mod tests {
         let out = render_djot(&doc);
         assert_eq!(out, "");
     }
-
-    // ========================================================================
-    // 2. Annotation tests
-    // ========================================================================
 
     #[test]
     fn test_render_djot_bold_annotation() {
@@ -535,7 +582,6 @@ mod tests {
         b.push_paragraph("Hello world", ann, None, None);
         let doc = b.build();
         let out = render_djot(&doc);
-        // Djot uses *text* for bold (strong)
         assert!(out.contains("*Hello* world"), "got: {}", out);
     }
 
@@ -550,7 +596,6 @@ mod tests {
         b.push_paragraph("Hello world", ann, None, None);
         let doc = b.build();
         let out = render_djot(&doc);
-        // Djot uses _text_ for italic (emphasis)
         assert!(out.contains("_Hello_ world"), "got: {}", out);
     }
 
@@ -657,10 +702,6 @@ mod tests {
         assert!(!out.contains("_world_"), "overlapping should be skipped, got: {}", out);
     }
 
-    // ========================================================================
-    // 3. Nested structure tests
-    // ========================================================================
-
     #[test]
     fn test_render_djot_blockquote() {
         let mut b = InternalDocumentBuilder::new("test");
@@ -697,10 +738,6 @@ mod tests {
         let out = render_djot(&doc);
         assert!(out.contains("> - Item in quote"), "got: {}", out);
     }
-
-    // ========================================================================
-    // 4. Footnote tests
-    // ========================================================================
 
     #[test]
     fn test_render_djot_footnote() {
@@ -741,10 +778,6 @@ mod tests {
         assert!(out.contains("[^doe2023]: Doe 2023"), "got: {}", out);
     }
 
-    // ========================================================================
-    // 5. Text normalization tests
-    // ========================================================================
-
     #[test]
     fn test_render_djot_normalizes_multiple_spaces() {
         let mut b = InternalDocumentBuilder::new("test");
@@ -774,7 +807,6 @@ mod tests {
     #[test]
     fn test_render_djot_strips_control_characters() {
         let mut b = InternalDocumentBuilder::new("test");
-        // STX (0x02) is emitted by pdf_oxide as a soft-hyphen marker
         b.push_paragraph("Hello\x02world", vec![], None, None);
         let doc = b.build();
         let out = render_djot(&doc);
@@ -845,10 +877,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // 6. Structural parity tests (djot vs markdown)
-    // ========================================================================
-
     #[test]
     fn test_djot_markdown_heading_parity() {
         use crate::rendering::render_markdown;
@@ -862,7 +890,6 @@ mod tests {
         let djot_out = render_djot(&doc);
         let md_out = render_markdown(&doc);
 
-        // Both should have the same heading markers
         assert!(djot_out.contains("# Title"), "djot heading 1, got: {}", djot_out);
         assert!(md_out.contains("# Title"), "md heading 1, got: {}", md_out);
         assert!(djot_out.contains("## Section"), "djot heading 2, got: {}", djot_out);
@@ -887,7 +914,6 @@ mod tests {
         let djot_out = render_djot(&doc);
         let md_out = render_markdown(&doc);
 
-        // Both formats should contain identical table cell content
         for cell in &["Name", "Value", "Alpha", "100", "Beta", "200"] {
             assert!(
                 djot_out.contains(cell),
@@ -917,12 +943,9 @@ mod tests {
         let djot_out = render_djot(&doc);
         let md_out = render_markdown(&doc);
 
-        // Count non-empty lines (blocks) in each output
         let djot_blocks: Vec<&str> = djot_out.lines().filter(|l| !l.trim().is_empty()).collect();
         let md_blocks: Vec<&str> = md_out.lines().filter(|l| !l.trim().is_empty()).collect();
 
-        // Djot may have more blocks than markdown (no paragraph consolidation),
-        // but should have at least as many.
         assert!(
             djot_blocks.len() >= md_blocks.len() - 1,
             "djot block count ({}) should be close to markdown ({})\ndjot:\n{}\nmd:\n{}",
@@ -932,7 +955,6 @@ mod tests {
             md_out,
         );
 
-        // Both should contain the same text content
         for text in &[
             "Title",
             "First paragraph",
@@ -953,11 +975,11 @@ mod tests {
         let mut b = InternalDocumentBuilder::new("test");
         b.push_paragraph("Only text.", vec![], None, None);
         b.push_element(crate::types::internal::InternalElement::text(
-            ElementKind::Image { image_index: 99 }, // no such image
+            ElementKind::Image { image_index: 99 },
             "",
             0,
         ));
-        let doc = b.build(); // doc.images is empty
+        let doc = b.build();
         let out = render_djot(&doc);
         assert!(
             !out.contains("image_99"),

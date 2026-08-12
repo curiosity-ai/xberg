@@ -3,6 +3,7 @@
 //! Tests for ZIP, TAR, TAR.GZ, and 7z archive extraction.
 //! Validates metadata extraction, content extraction, nested archives, and error handling.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "archives")]
 
 use std::io::{Cursor, Write};

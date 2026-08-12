@@ -25,7 +25,6 @@ pub fn find_all(text: &str) -> Vec<PatternMatch> {
             let group: u16 = cap.get(2)?.as_str().parse().ok()?;
             let serial: u16 = cap.get(3)?.as_str().parse().ok()?;
 
-            // SSA exclusions: 000, 666, 900-999 areas; 00 group; 0000 serial.
             if area == 0 || area == 666 || (900..=999).contains(&area) {
                 return None;
             }

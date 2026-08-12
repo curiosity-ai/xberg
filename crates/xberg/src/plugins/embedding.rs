@@ -172,7 +172,7 @@ mod tests {
     use super::*;
     use crate::XbergError;
     use crate::plugins::Plugin;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::plugins::registry::test_support::EmbeddingRegistryGuard;
 
     struct MockEmbeddingBackend {
         name: String,
@@ -205,45 +205,48 @@ mod tests {
         }
     }
 
-    /// Unique per-test name so parallel test runs don't collide in the shared
-    /// global `EMBEDDING_BACKEND_REGISTRY`.
-    fn unique_name(suffix: &str) -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("mock-{suffix}-{id}")
-    }
-
     #[test]
     fn register_list_unregister_roundtrip() {
-        let name = unique_name("roundtrip");
+        let _guard = EmbeddingRegistryGuard::acquire();
+        let name = "mock-roundtrip".to_string();
         register_embedding_backend(Arc::new(MockEmbeddingBackend {
             name: name.clone(),
             dimensions: 384,
         }))
         .unwrap();
 
-        assert!(list_embedding_backends().unwrap().contains(&name));
+        assert_eq!(list_embedding_backends().unwrap(), vec![name.clone()]);
 
         unregister_embedding_backend(&name).unwrap();
-        assert!(!list_embedding_backends().unwrap().contains(&name));
+        assert!(list_embedding_backends().unwrap().is_empty());
     }
 
     #[test]
     fn empty_name_rejected_via_global_api() {
+        let _guard = EmbeddingRegistryGuard::acquire();
         let result = register_embedding_backend(Arc::new(MockEmbeddingBackend {
             name: String::new(),
             dimensions: 384,
         }));
         assert!(matches!(result, Err(XbergError::Validation { .. })));
+        assert!(
+            list_embedding_backends().unwrap().is_empty(),
+            "a rejected registration must not leave anything behind"
+        );
     }
 
     #[test]
     fn zero_dimensions_rejected_via_global_api() {
+        let _guard = EmbeddingRegistryGuard::acquire();
         let result = register_embedding_backend(Arc::new(MockEmbeddingBackend {
-            name: unique_name("zero"),
+            name: "mock-zero".to_string(),
             dimensions: 0,
         }));
         assert!(matches!(result, Err(XbergError::Validation { .. })));
+        assert!(
+            list_embedding_backends().unwrap().is_empty(),
+            "a rejected registration must not leave anything behind"
+        );
     }
 
     #[tokio::test]
@@ -262,16 +265,17 @@ mod tests {
 
     #[test]
     fn register_list_clear_list_roundtrip() {
-        let name = unique_name("clear");
+        let _guard = EmbeddingRegistryGuard::acquire();
+        let name = "mock-clear".to_string();
         register_embedding_backend(Arc::new(MockEmbeddingBackend {
             name: name.clone(),
             dimensions: 128,
         }))
         .unwrap();
 
-        assert!(list_embedding_backends().unwrap().contains(&name));
+        assert_eq!(list_embedding_backends().unwrap(), vec![name]);
 
         clear_embedding_backends().unwrap();
-        assert!(!list_embedding_backends().unwrap().contains(&name));
+        assert!(list_embedding_backends().unwrap().is_empty());
     }
 }

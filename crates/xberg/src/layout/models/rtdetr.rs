@@ -2,8 +2,11 @@ use std::time::Instant;
 
 use image::RgbImage;
 use ndarray::{Array, Array2, Array4};
-use ort::{inputs, session::Session, value::Tensor};
 
+use crate::core::config::acceleration::AccelerationConfig;
+#[cfg(target_os = "macos")]
+use crate::core::config::acceleration::ExecutionProviderType;
+use crate::inference::{InferenceSession, InferenceTensor, default_backend};
 use crate::layout::error::LayoutError;
 use crate::layout::models::LayoutModel;
 use crate::layout::preprocessing;
@@ -15,13 +18,26 @@ const DEFAULT_THRESHOLD: f32 = 0.3;
 /// RT-DETR input resolution.
 const INPUT_SIZE: u32 = 640;
 
+pub(crate) fn effective_acceleration(accel: Option<&AccelerationConfig>) -> Option<AccelerationConfig> {
+    // The current RT-DETR export fails under CoreML; keep auto reliable while preserving explicit CoreML.
+    #[cfg(target_os = "macos")]
+    if accel.is_none_or(|config| config.provider == ExecutionProviderType::Auto) {
+        return Some(AccelerationConfig {
+            provider: ExecutionProviderType::Cpu,
+            device_id: accel.map_or(0, |config| config.device_id),
+        });
+    }
+
+    accel.cloned()
+}
+
 /// Docling RT-DETR v2 layout detection model.
 ///
 /// This model is NMS-free (transformer-based end-to-end detection).
 ///
 /// Input tensors:
 ///   - `images`:            f32 [batch, 3, 640, 640]  (preprocessed pixel data)
-///   - `orig_target_sizes`: i64 [batch, 2]            ([height, width] of original image)
+///   - `orig_target_sizes`: i64 [batch, 2]            ([height, width] of source image)
 ///
 /// Output tensors:
 ///   - `labels`: i64 [batch, num_queries]   (class IDs, 0-16)
@@ -29,27 +45,67 @@ const INPUT_SIZE: u32 = 640;
 ///   - `scores`: f32 [batch, num_queries]   (confidence scores)
 #[cfg_attr(alef, alef(skip))]
 pub struct RtDetrModel {
-    session: Session,
+    session: Box<dyn InferenceSession>,
     input_names: Vec<String>,
 }
 
 impl RtDetrModel {
     /// Load a Docling RT-DETR ONNX model from a file.
+    ///
+    /// The session (optimization level, thread budget, execution-provider
+    /// selection, and CPU-only fallback) is built by the [`crate::inference`]
+    /// seam's default backend, so the model is engine-neutral.
+    ///
+    /// Native-only: WASM has no filesystem model path and uses [`Self::from_bytes`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn from_file(
         path: &str,
-        accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
+        accel: Option<&AccelerationConfig>,
+        thread_budget: usize,
     ) -> Result<Self, LayoutError> {
-        let budget = crate::core::config::concurrency::resolve_thread_budget(None);
-        let session = crate::layout::session::build_session(path, accel, budget)?;
-        let input_names: Vec<String> = session.inputs().iter().map(|i| i.name().to_string()).collect();
+        let accel = effective_acceleration(accel);
+        let session = default_backend()
+            .load_with_thread_budget(std::path::Path::new(path), accel.as_ref(), thread_budget)
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
+        let input_names: Vec<String> = session.input_names().to_vec();
         Ok(Self { session, input_names })
+    }
+
+    /// Load a Docling RT-DETR ONNX model from an in-memory byte buffer.
+    ///
+    /// Used where there is no filesystem path to read from, e.g. WASM builds where
+    /// the JS host fetches and hands over the model weights directly. Uses the same
+    /// engine-neutral [`crate::inference`] seam as [`Self::from_file`].
+    pub(crate) fn from_bytes(model_bytes: &[u8], accel: Option<&AccelerationConfig>) -> Result<Self, LayoutError> {
+        let accel = effective_acceleration(accel);
+        let session = default_backend()
+            .load_from_memory(model_bytes, accel.as_ref())
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
+        let input_names: Vec<String> = session.input_names().to_vec();
+        Ok(Self { session, input_names })
+    }
+
+    /// The two input names (`images`, `orig_target_sizes`) the RT-DETR graph declares,
+    /// cloned for the `session.run` call.
+    ///
+    /// A model handed to [`Self::from_bytes`] by a caller (e.g. the WASM `detectLayout`
+    /// bridge) could declare fewer than two inputs; return an error rather than panicking
+    /// on an out-of-range index into `input_names`.
+    fn input_names_pair(&self) -> Result<(String, String), LayoutError> {
+        match (self.input_names.first(), self.input_names.get(1)) {
+            (Some(images), Some(sizes)) => Ok((images.clone(), sizes.clone())),
+            _ => Err(LayoutError::Inference(format!(
+                "RT-DETR model must declare 2 inputs (images, orig_target_sizes), found {}",
+                self.input_names.len()
+            ))),
+        }
     }
 
     /// Run inference and extract detections from raw outputs.
     ///
-    /// Uses aspect-preserving letterbox preprocessing (Lanczos3) to avoid
-    /// distorting the page geometry. The model sees a properly proportioned
-    /// image, which produces more accurate bounding box coordinates.
+    /// Uses the original official export contract: exact 640x640 bilinear
+    /// resize, /255 rescaling, and no ImageNet normalization. The model uses
+    /// `orig_target_sizes` to return boxes in source-image coordinates.
     fn run_inference(&mut self, img: &RgbImage, threshold: f32) -> Result<Vec<LayoutDetection>, LayoutError> {
         #[cfg(feature = "otel")]
         let inference_span = crate::telemetry::spans::model_inference_span("rtdetr-layout");
@@ -61,52 +117,47 @@ impl RtDetrModel {
         let orig_width = img.width();
         let orig_height = img.height();
 
-        // --- Preprocessing timing ---
         let preprocess_start = Instant::now();
 
-        // Letterbox preprocessing: resize preserving aspect ratio, pad to 640×640.
-        let (input_tensor, scale, pad_x, pad_y) = preprocessing::preprocess_imagenet_letterbox(img, INPUT_SIZE);
-        let images_tensor = Tensor::from_array(input_tensor)?;
+        let input_tensor = preprocessing::preprocess_rescale(img, INPUT_SIZE);
 
-        // Tell the model the "original" size is 640×640 (the letterboxed size).
-        // The model maps output boxes to this coordinate space; we un-letterbox below.
-        let sizes = Array::from_shape_vec((1, 2), vec![INPUT_SIZE as i64, INPUT_SIZE as i64])
+        let sizes = Array::from_shape_vec((1, 2), vec![orig_height as i64, orig_width as i64])
             .map_err(|e| LayoutError::InvalidOutput(format!("Failed to create sizes tensor: {e}")))?;
-        let sizes_tensor = Tensor::from_array(sizes)?;
 
         let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(preprocess_ms, "RT-DETR preprocessing complete");
 
-        // --- ONNX inference timing ---
         let onnx_start = Instant::now();
 
-        let outputs = self.session.run(inputs![
-            self.input_names[0].as_str() => images_tensor,
-            self.input_names[1].as_str() => sizes_tensor
-        ])?;
+        let (images_name, sizes_name) = self.input_names_pair()?;
+        let outputs = self
+            .session
+            .run(vec![
+                (images_name, InferenceTensor::F32(input_tensor.into_dyn())),
+                (sizes_name, InferenceTensor::I64(sizes.into_dyn())),
+            ])
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
 
         let onnx_ms = onnx_start.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(onnx_ms, "RT-DETR ONNX session.run() complete");
 
-        // Extract output tensors: try i64 labels first, then f32 boxes/scores.
         let mut float_data: Vec<Vec<f32>> = Vec::new();
         let mut float_shapes: Vec<Vec<usize>> = Vec::new();
         let mut label_data: Vec<i64> = Vec::new();
 
-        for (_name, value) in outputs.iter() {
-            if let Ok(view) = value.try_extract_tensor::<i64>() {
-                label_data = view.1.to_vec();
-                continue;
-            }
-            if let Ok(view) = value.try_extract_tensor::<f32>() {
-                let shape: Vec<usize> = view.0.iter().map(|&d| d as usize).collect();
-                let data: Vec<f32> = view.1.to_vec();
-                float_shapes.push(shape);
-                float_data.push(data);
+        for (_name, value) in outputs {
+            match value {
+                InferenceTensor::I64(array) => {
+                    label_data = array.into_raw_vec_and_offset().0;
+                }
+                InferenceTensor::F32(array) => {
+                    float_shapes.push(array.shape().to_vec());
+                    float_data.push(array.into_raw_vec_and_offset().0);
+                }
+                _ => {}
             }
         }
 
-        // If labels came as f32 instead of i64, convert the last float output.
         if label_data.is_empty() && float_data.len() >= 3 {
             label_data = float_data.last().unwrap().iter().map(|&v| v as i64).collect();
             float_data.pop();
@@ -129,12 +180,6 @@ impl RtDetrModel {
             box_shape[0]
         };
 
-        // Un-letterbox: map from padded 640×640 space → original image coordinates.
-        let inv_scale = 1.0 / scale;
-        let pad_x_f = pad_x as f32;
-        let pad_y_f = pad_y as f32;
-
-        // Guard against malformed model output before any indexing.
         if scores.len() < num_detections || label_data.len() < num_detections || boxes.len() < num_detections * 4 {
             return Err(LayoutError::InvalidOutput(format!(
                 "RT-DETR output shape mismatch: num_detections={num_detections} \
@@ -158,20 +203,17 @@ impl RtDetrModel {
                 None => continue,
             };
 
-            // Boxes are in 640×640 letterboxed coordinates. Remove padding and rescale.
-            let x1 = ((boxes[i * 4] - pad_x_f) * inv_scale).clamp(0.0, orig_width as f32);
-            let y1 = ((boxes[i * 4 + 1] - pad_y_f) * inv_scale).clamp(0.0, orig_height as f32);
-            let x2 = ((boxes[i * 4 + 2] - pad_x_f) * inv_scale).clamp(0.0, orig_width as f32);
-            let y2 = ((boxes[i * 4 + 3] - pad_y_f) * inv_scale).clamp(0.0, orig_height as f32);
+            let bbox = clamp_output_box(
+                [boxes[i * 4], boxes[i * 4 + 1], boxes[i * 4 + 2], boxes[i * 4 + 3]],
+                orig_width,
+                orig_height,
+            );
 
-            detections.push(LayoutDetection::new(class, score, BBox::new(x1, y1, x2, y2)));
+            detections.push(LayoutDetection::new(class, score, bbox));
         }
 
         detections = LayoutDetection::sort_by_confidence_desc(detections);
 
-        // Publish granular timings via the thread-local side-channel so that
-        // LayoutEngine::detect_timed() can populate PageTiming without changing
-        // the LayoutModel trait signature.
         crate::layout::inference_timings::set(preprocess_ms, onnx_ms);
 
         tracing::debug!(
@@ -208,69 +250,69 @@ impl RtDetrModel {
         #[cfg(feature = "otel")]
         let inference_start = Instant::now();
 
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
         let batch = images.len();
-        assert!(!images.is_empty(), "run_batch_inference called with empty slice");
 
         let ts = INPUT_SIZE as usize;
         let hw = ts * ts;
 
-        // --- Preprocessing ---
         let preprocess_start = Instant::now();
 
-        // Preprocess every image and collect per-image metadata needed for un-letterboxing.
         let mut all_pixel_data: Vec<f32> = Vec::with_capacity(batch * 3 * hw);
-        let mut metas: Vec<(u32, u32, f32, u32, u32)> = Vec::with_capacity(batch); // (orig_w, orig_h, scale, pad_x, pad_y)
+        let mut metas: Vec<(u32, u32)> = Vec::with_capacity(batch);
 
         for img in images {
-            let (tensor, scale, pad_x, pad_y) = preprocessing::preprocess_imagenet_letterbox(img, INPUT_SIZE);
-            // tensor shape is [1, 3, ts, ts]; extract flat data
-            all_pixel_data.extend_from_slice(tensor.as_slice().expect("tensor not contiguous"));
-            metas.push((img.width(), img.height(), scale, pad_x, pad_y));
+            let tensor = preprocessing::preprocess_rescale(img, INPUT_SIZE);
+            let slice = tensor
+                .as_slice()
+                .ok_or_else(|| LayoutError::InvalidOutput("preprocessed image tensor is not contiguous".to_string()))?;
+            all_pixel_data.extend_from_slice(slice);
+            metas.push((img.width(), img.height()));
         }
 
-        // Build batched [N, 3, 640, 640] images tensor.
         let images_array = Array4::from_shape_vec((batch, 3, ts, ts), all_pixel_data)
             .map_err(|e| LayoutError::InvalidOutput(format!("Failed to build batch images tensor: {e}")))?;
-        let images_tensor = Tensor::from_array(images_array)?;
 
-        // Build [N, 2] orig_target_sizes tensor — each row is [640, 640].
-        let sizes_flat: Vec<i64> = std::iter::repeat_n([INPUT_SIZE as i64, INPUT_SIZE as i64], batch)
-            .flatten()
+        let sizes_flat: Vec<i64> = images
+            .iter()
+            .flat_map(|img| [img.height() as i64, img.width() as i64])
             .collect();
         let sizes_array = Array2::from_shape_vec((batch, 2), sizes_flat)
             .map_err(|e| LayoutError::InvalidOutput(format!("Failed to build batch sizes tensor: {e}")))?;
-        let sizes_tensor = Tensor::from_array(sizes_array)?;
 
         let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(preprocess_ms, batch, "RT-DETR batch preprocessing complete");
 
-        // --- ONNX inference (single call for the whole batch) ---
         let onnx_start = Instant::now();
 
-        let outputs = self.session.run(inputs![
-            self.input_names[0].as_str() => images_tensor,
-            self.input_names[1].as_str() => sizes_tensor
-        ])?;
+        let (images_name, sizes_name) = self.input_names_pair()?;
+        let outputs = self
+            .session
+            .run(vec![
+                (images_name, InferenceTensor::F32(images_array.into_dyn())),
+                (sizes_name, InferenceTensor::I64(sizes_array.into_dyn())),
+            ])
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
 
         let onnx_ms = onnx_start.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(onnx_ms, batch, "RT-DETR batch ONNX session.run() complete");
 
-        // --- Output parsing ---
-        // Same tensor layout as single inference, but the leading dimension is N.
         let mut float_data: Vec<Vec<f32>> = Vec::new();
         let mut float_shapes: Vec<Vec<usize>> = Vec::new();
         let mut label_data: Vec<i64> = Vec::new();
 
-        for (_name, value) in outputs.iter() {
-            if let Ok(view) = value.try_extract_tensor::<i64>() {
-                label_data = view.1.to_vec();
-                continue;
-            }
-            if let Ok(view) = value.try_extract_tensor::<f32>() {
-                let shape: Vec<usize> = view.0.iter().map(|&d| d as usize).collect();
-                let data: Vec<f32> = view.1.to_vec();
-                float_shapes.push(shape);
-                float_data.push(data);
+        for (_name, value) in outputs {
+            match value {
+                InferenceTensor::I64(array) => {
+                    label_data = array.into_raw_vec_and_offset().0;
+                }
+                InferenceTensor::F32(array) => {
+                    float_shapes.push(array.shape().to_vec());
+                    float_data.push(array.into_raw_vec_and_offset().0);
+                }
+                _ => {}
             }
         }
 
@@ -287,21 +329,18 @@ impl RtDetrModel {
             )));
         }
 
-        let boxes = &float_data[0]; // [N * num_queries * 4]
-        let scores = &float_data[1]; // [N * num_queries]
+        let boxes = &float_data[0];
+        let scores = &float_data[1];
         let box_shape = &float_shapes[0];
 
-        // box_shape is [N, num_queries, 4]; resolve num_queries.
         let num_queries = if box_shape.len() == 3 {
             box_shape[1]
         } else {
             box_shape[0]
         };
 
-        // Publish timings via side-channel (amortized preprocess per batch).
         crate::layout::inference_timings::set(preprocess_ms / batch as f64, onnx_ms / batch as f64);
 
-        // Guard against malformed batch output before any indexing.
         let expected_flat = batch * num_queries;
         if scores.len() < expected_flat || label_data.len() < expected_flat || boxes.len() < expected_flat * 4 {
             return Err(LayoutError::InvalidOutput(format!(
@@ -313,14 +352,9 @@ impl RtDetrModel {
             )));
         }
 
-        // --- Split outputs by batch index ---
         let mut results: Vec<Vec<LayoutDetection>> = Vec::with_capacity(batch);
 
-        for (b, &(orig_width, orig_height, scale, pad_x, pad_y)) in metas.iter().enumerate() {
-            let inv_scale = 1.0 / scale;
-            let pad_x_f = pad_x as f32;
-            let pad_y_f = pad_y as f32;
-
+        for (b, &(orig_width, orig_height)) in metas.iter().enumerate() {
             let mut detections = Vec::new();
             for i in 0..num_queries {
                 let flat_i = b * num_queries + i;
@@ -336,12 +370,18 @@ impl RtDetrModel {
                 };
 
                 let box_base = flat_i * 4;
-                let x1 = ((boxes[box_base] - pad_x_f) * inv_scale).clamp(0.0, orig_width as f32);
-                let y1 = ((boxes[box_base + 1] - pad_y_f) * inv_scale).clamp(0.0, orig_height as f32);
-                let x2 = ((boxes[box_base + 2] - pad_x_f) * inv_scale).clamp(0.0, orig_width as f32);
-                let y2 = ((boxes[box_base + 3] - pad_y_f) * inv_scale).clamp(0.0, orig_height as f32);
+                let bbox = clamp_output_box(
+                    [
+                        boxes[box_base],
+                        boxes[box_base + 1],
+                        boxes[box_base + 2],
+                        boxes[box_base + 3],
+                    ],
+                    orig_width,
+                    orig_height,
+                );
 
-                detections.push(LayoutDetection::new(class, score, BBox::new(x1, y1, x2, y2)));
+                detections.push(LayoutDetection::new(class, score, bbox));
             }
 
             detections = LayoutDetection::sort_by_confidence_desc(detections);
@@ -367,6 +407,15 @@ impl RtDetrModel {
     }
 }
 
+fn clamp_output_box(coords: [f32; 4], image_width: u32, image_height: u32) -> BBox {
+    BBox::new(
+        coords[0].clamp(0.0, image_width as f32),
+        coords[1].clamp(0.0, image_height as f32),
+        coords[2].clamp(0.0, image_width as f32),
+        coords[3].clamp(0.0, image_height as f32),
+    )
+}
+
 impl LayoutModel for RtDetrModel {
     fn detect(&mut self, img: &RgbImage) -> Result<Vec<LayoutDetection>, LayoutError> {
         self.run_inference(img, DEFAULT_THRESHOLD)
@@ -385,7 +434,6 @@ impl LayoutModel for RtDetrModel {
             return Ok(Vec::new());
         }
         let t = threshold.unwrap_or(DEFAULT_THRESHOLD);
-        // Single-image case: use the regular inference path (no tensor stacking overhead).
         if images.len() == 1 {
             return self.run_inference(images[0], t).map(|d| vec![d]);
         }
@@ -394,5 +442,54 @@ impl LayoutModel for RtDetrModel {
 
     fn name(&self) -> &str {
         "Docling RT-DETR v2"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_output_box;
+    #[cfg(target_os = "macos")]
+    use super::effective_acceleration;
+    #[cfg(target_os = "macos")]
+    use crate::core::config::acceleration::{AccelerationConfig, ExecutionProviderType};
+
+    #[test]
+    fn output_boxes_are_already_in_portrait_source_coordinates() {
+        let bbox = clamp_output_box([32.0, 64.0, 288.0, 576.0], 320, 640);
+
+        assert_eq!([bbox.x1, bbox.y1, bbox.x2, bbox.y2], [32.0, 64.0, 288.0, 576.0]);
+    }
+
+    #[test]
+    fn output_boxes_are_already_in_landscape_source_coordinates() {
+        let bbox = clamp_output_box([-5.0, 32.0, 650.0, 340.0], 640, 320);
+
+        assert_eq!([bbox.x1, bbox.y1, bbox.x2, bbox.y2], [0.0, 32.0, 640.0, 320.0]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rtdetr_auto_uses_cpu_but_explicit_coreml_is_preserved() {
+        assert_eq!(
+            effective_acceleration(None).expect("auto must resolve").provider,
+            ExecutionProviderType::Cpu
+        );
+
+        let automatic = AccelerationConfig {
+            provider: ExecutionProviderType::Auto,
+            device_id: 2,
+        };
+        let automatic = effective_acceleration(Some(&automatic)).expect("auto must resolve");
+        assert_eq!(automatic.provider, ExecutionProviderType::Cpu);
+        assert_eq!(automatic.device_id, 2);
+
+        let coreml = AccelerationConfig {
+            provider: ExecutionProviderType::CoreMl,
+            device_id: 0,
+        };
+        assert_eq!(
+            effective_acceleration(Some(&coreml)).expect("explicit CoreML must be preserved"),
+            coreml
+        );
     }
 }

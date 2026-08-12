@@ -30,10 +30,6 @@ ZIP_MTIME = (2024, 1, 1, 0, 0, 0)
 TS_ALICE = "2024-04-01T09:00:00Z"
 TS_BOB = "2024-04-01T09:15:00Z"
 
-# Pre-built tracked-changes block. Two changed-regions: ct1 = insertion by
-# Alice, ct2 = deletion by Bob. The matching <text:change-start text:change-id="ct1"/>
-# / <text:change-end text:change-id="ct1"/> markers are spliced into body
-# paragraphs below.
 TRACKED_CHANGES_XML = (
     '<text:tracked-changes xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
     'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
@@ -57,10 +53,6 @@ TRACKED_CHANGES_XML = (
     "</text:tracked-changes>"
 )
 
-# Body fragment that references the change-regions. The extractor walks
-# body paragraphs and translates change-start/change-end markers into the
-# matching revisions, so we include both insertion live text and a point-
-# deletion marker.
 BODY_REVISION_MARKERS = (
     '<text:p xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">'
     '<text:change-start text:change-id="ct1"/>'
@@ -94,8 +86,6 @@ def _splice_tracked_changes(content_xml: str) -> str:
     """
     open_marker = "<office:text>"
     open_idx = content_xml.find(open_marker)
-    # Some odfpy versions emit ``<office:text ...>`` with attributes; fall
-    # back to locating the first ``>`` after ``<office:text``.
     if open_idx == -1:
         tag_idx = content_xml.find("<office:text")
         if tag_idx == -1:
@@ -122,8 +112,6 @@ def _replace_in_zip(src_bytes: bytes, replacements: dict[str, bytes]) -> bytes:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
             for name in src.namelist():
                 data = replacements.get(name, src.read(name))
-                # ODT requires ``mimetype`` to be the first entry and stored
-                # without compression. Preserve that invariant.
                 info = zipfile.ZipInfo(name, ZIP_MTIME)
                 if name == "mimetype":
                     info.compress_type = zipfile.ZIP_STORED

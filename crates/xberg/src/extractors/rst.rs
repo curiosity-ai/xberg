@@ -21,6 +21,8 @@ use crate::extractors::security::SecurityBudget;
 #[cfg(feature = "office")]
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 #[cfg(feature = "office")]
+use crate::types::Metadata;
+#[cfg(feature = "office")]
 use crate::types::document_structure::{AnnotationKind, TextAnnotation};
 #[cfg(feature = "office")]
 use crate::types::internal::InternalDocument;
@@ -31,13 +33,15 @@ use crate::types::internal_builder::InternalDocumentBuilder;
 #[cfg(feature = "office")]
 use crate::types::uri::ExtractedUri;
 #[cfg(feature = "office")]
-use crate::types::{Metadata, Table};
-#[cfg(feature = "office")]
 use ahash::AHashMap;
 #[cfg(feature = "office")]
 use async_trait::async_trait;
 #[cfg(feature = "office")]
 use std::borrow::Cow;
+
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+#[cfg(feature = "office")]
+const RST_WARNING_SOURCE: &str = "rst";
 
 /// Native Rust reStructuredText extractor.
 ///
@@ -67,7 +71,6 @@ impl RstExtractor {
 
         let text = Self::extract_text_from_rst(content, &mut additional);
 
-        // Map standard fields from additional to typed Metadata fields
         metadata.title = additional
             .remove(&Cow::Borrowed("title"))
             .and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -98,7 +101,6 @@ impl RstExtractor {
                 && line.contains(':')
                 && let Some((key, value)) = Self::parse_field_list_line(line)
             {
-                // Collect continuation lines (indented lines that follow)
                 let mut full_value = value.clone();
                 while i + 1 < lines.len() {
                     let next = lines[i + 1];
@@ -111,14 +113,11 @@ impl RstExtractor {
                     }
                 }
                 Self::add_metadata_field(&key, &full_value, metadata);
-                // Output the field list in preserved format
                 output.push_str(&format!(":{}: {}\n", key, full_value));
                 i += 1;
                 continue;
             }
 
-            // Overline+underline heading (document title): skip the overline,
-            // emit the title text, skip the underline.
             if Self::is_section_underline(line.trim())
                 && i + 2 < lines.len()
                 && !lines[i + 1].trim().is_empty()
@@ -145,16 +144,13 @@ impl RstExtractor {
             }
 
             if line.trim().starts_with(".. code-block::") || line.trim().starts_with(".. code::") {
-                // Preserve the directive line
                 output.push_str(line.trim());
                 output.push('\n');
                 i += 1;
-                // Preserve empty line after directive
                 while i < lines.len() && lines[i].trim().is_empty() {
                     output.push('\n');
                     i += 1;
                 }
-                // Preserve indented content
                 while i < lines.len() && (lines[i].starts_with("   ") || lines[i].is_empty()) {
                     output.push_str(lines[i]);
                     output.push('\n');
@@ -219,7 +215,6 @@ impl RstExtractor {
                     || directive.starts_with("hint::")
                     || directive.starts_with("tip::")
                 {
-                    // Preserve the directive marker
                     output.push_str(trimmed);
                     output.push('\n');
                     i += 1;
@@ -279,7 +274,6 @@ impl RstExtractor {
         let rest = &trimmed[1..];
         if let Some(end_pos) = rest.find(':') {
             let key = rest[..end_pos].to_string();
-            // A valid field list key must be non-empty
             if key.is_empty() {
                 return None;
             }
@@ -329,7 +323,6 @@ impl RstExtractor {
     /// Check if a line is a list item.
     fn is_list_item(line: &str) -> bool {
         let trimmed = line.trim_start();
-        // Bullet list markers: *, +, - followed by space or tab
         if trimmed.starts_with("* ")
             || trimmed.starts_with("+ ")
             || trimmed.starts_with("- ")
@@ -339,7 +332,6 @@ impl RstExtractor {
         {
             return true;
         }
-        // Auto-numbered list: #. or (#) item
         if trimmed.starts_with("#. ")
             || trimmed.starts_with("#.\t")
             || trimmed.starts_with("(#) ")
@@ -347,7 +339,6 @@ impl RstExtractor {
         {
             return true;
         }
-        // Parenthesized markers: (2), (A), (d) etc.
         if trimmed.starts_with('(')
             && let Some(close) = trimmed.find(')')
             && close > 1
@@ -361,7 +352,6 @@ impl RstExtractor {
                 return true;
             }
         }
-        // Find the first whitespace (space or tab) after the marker
         let sep_pos = trimmed.find([' ', '\t']);
         if let Some(space_pos) = sep_pos
             && space_pos > 0
@@ -370,11 +360,9 @@ impl RstExtractor {
             let prefix = &trimmed[..space_pos];
             if prefix.ends_with('.') || prefix.ends_with(')') {
                 let body = &prefix[..prefix.len() - 1];
-                // Numeric: 1. 2. etc.
                 if body.chars().all(|c| c.is_ascii_digit()) {
                     return true;
                 }
-                // Alpha: A. B. a. b. etc.
                 if body.chars().all(|c| c.is_ascii_alphabetic()) && body.len() <= 3 {
                     return true;
                 }
@@ -394,97 +382,6 @@ impl RstExtractor {
             && matches!(first, '=' | '-' | '~' | '+' | '^' | '"' | '`' | '#' | '*' | '/')
     }
 
-    /// Extract tables from RST content.
-    ///
-    /// Identifies and extracts both simple and grid tables.
-    fn extract_tables(content: &str) -> Vec<Table> {
-        let mut tables = Vec::new();
-        let lines: Vec<&str> = content.lines().collect();
-        let mut i = 0;
-
-        while i < lines.len() {
-            let line = lines[i];
-            let trimmed = line.trim();
-
-            // Simple table (=====  ===== separator)
-            if Self::is_simple_table_separator(trimmed) {
-                let start = i;
-                let mut table_lines = Vec::new();
-                table_lines.push(lines[i]);
-                i += 1;
-                while i < lines.len() {
-                    let tl = lines[i].trim();
-                    if tl.is_empty() {
-                        break;
-                    }
-                    table_lines.push(lines[i]);
-                    i += 1;
-                    if Self::is_simple_table_separator(tl) {
-                        break;
-                    }
-                }
-                let cells = Self::parse_simple_table_cells(&table_lines);
-                if !cells.is_empty() {
-                    let markdown = Self::cells_to_markdown(&cells);
-                    tables.push(Table {
-                        cells,
-                        markdown,
-                        page_number: 1,
-                        bounding_box: None,
-                    });
-                }
-                let _ = start;
-                continue;
-            }
-
-            // Grid table (+-----+-----+)
-            if trimmed.starts_with('+')
-                && trimmed.ends_with('+')
-                && trimmed.contains('-')
-                && let Some(table) = Self::parse_grid_table(&lines, &mut i)
-            {
-                tables.push(table);
-                continue;
-            }
-
-            i += 1;
-        }
-
-        tables
-    }
-
-    /// Parse a grid table from lines.
-    fn parse_grid_table(lines: &[&str], i: &mut usize) -> Option<Table> {
-        let mut cells = Vec::new();
-        let mut row = Vec::new();
-
-        while *i < lines.len() && (lines[*i].contains('|') || lines[*i].trim().starts_with('+')) {
-            let line = lines[*i].trim_matches(|c: char| c == '|' || c == '+');
-            if !line.is_empty() {
-                let cell_content = line.split('|').map(|s| s.trim().to_string()).collect::<Vec<_>>();
-                row.extend(cell_content);
-
-                if !row.is_empty() {
-                    cells.push(row.clone());
-                    row.clear();
-                }
-            }
-            *i += 1;
-        }
-
-        if cells.is_empty() {
-            return None;
-        }
-
-        let markdown = Self::cells_to_markdown(&cells);
-        Some(Table {
-            cells,
-            markdown,
-            page_number: 1,
-            bounding_box: None,
-        })
-    }
-
     /// Strip RST inline markup from text and produce annotations with byte offsets
     /// into the stripped text.
     ///
@@ -498,7 +395,6 @@ impl RstExtractor {
         let mut i = 0;
 
         while i < len {
-            // **strong emphasis**
             if i + 1 < len
                 && bytes[i] == b'*'
                 && bytes[i + 1] == b'*'
@@ -518,29 +414,25 @@ impl RstExtractor {
                 i = end + 2;
                 continue;
             }
-            // *emphasis*  (single star, not followed by another star)
             if bytes[i] == b'*'
                 && (i + 1 >= len || bytes[i + 1] != b'*')
                 && let Some(end) = Self::find_closing_marker(raw, i + 1, "*")
+                && (end + 1 >= len || bytes[end + 1] != b'*')
             {
-                // Make sure this isn't inside a ** pair
-                if end + 1 >= len || bytes[end + 1] != b'*' {
-                    let inner = &raw[i + 1..end];
-                    let start = out.len() as u32;
-                    out.push_str(inner);
-                    let end_off = out.len() as u32;
-                    if start < end_off {
-                        annotations.push(TextAnnotation {
-                            start,
-                            end: end_off,
-                            kind: AnnotationKind::Italic,
-                        });
-                    }
-                    i = end + 1;
-                    continue;
+                let inner = &raw[i + 1..end];
+                let start = out.len() as u32;
+                out.push_str(inner);
+                let end_off = out.len() as u32;
+                if start < end_off {
+                    annotations.push(TextAnnotation {
+                        start,
+                        end: end_off,
+                        kind: AnnotationKind::Italic,
+                    });
                 }
+                i = end + 1;
+                continue;
             }
-            // ``literal``
             if i + 1 < len
                 && bytes[i] == b'`'
                 && bytes[i + 1] == b'`'
@@ -560,16 +452,13 @@ impl RstExtractor {
                 i = end + 2;
                 continue;
             }
-            // `interpreted text` or `link text <url>`_  (RST inline hyperlink)
             if bytes[i] == b'`'
                 && (i + 1 >= len || bytes[i + 1] != b'`')
                 && let Some(end) = Self::find_closing_single_backtick(raw, i + 1)
             {
                 let inner = &raw[i + 1..end];
-                // Check for trailing `_ (hyperlink marker)
-                let after_close = end + 1; // position after closing backtick
+                let after_close = end + 1;
                 if after_close < len && bytes[after_close] == b'_' {
-                    // RST inline hyperlink: `link text <url>`_
                     if let Some(angle_start) = inner.rfind('<')
                         && let Some(angle_end) = inner.rfind('>')
                         && angle_end > angle_start
@@ -586,10 +475,9 @@ impl RstExtractor {
                                 kind: AnnotationKind::Link { url, title: None },
                             });
                         }
-                        i = after_close + 1; // skip past the trailing _
+                        i = after_close + 1;
                         continue;
                     }
-                    // Plain reference like `Python`_ — treat as code/interpreted text
                     let start = out.len() as u32;
                     out.push_str(inner);
                     let end_off = out.len() as u32;
@@ -603,7 +491,6 @@ impl RstExtractor {
                     i = after_close + 1;
                     continue;
                 }
-                // Regular interpreted text (no trailing _)
                 let start = out.len() as u32;
                 out.push_str(inner);
                 let end_off = out.len() as u32;
@@ -617,19 +504,16 @@ impl RstExtractor {
                 i = end + 1;
                 continue;
             }
-            // RST citation/footnote reference: [label]_  ->  [label]
-            // Strip the trailing underscore so that the brackets render unescaped.
             if bytes[i] == b'['
                 && let Some(close) = raw[i + 1..].find(']')
             {
                 let label_end = i + 1 + close;
-                // Check for trailing _
                 if label_end + 1 < len && bytes[label_end + 1] == b'_' {
                     let label = &raw[i + 1..label_end];
                     out.push('[');
                     out.push_str(label);
                     out.push(']');
-                    i = label_end + 2; // skip past ]_
+                    i = label_end + 2;
                     continue;
                 }
             }
@@ -652,7 +536,6 @@ impl RstExtractor {
         let mut j = from;
         while j < bytes.len() {
             if bytes[j] == b'`' {
-                // Make sure it's not ``
                 if j + 1 < bytes.len() && bytes[j + 1] == b'`' {
                     j += 2;
                     continue;
@@ -676,12 +559,11 @@ impl RstExtractor {
             {
                 let label_end = i + 1 + close;
                 let label = &line[i + 1..label_end];
-                // Check for trailing _
-                if label_end + 1 < bytes.len() && bytes[label_end + 1] == b'_' {
-                    // Valid footnote ref: numeric or #-prefixed
-                    if label.chars().all(|c| c.is_ascii_digit()) || label.starts_with('#') {
-                        refs.push(label.to_string());
-                    }
+                if label_end + 1 < bytes.len()
+                    && bytes[label_end + 1] == b'_'
+                    && (label.chars().all(|c| c.is_ascii_digit()) || label.starts_with('#'))
+                {
+                    refs.push(label.to_string());
                 }
             }
             i += 1;
@@ -714,6 +596,124 @@ impl RstExtractor {
         opts
     }
 
+    /// Push an image (or figure) URI and, if configured, a placeholder paragraph for it.
+    ///
+    /// Shared by the `.. image::` and `.. figure::` directive handlers so figures build on the
+    /// same image-emission logic instead of duplicating it.
+    fn push_image_directive(
+        b: &mut InternalDocumentBuilder,
+        uri: &str,
+        opts: &AHashMap<String, String>,
+        inject_placeholders: bool,
+    ) {
+        let alt = opts.get("alt").cloned();
+        let desc = alt.as_deref().unwrap_or(uri);
+        if !uri.is_empty() {
+            b.push_uri(ExtractedUri::image(uri, alt.clone()));
+        }
+        if inject_placeholders {
+            let idx = b.push_paragraph(&format!("[image: {}]", desc), vec![], None, None);
+            if !uri.is_empty() {
+                let mut attrs = ahash::AHashMap::new();
+                attrs.insert("src".to_string(), uri.to_string());
+                b.set_attributes(idx, attrs);
+            }
+        }
+    }
+
+    /// Parse the row/cell structure of a `.. list-table::` directive body.
+    ///
+    /// A list-table row is a top-level bullet item (`* - <cell>`), and each additional cell in
+    /// that row is a nested bullet item (`- <cell>`) indented deeper than the row marker:
+    ///
+    /// ```rst
+    /// * - Name
+    ///   - Age
+    /// * - Alice
+    ///   - 30
+    /// ```
+    fn parse_list_table_rows(lines: &[&str], start: &mut usize) -> Vec<Vec<String>> {
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        while *start < lines.len() {
+            let line = lines[*start];
+            if line.trim().is_empty() {
+                break;
+            }
+            let leading = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            let Some(after_star) = trimmed.strip_prefix("* ") else {
+                break;
+            };
+            let Some(cell_text) = after_star.strip_prefix("- ") else {
+                break;
+            };
+            let mut row = vec![cell_text.trim().to_string()];
+            *start += 1;
+            while *start < lines.len() {
+                let cell_line = lines[*start];
+                if cell_line.trim().is_empty() {
+                    break;
+                }
+                let cell_leading = cell_line.len() - cell_line.trim_start().len();
+                let cell_trimmed = cell_line.trim_start();
+                if cell_leading > leading && cell_trimmed.starts_with("- ") {
+                    row.push(cell_trimmed[2..].trim().to_string());
+                    *start += 1;
+                } else {
+                    break;
+                }
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Parse a single CSV-formatted line into fields, honoring double-quoted fields with
+    /// embedded commas and `""`-escaped quotes (RFC 4180-style), as used by `.. csv-table::`.
+    fn parse_csv_line(line: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let chars: Vec<char> = line.chars().collect();
+        let mut idx = 0;
+
+        while idx < chars.len() {
+            let ch = chars[idx];
+            if in_quotes {
+                if ch == '"' {
+                    if idx + 1 < chars.len() && chars[idx + 1] == '"' {
+                        current.push('"');
+                        idx += 2;
+                        continue;
+                    }
+                    in_quotes = false;
+                    idx += 1;
+                    continue;
+                }
+                current.push(ch);
+                idx += 1;
+                continue;
+            }
+            match ch {
+                '"' => {
+                    in_quotes = true;
+                    idx += 1;
+                }
+                ',' => {
+                    fields.push(current.trim().to_string());
+                    current = String::new();
+                    idx += 1;
+                }
+                _ => {
+                    current.push(ch);
+                    idx += 1;
+                }
+            }
+        }
+        fields.push(current.trim().to_string());
+        fields
+    }
+
     /// Build an `InternalDocument` from RST content.
     ///
     /// Handles sections, paragraphs, code blocks, tables, footnotes, citations,
@@ -730,7 +730,6 @@ impl RstExtractor {
             let line = lines[i];
             let trimmed = line.trim();
 
-            // Field list metadata
             if trimmed.starts_with(':')
                 && trimmed.len() > 1
                 && let Some((key, value)) = Self::parse_field_list_line(trimmed)
@@ -753,8 +752,6 @@ impl RstExtractor {
                 continue;
             }
 
-            // Overline+underline heading (document title): markup line, then text,
-            // then same markup line.  RST convention: this is the document title → H1.
             if Self::is_section_underline(trimmed)
                 && i + 2 < lines.len()
                 && !lines[i + 1].trim().is_empty()
@@ -771,16 +768,11 @@ impl RstExtractor {
                 }
             }
 
-            // Heading: text line followed by underline
-            // Section headings (underline only) start at level 2; the first
-            // underline character seen is H2, the second is H3, etc.
             if i + 1 < lines.len() && !trimmed.is_empty() && Self::is_section_underline(lines[i + 1]) {
                 let underline_char = lines[i + 1].trim().chars().next().unwrap_or('=');
                 if !heading_char_order.contains(&underline_char) {
                     heading_char_order.push(underline_char);
                 }
-                // When an overline heading already claimed H1, underline headings
-                // start at H2 (+2 offset).  Otherwise the first underline char is H1 (+1).
                 let base = if has_overline_heading { 2 } else { 1 };
                 let level = heading_char_order
                     .iter()
@@ -792,7 +784,6 @@ impl RstExtractor {
                 continue;
             }
 
-            // Code block directive
             if trimmed.starts_with(".. code-block::") || trimmed.starts_with(".. code::") {
                 let language: Option<&str> = if let Some(rest) = trimmed.strip_prefix(".. code-block::") {
                     let lang = rest.trim();
@@ -821,7 +812,6 @@ impl RstExtractor {
                 continue;
             }
 
-            // Admonition directives
             if trimmed.starts_with(".. note::")
                 || trimmed.starts_with(".. warning::")
                 || trimmed.starts_with(".. important::")
@@ -842,48 +832,105 @@ impl RstExtractor {
                     }
                     i += 1;
                 }
-                // Replace the kind-name text with the actual body text so the
-                // rendering layer puts the content inside the alert block.
                 if !admonition_text.is_empty() {
                     b.set_text(idx, &admonition_text);
                 }
                 continue;
             }
 
-            // Image directive
             if trimmed.starts_with(".. image::") {
                 let uri = trimmed.strip_prefix(".. image::").unwrap_or("").trim();
                 i += 1;
                 let opts = Self::parse_image_options(&lines, &mut i);
-                let alt = opts.get("alt").cloned();
-                let desc = alt.as_deref().unwrap_or(uri);
-                if !uri.is_empty() {
-                    b.push_uri(ExtractedUri::image(uri, alt.clone()));
-                }
-                if inject_placeholders {
-                    let idx = b.push_paragraph(&format!("[image: {}]", desc), vec![], None, None);
-                    if !uri.is_empty() {
-                        let mut attrs = ahash::AHashMap::new();
-                        attrs.insert("src".to_string(), uri.to_string());
-                        b.set_attributes(idx, attrs);
+                Self::push_image_directive(&mut b, uri, &opts, inject_placeholders);
+                continue;
+            }
+
+            if trimmed.starts_with(".. figure::") {
+                let uri = trimmed.strip_prefix(".. figure::").unwrap_or("").trim().to_string();
+                i += 1;
+                let opts = Self::parse_image_options(&lines, &mut i);
+                Self::push_image_directive(&mut b, &uri, &opts, inject_placeholders);
+
+                // The figure body (an indented paragraph following the option block) is the
+                // figure's caption. Collect it and emit it as a regular paragraph so the
+                // caption text is preserved instead of being dropped.
+                let mut caption_text = String::new();
+                while i < lines.len() {
+                    if lines[i].is_empty() {
+                        if !caption_text.is_empty() {
+                            break;
+                        }
+                        i += 1;
+                        continue;
                     }
+                    if !(lines[i].starts_with("   ") || lines[i].starts_with("\t")) {
+                        break;
+                    }
+                    if !caption_text.is_empty() {
+                        caption_text.push(' ');
+                    }
+                    caption_text.push_str(lines[i].trim());
+                    i += 1;
+                }
+                if !caption_text.is_empty() {
+                    let (stripped, annotations) = Self::parse_inline_markup(&caption_text);
+                    b.push_paragraph(&stripped, annotations, None, None);
                 }
                 continue;
             }
 
-            // Math directive
+            if trimmed.starts_with(".. list-table::") {
+                i += 1;
+                let opts = Self::parse_image_options(&lines, &mut i);
+                let _header_rows: usize = opts.get("header-rows").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                // `parse_image_options` only consumes the blank line that separates the option
+                // block from the body when options were actually present; skip any that remain
+                // so the row parser doesn't see a leading blank line and bail out immediately.
+                while i < lines.len() && lines[i].trim().is_empty() {
+                    i += 1;
+                }
+                let cells = Self::parse_list_table_rows(&lines, &mut i);
+                if !cells.is_empty() {
+                    b.push_table_from_cells(&cells, None, None);
+                }
+                continue;
+            }
+
+            if trimmed.starts_with(".. csv-table::") {
+                i += 1;
+                let opts = Self::parse_image_options(&lines, &mut i);
+                while i < lines.len() && lines[i].trim().is_empty() {
+                    i += 1;
+                }
+                let mut cells: Vec<Vec<String>> = Vec::new();
+                if let Some(header_line) = opts.get("header") {
+                    cells.push(Self::parse_csv_line(header_line));
+                }
+                while i < lines.len() {
+                    let l = lines[i];
+                    if l.trim().is_empty() || !(l.starts_with("   ") || l.starts_with("\t")) {
+                        break;
+                    }
+                    cells.push(Self::parse_csv_line(l.trim()));
+                    i += 1;
+                }
+                if !cells.is_empty() {
+                    b.push_table_from_cells(&cells, None, None);
+                }
+                continue;
+            }
+
             if trimmed.starts_with(".. math::") {
                 let inline_math = trimmed.strip_prefix(".. math::").unwrap_or("").trim();
                 i += 1;
-                // Skip option lines (:label:, :nowrap:, etc.)
                 while i < lines.len() {
                     let l = lines[i].trim();
-                    if l.starts_with(':') && l.ends_with(':') || (l.starts_with(':') && l.contains(": ")) {
-                        // Check if it looks like a directive option
-                        if lines[i].starts_with("   ") || lines[i].starts_with("\t") {
-                            i += 1;
-                            continue;
-                        }
+                    if (l.starts_with(':') && l.ends_with(':') || (l.starts_with(':') && l.contains(": ")))
+                        && (lines[i].starts_with("   ") || lines[i].starts_with("\t"))
+                    {
+                        i += 1;
+                        continue;
                     }
                     break;
                 }
@@ -892,11 +939,8 @@ impl RstExtractor {
                 } else {
                     inline_math.to_string()
                 };
-                // Collect math content. Blank lines within separate into
-                // multiple formula elements.
                 while i < lines.len() && (lines[i].starts_with("   ") || lines[i].is_empty()) {
                     if lines[i].is_empty() {
-                        // Blank line: emit current formula and start a new one
                         if !math_content.is_empty() {
                             b.push_formula(&math_content, None, None);
                             math_content = String::new();
@@ -915,7 +959,6 @@ impl RstExtractor {
                 continue;
             }
 
-            // Footnote definitions: .. [1] text  or  .. [#label] text
             if trimmed.starts_with(".. [")
                 && let Some(close) = trimmed.find(']')
                 && close > 4
@@ -931,7 +974,6 @@ impl RstExtractor {
                     full_text.push_str(lines[i].trim());
                     i += 1;
                 }
-                // Determine if it's a citation or footnote
                 let is_citation = label.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
                     && !label.chars().all(|c| c.is_ascii_digit())
                     && !label.starts_with('#');
@@ -943,7 +985,6 @@ impl RstExtractor {
                 continue;
             }
 
-            // Reference target directives: .. _label: url
             if trimmed.starts_with(".. _")
                 && let Some(colon_pos) = trimmed[4..].find(": ")
             {
@@ -969,46 +1010,92 @@ impl RstExtractor {
                 continue;
             }
 
-            // Highlight directive: sets the default language for subsequent :: blocks.
             if trimmed.starts_with(".. highlight::") {
                 let lang = trimmed.strip_prefix(".. highlight::").unwrap_or("").trim();
                 highlight_lang = if lang.is_empty() { None } else { Some(lang.to_string()) };
                 i += 1;
-                // Skip any options block
                 while i < lines.len() && (lines[i].starts_with("   ") || lines[i].is_empty()) {
                     i += 1;
                 }
                 continue;
             }
 
-            // Contents directive: emit the title text as a paragraph
+            // `.. include:: path` inlines another file's rendered content at this
+            // point in the source. This parser works on a single in-memory
+            // document and never resolves the reference, so unlike a generic
+            // unhandled directive (whose *own* body is still captured by the
+            // fallback below) the referenced file's content is always missing
+            // from the extracted text (#171). ~keep
+            if trimmed.starts_with(".. include::") {
+                let target = trimmed.strip_prefix(".. include::").unwrap_or("").trim();
+                b.add_warning(crate::core::diagnostics::warning(
+                    RST_WARNING_SOURCE,
+                    format!(
+                        "'.. include:: {target}' references an external file that was not read; \
+                         its content is missing from the extracted text"
+                    ),
+                ));
+                i += 1;
+                while i < lines.len() && (lines[i].starts_with("   ") || lines[i].is_empty()) {
+                    i += 1;
+                }
+                continue;
+            }
+
             if trimmed.starts_with(".. contents::") {
                 let title = trimmed.strip_prefix(".. contents::").unwrap_or("").trim();
                 if !title.is_empty() {
                     b.push_paragraph(title, vec![], None, None);
                 }
                 i += 1;
-                // Skip options block
                 while i < lines.len() && (lines[i].starts_with("   ") || lines[i].is_empty()) {
                     i += 1;
                 }
                 continue;
             }
 
-            // Other directives - skip (including their indented body, tabs or spaces)
             if trimmed.starts_with(".. ") || trimmed == ".." {
+                // Distinguish an actual (but otherwise unhandled) directive, `.. name:: args`,
+                // from a plain RST comment, `.. some comment text`. Directive names are a single
+                // word (no whitespace) immediately followed by `::`; comments are not, and their
+                // body must stay dropped rather than surfacing as document text. ~keep
+                let after_dots = trimmed.strip_prefix(".. ").unwrap_or("");
+                let is_directive = trimmed != ".."
+                    && after_dots
+                        .find("::")
+                        .map(|pos| {
+                            let name = &after_dots[..pos];
+                            !name.is_empty() && !name.contains(' ') && !name.contains('\t')
+                        })
+                        .unwrap_or(false);
+
                 i += 1;
-                while i < lines.len()
-                    && (lines[i].starts_with("   ") || lines[i].starts_with("\t") || lines[i].is_empty())
-                {
+                let mut body_text = String::new();
+                while i < lines.len() {
+                    let l = lines[i];
+                    if l.is_empty() {
+                        if !body_text.is_empty() {
+                            break;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if !(l.starts_with("   ") || l.starts_with("\t")) {
+                        break;
+                    }
+                    if !body_text.is_empty() {
+                        body_text.push(' ');
+                    }
+                    body_text.push_str(l.trim());
                     i += 1;
+                }
+                if is_directive && !body_text.is_empty() {
+                    let (stripped, annotations) = Self::parse_inline_markup(&body_text);
+                    b.push_paragraph(&stripped, annotations, None, None);
                 }
                 continue;
             }
 
-            // Simple RST table (=====  =====  ====== separator lines)
-            // Collect all non-blank lines. The table ends at a blank line or at a
-            // closing separator followed by a blank line / EOF.
             if Self::is_simple_table_separator(trimmed) {
                 let mut table_lines = Vec::new();
                 while i < lines.len() {
@@ -1026,7 +1113,6 @@ impl RstExtractor {
                 continue;
             }
 
-            // Grid table (+-----+-----+ border lines)
             if trimmed.starts_with('+') && trimmed.ends_with('+') && trimmed.contains('-') {
                 let mut table_lines = Vec::new();
                 while i < lines.len() && (lines[i].trim().starts_with('+') || lines[i].trim().starts_with('|')) {
@@ -1040,11 +1126,9 @@ impl RstExtractor {
                 continue;
             }
 
-            // List items
             if Self::is_list_item(line) {
                 let is_ordered = {
                     let t = trimmed.trim_start();
-                    // Auto-numbered lists (#.) are ordered
                     if t.starts_with("#. ") || t.starts_with("#.\t") {
                         true
                     } else if let Some(space_pos) = t.find([' ', '\t']) {
@@ -1073,7 +1157,6 @@ impl RstExtractor {
                     } else {
                         item_trimmed
                     };
-                    // Collect continuation lines (indented, not a new list item)
                     let mut full_text = text.to_string();
                     i += 1;
                     while i < lines.len()
@@ -1092,11 +1175,7 @@ impl RstExtractor {
                 continue;
             }
 
-            // ``::`` literal block: a line ending with ``::`` introduces an
-            // indented code block.  The ``.. highlight::`` directive, if any,
-            // sets the default language.
             if trimmed.ends_with("::") && !trimmed.starts_with(".. ") {
-                // Emit the introductory text (strip the trailing `::`)
                 if let Some(display_text) = trimmed.strip_suffix("::")
                     && !display_text.is_empty()
                 {
@@ -1104,14 +1183,11 @@ impl RstExtractor {
                     b.push_paragraph(&stripped, annotations, None, None);
                 }
                 i += 1;
-                // Skip blank lines between intro and indented content
                 while i < lines.len() && lines[i].trim().is_empty() {
                     i += 1;
                 }
-                // Collect indented content (spaces or tabs).
-                // Detect indent level from the first non-blank content line.
                 let indent = {
-                    let mut indent_len = 3usize; // default
+                    let mut indent_len = 3usize;
                     let mut j = i;
                     while j < lines.len() {
                         let l = lines[j];
@@ -1129,7 +1205,6 @@ impl RstExtractor {
                 let mut code_content = String::new();
                 while i < lines.len() {
                     let l = lines[i];
-                    // An indented line (by at least `indent` spaces or a tab)
                     let is_indented = l.starts_with("\t")
                         || (l.len() >= indent && l.as_bytes().iter().take(indent).all(|&b| b == b' '));
                     if !is_indented && !l.is_empty() {
@@ -1151,49 +1226,35 @@ impl RstExtractor {
                 continue;
             }
 
-            // Regular paragraph with footnote refs and cross-references.
-            // Join consecutive non-blank, non-indented lines into a single paragraph
-            // (RST hard-wrapping).
             if !trimmed.is_empty() && !Self::is_markup_line(line) {
                 let mut para_text = trimmed.to_string();
-                // Peek ahead: join continuation lines that are part of the same paragraph.
-                // A continuation line is non-empty, not indented, not a list item,
-                // not a directive, not a section underline, not a markup line.
                 while i + 1 < lines.len() {
                     let next = lines[i + 1];
                     let next_trimmed = next.trim();
-                    // Stop at blank lines
                     if next_trimmed.is_empty() {
                         break;
                     }
-                    // Stop at indented lines (could be a directive body, code block, etc.)
                     if next.starts_with(' ') || next.starts_with('\t') {
                         break;
                     }
-                    // Stop at section underlines
                     if Self::is_section_underline(next_trimmed) {
                         break;
                     }
-                    // Stop at markup lines
                     if Self::is_markup_line(next) {
                         break;
                     }
-                    // Stop at directives
                     if next_trimmed.starts_with(".. ") || next_trimmed == ".." {
                         break;
                     }
-                    // Stop at list items
                     if Self::is_list_item(next) {
                         break;
                     }
-                    // Stop at field lists
                     if next_trimmed.starts_with(':')
                         && next_trimmed.len() > 1
                         && Self::parse_field_list_line(next_trimmed).is_some()
                     {
                         break;
                     }
-                    // Stop at table separators
                     if Self::is_simple_table_separator(next_trimmed) {
                         break;
                     }
@@ -1208,13 +1269,11 @@ impl RstExtractor {
                 let (stripped, annotations) = Self::parse_inline_markup(&para_text);
                 let idx = b.push_paragraph(&stripped, annotations, None, None);
 
-                // Emit footnote reference relationships
                 for fref in &footnote_refs {
                     let ref_idx = b.push_footnote_ref(&format!("[{}]", fref), fref, None);
                     let _ = ref_idx;
                 }
 
-                // Check for cross-reference patterns like :ref:`target`
                 Self::extract_rst_cross_refs(&para_text, idx, &mut b);
             }
 
@@ -1236,7 +1295,6 @@ impl RstExtractor {
                     && let Some(close) = after[1..].find('`')
                 {
                     let target = &after[1..1 + close];
-                    // Handle <display text> patterns
                     let key = if let Some(angle_pos) = target.find('<') {
                         let end = target.find('>').unwrap_or(target.len());
                         &target[angle_pos + 1..end]
@@ -1266,7 +1324,6 @@ impl RstExtractor {
             if content.is_empty() {
                 continue;
             }
-            // Skip separator lines (all dashes/equals)
             if content
                 .chars()
                 .all(|c| c == '-' || c == '=' || c == '+' || c == '|' || c == ' ')
@@ -1291,11 +1348,9 @@ impl RstExtractor {
         if trimmed.len() < 3 {
             return false;
         }
-        // Must consist only of '=' and spaces, with at least one '=' run
         if !trimmed.chars().all(|c| c == '=' || c == ' ') {
             return false;
         }
-        // Must contain at least one run of '='
         trimmed.contains('=')
     }
 
@@ -1308,7 +1363,6 @@ impl RstExtractor {
             return Vec::new();
         }
 
-        // Determine column boundaries from the first separator line
         let separator = lines[0];
         let col_ranges = Self::simple_table_column_ranges(separator);
         if col_ranges.is_empty() {
@@ -1318,7 +1372,6 @@ impl RstExtractor {
         let mut cells = Vec::new();
         for line in lines {
             let trimmed = line.trim();
-            // Skip separator lines
             if Self::is_simple_table_separator(trimmed) {
                 continue;
             }
@@ -1358,41 +1411,6 @@ impl RstExtractor {
             }
         }
         ranges
-    }
-
-    /// Convert table cells to markdown format.
-    fn cells_to_markdown(cells: &[Vec<String>]) -> String {
-        if cells.is_empty() {
-            return String::new();
-        }
-
-        let mut md = String::new();
-
-        md.push('|');
-        for cell in &cells[0] {
-            md.push(' ');
-            md.push_str(cell);
-            md.push_str(" |");
-        }
-        md.push('\n');
-
-        md.push('|');
-        for _ in &cells[0] {
-            md.push_str(" --- |");
-        }
-        md.push('\n');
-
-        for row in &cells[1..] {
-            md.push('|');
-            for cell in row {
-                md.push(' ');
-                md.push_str(cell);
-                md.push_str(" |");
-            }
-            md.push('\n');
-        }
-
-        md
     }
 }
 
@@ -1462,16 +1480,14 @@ impl InternalDocumentExtractor for RstExtractor {
 
         let (_extracted_text, metadata) = Self::extract_text_and_metadata(&text);
 
-        let tables = Self::extract_tables(&text);
-
+        // Tables are parsed in place inside `build_internal_document` (via
+        // `push_table_from_cells`), which produces correctly-positioned table elements. A second
+        // `extract_tables` pass used to raw-push the same tables again, adding an unreferenced
+        // (and, for grid tables, less accurate) entry to `doc.tables` for every table without
+        // contributing anything to rendered output.
         let mut doc = Self::build_internal_document(&text, inject_placeholders);
         doc.mime_type = mime_type.to_string();
         doc.metadata = metadata;
-
-        // Add tables to InternalDocument
-        for table in tables {
-            doc.push_table(table);
-        }
 
         tracing::debug!(
             element_count = doc.elements.len(),
@@ -1580,22 +1596,6 @@ Second paragraph.
     }
 
     #[test]
-    fn test_cells_to_markdown_format() {
-        let cells = vec![
-            vec!["Name".to_string(), "Age".to_string()],
-            vec!["Alice".to_string(), "30".to_string()],
-            vec!["Bob".to_string(), "25".to_string()],
-        ];
-
-        let markdown = RstExtractor::cells_to_markdown(&cells);
-        assert!(markdown.contains("Name"));
-        assert!(markdown.contains("Age"));
-        assert!(markdown.contains("Alice"));
-        assert!(markdown.contains("Bob"));
-        assert!(markdown.contains("---"));
-    }
-
-    #[test]
     fn test_rst_extractor_default() {
         let extractor = RstExtractor;
         assert_eq!(extractor.name(), "rst-extractor");
@@ -1606,6 +1606,32 @@ Second paragraph.
         let extractor = RstExtractor::new();
         assert!(extractor.initialize().is_ok());
         assert!(extractor.shutdown().is_ok());
+    }
+
+    /// Regression test: the trait-level `extract_content` used to additionally re-push every
+    /// table via the raw, element-less `InternalDocument::push_table`, on top of the correctly
+    /// created table element from `build_internal_document`. That created a duplicate,
+    /// unreferenced (and sometimes incomplete, since the removed `extract_tables` grid-table
+    /// parser was less accurate) entry in `doc.tables` for every table without changing
+    /// rendered output. Assert there is exactly one table, not two.
+    #[tokio::test]
+    async fn test_rst_table_is_not_duplicated_in_structured_output() {
+        let rst = b"Intro.\n\n===== =====\nName  Age\n===== =====\nAlice 30\n===== =====\n\nOutro.\n";
+        let extractor = RstExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let doc = extractor
+            .extract_content(rst, "text/x-rst", &config)
+            .await
+            .expect("extraction should succeed");
+
+        assert_eq!(doc.tables.len(), 1, "table should not be duplicated: {:?}", doc.tables);
+        let table_element_count = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Table { .. }))
+            .count();
+        assert_eq!(table_element_count, 1);
     }
 
     #[test]
@@ -1624,6 +1650,42 @@ Second paragraph.
         assert!(
             !has_image,
             "expected no image placeholder with inject_placeholders=false"
+        );
+    }
+
+    fn rst_warnings(doc: &crate::types::internal::InternalDocument) -> Vec<String> {
+        doc.processing_warnings
+            .iter()
+            .filter(|w| w.source == RST_WARNING_SOURCE)
+            .map(|w| w.message.to_string())
+            .collect()
+    }
+
+    /// #171: `.. include:: path` inlines another file's rendered content, which
+    /// this single-file, line-based parser has no way to read.
+    #[test]
+    fn should_warn_when_rst_include_directive_is_skipped() {
+        let rst = "Intro text\n\n.. include:: chapter1.rst\n\nMore text\n";
+        let doc = RstExtractor::build_internal_document(rst, true);
+
+        let warnings = rst_warnings(&doc);
+        assert_eq!(warnings.len(), 1, "expected exactly one rst warning, got {warnings:?}");
+        assert!(
+            warnings[0].contains("chapter1.rst") && warnings[0].contains("was not read"),
+            "warning must name the skipped include target, got {warnings:?}"
+        );
+    }
+
+    /// A document with no `include` directive must not warn.
+    #[test]
+    fn should_not_warn_for_rst_document_without_include() {
+        let rst = "Intro text\n\n.. note::\n   A note body.\n\nMore text\n";
+        let doc = RstExtractor::build_internal_document(rst, true);
+
+        assert!(
+            rst_warnings(&doc).is_empty(),
+            "a document without .. include:: must not warn, got {:?}",
+            rst_warnings(&doc)
         );
     }
 }

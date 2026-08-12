@@ -50,7 +50,6 @@
 //! - Processing large documents in batches
 //! - Maintaining context across chunk boundaries
 
-// Module declarations
 pub mod boundaries;
 pub mod boundary_detection;
 mod builder;
@@ -58,6 +57,7 @@ pub mod classifier;
 pub mod config;
 pub mod core;
 mod headings;
+pub(crate) mod page_spans;
 pub mod processor;
 pub mod rag;
 pub mod semantic;
@@ -65,11 +65,17 @@ mod text_splitter;
 #[cfg(feature = "chunking-tokenizers")]
 mod tokenizer_cache;
 pub mod validation;
+pub(crate) mod vectors;
 mod yaml_section;
 
-// Re-export submodule types and functions
-pub use config::{ChunkSizing, ChunkerType, ChunkingConfig, ChunkingResult}; // ChunkingConfig re-exported from core::config::processing
-pub use core::chunk_text;
+pub(crate) use builder::heading_path_from_context;
+pub use config::{ChunkSizing, ChunkerType, ChunkingConfig, ChunkingResult};
+pub use core::{chunk_text, render_heading_breadcrumb};
+// Only used by `core::pipeline::features::try_code_chunks`, which is gated on
+// `tree-sitter` in addition to `chunking` — unused (and so `allow`ed) under other
+// feature combinations that enable `chunking` alone. ~keep
+#[allow(unused_imports)]
+pub(crate) use builder::resolve_token_counter;
 pub(crate) use core::chunk_text_with_heading_source;
 pub use processor::ChunkingProcessor;
 pub use rag::chunk_for_rag;

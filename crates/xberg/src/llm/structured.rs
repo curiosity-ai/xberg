@@ -29,7 +29,6 @@ use serde_json::Value;
 ///
 /// Returns an error if the LLM client cannot be constructed, the request fails,
 /// the response contains no content, or the response is not parseable JSON.
-// `stream` is pub(crate) in liter-llm, preventing struct literal initialisation.
 #[allow(clippy::field_reassign_with_default)]
 #[cfg_attr(alef, alef(skip))]
 pub async fn complete_with_json_schema(
@@ -51,8 +50,7 @@ pub async fn complete_with_json_schema(
         content: liter_llm::UserContent::Text(prompt.to_string()),
         name: None,
     })];
-    request.temperature = llm_config.temperature;
-    request.max_tokens = llm_config.max_tokens;
+    super::client::apply_request_time_params(&mut request, llm_config)?;
     request.response_format = Some(liter_llm::ResponseFormat::JsonSchema {
         json_schema: liter_llm::JsonSchemaFormat {
             name: schema_name.to_string(),
@@ -109,7 +107,6 @@ fn strip_markdown_fence(text: &str) -> &str {
 /// `additionalProperties` is rejected by Gemini and Anthropic but required
 /// by OpenAI strict mode. We strip it only for providers known to reject it.
 fn sanitize_schema_for_provider(schema: &Value, model: &str) -> Value {
-    // OpenAI requires additionalProperties for strict mode — don't strip
     let needs_strip = !model.starts_with("openai/");
 
     if needs_strip {
@@ -156,7 +153,6 @@ fn strip_additional_properties(schema: &Value) -> Value {
 /// - The LLM client cannot be created (invalid provider/credentials).
 /// - The LLM request fails (network, rate-limit, etc.).
 /// - The LLM response cannot be parsed as valid JSON.
-// `stream` is pub(crate) in liter-llm, preventing struct literal initialization.
 #[allow(clippy::field_reassign_with_default)]
 pub(crate) async fn extract_structured(
     content: &str,
@@ -166,7 +162,6 @@ pub(crate) async fn extract_structured(
 
     let client = super::client::create_client(&config.llm)?;
 
-    // Build prompt from custom Jinja2 template or default
     let template = config
         .prompt
         .as_deref()
@@ -184,22 +179,15 @@ pub(crate) async fn extract_structured(
 
     let prompt = super::prompts::render_template(template, &ctx)?;
 
-    // Sanitize the schema for cross-provider compatibility.
-    // Some providers (Gemini, Anthropic) reject fields like `additionalProperties`
-    // that others (OpenAI) require for strict mode. Strip unsupported fields so
-    // the same schema works across all providers.
     let sanitized_schema = sanitize_schema_for_provider(&config.schema, &config.llm.model);
 
-    // Build chat request with JSON schema response format.
-    // Field assignment needed: `stream` is pub(crate) in liter-llm, preventing struct literal.
     let mut request = liter_llm::ChatCompletionRequest::default();
     request.model = config.llm.model.clone();
     request.messages = vec![liter_llm::Message::User(liter_llm::UserMessage {
         content: liter_llm::UserContent::Text(prompt),
         name: None,
     })];
-    request.temperature = config.llm.temperature;
-    request.max_tokens = config.llm.max_tokens;
+    super::client::apply_request_time_params(&mut request, &config.llm)?;
     request.response_format = Some(liter_llm::ResponseFormat::JsonSchema {
         json_schema: liter_llm::JsonSchemaFormat {
             name: config.schema_name.clone(),
@@ -216,7 +204,6 @@ pub(crate) async fn extract_structured(
 
     let usage = super::usage::extract_usage_from_chat(&response, "structured_extraction");
 
-    // Extract text content from the first choice.
     let text = response
         .choices
         .first()
@@ -229,8 +216,6 @@ pub(crate) async fn extract_structured(
             ))
         })?;
 
-    // Parse the response as JSON. Some providers may wrap JSON in markdown
-    // code fences — strip them if present.
     let cleaned = text
         .trim()
         .strip_prefix("```json")

@@ -62,13 +62,11 @@ pub(crate) fn detect_columns(words: &[HocrWord], column_threshold: u32) -> Vec<u
         return Vec::new();
     }
 
-    // Group words by approximate x-position
     let mut position_groups: Vec<Vec<u32>> = Vec::new();
 
     for word in words {
         let x_pos = word.left;
 
-        // Find existing group within threshold
         let mut found_group = false;
         for group in &mut position_groups {
             if let Some(&first_pos) = group.first()
@@ -80,13 +78,11 @@ pub(crate) fn detect_columns(words: &[HocrWord], column_threshold: u32) -> Vec<u
             }
         }
 
-        // Create new group if not found
         if !found_group {
             position_groups.push(vec![x_pos]);
         }
     }
 
-    // Calculate median for each group
     let mut columns: Vec<u32> = position_groups
         .iter()
         .filter(|group| !group.is_empty())
@@ -98,7 +94,6 @@ pub(crate) fn detect_columns(words: &[HocrWord], column_threshold: u32) -> Vec<u
         })
         .collect();
 
-    // Sort columns left to right
     columns.sort_unstable();
     columns
 }
@@ -113,19 +108,16 @@ pub(crate) fn detect_rows(words: &[HocrWord], row_threshold_ratio: f64) -> Vec<u
         return Vec::new();
     }
 
-    // Calculate median height for threshold
     let mut heights: Vec<u32> = words.iter().map(|w| w.height).collect();
     heights.sort_unstable();
     let median_height = heights[heights.len() / 2];
     let row_threshold = (median_height as f64 * row_threshold_ratio) as u32;
 
-    // Group words by approximate y-center
     let mut position_groups: Vec<Vec<f64>> = Vec::new();
 
     for word in words {
         let y_center = word.y_center();
 
-        // Find existing group within threshold
         let mut found_group = false;
         for group in &mut position_groups {
             if let Some(&first_pos) = group.first()
@@ -137,13 +129,11 @@ pub(crate) fn detect_rows(words: &[HocrWord], row_threshold_ratio: f64) -> Vec<u
             }
         }
 
-        // Create new group if not found
         if !found_group {
             position_groups.push(vec![y_center]);
         }
     }
 
-    // Calculate median for each group
     let mut rows: Vec<u32> = position_groups
         .iter()
         .filter(|group| !group.is_empty())
@@ -155,7 +145,6 @@ pub(crate) fn detect_rows(words: &[HocrWord], row_threshold_ratio: f64) -> Vec<u
         })
         .collect();
 
-    // Sort rows top to bottom
     rows.sort_unstable();
     rows
 }
@@ -188,7 +177,6 @@ fn remove_empty_rows_and_columns(table: Vec<Vec<String>>) -> Vec<Vec<String>> {
         return table;
     }
 
-    // Find non-empty columns
     let num_cols = table[0].len();
     let mut non_empty_cols: Vec<bool> = vec![false; num_cols];
 
@@ -200,7 +188,6 @@ fn remove_empty_rows_and_columns(table: Vec<Vec<String>>) -> Vec<Vec<String>> {
         }
     }
 
-    // Filter rows and columns
     table
         .into_iter()
         .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
@@ -232,7 +219,6 @@ pub(crate) fn reconstruct_table(
         return Vec::new();
     }
 
-    // Detect table structure
     let col_positions = detect_columns(words, column_threshold);
     let row_positions = detect_rows(words, row_threshold_ratio);
 
@@ -240,12 +226,10 @@ pub(crate) fn reconstruct_table(
         return Vec::new();
     }
 
-    // Initialize table grid
     let num_rows = row_positions.len();
     let num_cols = col_positions.len();
     let mut table: Vec<Vec<Vec<String>>> = vec![vec![vec![]; num_cols]; num_rows];
 
-    // Assign words to cells
     for word in words {
         if let (Some(r), Some(c)) = (
             find_row_index(&row_positions, word),
@@ -257,7 +241,6 @@ pub(crate) fn reconstruct_table(
         }
     }
 
-    // Combine words within cells
     let result: Vec<Vec<String>> = table
         .into_iter()
         .map(|row| {
@@ -273,48 +256,21 @@ pub(crate) fn reconstruct_table(
         })
         .collect();
 
-    // Remove empty rows and columns
     remove_empty_rows_and_columns(result)
 }
 
 /// Convert a table grid to markdown format.
 ///
 /// The first row is treated as the header row, with a separator line added after it.
-/// Pipe characters in cell content are escaped.
+///
+/// Delegates to the crate's single table renderer
+/// ([`crate::rendering::common::render_table_markdown`]) so a reconstructed
+/// OCR/PDF table serialises identically to one from any other source
+/// (xberg-io/xberg#220). That renderer also pads every row to the widest row,
+/// which this reconstruction path did not do — ragged rows used to emit fewer
+/// pipe columns than the header, misaligning the table for downstream parsers.
 pub(crate) fn table_to_markdown(table: &[Vec<String>]) -> String {
-    if table.is_empty() {
-        return String::new();
-    }
-
-    let num_cols = table[0].len();
-    if num_cols == 0 {
-        return String::new();
-    }
-
-    let mut markdown = String::new();
-
-    // Add rows
-    for (row_idx, row) in table.iter().enumerate() {
-        markdown.push('|');
-        for cell in row {
-            markdown.push(' ');
-            // Escape pipes in cell content
-            markdown.push_str(&cell.replace('|', "\\|"));
-            markdown.push_str(" |");
-        }
-        markdown.push('\n');
-
-        // Add header separator after first row
-        if row_idx == 0 {
-            markdown.push('|');
-            for _ in 0..num_cols {
-                markdown.push_str(" --- |");
-            }
-            markdown.push('\n');
-        }
-    }
-
-    markdown
+    crate::rendering::common::render_table_markdown(table)
 }
 
 #[cfg(test)]
@@ -347,7 +303,6 @@ mod tests {
 
     #[test]
     fn test_nan_safe_sort_does_not_panic() {
-        // total_cmp is a proper total order; NaN sorts after all finite values (ascending).
         let mut values: Vec<f64> = vec![1.0, f64::NAN, 2.0];
         values.sort_by(|a, b| a.total_cmp(b));
         assert_eq!(values.len(), 3);
@@ -526,7 +481,6 @@ mod tests {
     #[test]
     fn test_reconstruct_table_intra_cell_word_spacing() {
         let words = vec![
-            // Row 1 (header)
             HocrWord {
                 text: "Chose".to_string(),
                 left: 57,
@@ -543,7 +497,6 @@ mod tests {
                 height: 12,
                 confidence: 95.0,
             },
-            // Row 2: "Chose 1" and "Truc 1"
             HocrWord {
                 text: "Chose".to_string(),
                 left: 57,
@@ -554,7 +507,7 @@ mod tests {
             },
             HocrWord {
                 text: "1".to_string(),
-                left: 90, // 3px gap from "Chose" which ends at 85
+                left: 90,
                 top: 510,
                 width: 6,
                 height: 12,
@@ -570,13 +523,12 @@ mod tests {
             },
             HocrWord {
                 text: "1".to_string(),
-                left: 332, // 5px gap from "Truc" which ends at 327
+                left: 332,
                 top: 510,
                 width: 5,
                 height: 12,
                 confidence: 95.0,
             },
-            // Row 3: "Chose 2" and "Truc 2"
             HocrWord {
                 text: "Chose".to_string(),
                 left: 57,
@@ -611,19 +563,103 @@ mod tests {
             },
         ];
 
-        // Use a large column threshold (>33px) to avoid splitting "Chose" and "1"
         let table = reconstruct_table(&words, 60, 0.5);
 
-        // Should produce a 3x2 table, not 3x4
         assert_eq!(table.len(), 3, "Expected 3 rows, got {}", table.len());
         assert_eq!(table[0].len(), 2, "Expected 2 columns in row 0, got {}", table[0].len());
 
-        // Verify cell contents are correctly merged
         assert_eq!(table[0][0], "Chose", "Header row 1, col 1");
         assert_eq!(table[0][1], "Truc", "Header row 1, col 2");
         assert_eq!(table[1][0], "Chose 1", "Row 2, col 1 should contain merged text");
         assert_eq!(table[1][1], "Truc 1", "Row 2, col 2 should contain merged text");
         assert_eq!(table[2][0], "Chose 2", "Row 3, col 1 should contain merged text");
         assert_eq!(table[2][1], "Truc 2", "Row 3, col 2 should contain merged text");
+    }
+
+    /// Regression/verification test for the claim in xberg-io/xberg#183 that
+    /// `reconstruct_table` "drops any word for which `find_row_index` or
+    /// `find_column_index` returns `None`".
+    ///
+    /// That claim does not hold for the current implementation: both
+    /// `find_row_index` and `find_column_index` resolve to the *nearest*
+    /// row/column via `min_by_key`, which is `Some` for every word whenever
+    /// `row_positions`/`col_positions` are non-empty — and `reconstruct_table`
+    /// already early-returns before this loop if either is empty. There is no
+    /// path through this function that silently discards a word; even a word
+    /// wildly outside the detected column/row bands is force-assigned to its
+    /// nearest band instead of being dropped. This test proves that with an
+    /// outlier word far outside the main table extent: every input word is
+    /// still present, exactly once, in the reconstructed table.
+    #[test]
+    fn test_reconstruct_table_never_drops_words_including_far_outliers() {
+        let mut words = vec![
+            HocrWord {
+                text: "A1".to_string(),
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 10,
+                confidence: 95.0,
+            },
+            HocrWord {
+                text: "B1".to_string(),
+                left: 200,
+                top: 0,
+                width: 10,
+                height: 10,
+                confidence: 95.0,
+            },
+            HocrWord {
+                text: "A2".to_string(),
+                left: 0,
+                top: 200,
+                width: 10,
+                height: 10,
+                confidence: 95.0,
+            },
+            HocrWord {
+                text: "B2".to_string(),
+                left: 200,
+                top: 200,
+                width: 10,
+                height: 10,
+                confidence: 95.0,
+            },
+        ];
+        // Far outside every detected row/column band and every other word's
+        // neighborhood — the scenario #183 claims gets silently dropped.
+        words.push(HocrWord {
+            text: "Outlier".to_string(),
+            left: 50_000,
+            top: 50_000,
+            width: 10,
+            height: 10,
+            confidence: 95.0,
+        });
+
+        let input_word_count = words.len();
+        let table = reconstruct_table(&words, 20, 0.5);
+
+        let output_word_count: usize = table
+            .iter()
+            .flat_map(|row| row.iter())
+            .flat_map(|cell| cell.split_whitespace())
+            .count();
+
+        assert_eq!(
+            output_word_count, input_word_count,
+            "every input word (including the far outlier) must appear exactly once in the output; \
+             reconstruct_table's nearest-row/nearest-column assignment never returns None here"
+        );
+
+        let all_text: Vec<&str> = table
+            .iter()
+            .flat_map(|row| row.iter())
+            .flat_map(|c| c.split_whitespace())
+            .collect();
+        assert!(
+            all_text.contains(&"Outlier"),
+            "the outlier word must not be silently dropped"
+        );
     }
 }

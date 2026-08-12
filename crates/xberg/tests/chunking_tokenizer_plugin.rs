@@ -78,9 +78,6 @@ fn registered_backend_sizes_chunks_by_its_token_count() {
     let backend = Arc::new(HalfCharTokenizer::new(&name));
     register_tokenizer_backend(backend.clone()).unwrap();
 
-    // Digit-dense text: 40 space-separated pairs, ~120 chars. With a 10-token
-    // budget at 2 chars/token, a char-interpreted budget of 10 would be far
-    // smaller, and an unsized fallback would produce one giant chunk.
     let text = (0..40).map(|i| format!("{:02}", i)).collect::<Vec<_>>().join(" ");
     let config = token_sized_config(&name, 10);
 
@@ -112,8 +109,6 @@ fn plugin_budget_is_tokens_not_characters() {
     let name = unique_name("units");
     register_tokenizer_backend(Arc::new(HalfCharTokenizer::new(&name))).unwrap();
 
-    // 30 chars of prose. A 16-CHAR budget would split it; a 16-TOKEN budget at
-    // 2 chars/token (= 32 chars) must keep it whole.
     let text = "alpha bravo charlie delta echo";
     assert_eq!(text.chars().count(), 30);
     let config = token_sized_config(&name, 16);
@@ -162,7 +157,6 @@ fn registered_backend_respects_overlap() {
 
     let result = chunk_text(text, &config, None).unwrap();
     assert!(result.chunk_count > 1);
-    // Consecutive chunks must overlap in the source text.
     for pair in result.chunks.windows(2) {
         assert!(
             pair[1].metadata.byte_start < pair[0].metadata.byte_end,
@@ -208,10 +202,6 @@ fn zero_count_for_nonempty_text_is_clamped_not_trusted() {
     let name = unique_name("zero-clamp");
     register_tokenizer_backend(Arc::new(ZeroAfterProbe { name: name.clone() })).unwrap();
 
-    // If zero counts were trusted, every span would appear to fit and the
-    // whole text would come back as one chunk. The sizer substitutes the
-    // character count instead, so the budget degrades to char semantics:
-    // a 12-token budget over this 49-char text must split it.
     let text = "alpha bravo charlie delta echo foxtrot golf hotel";
     let config = token_sized_config(&name, 12);
     let result = chunk_text(text, &config, None).unwrap();
@@ -237,13 +227,8 @@ fn unregistered_backend_is_not_consulted_after_removal() {
     let backend = Arc::new(HalfCharTokenizer::new(&name));
     register_tokenizer_backend(backend.clone()).unwrap();
     unregister_tokenizer_backend(&name).unwrap();
-    // Registration itself probes count_tokens once; chunking after removal
-    // must not add to that.
     let calls_after_removal = backend.calls.load(Ordering::Relaxed);
 
-    // The name no longer resolves in the registry; chunking falls through to
-    // the HuggingFace path, which cannot load this name and must error rather
-    // than silently using the removed backend.
     let text = "some text to chunk";
     let config = token_sized_config(&name, 10);
     let result = chunk_text(text, &config, None);

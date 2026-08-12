@@ -201,17 +201,7 @@ pub async fn extract_region_with_vlm_usage(
 ) -> crate::Result<(String, Option<LlmUsage>)> {
     let prompt = custom_prompt.unwrap_or_else(|| region_kind.default_prompt());
 
-    // vlm_ocr re-uses the language=eng path (no language hint for region extraction).
-    // The prompt is passed as `vlm_prompt`; `language` is set to a neutral value that
-    // suppresses the language-hint suffix in the VLM OCR template.
-    vlm_ocr(
-        image_bytes,
-        image_mime,
-        "eng", // language hint unused — prompt is self-contained
-        llm_config,
-        Some(prompt),
-    )
-    .await
+    vlm_ocr(image_bytes, image_mime, "eng", llm_config, Some(prompt)).await
 }
 
 #[cfg(test)]

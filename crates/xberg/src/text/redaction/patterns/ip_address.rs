@@ -9,13 +9,11 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 static RE_IPV4: Lazy<Regex> = Lazy::new(|| {
-    // Each octet 0-255 anchored on word boundaries.
     Regex::new(r"\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\b")
         .expect("ipv4 regex compiles")
 });
 
 static RE_IPV6: Lazy<Regex> = Lazy::new(|| {
-    // Conservative IPv6: 2+ groups separated by ':' with at least one '::' shortcut or 8 groups.
     Regex::new(
         r"(?xi)
         (?:
@@ -46,7 +44,6 @@ pub fn find_all(text: &str) -> Vec<PatternMatch> {
     }
     for m in RE_IPV6.find_iter(text) {
         let raw = m.as_str();
-        // Filter out obvious garbage: must contain at least one ':' and not be all-zeros.
         if raw.matches(':').count() < 2 {
             continue;
         }

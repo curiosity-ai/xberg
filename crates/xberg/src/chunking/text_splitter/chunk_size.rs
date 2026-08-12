@@ -393,7 +393,6 @@ where
         let mut semantic_level = None;
         let mut max_offset = None;
 
-        // We assume that larger levels are also longer. We can skip lower levels if going to a higher level would result in a shorter text
         let levels_with_first_chunk = levels_with_first_chunk.coalesce(|(a_level, a_str), (b_level, b_str)| {
             if a_str.len() >= b_str.len() {
                 Ok((b_level, b_str))
@@ -403,18 +402,15 @@ where
         });
 
         for (level, str) in levels_with_first_chunk {
-            // Skip tokenizing levels that we know are too small anyway.
             let len = str.len();
             if len > capacity.max {
                 let chunk_size = self.chunk_size(offset, str, trim);
                 let fits = capacity.fits(chunk_size);
-                // If this no longer fits, we use the level we are at.
                 if fits.is_gt() {
                     max_offset = Some(offset + len);
                     break;
                 }
             }
-            // Otherwise break up the text with the next level
             semantic_level = Some(level);
         }
 
@@ -430,10 +426,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::RefCell,
-        sync::atomic::{self, AtomicUsize},
-    };
+    // Both `RefCell` uses sit behind `chunking-tokenizers`; without the same gate the import
+    // is unused in any build without that feature, which `-D warnings` turns into an error.
+    #[cfg(feature = "chunking-tokenizers")]
+    use std::cell::RefCell;
+    use std::sync::atomic::{self, AtomicUsize};
 
     use super::super::trim::Trim;
 
@@ -523,7 +520,6 @@ mod tests {
     }
 
     impl ChunkSizer for CountingSizer {
-        // Return character version, but count calls
         fn size(&self, chunk: &str) -> usize {
             self.calls.fetch_add(1, atomic::Ordering::SeqCst);
             Characters.size(chunk)

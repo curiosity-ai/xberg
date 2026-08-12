@@ -9,6 +9,10 @@ use crate::{WireFormat, style};
 /// When `provider` is `"local"` (default), uses the ONNX preset model.
 /// When `provider` is `"llm"`, uses liter-llm with the specified model and API key.
 /// When `provider` is `"plugin"`, dispatches to a pre-registered in-process embedding backend.
+#[expect(
+    clippy::print_stdout,
+    reason = "embedding vectors are the command's stdout result output"
+)]
 pub fn embed_command(
     texts: Vec<String>,
     preset: &str,
@@ -22,7 +26,6 @@ pub fn embed_command(
         anyhow::bail!("No texts provided for embedding. Provide --text or pipe text via stdin.");
     }
 
-    // Validate no empty texts
     for (i, t) in texts.iter().enumerate() {
         if t.is_empty() {
             anyhow::bail!("Text at position {} is empty. All texts must be non-empty.", i + 1);
@@ -40,15 +43,13 @@ pub fn embed_command(
             let llm_config = xberg::LlmConfig {
                 model: model.to_string(),
                 api_key: llm_api_key,
-                base_url: None,
-                timeout_secs: None,
-                max_retries: None,
-                temperature: None,
-                max_tokens: None,
+                ..Default::default()
             };
 
             let config = xberg::EmbeddingConfig {
-                model: xberg::EmbeddingModelType::Llm { llm: llm_config },
+                model: xberg::EmbeddingModelType::Llm {
+                    llm: Box::new(llm_config),
+                },
                 show_download_progress: true,
                 ..Default::default()
             };
@@ -56,7 +57,6 @@ pub fn embed_command(
             (config, model.to_string())
         }
         "local" | "" => {
-            // Validate preset for local provider
             let _preset_info = xberg::get_embedding_preset(preset).with_context(|| {
                 format!(
                     "Unknown embedding preset '{}'. Available: {:?}",
@@ -85,8 +85,6 @@ pub fn embed_command(
                 anyhow::bail!("--plugin NAME must not be empty.");
             }
 
-            // Pre-flight: surface unknown backends with a list of registered names
-            // (parity with the REST handler, which returns 422 for the same case).
             let available =
                 xberg::plugins::list_embedding_backends().context("Failed to read embedding backend registry")?;
             if !available.iter().any(|n| n == name) {
@@ -116,7 +114,6 @@ pub fn embed_command(
         }
     };
 
-    // Generate embeddings
     let embeddings = xberg::embed_texts(texts.clone(), &config).context("Failed to generate embeddings")?;
 
     let dimensions = embeddings.first().map(|e| e.len()).unwrap_or(0);

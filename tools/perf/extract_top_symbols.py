@@ -21,20 +21,18 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-# Filter out stack frames that are dependencies, the runtime, or system noise.
-# The remaining frames are xberg's own code (or close enough to be actionable).
 EXCLUDE_PREFIXES = (
-    "__",  # __mh_execute_header, __os_lock_..., __pthread_...
-    "_",  # _open$NOCANCEL, _os_cpu_..., _pthread_...
-    "onnx::",  # ORT internals
+    "__",
+    "_",
+    "onnx::",
     "ort_sys::",
     "tokio::",
     "std::",
     "core::",
     "alloc::",
     "_$LT$std",
-    "image::",  # image crate
-    "pdf_oxide::",  # pdf_oxide internals
+    "image::",
+    "pdf_oxide::",
     "memchr::",
     "regex::",
     "serde::",
@@ -43,7 +41,6 @@ EXCLUDE_PREFIXES = (
     "pprof::",
 )
 
-# Explicit numeric address frames (raw hex / decimal) — appear when symbols are stripped.
 ADDRESS_PATTERN = re.compile(r"^\d+$|^0x[0-9a-f]+$")
 
 
@@ -90,7 +87,6 @@ def main() -> int:
 
     total_samples = sum(samples_per_fn.values()) or 1
 
-    # Application-level symbols, ranked by aggregate samples.
     app_ranked = sorted(
         ((fn, s) for fn, s in samples_per_fn.items() if is_xberg_or_application(fn)),
         key=lambda x: -x[1],
@@ -103,7 +99,6 @@ def main() -> int:
             "build only contains system frames.",
             file=sys.stderr,
         )
-        # Fall back to showing top frames regardless.
         app_ranked = sorted(samples_per_fn.items(), key=lambda x: -x[1])
 
     print(f"# Top {top_n} symbols by aggregate sample count from {svg_path.name}")

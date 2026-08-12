@@ -1,9 +1,10 @@
 //! Image preprocessing for GLM-OCR.
 //!
-//! Phase 1 stub. GLM-OCR uses CogViT-style patch tiling with a configurable
-//! `t_patch_size` and a max-pixel budget. The output is a normalised
-//! `(1, C, H, W)` BF16 pixel tensor and a grid descriptor that downstream
-//! code uses to compute the number of vision tokens.
+//! Decodes image bytes, smart-resizes them to a multiple of `patch_size * t_patch_size`
+//! within the configured min/max pixel budget, and normalises with the CogViT mean/std.
+//! Returns a `(1, C, H, W)` pixel tensor in the requested dtype plus a `(1, 3)`
+//! `[T, H_patches, W_patches]` grid descriptor that downstream code uses to compute the
+//! number of vision tokens.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,9 +19,6 @@ pub struct PreprocessConfig {
 }
 
 impl Default for PreprocessConfig {
-    // Defaults pulled from https://huggingface.co/zai-org/GLM-OCR/raw/main/preprocessor_config.json
-    // `size.shortest_edge` = 12_544 and `size.longest_edge` = 9_633_792 are pixel-count
-    // budgets, not edge lengths. `merge_size: 2` is consumed by the connector.
     fn default() -> Self {
         Self {
             patch_size: 14,
@@ -59,12 +57,9 @@ mod imp {
         let img = img.to_rgb8();
         let (width, height) = (img.width() as usize, img.height() as usize);
 
-        // Smart resize to fit within min_pixels/max_pixels bounds, rounded to
-        // multiples of patch_size. T is always 1 for static images.
         let factor = config.patch_size * config.t_patch_size;
         let (new_height, new_width) = smart_resize(height, width, factor, config.min_pixels, config.max_pixels)?;
 
-        // Resize: use CatmullRom as PIL's BICUBIC equivalent.
         let resized = image::imageops::resize(
             &img,
             new_width as u32,
@@ -72,7 +67,6 @@ mod imp {
             image::imageops::FilterType::CatmullRom,
         );
 
-        // Convert to tensor and normalize: (x / 255 - mean) / std
         let raw: Vec<u8> = resized.into_raw();
         let mean_t = Tensor::from_vec(config.image_mean.to_vec(), (3, 1, 1), device)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Mean tensor: {}", e)))?;
@@ -92,14 +86,12 @@ mod imp {
             .broadcast_div(&std_t)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Div std: {}", e)))?;
 
-        // Add batch dimension and convert to target dtype.
         let pixel_values = normalized
             .unsqueeze(0)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Unsqueeze: {}", e)))?
             .to_dtype(dtype)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Target dtype: {}", e)))?;
 
-        // Grid descriptor: [T=1, height_patches, width_patches]
         let h_patches = (new_height / config.patch_size) as u32;
         let w_patches = (new_width / config.patch_size) as u32;
         let grid_thw = Tensor::new(&[[1u32, h_patches, w_patches]], device)
@@ -125,7 +117,6 @@ mod imp {
         let mut h = height;
         let mut w = width;
 
-        // Ensure minimum dimension size.
         if h < factor {
             w = (w * factor + h / 2) / h;
             h = factor;
@@ -135,7 +126,6 @@ mod imp {
             w = factor;
         }
 
-        // Check aspect ratio constraint.
         let aspect = if h > w {
             h as f64 / w as f64
         } else {
@@ -148,13 +138,11 @@ mod imp {
             )));
         }
 
-        // Round to nearest multiple of factor.
         let mut h_bar = ((h + factor / 2) / factor) * factor;
         let mut w_bar = ((w + factor / 2) / factor) * factor;
 
         let total_pixels = h_bar * w_bar;
 
-        // Scale to fit pixel budget.
         if total_pixels > max_pixels {
             let beta = ((h * w) as f64 / max_pixels as f64).sqrt();
             h_bar = ((h as f64 / beta / factor as f64).floor() as usize) * factor;

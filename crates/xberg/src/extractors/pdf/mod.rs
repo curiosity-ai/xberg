@@ -8,12 +8,14 @@ mod extraction;
 mod layout_hints;
 #[cfg(all(feature = "pdf", feature = "layout-detection"))]
 mod layout_runner;
-mod ocr;
+pub(crate) mod ocr;
 mod pages;
 #[cfg(feature = "layout-detection")]
 pub(crate) mod reading_order;
 #[cfg(all(feature = "liter-llm", feature = "layout-detection"))]
 mod region_vlm;
+#[cfg(feature = "pdf")]
+pub(crate) mod rotation;
 
 use crate::Result;
 use crate::core::config::ExtractionConfig;
@@ -27,18 +29,513 @@ use std::path::Path;
 use extraction::extract_all_from_oxide_document;
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 use ocr::extract_with_ocr;
+
+#[cfg(feature = "pdf")]
+const PDF_OUTLINES_MARKER: &[u8] = b"/Outlines";
+#[cfg(feature = "pdf")]
+const PDF_PREVIOUS_XREF_MARKER: &[u8] = b"/Prev";
+
+#[cfg(feature = "pdf")]
+fn contains_pdf_marker(content: &[u8], marker: &[u8]) -> bool {
+    memchr::memmem::find(content, marker).is_some()
+}
+
+#[cfg(feature = "pdf")]
+fn catalog_needs_lopdf_compatibility_pass(catalog: Option<&pdf_oxide::object::Object>) -> bool {
+    let Some(catalog) = catalog else {
+        return true;
+    };
+    let Some(dictionary) = catalog.as_dict() else {
+        return true;
+    };
+    dictionary.contains_key("Outlines")
+}
+
+#[cfg(feature = "pdf")]
+fn raw_pdf_needs_lopdf_compatibility_pass(content: &[u8]) -> bool {
+    contains_pdf_marker(content, PDF_PREVIOUS_XREF_MARKER) || contains_pdf_marker(content, PDF_OUTLINES_MARKER)
+}
+
+#[cfg(feature = "pdf")]
+fn parsed_pdf_needs_lopdf_compatibility_pass(document: &crate::pdf::oxide::OxideDocument) -> bool {
+    match document.doc.catalog() {
+        Ok(catalog) => catalog_needs_lopdf_compatibility_pass(Some(&catalog)),
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "pdf_oxide catalog inspection failed; retaining lopdf compatibility pass"
+            );
+            catalog_needs_lopdf_compatibility_pass(None)
+        }
+    }
+}
+
+#[cfg(feature = "pdf")]
+fn extract_lopdf_compatibility_data(
+    content: &[u8],
+) -> (
+    Vec<crate::pdf::bookmarks::PdfOutlineEntry>,
+    Vec<crate::types::ExtractedUri>,
+    Option<Vec<crate::types::DocumentRevision>>,
+) {
+    match lopdf::Document::load_mem(content) {
+        Ok(lopdf_doc) => {
+            let entries = crate::pdf::bookmarks::extract_outline_entries(&lopdf_doc);
+            let uris = crate::pdf::bookmarks::extract_bookmarks_from_entries(&entries);
+            let revisions = crate::pdf::xref_revisions::extract_pdf_xref_revisions(content, &lopdf_doc);
+            (entries, uris, revisions)
+        }
+        Err(_) => (Vec::new(), Vec::new(), None),
+    }
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfDocumentOrigin {
+    Native,
+    Mixed,
+    Ocr,
+}
+
+/// Flat paragraph document for PDF text that arrived without structure.
+///
+/// `text` is whichever of native or OCR text won the extraction-method decision, and
+/// neither is guaranteed LF-only: `crate::pdf::text::fix_pdf_control_chars` explicitly
+/// whitelists `\r` as a character to preserve, and the VLM OCR backend returns model
+/// markdown verbatim from an HTTP response. Normalize before splitting (#316).
+fn flat_pdf_document(text: &str, mime_type: &str) -> InternalDocument {
+    let mut doc = InternalDocument::new("pdf");
+    doc.mime_type = mime_type.to_string();
+    let text = crate::extraction::transform::normalize_line_endings(text);
+    for paragraph in text.split("\n\n").map(str::trim).filter(|text| !text.is_empty()) {
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, paragraph, 0));
+    }
+    doc
+}
+
+const MIN_NATIVE_TOKENS_FOR_STRUCTURE_COVERAGE: usize = 20;
+const MIN_STRUCTURED_NATIVE_TOKEN_COVERAGE: f64 = 0.70;
+
+fn normalized_pdf_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| character.is_ascii_punctuation())
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+}
+
+fn structured_native_token_coverage(document: &InternalDocument, native_text: &str) -> Option<f64> {
+    let native_tokens = normalized_pdf_tokens(native_text).collect::<Vec<_>>();
+    if native_tokens.len() < MIN_NATIVE_TOKENS_FOR_STRUCTURE_COVERAGE {
+        return None;
+    }
+    let native_token_count = native_tokens.len();
+
+    let mut represented = ahash::AHashMap::<String, usize>::new();
+    for token in document
+        .elements
+        .iter()
+        .flat_map(|element| normalized_pdf_tokens(&element.text))
+        .chain(
+            document
+                .tables
+                .iter()
+                .flat_map(|table| table.cells.iter().flatten())
+                .flat_map(|cell| normalized_pdf_tokens(cell)),
+        )
+    {
+        *represented.entry(token).or_default() += 1;
+    }
+
+    let mut matched = 0usize;
+    for token in native_tokens {
+        if let Some(remaining) = represented.get_mut(&token)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            matched += 1;
+        }
+    }
+    Some(matched as f64 / native_token_count as f64)
+}
+
+fn select_native_pdf_document(
+    text: &str,
+    mime_type: &str,
+    pre_rendered_doc: Option<InternalDocument>,
+) -> (InternalDocument, bool) {
+    let Some(mut document) = pre_rendered_doc else {
+        return (flat_pdf_document(text, mime_type), false);
+    };
+    document.mime_type = mime_type.to_string();
+
+    let coverage = structured_native_token_coverage(&document, text);
+    if coverage.is_none_or(|coverage| coverage >= MIN_STRUCTURED_NATIVE_TOKEN_COVERAGE) {
+        return (document, true);
+    }
+
+    tracing::warn!(
+        coverage = coverage.unwrap_or_default(),
+        minimum_coverage = MIN_STRUCTURED_NATIVE_TOKEN_COVERAGE,
+        "PDF structure omitted substantial native text; using complete native text"
+    );
+    (flat_pdf_document(text, mime_type), false)
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn select_pdf_document(
+    extraction_method: ExtractionMethod,
+    text: &str,
+    mime_type: &str,
+    pre_rendered_doc: Option<InternalDocument>,
+    ocr_internal_doc: Option<InternalDocument>,
+    ocr_results: Option<&ahash::AHashMap<u32, String>>,
+    structured_ocr_pages: Option<&ahash::AHashMap<u32, InternalDocument>>,
+) -> (InternalDocument, PdfDocumentOrigin, bool) {
+    let (mut doc, origin, structured) = match extraction_method {
+        ExtractionMethod::Native => {
+            let (document, structured) = select_native_pdf_document(text, mime_type, pre_rendered_doc);
+            (document, PdfDocumentOrigin::Native, structured)
+        }
+        ExtractionMethod::Mixed => match pre_rendered_doc {
+            Some(mut doc) => {
+                if let Some(results) = ocr_results {
+                    if let Some(structured_pages) = structured_ocr_pages {
+                        ocr::merge_structured_ocr_pages_into_internal_document(&mut doc, results, structured_pages);
+                    } else {
+                        ocr::merge_ocr_pages_into_internal_document(&mut doc, results);
+                    }
+                }
+                (doc, PdfDocumentOrigin::Mixed, true)
+            }
+            None => (flat_pdf_document(text, mime_type), PdfDocumentOrigin::Mixed, false),
+        },
+        ExtractionMethod::Ocr => match ocr_internal_doc {
+            Some(doc) => (doc, PdfDocumentOrigin::Ocr, true),
+            None => (flat_pdf_document(text, mime_type), PdfDocumentOrigin::Ocr, false),
+        },
+    };
+    doc.mime_type = mime_type.to_string();
+    (doc, origin, structured)
+}
+
+fn attach_unrepresented_tables(doc: &mut InternalDocument, tables: Vec<crate::types::Table>) {
+    if doc.tables.is_empty() {
+        for table in tables {
+            doc.push_table(table);
+        }
+    }
+}
+
+/// Share of a table's cell tokens that must already be in the element stream
+/// before the table counts as represented.
+const MIN_TABLE_TOKEN_REPRESENTATION: f64 = 0.90;
+/// Cell-token count below which the containment check abstains: on a handful of
+/// tokens an incidental overlap with unrelated prose is likely, and injecting a
+/// duplicate is cheaper than dropping a real table.
+const MIN_TABLE_TOKENS_FOR_CONTAINMENT: usize = 8;
+
+/// Tokens the element stream already renders, as a consumable multiset.
+fn element_token_multiset(doc: &InternalDocument) -> ahash::AHashMap<String, usize> {
+    let mut represented = ahash::AHashMap::<String, usize>::new();
+    for token in doc
+        .elements
+        .iter()
+        .flat_map(|element| normalized_pdf_tokens(&element.text))
+    {
+        *represented.entry(token).or_default() += 1;
+    }
+    represented
+}
+
+/// Whether `table`'s cell text is already carried by the element stream.
+///
+/// Compares on `normalized_pdf_tokens`, so whitespace, line wrapping and edge
+/// punctuation do not matter — a table reconstructed from prose lines that are
+/// still in the stream verbatim reads as represented. Accounting is multiset
+/// based like [`structured_native_token_coverage`]: each text occurrence backs at
+/// most one cell occurrence, and the occurrences are consumed only when the table
+/// is judged represented, so one table cannot mask the next.
+///
+/// Both bailouts err toward returning `false` (inject), because a duplicated
+/// table costs precision while a dropped one costs content.
+fn table_is_represented(table: &crate::types::Table, represented: &mut ahash::AHashMap<String, usize>) -> bool {
+    let mut table_tokens = ahash::AHashMap::<String, usize>::new();
+    let mut table_token_count = 0usize;
+    for token in table
+        .cells
+        .iter()
+        .flatten()
+        .flat_map(|cell| normalized_pdf_tokens(cell))
+    {
+        *table_tokens.entry(token).or_default() += 1;
+        table_token_count += 1;
+    }
+    if table_token_count < MIN_TABLE_TOKENS_FOR_CONTAINMENT {
+        return false;
+    }
+
+    let matched: usize = table_tokens
+        .iter()
+        .map(|(token, count)| (*count).min(represented.get(token).copied().unwrap_or_default()))
+        .sum();
+    if (matched as f64 / table_token_count as f64) < MIN_TABLE_TOKEN_REPRESENTATION {
+        return false;
+    }
+
+    for (token, count) in table_tokens {
+        if let Some(remaining) = represented.get_mut(&token) {
+            *remaining = remaining.saturating_sub(count);
+        }
+    }
+    true
+}
+
+fn inject_unrepresented_table_elements(doc: &mut InternalDocument, allow_injection: bool) {
+    if !allow_injection
+        || doc
+            .elements
+            .iter()
+            .any(|element| matches!(element.kind, ElementKind::Table { .. }))
+    {
+        return;
+    }
+
+    // The `Table`-element guard above only ever fires on the structured path;
+    // `flat_pdf_document` builds nothing but `Paragraph`s, so on the flat path
+    // every detected table was injected on top of native text that already
+    // contained the words it was reconstructed from — the same content rendered
+    // twice (pdfa_031). Inject only the tables whose cells are genuinely absent. ~keep
+    let mut represented = element_token_multiset(doc);
+    let unrepresented = (0..doc.tables.len() as u32)
+        .filter(|table_index| !table_is_represented(&doc.tables[*table_index as usize], &mut represented))
+        .collect::<Vec<_>>();
+    for table_index in unrepresented {
+        doc.push_element(InternalElement::text(ElementKind::Table { table_index }, "", 0));
+    }
+}
+
+/// Surface filled AcroForm/XFA field values in rendered content (issue #64).
+///
+/// `doc.form_fields` already reaches the typed `ExtractedDocument.form_fields`
+/// API, but nothing renders it into `content`. For the plain-text path this is
+/// usually harmless: `oxide::text`'s `append_missing_widget_values` already
+/// splices Widget `/V` values into the flat native text before it is chopped
+/// into `Paragraph` elements. But the *structured* path (Markdown/HTML/Djot,
+/// built from `pdf::oxide::hierarchy`'s span segments) never sees that
+/// splice — a filled, non-flattened form renders with none of its entered
+/// values.
+///
+/// Follows `inject_unrepresented_table_elements`'s pattern: push one
+/// `ElementKind::Paragraph` per field that has a non-empty value and isn't
+/// already present verbatim somewhere in the document (the containment check
+/// is what keeps the plain-text path, which already has the value, from
+/// getting a duplicate).
+fn inject_unrepresented_form_field_elements(doc: &mut InternalDocument, form_fields: &[crate::types::PdfFormField]) {
+    for field in form_fields {
+        let Some(value) = field.value.as_ref().filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        if doc.elements.iter().any(|element| element.text.contains(value.as_str())) {
+            continue;
+        }
+        let display_name = if field.full_name.is_empty() {
+            field.name.as_str()
+        } else {
+            field.full_name.as_str()
+        };
+        doc.push_element(InternalElement::text(
+            ElementKind::Paragraph,
+            format!("{display_name}: {value}"),
+            0,
+        ));
+    }
+}
+
+/// Pages to OCR under `OcrStrategy::ScannedPages`, 1-indexed.
+///
+/// The union of detected scans and pages failing the text-quality gate, so never
+/// a subset of what `Auto` would OCR.
+///
+/// `None` means fall through to the `Auto` gate: wrong strategy, no page
+/// qualifies, or the gate wants the whole document rather than a page subset.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn scanned_pages_to_ocr(
+    config: &ExtractionConfig,
+    pdf_metadata: &crate::pdf::metadata::PdfExtractionMetadata,
+    native_text: &str,
+    boundaries: Option<&[crate::types::PageBoundary]>,
+) -> Option<Vec<u32>> {
+    use crate::core::config::OcrStrategy;
+
+    if !matches!(config.ocr_strategy, OcrStrategy::ScannedPages { .. }) {
+        return None;
+    }
+
+    let mut pages = pdf_metadata.pdf_specific.scanned_pages.clone()?;
+
+    if let Some(ocr_config) = config.ocr.as_ref() {
+        let decision = ocr::evaluate_per_page_ocr(
+            native_text,
+            boundaries,
+            pdf_metadata.pdf_specific.page_count,
+            &ocr_config.effective_thresholds(),
+        );
+        if decision.whole_doc_failure {
+            // A whole-document failure is itself a `ScannedPages` signal (see
+            // discarding the signal and relying on the caller's `Auto` fallthrough.
+            let page_count = pdf_metadata.pdf_specific.page_count.unwrap_or(0);
+            return if page_count == 0 {
+                None
+            } else {
+                Some((1..=page_count).collect())
+            };
+        }
+        pages.extend(decision.failing_pages);
+    }
+
+    pages.sort_unstable();
+    pages.dedup();
+
+    if pages.is_empty() { None } else { Some(pages) }
+}
 use pages::{assign_hierarchy_to_pages, assign_tables_and_images_to_pages};
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn replace_tables_with_ocr_output(tables: &mut Vec<crate::types::Table>, mut ocr_tables: Vec<crate::types::Table>) {
+    if ocr_tables.is_empty() {
+        return;
+    }
+
+    ocr_tables.sort_by_key(|table| table.page_number);
+    *tables = ocr_tables;
+}
+
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-pipeline")))]
+fn prepare_ocr_layout_inputs(
+    images: Vec<image::RgbImage>,
+    mut detections: Vec<crate::layout::DetectionResult>,
+) -> (Vec<image::DynamicImage>, Vec<crate::layout::DetectionResult>) {
+    if detections.len() != images.len() {
+        tracing::warn!(
+            images = images.len(),
+            detections = detections.len(),
+            "OCR layout input cardinality mismatch; discarding detections while reusing page rasters"
+        );
+        detections = images
+            .iter()
+            .map(|image| crate::layout::DetectionResult {
+                page_width: image.width(),
+                page_height: image.height(),
+                detections: Vec::new(),
+            })
+            .collect();
+    } else {
+        for (page_index, (image, detection)) in images.iter().zip(&mut detections).enumerate() {
+            if detection.page_width != image.width() || detection.page_height != image.height() {
+                tracing::warn!(
+                    page = page_index + 1,
+                    image_width = image.width(),
+                    image_height = image.height(),
+                    detection_width = detection.page_width,
+                    detection_height = detection.page_height,
+                    "OCR layout dimensions mismatch; discarding detections for this page"
+                );
+                *detection = crate::layout::DetectionResult {
+                    page_width: image.width(),
+                    page_height: image.height(),
+                    detections: Vec::new(),
+                };
+            }
+        }
+    }
+
+    let images = images.into_iter().map(image::DynamicImage::ImageRgb8).collect();
+    (images, detections)
+}
+
+/// Auto layout gate audit trail: 1-indexed skipped pages and per-page
+/// decision reasons, both `None` unless the `Auto` gate ran.
+///
+/// Unused only when both OCR features and the pdf + layout-detection pair
+/// are off; the allow is scoped wider because cfg algebra for "either user
+/// present" is not worth the noise.
+#[cfg_attr(not(any(feature = "ocr", feature = "ocr-pipeline")), allow(dead_code))]
+type OcrLayoutGateDecisions = (Option<Vec<u32>>, Option<Vec<String>>);
+
+/// Whether the markdown layout pass's rasters may be reused as OCR input.
+///
+/// Under `LayoutStrategy::Auto` with `SkipRender`, gate-skipped pages carry
+/// 64x64 white placeholders. Rotated pages also remain in the display-space
+/// coordinate frame required by Markdown layout. Reuse is therefore allowed
+/// only when every page ran the model and no page has an effective `/Rotate`;
+/// otherwise OCR reruns layout with normalized rasters. ~keep
+#[cfg(all(
+    feature = "pdf",
+    feature = "layout-detection",
+    any(feature = "ocr", feature = "ocr-pipeline")
+))]
+fn markdown_layout_reusable_for_ocr(
+    decisions: Option<&[crate::pdf::layout_gate::PageGateDecision]>,
+    page_rotations: &[u32],
+) -> bool {
+    decisions.is_none_or(|decisions| decisions.iter().all(|decision| decision.run_layout))
+        && page_rotations.iter().all(|rotation| rotation.is_multiple_of(360))
+}
+
+/// Convert gate decisions into the metadata representation.
+#[cfg(all(feature = "pdf", feature = "layout-detection"))]
+fn layout_gate_metadata(decisions: Option<&[crate::pdf::layout_gate::PageGateDecision]>) -> OcrLayoutGateDecisions {
+    let Some(decisions) = decisions else {
+        return (None, None);
+    };
+    let gated = decisions
+        .iter()
+        .enumerate()
+        .filter(|(_, decision)| !decision.run_layout)
+        .map(|(page_index, _)| page_index as u32 + 1)
+        .collect();
+    let reasons = decisions
+        .iter()
+        .map(|decision| decision.reason.wire_name().to_string())
+        .collect();
+    (Some(gated), Some(reasons))
+}
+
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-pipeline")))]
+fn config_with_layout_acceleration_override(
+    config: &ExtractionConfig,
+    acceleration_override: Option<crate::core::config::acceleration::AccelerationConfig>,
+) -> std::borrow::Cow<'_, ExtractionConfig> {
+    let Some(acceleration) = acceleration_override else {
+        return std::borrow::Cow::Borrowed(config);
+    };
+
+    let mut effective = config.clone();
+    if let Some(layout) = effective.layout.as_mut() {
+        layout.acceleration = Some(acceleration);
+    } else {
+        effective.acceleration = Some(acceleration);
+    }
+    std::borrow::Cow::Owned(effective)
+}
 
 /// Run OCR with optional layout detection on PDF bytes.
 ///
-/// Returns `None` when layout detection is not configured or fails.
-/// Failures are logged as warnings but do not propagate — extraction
-/// continues without layout hints (graceful degradation).
+/// Reuses detections from native extraction when available. Otherwise, when
+/// layout detection is configured, it runs a soft-failing layout pass before
+/// OCR. Layout failures are logged and OCR continues without layout hints.
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 async fn run_ocr_with_layout(
     content: &[u8],
     config: &ExtractionConfig,
     path: Option<&std::path::Path>,
+    #[cfg(feature = "layout-detection")] precomputed_layout_images: Option<Vec<image::RgbImage>>,
+    #[cfg(feature = "layout-detection")] precomputed_layout_detections: Option<Vec<crate::layout::DetectionResult>>,
+    #[cfg(feature = "layout-detection")] precomputed_layout_acceleration_override: Option<
+        crate::core::config::acceleration::AccelerationConfig,
+    >,
 ) -> crate::Result<(
     String,
     Vec<crate::types::Table>,
@@ -48,24 +545,124 @@ async fn run_ocr_with_layout(
     Vec<String>,
     Option<Vec<crate::types::ExtractedImage>>,
     Vec<crate::types::Formula>,
+    OcrLayoutGateDecisions,
+    Option<crate::types::ProcessingWarning>,
+    Vec<crate::types::ProcessingWarning>,
 )> {
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    let mut layout_warning = None;
+    #[cfg(not(all(feature = "pdf", feature = "layout-detection")))]
+    let layout_warning = None;
+
+    // `pdf_oxide` glyph-drop warnings captured while the layout pass rendered
+    // its pages (#353); populated only on the layout-detection path, since
+    // that is the only render call site routed through `spawn_blocking`.
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    let mut layout_glyph_drop_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
+    #[cfg(not(all(feature = "pdf", feature = "layout-detection")))]
+    let layout_glyph_drop_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
+
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    let mut ocr_layout_gate_decisions: OcrLayoutGateDecisions = (None, None);
+    #[cfg(not(all(feature = "pdf", feature = "layout-detection")))]
+    let ocr_layout_gate_decisions: OcrLayoutGateDecisions = (None, None);
+
+    #[cfg(feature = "layout-detection")]
+    let mut layout_acceleration_override = precomputed_layout_acceleration_override;
+
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    let owned_layout = if precomputed_layout_detections.is_none() || precomputed_layout_images.is_none() {
+        if let Some(layout_config) = config.resolved_layout_config() {
+            let thread_budget = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
+            match layout_runner::run_layout_for_ocr(content, layout_config.as_ref(), thread_budget).await {
+                Ok((
+                    layout_runner::LayoutAttempt {
+                        output:
+                            layout_runner::LayoutRunOutput {
+                                data: Some(layout),
+                                gate_decisions,
+                            },
+                        acceleration_override,
+                        warning,
+                    },
+                    glyph_drop_warnings,
+                )) => {
+                    layout_acceleration_override = acceleration_override;
+                    layout_warning = warning;
+                    layout_glyph_drop_warnings = glyph_drop_warnings;
+                    ocr_layout_gate_decisions = layout_gate_metadata(gate_decisions.as_deref());
+                    Some(layout)
+                }
+                Ok((
+                    layout_runner::LayoutAttempt {
+                        output:
+                            layout_runner::LayoutRunOutput {
+                                data: None,
+                                gate_decisions,
+                            },
+                        acceleration_override: _,
+                        warning,
+                    },
+                    glyph_drop_warnings,
+                )) => {
+                    layout_warning = warning;
+                    layout_glyph_drop_warnings = glyph_drop_warnings;
+                    tracing::info!("OCR layout: auto gate skipped every page, continuing without layout assembly");
+                    ocr_layout_gate_decisions = layout_gate_metadata(gate_decisions.as_deref());
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "OCR layout detection failed; continuing without layout assembly"
+                    );
+                    layout_warning = Some(layout_runner::layout_failure_warning(&error));
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    let layout_inputs = match (precomputed_layout_images, precomputed_layout_detections) {
+        (Some(images), Some(detections)) => Some((images, detections)),
+        _ => owned_layout.map(|(images, _, _, detections)| (images, detections)),
+    };
+    #[cfg(all(not(feature = "pdf"), feature = "layout-detection"))]
+    let layout_inputs = precomputed_layout_images.zip(precomputed_layout_detections);
+
+    #[cfg(feature = "layout-detection")]
+    let prepared_layout_inputs =
+        layout_inputs.map(|(images, detections)| prepare_ocr_layout_inputs(images, detections));
+    #[cfg(feature = "layout-detection")]
+    let ocr_images = prepared_layout_inputs.as_ref().map(|(images, _)| images.as_slice());
+    #[cfg(feature = "layout-detection")]
+    let layout_detections = prepared_layout_inputs
+        .as_ref()
+        .map(|(_, detections)| detections.as_slice());
+
+    #[cfg(feature = "layout-detection")]
+    let effective_config = config_with_layout_acceleration_override(config, layout_acceleration_override);
+    #[cfg(feature = "layout-detection")]
+    let config = effective_config.as_ref();
+
     let default_ocr_config = crate::core::config::OcrConfig::default();
     let ocr_config = config.ocr.as_ref().unwrap_or(&default_ocr_config);
 
-    #[cfg(feature = "layout-detection")]
-    let layout_detections: Option<Vec<crate::layout::DetectionResult>> = None;
-
-    // Check for pipeline configuration
     if let Some(pipeline) = ocr_config.effective_pipeline() {
-        // Box::pin the deep OCR future so its persisted state lives on the heap
-        // instead of inflating this frame. The OCR await chain is large and
-        // stack-sensitive; keeping it inline contributes to worker-stack overflow.
-        let (text, _ocr_tables, ocr_elements, pipeline_doc, llm_usage, ocr_pts, pipeline_rasters, pipeline_formulas) =
+        let (text, ocr_tables, ocr_elements, pipeline_doc, llm_usage, ocr_pts, pipeline_rasters, pipeline_formulas) =
             Box::pin(ocr::run_ocr_pipeline(
                 Some(content),
+                #[cfg(feature = "layout-detection")]
+                ocr_images,
+                #[cfg(not(feature = "layout-detection"))]
                 None,
                 #[cfg(feature = "layout-detection")]
-                layout_detections.as_deref(),
+                layout_detections,
                 config,
                 &pipeline,
                 path,
@@ -73,25 +670,28 @@ async fn run_ocr_with_layout(
             .await?;
         return Ok((
             text,
-            Vec::new(),
+            ocr_tables,
             ocr_elements,
             pipeline_doc,
             llm_usage,
             ocr_pts,
             pipeline_rasters,
             pipeline_formulas,
+            ocr_layout_gate_decisions,
+            layout_warning,
+            layout_glyph_drop_warnings,
         ));
     }
 
-    // Box::pin the deep OCR future so its persisted state lives on the heap
-    // instead of inflating this frame. The OCR await chain is large and
-    // stack-sensitive; keeping it inline contributes to worker-stack overflow.
     let (text, _mean_conf, ocr_tables, ocr_elements, ocr_doc, llm_usage, ocr_pts, ocr_rasters, formulas) =
         Box::pin(extract_with_ocr(
             Some(content),
+            #[cfg(feature = "layout-detection")]
+            ocr_images,
+            #[cfg(not(feature = "layout-detection"))]
             None,
             #[cfg(feature = "layout-detection")]
-            layout_detections.as_deref(),
+            layout_detections,
             config,
             path,
         ))
@@ -105,7 +705,22 @@ async fn run_ocr_with_layout(
         ocr_pts,
         ocr_rasters,
         formulas,
+        ocr_layout_gate_decisions,
+        layout_warning,
+        layout_glyph_drop_warnings,
     ))
+}
+
+/// Whether the caller actually asked for the recovered diagram, i.e. the
+/// request's output format resolves to the `dot` renderer.
+///
+/// `OutputFormat::Custom` is how any renderer, built-in or registered, is
+/// selected (see `plugins::registry::RendererRegistry`), so matching the
+/// renderer name here is the same test `derive_extraction_result` uses to
+/// decide which renderer runs — not a looser proxy for it.
+#[cfg(feature = "pdf")]
+fn wants_dot_output(config: &ExtractionConfig) -> bool {
+    matches!(&config.output_format, crate::core::config::OutputFormat::Custom(name) if name == "dot")
 }
 
 /// PDF document extractor using pdf_oxide.
@@ -156,10 +771,11 @@ impl InternalDocumentExtractor for PdfExtractor {
 
     #[cfg(feature = "tokio-runtime")]
     async fn extract_path(&self, path: &Path, mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
-        // Set the PDF file path for pdf_oxide text extraction (thread-local).
         #[cfg(feature = "pdf")]
         crate::pdf::oxide_text::set_current_pdf_path(Some(path.to_path_buf()));
-        let bytes = tokio::fs::read(path).await?;
+        // Async on native (non-blocking tokio::fs); sync fallback on wasm32 where tokio's `fs`
+        // feature is unavailable. See `core::io::read_file_async`. ~keep
+        let bytes = crate::core::io::read_file_async(path).await?;
         let result = self.extract_core(&bytes, mime_type, config, Some(path)).await;
         #[cfg(feature = "pdf")]
         crate::pdf::oxide_text::set_current_pdf_path(None);
@@ -200,16 +816,61 @@ impl PdfExtractor {
         config: &ExtractionConfig,
         path: Option<&std::path::Path>,
     ) -> Result<InternalDocument> {
-        let _ = &path; // used only when `ocr` feature is enabled
+        let _ = &path;
 
         #[cfg(all(feature = "pdf", feature = "layout-detection"))]
-        let (markdown_layout_images, markdown_layout_results, markdown_layout_hints) =
-            layout_runner::maybe_run_layout_for_markdown(content, config);
+        #[allow(unused_mut, unused_variables)]
+        let (
+            mut markdown_layout_images,
+            markdown_layout_results,
+            markdown_layout_hints,
+            mut markdown_layout_detections,
+            markdown_layout_gate_decisions,
+            markdown_layout_warning,
+            mut markdown_layout_acceleration_override,
+            markdown_layout_glyph_drop_warnings,
+        ) = layout_runner::maybe_run_layout_for_markdown(content, config).await;
 
         #[cfg(all(feature = "pdf", feature = "layout-detection"))]
         let layout_hints: Option<&[Vec<crate::pdf::structure::types::LayoutHint>]> = markdown_layout_hints.as_deref();
         #[cfg(not(feature = "layout-detection"))]
         let layout_hints: Option<&[Vec<crate::pdf::structure::types::LayoutHint>]> = None;
+
+        let passwords = config
+            .pdf_options
+            .as_ref()
+            .and_then(|options| options.passwords.as_deref())
+            .unwrap_or(&[]);
+        let raw_compatibility_signal = raw_pdf_needs_lopdf_compatibility_pass(content);
+        let compatibility_data = raw_compatibility_signal.then(|| extract_lopdf_compatibility_data(content));
+        let mut oxide_document = crate::pdf::oxide::OxideDocument::open_bytes_with_passwords(content, passwords)?;
+
+        let compatibility_data = match compatibility_data {
+            Some(data) => Some(data),
+            None if parsed_pdf_needs_lopdf_compatibility_pass(&oxide_document) => {
+                // Avoid holding both parser object graphs at once. Compressed
+                // catalog outlines are rare, so reopen pdf_oxide for this path. ~keep
+                drop(oxide_document);
+                let data = extract_lopdf_compatibility_data(content);
+                oxide_document = crate::pdf::oxide::OxideDocument::open_bytes_with_passwords(content, passwords)?;
+                Some(data)
+            }
+            None => None,
+        };
+        let (outline_entries, bookmark_uris, pdf_revisions) = compatibility_data.unwrap_or_default();
+
+        // Recovered before the document is handed on, which is the last point
+        // it is still borrowable. Pages that draw nothing graph-shaped cost one
+        // path parse and stop there, and a page that does still pays for a
+        // second full text pass on top of the one this extractor already runs.
+        // Skipped outright unless the caller actually asked for DOT output —
+        // every other renderer discards the result, so an ordinary ruled
+        // report must not pay for it.
+        let diagrams = if wants_dot_output(config) {
+            crate::extraction::diagram::pdf::recover(&mut oxide_document)
+        } else {
+            Vec::new()
+        };
 
         #[allow(unused_variables, unused_mut)]
         let (
@@ -223,9 +884,12 @@ impl PdfExtractor {
             pdf_annotations,
             mut extracted_images,
             pdf_form_fields,
+            mut pdf_extraction_warnings,
+            pdf_page_labels,
         ) = extract_all_from_oxide_document(
-            content,
+            oxide_document,
             config,
+            &outline_entries,
             layout_hints,
             #[cfg(feature = "layout-detection")]
             markdown_layout_images.as_deref(),
@@ -235,15 +899,10 @@ impl PdfExtractor {
             markdown_layout_results.as_deref(),
             #[cfg(not(feature = "layout-detection"))]
             None,
+            #[cfg(feature = "layout-detection")]
+            markdown_layout_acceleration_override.as_ref(),
         )?;
 
-        // --- Inline-image OCR ---
-        // Moved from extraction.rs (sync) to here (async) so we can resolve the
-        // configured backend through the OcrBackend registry instead of calling
-        // OcrProcessor directly, which previously hard-coded Tesseract regardless
-        // of OcrConfig.backend / vlm_fallback / pipeline. Fixes #1088.
-        // output_format is forwarded so backends that produce format-aware output
-        // (e.g. Markdown table rendering) behave consistently with the image extractor.
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         if config.pdf_options.as_ref().is_some_and(|p| p.ocr_inline_images)
             && let Some(ref mut imgs) = extracted_images
@@ -284,7 +943,6 @@ impl PdfExtractor {
             }
         }
 
-        // --- OCR evaluation ---
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let mut ocr_tables: Vec<crate::types::Table> = Vec::new();
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
@@ -298,16 +956,70 @@ impl PdfExtractor {
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let mut ocr_results_map: Option<ahash::AHashMap<u32, String>> = None;
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        let mut structured_ocr_pages: Option<ahash::AHashMap<u32, InternalDocument>> = None;
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let mut ocr_page_rasters: Option<Vec<crate::types::ExtractedImage>> = None;
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let mut ocr_formulas: Vec<crate::types::Formula> = Vec::new();
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        let mut ocr_fallback_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        #[allow(unused_assignments)]
+        let mut ocr_layout_gate_audit: OcrLayoutGateDecisions = (None, None);
+
+        #[cfg(all(
+            feature = "pdf",
+            feature = "layout-detection",
+            any(feature = "ocr", feature = "ocr-pipeline")
+        ))]
+        {
+            // These values exist only with layout detection; keep the reuse gate in the same cfg block. ~keep
+            let markdown_page_rotations = markdown_layout_images
+                .as_ref()
+                .map(|images| crate::pdf::render::get_page_rotations(content, images.len()))
+                .unwrap_or_default();
+            if !markdown_layout_reusable_for_ocr(markdown_layout_gate_decisions.as_deref(), &markdown_page_rotations) {
+                markdown_layout_images = None;
+                markdown_layout_detections = None;
+                markdown_layout_acceleration_override = None;
+            }
+        }
 
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let (text, extraction_method) = if config.effective_disable_ocr() {
             (native_text, ExtractionMethod::Native)
         } else if config.force_ocr {
-            let (ocr_text, ocr_tbls, ocr_elems, ocr_doc, llm_usage, ocr_pts, ocr_rstrs, formulas) =
-                run_ocr_with_layout(content, config, path).await?;
+            let (
+                ocr_text,
+                ocr_tbls,
+                ocr_elems,
+                ocr_doc,
+                llm_usage,
+                ocr_pts,
+                ocr_rstrs,
+                formulas,
+                gate_audit,
+                layout_warning,
+                layout_glyph_drop_warnings,
+            ) = run_ocr_with_layout(
+                content,
+                config,
+                path,
+                #[cfg(feature = "layout-detection")]
+                markdown_layout_images.take(),
+                #[cfg(feature = "layout-detection")]
+                markdown_layout_detections.take(),
+                #[cfg(feature = "layout-detection")]
+                markdown_layout_acceleration_override.take(),
+            )
+            .await?;
+            if let Some(warning) = layout_warning {
+                crate::core::diagnostics::push_warning_deduped(&mut ocr_fallback_warnings, warning);
+            }
+            for warning in layout_glyph_drop_warnings {
+                crate::core::diagnostics::push_warning_deduped(&mut ocr_fallback_warnings, warning);
+            }
+            ocr_layout_gate_audit = gate_audit;
             ocr_tables = ocr_tbls;
             ocr_elements = ocr_elems;
             ocr_internal_doc = ocr_doc;
@@ -320,15 +1032,24 @@ impl PdfExtractor {
             if !ocr_pages.is_empty() {
                 if let Some(ref bounds) = boundaries {
                     if !bounds.is_empty() {
-                        let (mixed, results_map, mixed_llm_usage, mixed_rstrs, mixed_formulas) =
-                            ocr::extract_mixed_ocr_native(&native_text, bounds, ocr_pages, content, config, path)
-                                .await?;
+                        let (
+                            mixed,
+                            results_map,
+                            mixed_structured_pages,
+                            mixed_llm_usage,
+                            mixed_rstrs,
+                            mixed_formulas,
+                            mixed_warnings,
+                        ) = ocr::extract_mixed_ocr_native(&native_text, bounds, ocr_pages, content, config, path)
+                            .await?;
                         ocr_llm_usage = mixed_llm_usage;
                         ocr_results_map = Some(results_map);
+                        structured_ocr_pages = Some(mixed_structured_pages);
                         ocr_page_rasters = mixed_rstrs;
                         if !mixed_formulas.is_empty() {
                             ocr_formulas = mixed_formulas;
                         }
+                        ocr_fallback_warnings.extend(mixed_warnings);
                         (mixed, ExtractionMethod::Mixed)
                     } else {
                         tracing::warn!("force_ocr_pages set but no page boundaries available; using native text");
@@ -341,7 +1062,46 @@ impl PdfExtractor {
             } else {
                 (native_text, ExtractionMethod::Native)
             }
-        } else if let Some(ocr_config) = config.ocr.as_ref() {
+        } else if let Some(scanned_pages) =
+            scanned_pages_to_ocr(config, &pdf_metadata, &native_text, boundaries.as_deref())
+        {
+            // A scanner's invisible sidecar passes the gate below, so detected
+            // pages are selected before it runs. ~keep
+            if let Some(ref bounds) = boundaries
+                && !bounds.is_empty()
+            {
+                let (
+                    mixed,
+                    results_map,
+                    mixed_structured_pages,
+                    mixed_llm_usage,
+                    mixed_rstrs,
+                    mixed_formulas,
+                    mixed_warnings,
+                ) = ocr::extract_mixed_ocr_native(&native_text, bounds, &scanned_pages, content, config, path).await?;
+                ocr_llm_usage = mixed_llm_usage;
+                ocr_results_map = Some(results_map);
+                structured_ocr_pages = Some(mixed_structured_pages);
+                ocr_page_rasters = mixed_rstrs;
+                if !mixed_formulas.is_empty() {
+                    ocr_formulas = mixed_formulas;
+                }
+                ocr_fallback_warnings.extend(mixed_warnings);
+                (mixed, ExtractionMethod::Mixed)
+            } else {
+                tracing::warn!("scanned pages detected but no page boundaries available; using native text");
+                (native_text, ExtractionMethod::Native)
+            }
+        } else if config.ocr.is_some() || native_text.trim().is_empty() {
+            // Under `Auto`, a PDF with NO native text at all (a scan / missing text layer)
+            // must reach OCR even when no explicit `ocr` config was given — the default
+            // `ocr: None` ("OCR disabled") otherwise silently discarded the detected scan
+            // and returned an empty result (#1338). This is gated on genuinely-absent text
+            // a legitimately sparse/short PDF must stay native under a default config, and
+            // heuristic quality failures still require an explicit `ocr` config to trigger
+            // OCR. An explicit `ocr` config keeps its full per-page gate behavior.
+            let default_ocr_config = crate::core::config::OcrConfig::default();
+            let ocr_config = config.ocr.as_ref().unwrap_or(&default_ocr_config);
             let thresholds = ocr_config.effective_thresholds();
             let decision = ocr::evaluate_per_page_ocr(
                 &native_text,
@@ -350,24 +1110,21 @@ impl PdfExtractor {
                 &thresholds,
             );
 
-            if std::env::var("XBERG_DEBUG_OCR").is_ok() {
-                eprintln!(
-                    "[xberg::pdf::ocr] fallback={} non_whitespace={} alnum={} meaningful_words={} \
-                     avg_non_whitespace={:.2} avg_alnum={:.2} alnum_ratio={:.3} fragmented_word_ratio={:.3} \
-                     avg_word_length={:.2} word_count={} consecutive_repeat_ratio={:.3}",
-                    decision.fallback,
-                    decision.stats.non_whitespace,
-                    decision.stats.alnum,
-                    decision.stats.meaningful_words,
-                    decision.avg_non_whitespace,
-                    decision.avg_alnum,
-                    decision.stats.alnum_ratio,
-                    decision.stats.fragmented_word_ratio,
-                    decision.stats.avg_word_length,
-                    decision.stats.word_count,
-                    decision.stats.consecutive_repeat_ratio
-                );
-            }
+            tracing::debug!(
+                target: "xberg::pdf::ocr",
+                fallback = decision.fallback,
+                non_whitespace = decision.stats.non_whitespace,
+                alnum = decision.stats.alnum,
+                meaningful_words = decision.stats.meaningful_words,
+                avg_non_whitespace = decision.avg_non_whitespace,
+                avg_alnum = decision.avg_alnum,
+                alnum_ratio = decision.stats.alnum_ratio,
+                fragmented_word_ratio = decision.stats.fragmented_word_ratio,
+                avg_word_length = decision.stats.avg_word_length,
+                word_count = decision.stats.word_count,
+                consecutive_repeat_ratio = decision.stats.consecutive_repeat_ratio,
+                "per-page OCR gate decision",
+            );
 
             let total_chars = native_text.chars().count();
             let alnum_ws_chars = native_text
@@ -406,16 +1163,44 @@ impl PdfExtractor {
                     (native_text, ExtractionMethod::Native)
                 }
                 ocr::OcrGateOutcome::RunFallback => {
-                    // Only skip document-level OCR when the caller explicitly configured
-                    // image extraction AND opted into per-image OCR. Callers with no
-                    // `images` config must not lose the fallback they previously relied on.
                     let skip_fallback = config.images.as_ref().map(|i| i.run_ocr_on_images).unwrap_or(false);
                     if skip_fallback {
                         tracing::debug!("Skipping document-level OCR fallback: run_ocr_on_images=true");
                         (native_text, ExtractionMethod::Native)
                     } else {
-                        match run_ocr_with_layout(content, config, path).await {
-                            Ok((ocr_text, ocr_tbls, ocr_elems, ocr_doc, llm_usage, ocr_pts, ocr_rstrs, formulas)) => {
+                        match run_ocr_with_layout(
+                            content,
+                            config,
+                            path,
+                            #[cfg(feature = "layout-detection")]
+                            markdown_layout_images.take(),
+                            #[cfg(feature = "layout-detection")]
+                            markdown_layout_detections.take(),
+                            #[cfg(feature = "layout-detection")]
+                            markdown_layout_acceleration_override.take(),
+                        )
+                        .await
+                        {
+                            Ok((
+                                ocr_text,
+                                ocr_tbls,
+                                ocr_elems,
+                                ocr_doc,
+                                llm_usage,
+                                ocr_pts,
+                                ocr_rstrs,
+                                formulas,
+                                gate_audit,
+                                layout_warning,
+                                layout_glyph_drop_warnings,
+                            )) => {
+                                if let Some(warning) = layout_warning {
+                                    crate::core::diagnostics::push_warning_deduped(&mut ocr_fallback_warnings, warning);
+                                }
+                                for warning in layout_glyph_drop_warnings {
+                                    crate::core::diagnostics::push_warning_deduped(&mut ocr_fallback_warnings, warning);
+                                }
+                                ocr_layout_gate_audit = gate_audit;
                                 ocr_tables = ocr_tbls;
                                 ocr_elements = ocr_elems;
                                 ocr_internal_doc = ocr_doc;
@@ -430,26 +1215,39 @@ impl PdfExtractor {
                                     error = %e,
                                     "OCR fallback failed; using native text extraction result"
                                 );
+                                ocr_fallback_warnings.push(crate::types::ProcessingWarning {
+                                    source: std::borrow::Cow::Borrowed("ocr"),
+                                    message: std::borrow::Cow::Owned(format!(
+                                        "OCR fallback failed ({e}); returning native text that was below the \
+                                         quality threshold which triggered OCR. Extracted content may be empty \
+                                         or incomplete."
+                                    )),
+                                });
                                 (native_text, ExtractionMethod::Native)
                             }
                         }
                     }
                 }
-                // Intentional asymmetry with RunFallback: RunFallback is suppressed when
-                // `run_ocr_on_images=true` because image-level OCR serves as the fallback.
-                // RunFallbackOnPages targets specific pages that failed native quality,
-                // which is independent of image extraction — suppressing it would silently
-                // skip OCR on text pages that need it.
                 ocr::OcrGateOutcome::RunFallbackOnPages(pages) => match boundaries.as_deref() {
                     Some(bounds) if !bounds.is_empty() => {
                         match ocr::extract_mixed_ocr_native(&native_text, bounds, &pages, content, config, path).await {
-                            Ok((mixed, results_map, mixed_llm_usage, mixed_rstrs, mixed_formulas)) => {
+                            Ok((
+                                mixed,
+                                results_map,
+                                mixed_structured_pages,
+                                mixed_llm_usage,
+                                mixed_rstrs,
+                                mixed_formulas,
+                                mixed_warnings,
+                            )) => {
                                 ocr_llm_usage = mixed_llm_usage;
                                 ocr_results_map = Some(results_map);
+                                structured_ocr_pages = Some(mixed_structured_pages);
                                 ocr_page_rasters = mixed_rstrs;
                                 if !mixed_formulas.is_empty() {
                                     ocr_formulas = mixed_formulas;
                                 }
+                                ocr_fallback_warnings.extend(mixed_warnings);
                                 (mixed, ExtractionMethod::Mixed)
                             }
                             Err(e) => {
@@ -458,6 +1256,14 @@ impl PdfExtractor {
                                     failing_pages = ?pages,
                                     "Targeted OCR fallback failed; using native text extraction result"
                                 );
+                                ocr_fallback_warnings.push(crate::types::ProcessingWarning {
+                                    source: std::borrow::Cow::Borrowed("ocr"),
+                                    message: std::borrow::Cow::Owned(format!(
+                                        "Targeted OCR fallback failed ({e}) for pages {pages:?}; those pages \
+                                         retain native text that was below the OCR-trigger quality threshold \
+                                         and may be empty or incomplete."
+                                    )),
+                                });
                                 (native_text, ExtractionMethod::Native)
                             }
                         }
@@ -467,6 +1273,14 @@ impl PdfExtractor {
                             failing_pages = ?pages,
                             "Targeted OCR requested but no page boundaries available; using native text"
                         );
+                        ocr_fallback_warnings.push(crate::types::ProcessingWarning {
+                            source: std::borrow::Cow::Borrowed("ocr"),
+                            message: std::borrow::Cow::Owned(format!(
+                                "Targeted OCR was required for pages {pages:?} but no page boundaries were \
+                                 available; those pages retain native text that was below the OCR-trigger \
+                                 quality threshold and may be empty or incomplete."
+                            )),
+                        });
                         (native_text, ExtractionMethod::Native)
                     }
                 },
@@ -480,12 +1294,12 @@ impl PdfExtractor {
         let (text, extraction_method) = (native_text, ExtractionMethod::Native);
 
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
-        if !ocr_tables.is_empty() {
-            tables.extend(ocr_tables);
-            tables.sort_by_key(|t| t.page_number);
-        }
+        // Full-document OCR is authoritative for tables when it produced
+        // them. The structured OCR document already contains the same table
+        // values, so later document assembly must not inject them a second
+        // time. ~keep
+        replace_tables_with_ocr_output(&mut tables, ocr_tables);
 
-        // --- Image extraction ---
         let (images, image_fallback_warning): (
             Option<Vec<crate::types::ExtractedImage>>,
             Option<crate::types::ProcessingWarning>,
@@ -506,8 +1320,6 @@ impl PdfExtractor {
                         page.is_blank = Some(crate::extraction::blank_detection::is_page_text_blank(&page.content));
                     }
 
-                    // Special case for VLM models that return a single string for a multi-page PDF:
-                    // we clear the content of the remaining pages to avoid stale native text fallback.
                     if pts_len == 1 && pages_len > 1 {
                         for p in pages.iter_mut().skip(1) {
                             p.content.clear();
@@ -515,7 +1327,6 @@ impl PdfExtractor {
                         }
                     }
                 } else {
-                    // No native pages, but we have OCR page texts - build the page array.
                     page_contents = Some(
                         pts.into_iter()
                             .enumerate()
@@ -540,7 +1351,7 @@ impl PdfExtractor {
                 }
             }
 
-            if let Some(results_map) = ocr_results_map
+            if let Some(results_map) = ocr_results_map.as_ref()
                 && let Some(ref mut pages) = page_contents
             {
                 for page in pages.iter_mut() {
@@ -550,20 +1361,24 @@ impl PdfExtractor {
                     }
                 }
             }
+
+            if let Some(ref content_pages) = page_contents
+                && let Some(ref mut page_structure) = pdf_metadata.page_structure
+                && let Some(ref mut info_pages) = page_structure.pages
+            {
+                for info in info_pages.iter_mut() {
+                    if let Some(content_page) = content_pages.iter().find(|p| p.page_number == info.number) {
+                        info.is_blank = content_page.is_blank;
+                    }
+                }
+            }
         }
 
-        // --- Recompute page boundaries after OCR fills page_contents (#1110) ---
-        // When OCR writes new text into page_contents, the original boundaries in
-        // pdf_metadata.page_structure (computed against native extraction) become
-        // invalid byte offsets into the OCR-filled content.  Recompute them here so
-        // downstream consumers (the chunker, result.metadata.pages) see valid offsets.
         #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "chunking"))]
         if extraction_method.used_ocr()
             && let Some(ref pages) = page_contents
             && !pages.is_empty()
         {
-            // Build combined content mirroring what render_plain produces from
-            // page texts so recompute_boundaries_from_pages can locate each page.
             let combined: String = pages
                 .iter()
                 .filter(|p| !p.content.trim().is_empty())
@@ -577,49 +1392,93 @@ impl PdfExtractor {
             }
         }
 
-        // --- Page assembly ---
         let mut final_pages =
             assign_tables_and_images_to_pages(page_contents, &tables, images.as_deref().unwrap_or(&[]));
 
-        // --- Build InternalDocument ---
         let pre_formatted_output: Option<String> = None;
 
         let used_ocr = extraction_method.used_ocr();
-        let use_structured_doc = !used_ocr && pre_rendered_doc.is_some();
 
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
-        let mut doc = if let Some(mut ocr_doc) = ocr_internal_doc.take() {
-            ocr_doc.mime_type = mime_type.to_string();
-            ocr_doc
-        } else if let Some(mut pre_doc) = pre_rendered_doc {
-            pre_doc.mime_type = mime_type.to_string();
-            pre_doc
-        } else {
-            let mut d = InternalDocument::new("pdf");
-            d.mime_type = mime_type.to_string();
-            for paragraph in text.split("\n\n") {
-                let trimmed = paragraph.trim();
-                if !trimmed.is_empty() {
-                    d.push_element(InternalElement::text(ElementKind::Paragraph, trimmed, 0));
-                }
-            }
-            d
-        };
+        let (mut doc, document_origin, document_is_structured) = select_pdf_document(
+            extraction_method,
+            &text,
+            mime_type,
+            pre_rendered_doc,
+            ocr_internal_doc.take(),
+            ocr_results_map.as_ref(),
+            structured_ocr_pages.as_ref(),
+        );
         #[cfg(not(any(feature = "ocr", feature = "ocr-pipeline")))]
-        let mut doc = if let Some(mut pre_doc) = pre_rendered_doc {
-            pre_doc.mime_type = mime_type.to_string();
-            pre_doc
-        } else {
-            let mut d = InternalDocument::new("pdf");
-            d.mime_type = mime_type.to_string();
-            for paragraph in text.split("\n\n") {
-                let trimmed = paragraph.trim();
-                if !trimmed.is_empty() {
-                    d.push_element(InternalElement::text(ElementKind::Paragraph, trimmed, 0));
-                }
+        let (mut doc, document_is_structured) = select_native_pdf_document(&text, mime_type, pre_rendered_doc);
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        tracing::debug!(?document_origin, document_is_structured, "selected PDF document origin");
+
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        doc.processing_warnings.append(&mut ocr_fallback_warnings);
+
+        doc.processing_warnings.append(&mut pdf_extraction_warnings);
+
+        // #340: drain any pdf_oxide glyph-drop warnings captured while this
+        // document's pages were rendered on *this* thread (OCR rasterization
+        // and any other call routed through `render_page_capturing_glyph_drops`
+        // in `crate::pdf::render` that runs inline on the extracting task's
+        // thread). The drain is unconditionally cheap and correct even when
+        // nothing was ever captured: `install_pdf_render_diagnostics` is
+        // opt-in and only an embedding application calls it (a library must
+        // not seize the process-global `log` backend on its own — see
+        // `pdf::render` for why), so this buffer stays empty for every caller
+        // that has not opted in and this loop is a no-op `Vec::is_empty`
+        // check. Deduped because a multi-page document can hit the identical
+        // pdf_oxide cause on many pages.
+        //
+        // Layout-detection rasterization runs inside `tokio::task::spawn_blocking`
+        // on a different OS thread, so this drain never sees those warnings —
+        // `layout_runner::run_layout_for_pdf_pages_async` drains them itself
+        // from inside that closure and threads them back through its return
+        // value instead (#353); they are merged below via
+        // `markdown_layout_glyph_drop_warnings` (markdown path) and were
+        // already folded into `ocr_fallback_warnings` above (OCR path). ~keep
+        for pdf_render_warning in crate::pdf::render::take_pdf_oxide_render_warnings() {
+            crate::core::diagnostics::push_warning_deduped(&mut doc.processing_warnings, pdf_render_warning);
+        }
+
+        // Surface a hard layout-inference failure (e.g. CoreML kernel error) so
+        // degraded no-layout output is never silent to the caller (#1344). Runs
+        // whenever layout-detection is on, independent of OCR.
+        #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+        if let Some(warning) = markdown_layout_warning {
+            crate::core::diagnostics::push_warning_deduped(&mut doc.processing_warnings, warning);
+        }
+
+        // #353: merge `pdf_oxide` glyph-drop warnings captured while the
+        // markdown layout pass rendered its pages off-thread inside
+        // `spawn_blocking` (see the drain comment above).
+        #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+        for warning in markdown_layout_glyph_drop_warnings {
+            crate::core::diagnostics::push_warning_deduped(&mut doc.processing_warnings, warning);
+        }
+
+        // Record the auto layout gate's audit trail from whichever pass ran
+        // it. Compiled whenever `pdf` is on so `ocr_layout_gate_audit` keeps
+        // a reader in profiles without layout-detection (it is always
+        // `(None, None)` there and the fields stay `None`). ~keep
+        {
+            #[cfg(feature = "layout-detection")]
+            #[allow(unused_mut)]
+            let (mut gated_pages, mut gate_reasons) = layout_gate_metadata(markdown_layout_gate_decisions.as_deref());
+            #[cfg(not(feature = "layout-detection"))]
+            #[allow(unused_mut)]
+            let (mut gated_pages, mut gate_reasons): OcrLayoutGateDecisions = (None, None);
+            #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+            if gated_pages.is_none() {
+                let (ocr_gated_pages, ocr_gate_reasons) = ocr_layout_gate_audit;
+                gated_pages = ocr_gated_pages;
+                gate_reasons = ocr_gate_reasons;
             }
-            d
-        };
+            pdf_metadata.pdf_specific.layout_gated_pages = gated_pages;
+            pdf_metadata.pdf_specific.layout_gate_reasons = gate_reasons;
+        }
 
         doc.metadata = Metadata {
             output_format: pre_formatted_output,
@@ -632,7 +1491,6 @@ impl PdfExtractor {
             created_by: pdf_metadata.created_by.clone(),
             pages: pdf_metadata.page_structure.clone(),
             format: Some(crate::types::FormatMetadata::Pdf(pdf_metadata.pdf_specific)),
-            // True when the OCR pipeline produced the returned text (fully or partially).
             ocr_used: used_ocr,
             ..Default::default()
         };
@@ -641,31 +1499,41 @@ impl PdfExtractor {
             serde_json::Value::String(extraction_method.as_str().to_string()),
         );
 
-        // Transfer form fields directly to InternalDocument carrier field
-        // so derive_extraction_result can move them via std::mem::take
-        doc.form_fields = pdf_form_fields;
-
-        // When using the structured doc, tables are already interleaved by the assembly pipeline.
-        // Only add tables separately for the flat-text fallback path.
-        if !use_structured_doc {
-            for table in tables {
-                let table_index = doc.push_table(table);
-                doc.push_element(InternalElement::text(ElementKind::Table { table_index }, "", 0));
-            }
+        // Issue #66: `/PageLabels` — one display label per page, index-aligned
+        // with `pdf_metadata.page_structure`/`PageBoundary::page_number`.
+        // `PdfMetadata` is an alef-listed type (no new public fields), so this
+        // rides in `additional` instead. ~keep
+        if let Some(labels) = pdf_page_labels {
+            doc.metadata
+                .additional
+                .insert(std::borrow::Cow::Borrowed("page_labels"), serde_json::json!(labels));
         }
 
+        // Issue #64: surface filled field values in rendered content for
+        // output shapes (Markdown/HTML/Djot) that the plain-text widget
+        // splice in `oxide::text` never touches.
+        inject_unrepresented_form_field_elements(&mut doc, &pdf_form_fields);
+        doc.form_fields = pdf_form_fields;
+
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        let allow_table_injection = (!document_is_structured
+            && (config.output_format != crate::core::config::OutputFormat::Plain
+                || document_origin == PdfDocumentOrigin::Ocr))
+            || (document_origin == PdfDocumentOrigin::Ocr && doc.tables.is_empty());
+        #[cfg(not(any(feature = "ocr", feature = "ocr-pipeline")))]
+        let allow_table_injection =
+            document_is_structured || config.output_format != crate::core::config::OutputFormat::Plain;
+        attach_unrepresented_tables(&mut doc, tables);
+        inject_unrepresented_table_elements(&mut doc, allow_table_injection);
+
         if let Some(imgs) = images {
-            // Only interleave image elements into the flat document when:
-            //   1. The structured-doc assembly pipeline hasn't already interleaved them.
-            //   2. The caller explicitly opted in via `config.images.inject_placeholders`.
-            //
-            // Without the inject_placeholders gate, a caller that sets only
-            // `pdf_options.extract_images = true` (and leaves `config.images` as None)
-            // would receive unexpected `![](image_N.jpeg)` placeholders in Markdown output.
             // The OCR path has its own guarded injection block below (see the `#[cfg(feature = "ocr")]`
-            // block); this gate ensures the native/flat path is consistent with it.
             let inject_placeholders = config.images.as_ref().is_some_and(|c| c.inject_placeholders);
-            if !use_structured_doc && inject_placeholders {
+            let document_has_image_elements = doc
+                .elements
+                .iter()
+                .any(|element| matches!(element.kind, ElementKind::Image { .. }));
+            if !document_has_image_elements && inject_placeholders {
                 for (idx, img) in imgs.iter().enumerate() {
                     let mut elem = InternalElement::text(
                         ElementKind::Image {
@@ -681,8 +1549,6 @@ impl PdfExtractor {
             doc.images = imgs;
         }
 
-        // Append OCR page rasters after embedded images; reindex to keep image_index contiguous.
-        // None → document-level bypass; Some([]) → zero-page PDF; Some([..]) → rasters captured.
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let ocr_rasters_bypass = ocr_page_rasters.is_none();
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
@@ -694,9 +1560,6 @@ impl PdfExtractor {
             }
         }
 
-        // Warn only on the document-level bypass path (ExtractionMethod::Ocr) — not when
-        // force_ocr_pages resolved to an empty set because all requested pages were out of
-        // range (ExtractionMethod::Mixed returns None rasters without document-level bypass).
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         if used_ocr
             && ocr_rasters_bypass
@@ -712,25 +1575,23 @@ impl PdfExtractor {
             });
         }
 
-        // On the OCR/VLM path the doc is a flat text document — image elements are not
-        // interleaved by the assembly pipeline. Inject them here so downstream renderers
-        // can emit Markdown placeholders (e.g. `![](image_0.jpeg)`).
-        //
-        // Note: positional interleaving within the text stream is not yet implemented on
-        // this path; all image elements are appended after the text content.
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         if used_ocr && !doc.images.is_empty() {
             let images_enabled = config.images.as_ref().map(|c| c.extract_images).unwrap_or(false)
                 || config.pdf_options.as_ref().map(|p| p.extract_images).unwrap_or(false);
-            // Require explicit opt-in via config.images.inject_placeholders — default false when
-            // config.images is absent to avoid injecting placeholders the caller never requested.
             if images_enabled && config.images.as_ref().map(|c| c.inject_placeholders).unwrap_or(false) {
-                // Collect first to avoid borrowing doc.images and doc simultaneously.
-                // page_number is 1-indexed per ExtractedImage contract; omit attribution
-                // entirely when the page is unknown rather than using an invalid sentinel.
+                let referenced_images: std::collections::HashSet<u32> = doc
+                    .elements
+                    .iter()
+                    .filter_map(|element| match element.kind {
+                        ElementKind::Image { image_index } => Some(image_index),
+                        _ => None,
+                    })
+                    .collect();
                 let elems: Vec<InternalElement> = doc
                     .images
                     .iter()
+                    .filter(|image| !referenced_images.contains(&image.image_index))
                     .map(|img| {
                         let elem = InternalElement::text(
                             ElementKind::Image {
@@ -757,7 +1618,6 @@ impl PdfExtractor {
         }
         doc.annotations = pdf_annotations;
 
-        // Extract URIs from annotations (links).
         {
             use crate::types::annotations::PdfAnnotationType;
             use crate::types::uri::{ExtractedUri, UriKind};
@@ -794,23 +1654,14 @@ impl PdfExtractor {
             }
         }
 
-        // Extract bookmarks/outlines and xref-chain revision history.
         #[cfg(feature = "pdf")]
         {
-            if let Ok(lopdf_doc) = lopdf::Document::load_mem(content) {
-                let bookmark_uris = crate::pdf::bookmarks::extract_bookmarks(&lopdf_doc);
-                for uri in bookmark_uris {
-                    doc.push_uri(uri);
-                }
-
-                // Walk the /Prev chain to surface incremental-update history.
-                // Single-save PDFs return None; incrementally-saved PDFs return
-                // Some(Vec<DocumentRevision>) with one entry per historical xref section.
-                doc.revisions = crate::pdf::xref_revisions::extract_pdf_xref_revisions(content, &lopdf_doc);
+            for uri in bookmark_uris {
+                doc.push_uri(uri);
             }
+            doc.revisions = pdf_revisions;
         }
 
-        // Extract embedded files.
         #[cfg(all(feature = "pdf", feature = "tokio-runtime"))]
         {
             let (embedded_children, embedded_warnings) =
@@ -826,45 +1677,37 @@ impl PdfExtractor {
             }
         }
 
-        // Assign hierarchy information from structured document to pages
         if let Some(ref mut pages) = final_pages {
             assign_hierarchy_to_pages(pages, &doc);
         }
 
         doc.prebuilt_pages = final_pages;
 
-        // Attach OCR elements so downstream pipeline can use per-word bounding boxes.
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         if !ocr_elements.is_empty() {
             doc.prebuilt_ocr_elements = Some(ocr_elements);
         }
 
-        // Carry formulas on the InternalDocument; derive_extraction_result moves
-        // them into ExtractedDocument.formulas (mirrors form_fields/llm_usage).
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         if !ocr_formulas.is_empty() {
             doc.formulas = ocr_formulas;
         }
 
-        // Attach LLM usage accumulated during OCR so derive_extraction_result can transfer it.
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         if !ocr_llm_usage.is_empty() {
             doc.llm_usage = Some(ocr_llm_usage);
         }
 
+        doc.diagrams = diagrams;
+
         tracing::debug!(
             elements = doc.elements.len(),
             tables = doc.tables.len(),
             has_pages = doc.prebuilt_pages.is_some(),
+            diagrams = doc.diagrams.len(),
             "InternalDocument finalized (oxide path)"
         );
 
-        // --- Per-region VLM extraction for figures and complex layouts ---
-        //
-        // When `vlm_fallback != Disabled` and layout detection found Picture regions,
-        // crop each region from the page raster and send it to the VLM. Results are
-        // appended to the assembled document. VLM failures per region are suppressed
-        // with warnings so that one bad crop cannot abort the whole extraction.
         #[cfg(all(feature = "liter-llm", feature = "layout-detection"))]
         {
             let vlm_enabled = config
@@ -894,9 +1737,6 @@ impl PdfExtractor {
             }
         }
 
-        // Guard total extracted text against max_content_size. A crafted PDF with
-        // repeated paragraphs or synthetic content streams could produce gigabytes
-        // of text. Checked after full assembly so the limit is a document-level cap.
         {
             let mut budget = crate::extractors::security::SecurityBudget::from_config(config);
             for elem in &doc.elements {
@@ -929,6 +1769,214 @@ mod tests {
     #[cfg(all(feature = "pdf", feature = "ocr"))]
     use serial_test::serial;
 
+    fn coverage_native_text() -> String {
+        (0..MIN_NATIVE_TOKENS_FOR_STRUCTURE_COVERAGE)
+            .map(|index| format!("token{index}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn should_fall_back_to_native_text_when_structure_drops_substantial_content() {
+        let native_text = coverage_native_text();
+        let represented = native_text.split_whitespace().take(13).collect::<Vec<_>>().join(" ");
+        let mut structured = InternalDocument::new("pdf");
+        structured.push_element(InternalElement::text(ElementKind::Heading { level: 1 }, represented, 0));
+
+        let (selected, is_structured) = select_native_pdf_document(&native_text, "application/pdf", Some(structured));
+
+        assert!(!is_structured);
+        assert_eq!(selected.elements.len(), 1);
+        assert_eq!(selected.elements[0].text, native_text);
+    }
+
+    #[test]
+    fn should_keep_structure_when_native_token_coverage_meets_floor() {
+        let native_text = coverage_native_text();
+        let represented = native_text.split_whitespace().take(14).collect::<Vec<_>>().join(" ");
+        let mut structured = InternalDocument::new("pdf");
+        structured.push_element(InternalElement::text(ElementKind::Heading { level: 1 }, represented, 0));
+
+        let (selected, is_structured) = select_native_pdf_document(&native_text, "application/pdf", Some(structured));
+
+        assert!(is_structured);
+        assert!(matches!(selected.elements[0].kind, ElementKind::Heading { level: 1 }));
+    }
+
+    #[test]
+    fn should_count_table_cells_as_structured_native_text() {
+        let native_text = coverage_native_text();
+        let mut structured = InternalDocument::new("pdf");
+        structured.tables.push(crate::types::Table {
+            cells: vec![native_text.split_whitespace().map(str::to_string).collect()],
+            ..Default::default()
+        });
+
+        let (_, is_structured) = select_native_pdf_document(&native_text, "application/pdf", Some(structured));
+
+        assert!(is_structured);
+    }
+
+    #[test]
+    fn should_not_apply_structure_coverage_gate_to_trivial_native_text() {
+        let mut structured = InternalDocument::new("pdf");
+        structured.push_element(InternalElement::text(ElementKind::Heading { level: 1 }, "Title", 0));
+
+        let (selected, is_structured) =
+            select_native_pdf_document("Title and body", "application/pdf", Some(structured));
+
+        assert!(is_structured);
+        assert!(matches!(selected.elements[0].kind, ElementKind::Heading { level: 1 }));
+    }
+
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    fn gate_decision(run_layout: bool) -> crate::pdf::layout_gate::PageGateDecision {
+        crate::pdf::layout_gate::PageGateDecision {
+            run_layout,
+            reason: if run_layout {
+                crate::pdf::layout_gate::GateReason::MultiColumn
+            } else {
+                crate::pdf::layout_gate::GateReason::PlainText
+            },
+        }
+    }
+
+    /// Gate-skipped pages carry placeholder rasters; any skip must refuse
+    /// raster reuse so OCR never reads a blank square.
+    #[cfg(all(
+        feature = "pdf",
+        feature = "layout-detection",
+        any(feature = "ocr", feature = "ocr-pipeline")
+    ))]
+    #[test]
+    fn markdown_layout_rasters_are_reusable_only_when_ungated_and_unrotated() {
+        assert!(markdown_layout_reusable_for_ocr(None, &[]));
+        assert!(markdown_layout_reusable_for_ocr(
+            Some(&[gate_decision(true), gate_decision(true)]),
+            &[0, 0]
+        ));
+        assert!(!markdown_layout_reusable_for_ocr(
+            Some(&[gate_decision(true), gate_decision(false)]),
+            &[0, 0]
+        ));
+        for rotation in [90, 180, 270] {
+            assert!(!markdown_layout_reusable_for_ocr(None, &[rotation]));
+        }
+    }
+
+    #[cfg(all(
+        feature = "pdf",
+        feature = "layout-detection",
+        any(feature = "ocr", feature = "ocr-pipeline")
+    ))]
+    #[test]
+    fn cpu_layout_retry_override_controls_downstream_ocr_models() {
+        use crate::core::config::{
+            acceleration::{AccelerationConfig, ExecutionProviderType},
+            layout::LayoutDetectionConfig,
+        };
+
+        let config = ExtractionConfig {
+            layout: Some(LayoutDetectionConfig {
+                acceleration: Some(AccelerationConfig {
+                    provider: ExecutionProviderType::CoreMl,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let effective = config_with_layout_acceleration_override(
+            &config,
+            Some(AccelerationConfig {
+                provider: ExecutionProviderType::Cpu,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(
+            effective
+                .resolved_layout_acceleration()
+                .map(|acceleration| acceleration.provider.clone()),
+            Some(ExecutionProviderType::Cpu)
+        );
+        assert_eq!(
+            config
+                .resolved_layout_acceleration()
+                .map(|acceleration| acceleration.provider.clone()),
+            Some(ExecutionProviderType::CoreMl)
+        );
+    }
+
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    #[test]
+    fn layout_gate_metadata_reports_one_indexed_skipped_pages_and_all_reasons() {
+        let decisions = [gate_decision(true), gate_decision(false), gate_decision(false)];
+        let (gated, reasons) = layout_gate_metadata(Some(&decisions));
+        assert_eq!(gated, Some(vec![2, 3]));
+        assert_eq!(
+            reasons,
+            Some(vec![
+                "multi_column".to_string(),
+                "plain_text".to_string(),
+                "plain_text".to_string()
+            ])
+        );
+
+        assert_eq!(layout_gate_metadata(None), (None, None));
+    }
+
+    #[cfg(feature = "pdf")]
+    fn catalog(
+        entries: impl IntoIterator<Item = (&'static str, pdf_oxide::object::Object)>,
+    ) -> pdf_oxide::object::Object {
+        pdf_oxide::object::Object::Dictionary(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn lopdf_compatibility_pass_skips_pdf_without_relevant_signals() {
+        let catalog = catalog([]);
+
+        assert!(!raw_pdf_needs_lopdf_compatibility_pass(
+            b"%PDF-1.7\nordinary content\n%%EOF",
+        ));
+        assert!(!catalog_needs_lopdf_compatibility_pass(Some(&catalog)));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn lopdf_compatibility_pass_keeps_raw_pdf_signals() {
+        let catalog = catalog([]);
+
+        assert!(raw_pdf_needs_lopdf_compatibility_pass(
+            b"%PDF-1.7\ntrailer << /Prev 42 >>",
+        ));
+        assert!(raw_pdf_needs_lopdf_compatibility_pass(
+            b"%PDF-1.7\n<< /Outlines 7 0 R >>",
+        ));
+        assert!(!catalog_needs_lopdf_compatibility_pass(Some(&catalog)));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn lopdf_compatibility_pass_keeps_parsed_catalog_outline() {
+        let catalog = catalog([("Outlines", pdf_oxide::object::Object::Null)]);
+
+        assert!(catalog_needs_lopdf_compatibility_pass(Some(&catalog)));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn lopdf_compatibility_pass_fails_open_without_catalog() {
+        assert!(catalog_needs_lopdf_compatibility_pass(None));
+    }
+
     #[cfg(feature = "pdf")]
     fn pdf_test_document(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../test_documents/pdf/{name}"))
@@ -937,6 +1985,464 @@ mod tests {
     #[cfg(feature = "pdf")]
     fn extraction_method(result: &crate::types::ExtractedDocument) -> Option<ExtractionMethod> {
         result.extraction_method
+    }
+
+    #[cfg(all(feature = "pdf", feature = "ocr", feature = "chunking"))]
+    fn assert_occurs_once(haystack: &str, needle: &str, projection: &str) {
+        assert_eq!(
+            haystack.matches(needle).count(),
+            1,
+            "mixed OCR text must occur exactly once in {projection}: {haystack}"
+        );
+    }
+
+    #[cfg(all(feature = "pdf", feature = "ocr", feature = "chunking"))]
+    fn mixed_native_and_scanned_pdf() -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+
+        let native_content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 18.into()]),
+                Operation::new("Td", vec![72.into(), 720.into()]),
+                Operation::new(
+                    "Tj",
+                    vec![Object::string_literal(
+                        "Issue 1281 native text remains on page one with enough meaningful words to pass the automatic per-page quality gate and preserve mixed routing.",
+                    )],
+                ),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let native_content_id = document.add_object(Stream::new(
+            dictionary! {},
+            native_content.encode().expect("native PDF content must encode"),
+        ));
+        let native_page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => native_content_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+
+        let image_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            vec![0],
+        ));
+        let scanned_content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![612.into(), 0.into(), 0.into(), 792.into(), 0.into(), 0.into()],
+                ),
+                Operation::new("Do", vec![Object::Name(b"Scan".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let scanned_content_id = document.add_object(Stream::new(
+            dictionary! {},
+            scanned_content.encode().expect("scanned PDF content must encode"),
+        ));
+        let scanned_page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => scanned_content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Scan" => image_id } },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![native_page_id.into(), scanned_page_id.into()],
+                "Count" => 2,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("mixed PDF fixture must serialize");
+        bytes
+    }
+
+    #[test]
+    fn flat_plain_text_retains_table_asset_without_duplicate_rendering() {
+        const TABLE_TEXT: &str = "Account balance 42";
+
+        let mut doc = InternalDocument::new("pdf");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, TABLE_TEXT, 0));
+        let table = crate::types::Table {
+            cells: vec![vec!["Account balance".to_string(), "42".to_string()]],
+            markdown: "| Account balance | 42 |".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        };
+
+        attach_unrepresented_tables(&mut doc, vec![table]);
+        inject_unrepresented_table_elements(&mut doc, false);
+
+        assert_eq!(doc.tables.len(), 1, "table assets must remain available to callers");
+        assert!(
+            !doc.elements
+                .iter()
+                .any(|element| matches!(element.kind, ElementKind::Table { .. })),
+            "flat plain text must not append a second renderable copy of native table text"
+        );
+
+        let result =
+            crate::extraction::derive::derive_extraction_result(doc, true, crate::core::config::OutputFormat::Plain);
+        assert_eq!(result.content.matches(TABLE_TEXT).count(), 1);
+        assert_eq!(result.tables.len(), 1);
+    }
+
+    #[test]
+    fn table_element_injection_remains_available_for_structured_output() {
+        let mut doc = InternalDocument::new("pdf");
+        let table = crate::types::Table {
+            cells: vec![vec!["Heading".to_string(), "Value".to_string()]],
+            markdown: "| Heading | Value |".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        };
+
+        attach_unrepresented_tables(&mut doc, vec![table]);
+        inject_unrepresented_table_elements(&mut doc, true);
+
+        assert_eq!(doc.tables.len(), 1);
+        assert_eq!(
+            doc.elements
+                .iter()
+                .filter(|element| matches!(element.kind, ElementKind::Table { .. }))
+                .count(),
+            1,
+            "structured and OCR paths must still be able to render attached table assets"
+        );
+    }
+
+    /// pdfa_031: the structure-coverage safeguard falls back to `flat_pdf_document`,
+    /// which carries no `Table` element, so a table reconstructed from prose that is
+    /// still in the flat text used to be rendered a second time.
+    #[test]
+    fn structured_output_skips_tables_already_present_in_the_element_stream() {
+        let mut doc = InternalDocument::new("pdf");
+        doc.push_element(InternalElement::text(
+            ElementKind::Paragraph,
+            "Persons committed to the custody of a sheriff shall be confined\nin the facilities designated by law.",
+            0,
+        ));
+        let table = crate::types::Table {
+            cells: vec![
+                vec![
+                    "Persons committed to the custody".to_string(),
+                    "of a sheriff".to_string(),
+                ],
+                vec![
+                    "shall be confined in the facilities".to_string(),
+                    "designated by law".to_string(),
+                ],
+            ],
+            markdown: "| Persons committed to the custody | of a sheriff |".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        };
+
+        attach_unrepresented_tables(&mut doc, vec![table]);
+        inject_unrepresented_table_elements(&mut doc, true);
+
+        assert_eq!(doc.tables.len(), 1, "table assets must remain available to callers");
+        assert!(
+            !doc.elements
+                .iter()
+                .any(|element| matches!(element.kind, ElementKind::Table { .. })),
+            "a table whose cells are already rendered must not be injected a second time"
+        );
+    }
+
+    #[test]
+    fn structured_output_still_injects_tables_missing_from_the_element_stream() {
+        let mut doc = InternalDocument::new("pdf");
+        doc.push_element(InternalElement::text(
+            ElementKind::Paragraph,
+            "Narrative prose that shares none of the tabulated content.",
+            0,
+        ));
+        let table = crate::types::Table {
+            cells: vec![
+                vec!["Region".to_string(), "Revenue".to_string(), "Growth".to_string()],
+                vec!["North".to_string(), "1200".to_string(), "4 percent".to_string()],
+                vec!["South".to_string(), "980".to_string(), "7 percent".to_string()],
+            ],
+            markdown: "| Region | Revenue | Growth |".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        };
+
+        attach_unrepresented_tables(&mut doc, vec![table]);
+        inject_unrepresented_table_elements(&mut doc, true);
+
+        assert_eq!(
+            doc.elements
+                .iter()
+                .filter(|element| matches!(element.kind, ElementKind::Table { .. }))
+                .count(),
+            1,
+            "dropped table content must still be recovered by injection"
+        );
+    }
+
+    /// The containment check abstains below `MIN_TABLE_TOKENS_FOR_CONTAINMENT`, so a
+    /// short table cannot be suppressed by an incidental token overlap.
+    #[test]
+    fn short_tables_are_injected_even_when_their_tokens_appear_in_the_text() {
+        let mut doc = InternalDocument::new("pdf");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "total 42 balance", 0));
+        let table = crate::types::Table {
+            cells: vec![vec!["Total".to_string(), "42".to_string()]],
+            markdown: "| Total | 42 |".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        };
+
+        attach_unrepresented_tables(&mut doc, vec![table]);
+        inject_unrepresented_table_elements(&mut doc, true);
+
+        assert_eq!(
+            doc.elements
+                .iter()
+                .filter(|element| matches!(element.kind, ElementKind::Table { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn ocr_tables_replace_native_tables_and_are_sorted() {
+        let table = |markdown: &str, page_number| crate::types::Table {
+            cells: Vec::new(),
+            markdown: markdown.to_string(),
+            page_number,
+            bounding_box: None,
+            ..Default::default()
+        };
+        let mut tables = vec![table("native", 1)];
+
+        replace_tables_with_ocr_output(&mut tables, vec![table("ocr-page-2", 2), table("ocr-page-1", 1)]);
+
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].markdown, "ocr-page-1");
+        assert_eq!(tables[1].markdown, "ocr-page-2");
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn empty_ocr_tables_preserve_native_tables() {
+        let mut tables = vec![crate::types::Table {
+            cells: Vec::new(),
+            markdown: "native".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        }];
+
+        replace_tables_with_ocr_output(&mut tables, Vec::new());
+
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].markdown, "native");
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn full_ocr_flat_fallback_never_selects_stale_native_document() {
+        let mut native = InternalDocument::new("pdf");
+        native.push_element(InternalElement::text(ElementKind::Paragraph, "stale native content", 0));
+
+        let (doc, origin, structured) = select_pdf_document(
+            ExtractionMethod::Ocr,
+            "authoritative OCR content",
+            "application/pdf",
+            Some(native),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(origin, PdfDocumentOrigin::Ocr);
+        assert!(!structured);
+        assert!(
+            doc.elements
+                .iter()
+                .any(|element| element.text == "authoritative OCR content")
+        );
+        assert!(
+            !doc.elements
+                .iter()
+                .any(|element| element.text == "stale native content")
+        );
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn mixed_origin_replaces_only_targeted_structured_page() {
+        let mut native = InternalDocument::new("pdf");
+        let table = crate::types::Table {
+            cells: vec![vec!["native table".to_string()]],
+            markdown: "| native table |".to_string(),
+            page_number: 2,
+            bounding_box: None,
+            ..Default::default()
+        };
+        native.tables.push(table.clone());
+        native.push_element(InternalElement::text(ElementKind::Paragraph, "native page one", 0).with_page(1));
+        native.push_element(InternalElement::text(ElementKind::PageBreak, "", 0));
+        native.push_element(InternalElement::text(ElementKind::Paragraph, "stale page two", 0).with_page(2));
+        native.push_element(InternalElement::text(ElementKind::Table { table_index: 0 }, "", 0).with_page(2));
+        let mut results = ahash::AHashMap::new();
+        results.insert(2, "OCR page two".to_string());
+
+        let (mut doc, origin, structured) = select_pdf_document(
+            ExtractionMethod::Mixed,
+            "flat text must not be selected",
+            "application/pdf",
+            Some(native),
+            None,
+            Some(&results),
+            None,
+        );
+
+        assert_eq!(origin, PdfDocumentOrigin::Mixed);
+        assert!(structured);
+        assert!(doc.elements.iter().any(|element| element.text == "native page one"));
+        assert!(doc.elements.iter().any(|element| element.text == "OCR page two"));
+        assert!(!doc.elements.iter().any(|element| element.text == "stale page two"));
+        attach_unrepresented_tables(&mut doc, vec![table]);
+        inject_unrepresented_table_elements(&mut doc, false);
+        assert_eq!(doc.tables.len(), 1, "structured table data must remain available");
+        assert!(
+            !doc.elements
+                .iter()
+                .any(|element| matches!(element.kind, ElementKind::Table { .. })),
+            "target-page table markup must not be re-injected after OCR replacement"
+        );
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn full_ocr_structured_without_ocr_tables_injects_native_fallback_once() {
+        let ocr_doc = InternalDocument::new("pdf");
+        let table = crate::types::Table {
+            cells: vec![vec!["native fallback".to_string()]],
+            markdown: "| native fallback |".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        };
+        let (mut doc, origin, structured) = select_pdf_document(
+            ExtractionMethod::Ocr,
+            "OCR content",
+            "application/pdf",
+            None,
+            Some(ocr_doc),
+            None,
+            None,
+        );
+        let allow_injection = !structured || (origin == PdfDocumentOrigin::Ocr && doc.tables.is_empty());
+
+        attach_unrepresented_tables(&mut doc, vec![table]);
+        inject_unrepresented_table_elements(&mut doc, allow_injection);
+
+        assert_eq!(doc.tables.len(), 1);
+        assert_eq!(
+            doc.elements
+                .iter()
+                .filter(|element| matches!(element.kind, ElementKind::Table { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    fn preparing_ocr_layout_inputs_transfers_raster_ownership() {
+        let image = image::RgbImage::from_pixel(4, 3, image::Rgb([1, 2, 3]));
+        let original_pixels = image.as_ptr();
+        let detections = vec![crate::layout::DetectionResult {
+            page_width: 4,
+            page_height: 3,
+            detections: Vec::new(),
+        }];
+
+        let (images, detections) = prepare_ocr_layout_inputs(vec![image], detections);
+
+        let image::DynamicImage::ImageRgb8(transferred) = &images[0] else {
+            panic!("RGB raster must retain its storage type");
+        };
+        assert_eq!(transferred.as_ptr(), original_pixels);
+        assert_eq!((detections[0].page_width, detections[0].page_height), (4, 3));
+    }
+
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    fn preparing_ocr_layout_inputs_discards_only_mismatched_page_detections() {
+        let images = vec![image::RgbImage::new(4, 3), image::RgbImage::new(8, 6)];
+        let detections = vec![
+            crate::layout::DetectionResult {
+                page_width: 4,
+                page_height: 3,
+                detections: Vec::new(),
+            },
+            crate::layout::DetectionResult {
+                page_width: 16,
+                page_height: 12,
+                detections: Vec::new(),
+            },
+        ];
+
+        let (_, detections) = prepare_ocr_layout_inputs(images, detections);
+
+        assert_eq!((detections[0].page_width, detections[0].page_height), (4, 3));
+        assert_eq!((detections[1].page_width, detections[1].page_height), (8, 6));
+        assert!(detections[1].detections.is_empty());
+    }
+
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    fn preparing_ocr_layout_inputs_repairs_detection_cardinality() {
+        let images = vec![image::RgbImage::new(4, 3), image::RgbImage::new(8, 6)];
+
+        let (_, detections) = prepare_ocr_layout_inputs(images, Vec::new());
+
+        assert_eq!(detections.len(), 2);
+        assert_eq!((detections[0].page_width, detections[0].page_height), (4, 3));
+        assert_eq!((detections[1].page_width, detections[1].page_height), (8, 6));
     }
 
     #[cfg(feature = "ocr")]
@@ -1207,6 +2713,82 @@ mod tests {
         );
     }
 
+    /// #1336 bug 2: `ScannedPages` must honor its own whole-document-failure
+    /// signal (OCR every page) rather than discarding it and relying on the
+    /// caller's fallthrough to the `Auto` gate.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn test_scanned_pages_to_ocr_returns_full_page_set_on_whole_doc_failure() {
+        use crate::core::config::{OcrConfig, OcrStrategy};
+        use crate::pdf::metadata::{PdfExtractionMetadata, PdfMetadata};
+
+        let config = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            ocr: Some(OcrConfig::default()),
+            ..Default::default()
+        };
+
+        let pdf_metadata = PdfExtractionMetadata {
+            title: None,
+            subject: None,
+            authors: None,
+            keywords: None,
+            created_at: None,
+            modified_at: None,
+            created_by: None,
+            pdf_specific: PdfMetadata {
+                page_count: Some(3),
+                scanned_pages: Some(Vec::new()),
+                ..Default::default()
+            },
+            page_structure: None,
+        };
+
+        // Empty native text everywhere triggers `whole_doc_failure` in the per-page gate.
+        let pages = scanned_pages_to_ocr(&config, &pdf_metadata, "", None);
+
+        assert_eq!(
+            pages,
+            Some(vec![1, 2, 3]),
+            "whole-doc failure under ScannedPages must OCR every page, not discard the signal"
+        );
+    }
+
+    /// Whole-doc failure with an unknown page count must not fabricate a page
+    /// range; falling through to `None` (the `Auto` gate) is the safe default.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn test_scanned_pages_to_ocr_falls_through_when_page_count_unknown() {
+        use crate::core::config::{OcrConfig, OcrStrategy};
+        use crate::pdf::metadata::{PdfExtractionMetadata, PdfMetadata};
+
+        let config = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            ocr: Some(OcrConfig::default()),
+            ..Default::default()
+        };
+
+        let pdf_metadata = PdfExtractionMetadata {
+            title: None,
+            subject: None,
+            authors: None,
+            keywords: None,
+            created_at: None,
+            modified_at: None,
+            created_by: None,
+            pdf_specific: PdfMetadata {
+                page_count: None,
+                scanned_pages: Some(Vec::new()),
+                ..Default::default()
+            },
+            page_structure: None,
+        };
+
+        let pages = scanned_pages_to_ocr(&config, &pdf_metadata, "", None);
+
+        assert_eq!(pages, None);
+    }
+
     #[tokio::test]
     #[cfg(feature = "pdf")]
     async fn test_pdf_batch_mode_validates_page_config_enabled() {
@@ -1373,37 +2955,189 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[cfg(all(feature = "pdf", feature = "ocr", feature = "chunking"))]
     #[serial]
-    async fn test_pdf_exposes_mixed_extraction_method() {
-        use crate::core::config::OcrConfig;
+    async fn test_mixed_pdf_ocr_survives_full_postprocessing() {
+        use crate::core::config::{ChunkingConfig, OcrConfig, PageConfig};
 
-        let _backend = register_mock_ocr_backend("pdf-extraction-method-mixed", "mixed OCR page");
+        const OCR_TEXT: &str = "Issue 1281 authoritative OCR replacement on page one.";
+        const RETAINED_PAGE_TWO_MARKER: &str = "Other notable software from this era included WordPerfect";
+        let _backend = register_mock_ocr_backend("pdf-extraction-method-mixed", OCR_TEXT);
         let extractor = PdfExtractor::new();
+        let pdf_path = pdf_test_document("multi_page.pdf");
+        let content = std::fs::read(pdf_path).expect("mixed OCR fixture must be available");
+        let native_config = ExtractionConfig {
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let native = extractor
+            .extract_content(&content, "application/pdf", &native_config)
+            .await
+            .expect("native PDF extraction should succeed");
+        let native =
+            crate::extraction::derive::derive_extraction_result(native, true, crate::core::config::OutputFormat::Plain);
+        let native_pages = native.pages.expect("native extraction must expose pages");
+        let stale_page_one = native_pages[0].content.clone();
+
         let config = ExtractionConfig {
             force_ocr_pages: Some(vec![1]),
+            output_format: crate::core::config::OutputFormat::Markdown,
+            include_document_structure: true,
+            use_cache: false,
             ocr: Some(OcrConfig {
                 backend: "pdf-extraction-method-mixed".to_string(),
                 language: vec!["eng".to_string()],
                 ..Default::default()
             }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            chunking: Some(ChunkingConfig {
+                max_characters: OCR_TEXT.chars().count() + 1,
+                overlap: 0,
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        let pdf_path = pdf_test_document("multi_page.pdf");
+        let internal = extractor
+            .extract_content(&content, "application/pdf", &config)
+            .await
+            .expect("mixed OCR/native extraction should succeed");
+        let derived = crate::extraction::derive::derive_extraction_result(
+            internal.clone(),
+            true,
+            crate::core::config::OutputFormat::Markdown,
+        );
+        assert_occurs_once(&derived.content, OCR_TEXT, "derived plain content");
+        assert_occurs_once(
+            derived
+                .formatted_content
+                .as_deref()
+                .expect("derived Markdown output must exist"),
+            OCR_TEXT,
+            "derived Markdown output",
+        );
+        let result = crate::core::pipeline::run_pipeline(internal, &config)
+            .await
+            .expect("mixed OCR post-processing should succeed");
 
-        if let Ok(content) = std::fs::read(pdf_path) {
-            let result = extractor
-                .extract_content(&content, "application/pdf", &config)
-                .await
-                .expect("mixed OCR/native extraction should succeed");
-            let result = crate::extraction::derive::derive_extraction_result(
-                result,
-                true,
-                crate::core::config::OutputFormat::Plain,
-            );
+        assert_eq!(extraction_method(&result), Some(ExtractionMethod::Mixed));
+        assert_occurs_once(&result.content, OCR_TEXT, "post-processed Markdown content");
+        assert!(!result.content.contains(&stale_page_one));
+        assert!(result.content.contains(RETAINED_PAGE_TWO_MARKER));
 
-            assert_eq!(extraction_method(&result), Some(ExtractionMethod::Mixed));
-        }
+        let pages = result.pages.as_ref().expect("mixed extraction must expose pages");
+        assert_occurs_once(&pages[0].content, OCR_TEXT, "page one");
+        assert!(!pages[0].content.contains(&stale_page_one));
+        assert_occurs_once(&pages[1].content, RETAINED_PAGE_TWO_MARKER, "retained page two");
+        assert!(!pages[1].content.contains(OCR_TEXT));
+
+        let document = result.document.as_ref().expect("document structure must be derived");
+        let ocr_nodes: Vec<_> = document
+            .nodes
+            .iter()
+            .filter(|node| node.content.text().is_some_and(|text| text.contains(OCR_TEXT)))
+            .collect();
+        assert_eq!(ocr_nodes.len(), 1, "document structure must not duplicate OCR text");
+        assert_eq!(ocr_nodes[0].page, Some(1));
+        assert!(
+            !document
+                .nodes
+                .iter()
+                .any(|node| node.content.text().is_some_and(|text| text.contains(&stale_page_one)))
+        );
+
+        let chunks = result.chunks.as_ref().expect("chunking must run");
+        let ocr_chunks: Vec<_> = chunks.iter().filter(|chunk| chunk.content.contains(OCR_TEXT)).collect();
+        assert_eq!(ocr_chunks.len(), 1, "chunks must not duplicate OCR text");
+        assert_eq!(ocr_chunks[0].metadata.first_page, Some(1));
+        assert_eq!(ocr_chunks[0].metadata.last_page, Some(1));
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr", feature = "chunking"))]
+    #[serial]
+    async fn test_scanned_page_strategy_automatically_routes_only_the_scan_to_ocr() {
+        use crate::core::config::{ChunkingConfig, OcrConfig, OcrStrategy, PageConfig};
+
+        const NATIVE_TEXT: &str = "Issue 1281 native text remains on page one";
+        const OCR_TEXT: &str = "Issue 1281 automatic OCR replacement on page two.";
+        let _backend = register_mock_ocr_backend("pdf-automatic-mixed-routing", OCR_TEXT);
+        let config = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            output_format: crate::core::config::OutputFormat::Markdown,
+            include_document_structure: true,
+            use_cache: false,
+            ocr: Some(OcrConfig {
+                backend: "pdf-automatic-mixed-routing".to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            chunking: Some(ChunkingConfig {
+                max_characters: OCR_TEXT.chars().count() + 1,
+                overlap: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let internal = PdfExtractor::new()
+            .extract_content(&mixed_native_and_scanned_pdf(), "application/pdf", &config)
+            .await
+            .expect("automatic mixed PDF extraction should succeed");
+        let derived = crate::extraction::derive::derive_extraction_result(
+            internal.clone(),
+            true,
+            crate::core::config::OutputFormat::Markdown,
+        );
+        assert_occurs_once(&derived.content, OCR_TEXT, "automatic derived content");
+        assert_occurs_once(
+            derived
+                .formatted_content
+                .as_deref()
+                .expect("automatic derived Markdown output must exist"),
+            OCR_TEXT,
+            "automatic derived Markdown output",
+        );
+        let result = crate::core::pipeline::run_pipeline(internal, &config)
+            .await
+            .expect("automatic mixed PDF post-processing should succeed");
+
+        assert_eq!(extraction_method(&result), Some(ExtractionMethod::Mixed));
+        assert_occurs_once(&result.content, NATIVE_TEXT, "automatic mixed Markdown content");
+        assert_occurs_once(&result.content, OCR_TEXT, "automatic mixed Markdown content");
+        let pages = result
+            .pages
+            .as_ref()
+            .expect("automatic mixed extraction must expose pages");
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].content.contains(NATIVE_TEXT));
+        assert!(!pages[0].content.contains(OCR_TEXT));
+        assert_occurs_once(&pages[1].content, OCR_TEXT, "automatically OCR'd page two");
+        assert!(!pages[1].content.contains(NATIVE_TEXT));
+
+        let document = result.document.as_ref().expect("document structure must be derived");
+        let ocr_nodes: Vec<_> = document
+            .nodes
+            .iter()
+            .filter(|node| node.content.text().is_some_and(|text| text.contains(OCR_TEXT)))
+            .collect();
+        assert_eq!(ocr_nodes.len(), 1);
+        assert_eq!(ocr_nodes[0].page, Some(2));
+
+        let chunks = result.chunks.as_ref().expect("automatic mixed chunking must run");
+        let ocr_chunks: Vec<_> = chunks.iter().filter(|chunk| chunk.content.contains(OCR_TEXT)).collect();
+        assert_eq!(ocr_chunks.len(), 1, "automatic chunks must not duplicate OCR text");
+        assert_eq!(ocr_chunks[0].metadata.first_page, Some(2));
+        assert_eq!(ocr_chunks[0].metadata.last_page, Some(2));
     }
 
     #[tokio::test]
@@ -1524,66 +3258,6 @@ mod tests {
         assert_ne!(page_texts[0], page_texts[1], "each page should get unique OCR text");
     }
 
-    // TODO(#936): test currently asserts `![](image_` placeholders in the
-    // rendered markdown, but the embedded_images_tables.pdf fixture's images
-    // don't surface through the pdf_oxide image-extraction path on `main`
-    // (the sibling no-image / no-ocr-config tests cover the wiring).
-    // Re-enable once a fixture that reliably yields inline raster XObjects
-    // lands in test_documents/pdf/.
-    #[ignore]
-    #[tokio::test]
-    #[cfg(all(feature = "pdf", feature = "ocr"))]
-    async fn test_pdf_ocr_inline_images() {
-        use crate::core::config::ExtractionConfig;
-        use crate::core::config::OutputFormat;
-        use crate::core::config::pdf::PdfConfig;
-
-        let extractor = PdfExtractor::new();
-
-        // Use embedded_images_tables.pdf which has a large image on page 1
-        let pdf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test_documents/pdf/embedded_images_tables.pdf");
-
-        assert!(
-            pdf_path.exists(),
-            "missing test fixture: {pdf_path:?} — add embedded_images_tables.pdf to test_documents/pdf/"
-        );
-
-        let content = std::fs::read(pdf_path).expect("Failed to read PDF");
-
-        let config = ExtractionConfig {
-            output_format: OutputFormat::Markdown,
-            pdf_options: Some(PdfConfig {
-                ocr_inline_images: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let result = extractor
-            .extract_content(&content, "application/pdf", &config)
-            .await
-            .expect("Inline-image OCR extraction failed");
-
-        let result = crate::extraction::derive::derive_extraction_result(result, true, OutputFormat::Markdown);
-
-        // Result should contain Markdown image references
-        assert!(
-            result.content.contains("![](image_"),
-            "Markdown should contain image references"
-        );
-
-        // Result should have non-empty images list
-        let images = result.images.as_ref().expect("Images list should be Some");
-        assert!(!images.is_empty(), "Images list should not be empty");
-
-        // At least one image should have an OCR result (the large one)
-        let has_ocr = images
-            .iter()
-            .any(|img| img.ocr_result.as_ref().is_some_and(|r| !r.content.trim().is_empty()));
-        assert!(has_ocr, "At least one image should have OCR content");
-    }
-
     /// Verifies that when a VLM returns a single string for a multi-page PDF,
     /// the guard clears stale native text on secondary pages (#928).
     #[cfg(feature = "ocr")]
@@ -1625,7 +3299,6 @@ mod tests {
         assert_eq!(pages[0].content, vlm_text, "page 1 should carry the VLM text");
         assert!(pages[1].content.is_empty(), "page 2 must be cleared by VLM guard");
         assert!(pages[2].content.is_empty(), "page 3 must be cleared by VLM guard");
-        // is_blank must be recalculated to match the updated content (issue #1095).
         assert_eq!(
             pages[0].is_blank,
             Some(false),
@@ -1648,8 +3321,6 @@ mod tests {
         let pts = vec!["page one content".to_string(), "page two content".to_string()];
         let pts_len = pts.len();
 
-        // Simulate scanned PDF: pages created by native extraction with empty content
-        // and is_blank=Some(true) — the value that persisted before the fix.
         let mut pages: Vec<PageContent> = (1u32..=2u32)
             .map(|n| PageContent {
                 page_number: n,
@@ -1781,6 +3452,83 @@ mod tests {
         }
     }
 
+    /// Regression for #1293: `metadata.pages.pages[].is_blank` must agree with the
+    /// top-level `pages[].is_blank` for OCR'd pages. Previously `PageInfo.is_blank`
+    /// was computed once from native content in `build_page_structure` and never
+    /// refreshed after OCR text overwrote `PageContent`, so a scanned page with no
+    /// native text but real OCR text reported `is_blank=true` in metadata while the
+    /// top-level page reported `is_blank=false`.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_metadata_page_info_is_blank_matches_page_content_after_ocr() {
+        use crate::core::config::{OcrConfig, PageConfig};
+
+        let _backend = register_mock_ocr_backend("is-blank-metadata-fix-1293", "extracted ocr text content here");
+        let extractor = PdfExtractor::new();
+        let config = ExtractionConfig {
+            force_ocr: true,
+            ocr: Some(OcrConfig {
+                backend: "is-blank-metadata-fix-1293".to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let pdf_path = pdf_test_document("non_searchable.pdf");
+        let content = std::fs::read(&pdf_path).unwrap_or_else(|e| panic!("non_searchable.pdf must be readable: {e}"));
+        let result = extractor
+            .extract_content(&content, "application/pdf", &config)
+            .await
+            .expect("extraction should succeed");
+        let result = crate::extraction::derive::derive_extraction_result(
+            result,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        let pages = result
+            .pages
+            .clone()
+            .expect("pages must be present when extract_pages=true");
+        let metadata_pages = result
+            .metadata
+            .pages
+            .as_ref()
+            .and_then(|structure| structure.pages.as_ref())
+            .expect("metadata.pages.pages must be present when extract_pages=true");
+
+        assert!(!pages.is_empty(), "must have at least one page");
+        assert_eq!(
+            pages.len(),
+            metadata_pages.len(),
+            "page counts must match between the two sources"
+        );
+
+        for page in &pages {
+            let info = metadata_pages
+                .iter()
+                .find(|p| p.number == page.page_number)
+                .unwrap_or_else(|| panic!("metadata.pages.pages missing entry for page {}", page.page_number));
+            assert_eq!(
+                info.is_blank, page.is_blank,
+                "page {}: metadata.pages.pages[].is_blank ({:?}) must match top-level pages[].is_blank ({:?}) (issue #1293)",
+                page.page_number, info.is_blank, page.is_blank
+            );
+            assert_eq!(
+                info.is_blank,
+                Some(false),
+                "page {} has OCR content, metadata is_blank must be Some(false) (issue #1293)",
+                page.page_number
+            );
+        }
+    }
+
     /// ocr_inline_images=true on a text-only PDF (no embedded images) must succeed
     /// and return an empty images list, not panic or error.
     #[tokio::test]
@@ -1791,7 +3539,6 @@ mod tests {
 
         let extractor = PdfExtractor::new();
 
-        // code_and_formula.pdf is a text-only document with no embedded raster images.
         let pdf_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/pdf/code_and_formula.pdf");
 
@@ -1814,9 +3561,7 @@ mod tests {
             .await
             .expect("Extraction should succeed even when there are no images to OCR");
 
-        // Images list should be empty — must not panic or error.
         for img in &result.images {
-            // Without embedded images, no ocr_result should be present.
             assert!(img.ocr_result.is_none(), "text-only PDF should produce no OCR results");
         }
     }
@@ -1841,7 +3586,6 @@ mod tests {
 
         let content = std::fs::read(pdf_path).expect("Failed to read PDF");
 
-        // ocr = None → code falls back to TesseractConfig::default(); must not panic.
         let config = ExtractionConfig {
             ocr: None,
             pdf_options: Some(PdfConfig {
@@ -1851,7 +3595,6 @@ mod tests {
             ..Default::default()
         };
 
-        // Should complete without panicking; OCR may succeed or warn, but must not crash.
         let _result = extractor
             .extract_content(&content, "application/pdf", &config)
             .await
@@ -1869,16 +3612,7 @@ mod tests {
     fn test_ocr_gate_runs_ocr_when_substantive_doc_but_fallback_needed() {
         let thresholds = OcrQualityThresholds::default();
 
-        // Inputs that reproduce the bug: pre_rendered_doc present, total_chars well
-        // above substantive_min_chars (100), good alnum_ws_ratio, but fallback=true
-        // because a scanned page was detected.
-        let outcome = ocr::evaluate_ocr_skip_gate(
-            true,                             // pre_rendered_doc present
-            500,                              // total_chars > substantive_min_chars
-            0.9,                              // alnum_ws_ratio > threshold (0.4)
-            &mk_decision(true, true, vec![]), // decision.fallback — scanned page detected
-            &thresholds,
-        );
+        let outcome = ocr::evaluate_ocr_skip_gate(true, 500, 0.9, &mk_decision(true, true, vec![]), &thresholds);
         assert_eq!(
             outcome,
             ocr::OcrGateOutcome::RunFallback,
@@ -1893,13 +3627,7 @@ mod tests {
     fn test_ocr_gate_skips_when_substantive_doc_and_no_fallback() {
         let thresholds = OcrQualityThresholds::default();
 
-        let outcome = ocr::evaluate_ocr_skip_gate(
-            true,                               // pre_rendered_doc present
-            500,                                // total_chars > substantive_min_chars
-            0.9,                                // alnum_ws_ratio > threshold
-            &mk_decision(false, false, vec![]), // decision.fallback — all pages look fine
-            &thresholds,
-        );
+        let outcome = ocr::evaluate_ocr_skip_gate(true, 500, 0.9, &mk_decision(false, false, vec![]), &thresholds);
         assert_eq!(
             outcome,
             ocr::OcrGateOutcome::SkipSubstantive,
@@ -1952,9 +3680,6 @@ mod tests {
 
         let result = crate::extraction::derive::derive_extraction_result(result, true, OutputFormat::Markdown);
 
-        // When the PDF contains at least one extractable image, the Markdown must include
-        // a placeholder reference. If no images were extracted the assertion is vacuously
-        // skipped with an explanatory message rather than a false positive.
         if result.images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
             assert!(
                 result.formatted_content.as_deref().unwrap_or("").contains("![") || result.content.contains("!["),
@@ -1982,8 +3707,6 @@ mod tests {
         );
         let content = std::fs::read(&pdf_path).expect("failed to read embedded_images_tables.pdf");
 
-        // Only pdf_options.extract_images=true — config.images is None.
-        // inject_placeholders must default to false on this path.
         let config = crate::core::config::ExtractionConfig {
             output_format: OutputFormat::Markdown,
             force_ocr: true,
@@ -2013,6 +3736,192 @@ mod tests {
         );
     }
 
+    /// Regression for #1355: when `force_ocr` renders a page blank (as pdf_oxide does
+    /// for a page whose only visible content is an image XObject it silently failed to
+    /// decode) but the page actually carries image XObjects, OCR must be retried on the
+    /// embedded image bytes and the recovery must be surfaced as a `ProcessingWarning`.
+    ///
+    /// The mock backend returns an empty string for its first invocation (standing in
+    /// for the blank whole-page render) and real text for every subsequent call. Because
+    /// `embedded_images_tables.pdf` has exactly one page, the whole-page OCR call is
+    /// always the first call the backend receives, so the fallback calls that follow in
+    /// the same per-page loop deterministically observe call index >= 1.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_force_ocr_image_xobject_fallback_recovers_blank_page_and_warns() {
+        use crate::core::config::OcrConfig;
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const BACKEND_NAME: &str = "blank-then-image-fallback-mock-1355";
+
+        struct BlankThenImageMockBackend {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl OcrBackend for BlankThenImageMockBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _lang: &str) -> bool {
+                true
+            }
+            async fn process_image(
+                &self,
+                _image_bytes: &[u8],
+                _config: &OcrConfig,
+            ) -> crate::Result<ExtractedDocument> {
+                let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
+                let content = if call_index == 0 {
+                    String::new()
+                } else {
+                    "IMG_TEXT".to_string()
+                };
+                Ok(ExtractedDocument {
+                    content,
+                    ..Default::default()
+                })
+            }
+            fn supports_document_processing(&self) -> bool {
+                false
+            }
+        }
+
+        impl Plugin for BlankThenImageMockBackend {
+            fn name(&self) -> &str {
+                BACKEND_NAME
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        crate::plugins::register_ocr_backend(Arc::new(BlankThenImageMockBackend {
+            call_count: AtomicUsize::new(0),
+        }))
+        .unwrap();
+        let _guard = RegisteredOcrBackendGuard { name: BACKEND_NAME };
+
+        let extractor = PdfExtractor::new();
+        let pdf_path = pdf_test_document("embedded_images_tables.pdf");
+        assert!(
+            pdf_path.exists(),
+            "missing test fixture: {pdf_path:?} — add embedded_images_tables.pdf to test_documents/pdf/"
+        );
+        let content = std::fs::read(&pdf_path).expect("failed to read embedded_images_tables.pdf");
+
+        let config = crate::core::config::ExtractionConfig {
+            force_ocr: true,
+            ocr: Some(OcrConfig {
+                backend: BACKEND_NAME.to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(&content, "application/pdf", &config)
+            .await
+            .expect("force_ocr extraction should succeed");
+        let result = crate::extraction::derive::derive_extraction_result(
+            result,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        assert!(
+            !crate::extraction::blank_detection::is_page_text_blank(&result.content),
+            "page content must be recovered from the embedded-image OCR fallback, not left blank; got {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("IMG_TEXT"),
+            "recovered content must come from the per-image fallback OCR call; got {:?}",
+            result.content
+        );
+        assert!(
+            result
+                .processing_warnings
+                .iter()
+                .any(|w| w.source == "ocr" && w.message.contains("image XObject")),
+            "expected a ProcessingWarning with source 'ocr' mentioning 'image XObject'; got: {:?}",
+            result.processing_warnings
+        );
+    }
+
+    /// False-positive guard for #1355: when the whole-page OCR result is not blank, the
+    /// image-XObject fallback must never fire, even on a page that has real embedded
+    /// images (`embedded_images_tables.pdf`) — no fallback warning, and page text
+    /// unchanged from whatever the (mock) OCR backend returned.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_force_ocr_image_xobject_fallback_does_not_fire_on_non_blank_page() {
+        use crate::core::config::OcrConfig;
+
+        const BACKEND_NAME: &str = "non-blank-no-fallback-mock-1355";
+        const SENTINEL: &str = "genuine OCR text, not blank";
+
+        let _backend = register_mock_ocr_backend(BACKEND_NAME, SENTINEL);
+
+        let extractor = PdfExtractor::new();
+        let pdf_path = pdf_test_document("embedded_images_tables.pdf");
+        let content = std::fs::read(&pdf_path).expect("failed to read embedded_images_tables.pdf");
+
+        let config = crate::core::config::ExtractionConfig {
+            force_ocr: true,
+            ocr: Some(OcrConfig {
+                backend: BACKEND_NAME.to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(&content, "application/pdf", &config)
+            .await
+            .expect("force_ocr extraction should succeed");
+        let result = crate::extraction::derive::derive_extraction_result(
+            result,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        // The fixture also carries real tables that get merged into the final content
+        // independently of OCR (unrelated to this fix), so assert the OCR-produced text
+        // is present unchanged rather than an exact match on the whole document body.
+        assert!(
+            result.content.starts_with(SENTINEL),
+            "non-blank OCR output must pass through unchanged when the fallback never fires; got {:?}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("IMG_TEXT"),
+            "the image fallback must never run when the whole-page OCR result was not blank; got {:?}",
+            result.content
+        );
+        assert!(
+            !result
+                .processing_warnings
+                .iter()
+                .any(|w| w.message.contains("image XObject")),
+            "no image-fallback warning must be added when the whole-page OCR result was not blank; got: {:?}",
+            result.processing_warnings
+        );
+    }
+
     /// Non-textual content (charts, diagrams) with a pre-rendered structured doc
     /// present should skip OCR regardless of the per-page fallback flag — OCR
     /// won't improve extraction quality for non-textual pages.
@@ -2021,19 +3930,15 @@ mod tests {
     fn test_ocr_gate_skips_non_textual_content_even_when_fallback_requested() {
         let thresholds = OcrQualityThresholds::default();
 
-        // Non-textual: high char count but alnum_ws_ratio below threshold (lots of symbols).
-        // Simulate a chart-heavy page that also triggered a per-page quality check.
-        let outcome = ocr::evaluate_ocr_skip_gate(
-            true,                             // pre_rendered_doc present
-            500,                              // total_chars > non_text_min_chars
-            0.1,                              // alnum_ws_ratio < threshold — non-textual content
-            &mk_decision(true, true, vec![]), // decision.fallback — per-page quality check fired
-            &thresholds,
-        );
+        // `fallback = true` (a per-page fallback flag) but `whole_doc_failure = false`: the
+        // document still has trustworthy native text, it just looks non-textual. A genuine
+        // whole-document failure instead routes to OCR (issue #1338), so this case must set
+        // `whole_doc_failure = false` to exercise the non-text skip it claims to test.
+        let outcome = ocr::evaluate_ocr_skip_gate(true, 500, 0.1, &mk_decision(true, false, vec![]), &thresholds);
         assert_eq!(
             outcome,
             ocr::OcrGateOutcome::SkipNonText,
-            "non-textual content with a structured doc must skip OCR even if fallback was requested"
+            "non-textual content with a structured doc must skip OCR even if per-page fallback was requested"
         );
     }
 
@@ -2044,13 +3949,7 @@ mod tests {
     fn test_ocr_gate_targets_specific_pages_on_hybrid_pdf() {
         let thresholds = OcrQualityThresholds::default();
 
-        let outcome = ocr::evaluate_ocr_skip_gate(
-            false, // no pre-rendered doc
-            500,
-            0.9,
-            &mk_decision(true, false, vec![3, 7]), // per-page failure, whole doc OK
-            &thresholds,
-        );
+        let outcome = ocr::evaluate_ocr_skip_gate(false, 500, 0.9, &mk_decision(true, false, vec![3, 7]), &thresholds);
         assert_eq!(
             outcome,
             ocr::OcrGateOutcome::RunFallbackOnPages(vec![3, 7]),
@@ -2089,11 +3988,8 @@ mod tests {
     fn test_evaluate_per_page_ocr_collects_all_failing_pages() {
         use crate::types::PageBoundary;
 
-        // `good`: 72 chars of alnum-dense prose — alnum_ratio well above threshold, passes quality check.
-        // `bad`: 5 chars of whitespace + punctuation only — alnum_ratio ≈ 0, triggers fallback deterministically.
         let good = "This page has plenty of meaningful searchable text content for extraction.";
         let bad = " . ; ";
-        // Layout: good, bad, good, bad — failing pages should be [2, 4].
         let text = format!("{}{}{}{}", good, bad, good, bad);
         let boundaries = vec![
             PageBoundary {
@@ -2156,10 +4052,6 @@ mod tests {
 
         let decision = ocr::evaluate_per_page_ocr(&text, Some(&boundaries), Some(2), &OcrQualityThresholds::default());
         assert!(decision.fallback);
-        // When all pages fail, the doc-level check fires first and whole_doc_failure is
-        // set before the per-page scan runs. The per-page scan is skipped (early return)
-        // so failing_pages is empty — that's correct; the gate uses whole_doc_failure to
-        // route to RunFallback, not the page list.
         assert!(
             decision.failing_pages.is_empty(),
             "doc-level failure fires before per-page scan when all pages fail"
@@ -2176,8 +4068,6 @@ mod tests {
             "all-pages-failing must produce RunFallback (Ocr), not RunFallbackOnPages (Mixed)"
         );
     }
-
-    // ── #1088: ocr_inline_images must route through the configured OcrBackend ────────────────
 
     /// Mock backend that records the OcrConfig it receives so tests can assert
     /// that fields like output_format are forwarded correctly.
@@ -2235,9 +4125,7 @@ mod tests {
     /// AtomicBool needed.
     ///
     /// Fixture note: with_images.pdf is used here (not embedded_images_tables.pdf)
-    /// because pdf_oxide reliably extracts its single raster XObject. The existing
-    /// test_pdf_ocr_inline_images test is #[ignore] precisely because
-    /// embedded_images_tables.pdf does not surface images through the oxide path.
+    /// because pdf_oxide reliably extracts its single raster XObject.
     #[tokio::test]
     #[cfg(all(feature = "pdf", feature = "ocr"))]
     #[serial]
@@ -2368,9 +4256,6 @@ mod tests {
             }),
             pdf_options: Some(crate::core::config::pdf::PdfConfig {
                 ocr_inline_images: false,
-                // extract_images must be true so embedded images appear in the
-                // result for the assertion below; without it the extractor skips
-                // image decompression entirely and result.images stays empty.
                 extract_images: true,
                 ..Default::default()
             }),
@@ -2386,7 +4271,6 @@ mod tests {
             !result.images.is_empty(),
             "with_images.pdf must yield images; fixture may need replacing"
         );
-        // Every image must have no ocr_result — the backend loop must not have run.
         for img in &result.images {
             assert!(
                 img.ocr_result.is_none(),
@@ -2401,7 +4285,6 @@ mod tests {
     /// Uses an existing test PDF rather than creating one programmatically.
     /// This is a simple smoke test to verify that form field extraction works
     /// and doesn't panic or crash the extraction pipeline.
-    /// TODO: Add a real fillable PDF fixture if one is available.
     /// Path to the vendored fillable-form fixture (AcroForm with text, button,
     /// and choice fields).
     #[cfg(feature = "pdf")]
@@ -2430,17 +4313,14 @@ mod tests {
             .await
             .expect("extraction must not fail");
 
-        // The fixture is a rich AcroForm; extraction must surface many fields.
         assert!(
             !internal_doc.form_fields.is_empty(),
             "AcroForm PDF must yield form fields, got none"
         );
-        // Every field must carry a non-empty fully-qualified name.
         assert!(
             internal_doc.form_fields.iter().all(|f| !f.full_name.is_empty()),
             "every extracted field must have a full_name"
         );
-        // The fixture contains text fields; at least one must map to Text.
         assert!(
             internal_doc
                 .form_fields
@@ -2485,7 +4365,6 @@ mod tests {
         let mut doc = InternalDocument::new("pdf");
         doc.mime_type = "application/pdf".to_string();
 
-        // Manually populate form_fields as the PDF extractor would
         doc.form_fields = vec![crate::types::PdfFormField {
             name: "full_name".to_string(),
             full_name: "form.full_name".to_string(),
@@ -2499,24 +4378,20 @@ mod tests {
             tooltip: None,
         }];
 
-        // Verify form_fields are in the carrier
         assert_eq!(doc.form_fields.len(), 1);
         let field = &doc.form_fields[0];
         assert_eq!(field.name, "full_name");
         assert_eq!(field.value, Some("Ada Lovelace".to_string()));
         assert_eq!(field.field_type, crate::types::FormFieldType::Text);
 
-        // Verify metadata.additional does NOT contain the old _pdf_form_fields key
         assert!(
             doc.metadata.additional.get("_pdf_form_fields").is_none(),
             "metadata.additional should not contain _pdf_form_fields (leak check)"
         );
 
-        // Convert to ExtractedDocument through the pipeline to verify the carrier works
         let result =
             crate::extraction::derive::derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
 
-        // Verify form_fields were transferred via std::mem::take
         assert_eq!(result.form_fields.len(), 1);
         assert_eq!(result.form_fields[0].name, "full_name");
         assert_eq!(result.form_fields[0].value, Some("Ada Lovelace".to_string()));
@@ -2529,16 +4404,99 @@ mod tests {
         let mut doc = InternalDocument::new("pdf");
         doc.mime_type = "application/pdf".to_string();
 
-        // Ensure form_fields is empty (simulating extract_form_fields=false)
         assert!(doc.form_fields.is_empty());
 
-        // Verify metadata.additional does NOT contain _pdf_form_fields
         assert!(doc.metadata.additional.get("_pdf_form_fields").is_none());
 
-        // Convert to ExtractedDocument and verify form_fields is empty
         let result =
             crate::extraction::derive::derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
 
         assert!(result.form_fields.is_empty());
+    }
+
+    /// Two stroked boxes joined by a line that ends in a filled arrowhead, with a
+    /// label centred in each box. Mirrors the fixture in
+    /// `tests/diagram_dot_pdf.rs`, kept local so this unit test can inspect
+    /// `InternalDocument::diagrams` directly rather than through the renderer.
+    #[cfg(feature = "pdf")]
+    fn two_boxes_and_an_arrow_pdf() -> Vec<u8> {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let content = b"1 w 0 0 0 RG
+10 150 80 30 re S
+10 20 80 30 re S
+50 150 m 50 56 l S
+46 56 m 54 56 l 50 50 l h f
+BT /F1 12 Tf 30 160 Td (Alpha) Tj ET
+BT /F1 12 Tf 30 30 Td (Beta) Tj ET
+"
+        .to_vec();
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let content_id = document.add_object(Stream::new(dictionary! {}, content));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("fixture PDF must save");
+        bytes
+    }
+
+    /// #579 defect: recovery ran on every PDF regardless of the requested
+    /// output format, so an ordinary document paid for a second full text
+    /// pass on any page that happened to look graph-shaped. `diagrams` is
+    /// internal, so this has to be a unit test here rather than in the
+    /// integration suite, which can only see the rendered `content` string —
+    /// and `content` looks identical whether recovery ran and was discarded
+    /// or never ran at all, so it cannot tell the two apart.
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    async fn recovery_is_skipped_unless_dot_output_is_requested() {
+        let bytes = two_boxes_and_an_arrow_pdf();
+        let extractor = PdfExtractor::new();
+
+        let plain_doc = extractor
+            .extract_content(&bytes, "application/pdf", &ExtractionConfig::default())
+            .await
+            .expect("plain extraction must succeed");
+        assert_eq!(
+            plain_doc.diagrams.len(),
+            0,
+            "diagram recovery must not run for non-dot output"
+        );
+
+        let dot_config = ExtractionConfig {
+            output_format: crate::core::config::OutputFormat::Custom("dot".to_string()),
+            ..Default::default()
+        };
+        let dot_doc = extractor
+            .extract_content(&bytes, "application/pdf", &dot_config)
+            .await
+            .expect("dot extraction must succeed");
+        assert_eq!(dot_doc.diagrams.len(), 1, "diagram recovery must run for dot output");
     }
 }

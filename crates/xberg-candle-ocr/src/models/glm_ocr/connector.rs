@@ -204,14 +204,12 @@ mod imp {
                 )));
             }
 
-            // (B, N, C_in) -> (B, h_patches, w_patches, C_in) -> (B, C_in, H, W)
             let x = vision_embeds
                 .reshape((batch, h_patches, w_patches, vision_hidden))
                 .and_then(|t| t.permute([0, 3, 1, 2]))
                 .and_then(|t| t.contiguous())
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Connector reshape to (B,C,H,W): {}", e)))?;
 
-            // Conv2d downsample: (B, C_in, H, W) -> (B, C_out, H/merge, W/merge)
             let x = self
                 .downsample
                 .forward(&x)
@@ -221,7 +219,6 @@ mod imp {
                 .dims4()
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Connector downsample output shape: {}", e)))?;
 
-            // (B, C_out, H', W') -> (B, H', W', C_out) -> (B, N', C_out)
             let new_num_tokens = h_merged * w_merged;
             let x = x
                 .permute([0, 2, 3, 1])
@@ -229,16 +226,6 @@ mod imp {
                 .and_then(|t| t.reshape((batch, new_num_tokens, c_out)))
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Connector reshape to (B,N',C): {}", e)))?;
 
-            // Upstream Glm4vVisionPatchMerger.forward order (transformers
-            // modeling_glm4v.py lines 126-129):
-            //   hidden = proj(hidden)
-            //   hidden = gelu(post_projection_norm(hidden))
-            //   return down_proj(silu(gate_proj(hidden)) * up_proj(hidden))
-            //
-            // i.e. proj -> LayerNorm -> GELU -> SwiGLU. The earlier version of
-            // this function inverted the entire flow — SwiGLU -> down_proj ->
-            // proj -> LayerNorm — which scrambles vision features beyond any
-            // useful signal. Match upstream exactly.
             let x = x
                 .apply(&self.proj)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Merger proj: {}", e)))?;
@@ -247,9 +234,6 @@ mod imp {
                 .apply(&self.post_projection_norm)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Merger post_projection_norm: {}", e)))?;
 
-            // Upstream `Glm4vVisionPatchMerger.act1 = nn.GELU()` defaults to
-            // `approximate='none'`, which is the exact erf-based GELU. Candle's
-            // `.gelu()` is tanh-approximate; use `.gelu_erf()` for the exact form.
             let x = x
                 .gelu_erf()
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Merger post_projection_norm gelu_erf: {}", e)))?;

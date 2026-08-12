@@ -1,231 +1,100 @@
 name: Setup PaddleOCR Models Cache
-description: Download and cache PaddleOCR ONNX models for CI testing
+description: Download pinned PaddleOCR ONNX artifacts into the standard Hugging Face cache
 
 inputs:
   cache-enabled:
-    description: Enable model caching (set to false for cross-arch builds)
+    description: Enable GitHub Actions caching for the Hugging Face Hub cache
     required: false
     default: "true"
   models:
-    description: Comma-separated list of models to setup (det,cls,rec or specific subset)
+    description: Comma-separated runtime model groups to setup (det,cls,rec)
     required: false
     default: "det,cls,rec"
   cache-key-suffix:
-    description: Suffix for cache key to differentiate model sets
+    description: Prefix for the GitHub Actions cache key
     required: false
     default: "paddle-ocr-v5-onnx"
 
 outputs:
   cache-hit:
-    description: Whether models were restored from cache (true/false)
+    description: Whether the Hugging Face cache was restored
     value: ${{ steps.cache-models.outputs.cache-hit }}
   cache-dir:
-    description: Path to the PaddleOCR model cache directory
+    description: Standard Hugging Face Hub cache root
     value: ${{ steps.set-outputs.outputs.cache-dir }}
   models-available:
-    description: Comma-separated list of available models
-    value: ${{ steps.verify-models.outputs.available-models }}
+    description: Comma-separated list of verified model groups
+    value: ${{ steps.download-models.outputs.available-models }}
 
 runs:
   using: composite
   steps:
-    - name: Setup cache directory
+    - name: Configure Hugging Face cache
       shell: bash
       run: |
-        mkdir -p ~/.cache/xberg/paddle-ocr
-        echo "Cache directory: $HOME/.cache/xberg/paddle-ocr"
+        mkdir -p "$HOME/.cache/huggingface/hub"
+        echo "HF_HUB_CACHE=$HOME/.cache/huggingface/hub" >> "$GITHUB_ENV"
 
-    - name: Restore PaddleOCR models from cache
+    - name: Restore Hugging Face model cache
       if: inputs.cache-enabled == 'true'
       uses: actions/cache@v5
       id: cache-models
       with:
-        path: ~/.cache/xberg/paddle-ocr
-        key: ${{ inputs.cache-key-suffix }}-${{ runner.os }}-${{ runner.arch }}-v4
+        path: ~/.cache/huggingface/hub
+        key: ${{ inputs.cache-key-suffix }}-${{ runner.os }}-${{ runner.arch }}-bfaf0b492cfc1dee
         restore-keys: |
           ${{ inputs.cache-key-suffix }}-${{ runner.os }}-${{ runner.arch }}-
           ${{ inputs.cache-key-suffix }}-${{ runner.os }}-
-          ${{ inputs.cache-key-suffix }}-
 
-    - name: Download detection model (det)
-      if: contains(inputs.models, 'det') && steps.cache-models.outputs.cache-hit != 'true'
+    - name: Install Hugging Face CLI
       shell: bash
-      run: |
-        MODEL_URL="https://huggingface.co/xberg-io/paddleocr-onnx-models/resolve/main/PP-OCRv5_server_det_infer.onnx"
-        CACHE_DIR="$HOME/.cache/xberg/paddle-ocr"
-        MODEL_DIR="$CACHE_DIR/det"
-        MODEL_FILE="$MODEL_DIR/model.onnx"
+      run: python -m pip install --disable-pip-version-check 'huggingface_hub>=0.34,<2'
 
-        echo "Downloading detection model from $MODEL_URL"
-        mkdir -p "$MODEL_DIR"
-
-        for attempt in 1 2 3; do
-          if [ $attempt -gt 1 ]; then
-            backoff=$((5 * 3 ** (attempt - 2)))
-            echo "Retry attempt $attempt/3 after ${backoff}s backoff..."
-            sleep $backoff
-          fi
-
-          if curl -f -L --progress-bar --connect-timeout 30 --max-time 600 \
-            -o "$MODEL_FILE" "$MODEL_URL"; then
-            echo "Detection model downloaded successfully ($(du -h "$MODEL_FILE" | cut -f1))"
-            exit 0
-          fi
-        done
-
-        echo "ERROR: Failed to download detection model after 3 attempts"
-        rm -f "$MODEL_FILE"
-        exit 1
-
-    - name: Download classification model (cls)
-      if: contains(inputs.models, 'cls') && steps.cache-models.outputs.cache-hit != 'true'
+    - name: Download and verify pinned runtime artifacts
+      id: download-models
       shell: bash
+      env:
+        REQUESTED_MODELS: ${{ inputs.models }}
       run: |
-        MODEL_URL="https://huggingface.co/xberg-io/paddleocr-onnx-models/resolve/main/ch_ppocr_mobile_v2.0_cls_infer.onnx"
-        CACHE_DIR="$HOME/.cache/xberg/paddle-ocr"
-        MODEL_DIR="$CACHE_DIR/cls"
-        MODEL_FILE="$MODEL_DIR/model.onnx"
+        set -euo pipefail
+        REPO="xberg-io/paddleocr-onnx-models"
+        REVISION="bfaf0b492cfc1dee0c73245fc5860bfdcf2c3443"
+        FILES=()
+        CHECKSUMS=()
+        AVAILABLE=()
 
-        echo "Downloading classification model from $MODEL_URL"
-        mkdir -p "$MODEL_DIR"
-
-        for attempt in 1 2 3; do
-          if [ $attempt -gt 1 ]; then
-            backoff=$((5 * 3 ** (attempt - 2)))
-            echo "Retry attempt $attempt/3 after ${backoff}s backoff..."
-            sleep $backoff
-          fi
-
-          if curl -f -L --progress-bar --connect-timeout 30 --max-time 600 \
-            -o "$MODEL_FILE" "$MODEL_URL"; then
-            echo "Classification model downloaded successfully ($(du -h "$MODEL_FILE" | cut -f1))"
-            exit 0
-          fi
-        done
-
-        echo "ERROR: Failed to download classification model after 3 attempts"
-        rm -f "$MODEL_FILE"
-        exit 1
-
-    - name: Download recognition model (rec/english)
-      if: contains(inputs.models, 'rec') && steps.cache-models.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        MODEL_URL="https://huggingface.co/xberg-io/paddleocr-onnx-models/resolve/main/rec/english/model.onnx"
-        CACHE_DIR="$HOME/.cache/xberg/paddle-ocr"
-        MODEL_DIR="$CACHE_DIR/rec/english"
-        MODEL_FILE="$MODEL_DIR/model.onnx"
-
-        echo "Downloading English recognition model from $MODEL_URL"
-        mkdir -p "$MODEL_DIR"
-
-        for attempt in 1 2 3; do
-          if [ $attempt -gt 1 ]; then
-            backoff=$((5 * 3 ** (attempt - 2)))
-            echo "Retry attempt $attempt/3 after ${backoff}s backoff..."
-            sleep $backoff
-          fi
-
-          if curl -f -L --progress-bar --connect-timeout 30 --max-time 600 \
-            -o "$MODEL_FILE" "$MODEL_URL"; then
-            echo "Recognition model downloaded successfully ($(du -h "$MODEL_FILE" | cut -f1))"
-            exit 0
-          fi
-        done
-
-        echo "ERROR: Failed to download recognition model after 3 attempts"
-        rm -f "$MODEL_FILE"
-        exit 1
-
-    - name: Download recognition dictionary (rec/english/dict.txt)
-      if: contains(inputs.models, 'rec') && steps.cache-models.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        DICT_URL="https://huggingface.co/xberg-io/paddleocr-onnx-models/resolve/main/rec/english/dict.txt"
-        CACHE_DIR="$HOME/.cache/xberg/paddle-ocr"
-        MODEL_DIR="$CACHE_DIR/rec/english"
-        DICT_FILE="$MODEL_DIR/dict.txt"
-
-        echo "Downloading English recognition dictionary from $DICT_URL"
-        mkdir -p "$MODEL_DIR"
-
-        for attempt in 1 2 3; do
-          if [ $attempt -gt 1 ]; then
-            backoff=$((5 * 3 ** (attempt - 2)))
-            echo "Retry attempt $attempt/3 after ${backoff}s backoff..."
-            sleep $backoff
-          fi
-
-          if curl -f -L --progress-bar --connect-timeout 30 --max-time 600 \
-            -o "$DICT_FILE" "$DICT_URL"; then
-            echo "Dictionary downloaded successfully ($(du -h "$DICT_FILE" | cut -f1))"
-            exit 0
-          fi
-        done
-
-        echo "ERROR: Failed to download dictionary after 3 attempts"
-        rm -f "$DICT_FILE"
-        exit 1
-
-    - name: Verify downloaded models
-      id: verify-models
-      shell: bash
-      run: |
-        CACHE_DIR="$HOME/.cache/xberg/paddle-ocr"
-        AVAILABLE_MODELS=()
-        TOTAL_SIZE=0
-
-        echo "Checking for PaddleOCR models in $CACHE_DIR"
-
-        if [ -f "$CACHE_DIR/det/model.onnx" ]; then
-          SIZE=$(wc -c < "$CACHE_DIR/det/model.onnx" | tr -d ' ')
-          AVAILABLE_MODELS+=("det")
-          TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
-          echo "  ✓ Detection model: $(numfmt --to=iec-i --suffix=B $SIZE 2>/dev/null || echo $SIZE bytes)"
+        if [[ ",$REQUESTED_MODELS," == *,det,* ]]; then
+          FILES+=("v2/det/server.onnx")
+          CHECKSUMS+=("d5f46afc7a2b7fe5773c4ce6ff05c9e23631eb5de0f59d7a90404d9c49678f3c")
+          AVAILABLE+=("det")
+        fi
+        if [[ ",$REQUESTED_MODELS," == *,cls,* ]]; then
+          FILES+=("v2/classifiers/PP-LCNet_x1_0_textline_ori.onnx")
+          CHECKSUMS+=("1090f9f483a115f904beefe04acc9d28edf0c0b7b08cf0dd8d0ea59a9e0f2735")
+          AVAILABLE+=("cls")
+        fi
+        if [[ ",$REQUESTED_MODELS," == *,rec,* ]]; then
+          FILES+=("v2/rec/unified_server/model.onnx" "v2/rec/unified_server/dict.txt")
+          CHECKSUMS+=("00667becb28bcd49dfbcb8c7724aa8d6e8f01a1444db66e404182431e0fcbc14" "74f75c9f414da39d503635e76c6871baf8ab8df3b5a47072d55b9344483086c9")
+          AVAILABLE+=("rec")
         fi
 
-        if [ -f "$CACHE_DIR/cls/model.onnx" ]; then
-          SIZE=$(wc -c < "$CACHE_DIR/cls/model.onnx" | tr -d ' ')
-          AVAILABLE_MODELS+=("cls")
-          TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
-          echo "  ✓ Classification model: $(numfmt --to=iec-i --suffix=B $SIZE 2>/dev/null || echo $SIZE bytes)"
-        fi
-
-        if [ -f "$CACHE_DIR/rec/english/model.onnx" ]; then
-          SIZE=$(wc -c < "$CACHE_DIR/rec/english/model.onnx" | tr -d ' ')
-          AVAILABLE_MODELS+=("rec")
-          TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
-          echo "  ✓ Recognition model (English): $(numfmt --to=iec-i --suffix=B $SIZE 2>/dev/null || echo $SIZE bytes)"
-        fi
-
-        if [ -f "$CACHE_DIR/rec/english/dict.txt" ]; then
-          SIZE=$(wc -c < "$CACHE_DIR/rec/english/dict.txt" | tr -d ' ')
-          TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
-          echo "  ✓ Recognition dictionary (English): $(numfmt --to=iec-i --suffix=B $SIZE 2>/dev/null || echo $SIZE bytes)"
-        fi
-
-        if [ ${#AVAILABLE_MODELS[@]} -eq 0 ]; then
-          echo "ERROR: No models found in cache directory after download"
-          echo "available-models=" >> $GITHUB_OUTPUT
+        if [ ${#FILES[@]} -eq 0 ]; then
+          echo "No recognized model groups requested: $REQUESTED_MODELS" >&2
           exit 1
         fi
 
-        AVAILABLE_MODELS_STR=$(IFS=, ; echo "${AVAILABLE_MODELS[*]}")
-        echo "✓ Total cached models: ${#AVAILABLE_MODELS[@]} ($(numfmt --to=iec-i --suffix=B $TOTAL_SIZE 2>/dev/null || echo $TOTAL_SIZE bytes))"
-        echo "available-models=$AVAILABLE_MODELS_STR" >> $GITHUB_OUTPUT
+        for index in "${!FILES[@]}"; do
+          file="${FILES[$index]}"
+          path=$(hf download "$REPO" "$file" --revision "$REVISION" --cache-dir "$HF_HUB_CACHE" --quiet)
+          printf '%s  %s\n' "${CHECKSUMS[$index]}" "$path" | sha256sum --check --status
+          echo "Verified $file in the Hugging Face cache"
+        done
+
+        available=$(IFS=,; echo "${AVAILABLE[*]}")
+        echo "available-models=$available" >> "$GITHUB_OUTPUT"
 
     - name: Set cache directory output
       id: set-outputs
       shell: bash
-      run: |
-        CACHE_DIR="$HOME/.cache/xberg/paddle-ocr"
-        echo "cache-dir=$CACHE_DIR" >> $GITHUB_OUTPUT
-        echo "PADDLE_OCR_MODEL_CACHE=$CACHE_DIR" >> $GITHUB_ENV
-        echo "XBERG_CACHE_DIR=$HOME/.cache/xberg" >> $GITHUB_ENV
-
-    - name: Export cache environment
-      shell: bash
-      run: |
-        echo "PADDLE_OCR_MODEL_CACHE=$HOME/.cache/xberg/paddle-ocr" >> $GITHUB_ENV
-        echo "XBERG_CACHE_DIR=$HOME/.cache/xberg" >> $GITHUB_ENV
-        echo "PaddleOCR model cache configured at: $HOME/.cache/xberg/paddle-ocr"
+      run: echo "cache-dir=$HF_HUB_CACHE" >> "$GITHUB_OUTPUT"

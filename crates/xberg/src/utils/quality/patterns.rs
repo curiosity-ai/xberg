@@ -7,8 +7,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 // ============================================================================
-// OCR Artifact Patterns
-// ============================================================================
 
 /// Detects scattered characters with excessive spacing (e.g., "a  b  c")
 pub(crate) static SCATTERED_CHARS_PATTERN: Lazy<Regex> = Lazy::new(|| {
@@ -39,10 +37,6 @@ pub(crate) static MALFORMED_WORDS_PATTERN: Lazy<Regex> = Lazy::new(|| {
 pub(crate) static EXCESSIVE_WHITESPACE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\s{3,}").expect("Excessive whitespace regex pattern is valid and should compile"));
 
-// ============================================================================
-// Script and Code Patterns
-// ============================================================================
-
 /// Detects JavaScript function declarations
 pub(crate) static JS_FUNCTION_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)function\s+\w+\s*\([^)]*\)\s*\{[^}]*\}")
@@ -64,10 +58,6 @@ pub(crate) static STYLE_TAG_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("Style tag regex pattern is valid and should compile")
 });
 
-// ============================================================================
-// Navigation Element Patterns
-// ============================================================================
-
 /// Detects common navigation words and phrases
 pub(crate) static NAV_WORDS_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(?:Skip to main content|Back to top|Main navigation|Site navigation)\b")
@@ -84,10 +74,6 @@ pub(crate) static PAGINATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(?:Page \d+ of \d+|First page|Last page|Previous page|Next page|^\d+ of \d+$)\b")
         .expect("Pagination regex pattern is valid and should compile")
 });
-
-// ============================================================================
-// Whitespace Normalization Patterns
-// ============================================================================
 
 /// Normalizes various types of whitespace characters
 pub(crate) static WHITESPACE_NORMALIZE: Lazy<Regex> = Lazy::new(|| {

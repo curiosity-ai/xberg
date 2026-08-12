@@ -1,6 +1,22 @@
 use ndarray::Array4;
 
 use super::*;
+
+#[test]
+fn v2_prompt_encoding_constructs_and_errors_cleanly() {
+    let splitter = crate::v2::splitter::V2Splitter::new().expect("valid regex");
+    let tokenizer_path = std::path::Path::new("nonexistent.json");
+    let result = crate::v2::tokenizer::V2Tokenizer::from_file(tokenizer_path);
+    assert!(result.is_err(), "missing file must error, not panic");
+    let _ = splitter; // keep both symbols referenced ~keep
+}
+
+#[test]
+fn span_new_and_greedy_search_are_public() {
+    let span = crate::Span::new(0, 0, 5, "hello".to_string(), "greeting".to_string(), 0.9).expect("valid span");
+    let merged = crate::decode::greedy_search(&[span], true, false, false);
+    assert_eq!(merged.len(), 1);
+}
 use crate::decode::{decode_logits, greedy_search};
 use crate::preprocess::{EncodedInput, PromptInput, TokenizedInput};
 use crate::session::validate_schema_names;

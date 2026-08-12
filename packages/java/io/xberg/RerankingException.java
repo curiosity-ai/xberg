@@ -7,15 +7,13 @@ package io.xberg;
  * Since v5.0.0.
  */
 public class RerankingException extends XbergErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new RerankingException with the given message. */
-    public RerankingException(final String message) {
-        super(message);
-    }
+  /** Creates a new RerankingException with the given message. */
+  public RerankingException(final String message) { super(message); }
 
-    /** Creates a new RerankingException with the given message and cause. */
-    public RerankingException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new RerankingException with the given message and cause. */
+  public RerankingException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

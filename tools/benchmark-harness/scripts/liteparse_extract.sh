@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
 
-# LiteParse (run-llama/liteparse) CLI wrapper for the benchmark harness.
-#
-# Calls `lit parse <file> --format text|markdown` for the same fairness as the other
-# competitor wrappers: default options only, no preloaded model server, no
-# OCR opt-out unless the caller explicitly asks.
-#
-# Supports both plaintext (--format=plaintext) and markdown (--format=markdown) output.
 
 set -euo pipefail
 
@@ -35,8 +28,6 @@ if [ -z "$FILE_PATH" ]; then
   exit 1
 fi
 
-# Map harness format to liteparse CLI format
-# plaintext -> "text", markdown -> "markdown"
 case "$FORMAT" in
 plaintext)
   LIT_FORMAT="text"
@@ -60,21 +51,17 @@ fi
 START=$(date +%s%N)
 
 if command -v timeout &>/dev/null; then
-  CONTENT=$(timeout 180s lit parse "$FILE_PATH" --format "$LIT_FORMAT" $LIT_EXTRA_FLAGS $OCR_FLAG --quiet 2>/dev/null || echo "")
+  CONTENT=$(timeout 180s lit parse "$FILE_PATH" --format "$LIT_FORMAT" $LIT_EXTRA_FLAGS $OCR_FLAG --quiet)
 elif command -v gtimeout &>/dev/null; then
-  CONTENT=$(gtimeout 180s lit parse "$FILE_PATH" --format "$LIT_FORMAT" $LIT_EXTRA_FLAGS $OCR_FLAG --quiet 2>/dev/null || echo "")
+  CONTENT=$(gtimeout 180s lit parse "$FILE_PATH" --format "$LIT_FORMAT" $LIT_EXTRA_FLAGS $OCR_FLAG --quiet)
 else
-  CONTENT=$(lit parse "$FILE_PATH" --format "$LIT_FORMAT" $LIT_EXTRA_FLAGS $OCR_FLAG --quiet 2>/dev/null || echo "")
+  CONTENT=$(lit parse "$FILE_PATH" --format "$LIT_FORMAT" $LIT_EXTRA_FLAGS $OCR_FLAG --quiet)
 fi
 
 END=$(date +%s%N)
 DURATION_MS=$(((END - START) / 1000000))
 
 if command -v jq &>/dev/null; then
-  # Pass content via a temp file with --rawfile rather than --arg. Large PDFs
-  # produce extracted text that exceeds ARG_MAX when passed on the command line,
-  # which made jq die with "Argument list too long" (exit 126). --rawfile reads
-  # the value from a file, so content size is unbounded.
   CONTENT_FILE=$(mktemp)
   printf '%s' "$CONTENT" >"$CONTENT_FILE"
   jq -n \

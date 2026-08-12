@@ -7,11 +7,10 @@
 //! - File I/O optimization
 //! - Resource utilization (CPU cores)
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+
 mod helpers;
-use helpers::{
-    BytesInput, UriBatchInput, extract_bytes_documents, extract_uri_document, extract_uri_document_blocking,
-    extract_uri_documents,
-};
+use helpers::{BytesInput, UriBatchInput, extract_bytes_documents, extract_uri_documents};
 
 use std::time::{Duration, Instant};
 use xberg::core::config::ExtractionConfig;
@@ -208,16 +207,16 @@ async fn test_batch_documents_preserves_order() {
 async fn test_multipage_pdf_extraction() {
     use helpers::{get_test_file_path, skip_if_missing};
 
-    if skip_if_missing("pdfs/multi_page.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         tracing::debug!("Skipping multi-page PDF test: test file not available");
         return;
     }
 
     let config = ExtractionConfig::default();
-    let pdf_path = get_test_file_path("pdfs/multi_page.pdf");
+    let pdf_path = get_test_file_path("pdf/multi_page.pdf");
 
     let start = Instant::now();
-    let result = extract_uri_document(&pdf_path, None, &config).await;
+    let result = helpers::extract_uri_document(&pdf_path, None, &config).await;
     let duration = start.elapsed();
 
     assert!(result.is_ok(), "Multi-page PDF extraction should succeed");
@@ -233,7 +232,7 @@ async fn test_multipage_pdf_extraction() {
 async fn test_concurrent_pdf_extractions() {
     use helpers::{get_test_file_path, skip_if_missing};
 
-    if skip_if_missing("pdfs/simple.pdf") {
+    if skip_if_missing("pdf/simple.pdf") {
         tracing::debug!("Skipping concurrent PDF test: test file not available");
         return;
     }
@@ -243,7 +242,7 @@ async fn test_concurrent_pdf_extractions() {
     let mut paths: Vec<UriBatchInput> = Vec::new();
     for _ in 0..10 {
         paths.push(UriBatchInput {
-            path: get_test_file_path("pdfs/simple.pdf"),
+            path: get_test_file_path("pdf/simple.pdf"),
             config: None,
         });
     }
@@ -289,13 +288,13 @@ fn test_ocr_multipage_efficiency() {
     let file_path = get_test_file_path("images/ocr_image.jpg");
 
     let start = Instant::now();
-    let result1 = extract_uri_document_blocking(&file_path, None, &config);
+    let result1 = helpers::extract_uri_document_blocking(&file_path, None, &config);
     let first_duration = start.elapsed();
 
     assert!(result1.is_ok(), "First OCR should succeed");
 
     let start = Instant::now();
-    let result2 = extract_uri_document_blocking(&file_path, None, &config);
+    let result2 = helpers::extract_uri_document_blocking(&file_path, None, &config);
     let second_duration = start.elapsed();
 
     assert!(result2.is_ok(), "Second OCR should succeed");
@@ -307,8 +306,6 @@ fn test_ocr_multipage_efficiency() {
         first_duration.as_secs_f64() / second_duration.as_secs_f64().max(0.001)
     );
 
-    // Note: caching speedup is system-dependent and may not be 2x under load.
-    // Only assert the second run completes successfully; the speedup is informational.
     assert!(
         second_duration < first_duration * 2,
         "Second OCR run should not be significantly slower. First: {:?}, Second: {:?}",

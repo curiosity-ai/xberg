@@ -16,7 +16,6 @@ mod metadata;
 mod parser;
 mod tables;
 
-// Re-export public functions for backward compatibility
 pub use formatting::normalize_whitespace;
 pub(crate) use metadata::extract_rtf_metadata;
 pub(crate) use parser::{extract_rtf_formatting, extract_text_from_rtf, spans_to_annotations};
@@ -33,6 +32,9 @@ use crate::types::uri::ExtractedUri;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::borrow::Cow;
+
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+const RTF_WARNING_SOURCE: &str = "rtf";
 
 /// Native Rust RTF extractor.
 ///
@@ -63,18 +65,14 @@ impl RtfExtractor {
 
         let (extracted_text, tables, rtf_images, para_metas, mut formatting) =
             extract_text_from_rtf(rtf_content, plain);
-        // Headers/footers are still extracted by the separate formatting pass since
-        // the text pass skips those destinations. Merge them in.
         let legacy_formatting = extract_rtf_formatting(rtf_content);
         formatting.header_text = legacy_formatting.header_text;
         formatting.footer_text = legacy_formatting.footer_text;
 
         let mut builder = InternalDocumentBuilder::new("rtf");
 
-        // Extract URIs from hyperlinks found during RTF parsing
         for (_start, _end, url) in &formatting.hyperlinks {
             if !url.is_empty() {
-                // Try to find link text from the extracted text
                 let label = extracted_text.get(*_start..*_end).map(|s| s.to_string());
                 builder.push_uri(ExtractedUri::hyperlink(url, label));
             }
@@ -83,9 +81,8 @@ impl RtfExtractor {
         let mut table_idx = 0;
         let mut meta_idx = 0;
         let mut byte_offset = 0usize;
-        let mut in_table_rows = false; // tracking consecutive is_table paragraphs
+        let mut in_table_rows = false;
 
-        // Track list state for grouping list items
         let mut in_list = false;
         let mut list_id: Option<u16> = None;
         let mut list_depth: u8 = 0;
@@ -101,9 +98,7 @@ impl RtfExtractor {
             let meta = para_metas.get(meta_idx).cloned().unwrap_or_default();
             meta_idx += 1;
 
-            // Check if this paragraph is a table row
             if meta.is_table {
-                // Close any open list (all nested levels)
                 if in_list {
                     for _ in 0..=list_depth {
                         builder.end_list();
@@ -113,12 +108,10 @@ impl RtfExtractor {
                     list_depth = 0;
                 }
                 in_table_rows = true;
-                // Table rows are handled as a block — skip the text, use structured table data
                 byte_offset += paragraph.len() + 2;
                 continue;
             }
 
-            // If we were in table rows and now we're not, push the table
             if in_table_rows {
                 in_table_rows = false;
                 if table_idx < tables.len() {
@@ -127,11 +120,9 @@ impl RtfExtractor {
                 }
             }
 
-            // Check if this paragraph looks like a table (fallback for pipe-delimited text)
             let lines: Vec<&str> = trimmed.lines().collect();
             let is_table_like = lines.len() >= 2 && lines.iter().all(|l| l.contains('|'));
             if is_table_like && table_idx < tables.len() {
-                // Close any open list (all nested levels)
                 if in_list {
                     for _ in 0..=list_depth {
                         builder.end_list();
@@ -149,9 +140,7 @@ impl RtfExtractor {
             let trim_offset = byte_offset + (paragraph.len() - paragraph.trim_start().len());
             let annotations = spans_to_annotations(trim_offset, trim_offset + trimmed.len(), &formatting);
 
-            // Handle headings
             if meta.heading_level > 0 && meta.heading_level <= 6 {
-                // Close any open list (all nested levels)
                 if in_list {
                     for _ in 0..=list_depth {
                         builder.end_list();
@@ -161,22 +150,17 @@ impl RtfExtractor {
                     list_depth = 0;
                 }
                 builder.push_heading(meta.heading_level, trimmed, None, None);
-            }
-            // Handle list items
-            else if let Some(level) = meta.list_level {
+            } else if let Some(level) = meta.list_level {
                 let new_list_id = meta.list_id;
                 let ordered = meta.ordered;
 
-                // Check if we need to start a new list or adjust nesting
                 if !in_list || list_id != new_list_id {
                     if in_list {
-                        // Close all nested levels plus the root list
                         for _ in 0..=list_depth {
                             builder.end_list();
                         }
                     }
                     builder.push_list(ordered);
-                    // If starting at a level > 0, nest immediately
                     for _ in 0..level {
                         builder.push_list(ordered);
                     }
@@ -184,13 +168,11 @@ impl RtfExtractor {
                     list_id = new_list_id;
                     list_depth = level;
                 } else if level > list_depth {
-                    // Nest deeper
                     for _ in list_depth..level {
                         builder.push_list(ordered);
                     }
                     list_depth = level;
                 } else if level < list_depth {
-                    // Un-nest
                     for _ in level..list_depth {
                         builder.end_list();
                     }
@@ -198,10 +180,7 @@ impl RtfExtractor {
                 }
 
                 builder.push_list_item(trimmed, ordered, annotations, None, None);
-            }
-            // Regular paragraph
-            else {
-                // Close any open list (all nested levels)
+            } else {
                 if in_list {
                     for _ in 0..=list_depth {
                         builder.end_list();
@@ -215,28 +194,23 @@ impl RtfExtractor {
             byte_offset += paragraph.len() + 2;
         }
 
-        // Close any open list (all nested levels)
         if in_list {
             for _ in 0..=list_depth {
                 builder.end_list();
             }
         }
 
-        // If we ended while in table rows, push the last table
         if in_table_rows && table_idx < tables.len() {
             builder.push_table_from_cells(&tables[table_idx].cells, None, None);
             table_idx += 1;
         }
 
-        // Push tables that weren't matched to text paragraphs
         while table_idx < tables.len() {
             builder.push_table_from_cells(&tables[table_idx].cells, None, None);
             table_idx += 1;
         }
 
-        // Push extracted images
         for (i, rtf_img) in rtf_images.into_iter().enumerate() {
-            // Classify image based on metadata and visual properties
             let (image_kind, kind_confidence) =
                 crate::extraction::image_kind::classify(&rtf_img.data, rtf_img.format, None, None, None, None, false);
 
@@ -264,7 +238,6 @@ impl RtfExtractor {
             builder.push_image(None, image, None, None);
         }
 
-        // Push header/footer with content layers
         if let Some(ref header) = formatting.header_text {
             let idx = builder.push_paragraph(header, vec![], None, None);
             builder.set_layer(idx, ContentLayer::Header);
@@ -324,13 +297,11 @@ impl InternalDocumentExtractor for RtfExtractor {
         let mut budget = SecurityBudget::from_config(config);
         budget.account_text(content.len())?;
         let rtf_content = String::from_utf8_lossy(content);
-        let plain = true; // InternalDocument doesn't need markdown formatting
+        let plain = true;
 
-        // extract_rtf_metadata needs the extracted text; get it from the same pass
         let (extracted_text, _tables, _images, _metas, _formatting_data) = extract_text_from_rtf(&rtf_content, plain);
         let mut metadata_map = extract_rtf_metadata(&rtf_content, &extracted_text);
 
-        // Map standard fields from metadata_map to typed Metadata fields
         let title = metadata_map
             .remove(&Cow::Borrowed("title"))
             .and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -356,9 +327,17 @@ impl InternalDocumentExtractor for RtfExtractor {
 
         let mut doc = Self::build_internal_document(&rtf_content, plain);
 
-        // Filter headers/footers based on content_filter config.
-        // When content_filter is None, keep current behavior (headers/footers included).
-        // When content_filter is Some(...), respect include_headers/include_footers flags.
+        // `from_utf8_lossy` above already replaced every undecodable byte with U+FFFD.
+        // RTF producers routinely emit raw 8-bit bytes instead of `\'hh` escapes, so this
+        // is a real and common way for characters to disappear without any error (#171).
+        if std::str::from_utf8(content).is_err() {
+            crate::core::diagnostics::push_lossy_decode_warning(
+                &mut doc.processing_warnings,
+                RTF_WARNING_SOURCE,
+                "RTF source",
+            );
+        }
+
         if let Some(ref filter) = config.content_filter {
             use crate::types::document_structure::ContentLayer;
             doc.elements.retain(|elem| match elem.layer {
@@ -437,7 +416,6 @@ mod tests {
     fn test_plain_text_table_uses_pipes() {
         let rtf_content = r#"{\rtf1 {\trowd Cell1\cell Cell2\cell\row}}"#;
         let (plain, tables, _, _, _) = extract_text_from_rtf(rtf_content, true);
-        // Table rows produce [TABLE_ROW] placeholders in plain text
         assert!(
             plain.contains("[TABLE_ROW]"),
             "Plain text should contain table row placeholder, got: {}",
@@ -450,7 +428,6 @@ mod tests {
     fn test_rtf_bold_formatting_extraction() {
         let rtf_content = r#"{\rtf1 Normal {\b Bold text} more normal}"#;
         let formatting = extract_rtf_formatting(rtf_content);
-        // Should have at least one bold span
         let has_bold = formatting.spans.iter().any(|s| s.bold);
         assert!(has_bold, "Should detect bold formatting in RTF");
     }
@@ -537,6 +514,152 @@ mod tests {
             link_text
         );
         assert_eq!(url, "#bookmark_1");
+    }
+
+    #[test]
+    fn test_rtf_ansicpg1251_hex_escape_extraction() {
+        let rtf_content =
+            r#"{\rtf1\ansi\ansicpg1251\deff0{\fonttbl{\f0\fnil\fcharset204 Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2}"#;
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(text.contains("Привет"), "expected readable Cyrillic, got: {text:?}");
+        assert!(
+            !text.contains("Ïðèâåò"),
+            "should not decode CP1251 bytes as Windows-1252"
+        );
+    }
+
+    #[test]
+    fn test_rtf_fcharset_overrides_ansicpg() {
+        // \ansicpg1252 (Latin) but the active font declares \fcharset204 (Cyrillic).
+        // The font's fcharset must win over the document-level \ansicpg.
+        let rtf_content =
+            r#"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204 Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2}"#;
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(
+            text.contains("Привет"),
+            "fcharset204 on the active font should decode as cp1251, got: {text:?}"
+        );
+        assert!(
+            !text.contains("Ïðèâåò"),
+            "should not decode CP1251 bytes as Windows-1252 from \\ansicpg, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_rtf_fcharset_font_switch_mid_document() {
+        // f0 is Cyrillic (fcharset204), f1 is Greek (fcharset161). Each run must
+        // decode per the font active at that point in the document.
+        let rtf_content = r#"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204 Arial;}{\f1\fnil\fcharset161 Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2 \f1 \'e3\'e5\'e9\'e1}"#;
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(
+            text.contains("Привет"),
+            "f0 run should decode via fcharset204 (cp1251), got: {text:?}"
+        );
+        assert!(
+            text.contains("γεια"),
+            "f1 run should decode via fcharset161 (cp1253), got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_rtf_fcharset_ignores_cpg_on_same_font() {
+        // Per spec, \cpgN on a font entry is ignored when \fcharsetN is present.
+        let rtf_content = r#"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204\cpg1252 Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2}"#;
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(
+            text.contains("Привет"),
+            "\\fcharset204 must win over the redundant \\cpg1252 on the same font, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_rtf_fcharset_falls_back_to_ansicpg_when_font_has_none() {
+        // f0 declares no \fcharset at all, so decoding must fall back to \ansicpg1251.
+        let rtf_content = r#"{\rtf1\ansi\ansicpg1251\deff0{\fonttbl{\f0\fnil Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2}"#;
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(
+            text.contains("Привет"),
+            "font with no \\fcharset should fall back to \\ansicpg1251, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_rtf_fcharset_deff_alone_is_sufficient() {
+        // No explicit \f0 before the text run: \deff0 alone must select the default font.
+        let rtf_content =
+            r#"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204 Arial;}}\'cf\'f0\'e8\'e2\'e5\'f2}"#;
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(
+            text.contains("Привет"),
+            "\\deff0 alone should select font 0's fcharset204 (cp1251), got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_rtf_ansicpg932_multibyte_run() {
+        let rtf_content =
+            r#"{\rtf1\ansi\ansicpg932\deff0{\fonttbl{\f0\fnil\fcharset128 MS Mincho;}}\f0 \'93\'fa\'96\'7b}"#;
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(
+            text.contains("日本"),
+            "adjacent escapes should decode as one Shift-JIS run, got: {text:?}"
+        );
+        assert!(!text.contains('\u{FFFD}'), "run must not decode byte-by-byte");
+    }
+
+    #[test]
+    fn test_rtf_hex_escape_run_split_by_newline() {
+        let rtf_content = "{\\rtf1\\ansi\\ansicpg932 \\'93\r\n\\'fa}";
+        let (text, _, _, _, _) = extract_text_from_rtf(rtf_content, true);
+
+        assert!(
+            text.contains('日'),
+            "a line wrap between the bytes of one character must not split the run, got: {text:?}"
+        );
+        assert!(!text.contains('\u{FFFD}'), "wrapped run must not decode as U+FFFD");
+    }
+
+    #[test]
+    fn test_rtf_ansicpg_codepage_table() {
+        let cases = [
+            (1251, r"\'cf\'f0\'e8\'e2\'e5\'f2", "Привет"),
+            (932, r"\'93\'fa\'96\'7b", "日本"),
+            (936, r"\'c4\'e3\'ba\'c3", "你好"),
+            (874, r"\'a1", "ก"),
+            (866, r"\'80\'81", "АБ"),
+            (20866, r"\'e1\'e2", "АБ"),
+            // Unknown codepage falls back to Windows-1252.
+            (1717, r"\'e9", "é"),
+        ];
+        for (codepage, escapes, expected) in cases {
+            let rtf_content = format!(r"{{\rtf1\ansi\ansicpg{codepage} {escapes}}}");
+            let (text, _, _, _, _) = extract_text_from_rtf(&rtf_content, true);
+            assert!(
+                text.contains(expected),
+                "codepage {codepage}: expected {expected:?}, got: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rtf_multibyte_formatting_span_alignment() {
+        let rtf_content = r#"{\rtf1\ansi\ansicpg932 before {\b \'93\'fa\'96\'7b} after}"#;
+        let (text, _, _, _, formatting) = extract_text_from_rtf(rtf_content, false);
+        let bold_spans: Vec<_> = formatting.spans.iter().filter(|s| s.bold).collect();
+        assert!(!bold_spans.is_empty(), "Should have bold spans");
+        let span = &bold_spans[0];
+        let bold_text = &text[span.start..span.end];
+        assert_eq!(
+            bold_text, "日本",
+            "Bold span should exactly cover the decoded multi-byte run, got: {bold_text:?}"
+        );
     }
 
     #[test]
@@ -631,7 +754,6 @@ mod tests {
 
     #[test]
     fn test_bookmark_hyperlink_with_formatting() {
-        // Nested groups inside fldrslt (e.g. color/font changes)
         let rtf_content = r#"{\rtf1\ansi
 \pard
 {\*\bkmkstart bookmark_1}Bookmark_1{\*\bkmkend bookmark_1}
@@ -654,7 +776,6 @@ mod tests {
 
     #[test]
     fn test_bookmark_hyperlink_with_extra_spaces() {
-        // Extra spaces before the field that cause normalization drift
         let rtf_content = r#"{\rtf1\ansi
 \pard
 {\*\bkmkstart bookmark_1}Bookmark_1{\*\bkmkend bookmark_1}
@@ -793,7 +914,6 @@ Some  text  before {\field{\*\fldinst { HYPERLINK  \\l "bookmark_1" }}{\fldrslt 
 
     #[test]
     fn test_listtext_ignorable_ordered_detection() {
-        // \listtext inside ignorable destination (\*) must still detect ordered lists
         let rtf_content = r#"{\rtf1\ansi
 \pard\ilvl0\ls1{\*\listtext 1.\tab}First item\par
 \pard\ilvl0\ls1{\*\listtext 2.\tab}Second item\par

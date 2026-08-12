@@ -10,7 +10,6 @@ use crate::Result;
     feature = "excel",
     feature = "excel-wasm",
     feature = "html",
-    feature = "transcription",
     feature = "tree-sitter",
     feature = "xml",
 ))]
@@ -23,7 +22,6 @@ use crate::plugins::registry::get_document_extractor_registry;
     feature = "excel",
     feature = "excel-wasm",
     feature = "html",
-    feature = "transcription",
     feature = "tree-sitter",
     feature = "xml",
 ))]
@@ -61,7 +59,6 @@ use std::sync::Arc;
     feature = "excel",
     feature = "excel-wasm",
     feature = "html",
-    feature = "transcription",
     feature = "tree-sitter",
     feature = "xml",
 ))]
@@ -85,9 +82,11 @@ pub(crate) trait SyncExtractor {
 #[cfg(feature = "tree-sitter")]
 pub mod code;
 
+pub mod asciidoc;
 pub mod csv;
 pub mod structured;
 pub mod text;
+pub mod vtt;
 
 pub mod djot_format;
 pub mod frontmatter_utils;
@@ -126,6 +125,9 @@ pub mod hwp;
 #[cfg(feature = "hwpx")]
 pub mod hwpx;
 
+#[cfg(feature = "wordperfect")]
+pub mod wordperfect;
+
 #[cfg(feature = "iwork")]
 pub mod iwork;
 
@@ -153,6 +155,8 @@ pub mod epub;
 #[cfg(feature = "office")]
 pub mod fictionbook;
 
+pub mod doctags;
+
 pub mod markdown;
 
 #[cfg(feature = "mdx")]
@@ -164,11 +168,14 @@ pub mod rst;
 #[cfg(feature = "office")]
 pub mod latex;
 
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 pub mod jupyter;
 
 #[cfg(feature = "office")]
 pub mod orgmode;
+
+#[cfg(feature = "office")]
+pub mod odp;
 
 #[cfg(feature = "office")]
 pub mod odt;
@@ -203,10 +210,13 @@ pub mod docbook;
 #[cfg(feature = "tree-sitter")]
 pub use code::CodeExtractor;
 
+pub use asciidoc::AsciiDocExtractor;
 pub use csv::CsvExtractor;
+pub use doctags::DocTagsExtractor;
 pub use markdown::MarkdownExtractor;
 pub use structured::StructuredExtractor;
 pub use text::PlainTextExtractor;
+pub use vtt::WebVttExtractor;
 
 #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
 pub use image::ImageExtractor;
@@ -228,6 +238,9 @@ pub use hwp::HwpExtractor;
 
 #[cfg(feature = "hwpx")]
 pub use hwpx::HwpxExtractor;
+
+#[cfg(feature = "wordperfect")]
+pub use wordperfect::WordPerfectExtractor;
 
 #[cfg(feature = "iwork")]
 pub use iwork::{keynote::KeynoteExtractor, numbers::NumbersExtractor, pages::PagesExtractor};
@@ -267,12 +280,14 @@ pub use rst::RstExtractor;
 #[cfg(feature = "office")]
 pub use latex::LatexExtractor;
 
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 pub use jupyter::JupyterExtractor;
 
 #[cfg(feature = "office")]
 pub use orgmode::OrgModeExtractor;
 
+#[cfg(feature = "office")]
+pub use odp::OdpExtractor;
 #[cfg(feature = "office")]
 pub use odt::OdtExtractor;
 
@@ -318,7 +333,11 @@ static EXTRACTORS_INITIALIZED: OnceCell<()> = OnceCell::new();
 /// This function is called automatically on first extraction operation.
 /// It's safe to call multiple times - registration only happens once,
 /// unless the registry was cleared, in which case extractors are re-registered.
-pub(crate) fn ensure_initialized() -> Result<()> {
+///
+/// Public so a caller that wants to *inspect* the registry — rather than extract —
+/// can populate it directly. Without this the only way to trigger registration is to
+/// run a real extraction, which `xberg formats` would otherwise have to fake (#233).
+pub fn ensure_initialized() -> Result<()> {
     EXTRACTORS_INITIALIZED.get_or_try_init(register_default_extractors)?;
 
     let registry = get_document_extractor_registry();
@@ -355,9 +374,12 @@ pub(crate) fn register_default_extractors() -> Result<()> {
     let mut registry = registry.write();
 
     registry.register_internal(Arc::new(PlainTextExtractor::new()))?;
+    registry.register_internal(Arc::new(AsciiDocExtractor::new()))?;
+    registry.register_internal(Arc::new(WebVttExtractor::new()))?;
     registry.register_internal(Arc::new(MarkdownExtractor::new()))?;
     registry.register_internal(Arc::new(StructuredExtractor::new()))?;
     registry.register_internal(Arc::new(CsvExtractor::new()))?;
+    registry.register_internal(Arc::new(DocTagsExtractor::new()))?;
 
     #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
     registry.register_internal(Arc::new(ImageExtractor::new()))?;
@@ -377,6 +399,9 @@ pub(crate) fn register_default_extractors() -> Result<()> {
 
     registry.register_internal(Arc::new(DjotExtractor::new()))?;
 
+    #[cfg(feature = "notebook")]
+    registry.register_internal(Arc::new(JupyterExtractor::new()))?;
+
     #[cfg(feature = "office")]
     {
         registry.register_internal(Arc::new(BibtexExtractor::new()))?;
@@ -386,7 +411,6 @@ pub(crate) fn register_default_extractors() -> Result<()> {
         registry.register_internal(Arc::new(RtfExtractor::new()))?;
         registry.register_internal(Arc::new(RstExtractor::new()))?;
         registry.register_internal(Arc::new(LatexExtractor::new()))?;
-        registry.register_internal(Arc::new(JupyterExtractor::new()))?;
         registry.register_internal(Arc::new(OrgModeExtractor::new()))?;
         registry.register_internal(Arc::new(OpmlExtractor::new()))?;
         registry.register_internal(Arc::new(TypstExtractor::new()))?;
@@ -395,6 +419,7 @@ pub(crate) fn register_default_extractors() -> Result<()> {
         registry.register_internal(Arc::new(PptExtractor::new()))?;
         registry.register_internal(Arc::new(PptxExtractor::new()))?;
         registry.register_internal(Arc::new(OdtExtractor::new()))?;
+        registry.register_internal(Arc::new(OdpExtractor::new()))?;
         registry.register_internal(Arc::new(DbfExtractor::new()))?;
     }
 
@@ -406,6 +431,11 @@ pub(crate) fn register_default_extractors() -> Result<()> {
     #[cfg(feature = "hwpx")]
     {
         registry.register_internal(Arc::new(HwpxExtractor::new()))?;
+    }
+
+    #[cfg(feature = "wordperfect")]
+    {
+        registry.register_internal(Arc::new(WordPerfectExtractor::new()))?;
     }
 
     #[cfg(feature = "iwork")]
@@ -462,13 +492,15 @@ mod tests {
         let extractor_names = reg.list();
 
         #[allow(unused_mut)]
-        let mut expected_count = 5; // plain-text, markdown, structured, djot, csv
-        // transcription-extractor is only present when the feature is compiled in
+        let mut expected_count = 8;
         assert!(extractor_names.contains(&"plain-text-extractor".to_string()));
+        assert!(extractor_names.contains(&"asciidoc-extractor".to_string()));
+        assert!(extractor_names.contains(&"webvtt-extractor".to_string()));
         assert!(extractor_names.contains(&"markdown-extractor".to_string()));
         assert!(extractor_names.contains(&"structured-extractor".to_string()));
         assert!(extractor_names.contains(&"djot-extractor".to_string()));
         assert!(extractor_names.contains(&"csv-extractor".to_string()));
+        assert!(extractor_names.contains(&"doctags-extractor".to_string()));
 
         #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
         {
@@ -496,6 +528,12 @@ mod tests {
             assert!(extractor_names.contains(&"excel-extractor".to_string()));
         }
 
+        #[cfg(feature = "notebook")]
+        {
+            expected_count += 1;
+            assert!(extractor_names.contains(&"jupyter-extractor".to_string()));
+        }
+
         #[cfg(feature = "office")]
         {
             expected_count += 17;
@@ -506,7 +544,6 @@ mod tests {
             assert!(extractor_names.contains(&"rtf-extractor".to_string()));
             assert!(extractor_names.contains(&"rst-extractor".to_string()));
             assert!(extractor_names.contains(&"latex-extractor".to_string()));
-            assert!(extractor_names.contains(&"jupyter-extractor".to_string()));
             assert!(extractor_names.contains(&"orgmode-extractor".to_string()));
             assert!(extractor_names.contains(&"opml-extractor".to_string()));
             assert!(extractor_names.contains(&"typst-extractor".to_string()));
@@ -516,6 +553,7 @@ mod tests {
             assert!(extractor_names.contains(&"ppt-extractor".to_string()));
             assert!(extractor_names.contains(&"pptx-extractor".to_string()));
             assert!(extractor_names.contains(&"odt-extractor".to_string()));
+            assert!(extractor_names.contains(&"odp-extractor".to_string()));
         }
 
         #[cfg(feature = "hwp")]
@@ -528,6 +566,12 @@ mod tests {
         {
             expected_count += 1;
             assert!(extractor_names.contains(&"hwpx-extractor".to_string()));
+        }
+
+        #[cfg(feature = "wordperfect")]
+        {
+            expected_count += 1;
+            assert!(extractor_names.contains(&"wordperfect-extractor".to_string()));
         }
 
         #[cfg(feature = "iwork")]

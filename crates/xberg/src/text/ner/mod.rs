@@ -15,14 +15,22 @@
 //!   `crate::model_download`.
 //! - [`llm::LlmBackend`] under `#[cfg(feature = "ner-llm")]` — liter-llm with a
 //!   structured-output schema. Used when categories outstrip the ONNX taxonomy.
+//!
+//! Every backend has a bounded input length, so both bundled backends window
+//! long input through [`offsets::split_into_windows`] rather than letting the
+//! model silently truncate — an undetected entity is PII that never gets
+//! redacted (xberg-io/xberg#262).
 
 #![cfg(feature = "ner")]
 
 pub mod backend;
+#[cfg(feature = "ner-candle-backend")]
+pub mod candle;
 #[cfg(feature = "ner-onnx")]
 pub mod gline;
 #[cfg(all(feature = "ner-llm", not(all(target_os = "android", target_arch = "x86_64"))))]
 pub mod llm;
+pub mod offsets;
 
 pub use backend::NerBackend;
 
@@ -31,10 +39,12 @@ use crate::types::entity::Entity;
 
 use std::path::PathBuf;
 
-/// Eagerly download a NER model into the xberg cache.
+/// Eagerly download a NER model into the Hugging Face Hub cache.
 ///
 /// `name` is a supported xberg GLiNER alias or catalog id. The CLI flag
-/// `xberg cache warm --ner` delegates here.
+/// `xberg cache warm --ner` delegates here. `cache_dir`, when provided, is a
+/// custom Hugging Face Hub cache root; otherwise the standard `HF_HUB_CACHE`,
+/// `HF_HOME`, and platform defaults apply.
 #[cfg(feature = "ner-onnx")]
 pub fn download_model(name: &str, cache_dir: Option<PathBuf>) -> crate::Result<PathBuf> {
     gline::download_model(name, cache_dir)
@@ -95,8 +105,9 @@ pub fn manifest() -> Vec<gline::GlinerManifestEntry> {
 ///
 /// ```rust,no_run
 /// use xberg::types::entity::EntityCategory;
-/// use xberg::text::ner::{detect_entities, LlmBackend};
+/// use xberg::text::ner::detect_entities;
 /// use xberg::core::config::LlmConfig;
+/// use xberg::LlmBackend;
 ///
 /// # async fn example() -> xberg::Result<()> {
 /// let backend = LlmBackend::new(LlmConfig::default());

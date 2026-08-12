@@ -65,13 +65,13 @@ impl OcrBoundingGeometry {
     ///
     /// Tuple of `(left, top, width, height)` in pixels.
     #[cfg(any(
-        feature = "paddle-ocr",
+        paddle_ocr,
         all(
             feature = "layout-detection",
             feature = "pdf",
             any(feature = "ocr", feature = "ocr-pipeline")
         ),
-        all(test, any(feature = "paddle-ocr", feature = "layout-detection", feature = "ocr"))
+        all(test, any(paddle_ocr, feature = "layout-detection", feature = "ocr"))
     ))]
     pub(crate) fn to_aabb(&self) -> (u32, u32, u32, u32) {
         match self {
@@ -157,7 +157,7 @@ impl OcrConfidence {
     /// Both scores should be in 0.0-1.0 range, but PaddleOCR may occasionally return
     /// values slightly above 1.0 due to model calibration. This method clamps both
     /// values to ensure they stay within the valid 0.0-1.0 range.
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     pub(crate) fn from_paddle(box_score: f32, text_score: f32) -> Self {
         Self {
             detection: Some((box_score as f64).clamp(0.0, 1.0)),
@@ -191,7 +191,7 @@ impl OcrRotation {
     /// # Errors
     ///
     /// Returns an error if `angle_index` is not in the valid range (0-3).
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     pub(crate) fn from_paddle(angle_index: i32, angle_score: f32) -> std::result::Result<Self, String> {
         if !(0..=3).contains(&angle_index) {
             return Err(format!(
@@ -206,7 +206,6 @@ impl OcrRotation {
                 1 => 180.0,
                 2 => 90.0,
                 3 => 270.0,
-                // INVARIANT: the range check above guarantees angle_index is 0..=3
                 _ => unreachable!("angle_index validated to 0..=3 above"),
             },
             confidence: Some((angle_score as f64).clamp(0.0, 1.0)),
@@ -242,7 +241,7 @@ impl OcrElementLevel {
         match level {
             1 => Self::Page,
             2 => Self::Block,
-            3 => Self::Block, // Paragraph treated as Block
+            3 => Self::Block,
             4 => Self::Line,
             5 => Self::Word,
             _ => Self::Line,
@@ -316,7 +315,7 @@ impl OcrElement {
     }
 
     /// Set rotation information.
-    #[cfg(test)]
+    #[cfg(all(test, paddle_ocr))]
     pub(crate) fn with_rotation(mut self, rotation: OcrRotation) -> Self {
         self.rotation = Some(rotation);
         self
@@ -374,7 +373,7 @@ pub struct OcrElementConfig {
 }
 
 /// Geometry-only tests that do not require the `ocr` feature.
-#[cfg(all(test, any(feature = "paddle-ocr", feature = "layout-detection")))]
+#[cfg(all(test, any(paddle_ocr, feature = "layout-detection")))]
 mod geometry_tests {
     use super::*;
 
@@ -391,7 +390,6 @@ mod geometry_tests {
 
     #[test]
     fn test_quadrilateral_to_aabb() {
-        // Slightly rotated quad
         let geom = OcrBoundingGeometry::Quadrilateral {
             points: [(10, 22), (108, 20), (110, 72), (12, 74)],
         };
@@ -428,35 +426,31 @@ mod tests {
         assert!((conf.recognition - 0.85).abs() < 0.001);
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_confidence_from_paddle() {
         let conf = OcrConfidence::from_paddle(0.95, 0.88);
-        // Use approximate comparison due to f32 -> f64 precision
         assert!(conf.detection.is_some());
         assert!((conf.detection.unwrap() - 0.95).abs() < 0.001);
         assert!((conf.recognition - 0.88).abs() < 0.001);
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_rotation_from_paddle() {
         let rot = OcrRotation::from_paddle(1, 0.92).expect("Valid angle_index");
         assert_eq!(rot.angle_degrees, 180.0);
-        // Use approximate comparison due to f32 -> f64 precision
         assert!(rot.confidence.is_some());
         assert!((rot.confidence.unwrap() - 0.92).abs() < 0.001);
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_rotation_from_paddle_invalid_angle_index() {
-        // Test that invalid angle indices are rejected
         assert!(OcrRotation::from_paddle(-1, 0.92).is_err());
         assert!(OcrRotation::from_paddle(4, 0.92).is_err());
         assert!(OcrRotation::from_paddle(100, 0.92).is_err());
 
-        // Valid indices should succeed
         assert!(OcrRotation::from_paddle(0, 0.92).is_ok());
         assert!(OcrRotation::from_paddle(1, 0.92).is_ok());
         assert!(OcrRotation::from_paddle(2, 0.92).is_ok());
@@ -518,7 +512,7 @@ mod tests {
         assert!(!geom1.overlaps(&geom3));
     }
 
-    #[cfg(feature = "paddle-ocr")]
+    #[cfg(paddle_ocr)]
     #[test]
     fn test_serialization_roundtrip() {
         let geom = OcrBoundingGeometry::Quadrilateral {

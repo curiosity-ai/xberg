@@ -1,23 +1,6 @@
 version: "3"
 
 # ============================================================================
-# Demo development environment
-#
-# Generates a patched demo-dev.html (CDN URLs → localhost), then starts two
-# servers that reproduce the cross-origin scenario the CDN creates in prod:
-#
-#   Docs server  → http://localhost:8001  (serves docs/)
-#   Asset server → http://localhost:9000  (serves crates/xberg-wasm/)
-#
-# First-time setup:
-#   task demo:dev:setup              # install wasm-pack, wasm-bindgen-cli, WASI SDK
-#
-# Usage:
-#   task demo:dev                    # full build + patch + both servers
-#   SKIP_WASM_BUILD=1 task demo:dev  # skip Rust build, TS + patch only
-#
-# Open:  http://localhost:8001/demo-dev.html
-# ============================================================================
 
 tasks:
   dev:
@@ -29,13 +12,15 @@ tasks:
       - task: dev:serve
 
   dev:build:
-    desc: "Build WASM binary for web target (unless SKIP_WASM_BUILD=1)"
+    desc: "Build WASM web target and shim its env/wasi imports (unless SKIP_WASM_BUILD=1)"
     dir: crates/xberg-wasm
     cmds:
-      - '[ "${SKIP_WASM_BUILD:-0}" = "1" ] || { pnpm run build:wasm:web && mkdir -p dist/pkg && cp pkg/web/xberg_wasm_bg.wasm dist/pkg/xberg_wasm_bg.wasm; }'
+      # Bake the same env/wasi ESM shim the publish pipeline applies, so local
+      # dev loads pkg/web exactly as production consumers do. ~keep
+      - '[ "${SKIP_WASM_BUILD:-0}" = "1" ] || { pnpm run build:wasm:web && node scripts/fix-wasi-imports.mjs; }'
 
   dev:patch:
-    desc: "Generate docs/demo-dev.html with CDN URLs replaced by localhost:9000"
+    desc: "Generate docs-site/public/demo-dev.html with CDN URLs replaced by localhost:9000"
     cmds:
       - node scripts/task/patch-demo-dev.mjs
 
@@ -63,9 +48,9 @@ tasks:
       - task: dev:serve:assets
 
   dev:serve:docs:
-    desc: "Serve docs on http://localhost:8001"
+    desc: "Serve the demo (docs-site/public) on http://localhost:8001"
     cmds:
-      - uv run --no-sync --group doc zensical serve -a localhost:8001
+      - npx --yes serve docs-site/public --cors -l tcp://0.0.0.0:8001
 
   dev:serve:assets:
     desc: "Serve WASM assets on http://localhost:9000 (simulates CDN origin)"

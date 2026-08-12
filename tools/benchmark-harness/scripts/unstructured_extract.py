@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Xberg. All rights reserved.
 """Unstructured extraction wrapper for benchmark harness."""
 
 from __future__ import annotations
@@ -21,63 +22,29 @@ def _get_peak_memory_bytes() -> int:
     return usage.ru_maxrss
 
 
-def _render_markdown(elements: list) -> str:
-    """Render Unstructured Elements as GFM-ish markdown."""
-    import re
-
-    parts: list[str] = []
-    for el in elements:
-        cls = type(el).__name__
-        text = (el.text or "").strip() if hasattr(el, "text") else str(el).strip()
-        if not text and cls not in ("Image", "Figure"):
-            continue
-        if cls == "Title":
-            parts.append(f"# {text}")
-        elif cls == "Header":
-            parts.append(f"## {text}")
-        elif cls == "ListItem":
-            parts.append(f"- {text}")
-        elif cls in ("CodeSnippet", "Code"):
-            parts.append(f"```\n{text}\n```")
-        elif cls in ("Image", "Figure"):
-            parts.append(f"![{text or cls}]()")
-        elif cls == "Table":
-            html = ""
-            md = getattr(el, "metadata", None)
-            if md is not None:
-                html = getattr(md, "text_as_html", "") or ""
-            if html:
-                rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.DOTALL | re.IGNORECASE)
-                rendered: list[str] = []
-                for i, row_html in enumerate(rows):
-                    cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.DOTALL | re.IGNORECASE)
-                    cells = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
-                    if cells:
-                        rendered.append("| " + " | ".join(cells) + " |")
-                        if i == 0:
-                            rendered.append("| " + " | ".join("---" for _ in cells) + " |")
-                if rendered:
-                    parts.append("\n".join(rendered))
-                else:
-                    parts.append(text)
-            else:
-                parts.append(text)
-        else:
-            parts.append(text)
-    return "\n\n".join(parts)
+def _tesseract_codes_to_languages(ocr_language: str | None) -> list[str]:
+    """Map a canonical Tesseract language string (``eng+kor``, ``jpn_vert``) to the
+    list Unstructured's ``partition(languages=...)`` expects. Unstructured forwards
+    these straight to Tesseract's ``-l`` flag, so the codes pass through unchanged;
+    an unset value falls back to English, matching the previous hardcoded default.
+    """
+    if not ocr_language:
+        return ["eng"]
+    codes = [code.strip() for code in ocr_language.split("+") if code.strip()]
+    return codes or ["eng"]
 
 
-def extract_sync(file_path: str, ocr_enabled: bool, output_format: str = "markdown") -> dict:
+def extract_sync(
+    file_path: str, ocr_enabled: bool, output_format: str = "plaintext", ocr_language: str | None = None
+) -> dict:
     """Extract using Unstructured partition API."""
     strategy = "hi_res" if ocr_enabled else "fast"
+    languages = _tesseract_codes_to_languages(ocr_language)
     start = time.perf_counter()
-    elements = partition(filename=file_path, strategy=strategy, languages=["eng"])
+    elements = partition(filename=file_path, strategy=strategy, languages=languages)
     duration_ms = (time.perf_counter() - start) * 1000.0
 
-    if output_format == "markdown":
-        content = _render_markdown(elements)
-    else:
-        content = "\n\n".join(str(el) for el in elements)
+    content = "\n\n".join(str(el) for el in elements)
     return {
         "content": content,
         "metadata": {"framework": "unstructured", "strategy": strategy, "output_format": output_format},
@@ -138,7 +105,6 @@ def _run_with_timeout(fn, args, timeout):
         parent_conn.close()
         return result
     except Exception:
-        # Fork not available — fall back to in-process extraction
         try:
             return fn(*args)
         except Exception as e:
@@ -156,7 +122,7 @@ def _parse_path(line: str) -> str:
     return stripped
 
 
-def run_server(ocr_enabled: bool, output_format: str, timeout=None) -> None:
+def run_server(ocr_enabled: bool, output_format: str, timeout=None, ocr_language: str | None = None) -> None:
     """Persistent server mode: read paths from stdin, write JSON to stdout."""
     print("READY", flush=True)
     for line in sys.stdin:
@@ -164,10 +130,10 @@ def run_server(ocr_enabled: bool, output_format: str, timeout=None) -> None:
         if not file_path:
             continue
         if timeout is not None:
-            result = _run_with_timeout(extract_sync, (file_path, ocr_enabled, output_format), timeout)
+            result = _run_with_timeout(extract_sync, (file_path, ocr_enabled, output_format, ocr_language), timeout)
         else:
             try:
-                result = extract_sync(file_path, ocr_enabled, output_format)
+                result = extract_sync(file_path, ocr_enabled, output_format, ocr_language)
             except Exception as e:
                 result = {"error": str(e), "_extraction_time_ms": 0}
         print(json.dumps(result), flush=True)
@@ -176,7 +142,8 @@ def run_server(ocr_enabled: bool, output_format: str, timeout=None) -> None:
 def main() -> None:
     ocr_enabled = False
     timeout = None
-    output_format = "markdown"
+    output_format = "plaintext"
+    ocr_language = None
     args = []
     for arg in sys.argv[1:]:
         if arg == "--ocr":
@@ -187,16 +154,18 @@ def main() -> None:
             timeout = int(arg.split("=", 1)[1])
         elif arg.startswith("--format="):
             output_format = arg.split("=", 1)[1]
+        elif arg.startswith("--ocr-lang="):
+            ocr_language = arg.split("=", 1)[1]
         else:
             args.append(arg)
 
-    if output_format not in ("markdown", "plaintext"):
-        print(f"Error: --format must be 'markdown' or 'plaintext'; got '{output_format}'", file=sys.stderr)
+    if output_format != "plaintext":
+        print(f"Error: Unstructured supports only native plaintext output; got '{output_format}'", file=sys.stderr)
         sys.exit(64)
 
     if len(args) < 1:
         print(
-            "Usage: unstructured_extract.py [--ocr|--no-ocr] [--timeout=SECS] [--format=markdown|plaintext] <mode> <file_path>",
+            "Usage: unstructured_extract.py [--ocr|--no-ocr] [--timeout=SECS] [--format=plaintext] <mode> <file_path>",
             file=sys.stderr,
         )
         print("Modes: sync, server", file=sys.stderr)
@@ -205,21 +174,20 @@ def main() -> None:
     mode = args[0]
 
     if mode == "server":
-        run_server(ocr_enabled, output_format, timeout=timeout)
+        run_server(ocr_enabled, output_format, timeout=timeout, ocr_language=ocr_language)
     elif mode == "sync":
         if len(args) < 2:
             print("Error: sync mode requires a file path", file=sys.stderr)
             sys.exit(1)
         try:
-            payload = extract_sync(args[1], ocr_enabled, output_format)
+            payload = extract_sync(args[1], ocr_enabled, output_format, ocr_language)
             print(json.dumps(payload), end="")
         except Exception as e:
             print(f"Error extracting with Unstructured: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        # Legacy mode: first arg is the file path directly
         try:
-            payload = extract_sync(args[0], ocr_enabled, output_format)
+            payload = extract_sync(args[0], ocr_enabled, output_format, ocr_language)
             print(json.dumps(payload), end="")
         except Exception as e:
             print(f"Error extracting with Unstructured: {e}", file=sys.stderr)

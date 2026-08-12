@@ -1,17 +1,27 @@
-/// PP-DocLayout-V3 layout detection model.
+#[cfg(feature = "layout-detection")]
+/// PP-DocLayout-V3 layout detection model. ORT-only: engine-neutral on the seam, but a
+/// tract 0.23.4 `LayerNormalization` op-translation bug leaves it unrunnable under tract
+/// (see `docs-site/src/content/docs/concepts/tract-inference.md`), so it is gated out of `layout-tract` builds.
 pub mod pp_doclayout_v3;
-/// RT-DETR v2 layout detection model.
+/// RT-DETR v2 layout detection model. Engine-neutral (runs on the `crate::inference`
+/// seam) — available under both `layout-detection` (ORT) and `layout-tract` (tract).
 pub mod rtdetr;
-#[cfg(feature = "pdf")]
-/// SLANeXT table structure recognition model.
+#[cfg(all(feature = "layout-detection", feature = "pdf"))]
+/// SLANeXT table structure recognition model. ORT-only (bare `ort::Session`; tract's
+/// `Loop` op is unimplemented).
 pub mod slanet;
 #[cfg(feature = "pdf")]
-/// Binary classifier for distinguishing wired vs wireless tables.
+/// Binary classifier for distinguishing wired vs wireless tables. Engine-neutral (runs
+/// on the `crate::inference` seam) — available under both `layout-detection` (ORT) and
+/// `layout-tract` (tract).
 pub mod table_classifier;
-#[cfg(feature = "pdf")]
-/// Table Transformer (TATR) table structure recognition model.
+#[cfg(all(feature = "layout-detection", feature = "pdf"))]
+/// Table Transformer (TATR) table structure recognition model. ORT-only (bare
+/// `ort::Session`; quantized export tract cannot unify — see `docs-site/src/content/docs/concepts/tract-inference.md`).
 pub mod tatr;
-/// YOLO-based layout detection models (DocLayNet, DocStructBench, YOLOX variants).
+#[cfg(feature = "layout-detection")]
+/// YOLO-based layout detection models (DocLayNet, DocStructBench, YOLOX variants). ORT-only
+/// (bare `ort::Session`).
 pub mod yolo;
 
 use image::RgbImage;

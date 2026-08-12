@@ -50,6 +50,64 @@ impl ExtractionMethod {
     }
 }
 
+/// Cheap structural counts for an extracted document.
+///
+/// Populated on every [`ExtractedDocument`] returned by `extract` /
+/// `extract_batch`, regardless of whether the heavy `pages` / `images`
+/// collections are materialized. A caller that only needs "how many pages /
+/// tables / images did this document have?" (reporting, cost estimation,
+/// progress, quotas) can read these without enabling per-page or per-image
+/// extraction.
+///
+/// The page count comes from the parse (the extractor already walks the page
+/// tree); it does not require opting into per-page content. `pages` is `0` for
+/// inputs that are not page-addressable (e.g. plain text).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+pub struct DocumentCounts {
+    /// Total pages in the source document (`0` when not page-addressable).
+    pub pages: usize,
+    /// Tables detected in the document.
+    pub tables: usize,
+    /// Images detected in the document.
+    pub images: usize,
+}
+
+/// Structured per-language detection result: confidence, document share, and script —
+/// the information the ISO-code-only `detected_languages` list cannot convey (#261).
+///
+/// Populated by [`crate::language_detection`] alongside `detected_languages`, with one
+/// entry per language, in the same order as `detected_languages`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+pub struct LanguageConfidence {
+    /// ISO 639-3 language code, matching the corresponding entry in `detected_languages`.
+    pub language: String,
+    /// Confidence for this language, in `[0.0, 1.0]`.
+    ///
+    /// In single-language mode this is whatlang's `Info::confidence()` for the whole
+    /// document. In multi-language mode this is the average whatlang confidence across
+    /// the document's 200-character chunks that were classified as this language.
+    pub confidence: f64,
+    /// Share of the document's analyzed content classified as this language, in `[0.0, 1.0]`.
+    ///
+    /// In single-language mode this is always `1.0`. In multi-language mode this is the
+    /// fraction of 200-character chunks classified as this language (chunks that did not
+    /// meet `min_confidence` for any language are excluded from the count but still count
+    /// toward the denominator).
+    pub proportion: f64,
+    /// Writing system whatlang detected for this language (e.g. `"Latin"`, `"Cyrillic"`).
+    pub script: String,
+    /// Whether this detection is considered reliable.
+    ///
+    /// In single-language mode this is whatlang's own `Info::is_reliable()` (confidence
+    /// above whatlang's internal 0.9 threshold). In multi-language mode this is the
+    /// chunk-averaged `confidence` above that same 0.9 threshold, since whatlang's
+    /// `is_reliable()` only applies to a single detection.
+    pub reliable: bool,
+}
+
 /// Document extracted by the core extraction pipeline.
 ///
 /// `extract` and `extract_batch` return an `ExtractionResult` envelope whose
@@ -74,9 +132,27 @@ pub struct ExtractedDocument {
     pub extraction_method: Option<ExtractionMethod>,
     /// Tables extracted from the document, each with structured cell data.
     pub tables: Vec<Table>,
+
+    /// Cheap structural counts (pages, tables, images).
+    ///
+    /// Always populated by the extraction pipeline, even when the `pages` /
+    /// `images` collections are `None`. See [`DocumentCounts`].
+    #[serde(default)]
+    pub counts: DocumentCounts,
+
     /// ISO 639-1 language codes detected in the document content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected_languages: Option<Vec<String>>,
+
+    /// Structured per-language detection results: confidence, document share, script,
+    /// and reliability, alongside the ISO-code-only `detected_languages` (#261).
+    ///
+    /// One entry per language in `detected_languages`, in the same order. `None` under
+    /// the same conditions as `detected_languages`: detection disabled, empty input
+    /// text, or no language met the configured `min_confidence`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub detected_language_confidences: Option<Vec<LanguageConfidence>>,
 
     /// Text chunks when chunking is enabled.
     ///
@@ -330,10 +406,20 @@ pub struct ExtractedDocument {
 
     /// Pre-rendered content in the requested output format.
     ///
-    /// Populated during `derive_extraction_result` before tree derivation consumes
-    /// element data. `apply_output_format` swaps this into `content` at the end
-    /// of the pipeline, after post-processors have operated on plain text.
+    /// Pipeline-internal scratch space, not a result field. `derive_extraction_result`
+    /// renders it before tree derivation consumes the element data, post-processors may
+    /// rewrite it alongside `content`, and `apply_output_format` then *moves* it into
+    /// `content` as the last pipeline step. Every document returned by `extract_bytes` /
+    /// `extract_file` — and every nested archive or email child — therefore carries
+    /// `None` here, with the rendering in `content`.
+    ///
+    /// It stays `pub` because it is part of the Rust plugin contract: a
+    /// `DocumentExtractor` may return it pre-rendered, and a post-processor that rewrites
+    /// `content` must rewrite this alongside it or the rendering is discarded as stale
+    /// (see `core::pipeline::discard_diverged_formatted_content`). It is hidden from the
+    /// language bindings, which only ever observe the post-pipeline document.
     #[serde(skip)]
+    #[cfg_attr(alef, alef(skip))]
     pub formatted_content: Option<String>,
 
     /// Structured hOCR document for the OCR+layout pipeline.
@@ -451,6 +537,12 @@ pub enum ChunkType {
     Formula,
     /// Code block or preformatted content.
     CodeBlock,
+    /// Function or method definition (tree-sitter structured code chunking).
+    Function,
+    /// Class, struct, interface, or trait definition (tree-sitter structured code chunking).
+    Class,
+    /// Module, namespace, or top-level file scope (tree-sitter structured code chunking).
+    Module,
     /// Embedded or referenced image content.
     Image,
     /// Organizational chart or hierarchy diagram.
@@ -486,6 +578,35 @@ pub struct Chunk {
     /// The dimensionality depends on the chosen embedding model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+
+    /// Optional sparse (SPLADE) learned embedding for this chunk.
+    ///
+    /// Only populated when sparse-embedding generation is configured for chunking.
+    /// `None` otherwise, including on builds without the `sparse-embeddings` feature.
+    ///
+    /// Uses the crate-root [`crate::SparseEmbedding`] alias rather than
+    /// `crate::sparse_embeddings::SparseEmbedding` directly: the `sparse_embeddings`
+    /// module itself only compiles under `sparse-embeddings`/`sparse-embedding-presets`,
+    /// while the crate-root alias is always defined (a field-compatible stub on builds
+    /// without either feature), so this field — and `Chunk` itself — compiles on every
+    /// feature combination, including the crate's default features.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub sparse_embedding: Option<crate::SparseEmbedding>,
+
+    /// Optional ColBERT-style multi-vector (late-interaction) embedding for this chunk.
+    ///
+    /// Only populated when late-interaction embedding generation is configured for
+    /// chunking. `None` otherwise, including on builds without the `late-interaction`
+    /// feature.
+    ///
+    /// Uses the crate-root [`crate::MultiVectorEmbedding`] alias for the same reason
+    /// `sparse_embedding` uses [`crate::SparseEmbedding`] — see that field's docs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub late_interaction: Option<crate::MultiVectorEmbedding>,
 
     /// Metadata about this chunk's position and properties.
     pub metadata: ChunkMetadata,
@@ -570,6 +691,53 @@ pub struct ChunkMetadata {
     /// Empty when image extraction is disabled or the chunk spans no pages with images.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub image_indices: Vec<u32>,
+
+    /// Ids of the [`DocumentNode`](super::document_structure::DocumentNode)s
+    /// this chunk was derived from.
+    ///
+    /// Joins a chunk back to the structured document tree via
+    /// [`DocumentNode::id`](super::document_structure::DocumentNode::id).
+    /// Empty until the node-to-rendered-offset mapping needed to compute the
+    /// intersection is implemented (tracked under #1294/#1295); this field is
+    /// the wire-format foundation for that follow-up.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub node_ids: Vec<String>,
+
+    /// Per-page bounding-box spans this chunk covers, for viewer highlighting (#1295).
+    ///
+    /// One entry per page the chunk overlaps, in page order — the first and last entries'
+    /// `page` fields equal [`first_page`](Self::first_page)/[`last_page`](Self::last_page).
+    /// Populated whenever page-boundary provenance is available (the same condition under
+    /// which `first_page`/`last_page` are populated); each entry's `bbox` is additionally
+    /// populated when the document's structured node tree ([`ExtractedDocument::document`]) is
+    /// available, as the union of that page's body-layer node bounding boxes found within this
+    /// chunk. Empty when page-boundary provenance is unavailable (mirrors `first_page`/
+    /// `last_page` being `None`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub page_spans: Vec<PageSpan>,
+
+    /// Multi-label classification result for this chunk.
+    ///
+    /// Populated by the chunk-classification post-processor when
+    /// [`ExtractionConfig::chunk_classification`](crate::core::config::ExtractionConfig::chunk_classification)
+    /// is set. A chunk may match zero, one, or many of the configured label
+    /// definitions. Empty when chunk classification was not configured.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub classifications: Vec<super::classification::ClassificationLabel>,
+}
+
+/// A single page covered by a chunk, with an optional bounding box on that page.
+///
+/// See [`ChunkMetadata::page_spans`] (#1295) for population semantics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+pub struct PageSpan {
+    /// Page number (1-indexed).
+    pub page: u32,
+
+    /// Bounding box on this page, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<BoundingBox>,
 }
 
 /// Heuristic classification of what an image likely depicts.
@@ -708,10 +876,6 @@ pub struct ExtractedImage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_base64: Option<String>,
 }
-
-// ============================================================================
-// Element-based Output Format Types (Unstructured-compatible)
-// ============================================================================
 
 /// Result-shape selection for extraction results.
 ///
@@ -873,6 +1037,7 @@ impl super::tables::Table {
                 x1: b.right as f64,
                 y1: b.bottom as f64,
             }),
+            ..Default::default()
         }
     }
 }
@@ -881,12 +1046,9 @@ impl super::tables::Table {
 mod tests {
     use super::*;
 
-    // ── ChunkMetadata backward-compat ────────────────────────────────────────
-
     #[test]
     fn chunk_metadata_omitting_heading_path_deserializes_to_empty_vec() {
         // heading_path has `#[serde(default)]` — stored JSON without the field
-        // must deserialize to an empty Vec, not an error.
         let json = r#"{
             "byte_start": 0,
             "byte_end": 42,
@@ -901,13 +1063,9 @@ mod tests {
         );
     }
 
-    // ── ExtractedDocument serde behavior ─────────────────────────────────────
-
     #[test]
     fn extraction_result_omitting_formulas_and_form_fields_defaults_to_empty() {
         // Both `formulas` and `form_fields` use `#[serde(default)]` and
-        // `skip_serializing_if = "Vec::is_empty"`.  Old JSON that lacks these
-        // fields must deserialize cleanly to empty Vecs.
         let json = r#"{
             "content": "hello",
             "mime_type": "text/plain",
@@ -919,6 +1077,149 @@ mod tests {
         assert!(
             result.form_fields.is_empty(),
             "omitted form_fields must default to empty vec"
+        );
+    }
+
+    #[test]
+    fn extraction_result_omitting_counts_defaults_to_zero() {
+        // `counts` uses `#[serde(default)]`; stored JSON predating the field must
+        let json = r#"{
+            "content": "hello",
+            "mime_type": "text/plain",
+            "metadata": {},
+            "tables": []
+        }"#;
+        let result: ExtractedDocument = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.counts,
+            DocumentCounts::default(),
+            "omitted counts must default to all-zero DocumentCounts"
+        );
+    }
+
+    #[test]
+    fn document_counts_round_trip() {
+        let counts = DocumentCounts {
+            pages: 7,
+            tables: 3,
+            images: 2,
+        };
+        let json = serde_json::to_string(&counts).unwrap();
+        let back: DocumentCounts = serde_json::from_str(&json).unwrap();
+        assert_eq!(counts, back);
+    }
+
+    fn empty_chunk_metadata() -> ChunkMetadata {
+        ChunkMetadata {
+            byte_start: 0,
+            byte_end: 10,
+            token_count: None,
+            chunk_index: 0,
+            total_chunks: 1,
+            first_page: None,
+            last_page: None,
+            heading_context: None,
+            heading_path: Vec::new(),
+            image_indices: Vec::new(),
+            node_ids: Vec::new(),
+            page_spans: Vec::new(),
+            classifications: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chunk_metadata_node_ids_omitted_when_empty() {
+        let meta = empty_chunk_metadata();
+        let json = serde_json::to_value(&meta).expect("serialize");
+        assert!(
+            json.get("node_ids").is_none(),
+            "empty node_ids must be omitted from the wire, got: {json:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_metadata_node_ids_present_when_set() {
+        let mut meta = empty_chunk_metadata();
+        meta.node_ids = vec![
+            crate::types::document_structure::NodeId::generate("paragraph", "a", Some(1), 0).to_string(),
+            crate::types::document_structure::NodeId::generate("paragraph", "b", Some(1), 1).to_string(),
+        ];
+        let json = serde_json::to_value(&meta).expect("serialize");
+        let ids = json
+            .get("node_ids")
+            .expect("node_ids present")
+            .as_array()
+            .expect("array");
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0].is_string(), "node ids must serialize as bare strings");
+
+        let back: ChunkMetadata = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.node_ids, meta.node_ids);
+    }
+
+    #[test]
+    fn chunk_metadata_omitting_node_ids_deserializes_to_empty_vec() {
+        let json = r#"{
+            "byte_start": 0,
+            "byte_end": 42,
+            "chunk_index": 0,
+            "total_chunks": 1
+        }"#;
+        let meta: ChunkMetadata = serde_json::from_str(json).unwrap();
+        assert!(meta.node_ids.is_empty(), "omitted node_ids must default to empty vec");
+    }
+
+    #[test]
+    fn chunk_metadata_page_spans_omitted_when_empty() {
+        let meta = empty_chunk_metadata();
+        let json = serde_json::to_value(&meta).expect("serialize");
+        assert!(
+            json.get("page_spans").is_none(),
+            "empty page_spans must be omitted from the wire, got: {json:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_metadata_page_spans_present_when_set() {
+        let mut meta = empty_chunk_metadata();
+        meta.page_spans = vec![
+            PageSpan {
+                page: 1,
+                bbox: Some(BoundingBox {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 100.0,
+                    y1: 200.0,
+                }),
+            },
+            PageSpan { page: 2, bbox: None },
+        ];
+        let json = serde_json::to_value(&meta).expect("serialize");
+        let spans = json
+            .get("page_spans")
+            .expect("page_spans present")
+            .as_array()
+            .expect("array");
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].get("bbox").is_some());
+        assert!(spans[1].get("bbox").is_none(), "None bbox must be omitted per-span");
+
+        let back: ChunkMetadata = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.page_spans, meta.page_spans);
+    }
+
+    #[test]
+    fn chunk_metadata_omitting_page_spans_deserializes_to_empty_vec() {
+        let json = r#"{
+            "byte_start": 0,
+            "byte_end": 42,
+            "chunk_index": 0,
+            "total_chunks": 1
+        }"#;
+        let meta: ChunkMetadata = serde_json::from_str(json).unwrap();
+        assert!(
+            meta.page_spans.is_empty(),
+            "omitted page_spans must default to empty vec"
         );
     }
 
@@ -945,7 +1246,6 @@ mod tests {
         };
 
         let json = serde_json::to_string(&result).unwrap();
-        // formulas must be present in JSON when non-empty
         assert!(json.contains("formulas"), "non-empty formulas must be serialized");
 
         let deserialized: ExtractedDocument = serde_json::from_str(&json).unwrap();
@@ -997,5 +1297,63 @@ mod tests {
         let bbox = deserialized.form_fields[0].bbox.unwrap();
         assert_eq!(bbox.x0, 72.0);
         assert_eq!(bbox.y1, 320.0);
+    }
+
+    fn empty_chunk(content: &str) -> Chunk {
+        Chunk {
+            content: content.to_string(),
+            chunk_type: ChunkType::default(),
+            embedding: None,
+            sparse_embedding: None,
+            late_interaction: None,
+            metadata: empty_chunk_metadata(),
+        }
+    }
+
+    #[test]
+    fn should_round_trip_exact_sparse_and_late_interaction_vectors_when_populated() {
+        let mut chunk = empty_chunk("hello world");
+        chunk.sparse_embedding = Some(crate::SparseEmbedding {
+            indices: vec![3, 7, 42],
+            values: vec![0.5, 0.25, 0.125],
+        });
+        chunk.late_interaction = Some(crate::MultiVectorEmbedding {
+            num_tokens: 2,
+            dim: 3,
+            data: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        });
+
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        let back: Chunk = serde_json::from_str(&json).expect("deserialize");
+
+        let sparse = back.sparse_embedding.expect("sparse_embedding must round-trip as Some");
+        assert_eq!(sparse.indices, vec![3, 7, 42]);
+        assert_eq!(sparse.values, vec![0.5, 0.25, 0.125]);
+
+        let late = back.late_interaction.expect("late_interaction must round-trip as Some");
+        assert_eq!(late.num_tokens, 2);
+        assert_eq!(late.dim, 3);
+        assert_eq!(late.data, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+    }
+
+    #[test]
+    fn should_omit_sparse_and_late_interaction_fields_when_not_configured() {
+        let chunk = empty_chunk("hello world");
+        assert!(chunk.sparse_embedding.is_none());
+        assert!(chunk.late_interaction.is_none());
+
+        let json = serde_json::to_value(&chunk).expect("serialize");
+        assert!(
+            json.get("sparse_embedding").is_none(),
+            "sparse_embedding must be omitted from the wire when None, got: {json:?}"
+        );
+        assert!(
+            json.get("late_interaction").is_none(),
+            "late_interaction must be omitted from the wire when None, got: {json:?}"
+        );
+
+        let back: Chunk = serde_json::from_value(json).expect("deserialize");
+        assert!(back.sparse_embedding.is_none());
+        assert!(back.late_interaction.is_none());
     }
 }

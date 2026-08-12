@@ -49,8 +49,8 @@ impl MultiModalData {
 // InferenceModel trait
 // ---------------------------------------------------------------------------
 
-/// Autoregressive inference interface shared by Hunyuan-OCR, DeepSeek-OCR,
-/// and PaddleOCR-VL.
+/// Autoregressive inference interface shared by DeepSeek-OCR and
+/// PaddleOCR-VL.
 ///
 /// Implementors hold their own KV cache and expose a two-phase forward pass:
 /// an initial pass that handles multimodal inputs, then a decode loop that
@@ -82,9 +82,9 @@ pub trait InferenceModel {
 
     /// Decode step with explicit position ids.
     ///
-    /// Unlocks the XD-RoPE plug-in path required by Hunyuan-OCR where the
-    /// first decoder layer receives custom 2-D position ids while subsequent
-    /// layers use the standard offset-based RoPE.
+    /// Unlocks a plug-in path where the first decoder layer receives custom
+    /// 2-D position ids while subsequent layers use the standard
+    /// offset-based RoPE.
     ///
     /// The default implementation ignores `position_ids` and delegates to
     /// [`forward_step`], so existing implementors remain source-compatible.

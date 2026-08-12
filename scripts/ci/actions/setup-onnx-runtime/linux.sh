@@ -63,13 +63,6 @@ dest="$GITHUB_WORKSPACE/$dest_dir"
 mkdir -p "$dest"
 cp -f "$ort_root/lib/"*.so* "$dest/"
 
-# `-L` lets the linker find libonnxruntime at build time. The bundled ORT .so
-# ships next to the .node file in the npm package, so add an `$ORIGIN` rpath:
-# the dynamic loader then resolves the ORT dependency relative to the directory
-# holding the .node binary at load time. `$ORIGIN` must reach the linker
-# literally — `-Wl,-rpath,\$ORIGIN` keeps the shell from expanding it here.
-# Without this the published binary has no matching RPATH/RUNPATH and fails
-# with ERR_DLOPEN_FAILED at require() time.
 rpath_flag="-C link-arg=-Wl,-rpath,\$ORIGIN"
 if [ -n "${RUSTFLAGS:-}" ]; then
   rustflags="$RUSTFLAGS -L $ort_root/lib $rpath_flag"

@@ -24,6 +24,7 @@
 //! Local opt-out (for laptop dev without network): set
 //! `XBERG_SKIP_LIVE_HF=1` to skip these tests.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(all(feature = "reranker", feature = "reranker-presets", feature = "tokio-runtime"))]
 
 use std::path::PathBuf;
@@ -39,10 +40,6 @@ struct FixtureSuite {
     query: String,
     documents: Vec<String>,
     expected_top_index: usize,
-    // Read from the JSON for future stronger assertions (currently only the
-    // top-rank is asserted; the bottom-rank check is deferred until Session 2
-    // when we add a stricter ranking metric). Keep deserialised so the fixture
-    // stays the source of truth.
     #[allow(dead_code)]
     expected_worst_index: usize,
 }
@@ -82,7 +79,6 @@ async fn run_preset_inference(preset_name: &str, suite: &FixtureSuite) -> xberg:
             name: preset_name.to_string(),
         },
         cache_dir: cache_dir(),
-        // Force conservative batch — some models OOM on default 32 with long docs.
         batch_size: 8,
         ..Default::default()
     };
@@ -122,7 +118,8 @@ async fn bge_reranker_base_english_top_ranks_first() {
     assert!(!suites.is_empty(), "must have English fixtures");
 
     let preset = get_reranker_preset("bge-reranker-base").expect("preset must exist");
-    assert_eq!(preset.model_repo, "BAAI/bge-reranker-base");
+    assert_eq!(preset.model_repo, "xberg-io/reranker-models");
+    assert_eq!(preset.model_file, "bge-reranker-base/model.onnx");
 
     for suite in suites {
         let results = run_preset_inference("bge-reranker-base", suite)
@@ -150,7 +147,8 @@ async fn jina_reranker_v1_turbo_en_english_top_ranks_first() {
     let suites = pick_suites(&fixture.suites, &["en"]);
 
     let preset = get_reranker_preset("jina-reranker-v1-turbo-en").expect("preset must exist");
-    assert_eq!(preset.model_repo, "jinaai/jina-reranker-v1-turbo-en");
+    assert_eq!(preset.model_repo, "xberg-io/reranker-models");
+    assert_eq!(preset.model_file, "jina-reranker-v1-turbo-en/model.onnx");
 
     for suite in suites {
         let results = run_preset_inference("jina-reranker-v1-turbo-en", suite)
@@ -168,30 +166,33 @@ async fn jina_reranker_v1_turbo_en_english_top_ranks_first() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn jina_reranker_v2_base_multilingual_top_ranks_first() {
+async fn ettin_reranker_150m_english_top_ranks_first() {
     if should_skip() {
         eprintln!("XBERG_SKIP_LIVE_HF=1, skipping");
         return;
     }
 
     let fixture = load_fixture();
-    let suites = pick_suites(&fixture.suites, &["en", "fr", "es", "de", "zh"]);
+    let suites = pick_suites(&fixture.suites, &["en"]);
+    assert!(!suites.is_empty(), "must have English fixtures");
 
-    let preset = get_reranker_preset("jina-reranker-v2-base-multilingual").expect("preset must exist");
-    assert_eq!(preset.model_repo, "jinaai/jina-reranker-v2-base-multilingual");
+    let preset = get_reranker_preset("ettin-reranker-150m").expect("preset must exist");
+    assert_eq!(preset.model_repo, "xberg-io/reranker-models");
+    assert_eq!(preset.model_file, "ettin-reranker-150m/model.onnx");
+    assert!(preset.additional_files.is_empty(), "ettin ships as a single model.onnx");
 
     for suite in suites {
-        let results = run_preset_inference("jina-reranker-v2-base-multilingual", suite)
+        let results = run_preset_inference("ettin-reranker-150m", suite)
             .await
-            .unwrap_or_else(|e| panic!("jina-v2-multilingual on {}: {e}", suite.id));
+            .unwrap_or_else(|e| panic!("ettin-reranker-150m on {}: {e}", suite.id));
 
-        assert_scores_in_unit_interval(&results, &format!("jina-v2-multilingual / {}", suite.id));
-        assert_top_is_expected(
-            &results,
-            suite.expected_top_index,
-            &suite.id,
-            "jina-reranker-v2-base-multilingual",
+        assert_eq!(
+            results.len(),
+            suite.documents.len(),
+            "result count must match input count"
         );
+        assert_scores_in_unit_interval(&results, &format!("ettin-reranker-150m / {}", suite.id));
+        assert_top_is_expected(&results, suite.expected_top_index, &suite.id, "ettin-reranker-150m");
     }
 }
 
@@ -210,12 +211,12 @@ async fn bge_reranker_v2_m3_loads_via_additional_files() {
     }
 
     let preset = get_reranker_preset("bge-reranker-v2-m3").expect("preset must exist");
-    assert_eq!(preset.model_repo, "rozgo/bge-reranker-v2-m3");
-    assert_eq!(preset.model_file, "model.onnx");
+    assert_eq!(preset.model_repo, "xberg-io/reranker-models");
+    assert_eq!(preset.model_file, "bge-reranker-v2-m3/model.onnx");
     assert_eq!(
         preset.additional_files,
-        vec!["model.onnx.data".to_string()],
-        "v2-m3 must declare its weight-blob sibling"
+        vec!["bge-reranker-v2-m3/model.onnx.data".to_string()],
+        "v2-m3 must declare its weight-blob sibling (full repo-relative path)"
     );
 
     let fixture = load_fixture();
@@ -279,6 +280,7 @@ async fn preset_and_custom_are_equivalent_for_same_repo() {
                 model_file: Some(preset.model_file.clone()),
                 additional_files: preset.additional_files.clone(),
                 max_length: Some(preset.max_length as i64),
+                head: xberg::core::config::reranker::RerankerHead::CrossEncoder,
             },
             cache_dir: cache_dir(),
             batch_size: 8,
@@ -297,6 +299,47 @@ async fn preset_and_custom_are_equivalent_for_same_repo() {
             "scores diverge: preset {p:?} vs custom {c:?}",
         );
     }
+}
+
+/// `qwen3-reranker-0.6b` is a generative reranker: a causal-LM yes/no head, not
+/// a BERT cross-encoder. This exercises the self-hosted custom ONNX export
+/// (`[batch, seq, vocab]` logits + `model.onnx.data` sibling), the last-real-token
+/// read under right-padding, and the tokenizer-driven yes/no id resolution — all
+/// the seams the synthetic unit tests can't cover. Scores are `P(yes)` in `[0, 1]`.
+#[tokio::test(flavor = "multi_thread")]
+async fn qwen3_reranker_generative_head_top_ranks_first() {
+    if should_skip() {
+        eprintln!("XBERG_SKIP_LIVE_HF=1, skipping");
+        return;
+    }
+
+    let preset = get_reranker_preset("qwen3-reranker-0.6b").expect("preset must exist");
+    assert_eq!(preset.model_repo, "xberg-io/reranker-models");
+    assert_eq!(preset.model_file, "qwen3-reranker-0.6b/model.onnx");
+    assert_eq!(
+        preset.additional_files,
+        vec!["qwen3-reranker-0.6b/model.onnx.data".to_string()],
+        "qwen3 must declare its weight-blob sibling (full repo-relative path)"
+    );
+
+    let fixture = load_fixture();
+    let suite = fixture
+        .suites
+        .iter()
+        .find(|s| s.id == "english_basic")
+        .expect("english_basic suite must exist");
+
+    let results = run_preset_inference("qwen3-reranker-0.6b", suite)
+        .await
+        .unwrap_or_else(|e| panic!("qwen3-reranker-0.6b download/inference failed: {e}"));
+
+    assert_eq!(
+        results.len(),
+        suite.documents.len(),
+        "result count must match input count"
+    );
+    assert_scores_in_unit_interval(&results, "qwen3-reranker-0.6b / english_basic");
+    assert_top_is_expected(&results, suite.expected_top_index, &suite.id, "qwen3-reranker-0.6b");
 }
 
 /// `top_k` truncates after sorting — verify the top result is still correct

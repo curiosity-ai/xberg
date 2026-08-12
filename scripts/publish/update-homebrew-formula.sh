@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Update Formula/xberg.rb in the homebrew-tap with the new tag's URL and
-# source-tarball SHA256. The bottle DSL is updated separately by the
-# `homebrew-merge-bottles@v1` action after bottles are built.
-#
-# Usage (env vars):
 #   TAG=v5.0.0-rc.2 VERSION=5.0.0-rc.2 \
-#   TAP_DIR=/path/to/homebrew-tap \
-#   ./update-homebrew-formula.sh
 
 tag="${TAG:?TAG is required (e.g. v5.0.0-rc.2)}"
 version="${VERSION:?VERSION is required (e.g. 5.0.0-rc.2)}"
@@ -22,26 +15,42 @@ formula="${tap_dir}/Formula/xberg.rb"
   exit 1
 }
 
-tarball_url="https://github.com/xberg-io/xberg/archive/${tag}.tar.gz"
+github_archive="https://github.com/xberg-io/xberg/archive/${tag}.tar.gz"
+
+# GitHub's auto-generated /archive/<tag>.tar.gz is NOT byte-stable over time: the
+# gzip stream can differ between requests for the same ref, so its sha256 changes.
+# Hashing it here (formula-update) and re-downloading it later (bottle build,
+# `brew install`) yields mismatched checksums and the bottle job fails with
+# "Formula reports different checksum". Pin the formula to a release asset whose
+# exact bytes we own instead: download the archive once, publish it as a stable
+# release asset, and point the formula url/sha at that asset. ~keep
+asset_name="xberg-${version}.tar.gz"
+tarball_url="https://github.com/xberg-io/xberg/releases/download/${tag}/${asset_name}"
 
 echo "Updating Homebrew formula for xberg ${version} (tag ${tag})"
 
 if [[ "$dry_run" == "true" ]]; then
   echo "[dry-run] target formula: $formula"
-  echo "[dry-run] would set url to: $tarball_url"
-  echo "[dry-run] would compute sha256 of source tarball and rewrite the formula"
-  echo "[dry-run] would leave bottle DSL untouched (handled by homebrew-merge-bottles)"
+  echo "[dry-run] would download $github_archive once"
+  echo "[dry-run] would upload it as release asset $asset_name on $tag"
+  echo "[dry-run] would set url to: $tarball_url and pin its sha256"
+  echo "[dry-run] would drop the stale bottle DSL block (homebrew-merge-bottles re-adds a fresh one)"
   exit 0
 fi
 
-echo "Fetching source tarball SHA256 for ${tag}..."
-sha256=$(curl -fsSL "$tarball_url" | shasum -a 256 | awk '{print $1}')
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+
+echo "Fetching source tarball from ${github_archive}..."
+curl -fsSL "$github_archive" -o "${workdir}/${asset_name}"
+sha256=$(shasum -a 256 "${workdir}/${asset_name}" | awk '{print $1}')
+
+echo "Publishing stable source tarball as release asset ${asset_name}..."
+gh release upload "$tag" "${workdir}/${asset_name}" --repo xberg-io/xberg --clobber
+
 echo "  url:    $tarball_url"
 echo "  sha256: $sha256"
 
-# Update the top-level url + sha256 lines (the ones outside `bottle do ... end`).
-# Match `url "..."` on one line, `sha256 "..."` on the next, only when both come
-# before the `bottle do` block.
 python3 - "$formula" "$tarball_url" "$sha256" <<'PY'
 import re
 import sys
@@ -49,12 +58,17 @@ import sys
 formula_path, new_url, new_sha = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(formula_path).read()
 
-# Split off the bottle block so the regex only touches the formula header.
-bottle_start = text.find("bottle do")
-if bottle_start == -1:
-    head, tail = text, ""
-else:
-    head, tail = text[:bottle_start], text[bottle_start:]
+# Drop any existing `bottle do ... end` block. It describes bottles built for
+# the PREVIOUS version; carrying it forward while we bump url/version to a new
+# release makes Homebrew fetch `xberg-<newversion>.<tag>.bottle.tar.gz` from a
+# stale `root_url`, which 404s (issue #1247). homebrew-merge-bottles re-inserts
+# a fresh, correct block (root_url = current tag) once this release's bottles are
+# actually built; if that job is skipped, the formula simply has no bottle block
+# and Homebrew builds from source instead of hitting a dead download.
+head = re.sub(
+    r"^[ \t]*bottle do\b.*?^[ \t]*end(?:\n|\Z)", "", text, flags=re.MULTILINE | re.DOTALL
+)
+head = re.sub(r"\n{3,}", "\n\n", head)
 
 head = re.sub(r'^(\s*url\s+)"[^"]*"', rf'\1"{new_url}"', head, count=1, flags=re.MULTILINE)
 head = re.sub(r'^(\s*sha256\s+)"[^"]*"', rf'\1"{new_sha}"', head, count=1, flags=re.MULTILINE)
@@ -71,7 +85,7 @@ for dep in required_deps:
         )
 
 with open(formula_path, "w") as f:
-    f.write(head + tail)
+    f.write(head)
 PY
 
 echo "Updated $formula"

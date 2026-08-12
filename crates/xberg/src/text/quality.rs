@@ -15,7 +15,6 @@ const STRUCTURE_BONUS_WEIGHT: f64 = 0.2;
 const METADATA_BONUS_WEIGHT: f64 = 0.1;
 
 const MIN_TEXT_LENGTH: usize = 10;
-const LARGE_TEXT_LENGTH: usize = 1000;
 const MIN_SENTENCE_WORDS: f64 = 10.0;
 const MAX_SENTENCE_WORDS: f64 = 30.0;
 const MIN_PARAGRAPH_WORDS: f64 = 50.0;
@@ -48,10 +47,6 @@ static JS_FUNCTION_PATTERN: Lazy<Regex> = Lazy::new(|| {
 static CSS_RULES_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\.[a-zA-Z][\w-]*\s*\{[^}]*\}").expect("CSS rules regex pattern is valid and should compile")
 });
-// SCRIPT_TAG_PATTERN and STYLE_TAG_PATTERN are replaced by the `count_tag_bytes` memmem scanner
-// below. The `(?is).*?` pattern over large inputs triggers the regex_automata BoundedBacktracker,
-// causing heap spikes (observed ~1.6 MiB combined in staging heap profiles). The scanner is O(n)
-// with zero regex allocation.
 
 static NAV_WORDS_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(?:Skip to main content|Back to top|Main navigation|Site navigation)\b")
@@ -89,7 +84,6 @@ fn sum_match_lengths(text: &str, pattern: &Regex) -> usize {
 /// patterns trigger the `regex_automata` `BoundedBacktracker` on large inputs, causing
 /// multi-MiB transient allocations (observed in staging heap profiles at ~1.6 MiB combined).
 fn count_tag_bytes(text: &str, open_needle: &[u8], close_needle: &[u8]) -> usize {
-    // Lowercase once — ASCII tags only, so byte length is preserved.
     let lower = text.to_ascii_lowercase();
     let bytes = lower.as_bytes();
 
@@ -105,10 +99,8 @@ fn count_tag_bytes(text: &str, open_needle: &[u8], close_needle: &[u8]) -> usize
         };
         let open_start = pos + open_start;
 
-        // Find the end of the opening tag (the `>`).
         let tag_body_start = match bytes[open_start..].iter().position(|&b| b == b'>') {
             Some(rel) => open_start + rel + 1,
-            // Unclosed opening tag — nothing more to match.
             None => break,
         };
 
@@ -145,22 +137,22 @@ pub fn calculate_quality_score(text: &str, metadata: Option<&AHashMap<Cow<'stati
         return 0.1;
     }
 
+    // Every penalty/bonus applies regardless of `text.len()`. This used to
+    // short-circuit script and navigation penalties for texts at or below
+    // `LARGE_TEXT_LENGTH`, so a short HTML-derived fragment full of nav chrome
+    // (breadcrumbs, "Skip to main content", pagination) scored as clean prose
+    // purely because it was short (#267). ~keep
     let mut score = 1.0;
 
-    if text.len() > LARGE_TEXT_LENGTH {
-        let ocr_penalty = calculate_ocr_penalty(text, total_chars);
-        let script_penalty = calculate_script_penalty(text, total_chars);
-        let nav_penalty = calculate_navigation_penalty(text, total_chars);
-        let structure_bonus = calculate_structure_bonus(text);
+    let ocr_penalty = calculate_ocr_penalty(text, total_chars);
+    let script_penalty = calculate_script_penalty(text, total_chars);
+    let nav_penalty = calculate_navigation_penalty(text, total_chars);
+    let structure_bonus = calculate_structure_bonus(text);
 
-        score -= ocr_penalty * OCR_PENALTY_WEIGHT;
-        score -= script_penalty * SCRIPT_PENALTY_WEIGHT;
-        score -= nav_penalty * NAV_PENALTY_WEIGHT;
-        score += structure_bonus * STRUCTURE_BONUS_WEIGHT;
-    } else {
-        score -= calculate_ocr_penalty(text, total_chars) * OCR_PENALTY_WEIGHT;
-        score += calculate_structure_bonus(text) * STRUCTURE_BONUS_WEIGHT;
-    }
+    score -= ocr_penalty * OCR_PENALTY_WEIGHT;
+    score -= script_penalty * SCRIPT_PENALTY_WEIGHT;
+    score -= nav_penalty * NAV_PENALTY_WEIGHT;
+    score += structure_bonus * STRUCTURE_BONUS_WEIGHT;
 
     if let Some(metadata) = metadata {
         score += calculate_metadata_bonus(metadata) * METADATA_BONUS_WEIGHT;
@@ -221,26 +213,18 @@ fn calculate_script_penalty(text: &str, total_chars: f64) -> f64 {
         return 0.0;
     }
 
-    // Fast early-exit using case-insensitive literal scan on a lowercased view.
-    // Avoids allocating the lowercase copy in the common case where no script noise is present.
     let bytes = text.as_bytes();
     if memmem::find(bytes, b"function").is_none()
         && memmem::find(bytes, b"<script").is_none()
         && memmem::find(bytes, b"<style").is_none()
+        && memmem::find(bytes, b"FUNCTION").is_none()
+        && memmem::find(bytes, b"<SCRIPT").is_none()
+        && memmem::find(bytes, b"<STYLE").is_none()
     {
-        // None of the lowercase forms are present.  Check uppercase to avoid false negatives on
-        // ALL-CAPS inputs, then give up if neither is found.
-        if memmem::find(bytes, b"FUNCTION").is_none()
-            && memmem::find(bytes, b"<SCRIPT").is_none()
-            && memmem::find(bytes, b"<STYLE").is_none()
-        {
-            return 0.0;
-        }
+        return 0.0;
     }
 
-    // Truncate for the brace-bounded regex patterns — heuristic noise detection only.
     let truncated = if text.len() > JS_CSS_PATTERN_INPUT_CAP {
-        // Find a valid UTF-8 boundary at or before the cap.
         let mut end = JS_CSS_PATTERN_INPUT_CAP;
         while !text.is_char_boundary(end) {
             end -= 1;
@@ -250,11 +234,6 @@ fn calculate_script_penalty(text: &str, total_chars: f64) -> f64 {
         text
     };
 
-    // Asymmetric input lengths are deliberate: JS_FUNCTION/CSS_RULES use the
-    // truncated 64 KiB slice (their backtracker buffers scale with input length
-    // and the patterns are noise heuristics, so JS leakage past 64 KiB is
-    // acceptably under-counted). `count_tag_bytes` walks the full `text` because
-    // its memmem scanner is linear in input length and cheap regardless of size.
     let script_chars = sum_match_lengths(truncated, &JS_FUNCTION_PATTERN)
         + sum_match_lengths(truncated, &CSS_RULES_PATTERN)
         + count_tag_bytes(text, b"<script", b"</script>")
@@ -546,7 +525,45 @@ mod tests {
     #[test]
     fn test_quality_constants() {
         assert_eq!(MIN_TEXT_LENGTH, 10);
-        assert_eq!(LARGE_TEXT_LENGTH, 1000);
         assert_eq!(OCR_PENALTY_WEIGHT, 0.3);
+    }
+
+    #[test]
+    fn should_apply_navigation_penalty_to_short_text() {
+        // Below the removed `LARGE_TEXT_LENGTH` threshold, navigation chrome
+        // used to be scored as if it were clean prose (#267). This text is
+        // short (well under 1000 bytes) and dominated by nav chrome, so the
+        // navigation penalty must pull the score down from the neutral 1.0
+        // baseline instead of leaving it unpenalized.
+        let text = "Skip to main content. Back to top. Home > Products > Widgets. Page 1 of 12.";
+        assert!(text.len() < 1000, "fixture must exercise the short-text path");
+
+        let score = calculate_quality_score(text, None);
+        let nav_penalty = calculate_navigation_penalty(text, text.len() as f64);
+
+        assert!(
+            nav_penalty > 0.0,
+            "fixture must actually trigger the navigation pattern"
+        );
+        assert!(
+            score < 1.0,
+            "navigation-heavy short text must be penalized, got score {score}"
+        );
+    }
+
+    #[test]
+    fn should_apply_script_penalty_to_short_text() {
+        // Same defect as above but for the script/style penalty (#267).
+        let text = "function init() { doStuff(); } Welcome to our site!";
+        assert!(text.len() < 1000, "fixture must exercise the short-text path");
+
+        let score = calculate_quality_score(text, None);
+        let script_penalty = calculate_script_penalty(text, text.len() as f64);
+
+        assert!(script_penalty > 0.0, "fixture must actually trigger the script pattern");
+        assert!(
+            score < 1.0,
+            "script-heavy short text must be penalized, got score {score}"
+        );
     }
 }

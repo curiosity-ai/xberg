@@ -1,12 +1,19 @@
 //! Render an `InternalDocument` to plain text.
 //!
 //! Emits text only, with no formatting. Double newlines separate blocks.
-//! Annotations are stripped. Tables are rendered as space-separated columns.
+//! Inline text annotations (bold/italic/links) are stripped. Tables are
+//! rendered as space-separated columns. Document-level PDF annotations
+//! (issue #63), when present, are appended as a trailing "Annotations:"
+//! section.
 
+use crate::types::annotations::PdfAnnotation;
 use crate::types::document_structure::ContentLayer;
 use crate::types::internal::{ElementKind, InternalDocument};
 
-use super::common::{get_admonition_kind, get_admonition_title, parse_metadata_entries, render_table_plain};
+use super::common::{
+    annotation_display_text, annotation_type_label, get_admonition_kind, get_admonition_title, parse_metadata_entries,
+    render_table_plain,
+};
 
 /// Render an `InternalDocument` to plain text.
 pub(crate) fn render_plain(doc: &InternalDocument) -> String {
@@ -14,12 +21,10 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
     let mut last_heading_depth: Option<u16> = None;
 
     for elem in &doc.elements {
-        // Only render body-layer elements in main pass
         if elem.layer != ContentLayer::Body {
             continue;
         }
 
-        // Skip container markers
         if elem.kind.is_container_start() || elem.kind.is_container_end() {
             continue;
         }
@@ -27,22 +32,18 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
         match elem.kind {
             ElementKind::Title | ElementKind::Heading { .. } | ElementKind::Paragraph => {
                 if !elem.text.is_empty() {
-                    // Insert blank line between XML element siblings at depth 0 and depth 1
                     if matches!(elem.kind, ElementKind::Heading { .. }) {
-                        if let Some(last_depth) = last_heading_depth {
-                            // Only insert blank lines between siblings at the same depth, depth 0 or 1
-                            if (last_depth == 0 || last_depth == 1)
-                                && last_depth == elem.depth
-                                && !out.is_empty()
-                                && !out.ends_with("\n\n")
-                            {
-                                out.push('\n');
-                            }
+                        if let Some(last_depth) = last_heading_depth
+                            && (last_depth == 0 || last_depth == 1)
+                            && last_depth == elem.depth
+                            && !out.is_empty()
+                            && !out.ends_with("\n\n")
+                        {
+                            out.push('\n');
                         }
                         last_heading_depth = Some(elem.depth);
                     }
 
-                    // Paragraphs and headings with depth > 0 get depth-based indentation; titles/headings at depth 0 are flush-left.
                     if matches!(elem.kind, ElementKind::Paragraph)
                         || (matches!(elem.kind, ElementKind::Heading { .. }) && elem.depth > 0)
                     {
@@ -50,10 +51,8 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
                         out.push_str(&indent);
                     }
 
-                    // Format heading with attributes if present
                     if let (true, Some(attrs)) = (matches!(elem.kind, ElementKind::Heading { .. }), &elem.attributes) {
                         out.push_str(&elem.text);
-                        // Filter out xmlns attributes and format remaining ones, sorted for deterministic output
                         let mut filtered_attrs: Vec<_> = attrs
                             .iter()
                             .filter(|(k, v)| !k.starts_with("xmlns") && !v.is_empty())
@@ -70,7 +69,6 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
                         out.push_str(&elem.text);
                     }
 
-                    // Headings (XML elements) use single newlines; paragraphs/titles use double
                     if matches!(elem.kind, ElementKind::Heading { .. }) {
                         out.push('\n');
                     } else {
@@ -95,10 +93,11 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
             }
             ElementKind::Table { table_index } => {
                 if let Some(table) = doc.tables.get(table_index as usize) {
-                    let table_str = if !table.cells.is_empty() {
+                    let table_str = if !elem.text.is_empty() {
+                        elem.text.clone()
+                    } else if !table.cells.is_empty() {
                         render_table_plain(&table.cells)
                     } else {
-                        // TATR produces markdown directly without populating cells.
                         table.markdown.clone()
                     };
                     if !table_str.trim().is_empty() {
@@ -117,8 +116,8 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
                         out.push_str("]\n\n");
                     }
 
-                    // If the image has an OCR result, append its content
-                    if let Some(ocr_result) = &img.ocr_result
+                    if elem.should_render_image_ocr()
+                        && let Some(ocr_result) = &img.ocr_result
                         && !ocr_result.content.is_empty()
                     {
                         out.push_str(&ocr_result.content);
@@ -126,14 +125,11 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
                     }
                 }
             }
-            ElementKind::FootnoteRef => {
-                // Skip in plain text
-            }
-            ElementKind::FootnoteDefinition => {
-                // Skip in body pass; footnotes rendered at end
-            }
+            ElementKind::FootnoteRef => {}
+            ElementKind::FootnoteDefinition => {}
+            ElementKind::CommentRef => {}
+            ElementKind::CommentDefinition => {}
             ElementKind::Citation => {
-                // Render just the text
                 if !elem.text.is_empty() {
                     out.push_str(&elem.text);
                     out.push_str("\n\n");
@@ -200,7 +196,6 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
                     out.push_str("\n\n");
                 }
             }
-            // Container markers handled above
             ElementKind::ListStart { .. }
             | ElementKind::ListEnd
             | ElementKind::QuoteStart
@@ -210,7 +205,6 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
         }
     }
 
-    // Footnotes at end
     let has_footnotes = doc
         .elements
         .iter()
@@ -225,9 +219,65 @@ pub(crate) fn render_plain(doc: &InternalDocument) -> String {
         }
     }
 
-    // Plain text content string: trim trailing whitespace, no trailing newline
-    // (matches derive_content_string behavior — post-processors expect this)
+    // Comment definitions (#300) are furniture, not body flow, just like footnote
+    // definitions — surface them the same way so the comment body is not silently
+    // dropped now that it no longer shares `ElementKind::FootnoteDefinition`.
+    let has_comments = doc
+        .elements
+        .iter()
+        .any(|e| e.kind == ElementKind::CommentDefinition && e.layer == ContentLayer::Footnote);
+    if has_comments {
+        out.push('\n');
+        for elem in &doc.elements {
+            if elem.kind == ElementKind::CommentDefinition && elem.layer == ContentLayer::Footnote {
+                out.push_str(&elem.text);
+                out.push_str("\n\n");
+            }
+        }
+    }
+
+    if let Some(annotations) = doc.annotations.as_deref() {
+        let block = render_annotations_plain(annotations);
+        if !block.is_empty() {
+            if !out.trim_end().is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&block);
+        }
+    }
+
     out.truncate(out.trim_end().len());
+    out
+}
+
+/// Render the document-level PDF annotations (issue #63) as a plain-text
+/// section: an "Annotations:" header followed by one line per annotation.
+///
+/// Returns an empty string when `annotations` is empty.
+fn render_annotations_plain(annotations: &[PdfAnnotation]) -> String {
+    if annotations.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("Annotations:\n");
+    for annotation in annotations {
+        out.push_str(annotation_type_label(annotation.annotation_type));
+        out.push_str(" (page ");
+        out.push_str(&annotation.page_number.to_string());
+        out.push(')');
+
+        if let Some(author) = annotation.author.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(" by ");
+            out.push_str(author);
+        }
+
+        if let Some(text) = annotation_display_text(annotation) {
+            out.push_str(": ");
+            out.push_str(text);
+        }
+
+        out.push('\n');
+    }
     out
 }
 
@@ -236,10 +286,6 @@ mod tests {
     use super::*;
     use crate::types::document_structure::ContentLayer;
     use crate::types::internal_builder::InternalDocumentBuilder;
-
-    // ========================================================================
-    // 1. Element rendering tests
-    // ========================================================================
 
     #[test]
     fn test_render_plain_title() {
@@ -256,9 +302,6 @@ mod tests {
         b.push_heading(2, "Section", None, None);
         let doc = b.build();
         let out = render_plain(&doc);
-        // Headings at depth>0 receive depth-based indentation so XML/OPML/markdown
-        // hierarchies render with visible nesting in plain output. A standalone
-        // level-2 heading lands at depth 1 (one indent step).
         assert_eq!(out, "  Section");
     }
 
@@ -293,7 +336,6 @@ mod tests {
         b.end_list();
         let doc = b.build();
         let out = render_plain(&doc);
-        // Plain text just outputs the text, no numbering
         assert!(out.contains("First"), "got: {}", out);
         assert!(out.contains("Second"), "got: {}", out);
     }
@@ -328,6 +370,21 @@ mod tests {
         let out = render_plain(&doc);
         assert!(out.contains("Name Age"), "got: {}", out);
         assert!(out.contains("Alice 30"), "got: {}", out);
+    }
+
+    #[test]
+    fn should_use_explicit_plain_text_for_table_when_present() {
+        let mut builder = InternalDocumentBuilder::new("test");
+        let cells = vec![
+            vec!["Name".to_string(), "Age".to_string()],
+            vec!["Alice".to_string(), "30".to_string()],
+        ];
+        let table_index = builder.push_table_from_cells(&cells, None, None);
+        builder.set_text(table_index, "Name: Alice\nAge: 30");
+
+        let output = render_plain(&builder.build());
+
+        assert_eq!(output, "Name: Alice\nAge: 30");
     }
 
     #[test]
@@ -437,10 +494,6 @@ mod tests {
         assert_eq!(out, "");
     }
 
-    // ========================================================================
-    // 2. Plain text has no annotations (stripped)
-    // ========================================================================
-
     #[test]
     fn test_render_plain_strips_annotations() {
         use crate::types::document_structure::{AnnotationKind, TextAnnotation};
@@ -453,13 +506,8 @@ mod tests {
         b.push_paragraph("Hello world", ann, None, None);
         let doc = b.build();
         let out = render_plain(&doc);
-        // No formatting markers, just raw text
         assert_eq!(out, "Hello world");
     }
-
-    // ========================================================================
-    // 3. Nested structure tests (containers skipped in plain)
-    // ========================================================================
 
     #[test]
     fn test_render_plain_blockquote_content() {
@@ -469,7 +517,6 @@ mod tests {
         b.push_quote_end();
         let doc = b.build();
         let out = render_plain(&doc);
-        // Plain text just outputs the content, no quote markers
         assert!(out.contains("Quoted text."), "got: {}", out);
     }
 
@@ -488,10 +535,6 @@ mod tests {
         assert!(out.contains("Inner"), "got: {}", out);
     }
 
-    // ========================================================================
-    // 4. Footnote tests
-    // ========================================================================
-
     #[test]
     fn test_render_plain_footnote_definitions_at_end() {
         let mut b = InternalDocumentBuilder::new("test");
@@ -501,7 +544,6 @@ mod tests {
         b.set_layer(def, ContentLayer::Footnote);
         let doc = b.build();
         let out = render_plain(&doc);
-        // Footnote refs are skipped in plain text, but definitions appear at end
         assert!(out.contains("Main text"), "got: {}", out);
         assert!(out.contains("A note."), "got: {}", out);
     }

@@ -4,16 +4,19 @@
 //! - Plain text output respects reading-order reordering when enabled
 //! - Markdown output respects reading-order reordering when enabled
 //!
-//! Run plain-text test (no model download):
-//! ```
-//! cargo test -p xberg --test reading_order plain_text
-//! ```
+//! Both tests are `#[ignore]`d because they instantiate the layout engine, which
+//! downloads the RT-DETR layout ONNX weights from Hugging Face Hub on first use
+//! (see `crates/xberg/src/layout/model_manager.rs`). Network + ~300MB of weights is
+//! not acceptable in the default `cargo test -p xberg --features full` leg that
+//! `scripts/ci/rust/run-unit-tests.sh` drives.
 //!
-//! Run with layout detection (downloads layout ONNX model, ~300MB):
-//! ```
-//! XBERG_RUN_LAYOUT_TESTS=1 cargo test -p xberg --features full --test reading_order -- --nocapture
+//! NOTHING CURRENTLY INVOKES THESE TESTS. To run them, a CI job (or a developer)
+//! must execute:
+//! ```text
+//! cargo test -p xberg --features full --test reading_order -- --ignored --nocapture
 //! ```
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(all(feature = "pdf", feature = "layout-detection", not(target_arch = "wasm32")))]
 
 mod helpers;
@@ -22,172 +25,90 @@ use helpers::extract_bytes_document_blocking;
 use std::path::PathBuf;
 use xberg::core::config::{ExtractionConfig, OutputFormat, PdfConfig};
 
-/// Helper: check if layout-detection tests are enabled via env var
-fn should_run_layout_tests() -> bool {
-    std::env::var("XBERG_RUN_LAYOUT_TESTS").is_ok()
-}
+/// The fixture is a multi-page, multi-column research paper (DocLayNet, arXiv 2206.01062).
+/// Producing less than this is a hard extraction failure, not a marginal difference.
+const MIN_EXPECTED_CONTENT_BYTES: usize = 1000;
 
-/// Helper: load the test document
+/// Load the multi-column test document.
+///
+/// Panics naming the absolute path when absent: `test_documents/` is bucket-fetched
+/// (`python3 test_documents/scripts/fetch_corpus.py`) and is not in a bare checkout.
+/// These tests are opt-in via `--ignored`, so a caller who asked for them deserves a
+/// hard, named failure rather than a silent skip.
 fn load_test_pdf() -> Vec<u8> {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/vendored/docling/pdf/2206.01062.pdf");
-    std::fs::read(path).expect("Failed to load test PDF 2206.01062.pdf")
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "missing fixture {}: {error}. Run `python3 test_documents/scripts/fetch_corpus.py`",
+            path.display()
+        )
+    })
 }
 
-/// Test: plain-text reading-order differs with vs without reordering
-///
-/// CONFIRMED: this should PASS, proving the text path works.
-#[test]
-#[cfg_attr(not(feature = "layout-detection"), ignore)]
-fn text_reading_order_changes_output() {
-    if !should_run_layout_tests() {
-        eprintln!("Skipping layout-detection test (set XBERG_RUN_LAYOUT_TESTS=1 to enable)");
-        return;
-    }
-
-    let content = load_test_pdf();
-
-    // Extract with reading_order = false (baseline)
-    let mut config_no_ro = ExtractionConfig {
-        output_format: OutputFormat::Plain,
+/// Build a layout-enabled config for the given output format and reading-order setting.
+fn layout_config(output_format: OutputFormat, reading_order: bool) -> ExtractionConfig {
+    ExtractionConfig {
+        output_format,
         pdf_options: Some(PdfConfig {
-            reading_order: false,
+            reading_order,
             ..Default::default()
         }),
+        layout: Some(Default::default()),
+        use_layout_for_markdown: true,
+        use_cache: false,
         ..Default::default()
-    };
-    config_no_ro.layout = Some(Default::default()); // Enable layout detection
-    config_no_ro.use_layout_for_markdown = true; // Needed for layout hints to be computed
-
-    eprintln!(
-        "Config no_ro: reading_order={}, layout={}, use_layout_for_markdown={}",
-        config_no_ro
-            .pdf_options
-            .as_ref()
-            .map(|p| p.reading_order)
-            .unwrap_or(false),
-        config_no_ro.layout.is_some(),
-        config_no_ro.use_layout_for_markdown
-    );
-
-    let result_no_ro = extract_bytes_document_blocking(&content, "application/pdf", &config_no_ro)
-        .expect("Failed to extract with reading_order=false");
-
-    // Extract with reading_order = true
-    let mut config_with_ro = ExtractionConfig {
-        output_format: OutputFormat::Plain,
-        pdf_options: Some(PdfConfig {
-            reading_order: true,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    config_with_ro.layout = Some(Default::default()); // Enable layout detection
-    config_with_ro.use_layout_for_markdown = true; // Needed for layout hints to be computed
-
-    eprintln!(
-        "Config with_ro: reading_order={}, layout={}, use_layout_for_markdown={}",
-        config_with_ro
-            .pdf_options
-            .as_ref()
-            .map(|p| p.reading_order)
-            .unwrap_or(false),
-        config_with_ro.layout.is_some(),
-        config_with_ro.use_layout_for_markdown
-    );
-
-    let result_with_ro = extract_bytes_document_blocking(&content, "application/pdf", &config_with_ro)
-        .expect("Failed to extract with reading_order=true");
-
-    // Both should produce text
-    assert!(!result_no_ro.content.is_empty(), "No-RO extraction produced empty text");
-    assert!(
-        !result_with_ro.content.is_empty(),
-        "With-RO extraction produced empty text"
-    );
-
-    // Text outputs should differ (if they're identical, the feature is broken)
-    if result_no_ro.content == result_with_ro.content {
-        eprintln!("WARNING: text outputs are IDENTICAL with vs without reading_order");
-        eprintln!("This suggests reading_order is not being applied to the plain-text path.");
-        eprintln!("No-RO length: {}", result_no_ro.content.len());
-        eprintln!("With-RO length: {}", result_with_ro.content.len());
-        panic!("Text reading_order did not change output (feature may be broken)");
-    } else {
-        println!(
-            "✓ Text outputs differ ({} vs {} bytes)",
-            result_no_ro.content.len(),
-            result_with_ro.content.len()
-        );
     }
 }
 
-/// Test: markdown reading-order differs with vs without reordering
-///
-/// This test will FAIL before the fix, PASS after.
+/// Plain-text output must change when reading-order reconstruction is enabled.
 #[test]
-#[cfg_attr(not(feature = "layout-detection"), ignore)]
-fn markdown_reading_order_changes_output() {
-    if !should_run_layout_tests() {
-        eprintln!("Skipping layout-detection test (set XBERG_RUN_LAYOUT_TESTS=1 to enable)");
-        return;
-    }
+#[ignore = "downloads the RT-DETR layout ONNX weights from Hugging Face Hub; run with --ignored"]
+fn plain_text_output_differs_when_reading_order_is_enabled() {
+    assert_reading_order_changes_output(OutputFormat::Plain, "plain text");
+}
 
+/// Markdown output must change when reading-order reconstruction is enabled.
+///
+/// Regression guard: reading-order was once wired only to the plain-text path, so
+/// markdown came out identical with and without it.
+#[test]
+#[ignore = "downloads the RT-DETR layout ONNX weights from Hugging Face Hub; run with --ignored"]
+fn markdown_output_differs_when_reading_order_is_enabled() {
+    assert_reading_order_changes_output(OutputFormat::Markdown, "markdown");
+}
+
+/// Extract the fixture twice — reading-order off, then on — and assert the outputs differ.
+fn assert_reading_order_changes_output(output_format: OutputFormat, label: &str) {
     let content = load_test_pdf();
 
-    // Extract with reading_order = false (baseline)
-    let mut config_no_ro = ExtractionConfig {
-        output_format: OutputFormat::Markdown,
-        pdf_options: Some(PdfConfig {
-            reading_order: false,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    config_no_ro.layout = Some(Default::default()); // Enable layout detection
-    config_no_ro.use_layout_for_markdown = true; // Needed for layout hints to be computed
+    let without_reading_order = extract_bytes_document_blocking(
+        &content,
+        "application/pdf",
+        &layout_config(output_format.clone(), false),
+    )
+    .unwrap_or_else(|error| panic!("{label} extraction with reading_order=false failed: {error}"));
 
-    let result_no_ro = extract_bytes_document_blocking(&content, "application/pdf", &config_no_ro)
-        .expect("Failed to extract with reading_order=false");
+    let with_reading_order =
+        extract_bytes_document_blocking(&content, "application/pdf", &layout_config(output_format, true))
+            .unwrap_or_else(|error| panic!("{label} extraction with reading_order=true failed: {error}"));
 
-    // Extract with reading_order = true
-    let mut config_with_ro = ExtractionConfig {
-        output_format: OutputFormat::Markdown,
-        pdf_options: Some(PdfConfig {
-            reading_order: true,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    config_with_ro.layout = Some(Default::default()); // Enable layout detection
-    config_with_ro.use_layout_for_markdown = true; // Needed for layout hints to be computed
-
-    let result_with_ro = extract_bytes_document_blocking(&content, "application/pdf", &config_with_ro)
-        .expect("Failed to extract with reading_order=true");
-
-    // Both should produce markdown
     assert!(
-        !result_no_ro.content.is_empty(),
-        "No-RO markdown extraction produced empty text"
+        without_reading_order.content.len() >= MIN_EXPECTED_CONTENT_BYTES,
+        "{label} reading_order=false produced {} bytes, expected at least {MIN_EXPECTED_CONTENT_BYTES}",
+        without_reading_order.content.len()
     );
     assert!(
-        !result_with_ro.content.is_empty(),
-        "With-RO markdown extraction produced empty text"
+        with_reading_order.content.len() >= MIN_EXPECTED_CONTENT_BYTES,
+        "{label} reading_order=true produced {} bytes, expected at least {MIN_EXPECTED_CONTENT_BYTES}",
+        with_reading_order.content.len()
     );
 
-    // Markdown outputs should differ (if they're identical, the feature is broken)
-    if result_no_ro.content == result_with_ro.content {
-        eprintln!("WARNING: markdown outputs are IDENTICAL with vs without reading_order");
-        eprintln!("This confirms the bug: reading_order is not wired to the markdown path.");
-        eprintln!("No-RO length: {}", result_no_ro.content.len());
-        eprintln!("With-RO length: {}", result_with_ro.content.len());
-        // For now, report this as expected (the bug we're fixing)
-        panic!("Markdown reading_order did not change output (this is the bug we're fixing)");
-    } else {
-        println!(
-            "✓ Markdown outputs differ ({} vs {} bytes)",
-            result_no_ro.content.len(),
-            result_with_ro.content.len()
-        );
-    }
+    assert_ne!(
+        without_reading_order.content,
+        with_reading_order.content,
+        "{label} output is byte-identical with and without reading_order on a multi-column paper, \
+         so reading-order reconstruction is not reaching the {label} path ({} bytes both times)",
+        without_reading_order.content.len()
+    );
 }

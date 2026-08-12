@@ -35,8 +35,6 @@ mod tests {
 
     use super::*;
 
-    // ── Embedded registry ──────────────────────────────────────────────────
-
     #[test]
     fn load_embedded_succeeds_and_contains_generic_document() {
         let registry = Registry::load_embedded().expect("embedded presets must load");
@@ -68,8 +66,6 @@ mod tests {
         let summaries = registry.summaries();
         assert!(summaries.iter().any(|s| s.id == "generic_document"));
     }
-
-    // ── extend_from_dir ────────────────────────────────────────────────────
 
     #[test]
     fn extend_from_dir_loads_valid_preset() {
@@ -125,7 +121,6 @@ mod tests {
     #[test]
     fn extend_from_dir_rejects_schema_invalid_preset() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Valid JSON but missing required fields (no `schema`, no `system_prompt`).
         let invalid = serde_json::json!({
             "id": "bad_preset",
             "version": "v1",
@@ -148,8 +143,6 @@ mod tests {
             "expected LoadError::SchemaValidation, got: {err}"
         );
     }
-
-    // ── resolve ────────────────────────────────────────────────────────────
 
     #[test]
     fn resolve_generic_document_without_overrides() {

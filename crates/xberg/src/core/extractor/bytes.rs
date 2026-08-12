@@ -40,15 +40,17 @@ use super::file::extract_bytes_with_extractor;
 ///
 /// # Example
 ///
+/// This function is crate-internal; the public entry point that reaches it is
+/// [`crate::extract`] with a bytes input.
+///
 /// ```rust,no_run
-/// use xberg::core::extractor::extract_bytes;
-/// use xberg::core::config::ExtractionConfig;
+/// use xberg::{ExtractInput, ExtractionConfig, extract};
 ///
 /// # async fn example() -> xberg::Result<()> {
 /// let config = ExtractionConfig::default();
-/// let bytes = b"Hello, world!";
-/// let result = extract_bytes(bytes, "text/plain", &config).await?;
-/// println!("Content: {}", result.content);
+/// let input = ExtractInput::from_bytes(b"Hello, world!".to_vec(), "text/plain", None);
+/// let output = extract(input, &config).await?;
+/// println!("Content: {}", output.results[0].content);
 /// # Ok(())
 /// # }
 /// ```
@@ -78,16 +80,24 @@ pub(crate) async fn extract_bytes(
             });
         }
 
+        if matches!(
+            config.ocr_strategy,
+            crate::core::config::OcrStrategy::ScannedPages { .. }
+        ) && config.effective_disable_ocr()
+        {
+            return Err(crate::XbergError::Validation {
+                message: "ocr_strategy selects scanned pages for OCR, but disable_ocr is true".to_string(),
+                source: None,
+            });
+        }
+
         let validated_mime = if mime_type == "application/octet-stream" {
-            // When tree-sitter is configured, check if content is recognized source code.
-            // This allows octet-stream files with tree-sitter config to be detected as code.
             #[cfg(feature = "tree-sitter")]
             {
                 if config.tree_sitter.is_some() {
                     if let Ok(text) = std::str::from_utf8(content) {
                         let trimmed = text.trim_start();
                         if tree_sitter_language_pack::detect_language_from_content(trimmed).is_some() {
-                            // Recognize as source code when tree-sitter can detect a language.
                             mime::SOURCE_CODE_MIME_TYPE.to_string()
                         } else {
                             mime::detect_mime_type_from_bytes(content)?
@@ -108,8 +118,6 @@ pub(crate) async fn extract_bytes(
             mime::validate_mime_type(mime_type)?
         };
 
-        // Native DOC/PPT extractors are registered in the plugin registry.
-        // When the office feature is disabled, these MIME types are unsupported.
         #[cfg(not(feature = "office"))]
         match validated_mime.as_str() {
             LEGACY_WORD_MIME_TYPE => {
@@ -125,7 +133,6 @@ pub(crate) async fn extract_bytes(
             _ => {}
         }
 
-        // Suppress unused import warnings when office feature is enabled
         #[cfg(feature = "office")]
         {
             let _ = LEGACY_WORD_MIME_TYPE;
@@ -135,7 +142,11 @@ pub(crate) async fn extract_bytes(
         Box::pin(extract_bytes_with_extractor(content, &validated_mime, config)).await
     });
 
-    #[cfg(feature = "tokio-runtime")]
+    // without a JS/WASI shim), which aborts the whole module with an uncatchable
+    // `unreachable` trap. `tokio-runtime` can be enabled transitively on that target
+    // (e.g. by `layout-tract` inside `wasm-target`), so gating on the feature alone is
+    // not enough — explicitly exclude wasm32 here, matching `run_timed_extraction` in
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
     let result = if let Some(secs) = config.extraction_timeout_secs {
         let start = std::time::Instant::now();
         match tokio::time::timeout(std::time::Duration::from_secs(secs), extraction_future).await {
@@ -154,13 +165,17 @@ pub(crate) async fn extract_bytes(
         extraction_future.await
     };
 
-    #[cfg(not(feature = "tokio-runtime"))]
+    #[cfg(any(not(feature = "tokio-runtime"), target_arch = "wasm32"))]
     let result = {
+        // Without a usable tokio timer (no 'tokio-runtime' feature, or the WASM build,
+        // where `std::time::Instant::now()` panics) there is no timer to enforce a
+        // timeout, but the default ExtractionConfig sets extraction_timeout_secs, so
+        // erroring here would reject every default call. Ignore the unenforceable
+        // limit and run the extraction instead. ~keep
         if config.extraction_timeout_secs.is_some() {
-            return Err(crate::XbergError::Validation {
-                message: "extraction_timeout_secs requires the 'tokio-runtime' feature to be enabled".to_string(),
-                source: None,
-            });
+            tracing::debug!(
+                "extraction_timeout_secs is ignored on this target (no usable tokio timer); running without a timeout"
+            );
         }
         extraction_future.await
     };

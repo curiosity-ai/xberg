@@ -15,9 +15,9 @@
 use crate::Result;
 use crate::comparison::{Pipeline, PipelineResult};
 use crate::corpus::{self, CorpusDocument, CorpusFilter};
-use crate::markdown_quality::{MdBlockType, parse_markdown_blocks, score_structural_quality_normalized};
+use crate::quality::structural_sidecar::{self, StructuralNode, StructuralSidecar};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Which pipeline paths to include.
@@ -25,6 +25,8 @@ pub struct PipelineBenchmarkConfig {
     pub fixtures_dir: PathBuf,
     pub paths: Vec<Pipeline>,
     pub doc_filter: Vec<String>,
+    /// Exact fixture stems or fixture-root-relative JSON paths from a benchmark group/cohort. ~keep
+    pub exact_doc_filter: Vec<String>,
     pub dump_outputs: bool,
     pub json_output: Option<PathBuf>,
     pub sort_by: SortMetric,
@@ -59,7 +61,7 @@ impl SortMetric {
                 if pr.time_ms.is_nan() {
                     f64::NEG_INFINITY
                 } else {
-                    -pr.time_ms // negate so ascending sort = slowest first
+                    -pr.time_ms
                 }
             }
         }
@@ -79,6 +81,12 @@ pub struct PipelineDocResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineAggregate {
     pub pipeline: String,
+    /// Number of documents contributing to SF1 statistics.
+    #[serde(default)]
+    pub sf1_count: Option<usize>,
+    /// Number of documents contributing to TF1 statistics.
+    #[serde(default)]
+    pub tf1_count: Option<usize>,
     pub mean_sf1: f64,
     pub mean_tf1: f64,
     pub mean_time_ms: f64,
@@ -97,6 +105,22 @@ pub struct PipelineRunSummary {
     pub pipeline_count: usize,
     pub aggregates: Vec<PipelineAggregate>,
     pub docs: Vec<PipelineDocResult>,
+    #[serde(default)]
+    pub provenance: PipelineRunProvenance,
+}
+
+/// Inputs required to reproduce and audit a benchmark result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PipelineRunProvenance {
+    pub hash_algorithm: String,
+    pub git_dirty: bool,
+    pub git_diff_hash: Option<String>,
+    pub binary_hash: Option<String>,
+    pub scorer_hash: String,
+    pub corpus_hash: Option<String>,
+    pub config_hash: Option<String>,
+    pub features: Vec<String>,
+    pub argv: Vec<String>,
 }
 
 /// Default 6-path set.
@@ -131,42 +155,27 @@ async fn extract_and_score(
     fixtures_dir: &Path,
 ) -> PipelineResult {
     let (content_opt, time_ms) = crate::comparison::extract_pipeline(pipeline, doc, fixtures_dir).await;
+    let extraction_failed = content_opt.is_none();
     let content = content_opt.unwrap_or_default();
-    let (tf1, _basic_sf1, _basic_order, _basic_per_type) =
-        crate::comparison::score_document(&content, gt_text, gt_markdown);
+    let tf1 = if extraction_failed {
+        f64::NAN
+    } else {
+        crate::comparison::score_document(&content, gt_text, gt_markdown).0
+    };
 
-    // Use the pipeline benchmark's enhanced scoring: heading-level-normalized,
-    // with structure detection and content capping.
-    let (sf1, order_score, per_type_sf1) = match gt_markdown {
-        Some(md) => {
-            // Skip SF1 for documents without structural ground truth
-            // (all-Paragraph docs produce meaningless 0% scores)
-            let gt_blocks = parse_markdown_blocks(md);
-            let has_structure = gt_blocks
-                .iter()
-                .any(|b| !matches!(b.block_type, MdBlockType::Paragraph));
+    let structural = match (extraction_failed, gt_markdown) {
+        (false, Some(md)) => score_structural_markdown(&content, md),
+        _ => crate::comparison::StructuralBreakdown {
+            sf1: f64::NAN,
+            order_score: f64::NAN,
+            ..Default::default()
+        },
+    };
 
-            if !has_structure {
-                (f64::NAN, f64::NAN, HashMap::new())
-            } else {
-                // Cap content to 50K chars to prevent scoring from taking too long
-                let capped = if content.len() > 50_000 {
-                    // Find a valid UTF-8 boundary near 50K
-                    let mut end = 50_000;
-                    while end > 0 && !content.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    &content[..end]
-                } else {
-                    &content
-                };
-                // Use heading-level-normalized scoring (H1≡H2≡H3 etc.)
-                let sq = score_structural_quality_normalized(capped, md);
-                let per_type: HashMap<String, f64> = sq.per_type.iter().map(|(k, v)| (k.to_string(), v.f1)).collect();
-                (sq.structural_f1, sq.order_score, per_type)
-            }
-        }
-        None => (f64::NAN, f64::NAN, HashMap::new()),
+    let char_similarity = if extraction_failed {
+        f64::NAN
+    } else {
+        crate::quality::normalized_edit_similarity(&content, gt_text)
     };
 
     let ext_tokens = crate::quality::tokenize(&content);
@@ -177,10 +186,13 @@ async fn extract_and_score(
 
     PipelineResult {
         pipeline,
-        sf1,
+        sf1: structural.sf1,
         tf1,
-        order_score,
-        per_type_sf1,
+        char_similarity,
+        order_score: structural.order_score,
+        per_type_sf1: structural.per_type_sf1,
+        per_type_precision: structural.per_type_precision,
+        per_type_recall: structural.per_type_recall,
         time_ms,
         missing_tokens,
         extra_tokens,
@@ -188,16 +200,43 @@ async fn extract_and_score(
     }
 }
 
+fn score_structural_markdown(predicted: &str, ground_truth: &str) -> crate::comparison::StructuralBreakdown {
+    use crate::comparison::StructuralBreakdown;
+
+    let gt_sidecar = StructuralSidecar::from_markdown(ground_truth);
+    let has_structure = gt_sidecar
+        .nodes
+        .iter()
+        .any(|node| !matches!(node, StructuralNode::Paragraph { .. }));
+
+    if !has_structure {
+        return StructuralBreakdown {
+            sf1: f64::NAN,
+            order_score: f64::NAN,
+            ..Default::default()
+        };
+    }
+
+    let score = structural_sidecar::score_structural(&StructuralSidecar::from_markdown(predicted), &gt_sidecar);
+    StructuralBreakdown::from_score(&score)
+}
+
 /// Run the pipeline benchmark.
 pub async fn run_pipeline_benchmark(config: &PipelineBenchmarkConfig) -> Result<Vec<PipelineDocResult>> {
     let filter = CorpusFilter {
-        file_types: None, // All formats with ground truth
+        file_types: None,
         require_ground_truth: true,
         name_patterns: config.doc_filter.clone(),
+        exact_names: config.exact_doc_filter.clone(),
         ..Default::default()
     };
 
     let docs = corpus::build_corpus(&config.fixtures_dir, &filter)?;
+    if docs.is_empty() {
+        return Err(crate::Error::Config(
+            "pipeline benchmark selection matched zero documents".to_string(),
+        ));
+    }
     eprintln!(
         "Pipeline benchmark: {} documents, {} paths",
         docs.len(),
@@ -247,7 +286,6 @@ pub async fn run_pipeline_benchmark(config: &PipelineBenchmarkConfig) -> Result<
                 let doc_dir = dir.join(&doc.name);
                 let _ = std::fs::create_dir_all(&doc_dir);
                 let _ = std::fs::write(doc_dir.join(format!("{}.md", pipeline.name())), &pr.content);
-                // Also dump ground truth for comparison
                 if let Some(ref gt_md) = gt_markdown {
                     let _ = std::fs::write(doc_dir.join("ground_truth.md"), gt_md);
                 }
@@ -300,10 +338,8 @@ pub fn print_pipeline_table(results: &[PipelineDocResult], sort_by: SortMetric, 
         return;
     }
 
-    // Optionally sort and truncate for triage view
     let display_results: Vec<&PipelineDocResult> = if let Some(n) = bottom_n {
         let mut sorted: Vec<&PipelineDocResult> = results.iter().collect();
-        // Sort by the worst (min) score across all pipelines for the chosen metric
         sorted.sort_by(|a, b| {
             let a_worst = a
                 .results
@@ -324,13 +360,12 @@ pub fn print_pipeline_table(results: &[PipelineDocResult], sort_by: SortMetric, 
 
     let pipelines: Vec<&str> = results[0].results.iter().map(|r| r.pipeline.name()).collect();
 
-    // Header
     eprint!("{:<30} {:>5}", "Document", "Type");
     for p in &pipelines {
-        eprint!(" {:>8} {:>8} {:>7}", format!("{} SF1", p), "TF1", "ms");
+        eprint!(" {:>8} {:>8} {:>8} {:>7}", format!("{} SF1", p), "TF1", "Ord", "ms");
     }
     eprintln!();
-    eprintln!("{}", "-".repeat(36 + pipelines.len() * 26));
+    eprintln!("{}", "-".repeat(36 + pipelines.len() * 35));
 
     for doc in &display_results {
         eprint!(
@@ -353,25 +388,28 @@ pub fn print_pipeline_table(results: &[PipelineDocResult], sort_by: SortMetric, 
             } else {
                 format!("{:>7.1}%", pr.tf1 * 100.0)
             };
+            let ord_str = if pr.order_score.is_nan() {
+                "    —   ".to_string()
+            } else {
+                format!("{:>7.1}%", pr.order_score * 100.0)
+            };
             let time_str = if pr.time_ms.is_nan() {
                 "    N/A".to_string()
             } else {
                 format!("{:>7.0}", pr.time_ms)
             };
-            eprint!(" {} {} {}", sf1_str, tf1_str, time_str);
+            eprint!(" {} {} {} {}", sf1_str, tf1_str, ord_str, time_str);
         }
         eprintln!();
     }
 
-    // Averages (always over all results, not just displayed)
-    let total_docs = results.len();
-    eprintln!("{}", "-".repeat(36 + pipelines.len() * 26));
+    eprintln!("{}", "-".repeat(36 + pipelines.len() * 35));
     eprint!("{:<30} {:>5}", "AVERAGE", "");
     for (i, _) in pipelines.iter().enumerate() {
         let sf1_vals: Vec<f64> = results
             .iter()
             .map(|r| r.results[i].sf1)
-            .filter(|v| !v.is_nan())
+            .filter(|v| v.is_finite())
             .collect();
         let sf1 = if !sf1_vals.is_empty() {
             sf1_vals.iter().sum::<f64>() / sf1_vals.len() as f64
@@ -381,36 +419,61 @@ pub fn print_pipeline_table(results: &[PipelineDocResult], sort_by: SortMetric, 
         let tf1_vals: Vec<f64> = results
             .iter()
             .map(|r| r.results[i].tf1)
-            .filter(|v| !v.is_nan())
+            .filter(|v| v.is_finite())
             .collect();
         let tf1 = if !tf1_vals.is_empty() {
             tf1_vals.iter().sum::<f64>() / tf1_vals.len() as f64
         } else {
             0.0
         };
+        let order_vals: Vec<f64> = results
+            .iter()
+            .map(|r| r.results[i].order_score)
+            .filter(|v| v.is_finite())
+            .collect();
+        let order = if !order_vals.is_empty() {
+            order_vals.iter().sum::<f64>() / order_vals.len() as f64
+        } else {
+            0.0
+        };
         let time_vals: Vec<f64> = results
             .iter()
             .map(|r| r.results[i].time_ms)
-            .filter(|v| !v.is_nan())
+            .filter(|v| v.is_finite())
             .collect();
         if time_vals.is_empty() {
-            eprint!(" {:>7.1}% {:>7.1}% {:>7}", sf1 * 100.0, tf1 * 100.0, "N/A");
+            eprint!(
+                " {:>7.1}% {:>7.1}% {:>7.1}% {:>7}",
+                sf1 * 100.0,
+                tf1 * 100.0,
+                order * 100.0,
+                "N/A"
+            );
         } else {
             let ms: f64 = time_vals.iter().sum::<f64>() / time_vals.len() as f64;
-            eprint!(" {:>7.1}% {:>7.1}% {:>7.0}", sf1 * 100.0, tf1 * 100.0, ms);
+            eprint!(
+                " {:>7.1}% {:>7.1}% {:>7.1}% {:>7.0}",
+                sf1 * 100.0,
+                tf1 * 100.0,
+                order * 100.0,
+                ms
+            );
         }
     }
     eprintln!();
-    // Report how many docs were excluded from SF1 average
-    let sf1_excluded: usize = results.iter().map(|r| r.results[0].sf1).filter(|v| v.is_nan()).count();
-    if sf1_excluded > 0 {
-        eprintln!(
-            "  (SF1 averaged over {}/{} docs; {} paragraph-only docs excluded)",
-            total_docs - sf1_excluded,
-            total_docs,
-            sf1_excluded
-        );
+    for aggregate in compute_aggregates(results) {
+        eprintln!("{}", format_coverage_line(&aggregate, results.len()));
     }
+}
+
+fn format_coverage_line(aggregate: &PipelineAggregate, total_docs: usize) -> String {
+    let (Some(sf1_count), Some(tf1_count)) = (aggregate.sf1_count, aggregate.tf1_count) else {
+        return format!("  {} coverage: unknown (legacy artifact)", aggregate.pipeline);
+    };
+    format!(
+        "  {} coverage: SF1 {}/{} docs, TF1 {}/{} docs",
+        aggregate.pipeline, sf1_count, total_docs, tf1_count, total_docs
+    )
 }
 
 /// Print per-block-type F1 breakdown for triage.
@@ -419,9 +482,16 @@ pub fn print_triage_blocks(results: &[PipelineDocResult], sort_by: SortMetric, b
         return;
     }
 
-    let block_types = ["H1", "H2", "H3", "Table", "Code", "ListItem", "Paragraph"];
+    const STRUCTURAL_DIMENSIONS: [&str; 7] = [
+        "paragraph",
+        "heading",
+        "list",
+        "table",
+        "table_content",
+        "edges",
+        "order",
+    ];
 
-    // Sort and take bottom N
     let mut sorted: Vec<&PipelineDocResult> = results.iter().collect();
     sorted.sort_by(|a, b| {
         let a_worst = a
@@ -443,15 +513,31 @@ pub fn print_triage_blocks(results: &[PipelineDocResult], sort_by: SortMetric, b
     for doc in &display {
         eprintln!("\n  {}", doc.name);
         for pr in &doc.results {
-            let blocks_str: String = block_types
+            let blocks_str: String = STRUCTURAL_DIMENSIONS
                 .iter()
-                .filter_map(|bt| pr.per_type_sf1.get(*bt).map(|v| format!("{}:{:.0}%", bt, v * 100.0)))
+                .filter_map(|bt| {
+                    pr.per_type_sf1.get(*bt).map(|f1| {
+                        match (pr.per_type_precision.get(*bt), pr.per_type_recall.get(*bt)) {
+                            (Some(p), Some(r)) => {
+                                format!("{}:{:.0}%(p{:.0}/r{:.0})", bt, f1 * 100.0, p * 100.0, r * 100.0)
+                            }
+                            _ => format!("{}:{:.0}%", bt, f1 * 100.0),
+                        }
+                    })
+                })
                 .collect::<Vec<_>>()
                 .join("  ");
+            let sim_str = if pr.char_similarity.is_nan() {
+                String::new()
+            } else {
+                format!("  Sim:{:.0}%", pr.char_similarity * 100.0)
+            };
             eprintln!(
-                "    {:<18} SF1:{:.0}%  {}",
+                "    {:<18} SF1:{:.0}%  TF1:{:.0}%{}  {}",
                 pr.pipeline.name(),
                 pr.sf1 * 100.0,
+                pr.tf1 * 100.0,
+                sim_str,
                 blocks_str
             );
         }
@@ -472,47 +558,67 @@ pub fn compute_aggregates(results: &[PipelineDocResult]) -> Vec<PipelineAggregat
         return Vec::new();
     }
 
-    let n = results.len() as f64;
     let num_pipelines = results[0].results.len();
     let mut aggregates = Vec::new();
 
     for i in 0..num_pipelines {
         let pipeline_name = results[0].results[i].pipeline.name().to_string();
 
-        // Filter NaN values from SF1 (docs without structural ground truth)
         let mut sf1s: Vec<f64> = results
             .iter()
             .map(|r| r.results[i].sf1)
-            .filter(|v| !v.is_nan())
+            .filter(|v| v.is_finite())
             .collect();
-        let mut tf1s: Vec<f64> = results.iter().map(|r| r.results[i].tf1).collect();
+        let mut tf1s: Vec<f64> = results
+            .iter()
+            .map(|r| r.results[i].tf1)
+            .filter(|v| v.is_finite())
+            .collect();
         let mut times: Vec<f64> = results
             .iter()
             .map(|r| r.results[i].time_ms)
-            .filter(|v| !v.is_nan())
+            .filter(|v| v.is_finite())
             .collect();
 
         sf1s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         tf1s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let sf1_n = sf1s.len() as f64;
+        // Metric availability differs by document, so retain independent denominators. ~keep
+        let sf1_count = sf1s.len();
+        let tf1_count = tf1s.len();
+        let sf1_n = sf1_count as f64;
+        let tf1_n = tf1_count as f64;
 
         aggregates.push(PipelineAggregate {
             pipeline: pipeline_name,
+            sf1_count: Some(sf1_count),
+            tf1_count: Some(tf1_count),
             mean_sf1: if sf1_n > 0.0 {
                 sf1s.iter().sum::<f64>() / sf1_n
             } else {
-                0.0
+                f64::NAN
             },
-            mean_tf1: tf1s.iter().sum::<f64>() / n,
+            mean_tf1: if tf1_n > 0.0 {
+                tf1s.iter().sum::<f64>() / tf1_n
+            } else {
+                f64::NAN
+            },
             mean_time_ms: if times.is_empty() {
                 f64::NAN
             } else {
                 times.iter().sum::<f64>() / times.len() as f64
             },
-            p50_sf1: percentile(&sf1s, 0.5),
-            p50_tf1: percentile(&tf1s, 0.5),
+            p50_sf1: if sf1s.is_empty() {
+                f64::NAN
+            } else {
+                percentile(&sf1s, 0.5)
+            },
+            p50_tf1: if tf1s.is_empty() {
+                f64::NAN
+            } else {
+                percentile(&tf1s, 0.5)
+            },
             p50_time_ms: percentile(&times, 0.5),
             p90_time_ms: percentile(&times, 0.9),
         });
@@ -523,8 +629,16 @@ pub fn compute_aggregates(results: &[PipelineDocResult]) -> Vec<PipelineAggregat
 
 /// Build a full run summary for JSON serialization.
 pub fn build_summary(results: &[PipelineDocResult]) -> PipelineRunSummary {
+    build_summary_with_config(results, None)
+}
+
+/// Build a run summary and fingerprint the exact benchmark inputs when config is available.
+pub fn build_summary_with_config(
+    results: &[PipelineDocResult],
+    config: Option<&PipelineBenchmarkConfig>,
+) -> PipelineRunSummary {
     let git_sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -540,12 +654,185 @@ pub fn build_summary(results: &[PipelineDocResult]) -> PipelineRunSummary {
         pipeline_count: results.first().map(|r| r.results.len()).unwrap_or(0),
         aggregates: compute_aggregates(results),
         docs: results.to_vec(),
+        provenance: build_provenance(config),
     }
+}
+
+fn build_provenance(config: Option<&PipelineBenchmarkConfig>) -> PipelineRunProvenance {
+    let status = command_output("git", &["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    let git_dirty = status.as_ref().is_some_and(|bytes| !bytes.is_empty());
+    let git_diff_hash = git_dirty.then(hash_worktree).flatten();
+
+    PipelineRunProvenance {
+        hash_algorithm: "blake3".to_string(),
+        git_dirty,
+        git_diff_hash,
+        binary_hash: std::env::current_exe()
+            .ok()
+            .and_then(|path| hash_files(&[("binary", path)])),
+        scorer_hash: scorer_hash(),
+        corpus_hash: config.and_then(hash_selected_corpus),
+        config_hash: config.map(hash_config),
+        features: enabled_features(),
+        argv: std::env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+    }
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let output = std::process::Command::new(program).args(args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn hash_worktree() -> Option<String> {
+    let mut hasher = blake3::Hasher::new();
+    hash_bytes_into(
+        &mut hasher,
+        &command_output("git", &["diff", "--binary", "HEAD", "--"])?,
+    );
+    let untracked = command_output("git", &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut paths: Vec<&[u8]> = untracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    paths.sort_unstable();
+    for path in paths {
+        hash_bytes_into(&mut hasher, path);
+        let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
+        hash_file_into(&mut hasher, &path).ok()?;
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+fn scorer_hash() -> String {
+    let mut hasher = blake3::Hasher::new();
+    for source in [
+        include_bytes!("structural_sidecar.rs").as_slice(),
+        include_bytes!("quality.rs").as_slice(),
+        include_bytes!("markdown_quality.rs").as_slice(),
+        include_bytes!("pipeline_benchmark.rs").as_slice(),
+    ] {
+        hash_bytes_into(&mut hasher, source);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn hash_config(config: &PipelineBenchmarkConfig) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hash_bytes_into(&mut hasher, config.fixtures_dir.to_string_lossy().as_bytes());
+    for path in &config.paths {
+        hash_bytes_into(&mut hasher, path.name().as_bytes());
+    }
+    for pattern in &config.doc_filter {
+        hash_bytes_into(&mut hasher, pattern.as_bytes());
+    }
+    for name in &config.exact_doc_filter {
+        hash_bytes_into(&mut hasher, name.as_bytes());
+    }
+    hash_bytes_into(&mut hasher, &[u8::from(config.dump_outputs)]);
+    match &config.json_output {
+        Some(path) => hash_bytes_into(&mut hasher, path.to_string_lossy().as_bytes()),
+        None => hash_bytes_into(&mut hasher, &[]),
+    }
+    hash_bytes_into(&mut hasher, format!("{:?}", config.sort_by).as_bytes());
+    hash_bytes_into(&mut hasher, &config.bottom_n.unwrap_or(usize::MAX).to_le_bytes());
+    hash_bytes_into(&mut hasher, &[u8::from(config.triage_blocks)]);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn hash_selected_corpus(config: &PipelineBenchmarkConfig) -> Option<String> {
+    let docs = corpus::build_corpus(
+        &config.fixtures_dir,
+        &CorpusFilter {
+            require_ground_truth: true,
+            name_patterns: config.doc_filter.clone(),
+            exact_names: config.exact_doc_filter.clone(),
+            ..Default::default()
+        },
+    )
+    .ok()?;
+    let mut files = Vec::new();
+    for doc in docs {
+        files.push((format!("{}/fixture", doc.name), doc.fixture_path));
+        files.push((format!("{}/document", doc.name), doc.document_path));
+        if let Some(path) = doc.ground_truth_text {
+            files.push((format!("{}/ground_truth_text", doc.name), path));
+        }
+        if let Some(path) = doc.ground_truth_markdown {
+            files.push((format!("{}/ground_truth_markdown", doc.name), path));
+        }
+    }
+    let refs: Vec<(&str, PathBuf)> = files
+        .iter()
+        .map(|(label, path)| (label.as_str(), path.clone()))
+        .collect();
+    hash_files(&refs)
+}
+
+fn hash_files(files: &[(&str, PathBuf)]) -> Option<String> {
+    let mut hasher = blake3::Hasher::new();
+    for (label, path) in files {
+        hash_bytes_into(&mut hasher, label.as_bytes());
+        hash_file_into(&mut hasher, path).ok()?;
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+fn hash_file_into(hasher: &mut blake3::Hasher, path: &Path) -> std::io::Result<()> {
+    let mut file = std::fs::File::open(path)?;
+    hasher.update(&file.metadata()?.len().to_le_bytes());
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn hash_bytes_into(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn enabled_features() -> Vec<String> {
+    let mut features = vec!["xberg/full".to_string()];
+    for (enabled, name) in [
+        (cfg!(feature = "profiling"), "profiling"),
+        (cfg!(feature = "memory-profiling"), "memory-profiling"),
+        (cfg!(feature = "glm-ocr-bench"), "glm-ocr-bench"),
+        (cfg!(feature = "candle-deepseek-ocr-bench"), "candle-deepseek-ocr-bench"),
+        (
+            cfg!(feature = "candle-paddleocr-vl-15-bench"),
+            "candle-paddleocr-vl-15-bench",
+        ),
+    ] {
+        if enabled {
+            features.push(name.to_string());
+        }
+    }
+    features
 }
 
 /// Write the run summary to a JSON file.
 pub fn write_json_output(results: &[PipelineDocResult], path: &std::path::Path) -> Result<()> {
     let summary = build_summary(results);
+    write_summary(&summary, path)
+}
+
+/// Write a run summary including hashes for the selected config and corpus.
+pub fn write_json_output_with_config(
+    results: &[PipelineDocResult],
+    path: &std::path::Path,
+    config: &PipelineBenchmarkConfig,
+) -> Result<()> {
+    let summary = build_summary_with_config(results, Some(config));
+    write_summary(&summary, path)
+}
+
+fn write_summary(summary: &PipelineRunSummary, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(crate::Error::Io)?;
     }
@@ -554,4 +841,161 @@ pub fn write_json_output(results: &[PipelineDocResult], path: &std::path::Path) 
     std::fs::write(path, json).map_err(crate::Error::Io)?;
     eprintln!("JSON output written to: {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn test_config(fixtures_dir: PathBuf) -> PipelineBenchmarkConfig {
+        PipelineBenchmarkConfig {
+            fixtures_dir,
+            paths: vec![Pipeline::Baseline],
+            doc_filter: Vec::new(),
+            exact_doc_filter: Vec::new(),
+            dump_outputs: false,
+            json_output: None,
+            sort_by: SortMetric::Sf1,
+            bottom_n: None,
+            triage_blocks: false,
+        }
+    }
+
+    #[test]
+    fn structural_scoring_uses_content_after_50_kib() {
+        let prefix = format!("{}\n\n", "plain text ".repeat(6_000));
+        assert!(prefix.len() > 50 * 1024);
+        let markdown = format!("{prefix}# Tail heading\n");
+        let structural = score_structural_markdown(&markdown, &markdown);
+        assert_eq!(structural.sf1, 1.0);
+        assert_eq!(structural.per_type_sf1.get("heading"), Some(&1.0));
+    }
+
+    #[test]
+    fn aggregates_count_available_metrics_independently() {
+        let pipeline_result = |sf1, tf1| PipelineResult {
+            pipeline: Pipeline::Docling,
+            sf1,
+            tf1,
+            char_similarity: tf1,
+            order_score: tf1,
+            per_type_sf1: HashMap::new(),
+            per_type_precision: HashMap::new(),
+            per_type_recall: HashMap::new(),
+            time_ms: 10.0,
+            missing_tokens: Vec::new(),
+            extra_tokens: Vec::new(),
+            content: String::new(),
+        };
+        let doc_result = |name: &str, sf1, tf1| PipelineDocResult {
+            name: name.to_string(),
+            file_type: "pdf".to_string(),
+            file_size: 1,
+            results: vec![pipeline_result(sf1, tf1)],
+        };
+        let results = vec![
+            doc_result("all-metrics", 0.75, 0.75),
+            doc_result("tf1-only", f64::NAN, 0.25),
+        ];
+
+        let aggregates = compute_aggregates(&results);
+
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates[0].sf1_count, Some(1));
+        assert_eq!(aggregates[0].tf1_count, Some(2));
+        assert_eq!(aggregates[0].mean_tf1, 0.5);
+        assert_eq!(aggregates[0].p50_tf1, 0.75);
+        let serialized = serde_json::to_value(&aggregates).unwrap();
+        assert_eq!(serialized[0]["sf1_count"], 1);
+        assert_eq!(serialized[0]["tf1_count"], 2);
+        assert_eq!(
+            format_coverage_line(&aggregates[0], results.len()),
+            "  docling coverage: SF1 1/2 docs, TF1 2/2 docs"
+        );
+    }
+
+    #[test]
+    fn aggregates_preserve_all_unavailable_scores() {
+        let results = vec![PipelineDocResult {
+            name: "failure".to_string(),
+            file_type: "pdf".to_string(),
+            file_size: 1,
+            results: vec![PipelineResult {
+                pipeline: Pipeline::Docling,
+                sf1: f64::NAN,
+                tf1: f64::NAN,
+                char_similarity: f64::NAN,
+                order_score: f64::NAN,
+                per_type_sf1: HashMap::new(),
+                per_type_precision: HashMap::new(),
+                per_type_recall: HashMap::new(),
+                time_ms: f64::NAN,
+                missing_tokens: Vec::new(),
+                extra_tokens: Vec::new(),
+                content: String::new(),
+            }],
+        }];
+
+        let aggregates = compute_aggregates(&results);
+        let serialized = serde_json::to_value(&aggregates).unwrap();
+
+        assert!(aggregates[0].mean_sf1.is_nan());
+        assert!(aggregates[0].mean_tf1.is_nan());
+        assert_eq!(aggregates[0].sf1_count, Some(0));
+        assert_eq!(aggregates[0].tf1_count, Some(0));
+        assert!(aggregates[0].p50_sf1.is_nan());
+        assert!(aggregates[0].p50_tf1.is_nan());
+        assert!(serialized[0]["mean_sf1"].is_null());
+        assert!(serialized[0]["mean_tf1"].is_null());
+        assert!(serialized[0]["p50_sf1"].is_null());
+        assert!(serialized[0]["p50_tf1"].is_null());
+    }
+
+    #[test]
+    fn legacy_summary_deserializes_without_provenance() {
+        let summary: PipelineRunSummary = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "git_sha": "abc",
+            "doc_count": 0,
+            "pipeline_count": 0,
+            "aggregates": [{
+                "pipeline": "docling",
+                "mean_sf1": 0.0,
+                "mean_tf1": 0.0,
+                "mean_time_ms": 0.0,
+                "p50_sf1": 0.0,
+                "p50_tf1": 0.0,
+                "p50_time_ms": 0.0,
+                "p90_time_ms": 0.0
+            }],
+            "docs": []
+        }))
+        .unwrap();
+        assert!(summary.provenance.hash_algorithm.is_empty());
+        assert_eq!(summary.aggregates[0].sf1_count, None);
+        assert_eq!(summary.aggregates[0].tf1_count, None);
+        assert_eq!(
+            format_coverage_line(&summary.aggregates[0], 0),
+            "  docling coverage: unknown (legacy artifact)"
+        );
+    }
+
+    #[test]
+    fn config_hash_tracks_exact_selection() {
+        let mut config = test_config(PathBuf::from("fixtures"));
+        let before = hash_config(&config);
+        config.exact_doc_filter.push("fixture-a".to_string());
+        assert_ne!(before, hash_config(&config));
+    }
+
+    #[tokio::test]
+    async fn empty_selection_is_an_error() {
+        let fixtures = tempfile::tempdir().unwrap();
+        let error = run_pipeline_benchmark(&test_config(fixtures.path().to_path_buf()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::Config(_)));
+    }
 }

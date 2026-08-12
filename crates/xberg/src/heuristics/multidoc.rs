@@ -26,8 +26,6 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-// ── Named constants for signal-derivation heuristics ─────────────────────────
-
 /// Characters taken from the start of each page for `text_excerpt`.
 const TEXT_EXCERPT_LEN: usize = 500;
 
@@ -233,13 +231,10 @@ fn detect_page_one_marker(text: &str) -> bool {
     let window: String = text.chars().take(PAGE_ONE_MARKER_WINDOW).collect();
     let lower = window.to_ascii_lowercase();
 
-    // "1 of N" pattern — e.g. "1 of 5", "1 of many"
     if lower.contains("1 of ") {
         return true;
     }
 
-    // "page 1" followed by a non-digit character (or end of string) to avoid
-    // matching "page 10", "page 11", etc.
     let mut search = lower.as_str();
     while let Some(pos) = search.find("page 1") {
         let after = &search[pos + "page 1".len()..];
@@ -249,7 +244,6 @@ fn detect_page_one_marker(text: &str) -> bool {
             Some(c) if !c.is_ascii_digit() => return true,
             _ => {}
         }
-        // advance past this occurrence and keep looking
         search = &search[pos + 1..];
     }
 
@@ -273,7 +267,6 @@ fn detect_signature_block(text: &str) -> bool {
         return false;
     }
 
-    // Require at least one short, non-empty trailing line typical of a closing.
     text.lines().rev().take(10).any(|line| {
         let len = line.trim().len();
         (SIGNATURE_SHORT_LINE_MIN..=SIGNATURE_SHORT_LINE_MAX).contains(&len)
@@ -294,11 +287,14 @@ fn detect_signature_block(text: &str) -> bool {
 /// # Text density
 ///
 /// [`crate::types::PageContent`] does not carry a pre-computed density score.
-/// This function approximates density as
-/// `non_whitespace_chars / total_chars` (clamped to `[0.0, 1.0]`), which is a
-/// reasonable proxy for how text-dense a page is relative to itself.  Pass a
-/// custom [`MultidocInput`] to [`detect_boundaries`] directly when you need a
-/// higher-fidelity density measurement (e.g. chars-per-pt² from a PDF extractor).
+/// This function approximates density from the *amount* of visible text on the
+/// page (see [`approximate_text_density`]): a saturating curve over the
+/// non-whitespace character count, so a sparse page (a one-page memo or form)
+/// scores low and a dense page (paper body text) scores high.  A raw
+/// non-whitespace *ratio* was near-constant across text pages and left the
+/// `DensityShift` rule inert.  Pass a custom [`MultidocInput`] to
+/// [`detect_boundaries`] directly when you need a higher-fidelity measurement
+/// (e.g. chars-per-pt² from a PDF extractor that also knows page geometry).
 ///
 /// # Arguments
 ///
@@ -310,7 +306,6 @@ pub fn boundaries_from_extraction_result(
 ) -> Vec<DocumentBoundary> {
     let pages = match result.pages.as_deref() {
         None | Some([]) => {
-            // No per-page data — treat whole document as a single document.
             return detect_boundaries(
                 &MultidocInput {
                     page_count: 1,
@@ -347,16 +342,27 @@ pub fn boundaries_from_extraction_result(
     )
 }
 
-/// Approximate text density as the fraction of non-whitespace characters.
+/// Density scale (visible chars): a page reaches ~0.63 density at this many
+/// non-whitespace characters and saturates toward 1.0 beyond it. Chosen so a
+/// short memo/form page (a few hundred visible chars) scores well below a dense
+/// paper body page (thousands), producing a large delta at a document seam.
+const DENSITY_CHAR_SCALE: f32 = 800.0;
+
+/// Approximate per-page text density on a saturating `[0.0, 1.0]` scale from the
+/// count of visible (non-whitespace) characters.
 ///
-/// Returns a value in `[0.0, 1.0]`.  Returns `0.0` for empty strings.
+/// `density = 1 - exp(-visible_chars / DENSITY_CHAR_SCALE)`. This measures *how
+/// much* text a page carries, which discriminates sparse pages (memos, forms,
+/// cover pages) from dense body pages — unlike the non-whitespace *ratio*, which
+/// is ~0.8 on virtually every text page and never triggered the `DensityShift`
+/// rule. Consecutive pages within one document have similar amounts of text, so
+/// their delta stays small; the strict bigram-overlap gate in
+/// [`detect_page_transition`] further suppresses intra-document false positives.
+///
+/// Returns `0.0` for empty strings.
 fn approximate_text_density(text: &str) -> f32 {
-    let total = text.chars().count();
-    if total == 0 {
-        return 0.0;
-    }
-    let non_ws = text.chars().filter(|c| !c.is_whitespace()).count();
-    (non_ws as f32 / total as f32).clamp(0.0, 1.0)
+    let visible = text.chars().filter(|c| !c.is_whitespace()).count() as f32;
+    (1.0 - (-visible / DENSITY_CHAR_SCALE).exp()).clamp(0.0, 1.0)
 }
 
 /// Detect document boundaries in a multi-document PDF.
@@ -385,7 +391,6 @@ pub fn detect_boundaries(input: &MultidocInput, thresholds: &MultidocThresholds)
         reason: BoundaryReason::Start,
     }];
 
-    // Detect transitions between consecutive pages.
     for i in 0..input.pages.len().saturating_sub(1) {
         let current = &input.pages[i];
         let next = &input.pages[i + 1];
@@ -395,7 +400,6 @@ pub fn detect_boundaries(input: &MultidocInput, thresholds: &MultidocThresholds)
         }
     }
 
-    // Add end boundary.
     if input.page_count > 0 {
         boundaries.push(DocumentBoundary {
             start_page: input.page_count,
@@ -414,7 +418,6 @@ fn detect_page_transition(
     next: &PageSignals,
     thresholds: &MultidocThresholds,
 ) -> Option<DocumentBoundary> {
-    // Rule 1: Page-one marker (highest confidence).
     if next.has_page_number_one_marker || has_page_one_pattern(&next.text_excerpt) {
         return Some(DocumentBoundary {
             start_page: next.page_number,
@@ -424,7 +427,6 @@ fn detect_page_transition(
         });
     }
 
-    // Rule 2: Letterhead reset after signature.
     if current.has_signature_block && next.starts_with_letterhead_like {
         return Some(DocumentBoundary {
             start_page: next.page_number,
@@ -434,7 +436,6 @@ fn detect_page_transition(
         });
     }
 
-    // Rule 3: Density shift with low bigram overlap.
     let density_delta = (current.layout_text_density - next.layout_text_density).abs();
     if density_delta > thresholds.density_shift_threshold {
         let overlap_ratio = compute_bigram_overlap(&current.text_excerpt, &next.text_excerpt);
@@ -510,7 +511,30 @@ mod tests {
         }
     }
 
-    // ── PageSignals::from_page_text ───────────────────────────────────────────
+    #[test]
+    fn density_is_sparse_for_short_pages_and_dense_for_long_pages() {
+        let empty = approximate_text_density("");
+        let sparse = approximate_text_density(&"word ".repeat(40));
+        let dense = approximate_text_density(&"word ".repeat(1000));
+        assert_eq!(empty, 0.0, "empty page has zero density");
+        assert!(sparse < 0.3, "a short memo page should score low, got {sparse}");
+        assert!(dense > 0.9, "a dense paper page should saturate high, got {dense}");
+        assert!(
+            dense - sparse > MultidocThresholds::default().density_shift_threshold,
+            "sparse→dense delta must exceed the density-shift threshold"
+        );
+    }
+
+    #[test]
+    fn density_delta_between_two_dense_pages_stays_small() {
+        let page_a = approximate_text_density(&"lorem ipsum ".repeat(300));
+        let page_b = approximate_text_density(&"dolor sit amet ".repeat(300));
+        assert!(
+            (page_a - page_b).abs() < MultidocThresholds::default().density_shift_threshold,
+            "dense→dense delta {} must stay below the threshold",
+            (page_a - page_b).abs()
+        );
+    }
 
     #[test]
     fn from_page_text_detects_letterhead() {
@@ -524,7 +548,6 @@ mod tests {
 
     #[test]
     fn from_page_text_no_letterhead_for_long_lines() {
-        // Long lines should not trigger letterhead even if uppercase-heavy.
         let long_line = "THIS IS A VERY LONG LINE THAT EXCEEDS THE MAXIMUM LETTERHEAD LENGTH THRESHOLD BY FAR";
         let text = format!("{long_line}\n{long_line}\nBody text follows.");
         let signals = PageSignals::from_page_text(1, &text, 0.5);
@@ -550,7 +573,6 @@ mod tests {
 
     #[test]
     fn from_page_text_no_page_one_marker_for_page_10() {
-        // "page 10" must not match "page 1"
         let text = "Page 10 of 20\nDocument body text.";
         let signals = PageSignals::from_page_text(10, text, 0.5);
         assert!(
@@ -575,12 +597,10 @@ mod tests {
 
     #[test]
     fn from_page_text_no_signature_for_body_prose() {
-        // Mentioning "signature" in a long paragraph should not trigger.
         let text = "Please provide your signature on the form attached. This is a long line that \
                     exceeds the short-line threshold so it should not be treated as a closing block \
                     in the signature detection heuristic.";
         let signals = PageSignals::from_page_text(1, text, 0.5);
-        // The keyword "signature" is present but there's no short trailing line — should be false.
         assert!(
             !signals.has_signature_block,
             "Body prose mentioning 'signature' without short closing lines should not trigger"
@@ -597,8 +617,6 @@ mod tests {
             "text_excerpt should be truncated to TEXT_EXCERPT_LEN"
         );
     }
-
-    // ── boundaries_from_extraction_result ────────────────────────────────────
 
     fn make_extraction_result(pages: Vec<(&str, u32)>) -> crate::types::ExtractedDocument {
         use crate::types::PageContent;
@@ -628,7 +646,6 @@ mod tests {
 
     #[test]
     fn boundaries_from_result_three_pages_detects_second_doc() {
-        // Page 2 starts a new document (has a page-one marker).
         let result = make_extraction_result(vec![
             ("First document body text for page one.", 1),
             ("Page 1 of 3\nACME CORP\nSecond document header content.", 2),
@@ -657,7 +674,6 @@ mod tests {
         let thresholds = MultidocThresholds::default();
         let boundaries = boundaries_from_extraction_result(&result, &thresholds);
 
-        // Expect Start + End, no interior boundaries.
         assert_eq!(boundaries.len(), 2);
         assert_eq!(boundaries[0].reason, BoundaryReason::Start);
         assert_eq!(boundaries[1].reason, BoundaryReason::End);
@@ -674,7 +690,6 @@ mod tests {
         let thresholds = MultidocThresholds::default();
         let boundaries = boundaries_from_extraction_result(&result, &thresholds);
 
-        // Fallback to single-document treatment.
         assert_eq!(boundaries.len(), 2);
         assert_eq!(boundaries[0].reason, BoundaryReason::Start);
         assert_eq!(boundaries[1].reason, BoundaryReason::End);
@@ -904,8 +919,6 @@ mod tests {
         let text_a = "hello";
         let text_b = "hella";
         let overlap = compute_bigram_overlap(text_a, text_b);
-        // "he", "el", "ll", "lo" vs "he", "el", "ll", "la"
-        // intersection: "he", "el", "ll" = 3; union: 4 + 4 - 3 = 5; ratio: 3/5 = 0.6
         assert!(overlap > 0.5 && overlap < 0.7);
     }
 

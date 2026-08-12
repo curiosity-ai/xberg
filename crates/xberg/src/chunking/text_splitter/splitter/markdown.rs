@@ -1,9 +1,4 @@
 //! Vendored from text-splitter v0.30.1 (MIT, © 2023 Benjamin Brandt). See ATTRIBUTIONS.md.
-/*!
-# [`MarkdownSplitter`]
-Semantic splitting of Markdown documents. Tries to use as many semantic units from Markdown
-as possible, according to the Common Mark specification.
-*/
 
 use std::{iter::once, ops::Range};
 
@@ -133,7 +128,6 @@ where
                 ) => Some((Element::Block, range)),
                 Event::Rule => Some((Element::Rule, range)),
                 Event::Start(Tag::Heading { level, .. }) => Some((Element::Heading(level.into()), range)),
-                // End events are identical to start, so no need to grab them.
                 Event::End(_) => None,
             })
             .collect()
@@ -196,7 +190,6 @@ impl Element {
     fn split_position(self) -> SemanticSplitPosition {
         match self {
             Self::SoftBreak | Self::Block | Self::Rule | Self::Inline => SemanticSplitPosition::Own,
-            // Attach it to the next text
             Self::Heading(_) => SemanticSplitPosition::Next,
         }
     }
@@ -220,14 +213,11 @@ impl SemanticLevel for Element {
             .batching(move |it| {
                 loop {
                     match it.next() {
-                        // If we've hit the end, actually return None
                         None if final_match => return None,
-                        // First time we hit None, return the final section of the text
                         None => {
                             final_match = true;
                             return text.get(cursor..).map(|t| Either::Left(once((cursor, t))));
                         }
-                        // Return text preceding match + the match
                         Some((level, range)) => {
                             let offset = cursor;
                             match level.split_position() {
@@ -257,7 +247,6 @@ impl SemanticLevel for Element {
                                     }
                                     let prev_section =
                                         text.get(cursor..range.start).expect("invalid character sequence");
-                                    // Separator will be part of the next chunk
                                     cursor = range.start;
                                     return Some(Either::Left(once((offset, prev_section))));
                                 }

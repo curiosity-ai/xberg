@@ -20,9 +20,14 @@ use crate::types::extraction::BoundingBox;
 use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
 use crate::types::ocr_elements::{OcrBoundingGeometry, OcrConfidence, OcrElementLevel};
 
-// ============================================================================
-// Public API
-// ============================================================================
+/// Attribute used to retain the logical hOCR block enclosing an `ocr_par`.
+pub(crate) const HOCR_BLOCK_ID_ATTRIBUTE: &str = "hocr_block_id";
+
+#[derive(Debug)]
+struct HocrBlockExtent {
+    end: usize,
+    id: String,
+}
 
 /// Parse hOCR HTML into an `InternalDocument` with full spatial and confidence metadata.
 ///
@@ -53,6 +58,7 @@ pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocume
 
     let bytes = hocr_html.as_bytes();
     let mut pos = 0;
+    let mut block_extents = Vec::<HocrBlockExtent>::new();
 
     while pos < bytes.len() {
         let Some(tag_start) = memchr(b'<', &bytes[pos..]).map(|i| pos + i) else {
@@ -63,17 +69,16 @@ pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocume
         };
         let tag_content = &hocr_html[tag_start + 1..tag_end];
         pos = tag_end + 1;
+        block_extents.retain(|extent| tag_start < extent.end);
 
-        // Skip closing / self-closing tags
         if tag_content.starts_with('/') || tag_content.ends_with('/') {
             continue;
         }
 
-        // ── ocr_page ─────────────────────────────────────────────
         if has_class(tag_content, "ocr_page") {
             let title = extract_title_attr(tag_content);
             let props = parse_title_properties(&title);
-            let page_number = props.ppageno.map(|p| p + 1); // 0-indexed → 1-indexed
+            let page_number = props.ppageno.map(|p| p + 1);
 
             if let Some(prev) = last_page
                 && page_number != Some(prev)
@@ -86,7 +91,20 @@ pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocume
             continue;
         }
 
-        // ── ocr_par ──────────────────────────────────────────────
+        if has_class(tag_content, "ocr_carea") || has_class(tag_content, "ocrx_block") {
+            let tag_name = tag_content
+                .split_whitespace()
+                .next()
+                .unwrap_or("div")
+                .to_ascii_lowercase();
+            let end = skip_to_matching_close(hocr_html, pos, &tag_name);
+            let id = extract_attribute(tag_content, "id")
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| format!("hocr-block-{tag_start}-{end}"));
+            block_extents.push(HocrBlockExtent { end, id });
+            continue;
+        }
+
         if is_paragraph_tag(tag_content) {
             let par_tag_name = tag_content
                 .split_whitespace()
@@ -97,7 +115,12 @@ pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocume
                 parse_paragraph(hocr_html, pos, last_page.unwrap_or(1), element_index, &par_tag_name);
             pos = end_pos;
 
-            if let Some(elem) = paragraph {
+            if let Some(mut elem) = paragraph {
+                if let Some(block) = block_extents.last() {
+                    elem.attributes
+                        .get_or_insert_with(Default::default)
+                        .insert(HOCR_BLOCK_ID_ATTRIBUTE.to_string(), block.id.clone());
+                }
                 element_index += 1;
                 doc.push_element(elem);
             }
@@ -113,10 +136,6 @@ pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocume
 
     doc
 }
-
-// ============================================================================
-// hOCR property parsing (adapted from html-to-markdown parser.rs)
-// ============================================================================
 
 /// Parsed properties from an hOCR `title` attribute.
 #[derive(Debug, Default)]
@@ -209,10 +228,6 @@ fn parse_quoted_value(part: &str) -> Option<String> {
     Some(part[start + 1..start + 1 + end].to_string())
 }
 
-// ============================================================================
-// Word accumulator
-// ============================================================================
-
 /// A word extracted from hOCR with its metadata.
 struct HocrWordInfo {
     text: String,
@@ -221,11 +236,20 @@ struct HocrWordInfo {
     x1: u32,
     y1: u32,
     confidence: Option<f64>,
+    /// Font size in points, from the word's `x_fsize` hOCR property.
+    font_size: Option<u32>,
+    /// Text rotation angle in degrees, from the word's `textangle` hOCR property.
+    text_angle: Option<f64>,
 }
 
-// ============================================================================
-// Paragraph parsing
-// ============================================================================
+/// Attribute key holding the paragraph's average word font size (points, as a
+/// decimal string). Consumed by markdown assembly to promote large-font
+/// paragraphs to headings (#185).
+pub(crate) const HOCR_FONT_SIZE_ATTRIBUTE: &str = "x_fsize";
+
+/// Attribute key holding the paragraph's average word text-rotation angle in
+/// degrees (as a decimal string), when any word reported a non-zero angle.
+pub(crate) const HOCR_TEXT_ANGLE_ATTRIBUTE: &str = "textangle";
 
 /// Parse a single `<p class="ocr_par">` (or `<span class="ocr_par">`) and all nested
 /// content up to the matching closing tag.
@@ -251,12 +275,7 @@ fn parse_paragraph(
     let mut current_line: Vec<HocrWordInfo> = Vec::new();
     let mut in_line = false;
 
-    // Track nesting depth using ONLY tags matching the paragraph's own tag name.
-    // This ensures that inner elements (ocr_line spans, ocrx_word spans,
-    // formatting tags, etc.) cannot interfere with finding the paragraph's
-    // closing tag — even when their subtrees contain unbalanced or malformed
-    // same-name tags that cause word-level skip functions to overshoot.
-    let mut depth: u32 = 1; // we already consumed the opening tag
+    let mut depth: u32 = 1;
 
     while pos < bytes.len() {
         let Some(tag_start) = memchr(b'<', &bytes[pos..]).map(|i| pos + i) else {
@@ -268,13 +287,11 @@ fn parse_paragraph(
         let tag_content = &html[tag_start + 1..tag_end];
         pos = tag_end + 1;
 
-        // ── closing tags ─────────────────────────────────────────
         if let Some(stripped) = tag_content.strip_prefix('/') {
             let closing_name = stripped.trim().to_ascii_lowercase();
             if closing_name == par_tag {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    // End of our paragraph — flush current line
                     if !current_line.is_empty() {
                         lines.push(std::mem::take(&mut current_line));
                     }
@@ -284,40 +301,31 @@ fn parse_paragraph(
             continue;
         }
 
-        // Skip self-closing
         if tag_content.ends_with('/') {
             continue;
         }
 
         let tag_name = tag_content.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
 
-        // ── ocr_line / ocrx_line ─────────────────────────────────
         if has_class(tag_content, "ocr_line") || has_class(tag_content, "ocrx_line") {
             if in_line && !current_line.is_empty() {
                 lines.push(std::mem::take(&mut current_line));
             }
             in_line = true;
-            // Only track depth for tags matching the paragraph's tag name.
             if tag_name == par_tag {
                 depth += 1;
             }
             continue;
         }
 
-        // ── ocrx_word ────────────────────────────────────────────
         if has_class(tag_content, "ocrx_word") {
             let title = extract_title_attr(tag_content);
             let props = parse_title_properties(&title);
 
-            // Extract text content up to the matching close tag (stripping
-            // nested formatting tags). The paragraph depth counter is
-            // unaffected by skip_to_matching_close because depth only
-            // tracks the paragraph's own tag type, not word/line spans.
             let word_text = extract_inner_text(html, pos);
             let trimmed = decode_html_entities(&word_text);
             let trimmed = trimmed.trim();
 
-            // Advance past the word content and its closing tag(s)
             pos = skip_to_matching_close(html, pos, &tag_name);
 
             if !trimmed.is_empty() {
@@ -329,37 +337,39 @@ fn parse_paragraph(
                     x1,
                     y1,
                     confidence: props.x_wconf,
+                    font_size: props.x_fsize,
+                    text_angle: props.textangle,
                 });
             }
             continue;
         }
 
-        // Only track depth for tags matching the paragraph's tag name.
         if tag_name == par_tag {
             depth += 1;
         }
     }
 
-    // Build the element from collected lines
     let all_words: Vec<&HocrWordInfo> = lines.iter().flat_map(|l| l.iter()).collect();
     if all_words.is_empty() {
         return (None, pos);
     }
 
-    // Text: words joined by spaces within lines, lines joined by newlines
     let text: String = lines
         .iter()
         .map(|line| line.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Compute union bounding box and average confidence
     let mut min_x0 = u32::MAX;
     let mut min_y0 = u32::MAX;
     let mut max_x1 = 0u32;
     let mut max_y1 = 0u32;
     let mut conf_sum = 0.0f64;
     let mut conf_count = 0u32;
+    let mut font_size_sum = 0u32;
+    let mut font_size_count = 0u32;
+    let mut angle_sum = 0.0f64;
+    let mut angle_count = 0u32;
 
     for word in &all_words {
         if word.x1 > 0 || word.y1 > 0 {
@@ -371,6 +381,14 @@ fn parse_paragraph(
         if let Some(c) = word.confidence {
             conf_sum += c;
             conf_count += 1;
+        }
+        if let Some(fs) = word.font_size {
+            font_size_sum += fs;
+            font_size_count += 1;
+        }
+        if let Some(angle) = word.text_angle {
+            angle_sum += angle;
+            angle_count += 1;
         }
     }
 
@@ -405,7 +423,6 @@ fn parse_paragraph(
         }
         #[cfg(not(feature = "ocr"))]
         {
-            // WASM fallback: use normalized confidence directly
             Some(OcrConfidence {
                 recognition: (conf_sum / conf_count as f64) / 100.0,
                 detection: None,
@@ -427,12 +444,23 @@ fn parse_paragraph(
     elem.ocr_geometry = ocr_geometry;
     elem.ocr_confidence = ocr_confidence;
 
+    if font_size_count > 0 {
+        let avg_font_size = font_size_sum as f64 / font_size_count as f64;
+        elem.attributes
+            .get_or_insert_with(Default::default)
+            .insert(HOCR_FONT_SIZE_ATTRIBUTE.to_string(), avg_font_size.to_string());
+    }
+    if angle_count > 0 {
+        let avg_angle = angle_sum / angle_count as f64;
+        if avg_angle.abs() > 0.0 {
+            elem.attributes
+                .get_or_insert_with(Default::default)
+                .insert(HOCR_TEXT_ANGLE_ATTRIBUTE.to_string(), avg_angle.to_string());
+        }
+    }
+
     (Some(elem), pos)
 }
-
-// ============================================================================
-// Lightweight HTML helpers
-// ============================================================================
 
 /// Fast single-byte search (equivalent to `memchr::memchr` but without the dependency).
 #[inline]
@@ -464,17 +492,23 @@ fn is_paragraph_tag(tag_content: &str) -> bool {
 
 /// Extract the `title="..."` attribute value from raw tag content.
 fn extract_title_attr(tag_content: &str) -> String {
-    if let Some(title_start) = tag_content.find("title=") {
-        let rest = &tag_content[title_start + 6..];
+    extract_attribute(tag_content, "title").unwrap_or_default()
+}
+
+/// Extract a quoted attribute value from raw tag content.
+fn extract_attribute(tag_content: &str, attribute: &str) -> Option<String> {
+    let marker = format!("{attribute}=");
+    if let Some(attribute_start) = tag_content.find(&marker) {
+        let rest = &tag_content[attribute_start + marker.len()..];
         let quote = rest.as_bytes().first().copied().unwrap_or(b'"');
         if quote == b'"' || quote == b'\'' {
             let inner = &rest[1..];
             if let Some(end) = inner.find(quote as char) {
-                return inner[..end].to_string();
+                return Some(inner[..end].to_string());
             }
         }
     }
-    String::new()
+    None
 }
 
 /// Extract all text content inside an element, stripping nested tags.
@@ -489,7 +523,6 @@ fn extract_inner_text(html: &str, start: usize) -> String {
 
     while pos < bytes.len() && depth > 0 {
         if let Some(lt) = memchr(b'<', &bytes[pos..]).map(|i| pos + i) {
-            // Collect text before this tag
             result.push_str(&html[pos..lt]);
 
             if let Some(gt) = memchr(b'>', &bytes[lt..]).map(|i| lt + i) {
@@ -563,10 +596,6 @@ fn decode_html_entities(text: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,23 +620,19 @@ mod tests {
         let doc = parse_hocr_to_internal_document(hocr);
         let elements = doc.elements;
 
-        // Should have exactly one paragraph element (no page break for first page)
         assert_eq!(elements.len(), 1);
 
         let elem = &elements[0];
         assert_eq!(elem.text, "Hello World");
-        assert_eq!(elem.page, Some(1)); // ppageno 0 → page 1
+        assert_eq!(elem.page, Some(1));
 
-        // Check bounding box is the union
         let bbox = elem.bbox.as_ref().unwrap();
         assert_eq!(bbox.x0, 100.0);
         assert_eq!(bbox.y0, 100.0);
         assert_eq!(bbox.x1, 350.0);
         assert_eq!(bbox.y1, 140.0);
 
-        // Check confidence
         let conf = elem.ocr_confidence.as_ref().unwrap();
-        // Average of 95 and 90 = 92.5, normalized to 0–1 → 0.925
         assert!((conf.recognition - 0.925).abs() < 0.01);
     }
 
@@ -649,7 +674,6 @@ mod tests {
         let doc = parse_hocr_to_internal_document(hocr);
         let elements = doc.elements;
 
-        // page1-paragraph, page-break, page2-paragraph
         assert_eq!(elements.len(), 3);
         assert!(matches!(elements[0].kind, ElementKind::OcrText { .. }));
         assert!(matches!(elements[1].kind, ElementKind::PageBreak));
@@ -737,6 +761,56 @@ mod tests {
     }
 
     #[test]
+    fn test_paragraph_stores_average_font_size_attribute() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 10 50 30; x_wconf 90; x_fsize 24">BIG</span>
+                    <span class="ocrx_word" title="bbox 60 10 100 30; x_wconf 90; x_fsize 20">Title</span>
+                </span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let attrs = doc.elements[0].attributes.as_ref().expect("attributes present");
+        assert_eq!(attrs.get(HOCR_FONT_SIZE_ATTRIBUTE), Some(&"22".to_string()));
+    }
+
+    #[test]
+    fn test_paragraph_without_font_size_has_no_attribute() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocrx_word" title="bbox 10 10 50 30; x_wconf 90">NoFontSize</span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let has_font_size = doc.elements[0]
+            .attributes
+            .as_ref()
+            .is_some_and(|attrs| attrs.contains_key(HOCR_FONT_SIZE_ATTRIBUTE));
+        assert!(
+            !has_font_size,
+            "should not synthesize a font size when hOCR provides none"
+        );
+    }
+
+    #[test]
+    fn test_paragraph_stores_average_text_angle_attribute() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 10 50 30; x_wconf 90; textangle 90">Rotated</span>
+                </span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let attrs = doc.elements[0].attributes.as_ref().expect("attributes present");
+        assert_eq!(attrs.get(HOCR_TEXT_ANGLE_ATTRIBUTE), Some(&"90".to_string()));
+    }
+
+    #[test]
     fn test_ocr_geometry_set() {
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
             <p class="ocr_par">
@@ -763,8 +837,6 @@ mod tests {
         }
     }
 
-    // Integration tests with real hOCR data
-
     #[test]
     fn test_english_pdf_real_data() {
         let hocr = include_str!("../../test_data/hocr/english_pdf_default.hocr");
@@ -773,7 +845,6 @@ mod tests {
             !doc.elements.is_empty(),
             "Should extract elements from English PDF hOCR"
         );
-        // Verify we got text content
         let total_text: String = doc
             .elements
             .iter()
@@ -781,7 +852,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(!total_text.trim().is_empty(), "Should have non-empty text");
-        // Verify page numbers are set
         let has_pages = doc.elements.iter().any(|e| e.page.is_some());
         assert!(has_pages, "Should have page numbers");
     }
@@ -791,7 +861,6 @@ mod tests {
         let hocr = include_str!("../../test_data/hocr/german_pdf_default.hocr");
         let doc = parse_hocr_to_internal_document(hocr);
         assert!(!doc.elements.is_empty(), "Should extract elements from German PDF hOCR");
-        // German text should preserve umlauts
         let total_text: String = doc
             .elements
             .iter()
@@ -806,7 +875,6 @@ mod tests {
         let hocr = include_str!("../../test_data/hocr/invoice_image_default.hocr");
         let doc = parse_hocr_to_internal_document(hocr);
         assert!(!doc.elements.is_empty(), "Should extract elements from invoice hOCR");
-        // Invoices typically have numbers
         let total_text: String = doc
             .elements
             .iter()
@@ -821,9 +889,6 @@ mod tests {
 
     #[test]
     fn test_word_confidence_real_data() {
-        // This file contains <p> tags with title attributes (x_wconf, x_confs)
-        // but without standard hOCR class structure (ocr_page/ocr_par/ocrx_word),
-        // so the parser correctly produces no elements.
         let hocr = include_str!("../../test_data/hocr/word_confidence.hocr");
         let doc = parse_hocr_to_internal_document(hocr);
         assert!(
@@ -834,9 +899,6 @@ mod tests {
 
     #[test]
     fn test_utf8_encoding_real_data() {
-        // This file contains a plain <p> tag without hOCR classes,
-        // so the parser correctly produces no elements. It verifies
-        // that the parser does not crash on UTF-8 content with special chars.
         let hocr = include_str!("../../test_data/hocr/utf8_encoding.hocr");
         let doc = parse_hocr_to_internal_document(hocr);
         assert!(
@@ -867,9 +929,6 @@ mod tests {
 
     #[test]
     fn test_many_paragraphs_all_captured() {
-        // Regression test: parser must capture ALL paragraphs on a page,
-        // including those near the bottom. Reproduces the pdfa_006 bug where
-        // the last ~7 paragraphs were dropped.
         let paragraph_texts: Vec<&str> = vec![
             "First paragraph",
             "Second paragraph",
@@ -935,7 +994,6 @@ mod tests {
 "#
             ));
 
-            // Add words for this paragraph
             let mut wx = 100;
             for (wi, word) in text.split_whitespace().enumerate() {
                 let word_id = i * 10 + wi + 1;
@@ -955,7 +1013,6 @@ mod tests {
 
         let doc = parse_hocr_to_internal_document(&hocr);
 
-        // Filter out page breaks, keep only OcrText elements
         let text_elements: Vec<_> = doc
             .elements
             .iter()
@@ -970,7 +1027,6 @@ mod tests {
             text_elements.len()
         );
 
-        // Verify each paragraph's text matches
         for (i, (elem, expected)) in text_elements.iter().zip(paragraph_texts.iter()).enumerate() {
             assert_eq!(
                 elem.text,
@@ -982,8 +1038,6 @@ mod tests {
             );
         }
 
-        // Specifically verify the last few paragraphs are present (the ones
-        // that were dropped in the pdfa_006 bug)
         let last_text = &text_elements.last().unwrap().text;
         assert_eq!(
             last_text, "*** Note this is the last paragraph",
@@ -993,8 +1047,6 @@ mod tests {
 
     #[test]
     fn test_paragraph_with_nested_span_in_word() {
-        // Test that a word containing a nested <span> (e.g., font info) doesn't
-        // cause depth tracking issues that swallow subsequent paragraphs.
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <p class="ocr_par">
@@ -1037,8 +1089,6 @@ mod tests {
 
     #[test]
     fn test_paragraph_with_words_outside_line() {
-        // Words directly inside ocr_par, without ocr_line wrapping.
-        // This can happen with some Tesseract configurations.
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <p class="ocr_par">
@@ -1070,8 +1120,6 @@ mod tests {
 
     #[test]
     fn test_paragraph_depth_with_extra_div_nesting() {
-        // Test that extra div nesting (ocr_carea or other containers)
-        // inside a paragraph doesn't break depth tracking.
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <p class="ocr_par">
@@ -1110,9 +1158,6 @@ mod tests {
 
     #[test]
     fn test_paragraph_div_swallows_carea_close() {
-        // If ocr_par uses <div> and carea also uses <div>, make sure
-        // the parser doesn't get confused when ocr_par lacks explicit close.
-        // Also test with missing par close (carea close used instead).
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <div class="ocr_par">
@@ -1149,8 +1194,6 @@ mod tests {
 
     #[test]
     fn test_paragraph_unclosed_par_div_steals_carea_close() {
-        // When ocr_par <div> is not closed, the carea </div> closes
-        // the paragraph instead. Subsequent careas should still be found.
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <div class="ocr_par">
@@ -1173,8 +1216,6 @@ mod tests {
             .filter(|e| matches!(e.kind, ElementKind::OcrText { .. }))
             .collect();
 
-        // Even with missing par close, should still find both paragraphs
-        // (first par closed by carea's div, second par closed by page's div)
         assert_eq!(
             text_elements.len(),
             2,
@@ -1185,18 +1226,6 @@ mod tests {
 
     #[test]
     fn test_depth_tracking_uses_paragraph_tag_name() {
-        // Regression test: parse_paragraph tracks depth using only the
-        // paragraph's own tag name (e.g., "p"). Inner span elements
-        // (lines, words, formatting) do not affect the paragraph's depth.
-        // This prevents skip_to_matching_close for words from causing the
-        // paragraph to overshoot and merge/drop subsequent paragraphs.
-        //
-        // Previously, depth tracked all p/span/div generically. If a word's
-        // skip_to_matching_close consumed a line's </span>, the depth counter
-        // stayed elevated, causing the paragraph to scan past its own </p>
-        // and consume subsequent paragraphs.
-
-        // Case 1: Paragraphs in separate ocr_carea containers.
         let hocr_separate = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <p class="ocr_par">
@@ -1225,9 +1254,6 @@ mod tests {
         assert_eq!(text_elements[0].text, "Styled text");
         assert_eq!(text_elements[1].text, "After");
 
-        // Case 2: Multiple paragraphs in the same ocr_carea.
-        // The depth counter must correctly find each </p> because it
-        // only tracks <p>/<p> nesting, not inner <span>s.
         let hocr_same_carea = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <p class="ocr_par">
@@ -1262,8 +1288,36 @@ mod tests {
     }
 
     #[test]
+    fn test_paragraphs_retain_enclosing_hocr_block_id() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+  <div class="ocr_carea" id="block_1_1">
+    <div class="nested"><p class="ocr_par"><span class="ocrx_word">First</span></p></div>
+    <p class="ocr_par"><span class="ocrx_word">Second</span></p>
+  </div>
+  <div class="ocr_carea" id="block_1_2">
+    <p class="ocr_par"><span class="ocrx_word">Third</span></p>
+  </div>
+</div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let block_ids = doc
+            .elements
+            .iter()
+            .filter(|element| matches!(element.kind, ElementKind::OcrText { .. }))
+            .map(|element| {
+                element
+                    .attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.get(HOCR_BLOCK_ID_ATTRIBUTE))
+                    .map(String::as_str)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(block_ids, vec![Some("block_1_1"), Some("block_1_1"), Some("block_1_2")]);
+    }
+
+    #[test]
     fn test_paragraph_with_ocr_separator_between_paragraphs() {
-        // ocr_separator divs between paragraphs should not interfere.
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
   <div class="ocr_carea">
     <p class="ocr_par">

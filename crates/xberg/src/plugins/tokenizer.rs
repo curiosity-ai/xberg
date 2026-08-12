@@ -157,7 +157,7 @@ mod tests {
     use super::*;
     use crate::XbergError;
     use crate::plugins::Plugin;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::plugins::registry::test_support::TokenizerRegistryGuard;
 
     struct MockTokenizerBackend {
         name: String,
@@ -184,40 +184,39 @@ mod tests {
         }
     }
 
-    /// Unique per-test name so parallel test runs don't collide in the shared
-    /// global `TOKENIZER_BACKEND_REGISTRY`.
-    fn unique_name(suffix: &str) -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("mock-tokenizer-{suffix}-{id}")
-    }
-
     #[test]
     fn register_list_unregister_roundtrip() {
-        let name = unique_name("roundtrip");
+        let _guard = TokenizerRegistryGuard::acquire();
+        let name = "mock-tokenizer-roundtrip".to_string();
         register_tokenizer_backend(Arc::new(MockTokenizerBackend { name: name.clone() })).unwrap();
 
-        assert!(list_tokenizer_backends().unwrap().contains(&name));
+        assert_eq!(list_tokenizer_backends().unwrap(), vec![name.clone()]);
 
         unregister_tokenizer_backend(&name).unwrap();
-        assert!(!list_tokenizer_backends().unwrap().contains(&name));
+        assert!(list_tokenizer_backends().unwrap().is_empty());
     }
 
     #[test]
     fn empty_name_rejected_via_global_api() {
+        let _guard = TokenizerRegistryGuard::acquire();
         let result = register_tokenizer_backend(Arc::new(MockTokenizerBackend { name: String::new() }));
         assert!(matches!(result, Err(XbergError::Validation { .. })));
+        assert!(
+            list_tokenizer_backends().unwrap().is_empty(),
+            "a rejected registration must not leave anything behind"
+        );
     }
 
     #[test]
     fn register_clear_roundtrip() {
-        let name = unique_name("clear");
+        let _guard = TokenizerRegistryGuard::acquire();
+        let name = "mock-tokenizer-clear".to_string();
         register_tokenizer_backend(Arc::new(MockTokenizerBackend { name: name.clone() })).unwrap();
 
-        assert!(list_tokenizer_backends().unwrap().contains(&name));
+        assert_eq!(list_tokenizer_backends().unwrap(), vec![name]);
 
         clear_tokenizer_backends().unwrap();
-        assert!(!list_tokenizer_backends().unwrap().contains(&name));
+        assert!(list_tokenizer_backends().unwrap().is_empty());
     }
 
     #[test]

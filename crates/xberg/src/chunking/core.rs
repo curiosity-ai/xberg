@@ -9,9 +9,12 @@ use std::fmt::Write;
 use crate::chunking::text_splitter::ChunkCapacity;
 use crate::chunking::text_splitter::{ChunkConfig, ChunkSizer, MarkdownSplitter, TextSplitter};
 use crate::error::Result;
-use crate::types::PageBoundary;
+use crate::types::{HeadingContext, PageBoundary};
 
-use super::builder::{build_chunk_config, build_chunks};
+#[cfg(feature = "chunking-tokenizers")]
+use super::builder::TokenizerBackendSizer;
+use super::builder::{build_chunk_config, build_chunks, resolve_token_counter};
+use super::classifier::classify_chunk;
 use super::config::{ChunkerType, ChunkingConfig, ChunkingResult, TableChunkingMode};
 use super::headings::{build_heading_map, resolve_heading_context};
 use super::validation::validate_utf8_boundaries;
@@ -80,12 +83,10 @@ pub(crate) fn chunk_text_with_heading_source(
         validate_utf8_boundaries(text, boundaries)?;
     }
 
-    // Yaml creates new content per chunk (key prefix), can't use generic &str splitter.
     if config.chunker_type == ChunkerType::Yaml {
         return super::yaml_section::chunk_yaml_by_sections(text, config, page_boundaries);
     }
 
-    // Semantic chunker has its own pipeline (segment → topic detect → merge).
     if config.chunker_type == ChunkerType::Semantic {
         return super::semantic::chunk_semantic(text, config, page_boundaries);
     }
@@ -93,9 +94,6 @@ pub(crate) fn chunk_text_with_heading_source(
     let text_chunks: Vec<&str> = match &config.sizing {
         #[cfg(feature = "chunking-tokenizers")]
         crate::core::config::ChunkSizing::Tokenizer { model, .. } => {
-            // A tokenizer backend registered under this name takes precedence
-            // over a HuggingFace model id, so callers can size chunks with the
-            // exact tokenizer their embedder uses.
             let registered = crate::plugins::registry::get_tokenizer_backend_registry()
                 .read()
                 .lookup(model);
@@ -107,9 +105,6 @@ pub(crate) fn chunk_text_with_heading_source(
                     .map_err(|e| crate::XbergError::validation(format!("Invalid chunking configuration: {}", e)))?;
                 split_with_config(text, &config.chunker_type, chunk_config)
             } else {
-                // `load_tokenizer` already names the tokenizer and the load failure;
-                // append the registration hint to validation failures and pass any
-                // other error (e.g. a poisoned cache lock) through untouched.
                 let tokenizer = super::tokenizer_cache::get_or_init_tokenizer(model).map_err(|e| match e {
                     crate::XbergError::Validation { message, source } => crate::XbergError::Validation {
                         message: format!(
@@ -129,7 +124,6 @@ pub(crate) fn chunk_text_with_heading_source(
                 split_with_config(text, &config.chunker_type, chunk_config)
             }
         }
-        // Characters sizing (default) — also matches when no token features are enabled
         _ => {
             let chunk_config = build_chunk_config(config.max_characters, config.overlap, config.trim)?;
             split_with_config(text, &config.chunker_type, chunk_config)
@@ -138,58 +132,125 @@ pub(crate) fn chunk_text_with_heading_source(
 
     let mut chunks = build_chunks(text, text_chunks, page_boundaries)?;
 
-    // For Markdown chunker, resolve heading context for each chunk.
-    // Use the heading_source (markdown-formatted content) if provided, otherwise fall back to text.
     if config.chunker_type == ChunkerType::Markdown {
         let heading_map = build_heading_map(heading_source.unwrap_or(text));
         if !heading_map.is_empty() {
             for chunk in &mut chunks {
-                chunk.metadata.heading_context = resolve_heading_context(chunk.metadata.byte_start, &heading_map);
+                chunk.metadata.heading_context =
+                    resolve_heading_context(chunk.metadata.byte_start, &heading_map, page_boundaries);
+                // Reclassify now that heading context is known: heading-context-aware
+                // rules (e.g. `is_schedule`) are dead at construction time, where
+                // `build_chunks` always classifies with `heading_context = None` (#211).
+                chunk.chunk_type = classify_chunk(&chunk.content, chunk.metadata.heading_context.as_ref());
             }
 
-            // Optionally prepend heading hierarchy path to chunk content.
-            if config.prepend_heading_context {
-                for chunk in &mut chunks {
-                    let Some(ref ctx) = chunk.metadata.heading_context else {
-                        continue;
-                    };
-
-                    // Build breadcrumb prefix directly into the output buffer.
-                    let mut new_content = String::with_capacity(chunk.content.len() + 64);
-                    for (i, h) in ctx.headings.iter().enumerate() {
-                        if i > 0 {
-                            new_content.push_str(" > ");
-                        }
-                        for _ in 0..h.level {
-                            new_content.push('#');
-                        }
-                        // Writing to String is infallible.
-                        let _ = write!(new_content, " {}", h.text);
-                    }
-                    new_content.push_str("\n\n");
-
-                    // If the markdown splitter included the deepest heading at the
-                    // start of the chunk, skip it to avoid duplication.
-                    let body = match ctx.headings.last() {
-                        Some(h) => strip_leading_heading(&chunk.content, h.level, &h.text),
-                        None => &chunk.content,
-                    };
-                    new_content.push_str(body);
-                    chunk.content = new_content;
-                }
-            }
+            // `chunk.content` is never mutated with a heading breadcrumb here (#1393
+            // revised design, superseding the `BreadcrumbTarget::Content` mutation this
+            // block used to perform for issue #337). `content` always stays exactly the
+            // `[byte_start, byte_end)` source span — see the `#1294` note on
+            // `ChunkMetadata::byte_start`/`byte_end` this closes: prepending used to make
+            // `chunk.content.len() != byte_end - byte_start`, so slicing the original
+            // document by the chunk's own offsets silently returned different text than
+            // `content` whenever a breadcrumb had been prepended.
+            //
+            // `heading_context`/`heading_path` (set above, and derived from it by
+            // `chunk_for_rag`) are the source of truth for the breadcrumb instead. Three
+            // retrieval consumers want three different views of the same chunk — dense
+            // wants the breadcrumb inline, BM25 wants it excluded or down-weighted,
+            // SPLADE wants it out entirely — so rendering it into `content` is a
+            // *consumer* decision applied at index time, not something the chunker
+            // picks once for everyone. A caller that wants the `Content`-mode view for
+            // the dense/embedding arm calls [`render_heading_breadcrumb`] explicitly with
+            // the chunk's (clean) `content` and its `heading_context`.
+            //
+            // `prepend_heading_context` and `breadcrumb_target` are deprecated and now
+            // inert: neither field has any effect on `content` any more. They are kept on
+            // `ChunkingConfig` only so existing callers keep compiling; see
+            // [`render_heading_breadcrumb`] for the explicit replacement. ~keep
         }
     }
 
-    // For Markdown chunker with RepeatHeader mode, prepend the table header to
-    // every continuation chunk so downstream consumers retain column context.
     if config.chunker_type == ChunkerType::Markdown && config.table_chunking == TableChunkingMode::RepeatHeader {
         inject_table_headers(&mut chunks);
+    }
+
+    // Populate `token_count` from the configured tokenizer sizer, if any (#255).
+    // Computed last so it reflects each chunk's final `content` (after any
+    // table-header repetition above, the only remaining step that legitimately
+    // changes `content` past `build_chunks`). `token_count` must describe the
+    // content it is stored next to, so it is never counted against a
+    // heading-breadcrumb prefix that no longer exists in `content` (#1393).
+    if let Some(counter) = resolve_token_counter(&config.sizing) {
+        for chunk in &mut chunks {
+            chunk.metadata.token_count = Some(counter(&chunk.content));
+        }
     }
 
     let chunk_count = chunks.len();
 
     Ok(ChunkingResult { chunks, chunk_count })
+}
+
+/// Render `content` with its Markdown heading breadcrumb prepended.
+///
+/// This is the explicit, consumer-applied rendering step described by the
+/// revised #1393 design: [`chunk_text`] never mutates `chunk.content` with a
+/// heading breadcrumb — `content` always stays exactly the source span
+/// (`chunk.content == &source[byte_start..byte_end]`), regardless of the
+/// deprecated `prepend_heading_context`/`breadcrumb_target` config fields.
+/// A caller that wants the breadcrumb inline — e.g. for the dense/embedding
+/// retrieval arm, which benefits from a self-contained passage that carries
+/// its own structural context — calls this function directly at index time
+/// with the chunk's (clean) `content` and its
+/// [`heading_context`](crate::types::ChunkMetadata::heading_context), and
+/// keeps `content` itself untouched for BM25/SPLADE, which do not want the
+/// breadcrumb at all. See the [`rag`](crate::chunking::rag) module docs for
+/// the full retrieval-mode guidance.
+///
+/// Formats `context`'s heading hierarchy as a single breadcrumb line — each
+/// heading rendered as ATX hashes followed by its text, joined by `" > "`
+/// (e.g. `"# Guide > ## Setup"`) — then a blank line, then `content` with a
+/// leading occurrence of the breadcrumb's deepest (last) heading stripped so
+/// the heading is not duplicated when `content` itself already starts with
+/// that heading line, as Markdown-chunked content commonly does (the
+/// Markdown splitter keeps the heading that opens a section as the first
+/// line of that section's first chunk).
+///
+/// # Examples
+///
+/// ```rust
+/// use xberg::chunking::render_heading_breadcrumb;
+/// use xberg::types::{HeadingContext, HeadingLevel};
+///
+/// let context = HeadingContext {
+///     headings: vec![
+///         HeadingLevel { level: 1, text: "Guide".to_string() },
+///         HeadingLevel { level: 2, text: "Setup".to_string() },
+///     ],
+/// };
+/// let rendered = render_heading_breadcrumb("## Setup\n\nInstall the dependencies.", &context);
+/// assert_eq!(rendered, "# Guide > ## Setup\n\nInstall the dependencies.");
+/// ```
+#[cfg_attr(alef, alef(skip))]
+pub fn render_heading_breadcrumb(content: &str, context: &HeadingContext) -> String {
+    let mut new_content = String::with_capacity(content.len() + 64);
+    for (i, h) in context.headings.iter().enumerate() {
+        if i > 0 {
+            new_content.push_str(" > ");
+        }
+        for _ in 0..h.level {
+            new_content.push('#');
+        }
+        let _ = write!(new_content, " {}", h.text);
+    }
+    new_content.push_str("\n\n");
+
+    let body = match context.headings.last() {
+        Some(h) => strip_leading_heading(content, h.level, &h.text),
+        None => content,
+    };
+    new_content.push_str(body);
+    new_content
 }
 
 /// If `text` starts with a markdown ATX heading matching `level` and `title`,
@@ -201,7 +262,6 @@ fn strip_leading_heading<'a>(text: &'a str, level: u8, title: &str) -> &'a str {
     debug_assert!(level > 0, "heading level must be 1..=6");
     let n = level as usize;
     let bytes = text.as_bytes();
-    // Must start with exactly `n` '#' characters followed by a space.
     if bytes.len() <= n || bytes[..n].iter().any(|&b| b != b'#') || bytes[n] != b' ' {
         return text;
     }
@@ -209,41 +269,9 @@ fn strip_leading_heading<'a>(text: &'a str, level: u8, title: &str) -> &'a str {
     if !after_prefix.starts_with(title) {
         return text;
     }
-    // Consume only through the end of the heading line, then trim leading newlines.
-    // This avoids greedily eating into body content that follows on the same line.
     let rest = &after_prefix[title.len()..];
     let line_end = rest.find('\n').unwrap_or(rest.len());
     rest[line_end..].trim_start_matches('\n')
-}
-
-/// Adapts a registered [`crate::plugins::TokenizerBackend`] to the splitter's
-/// [`ChunkSizer`] interface: chunk size is the backend's token count.
-///
-/// A backend reporting zero tokens for non-empty text is not trusted: a zero
-/// count would make every span appear to fit any budget and silently produce
-/// oversized chunks. Host-language bridges surface backend exceptions as a
-/// zero count, so this is also the failure mode of a backend that starts
-/// erroring mid-run. The sizer falls back to the character count — tokens
-/// don't exceed characters for practical tokenizers, so the budget degrades
-/// to the conservative `max_characters` semantics instead of an unbounded
-/// chunk — and logs the substitution.
-#[cfg(feature = "chunking-tokenizers")]
-struct TokenizerBackendSizer(std::sync::Arc<dyn crate::plugins::TokenizerBackend>);
-
-#[cfg(feature = "chunking-tokenizers")]
-impl ChunkSizer for TokenizerBackendSizer {
-    fn size(&self, chunk: &str) -> usize {
-        let count = self.0.count_tokens(chunk);
-        if count == 0 && !chunk.is_empty() {
-            tracing::warn!(
-                backend = self.0.name(),
-                chunk_len = chunk.len(),
-                "Tokenizer backend reported zero tokens for non-empty text; using character count instead"
-            );
-            return chunk.chars().count();
-        }
-        count
-    }
 }
 
 /// Split text using the appropriate splitter type with a generic sizer.
@@ -269,18 +297,10 @@ fn split_with_config<'a, S: ChunkSizer>(
 ///
 /// Only called when `table_chunking == RepeatHeader` and `chunker_type == Markdown`.
 fn inject_table_headers(chunks: &mut [crate::types::Chunk]) {
-    // Extract the table header from a chunk: header row + separator row as a
-    // standalone string. Returns None if the chunk contains no complete table header.
-    //
-    // The injected header uses the same line terminator as the chunk body so that
-    // CRLF input produces a CRLF-consistent header.
     fn extract_table_header(content: &str) -> Option<String> {
-        // Detect the body's line terminator: prefer \r\n if present, fall back to \n.
         let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
 
         let mut lines = content.lines();
-        // `.lines()` strips the terminator; strip_line_terminator keeps interior
-        // whitespace intact while removing only the trailing \r\n or \n.
         let first_raw = lines.next()?;
         let first = strip_line_terminator(first_raw);
         if !first.starts_with('|') {
@@ -294,33 +314,16 @@ fn inject_table_headers(chunks: &mut [crate::types::Chunk]) {
         Some(format!("{first}{line_ending}{second}{line_ending}"))
     }
 
-    // Strip only the trailing line terminator (\r\n or \n) from a line, leaving
-    // interior whitespace (cell padding, alignment) untouched.
     fn strip_line_terminator(line: &str) -> &str {
         line.strip_suffix("\r\n")
             .or_else(|| line.strip_suffix('\n'))
             .unwrap_or(line)
     }
 
-    // Return true if `line` is a GFM table separator row.
-    //
-    // A valid separator row looks like `|:---|:---:|---:|---|`. It must:
-    //   - start with `|`
-    //   - when split on `|`, yield at least one non-empty cell
-    //   - have EVERY non-empty cell match `^\s*:?-+:?\s*$` (optional leading/trailing
-    //     colon, one-or-more dashes, optional surrounding whitespace)
-    //
-    // This rejects data rows whose cells happen to contain a single dash (e.g. `| - |`
-    // or `| :- |`) because those cells have fewer than one dash between the colons, or
-    // more precisely because `:` must be adjacent to dashes in the separator pattern.
-    //
-    // Implemented with char scanning to avoid a regex dependency.
     fn is_table_separator(line: &str) -> bool {
         if !line.starts_with('|') {
             return false;
         }
-        // Split on `|`; the leading `|` produces a leading empty segment and the
-        // trailing `|` (if present) produces a trailing empty segment — skip both.
         let cells: Vec<&str> = line.split('|').filter(|c| !c.is_empty()).collect();
         if cells.is_empty() {
             return false;
@@ -328,35 +331,20 @@ fn inject_table_headers(chunks: &mut [crate::types::Chunk]) {
         cells.iter().all(|cell| is_separator_cell(cell))
     }
 
-    // Return true if `cell` matches the GFM separator-cell pattern:
-    //   optional leading whitespace, optional ':', two or more '-', optional ':', optional trailing whitespace.
-    //
-    // We require at least two dashes (not one) because a single dash (`-`) is
-    // indistinguishable from a data cell in common Markdown tables. Real GFM
-    // separator rows use `---` or longer. This prevents `| - |` from being
-    // misidentified as a separator row.
     fn is_separator_cell(cell: &str) -> bool {
-        // Strip surrounding whitespace only; preserve colons and dashes.
         let s = cell.trim_matches(|c: char| c == ' ' || c == '\t');
-        // Strip optional leading colon.
         let s = s.strip_prefix(':').unwrap_or(s);
-        // Must start with at least one '-'.
         if !s.starts_with('-') {
             return false;
         }
-        // Strip ALL leading dashes; count how many there were.
         let after_dashes = s.trim_start_matches('-');
         let dash_count = s.len() - after_dashes.len();
-        // Require at least two dashes to reject ambiguous single-dash data cells.
         if dash_count < 2 {
             return false;
         }
-        // After the dashes, only an optional trailing colon (and nothing else) is allowed.
         matches!(after_dashes, "" | ":")
     }
 
-    // Return true if a chunk starts with table rows but has no header separator
-    // within the first two lines (i.e. it is a continuation, not a table start).
     fn is_table_continuation(content: &str) -> bool {
         let trimmed = content.trim_start();
         if !trimmed.starts_with('|') {
@@ -368,7 +356,6 @@ fn inject_table_headers(chunks: &mut [crate::types::Chunk]) {
             return false;
         }
         let second = lines.next().unwrap_or("").trim();
-        // If the second line is a separator this chunk already has a header.
         !is_table_separator(second)
     }
 
@@ -384,7 +371,6 @@ fn inject_table_headers(chunks: &mut [crate::types::Chunk]) {
                 chunk.content = format!("{header}{}", chunk.content);
             }
         } else {
-            // Non-table chunk resets the header context.
             last_header = None;
         }
     }
@@ -409,7 +395,11 @@ fn inject_table_headers(chunks: &mut [crate::types::Chunk]) {
 ///
 /// # Examples
 ///
-/// ```rust
+/// This function is `#[cfg(test)]`, so it does not exist in a normal build and the example
+/// cannot be compiled. The public route is [`chunk_text`], which takes a
+/// [`ChunkingConfig`](crate::chunking::ChunkingConfig) carrying the same knobs.
+///
+/// ```ignore
 /// use xberg::chunking::{chunk_text_with_type, ChunkerType};
 ///
 /// # fn example() -> xberg::Result<()> {
@@ -456,7 +446,10 @@ pub(crate) fn chunk_text_with_type(
 ///
 /// # Examples
 ///
-/// ```rust
+/// This function is `#[cfg(test)]`, so it does not exist in a normal build and the example
+/// cannot be compiled. The public route is [`chunk_text`], called once per input.
+///
+/// ```ignore
 /// use xberg::chunking::{chunk_texts_batch, ChunkingConfig};
 ///
 /// # fn example() -> xberg::Result<()> {
@@ -821,8 +814,18 @@ mod tests {
         assert!(result.chunk_count >= 1);
     }
 
+    /// Core invariant of the #1393 revised design: `chunk.content` is *always* the
+    /// exact `[byte_start, byte_end)` span of the original document, byte-for-byte,
+    /// even with the (deprecated) `prepend_heading_context` flag enabled. Before this
+    /// fix, `BreadcrumbTarget::Content` (the default) prepended a breadcrumb into
+    /// `content` without adjusting `byte_start`/`byte_end` — the `#1294` NOTE this
+    /// function used to sit under admitted as much — so slicing the source document
+    /// by a chunk's own offsets returned different text than `chunk.content` for
+    /// every chunk under a heading. This test fails against that old behavior and
+    /// passes now that `content` is never mutated.
     #[test]
-    fn test_prepend_heading_context() {
+    fn chunk_content_matches_source_span_byte_for_byte_when_heading_breadcrumb_enabled() {
+        let original_document = "# Title\n\nSome text\n\n## Section\n\nMore text that will not be merged back up";
         let config = ChunkingConfig {
             max_characters: 50,
             overlap: 0,
@@ -831,45 +834,259 @@ mod tests {
             prepend_heading_context: true,
             ..Default::default()
         };
-        let markdown = "# Title\n\nSome text\n\n## Section\n\nMore text";
-        let result = chunk_text(markdown, &config, None).unwrap();
-        assert!(result.chunk_count >= 1);
-        // Each chunk with heading context should have its content prefixed with
-        // a heading breadcrumb path like "# Title" or "# Title > ## Section".
+
+        let result = chunk_text(original_document, &config, None).unwrap();
+        assert!(!result.chunks.is_empty());
+
+        let mut checked_a_chunk_under_a_heading = false;
         for chunk in &result.chunks {
+            assert_eq!(
+                chunk.content,
+                &original_document[chunk.metadata.byte_start..chunk.metadata.byte_end],
+                "chunk.content must be byte-identical to the source span it claims to cover"
+            );
             if chunk.metadata.heading_context.is_some() {
-                assert!(
-                    chunk.content.starts_with('#'),
-                    "Expected chunk content to start with heading path, got: {:?}",
-                    &chunk.content
-                );
+                checked_a_chunk_under_a_heading = true;
             }
         }
-        // At least one chunk should contain the section breadcrumb
-        let has_section = result
-            .chunks
-            .iter()
-            .any(|c| c.content.contains("# Title") || c.content.contains("## Section"));
         assert!(
-            has_section,
-            "Expected at least one chunk with heading breadcrumb in content"
+            checked_a_chunk_under_a_heading,
+            "test fixture must produce at least one chunk under a heading"
         );
-        // No heading should appear more than once per chunk (breadcrumb + body duplication).
-        for chunk in &result.chunks {
-            if let Some(ref ctx) = chunk.metadata.heading_context
-                && let Some(deepest) = ctx.headings.last()
-            {
-                let heading_line = format!("{} {}", "#".repeat(deepest.level as usize), deepest.text);
-                let occurrences = chunk.content.matches(&heading_line).count();
-                assert!(
-                    occurrences <= 1,
-                    "Heading '{}' appears {} times in chunk (expected at most 1): {:?}",
-                    heading_line,
-                    occurrences,
-                    &chunk.content
-                );
-            }
+    }
+
+    /// `prepend_heading_context` is deprecated and now inert: setting it to `true`
+    /// must not change `content` at all relative to leaving it `false` (#1393 revised
+    /// design). `heading_context` is still populated so a caller can render the
+    /// breadcrumb explicitly via `render_heading_breadcrumb` instead.
+    #[test]
+    fn prepend_heading_context_flag_is_deprecated_and_inert() {
+        let markdown = "# Title\n\nSome text\n\n## Section\n\nMore text";
+        let base_config = ChunkingConfig {
+            max_characters: 50,
+            overlap: 0,
+            trim: true,
+            chunker_type: ChunkerType::Markdown,
+            ..Default::default()
+        };
+        let flagged_config = ChunkingConfig {
+            prepend_heading_context: true,
+            ..base_config.clone()
+        };
+
+        let baseline = chunk_text(markdown, &base_config, None).unwrap();
+        let flagged = chunk_text(markdown, &flagged_config, None).unwrap();
+
+        assert_eq!(baseline.chunks.len(), flagged.chunks.len());
+        assert!(!flagged.chunks.is_empty());
+
+        for (base, flagged) in baseline.chunks.iter().zip(flagged.chunks.iter()) {
+            assert_eq!(
+                base.content, flagged.content,
+                "prepend_heading_context=true must produce byte-identical content to prepend_heading_context=false"
+            );
         }
+
+        let has_heading_context = flagged.chunks.iter().any(|c| c.metadata.heading_context.is_some());
+        assert!(
+            has_heading_context,
+            "heading_context must still be populated even though content is never mutated"
+        );
+    }
+
+    /// Regression test for #1294 item 3, re-scoped to the #1393 revised design:
+    /// `byte_start`/`byte_end` must index the source text regardless of
+    /// `prepend_heading_context`, and page-range attribution derived from those
+    /// offsets must be unaffected. Since `content` is never mutated any more, the
+    /// baseline and flagged runs must now match on `content` too, not just offsets.
+    #[test]
+    fn prepend_heading_context_does_not_desync_byte_offsets_or_page_range() {
+        let p1 = "Body text for page one goes here";
+        let p2 = "Body text for page two goes here";
+        let source = format!("# Title\n\n{p1}\n\n## Section\n\n{p2}");
+
+        let boundaries = vec![
+            PageBoundary {
+                page_number: 1,
+                byte_start: 0,
+                byte_end: "# Title\n\n".len() + p1.len(),
+            },
+            PageBoundary {
+                page_number: 2,
+                byte_start: "# Title\n\n".len() + p1.len(),
+                byte_end: source.len(),
+            },
+        ];
+
+        let base_config = ChunkingConfig {
+            max_characters: 40,
+            overlap: 0,
+            trim: true,
+            chunker_type: ChunkerType::Markdown,
+            ..Default::default()
+        };
+        let prepend_config = ChunkingConfig {
+            prepend_heading_context: true,
+            ..base_config.clone()
+        };
+
+        let baseline = chunk_text(&source, &base_config, Some(&boundaries)).unwrap();
+        let flagged = chunk_text(&source, &prepend_config, Some(&boundaries)).unwrap();
+
+        assert_eq!(baseline.chunks.len(), flagged.chunks.len());
+        assert!(!flagged.chunks.is_empty());
+
+        for (base, flagged) in baseline.chunks.iter().zip(flagged.chunks.iter()) {
+            assert_eq!(
+                base.metadata.byte_start, flagged.metadata.byte_start,
+                "prepend_heading_context must not shift byte_start"
+            );
+            assert_eq!(
+                base.metadata.byte_end, flagged.metadata.byte_end,
+                "prepend_heading_context must not shift byte_end"
+            );
+            assert_eq!(
+                base.metadata.first_page, flagged.metadata.first_page,
+                "prepend_heading_context must not change page-range attribution"
+            );
+            assert_eq!(base.metadata.last_page, flagged.metadata.last_page);
+            assert!(
+                flagged.metadata.byte_end <= source.len(),
+                "byte_end must index into the source text length"
+            );
+            assert_eq!(
+                base.content, flagged.content,
+                "prepend_heading_context must not change content at all any more"
+            );
+        }
+
+        let has_page_provenance = flagged.chunks.iter().any(|c| c.metadata.first_page.is_some());
+        assert!(
+            has_page_provenance,
+            "page-range attribution must survive regardless of prepend_heading_context"
+        );
+    }
+
+    /// `render_heading_breadcrumb` is the explicit rendering step that replaces the
+    /// old in-place mutation (#1393 revised design): a caller who wants the
+    /// `Content`-mode breadcrumb for the dense/embedding retrieval arm now calls it
+    /// directly on a chunk's (always-clean) `content` instead of relying on the
+    /// chunker to have mutated it. Uses an explicit `HeadingContext`, independent of
+    /// the Markdown splitter's own boundary choices, so it only exercises the
+    /// rendering logic itself.
+    #[test]
+    fn render_heading_breadcrumb_reconstructs_the_expected_breadcrumb_prefixed_text() {
+        use crate::types::HeadingLevel;
+
+        let context = HeadingContext {
+            headings: vec![
+                HeadingLevel {
+                    level: 1,
+                    text: "Title".to_string(),
+                },
+                HeadingLevel {
+                    level: 2,
+                    text: "Section".to_string(),
+                },
+            ],
+        };
+        let clean_content = "## Section\n\nMore text that will not be merged back up";
+
+        let rendered = render_heading_breadcrumb(clean_content, &context);
+
+        assert_eq!(
+            rendered, "# Title > ## Section\n\nMore text that will not be merged back up",
+            "render_heading_breadcrumb must prepend the full heading path and strip the duplicated leading heading line"
+        );
+    }
+
+    #[test]
+    fn should_join_heading_levels_with_the_configured_separator() {
+        use crate::types::HeadingLevel;
+
+        let context = HeadingContext {
+            headings: vec![
+                HeadingLevel {
+                    level: 1,
+                    text: "Guide".to_string(),
+                },
+                HeadingLevel {
+                    level: 2,
+                    text: "Setup".to_string(),
+                },
+                HeadingLevel {
+                    level: 3,
+                    text: "Prerequisites".to_string(),
+                },
+            ],
+        };
+
+        let rendered = render_heading_breadcrumb("Install the dependencies.", &context);
+
+        assert_eq!(
+            rendered, "# Guide > ## Setup > ### Prerequisites\n\nInstall the dependencies.",
+            "each heading level must render as ATX hashes and join with ' > ', in order"
+        );
+    }
+
+    #[test]
+    fn should_render_single_heading_without_a_separator() {
+        use crate::types::HeadingLevel;
+
+        let context = HeadingContext {
+            headings: vec![HeadingLevel {
+                level: 2,
+                text: "Setup".to_string(),
+            }],
+        };
+
+        let rendered = render_heading_breadcrumb("Install the dependencies.", &context);
+
+        assert_eq!(
+            rendered, "## Setup\n\nInstall the dependencies.",
+            "a single heading must not have a ' > ' separator appended"
+        );
+    }
+
+    #[test]
+    fn should_prepend_only_a_blank_line_when_there_are_no_headings() {
+        let context = HeadingContext { headings: vec![] };
+
+        let rendered = render_heading_breadcrumb("Install the dependencies.", &context);
+
+        assert_eq!(
+            rendered, "\n\nInstall the dependencies.",
+            "no headings means no breadcrumb text, but the blank-line separator is still emitted \
+             and content is passed through unstripped"
+        );
+    }
+
+    #[test]
+    fn should_strip_a_leading_duplicate_of_the_deepest_heading_from_content() {
+        use crate::types::HeadingLevel;
+
+        let context = HeadingContext {
+            headings: vec![
+                HeadingLevel {
+                    level: 1,
+                    text: "Guide".to_string(),
+                },
+                HeadingLevel {
+                    level: 2,
+                    text: "Setup".to_string(),
+                },
+            ],
+        };
+
+        // The Markdown splitter commonly keeps the opening heading as the first
+        // line of a section's first chunk; render_heading_breadcrumb must strip
+        // that one leading occurrence so the heading is not duplicated.
+        let rendered = render_heading_breadcrumb("## Setup\n\nInstall the dependencies.", &context);
+
+        assert_eq!(
+            rendered, "# Guide > ## Setup\n\nInstall the dependencies.",
+            "a leading occurrence of the deepest heading in content must be stripped, not duplicated"
+        );
     }
 
     #[test]
@@ -1462,7 +1679,6 @@ mod tests {
 
         let result = chunk_text(&full_text, &config, Some(&boundaries)).unwrap();
 
-        // The last chunk must reference pages near the end of the document
         let last_chunk = result.chunks.last().unwrap();
         assert!(
             last_chunk.metadata.last_page.unwrap() >= num_pages - 2,
@@ -1471,8 +1687,6 @@ mod tests {
             last_chunk.metadata.last_page
         );
 
-        // Every chunk's byte range must correspond to where its content
-        // actually lives in the original text
         for (i, chunk) in result.chunks.iter().enumerate() {
             let actual_pos = full_text
                 .find(&chunk.content)
@@ -1539,7 +1753,6 @@ mod tests {
         let result = chunk_text(&repeated, &config, Some(&boundaries)).unwrap();
 
         for (i, chunk) in result.chunks.iter().enumerate() {
-            // The chunk content at byte_start..byte_end must match the actual content
             let byte_start = chunk.metadata.byte_start;
             let byte_end = chunk.metadata.byte_end;
             assert!(
@@ -1601,10 +1814,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Issue #1100: table chunks must retain header in RepeatHeader mode
-    // -----------------------------------------------------------------------
-
     fn make_large_table(rows: usize) -> String {
         let mut s = "| Name | Value | Description |\n|------|-------|-------------|\n".to_string();
         for i in 0..rows {
@@ -1654,13 +1863,11 @@ mod tests {
             overlap: 0,
             trim: true,
             chunker_type: ChunkerType::Markdown,
-            // Default: Split — no header injection
             ..Default::default()
         };
         let result = chunk_text(&markdown, &config, None).unwrap();
         assert!(result.chunks.len() > 1, "table must split into multiple chunks");
 
-        // At least one continuation chunk must lack the header (proving default unchanged)
         let continuation_without_header = result.chunks.iter().skip(1).any(|c| {
             let t = c.content.trim_start();
             t.starts_with('|') && !c.content.contains("|------|")
@@ -1673,8 +1880,6 @@ mod tests {
 
     #[test]
     fn table_repeat_header_two_split_tables_each_get_own_header() {
-        // Two tables both large enough to split. Each table's continuation chunks
-        // must carry THAT table's header, not the other table's header.
         let table1 = "| Name | Value | Description |\n|------|-------|-------------|\n".to_string()
             + &"| item | val | some description text here |\n".repeat(30);
         let separator = "\n\n---\n\n";
@@ -1693,15 +1898,13 @@ mod tests {
         let result = chunk_text(&markdown, &config, None).unwrap();
         assert!(result.chunks.len() > 2, "both tables must produce multiple chunks");
 
-        // Every chunk that starts with a `|` row must have a header + separator
-        // within its first two lines (via injection or natural start).
         for chunk in &result.chunks {
             let trimmed = chunk.content.trim_start();
             if !trimmed.starts_with('|') {
                 continue;
             }
             let mut lines = trimmed.lines();
-            lines.next(); // header row
+            lines.next();
             let second = lines.next().unwrap_or("").trim();
             assert!(
                 second.starts_with('|') && second.contains('-'),
@@ -1710,7 +1913,6 @@ mod tests {
             );
         }
 
-        // Chunks that contain table2 content must NOT have table1's header.
         for chunk in &result.chunks {
             if chunk.content.contains("alpha") || chunk.content.contains("Alpha") {
                 assert!(
@@ -1724,7 +1926,6 @@ mod tests {
 
     #[test]
     fn table_repeat_header_text_chunker_is_unaffected() {
-        // RepeatHeader is a no-op when chunker_type is Text.
         let markdown = make_large_table(40);
         let config = ChunkingConfig {
             max_characters: 300,
@@ -1735,13 +1936,11 @@ mod tests {
             ..Default::default()
         };
         let result = chunk_text(&markdown, &config, None).unwrap();
-        // Text chunker should not crash and default split behaviour applies.
         assert!(!result.chunks.is_empty());
     }
 
     #[test]
     fn table_repeat_header_single_chunk_table_unchanged() {
-        // A table that fits in one chunk must not be duplicated.
         let markdown = "| Col1 | Col2 |\n|------|------|\n| A    | B    |\n| C    | D    |\n";
         let config = ChunkingConfig {
             max_characters: 5000,
@@ -1762,9 +1961,6 @@ mod tests {
 
     #[test]
     fn table_repeat_header_with_overlap_prepends_header_to_continuation_chunks() {
-        // With overlap > 0, continuation chunks start with rows from the tail of the
-        // previous chunk. The is_table_continuation check still fires correctly because
-        // those rows start with `|` and the second line is also a data row (no separator).
         let markdown = make_large_table(40);
         let config = ChunkingConfig {
             max_characters: 300,
@@ -1779,9 +1975,6 @@ mod tests {
             result.chunks.len() > 2,
             "table must split into multiple chunks with overlap"
         );
-        // Every chunk that starts with `|` (table content) must have a separator on its
-        // second non-empty line — either it's the header chunk itself, or the header was
-        // injected into a continuation chunk.
         for chunk in &result.chunks {
             let lines: Vec<&str> = chunk.content.lines().filter(|l| !l.is_empty()).collect();
             if lines.first().is_some_and(|l| l.starts_with('|')) {
@@ -1799,10 +1992,6 @@ mod tests {
 
     #[test]
     fn table_repeat_header_oversized_header_does_not_panic() {
-        // When the header row itself exceeds max_characters it becomes its own chunk.
-        // inject_table_headers will prepend it to continuation chunks, producing chunks
-        // larger than max_characters. This is documented accepted behaviour — the
-        // invariant is no panic and no data loss, not size capping.
         let wide_cols: String = (0..20).map(|i| format!("| Column {i:02} ")).collect::<String>() + "|";
         let separator: String = (0..20).map(|_| "|----------").collect::<String>() + "|";
         let row: String = (0..20).map(|i| format!("| value  {i:02} ")).collect::<String>() + "|";
@@ -1823,18 +2012,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // is_table_separator false-positive fixes
-    // -----------------------------------------------------------------------
-
     /// A data row whose cell contains a lone dash (`| - |`) must NOT be treated
     /// as a separator row and must NOT trigger spurious header injection.
     #[test]
     fn table_repeat_header_single_dash_data_cell_not_misidentified_as_separator() {
-        // "| - |" in a data row is a literal dash value, not a GFM separator.
-        // The table below has a valid header + separator on lines 1-2, then data rows
-        // where one cell is literally " - ". None of the data rows should be
-        // mistaken for a separator, so no spurious header injection should occur.
         let markdown = "| Item | Status |\n|------|--------|\n| foo  | - |\n| bar  | done |\n| baz  | :- |\n";
         let config = ChunkingConfig {
             max_characters: 5000,
@@ -1845,7 +2026,6 @@ mod tests {
             ..Default::default()
         };
         let result = chunk_text(markdown, &config, None).unwrap();
-        // The whole table fits in one chunk — header must appear exactly once.
         assert_eq!(result.chunks.len(), 1, "small table must fit in one chunk");
         assert_eq!(
             result.chunks[0].content.matches("|------|").count(),
@@ -1853,7 +2033,6 @@ mod tests {
             "separator must appear exactly once — no spurious injection from data rows with dashes:\n{:?}",
             result.chunks[0].content,
         );
-        // Data rows must be present and unmodified.
         assert!(
             result.chunks[0].content.contains("| foo  | - |"),
             "data row with lone-dash cell must be preserved:\n{:?}",
@@ -1870,7 +2049,6 @@ mod tests {
     /// chunks where the injected header uses `\r\n` consistently with the body.
     #[test]
     fn table_repeat_header_crlf_input_header_uses_crlf_line_endings() {
-        // Build a CRLF table large enough to force a split.
         let header = "| Name | Value |\r\n|------|-------|\r\n";
         let data_rows: String = (0..40).map(|i| format!("| item{i:02} | {i:03} |\r\n")).collect();
         let markdown = format!("{header}{data_rows}");
@@ -1886,31 +2064,23 @@ mod tests {
         let result = chunk_text(&markdown, &config, None).unwrap();
         assert!(result.chunks.len() > 1, "CRLF table must split into multiple chunks");
 
-        // Every continuation chunk that starts with `|` must have its injected header
-        // terminated with \r\n, not \n, so that line endings are consistent with the body.
         for (i, chunk) in result.chunks.iter().enumerate().skip(1) {
             let trimmed = chunk.content.trim_start();
             if !trimmed.starts_with('|') {
                 continue;
             }
-            // The first line of the chunk (the injected header row) must end with \r\n.
-            // Find the position of the first line break in the content.
             assert!(
                 chunk.content.contains("\r\n"),
                 "continuation chunk {} must contain \\r\\n line endings from injected header, but got:\n{:?}",
                 i,
                 chunk.content,
             );
-            // The injected header's first line (`| Name | Value |`) must be \r\n
-            // terminated, proving the injected header uses CRLF consistently with
-            // the body rather than a bare \n.
             assert!(
                 chunk.content.contains("| Name | Value |\r\n"),
                 "continuation chunk {} injected header row must end with \\r\\n, not \\n:\n{:?}",
                 i,
                 chunk.content,
             );
-            // The injected separator row (`|------|-------|`) must also end with \r\n.
             assert!(
                 chunk.content.contains("|-------|\r\n"),
                 "continuation chunk {} injected separator must end with \\r\\n, not \\n:\n{:?}",
@@ -1924,7 +2094,6 @@ mod tests {
     /// correctly detected and their headers injected into continuation chunks.
     #[test]
     fn table_repeat_header_alignment_separators_are_detected_correctly() {
-        // Use left-align, right-align, and center-align separator cells.
         let header = "| Left | Right | Center |\n|:-----|------:|:------:|\n";
         let data_rows: String = (0..40).map(|i| format!("| l{i:02} | r{i:02} | c{i:02} |\n")).collect();
         let markdown = format!("{header}{data_rows}");
@@ -1943,7 +2112,6 @@ mod tests {
             "alignment-separator table must split into multiple chunks"
         );
 
-        // Every chunk starting with `|` must carry the header row.
         for chunk in &result.chunks {
             let trimmed = chunk.content.trim_start();
             if !trimmed.starts_with('|') {
@@ -1954,12 +2122,127 @@ mod tests {
                 "alignment-separator table chunk missing header row:\n{:?}",
                 chunk.content,
             );
-            // The separator row with alignment markers must appear exactly once per chunk.
             assert!(
                 chunk.content.contains("|:-----|------:|:------:|"),
                 "alignment-separator table chunk missing alignment separator row:\n{:?}",
                 chunk.content,
             );
         }
+    }
+
+    /// Regression test for #255: with `ChunkSizing::Tokenizer` pointed at a registered
+    /// [`crate::plugins::TokenizerBackend`], `token_count` must be populated from that
+    /// backend's count instead of staying `None` forever.
+    #[cfg(feature = "chunking-tokenizers")]
+    #[test]
+    fn test_token_count_populated_from_registered_tokenizer_backend() {
+        use crate::plugins::registry::test_support::TokenizerRegistryGuard;
+        use crate::plugins::{Plugin, TokenizerBackend, register_tokenizer_backend};
+        use std::sync::Arc;
+
+        struct WordCountTokenizer;
+        impl Plugin for WordCountTokenizer {
+            fn name(&self) -> &str {
+                "chunking-core-word-count-tokenizer"
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+        impl TokenizerBackend for WordCountTokenizer {
+            fn count_tokens(&self, text: &str) -> usize {
+                text.split_whitespace().count()
+            }
+        }
+
+        let _guard = TokenizerRegistryGuard::acquire();
+        register_tokenizer_backend(Arc::new(WordCountTokenizer)).unwrap();
+
+        let config = ChunkingConfig {
+            max_characters: 100,
+            overlap: 0,
+            trim: true,
+            chunker_type: ChunkerType::Text,
+            sizing: crate::core::config::ChunkSizing::Tokenizer {
+                model: "chunking-core-word-count-tokenizer".to_string(),
+                cache_dir: None,
+            },
+            ..Default::default()
+        };
+        let text = "one two three four five";
+        let result = chunk_text(text, &config, None).unwrap();
+
+        assert_eq!(result.chunks.len(), 1);
+        assert_eq!(
+            result.chunks[0].metadata.token_count,
+            Some(5),
+            "token_count must be populated from the registered tokenizer backend, not left None"
+        );
+    }
+
+    /// `token_count` has no meaningful value for character-based sizing (the default);
+    /// it must stay `None` rather than being populated with a bogus count.
+    #[test]
+    fn test_token_count_stays_none_for_character_sizing() {
+        let config = ChunkingConfig::default();
+        let result = chunk_text("hello world", &config, None).unwrap();
+        assert_eq!(result.chunks.len(), 1);
+        assert_eq!(result.chunks[0].metadata.token_count, None);
+    }
+
+    /// Regression test for #211: heading-context-aware classification rules (e.g.
+    /// `is_schedule`, which inspects the *heading text*, not just the chunk body) are
+    /// dead at `build_chunks` time because `heading_context` is always `None` there —
+    /// it is only resolved afterward. After the fix, chunks must be reclassified using
+    /// the now-known `heading_context`.
+    #[test]
+    fn test_chunk_reclassified_after_heading_context_resolved() {
+        let heading = "# Schedule 1";
+        // No schedule/annex/appendix/exhibit keyword in the body itself, and not
+        // matching any other higher-priority rule (heading/code/table/formula/
+        // definitions/signature/operative-clause/party-list), so this body classifies
+        // as `Unknown` on its own — only the heading context can make it `Schedule`.
+        let body = "This paragraph states general provisions applicable under the arrangement.";
+        let markdown = format!("{heading}\n\n{body}");
+
+        // Small enough that the heading and body land in separate chunks, so the body
+        // chunk's own content never starts with '#' (which would otherwise trip the
+        // higher-priority `is_heading` rule instead of exercising `is_schedule`).
+        let config = ChunkingConfig {
+            max_characters: body.len(),
+            overlap: 0,
+            trim: true,
+            chunker_type: ChunkerType::Markdown,
+            ..Default::default()
+        };
+        let result = chunk_text(&markdown, &config, None).unwrap();
+
+        let body_chunk = result
+            .chunks
+            .iter()
+            .find(|c| c.content.trim() == body)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a chunk containing exactly the body text, got: {:?}",
+                    result.chunks
+                )
+            });
+
+        assert!(
+            body_chunk.metadata.heading_context.is_some(),
+            "body chunk must have heading_context resolved"
+        );
+        assert_eq!(
+            body_chunk.chunk_type,
+            crate::types::ChunkType::Schedule,
+            "chunk under a 'Schedule 1' heading must reclassify as Schedule once heading_context is known, got {:?}",
+            body_chunk.chunk_type
+        );
     }
 }

@@ -1,7 +1,4 @@
 //! Vendored from text-splitter v0.30.1 (MIT, © 2023 Benjamin Brandt). See ATTRIBUTIONS.md.
-/*!
-Different trimming behaviors for different splitter types.
-*/
 
 /// Out-of-the-box trim options.
 /// If you need a custom trim behavior, you can implement the `Trim` trait.
@@ -26,12 +23,10 @@ impl Trim {
     pub fn trim(self, offset: usize, chunk: &str) -> (usize, &str) {
         match self {
             Self::All => {
-                // Figure out how many bytes we lose trimming the beginning
                 let diff = chunk.len() - chunk.trim_start().len();
                 (offset + diff, chunk.trim())
             }
             Self::PreserveIndentation => {
-                // Preserve indentation if we have newlines inside the element
                 if chunk.trim().contains(NEWLINES) {
                     let diff = chunk.len() - chunk.trim_start_matches(NEWLINES).len();
                     (offset + diff, chunk.trim_start_matches(NEWLINES).trim_end())

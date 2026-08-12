@@ -70,13 +70,13 @@ pub struct CacheWarmParams {
     /// Specific embedding preset name to download (e.g. "balanced", "speed", "quality")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
-    /// Download the default GLiNER NER model
+    /// Download the default GLiNER NER model into the standard Hugging Face cache
     #[serde(default)]
     pub ner: bool,
-    /// Download every known GLiNER NER model
+    /// Download every known GLiNER NER model into the standard Hugging Face cache
     #[serde(default)]
     pub all_ner_models: bool,
-    /// Specific GLiNER NER model alias or catalog id to download
+    /// Specific GLiNER NER model alias or catalog id to download into the standard Hugging Face cache
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ner_model: Option<String>,
 }
@@ -123,37 +123,6 @@ fn extract_inputs_schema(generator: &mut schemars::SchemaGenerator) -> schemars:
         "type": "array",
         "items": input_schema
     })
-}
-
-// These param structs are constructed by the rmcp framework via serde deserialization,
-// not directly in Rust code, so clippy's dead_code lint is a false positive.
-#[allow(dead_code)]
-#[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-pub struct DownloadGrammarsParams {
-    /// Specific languages to download (e.g., ["python", "rust", "javascript"]).
-    /// If not provided, must specify groups or all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub languages: Option<Vec<String>>,
-
-    /// Language groups to download (e.g., ["web", "systems", "scripting"]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub groups: Option<Vec<String>>,
-
-    /// Download all available languages.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub all: Option<bool>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-pub struct ListGrammarsParams {
-    /// Only show downloaded/cached languages (default: false, shows all available).
-    #[serde(default)]
-    pub downloaded_only: bool,
-
-    /// Filter languages by name substring.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<String>,
 }
 
 #[cfg(test)]

@@ -9,10 +9,7 @@ use crate::types::redaction::PiiCategory;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-static RE_CC: Lazy<Regex> = Lazy::new(|| {
-    // 13–19 digits with optional space or dash separators.
-    Regex::new(r"\b(?:\d[ \-]?){12,18}\d\b").expect("credit card regex compiles")
-});
+static RE_CC: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(?:\d[ \-]?){12,18}\d\b").expect("credit card regex compiles"));
 
 /// Find all credit card number spans in `text`, validated with the Luhn algorithm.
 pub fn find_all(text: &str) -> Vec<PatternMatch> {

@@ -64,18 +64,14 @@ pub fn calculate_chunk_plan(page_count: u32, size_bytes: u64, needs_ocr: bool, c
 
 /// Calculate the optimal number of pages per chunk.
 fn calculate_pages_per_chunk(page_count: u32, needs_ocr: bool, config: &HeuristicsConfig) -> u32 {
-    // For OCR documents, use smaller chunks to enable parallelism.
     let base_pages = if needs_ocr {
         config.target_pages_per_chunk
     } else {
-        // For non-OCR, we can process more pages per chunk.
         config.target_pages_per_chunk * 2
     };
 
-    // Ensure we don't exceed max_pages_per_chunk.
     let pages = base_pages.min(config.max_pages_per_chunk);
 
-    // Ensure at least 1 page per chunk, at most page_count.
     pages.max(1).min(page_count)
 }
 
@@ -132,7 +128,7 @@ pub fn calculate_plan_from_overrides(
             ChunkInfo {
                 index: idx as u32,
                 pages: range.clone(),
-                estimated_time_ms: estimate_chunk_time(pages, true), // Assume OCR for safety.
+                estimated_time_ms: estimate_chunk_time(pages, true),
             }
         })
         .collect();
@@ -234,10 +230,10 @@ mod tests {
     #[test]
     fn test_estimate_chunk_time() {
         let ocr_time = estimate_chunk_time(10, true);
-        assert_eq!(ocr_time, 30000); // 10 pages * 3000ms
+        assert_eq!(ocr_time, 30000);
 
         let text_time = estimate_chunk_time(10, false);
-        assert_eq!(text_time, 1000); // 10 pages * 100ms
+        assert_eq!(text_time, 1000);
     }
 
     #[test]

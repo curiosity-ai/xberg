@@ -35,8 +35,8 @@ use crate::types::{ExtractedDocument, ExtractedImage};
 ///
 /// # Concurrency
 ///
-/// Concurrency is bounded by the configured thread budget
-/// using a semaphore to prevent resource exhaustion.
+/// Concurrency is bounded by the configured thread budget using a replenished
+/// task set, so queued images do not create an unbounded number of futures.
 #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
 pub(crate) async fn process_images_with_ocr(
     mut images: Vec<ExtractedImage>,
@@ -51,42 +51,26 @@ pub(crate) async fn process_images_with_ocr(
     let output_format = config.output_format.clone();
     let acceleration = ocr_config.acceleration.clone();
 
-    use std::sync::Arc;
-    use tokio::sync::Semaphore;
+    use std::collections::VecDeque;
     use tokio::task::JoinSet;
 
-    // Bound concurrency to prevent resource exhaustion with many images.
     let max_tasks = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
-    let semaphore = Arc::new(Semaphore::new(max_tasks));
 
-    // Each spawned task returns `(image_index, ocr_result)`.
     type OcrTaskResult = (usize, crate::Result<ExtractedDocument>);
+    type PendingOcrTask = (usize, bytes::Bytes, crate::core::config::OcrConfig);
     let mut join_set: JoinSet<OcrTaskResult> = JoinSet::new();
+    let mut pending: VecDeque<PendingOcrTask> = VecDeque::with_capacity(images.len());
 
     for (idx, image) in images.iter().enumerate() {
         let image_data = image.data.clone();
-        let permit = Arc::clone(&semaphore);
         let mut ocr_config_clone = ocr_config.clone();
         ocr_config_clone.output_format = Some(output_format.clone());
         ocr_config_clone.acceleration = acceleration.clone();
+        pending.push_back((idx, image_data, ocr_config_clone));
+    }
 
+    let spawn_task = |join_set: &mut JoinSet<OcrTaskResult>, (idx, image_data, ocr_config_clone): PendingOcrTask| {
         join_set.spawn(async move {
-            // Acquire a semaphore permit before starting OCR work.
-            // The permit is held for the duration of the OCR task,
-            // ensuring at most max_tasks run simultaneously.
-            let _permit = match permit.acquire().await {
-                Ok(p) => p,
-                Err(_) => {
-                    return (
-                        idx,
-                        Err(crate::XbergError::Ocr {
-                            message: "OCR concurrency semaphore closed unexpectedly".to_string(),
-                            source: None,
-                        }),
-                    );
-                }
-            };
-
             let backend = {
                 let registry = crate::plugins::registry::get_ocr_backend_registry();
                 let registry = registry.read();
@@ -107,11 +91,16 @@ pub(crate) async fn process_images_with_ocr(
             let ocr_result = backend.process_image(&image_data, &ocr_config_clone).await;
             (idx, ocr_result)
         });
+    };
+
+    while join_set.len() < max_tasks {
+        let Some(task) = pending.pop_front() else {
+            break;
+        };
+        spawn_task(&mut join_set, task);
     }
 
     while let Some(join_result) = join_set.join_next().await {
-        // JoinSet join error means the async wrapper itself panicked, which is
-        // not expected; propagate as a hard error.
         let (idx, ocr_result) = join_result.map_err(|e| crate::XbergError::Ocr {
             message: format!("OCR task panicked: {}", e),
             source: None,
@@ -119,17 +108,17 @@ pub(crate) async fn process_images_with_ocr(
 
         match ocr_result {
             Ok(extraction_result) => {
-                // Recursion prevention: the child ExtractedDocument explicitly
-                // disables image extraction (`images: None`) and omits all
-                // expensive post-processing fields (chunking, language detection,
-                // keywords, etc.) to prevent further extraction cycles and
-                // minimize overhead.
-                images[idx].ocr_result = Some(Box::new(ExtractedDocument {
-                    content: extraction_result.content,
-                    mime_type: extraction_result.mime_type,
-                    ocr_elements: extraction_result.ocr_elements,
-                    ..Default::default()
-                }));
+                // Keep the backend's result whole. Rebuilding it field-by-field silently
+                // dropped everything the backend populated besides content/mime_type/
+                // ocr_elements — tables, metadata (OCR language, PSM, confidence),
+                // formulas, llm_usage (VLM cost accounting), detected_languages and
+                // processing_warnings. The PDF inline-image path already stores the
+                // backend result unmodified; mirror it here.
+                let mut ocr_document = extraction_result;
+                // Recursion guard: OCR output must never carry nested images, or an
+                // archive/recursive consumer would extract images out of OCR output.
+                ocr_document.images = None;
+                images[idx].ocr_result = Some(Box::new(ocr_document));
             }
             Err(e) => {
                 warnings.push(crate::types::ProcessingWarning {
@@ -138,6 +127,10 @@ pub(crate) async fn process_images_with_ocr(
                 });
                 images[idx].ocr_result = None;
             }
+        }
+
+        if let Some(task) = pending.pop_front() {
+            spawn_task(&mut join_set, task);
         }
     }
 

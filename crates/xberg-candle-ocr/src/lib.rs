@@ -19,9 +19,13 @@
 //!
 //! Pass-through features to candle: `cuda`, `metal`, `mkl`, `accelerate`.
 
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(test, allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro))]
 #![allow(clippy::too_many_arguments)]
 
 pub mod device;
+#[cfg(any(feature = "trocr", feature = "glm-ocr"))]
+pub(crate) mod download_guard;
 pub mod error;
 pub mod models;
 pub(crate) mod vendor;

@@ -15,51 +15,21 @@
 use crate::OutputFormat;
 use crate::Result;
 use crate::core::config::ExtractionConfig;
-use crate::extraction::cells_to_markdown;
 use crate::extractors::security::SecurityBudget;
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 use crate::types::internal::InternalDocument;
 use crate::types::internal_builder::InternalDocumentBuilder;
 use crate::types::uri::ExtractedUri;
-use crate::types::{ExtractedImage, Metadata, Table};
+use crate::types::{ExtractedImage, Metadata};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
-use quick_xml::Reader;
 use quick_xml::events::Event;
 
-/// Resolve an XML entity reference name to its character(s).
-fn resolve_entity(name: &str) -> Option<&'static str> {
-    match name {
-        "amp" => Some("&"),
-        "lt" => Some("<"),
-        "gt" => Some(">"),
-        "quot" => Some("\""),
-        "apos" => Some("'"),
-        "nbsp" => Some("\u{00A0}"),
-        _ if name.starts_with('#') => None, // char refs handled separately
-        _ => None,
-    }
-}
+use crate::utils::xml_utils::EntityReader;
 
-/// Resolve an XML general reference (entity or char ref) to a string.
-fn resolve_general_ref(ref_bytes: &[u8]) -> String {
-    let name = String::from_utf8_lossy(ref_bytes);
-    if let Some(entity) = resolve_entity(&name) {
-        return entity.to_string();
-    }
-    if let Some(num) = name.strip_prefix('#') {
-        let code = if let Some(hex) = num.strip_prefix('x') {
-            u32::from_str_radix(hex, 16).ok()
-        } else {
-            num.parse::<u32>().ok()
-        };
-        if let Some(ch) = code.and_then(char::from_u32) {
-            return ch.to_string();
-        }
-    }
-    String::new()
-}
+/// `ProcessingWarning::source` used for every degradation reported by this extractor.
+const FICTIONBOOK_WARNING_SOURCE: &str = "fictionbook";
 
 /// FictionBook document extractor.
 ///
@@ -79,7 +49,7 @@ impl FictionBookExtractor {
     }
 
     /// Extract text content from a FictionBook element and its children.
-    fn extract_text_content(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<String> {
+    fn extract_text_content(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<String> {
         let mut text = String::new();
         let mut depth = 0;
 
@@ -141,12 +111,6 @@ impl FictionBookExtractor {
                         text.push('\n');
                     }
                 }
-                Ok(Event::GeneralRef(r)) => {
-                    let resolved = resolve_general_ref(r.as_ref());
-                    if !resolved.is_empty() {
-                        text.push_str(&resolved);
-                    }
-                }
                 Ok(Event::Eof) => break,
                 Err(e) => {
                     return Err(crate::error::XbergError::parsing(format!("XML parsing error: {}", e)));
@@ -167,7 +131,7 @@ impl FictionBookExtractor {
 
     /// Extract metadata from FictionBook document.
     fn extract_metadata(data: &[u8], budget: &mut SecurityBudget) -> Result<Metadata> {
-        let mut reader = Reader::from_reader(data);
+        let mut reader = EntityReader::from_bytes(data);
         let mut metadata = Metadata::default();
         let mut additional = ahash::AHashMap::new();
         let mut in_title_info = false;
@@ -179,7 +143,6 @@ impl FictionBookExtractor {
         let mut authors: Vec<String> = Vec::new();
         let mut annotation_text = String::new();
 
-        // Author name parts
         let mut first_name = String::new();
         let mut middle_name = String::new();
         let mut last_name = String::new();
@@ -305,7 +268,6 @@ impl FictionBookExtractor {
                         }
                         "author" if in_author => {
                             in_author = false;
-                            // Build full author name from parts
                             let mut parts = Vec::new();
                             if !first_name.is_empty() {
                                 parts.push(first_name.clone());
@@ -318,7 +280,6 @@ impl FictionBookExtractor {
                             }
                             let full_name = parts.join(" ");
                             if !full_name.is_empty() {
-                                // Store individual name parts in additional metadata
                                 let mut author_detail = serde_json::Map::new();
                                 if !first_name.is_empty() {
                                     author_detail.insert("first_name".to_string(), serde_json::json!(first_name));
@@ -334,7 +295,6 @@ impl FictionBookExtractor {
                                 }
                                 authors.push(full_name);
 
-                                // Store author details in additional metadata as array
                                 let existing = additional
                                     .entry(std::borrow::Cow::Borrowed("author_details"))
                                     .or_insert_with(|| serde_json::json!([]));
@@ -371,7 +331,6 @@ impl FictionBookExtractor {
                         annotation_text.push_str(trimmed);
                     }
                 }
-                // Self-closing tags (e.g. <sequence ... />) produce Event::Empty, not Event::Start
                 Ok(Event::Empty(e)) => {
                     let name = e.name();
                     let tag = crate::utils::xml_tag_name(name.as_ref());
@@ -429,7 +388,7 @@ impl FictionBookExtractor {
     }
 
     /// Extract a single table from the XML reader (positioned just after `<table>`).
-    fn extract_table(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<Vec<Vec<String>>> {
+    fn extract_table(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<Vec<Vec<String>>> {
         let mut table: Vec<Vec<String>> = Vec::new();
         let mut current_row: Vec<String> = Vec::new();
         let mut in_row = false;
@@ -490,45 +449,6 @@ impl FictionBookExtractor {
         Ok(table)
     }
 
-    /// Extract all tables from the FictionBook body.
-    fn extract_tables_from_body(data: &[u8], budget: &mut SecurityBudget) -> Result<Vec<Table>> {
-        let mut reader = Reader::from_reader(data);
-        let mut tables = Vec::new();
-        let mut table_index = 0;
-
-        loop {
-            budget.step()?;
-            match reader.read_event() {
-                Ok(Event::Start(e)) => {
-                    budget.enter()?;
-                    let name = e.name();
-                    let tag = crate::utils::xml_tag_name(name.as_ref());
-                    if tag == "table"
-                        && let Ok(cells) = Self::extract_table(&mut reader, budget)
-                        && !cells.is_empty()
-                    {
-                        let markdown = cells_to_markdown(&cells);
-                        tables.push(Table {
-                            cells,
-                            markdown,
-                            page_number: table_index + 1,
-                            bounding_box: None,
-                        });
-                        table_index += 1;
-                    }
-                }
-                Ok(Event::End(_)) => {
-                    budget.leave();
-                }
-                Ok(Event::Eof) => break,
-                Err(_) => break,
-                _ => {}
-            }
-        }
-
-        Ok(tables)
-    }
-
     /// Extract embedded images from `<binary>` elements in FictionBook XML.
     ///
     /// FB2 embeds images as base64-encoded data inside `<binary>` elements with
@@ -537,7 +457,7 @@ impl FictionBookExtractor {
     /// <binary id="cover.jpg" content-type="image/jpeg">base64data...</binary>
     /// ```
     fn extract_binary_images(data: &[u8], budget: &mut SecurityBudget) -> Result<Vec<ExtractedImage>> {
-        let mut reader = Reader::from_reader(data);
+        let mut reader = EntityReader::from_bytes(data);
         let mut images = Vec::new();
         let mut image_index = 0;
 
@@ -562,7 +482,6 @@ impl FictionBookExtractor {
                             }
                         }
 
-                        // Read the base64 text content
                         let mut b64_text = String::new();
                         loop {
                             budget.step()?;
@@ -582,14 +501,12 @@ impl FictionBookExtractor {
                             }
                         }
 
-                        // Strip whitespace from base64 data and decode
                         let cleaned: String = b64_text.chars().filter(|c| !c.is_whitespace()).collect();
                         if cleaned.is_empty() {
                             continue;
                         }
 
                         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&cleaned) {
-                            // Determine format from content-type or detect from bytes
                             let format = if let Some(subtype) = content_type.strip_prefix("image/") {
                                 std::borrow::Cow::Owned(subtype.to_string())
                             } else {
@@ -598,7 +515,6 @@ impl FictionBookExtractor {
 
                             let description = if id.is_empty() { None } else { Some(id) };
 
-                            // Classify image based on metadata and visual properties
                             let (image_kind, kind_confidence) = crate::extraction::image_kind::classify(
                                 &decoded, &format, None, None, None, None, false,
                             );
@@ -648,7 +564,7 @@ impl FictionBookExtractor {
     /// <a xlink:href="#note1">footnote ref</a>
     /// ```
     fn extract_links(data: &[u8], budget: &mut SecurityBudget) -> Result<Vec<ExtractedUri>> {
-        let mut reader = Reader::from_reader(data);
+        let mut reader = EntityReader::from_bytes(data);
         let mut uris = Vec::new();
         let mut in_body = false;
 
@@ -667,7 +583,6 @@ impl FictionBookExtractor {
                             let attr_name = String::from_utf8_lossy(attr.key.as_ref());
                             let attr_value = String::from_utf8_lossy(attr.value.as_ref());
                             budget.check_attr(&attr_name, &attr_value)?;
-                            // FB2 uses l:href or xlink:href; also check plain href
                             if attr_name == "l:href" || attr_name == "xlink:href" || attr_name == "href" {
                                 href = attr_value.to_string();
                             }
@@ -677,7 +592,6 @@ impl FictionBookExtractor {
                             continue;
                         }
 
-                        // Collect label text from the <a> element
                         let mut label_text = String::new();
                         let mut depth = 1;
                         loop {
@@ -735,9 +649,23 @@ impl FictionBookExtractor {
     }
 
     /// Build an `InternalDocument` from FictionBook XML content.
-    fn build_internal_document(data: &[u8], budget: &mut SecurityBudget) -> Result<InternalDocument> {
-        let mut reader = Reader::from_reader(data);
+    ///
+    /// `images` are extracted separately (see `extract_binary_images`) because FB2 stores
+    /// image bytes in top-level `<binary>` elements that are typically located after
+    /// `</body>` and referenced from the body only indirectly via `<image l:href="#id"/>`.
+    /// Correlating those references to their binary payload while preserving in-flow
+    /// position would require a larger two-pass refactor, so images are appended as
+    /// elements at the end of the document instead of being dropped. Tables, in contrast,
+    /// are nested directly inside `<body>` and are parsed in place below, preserving their
+    /// original position in the document flow.
+    fn build_internal_document(
+        data: &[u8],
+        images: Vec<ExtractedImage>,
+        budget: &mut SecurityBudget,
+    ) -> Result<InternalDocument> {
+        let mut reader = EntityReader::from_bytes(data);
         let mut builder = InternalDocumentBuilder::new("fictionbook");
+        let mut parse_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
 
         let mut in_body = false;
         let mut is_notes_body = false;
@@ -752,7 +680,13 @@ impl FictionBookExtractor {
                     let name = e.name();
                     let tag = crate::utils::xml_tag_name(name.as_ref());
 
-                    if tag == "body" {
+                    if tag == "table" {
+                        if let Ok(cells) = Self::extract_table(&mut reader, budget)
+                            && !cells.is_empty()
+                        {
+                            builder.push_table_from_cells(&cells, None, None);
+                        }
+                    } else if tag == "body" {
                         let mut is_notes = false;
                         for a in e.attributes().flatten() {
                             let attr_name = String::from_utf8_lossy(a.key.as_ref());
@@ -772,9 +706,6 @@ impl FictionBookExtractor {
                     } else if tag == "title" && in_body {
                         match Self::extract_text_content(&mut reader, budget) {
                             Ok(text) if !text.is_empty() => {
-                                // Body title (section_depth=0) -> H1
-                                // Top-level section title (section_depth=1) -> H2
-                                // Nested section titles -> H3, H4, etc.
                                 let level: u8 = if section_depth == 0 {
                                     1
                                 } else {
@@ -784,25 +715,11 @@ impl FictionBookExtractor {
                             }
                             _ => {}
                         }
-                    } else if tag == "p" && in_body && !is_notes_body {
-                        match Self::extract_paragraph_with_annotations(&mut reader, budget) {
-                            Ok((text, annotations)) if !text.is_empty() => {
-                                builder.push_paragraph(&text, annotations, None, None);
-                            }
-                            _ => {}
-                        }
-                    } else if tag == "v" && in_body && !is_notes_body {
-                        // FB2 verse line inside <poem><stanza>
-                        match Self::extract_paragraph_with_annotations(&mut reader, budget) {
-                            Ok((text, annotations)) if !text.is_empty() => {
-                                builder.push_paragraph(&text, annotations, None, None);
-                            }
-                            _ => {}
-                        }
+                    } else if (tag == "p" || tag == "v") && in_body && !is_notes_body {
+                        let _ = Self::extract_paragraph_with_annotations(&mut reader, budget, &mut builder);
                     } else if tag == "subtitle" && in_body && !is_notes_body {
                         match Self::extract_text_content(&mut reader, budget) {
                             Ok(text) if !text.is_empty() => {
-                                // Subtitle is one level deeper than the section heading
                                 let level: u8 = std::cmp::min(section_depth.saturating_add(2), 6);
                                 builder.push_heading(level, &text, None, None);
                             }
@@ -832,10 +749,27 @@ impl FictionBookExtractor {
                             _ => {}
                         }
                     } else if tag == "section" && is_notes_body {
+                        let mut note_id = String::new();
+                        for attr in e.attributes().flatten() {
+                            let attr_name = String::from_utf8_lossy(attr.key.as_ref());
+                            let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                            budget.check_attr(&attr_name, &attr_value)?;
+                            if attr_name == "id" {
+                                note_id = attr_value.to_string();
+                            }
+                        }
                         match Self::extract_footnote_text(&mut reader, budget) {
                             Ok(text) if !text.is_empty() => {
-                                footnote_counter += 1;
-                                let key = format!("fn-{}", footnote_counter);
+                                // Prefer the note section's own `id` so this definition can be
+                                // matched to its `<a href="#id">` reference in the body (#141).
+                                // Fall back to a synthetic key only when the source document
+                                // omits `id`, to avoid dropping unreferenceable content.
+                                let key = if note_id.is_empty() {
+                                    footnote_counter += 1;
+                                    format!("fn-{}", footnote_counter)
+                                } else {
+                                    note_id
+                                };
                                 builder.push_footnote_definition(&text, &key, None);
                             }
                             _ => {}
@@ -857,25 +791,57 @@ impl FictionBookExtractor {
                     }
                 }
                 Ok(Event::Eof) => break,
-                Err(_) => break,
+                // Bailing out here abandons every remaining section of the book. Returning
+                // `Ok` with a half-read body and no warning is what #133 reports; name the
+                // loss and keep the sections that were already collected.
+                Err(e) => {
+                    crate::core::diagnostics::push_truncated_parse_warning(
+                        &mut parse_warnings,
+                        FICTIONBOOK_WARNING_SOURCE,
+                        "the FictionBook body",
+                        &e,
+                    );
+                    break;
+                }
                 _ => {}
             }
         }
 
-        Ok(builder.build())
+        // Images cannot be positioned in-flow (see doc comment above); append them at the end of
+        // the document instead of dropping them silently.
+        for image in images {
+            let description = image.description.clone();
+            builder.push_image(description.as_deref(), image, None, None);
+        }
+
+        let mut doc = builder.build();
+        for warning in parse_warnings {
+            crate::core::diagnostics::push_warning_deduped(&mut doc.processing_warnings, warning);
+        }
+        Ok(doc)
     }
 
     /// Extract paragraph text with annotation tracking for inline formatting.
+    ///
+    /// Inline footnote/endnote references (`<a type="note" href="#id">marker</a>` or
+    /// `<a xlink:href="#id">marker</a>`) are resolved by `id` and pushed as their own
+    /// `FootnoteRef` element via `builder`, so the renderer can later link them to the
+    /// matching `FootnoteDefinition` pushed from the `<body name="notes">` section (see
+    /// `build_internal_document`). Any text collected before the reference is flushed as
+    /// a paragraph fragment first, preserving reading order. References whose `href` does
+    /// not start with `#` (regular hyperlinks) are left untouched and their label text
+    /// flows into the surrounding paragraph as before.
     fn extract_paragraph_with_annotations(
-        reader: &mut Reader<&[u8]>,
+        reader: &mut EntityReader<'_>,
         budget: &mut SecurityBudget,
-    ) -> Result<(String, Vec<crate::types::document_structure::TextAnnotation>)> {
+        builder: &mut InternalDocumentBuilder,
+    ) -> Result<()> {
         use crate::types::document_structure::{AnnotationKind, TextAnnotation};
 
         let mut text = String::new();
         let mut annotations = Vec::new();
         let mut depth = 0;
-        let mut format_stack: Vec<(String, u32)> = Vec::new(); // (tag, start_byte_offset)
+        let mut format_stack: Vec<(String, u32)> = Vec::new();
 
         loop {
             budget.step()?;
@@ -884,6 +850,29 @@ impl FictionBookExtractor {
                     budget.enter()?;
                     let name = e.name();
                     let tag = crate::utils::xml_tag_name(name.as_ref());
+
+                    if tag == "a" {
+                        let mut href = String::new();
+                        for attr in e.attributes().flatten() {
+                            let attr_name = String::from_utf8_lossy(attr.key.as_ref());
+                            let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                            budget.check_attr(&attr_name, &attr_value)?;
+                            if attr_name == "l:href" || attr_name == "xlink:href" || attr_name == "href" {
+                                href = attr_value.to_string();
+                            }
+                        }
+                        if let Some(key) = href.strip_prefix('#').filter(|k| !k.is_empty()) {
+                            let key = key.to_string();
+                            if !text.is_empty() {
+                                builder.push_paragraph(&text, std::mem::take(&mut annotations), None, None);
+                                text.clear();
+                            }
+                            let marker = Self::extract_inline_label(reader, budget)?;
+                            builder.push_footnote_ref(&marker, &key, None);
+                            continue;
+                        }
+                    }
+
                     depth += 1;
                     match tag.as_ref() {
                         "emphasis" | "strong" | "strikethrough" | "code" => {
@@ -935,10 +924,53 @@ impl FictionBookExtractor {
                         text.push_str(trimmed);
                     }
                 }
-                Ok(Event::GeneralRef(r)) => {
-                    let resolved = resolve_general_ref(r.as_ref());
-                    if !resolved.is_empty() {
-                        text.push_str(&resolved);
+                Ok(Event::Eof) => break,
+                Err(e) => {
+                    return Err(crate::error::XbergError::parsing(format!("XML parsing error: {}", e)));
+                }
+                _ => {}
+            }
+        }
+
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            builder.push_paragraph(trimmed, annotations, None, None);
+        }
+
+        Ok(())
+    }
+
+    /// Read the inner text of an `<a>` element whose `Start` event has already been
+    /// consumed, stopping at its matching `End`. Used to recover the footnote marker
+    /// text (e.g. `"1"`) from `<a href="#note1">1</a>`.
+    fn extract_inline_label(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<String> {
+        let mut label = String::new();
+        let mut depth = 1;
+
+        loop {
+            budget.step()?;
+            match reader.read_event() {
+                Ok(Event::Start(_)) => {
+                    budget.enter()?;
+                    depth += 1;
+                }
+                Ok(Event::End(_)) => {
+                    budget.leave();
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Ok(Event::Text(t)) => {
+                    let decoded = String::from_utf8_lossy(t.as_ref());
+                    budget.check_entity(&decoded)?;
+                    budget.account_text(decoded.len())?;
+                    let trimmed = decoded.trim();
+                    if !trimmed.is_empty() {
+                        if !label.is_empty() {
+                            label.push(' ');
+                        }
+                        label.push_str(trimmed);
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -949,11 +981,11 @@ impl FictionBookExtractor {
             }
         }
 
-        Ok((text.trim().to_string(), annotations))
+        Ok(label.trim().to_string())
     }
 
     /// Extract footnote text from a notes-body section.
-    fn extract_footnote_text(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<String> {
+    fn extract_footnote_text(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<String> {
         let mut text = String::new();
         let mut section_depth = 1;
 
@@ -1040,30 +1072,17 @@ impl InternalDocumentExtractor for FictionBookExtractor {
 
         let metadata = Self::extract_metadata(content, &mut budget)?;
 
-        let tables = Self::extract_tables_from_body(content, &mut budget)?;
         let images = Self::extract_binary_images(content, &mut budget)?;
         let links = Self::extract_links(content, &mut budget)?;
 
-        let mut doc = Self::build_internal_document(content, &mut budget)?;
+        let mut doc = Self::build_internal_document(content, images, &mut budget)?;
         doc.mime_type = mime_type.to_string();
         doc.metadata = metadata;
 
-        // Add extracted tables
-        for table in tables {
-            doc.push_table(table);
-        }
-
-        // Add extracted images
-        for image in images {
-            doc.push_image(image);
-        }
-
-        // Add extracted links
         for uri in links {
             doc.push_uri(uri);
         }
 
-        // Pre-render markdown for Markdown output format to preserve formatting
         if config.output_format == OutputFormat::Markdown {
             doc.pre_rendered_content = Some(crate::rendering::render_markdown(&doc));
             doc.metadata.output_format = Some("markdown".to_string());
@@ -1151,7 +1170,6 @@ mod tests {
             authors[0]
         );
 
-        // Check author details in additional metadata
         let details = metadata
             .additional
             .get("author_details")
@@ -1259,7 +1277,6 @@ mod tests {
 
     #[test]
     fn test_fictionbook_binary_images() {
-        // A minimal 1x1 red PNG as base64
         let png_b64 =
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg==";
         let fb2 = format!(
@@ -1281,7 +1298,6 @@ mod tests {
         assert_eq!(images[0].image_index, 0);
         assert_eq!(images[0].description, Some("cover.png".to_string()));
         assert!(!images[0].data.is_empty(), "image data should not be empty");
-        // Verify it starts with PNG magic bytes
         assert!(images[0].data.starts_with(&[0x89, 0x50, 0x4E, 0x47]));
     }
 
@@ -1299,7 +1315,6 @@ mod tests {
 
         let images = FictionBookExtractor::extract_binary_images(fb2, &mut SecurityBudget::with_defaults())
             .expect("Image extraction failed");
-        // Both entries are present (even if base64 decodes to short data)
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].image_index, 0);
         assert_eq!(images[1].image_index, 1);
@@ -1367,7 +1382,6 @@ mod tests {
   </description>
 </FictionBook>"#;
 
-        // Links outside <body> should not be extracted
         let links = FictionBookExtractor::extract_links(fb2, &mut SecurityBudget::with_defaults())
             .expect("Link extraction failed");
         assert!(links.is_empty());
@@ -1392,29 +1406,114 @@ mod tests {
         assert!(links.is_empty());
     }
 
-    #[test]
-    fn test_fictionbook_tables() {
+    /// Regression test for the bug where extracted tables never reached rendered output:
+    /// `extract_content` used the raw `InternalDocument::push_table`, which only records the
+    /// table data without creating a matching `ElementKind::Table` element, so renderers that
+    /// walk `doc.elements` (all of them) never emitted the table. See
+    /// `crate::types::internal_builder::InternalDocumentBuilder::push_table` for the correct API.
+    #[tokio::test]
+    async fn test_fictionbook_tables_render_in_markdown_output() {
         let fb2 = br#"<?xml version="1.0" encoding="UTF-8"?>
 <FictionBook>
-  <description>
-    <title-info><lang>en</lang></title-info>
-  </description>
   <body>
     <section>
+      <p>Intro paragraph.</p>
       <table>
         <tr><th>Name</th><th>Age</th></tr>
         <tr><td>Alice</td><td>30</td></tr>
         <tr><td>Bob</td><td>25</td></tr>
       </table>
+      <p>Outro paragraph.</p>
     </section>
   </body>
 </FictionBook>"#;
 
-        let tables = FictionBookExtractor::extract_tables_from_body(fb2, &mut SecurityBudget::with_defaults())
-            .expect("Table extraction failed");
-        assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].cells.len(), 3);
-        assert_eq!(tables[0].cells[0], vec!["Name", "Age"]);
-        assert_eq!(tables[0].cells[1], vec!["Alice", "30"]);
+        let extractor = FictionBookExtractor::new();
+        let config = ExtractionConfig {
+            output_format: OutputFormat::Markdown,
+            ..Default::default()
+        };
+
+        let doc = extractor
+            .extract_content(fb2, "application/x-fictionbook+xml", &config)
+            .await
+            .expect("extraction should succeed");
+
+        assert_eq!(doc.tables.len(), 1);
+        assert_eq!(doc.tables[0].cells.len(), 3);
+        assert_eq!(doc.tables[0].cells[0], vec!["Name", "Age"]);
+        assert_eq!(doc.tables[0].cells[1], vec!["Alice", "30"]);
+        assert_eq!(doc.tables[0].cells[2], vec!["Bob", "25"]);
+
+        let markdown = doc
+            .pre_rendered_content
+            .clone()
+            .expect("markdown output should have been pre-rendered");
+
+        assert!(
+            markdown.contains("Alice")
+                && markdown.contains("30")
+                && markdown.contains("Bob")
+                && markdown.contains("25")
+                && markdown.contains("Name"),
+            "table cell values missing from rendered markdown output: {markdown}"
+        );
+
+        let intro_pos = markdown.find("Intro paragraph").expect("intro paragraph present");
+        let table_pos = markdown.find("Alice").expect("table cell present");
+        let outro_pos = markdown.find("Outro paragraph").expect("outro paragraph present");
+        assert!(
+            intro_pos < table_pos && table_pos < outro_pos,
+            "table should be positioned in document flow between the two paragraphs: {markdown}"
+        );
+
+        let table_element_count = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Table { .. }))
+            .count();
+        assert_eq!(
+            table_element_count, 1,
+            "expected exactly one Table element in {:?}",
+            doc.elements
+        );
+    }
+
+    /// Regression test: embedded `<binary>` images must also produce a renderable
+    /// `ElementKind::Image` element, not just an entry in `doc.images` that nothing references.
+    #[tokio::test]
+    async fn test_fictionbook_images_produce_image_element() {
+        let png_b64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg==";
+        let fb2 = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<FictionBook>
+  <body><section><p>Content with image.</p></section></body>
+  <binary id="cover.png" content-type="image/png">{}</binary>
+</FictionBook>"#,
+            png_b64
+        );
+
+        let extractor = FictionBookExtractor::new();
+        let doc = extractor
+            .extract_content(
+                fb2.as_bytes(),
+                "application/x-fictionbook+xml",
+                &ExtractionConfig::default(),
+            )
+            .await
+            .expect("extraction should succeed");
+
+        assert_eq!(doc.images.len(), 1);
+        let image_element_count = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Image { .. }))
+            .count();
+        assert_eq!(
+            image_element_count, 1,
+            "expected one Image element in {:?}",
+            doc.elements
+        );
     }
 }

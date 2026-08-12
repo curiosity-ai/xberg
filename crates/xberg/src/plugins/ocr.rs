@@ -23,7 +23,7 @@ pub enum OcrBackendType {
     PaddleOCR,
     /// Candle-based VLM OCR (TrOCR, PaddleOCR-VL).
     Candle,
-    /// Custom/third-party OCR backend
+    /// Name-selected built-in or third-party OCR backend.
     Custom,
 }
 
@@ -61,11 +61,10 @@ pub enum OcrBackendType {
 /// impl OcrBackend for CustomOcrBackend {
 ///     async fn process_image(&self, image_bytes: &[u8], config: &OcrConfig) -> Result<ExtractedDocument> {
 ///         // Implement OCR logic here
-///         Ok(ExtractedDocument {
-///             content: "Extracted text".to_string(),
-///             mime_type: Cow::Borrowed("text/plain"),
-///             ..Default::default()
-///         })
+///         let mut document = ExtractedDocument::default();
+///         document.content = "Extracted text".to_string();
+///         document.mime_type = Cow::Borrowed("text/plain");
+///         Ok(document)
 ///     }
 ///
 ///     async fn process_image_file(&self, path: &Path, config: &OcrConfig) -> Result<ExtractedDocument> {
@@ -127,7 +126,9 @@ pub trait OcrBackend: Plugin {
     /// # impl OcrBackend for MyOcr {
     /// #     fn supports_language(&self, _: &str) -> bool { true }
     /// #     fn backend_type(&self) -> OcrBackendType { OcrBackendType::Custom }
-    /// #     async fn process_image_file(&self, _: &Path, _: &OcrConfig) -> Result<ExtractedDocument> { todo!() }
+    /// #     async fn process_image_file(&self, _: &Path, _: &OcrConfig) -> Result<ExtractedDocument> {
+    /// #         Ok(ExtractedDocument::default())
+    /// #     }
     /// async fn process_image(&self, image_bytes: &[u8], config: &OcrConfig) -> Result<ExtractedDocument> {
     ///     // Read backend-specific options; unknown keys are silently ignored.
     ///     let fast_mode = config.backend_options
@@ -147,18 +148,32 @@ pub trait OcrBackend: Plugin {
     ///     let text = if fast_mode {
     ///         "Fast OCR result".to_string()
     ///     } else {
-    ///         format!("Extracted text in language: {}", config.language)
+    ///         format!("Extracted text in language: {:?}", config.language)
     ///     };
     ///
-    ///     Ok(ExtractedDocument {
-    ///         content: text,
-    ///         mime_type: Cow::Borrowed("text/plain"),
-    ///         ..Default::default()
-    ///     })
+    ///     let mut document = ExtractedDocument::default();
+    ///     document.content = text;
+    ///     document.mime_type = Cow::Borrowed("text/plain");
+    ///     Ok(document)
     /// }
     /// # }
     /// ```
     async fn process_image(&self, image_bytes: &[u8], config: &OcrConfig) -> Result<ExtractedDocument>;
+
+    /// Process an owned image buffer and extract text via OCR.
+    ///
+    /// The default implementation delegates to [`Self::process_image`]. Backends
+    /// that hand work to an owned blocking task can override this method to avoid
+    /// copying the image buffer.
+    ///
+    /// Excluded from the polyglot binding surface: it is an owned-buffer perf
+    /// override whose `Arc<Vec<u8>>` parameter has no binding representation, and
+    /// foreign backends satisfy the trait through [`Self::process_image`] via this
+    /// default delegation.
+    #[cfg_attr(alef, alef(skip))]
+    async fn process_image_owned(&self, image_bytes: Arc<Vec<u8>>, config: &OcrConfig) -> Result<ExtractedDocument> {
+        self.process_image(image_bytes.as_slice(), config).await
+    }
 
     /// Process a file and extract text via OCR.
     ///
@@ -218,8 +233,12 @@ pub trait OcrBackend: Plugin {
     /// # #[async_trait]
     /// # impl OcrBackend for MyOcr {
     /// #     fn backend_type(&self) -> OcrBackendType { OcrBackendType::Custom }
-    /// #     async fn process_image(&self, _: &[u8], _: &OcrConfig) -> Result<ExtractedDocument> { todo!() }
-    /// #     async fn process_image_file(&self, _: &Path, _: &OcrConfig) -> Result<ExtractedDocument> { todo!() }
+    /// #     async fn process_image(&self, _: &[u8], _: &OcrConfig) -> Result<ExtractedDocument> {
+    /// #         Ok(ExtractedDocument::default())
+    /// #     }
+    /// #     async fn process_image_file(&self, _: &Path, _: &OcrConfig) -> Result<ExtractedDocument> {
+    /// #         Ok(ExtractedDocument::default())
+    /// #     }
     /// fn supports_language(&self, lang: &str) -> bool {
     ///     self.languages.contains(&lang.to_string())
     /// }
@@ -251,8 +270,12 @@ pub trait OcrBackend: Plugin {
     /// # #[async_trait]
     /// # impl OcrBackend for TesseractBackend {
     /// #     fn supports_language(&self, _: &str) -> bool { true }
-    /// #     async fn process_image(&self, _: &[u8], _: &OcrConfig) -> Result<ExtractedDocument> { todo!() }
-    /// #     async fn process_image_file(&self, _: &Path, _: &OcrConfig) -> Result<ExtractedDocument> { todo!() }
+    /// #     async fn process_image(&self, _: &[u8], _: &OcrConfig) -> Result<ExtractedDocument> {
+    /// #         Ok(ExtractedDocument::default())
+    /// #     }
+    /// #     async fn process_image_file(&self, _: &Path, _: &OcrConfig) -> Result<ExtractedDocument> {
+    /// #         Ok(ExtractedDocument::default())
+    /// #     }
     /// fn backend_type(&self) -> OcrBackendType {
     ///     OcrBackendType::Tesseract
     /// }
@@ -304,6 +327,21 @@ pub trait OcrBackend: Plugin {
             "Document-level OCR processing not supported by this backend".to_string(),
         ))
     }
+
+    /// Optional: Probe whether this backend will actually execute on this host
+    /// with the given configuration.
+    ///
+    /// Used by `doctor` diagnostics. Implementations must not download models
+    /// or make billable API calls; anything not yet local is reported as
+    /// `ProbeStatus::Skip`. Defaults to `Skip` so custom backends need no
+    /// changes; implement it to give users real environment diagnostics.
+    ///
+    /// Excluded from the polyglot binding surface: doctor results are produced
+    /// by the generated `doctor()` function, not per-backend calls.
+    #[cfg_attr(alef, alef(skip))]
+    fn probe(&self, _config: &OcrConfig) -> crate::doctor::DoctorCheck {
+        crate::doctor::DoctorCheck::skip(self.name(), "no probe implemented for this backend")
+    }
 }
 
 /// Register an OCR backend with the global registry.
@@ -348,11 +386,10 @@ pub trait OcrBackend: Plugin {
 /// #[async_trait]
 /// impl OcrBackend for CustomOcr {
 ///     async fn process_image(&self, _: &[u8], _: &OcrConfig) -> Result<ExtractedDocument> {
-///         Ok(ExtractedDocument {
-///             content: "text".to_string(),
-///             mime_type: Cow::Borrowed("text/plain"),
-///             ..Default::default()
-///         })
+///         let mut document = ExtractedDocument::default();
+///         document.content = "text".to_string();
+///         document.mime_type = Cow::Borrowed("text/plain");
+///         Ok(document)
 ///     }
 ///     fn supports_language(&self, _: &str) -> bool { true }
 ///     fn backend_type(&self) -> OcrBackendType { OcrBackendType::Custom }
@@ -474,10 +511,13 @@ pub fn clear_ocr_backends() -> crate::Result<()> {
 ///
 /// This function is the self-healing counterpart, mirroring
 /// `crate::extractors::ensure_initialized` for the document extractor registry:
-/// if the registry is empty it re-registers the built-in backends so that
-/// callers always see a usable registry. It is a no-op when the registry
-/// already has at least one backend, so callers may invoke it cheaply before
-/// every OCR dispatch.
+/// it re-registers the built-in backends whenever the built-in default is
+/// missing so that callers always see a usable registry. It re-seeds not only
+/// when the registry is empty but also when it is non-empty yet missing the
+/// built-in default (e.g. after [`clear_ocr_backends`] followed by registering
+/// a *different* backend) — the plain "empty" check would leave default-config
+/// OCR without a backend. Re-seeding is non-destructive (user-registered
+/// backends are kept) and cheap to invoke before every OCR dispatch.
 #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
 pub(crate) fn ensure_ocr_backends_initialized() {
     use crate::plugins::registry::get_ocr_backend_registry;
@@ -486,17 +526,12 @@ pub(crate) fn ensure_ocr_backends_initialized() {
 
     {
         let registry = registry.read();
-        if !registry.list().is_empty() {
+        if !registry.is_missing_default_backend() {
             return;
         }
     }
 
-    let mut registry = registry.write();
-    // Re-check under the write lock: another thread may have re-seeded the
-    // registry between dropping the read lock and acquiring the write lock.
-    if registry.list().is_empty() {
-        registry.register_defaults();
-    }
+    registry.write().ensure_defaults();
 }
 
 #[cfg(test)]
@@ -562,6 +597,21 @@ mod tests {
         };
 
         let result = backend.process_image(b"fake image data", &config).await.unwrap();
+        assert_eq!(result.content, "Mocked OCR text");
+        assert_eq!(result.mime_type, "text/plain");
+    }
+
+    #[tokio::test]
+    async fn test_ocr_backend_process_image_owned_default_impl_is_object_safe() {
+        let backend: Arc<dyn OcrBackend> = Arc::new(MockOcrBackend {
+            languages: vec!["eng".to_string()],
+        });
+
+        let result = backend
+            .process_image_owned(Arc::new(b"fake image data".to_vec()), &OcrConfig::default())
+            .await
+            .unwrap();
+
         assert_eq!(result.content, "Mocked OCR text");
         assert_eq!(result.mime_type, "text/plain");
     }
@@ -688,7 +738,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // A backend that reads backend_options and adjusts its output accordingly.
     struct OptionAwareBackend;
 
     impl Plugin for OptionAwareBackend {
@@ -755,7 +804,6 @@ mod tests {
     async fn test_backend_options_unknown_keys_silently_ignored() {
         let backend = OptionAwareBackend;
 
-        // Keys not used by this backend should not cause any error.
         let config = OcrConfig {
             backend_options: Some(serde_json::json!({
                 "unknown_key": "value",

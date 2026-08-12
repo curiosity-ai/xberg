@@ -15,7 +15,11 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! `OcrProcessor::new` and `process_image` are `pub(crate)` — OCR is driven through the
+//! extraction pipeline (`ExtractionConfig::ocr`), not by constructing a processor directly.
+//! The example below documents the internal shape and is not compiled.
+//!
+//! ```ignore
 //! use xberg::ocr::{OcrProcessor, TesseractConfig};
 //!
 //! # fn example() -> Result<(), xberg::ocr::error::OcrError> {
@@ -37,11 +41,10 @@
 //! [dependencies]
 //! xberg = { version = "4.0", features = ["ocr"] }
 //! ```
-mod backends;
 #[cfg(feature = "ocr")]
 /// Persistent file-backed cache for OCR results keyed by image hash and config.
 pub mod cache;
-#[cfg(any(feature = "ocr", feature = "paddle-ocr"))]
+#[cfg(any(feature = "ocr", paddle_ocr))]
 /// Type conversions between internal OCR types and public API types.
 pub mod conversion;
 /// OCR error types.
@@ -49,8 +52,6 @@ pub mod error;
 #[cfg(feature = "ocr")]
 /// hOCR HTML output parser that extracts word bounding boxes and confidence scores.
 pub mod hocr_parser;
-/// Registry of Tesseract language codes and language-pack validation helpers.
-pub mod language_registry;
 #[cfg(all(
     feature = "layout-detection",
     feature = "pdf",
@@ -88,7 +89,6 @@ pub mod validation;
 #[cfg(feature = "ocr")]
 pub use cache::{OcrCache, OcrCacheStats};
 pub use error::OcrError;
-pub use language_registry::LanguageRegistry;
 #[cfg(feature = "ocr")]
 pub use processor::OcrProcessor;
 #[cfg(feature = "ocr")]

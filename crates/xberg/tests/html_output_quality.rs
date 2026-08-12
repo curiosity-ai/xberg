@@ -6,8 +6,9 @@
 //! Usage:
 //!   cargo test -p xberg --test html_output_quality -- --nocapture
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+
 mod helpers;
-use helpers::extract_uri_document_blocking;
 
 use xberg::core::config::OutputFormat;
 use xberg::extraction::derive::derive_extraction_result;
@@ -41,10 +42,6 @@ fn render_html(doc: xberg::types::internal::InternalDocument) -> String {
     let result = derive_extraction_result(doc, false, OutputFormat::Html);
     result.formatted_content.unwrap_or(result.content)
 }
-
-// ---------------------------------------------------------------------------
-// Document builders
-// ---------------------------------------------------------------------------
 
 /// A rich document with headings, paragraph, list, code block, and table.
 fn build_rich_document() -> xberg::types::internal::InternalDocument {
@@ -120,10 +117,6 @@ fn build_minimal_document() -> xberg::types::internal::InternalDocument {
     b.build()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_rich_document_html_quality() {
     let html = render_html(build_rich_document());
@@ -183,7 +176,7 @@ fn test_file_extraction_html_quality() {
             continue;
         }
 
-        let result = extract_uri_document_blocking(&path, None, &config).expect("extraction should succeed");
+        let result = helpers::extract_uri_document_blocking(&path, None, &config).expect("extraction should succeed");
         let html = result.formatted_content.as_deref().unwrap_or(&result.content);
 
         if let Err(msg) = assert_html_quality(html) {

@@ -30,8 +30,12 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionConfig {
-    /// Master switch. When false the block is ignored and audio files fall back
-    /// to the normal "unsupported format" path.
+    /// Master switch. When `false`, the transcription pipeline is not run.
+    ///
+    /// The extractor is registered for audio/video MIME types whenever the `transcription`
+    /// feature is compiled in, independently of this flag, so an audio/video input with
+    /// `enabled = false` fails with an `XbergError::Transcription` explaining how to turn
+    /// transcription on — it does not fall through to another extractor.
     #[serde(default = "default_true")]
     pub enabled: bool,
 
@@ -51,8 +55,10 @@ pub struct TranscriptionConfig {
 
     /// Whether to request segment-level timestamps.
     ///
-    /// Accepted for forward compatibility. The current engine always uses
-    /// `<|notimestamps|>` and does not emit segment metadata yet.
+    /// When `true`, the decoder prompt omits `<|notimestamps|>` so the model emits
+    /// `<|x.xx|>` tokens, and each transcript segment becomes its own paragraph element
+    /// carrying `start_ms` / `end_ms` attributes. When `false` (default), all segment
+    /// text is joined into a single flat paragraph with no timing attributes.
     #[serde(default)]
     pub timestamps: bool,
 
@@ -72,16 +78,22 @@ pub struct TranscriptionConfig {
 
     /// Wall-clock timeout for the entire transcription operation (ms).
     ///
-    /// Default: 10 minutes. Reserved for timeout enforcement; the current
-    /// extractor does not enforce this field yet.
+    /// Bounds audio decode, model resolution/download, and inference together. On expiry
+    /// the extraction fails with an `XbergError::Transcription`. `None` disables the bound
+    /// and lets the operation run unbounded (not recommended for untrusted input).
+    ///
+    /// Enforced on the async extraction path only; the size and duration caps
+    /// (`max_bytes`, `max_duration_ms`) are checked on every path.
+    ///
+    /// Default: 10 minutes.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: Option<u64>,
 
-    /// Override the directory used for Whisper model cache.
+    /// Optional alternate Hugging Face cache root for Whisper models.
     ///
-    /// When `None`, uses the centralized resolver:
-    /// `XBERG_CACHE_DIR/whisper` or the platform default
-    /// (`~/.cache/xberg/whisper` on Linux, etc.).
+    /// When unset, hf-hub follows `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`,
+    /// `HF_HOME`, XDG, and platform defaults. Files remain in the standard
+    /// content-addressed snapshot layout and are not copied into an Xberg cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_cache_dir: Option<PathBuf>,
 
@@ -94,9 +106,11 @@ pub struct TranscriptionConfig {
 
     /// Request SHA256 verification of downloaded model files.
     ///
-    /// Reserved for the checksum table follow-up. The current resolver logs a
-    /// warning and treats this as a no-op.
-    #[serde(default = "default_true")]
+    /// Defaults to `false` because the resolver downloads from mutable Hugging
+    /// Face refs unless callers pin and verify models out-of-band. Explicit
+    /// `true` requests are rejected by the model resolver until pinned checksum
+    /// metadata is available.
+    #[serde(default)]
     pub verify_hash: bool,
 }
 
@@ -112,7 +126,7 @@ impl Default for TranscriptionConfig {
             timeout_ms: default_timeout_ms(),
             model_cache_dir: None,
             allow_network: true,
-            verify_hash: true,
+            verify_hash: false,
         }
     }
 }
@@ -122,15 +136,15 @@ fn default_true() -> bool {
 }
 
 fn default_max_duration_ms() -> Option<u64> {
-    Some(30 * 60 * 1000) // 30 minutes
+    Some(30 * 60 * 1000)
 }
 
 fn default_max_bytes() -> Option<u64> {
-    Some(512 * 1024 * 1024) // 512 MiB
+    Some(512 * 1024 * 1024)
 }
 
 fn default_timeout_ms() -> Option<u64> {
-    Some(10 * 60 * 1000) // 10 minutes
+    Some(10 * 60 * 1000)
 }
 
 /// Supported Whisper model sizes.
@@ -184,7 +198,6 @@ mod tests {
     fn test_serde_omits_none_fields() {
         let cfg = TranscriptionConfig::default();
         let json = serde_json::to_string(&cfg).unwrap();
-        // language and cache_dir should be omitted when None
         assert!(!json.contains("language"));
         assert!(!json.contains("model_cache_dir"));
     }

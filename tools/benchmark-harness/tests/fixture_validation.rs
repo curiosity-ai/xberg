@@ -9,6 +9,8 @@
 //! - Detecting duplicate document references
 //! - Ensuring format coverage for core formats
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+
 use benchmark_harness::Fixture;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -25,7 +27,6 @@ fn discover_fixture_files() -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Recursively find JSON files in subdirectories
                 discover_fixtures_recursive(&path, &mut fixtures);
             } else if is_json_fixture(&path) {
                 fixtures.push(path);
@@ -54,6 +55,10 @@ fn discover_fixtures_recursive(dir: &Path, fixtures: &mut Vec<PathBuf>) {
 /// Check if a path is a JSON fixture file (ends with .json)
 fn is_json_fixture(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        && !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".split.json"))
 }
 
 #[test]
@@ -101,12 +106,10 @@ fn all_fixtures_deserialize_and_validate() {
     for fixture_path in &fixtures {
         match Fixture::from_file(fixture_path) {
             Ok(fixture) => {
-                // Verify file_type is non-empty
                 if fixture.file_type.is_empty() {
                     validation_errors.push(format!("{}: file_type cannot be empty", fixture_path.display()));
                 }
 
-                // Verify document path is relative
                 if fixture.document.is_absolute() {
                     validation_errors.push(format!(
                         "{}: document path must be relative, got {}",
@@ -180,12 +183,6 @@ fn all_fixture_documents_exist_on_disk() {
     }
 }
 
-// TODO: re-enable once fixture file_size metadata is regenerated against the
-// current test_documents submodule. 143 fixtures drifted vs disk (likely after
-// a submodule sync that updated some HTML/PDF fixtures by a few bytes each).
-// Tracking separately; not a correctness issue — file_size metadata is purely
-// informational, the benchmark harness re-reads actual sizes at run time.
-#[ignore = "TODO: regenerate fixture file_size metadata against current test_documents/"]
 #[test]
 fn all_fixture_file_sizes_match() {
     let fixtures = discover_fixture_files();
@@ -312,7 +309,6 @@ fn no_duplicate_document_references() {
                     .expect("fixture path should have parent directory");
                 let document_path = fixture_dir.join(&fixture.document);
 
-                // Canonicalize path if it exists, otherwise use as-is
                 let canonical_path = if document_path.exists() {
                     match document_path.canonicalize() {
                         Ok(p) => p,
@@ -337,7 +333,6 @@ fn no_duplicate_document_references() {
         }
     }
 
-    // Check for duplicates
     for (doc_path, fixture_paths) in document_map {
         if fixture_paths.len() > 1 {
             duplicates.push(format!(
@@ -370,7 +365,6 @@ fn core_formats_have_fixture_coverage() {
         "No fixture JSON files found in fixtures directory"
     );
 
-    // Core formats that should have at least one fixture
     let required_formats = vec![
         "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "html", "csv", "json", "xml", "yaml", "md", "txt", "eml",
         "epub", "rtf", "odt", "png", "jpg", "gif", "bmp", "tiff", "webp",
@@ -380,27 +374,20 @@ fn core_formats_have_fixture_coverage() {
     let mut format_examples: HashMap<String, Vec<String>> = HashMap::new();
 
     for fixture_path in &fixtures {
-        match Fixture::from_file(fixture_path) {
-            Ok(fixture) => {
-                let file_type_lower = fixture.file_type.to_lowercase();
+        if let Ok(fixture) = Fixture::from_file(fixture_path) {
+            let file_type_lower = fixture.file_type.to_lowercase();
 
-                // Track format coverage
-                if required_formats.contains(&file_type_lower.as_str()) {
-                    covered_formats.insert(file_type_lower.clone());
-                }
+            if required_formats.contains(&file_type_lower.as_str()) {
+                covered_formats.insert(file_type_lower.clone());
+            }
 
-                // Record examples for debugging
-                format_examples.entry(file_type_lower).or_default().push(
-                    fixture_path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                );
-            }
-            Err(_) => {
-                // Skip invalid fixtures
-            }
+            format_examples.entry(file_type_lower).or_default().push(
+                fixture_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
     }
 
@@ -424,7 +411,6 @@ fn core_formats_have_fixture_coverage() {
         );
     }
 
-    // Print coverage summary for informational purposes
     eprintln!("\nFormat Coverage Summary:");
     eprintln!("========================");
     for format in required_formats.iter().copied() {
@@ -437,7 +423,6 @@ fn core_formats_have_fixture_coverage() {
 /// This is a helper that can be used to validate a specific fixture
 #[test]
 fn fixture_structure_is_valid() {
-    // Create a sample fixture in memory to test structure validation
     let sample_json = json!({
         "document": "relative/path/to/document.pdf",
         "file_type": "pdf",
@@ -453,7 +438,6 @@ fn fixture_structure_is_valid() {
         }
     });
 
-    // Should deserialize successfully
     let result: Result<Fixture, _> = serde_json::from_value(sample_json);
     assert!(
         result.is_ok(),

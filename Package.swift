@@ -33,7 +33,7 @@ let package = Package(
     // sibling RustBridge target below and link against this binary.
     .binaryTarget(
       name: "RustBridgeBinary",
-      url: "https://github.com/xberg-io/xberg/releases/download/v__ALEF_SWIFT_VERSION__/Xberg-rs.artifactbundle.zip",
+      url: "https://github.com/xberg-io/xberg/releases/download/v1.1.0/Xberg-rs.artifactbundle.zip",
       checksum: "__ALEF_SWIFT_CHECKSUM__"
     ),
     // RustBridge: Swift wrapper module owning the swift-bridge generated
@@ -45,9 +45,26 @@ let package = Package(
       path: "packages/swift/Sources/RustBridge",
       // The pre-built static library inside RustBridgeBinary references Apple
       // system frameworks (e.g. reqwest's proxy detection pulls in the Rust
-      // `system_configuration` crate → `SC*` symbols). The artifactbundle ships
-      // only the `.a`, so these frameworks must be linked by the consumer.
+      // `system_configuration` crate → `SC*` symbols) and native system
+      // libraries (e.g. the archive/`xz2` path pulls in `lzma-sys` →
+      // `_lzma_stream_decoder`). The artifactbundle ships only the `.a`, so these
+      // must be linked by the consumer. `liblzma` ships in the macOS SDK and on
+      // Linux.
       linkerSettings: [
+        .linkedLibrary("lzma"),
+        // Same reasoning as lzma: the bzip2 crates (archive/zip/unhwp) emit
+        // `-lbz2`, surfacing undefined `_BZ2_bzDecompress*`. `libbz2` ships in
+        // the macOS SDK and on Linux.
+        .linkedLibrary("bz2"),
+        // The pre-built static library pulls in C++ dependencies (onnxruntime,
+        // tesseract, ClipperLib) that reference the C++ runtime/ABI
+        // (`__cxa_throw`, `__gxx_personality_v0`, `__cxa_guard_acquire`, ...). A
+        // `.a` archive does not carry the transitive `-lc++`/`-lstdc++`
+        // system-lib dependency, so the consumer must link the C++ standard
+        // library explicitly or the final link fails with undefined symbols
+        // from those crates.
+        .linkedLibrary("c++", .when(platforms: [.macOS, .iOS])),
+        .linkedLibrary("stdc++", .when(platforms: [.linux])),
         .linkedFramework("Security", .when(platforms: [.macOS, .iOS])),
         .linkedFramework("CoreFoundation", .when(platforms: [.macOS, .iOS])),
         .linkedFramework("SystemConfiguration", .when(platforms: [.macOS])),

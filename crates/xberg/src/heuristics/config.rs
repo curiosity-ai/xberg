@@ -82,11 +82,11 @@ impl Default for HeuristicsConfig {
         Self {
             enable_pdf_text_heuristics: true,
             text_layer_threshold: 0.7,
-            file_size_threshold_bytes: 10 * 1024 * 1024, // 10 MiB
+            file_size_threshold_bytes: 10 * 1024 * 1024,
             page_count_threshold: 50,
             target_pages_per_chunk: 10,
             max_pages_per_chunk: 25,
-            disk_processing_threshold_bytes: 50 * 1024 * 1024, // 50 MiB
+            disk_processing_threshold_bytes: 50 * 1024 * 1024,
             min_chars_per_page: 50,
             max_xlsx_sheet_count: 200,
             max_xlsx_workbook_cells: 5_000_000,
@@ -137,11 +137,11 @@ impl HeuristicsConfig {
         Self {
             enable_pdf_text_heuristics: true,
             text_layer_threshold: 0.5,
-            file_size_threshold_bytes: 1024, // 1 KiB
+            file_size_threshold_bytes: 1024,
             page_count_threshold: 5,
             target_pages_per_chunk: 2,
             max_pages_per_chunk: 5,
-            disk_processing_threshold_bytes: 10 * 1024, // 10 KiB
+            disk_processing_threshold_bytes: 10 * 1024,
             min_chars_per_page: 10,
             max_xlsx_sheet_count: 10,
             max_xlsx_workbook_cells: 50_000,

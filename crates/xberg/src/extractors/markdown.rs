@@ -12,7 +12,9 @@
 //! - Data URI image extraction
 //!
 use super::annotation_utils::adjust_annotations_for_trim;
-use super::frontmatter_utils::{extract_frontmatter, extract_metadata_from_yaml, extract_title_from_content};
+use super::frontmatter_utils::{
+    extract_frontmatter_with_warning, extract_metadata_from_yaml, extract_title_from_content,
+};
 use crate::Result;
 use crate::core::config::ExtractionConfig;
 use crate::extractors::security::SecurityBudget;
@@ -26,8 +28,56 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// Annotation tracking entry: (kind_tag, byte_start, optional link data).
 ///
-/// kind_tag: 0=bold, 1=italic, 2=strikethrough, 3=code, 4=link
+/// kind_tag: 0=bold, 1=italic, 2=strikethrough, 3=code, 4=link, 5=superscript, 6=subscript
 type AnnotationEntry = (u8, u32, Option<(String, Option<String>)>);
+
+/// Full pulldown-cmark option set used for every Markdown parse.
+///
+/// Enables the complete parser feature surface (pandoc/GFM/Quarto supersets): tables,
+/// footnotes, strikethrough, task lists, smart punctuation, heading attributes, math,
+/// GFM alerts, definition lists, super/subscript, and wikilinks. The metadata-block
+/// options are intentionally omitted — YAML/`+++` frontmatter is stripped up-front by
+/// [`extract_frontmatter`], so those flags would never fire and would only double-parse.
+/// `ENABLE_OLD_FOOTNOTES` is also omitted (deprecated Hoedown semantics that conflict
+/// with `ENABLE_FOOTNOTES`).
+pub(crate) fn markdown_options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_SMART_PUNCTUATION
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_MATH
+        | Options::ENABLE_GFM
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_SUPERSCRIPT
+        | Options::ENABLE_SUBSCRIPT
+        | Options::ENABLE_WIKILINKS
+}
+
+/// Normalize a fenced code-block info string into a bare language token.
+///
+/// Quarto and R Markdown executable cells use a braced info string that also carries
+/// chunk options, e.g. `` ```{python} `` or `` ```{r, echo=FALSE} ``. Strip the braces
+/// and any trailing options so the emitted language is the bare kernel name (`python`,
+/// `r`). Ordinary fences (`rust`, `python`) pass through unchanged. Returns `None` for an
+/// empty or attribute-only info string.
+pub(crate) fn normalize_fence_lang(info: &str) -> Option<String> {
+    let info = info.trim();
+    if info.is_empty() {
+        return None;
+    }
+    let inner = info
+        .strip_prefix('{')
+        .map_or(info, |rest| rest.strip_suffix('}').unwrap_or(rest));
+    let lang = inner
+        .split([',', ' ', '\t'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('.');
+    if lang.is_empty() { None } else { Some(lang.to_string()) }
+}
 
 /// Markdown extractor with metadata and table support.
 ///
@@ -46,18 +96,32 @@ impl MarkdownExtractor {
         Self
     }
 
-    // Frontmatter utilities moved to shared frontmatter_utils module
-    // Text extraction and data URI decoding moved to shared markdown_utils module
-
-    // cells_to_markdown and extract_title_from_content moved to shared frontmatter_utils module
+    /// Build an `InternalDocument` from pulldown-cmark events and optional YAML frontmatter.
+    ///
+    /// Kept as a 2-argument function for existing callers (e.g. the Jupyter notebook
+    /// extractor's Markdown cell rendering) that have no JSX blocks to record. See
+    /// [`Self::build_internal_document_with_jsx`] for the MDX entry point.
+    pub(crate) fn build_internal_document(events: &[Event], yaml: &Option<serde_yaml_ng::Value>) -> InternalDocument {
+        Self::build_internal_document_with_jsx(events, yaml, &[])
+    }
 
     /// Build an `InternalDocument` from pulldown-cmark events and optional YAML frontmatter.
-    pub(crate) fn build_internal_document(events: &[Event], yaml: &Option<serde_yaml_ng::Value>) -> InternalDocument {
+    ///
+    /// This is the single shared event-stream builder for both the Markdown and MDX
+    /// extractors (see issue #273: the two used to be a ~470-line copy-paste fork that
+    /// drifted, silently dropping math/inline-HTML/superscript/subscript/definition-list
+    /// support in `.mdx` files). `raw_jsx_blocks` carries MDX-specific stripped JSX
+    /// fragments to be recorded as raw blocks; pass an empty slice for plain Markdown
+    /// (that's what [`Self::build_internal_document`] does).
+    pub(crate) fn build_internal_document_with_jsx(
+        events: &[Event],
+        yaml: &Option<serde_yaml_ng::Value>,
+        raw_jsx_blocks: &[String],
+    ) -> InternalDocument {
         use crate::types::builder;
         use crate::types::document_structure::TextAnnotation;
         let mut b = InternalDocumentBuilder::new("markdown");
 
-        // Emit frontmatter as a metadata block
         if let Some(serde_yaml_ng::Value::Mapping(map)) = yaml {
             let entries: Vec<(String, String)> = map
                 .iter()
@@ -75,6 +139,12 @@ impl MarkdownExtractor {
             }
         }
 
+        for jsx in raw_jsx_blocks {
+            if !jsx.trim().is_empty() {
+                b.push_raw_block("jsx", jsx, None);
+            }
+        }
+
         let mut paragraph_text = String::new();
         let mut paragraph_annotations: Vec<TextAnnotation> = Vec::new();
         let mut in_paragraph = false;
@@ -89,15 +159,20 @@ impl MarkdownExtractor {
         let mut current_row: Vec<String> = Vec::new();
         let mut current_cell = String::new();
         let mut in_table_cell = false;
-        let mut list_stack: Vec<bool> = Vec::new(); // ordered flag
+        let mut list_stack: Vec<bool> = Vec::new();
         let mut list_item_text = String::new();
         let mut list_item_annotations: Vec<TextAnnotation> = Vec::new();
         let mut in_list_item = false;
         let mut in_image = false;
         let mut image_alt = String::new();
         let mut image_url: Option<String> = None;
+        let mut image_counter: u32 = 0;
         let mut footnote_def_label: Option<String> = None;
         let mut footnote_def_text = String::new();
+        let mut in_def_title = false;
+        let mut in_def_desc = false;
+        let mut def_buf = String::new();
+        let mut blockquote_stack: Vec<bool> = Vec::new();
 
         let mut annotation_starts: Vec<AnnotationEntry> = Vec::new();
 
@@ -139,7 +214,9 @@ impl MarkdownExtractor {
                     heading_text.clear();
                     heading_annotations.clear();
                 }
-                Event::Start(Tag::Paragraph) if !in_heading && !in_list_item && footnote_def_label.is_none() => {
+                Event::Start(Tag::Paragraph)
+                    if !in_heading && !in_list_item && footnote_def_label.is_none() && !in_def_desc =>
+                {
                     paragraph_text.clear();
                     paragraph_annotations.clear();
                     in_paragraph = true;
@@ -158,8 +235,6 @@ impl MarkdownExtractor {
                     paragraph_text.clear();
                     paragraph_annotations.clear();
                 }
-                // Inline formatting — annotation tracking
-                // Annotations are tracked for paragraphs, headings, and list items.
                 Event::Start(Tag::Strong) => {
                     if in_paragraph {
                         annotation_starts.push((0, active_text_offset(&paragraph_text), None));
@@ -250,6 +325,66 @@ impl MarkdownExtractor {
                         }
                     }
                 }
+                Event::Start(Tag::Superscript) => {
+                    if in_paragraph {
+                        annotation_starts.push((5, active_text_offset(&paragraph_text), None));
+                    } else if in_heading {
+                        annotation_starts.push((5, active_text_offset(&heading_text), None));
+                    } else if in_list_item {
+                        annotation_starts.push((5, active_text_offset(&list_item_text), None));
+                    }
+                }
+                Event::End(TagEnd::Superscript) => {
+                    if let Some(i) = annotation_starts.iter().rposition(|(k, _, _)| *k == 5) {
+                        let (_, start, _) = annotation_starts.remove(i);
+                        if in_paragraph {
+                            let end = active_text_offset(&paragraph_text);
+                            if start < end {
+                                paragraph_annotations.push(builder::superscript(start, end));
+                            }
+                        } else if in_heading {
+                            let end = active_text_offset(&heading_text);
+                            if start < end {
+                                heading_annotations.push(builder::superscript(start, end));
+                            }
+                        } else if in_list_item {
+                            let end = active_text_offset(&list_item_text);
+                            if start < end {
+                                list_item_annotations.push(builder::superscript(start, end));
+                            }
+                        }
+                    }
+                }
+                Event::Start(Tag::Subscript) => {
+                    if in_paragraph {
+                        annotation_starts.push((6, active_text_offset(&paragraph_text), None));
+                    } else if in_heading {
+                        annotation_starts.push((6, active_text_offset(&heading_text), None));
+                    } else if in_list_item {
+                        annotation_starts.push((6, active_text_offset(&list_item_text), None));
+                    }
+                }
+                Event::End(TagEnd::Subscript) => {
+                    if let Some(i) = annotation_starts.iter().rposition(|(k, _, _)| *k == 6) {
+                        let (_, start, _) = annotation_starts.remove(i);
+                        if in_paragraph {
+                            let end = active_text_offset(&paragraph_text);
+                            if start < end {
+                                paragraph_annotations.push(builder::subscript(start, end));
+                            }
+                        } else if in_heading {
+                            let end = active_text_offset(&heading_text);
+                            if start < end {
+                                heading_annotations.push(builder::subscript(start, end));
+                            }
+                        } else if in_list_item {
+                            let end = active_text_offset(&list_item_text);
+                            if start < end {
+                                list_item_annotations.push(builder::subscript(start, end));
+                            }
+                        }
+                    }
+                }
                 Event::Start(Tag::Link { dest_url, title, .. }) => {
                     let url = dest_url.to_string();
                     let title_opt = if title.is_empty() {
@@ -269,7 +404,6 @@ impl MarkdownExtractor {
                     if let Some(i) = annotation_starts.iter().rposition(|(k, _, _)| *k == 4) {
                         let (_, start, link_data) = annotation_starts.remove(i);
                         if let Some((url, title)) = link_data {
-                            // Collect the link label text from the active buffer
                             let label_text = if in_paragraph {
                                 let end = active_text_offset(&paragraph_text);
                                 if start < end {
@@ -297,7 +431,6 @@ impl MarkdownExtractor {
                             } else {
                                 None
                             };
-                            // Push URI (compute kind before moving url)
                             if !url.is_empty() {
                                 let kind = classify_uri(&url);
                                 b.push_uri(ExtractedUri {
@@ -312,7 +445,7 @@ impl MarkdownExtractor {
                 }
                 Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang))) => {
                     code_text.clear();
-                    code_lang = if lang.is_empty() { None } else { Some(lang.to_string()) };
+                    code_lang = normalize_fence_lang(lang);
                     in_code_block = true;
                 }
                 Event::Start(Tag::CodeBlock(_)) => {
@@ -329,11 +462,28 @@ impl MarkdownExtractor {
                     code_text.clear();
                     code_lang = None;
                 }
-                Event::Start(Tag::BlockQuote(_)) => {
-                    b.push_quote_start();
+                Event::Start(Tag::BlockQuote(kind)) => {
+                    // GFM alert (`> [!NOTE]`) — pulldown consumes the `[!KIND]` marker into
+                    if let Some(alert) = kind {
+                        let alert_kind = match alert {
+                            pulldown_cmark::BlockQuoteKind::Note => "note",
+                            pulldown_cmark::BlockQuoteKind::Tip => "tip",
+                            pulldown_cmark::BlockQuoteKind::Important => "important",
+                            pulldown_cmark::BlockQuoteKind::Warning => "warning",
+                            pulldown_cmark::BlockQuoteKind::Caution => "caution",
+                        };
+                        b.push_admonition(alert_kind, None, None);
+                        blockquote_stack.push(true);
+                    } else {
+                        b.push_quote_start();
+                        blockquote_stack.push(false);
+                    }
                 }
                 Event::End(TagEnd::BlockQuote(_)) => {
-                    b.push_quote_end();
+                    let was_alert = blockquote_stack.pop().unwrap_or(false);
+                    if !was_alert {
+                        b.push_quote_end();
+                    }
                 }
                 Event::Start(Tag::List(start)) => {
                     let ordered = start.is_some();
@@ -376,6 +526,7 @@ impl MarkdownExtractor {
                             markdown,
                             page_number: 1,
                             bounding_box: None,
+                            ..Default::default()
                         };
                         b.push_table(table, None, None);
                     }
@@ -399,40 +550,44 @@ impl MarkdownExtractor {
                 Event::Start(Tag::Image { dest_url, .. }) => {
                     in_image = true;
                     image_alt.clear();
-                    // Store image URL for URI collection on End
                     image_url = Some(dest_url.to_string());
                 }
                 Event::End(TagEnd::Image) => {
                     in_image = false;
-                    // Push a proper image element (no ExtractedImage data, use sentinel index)
                     let trimmed = image_alt.trim();
-                    let desc = if trimmed.is_empty() { "" } else { trimmed };
-                    {
-                        use crate::types::document_structure::ContentLayer;
-                        use crate::types::internal::{ElementKind, InternalElement, InternalElementId};
-                        let kind = ElementKind::Image { image_index: u32::MAX };
-                        let id = InternalElementId::generate(kind.discriminant(), desc, None, 0);
-                        b.push_element(InternalElement {
-                            id,
-                            kind,
-                            text: desc.to_string(),
-                            depth: 0,
-                            page: None,
-                            bbox: None,
-                            layer: ContentLayer::Body,
-                            annotations: Vec::new(),
-                            attributes: None,
-                            anchor: None,
-                            ocr_geometry: None,
-                            ocr_confidence: None,
-                            ocr_rotation: None,
-                        });
+                    let desc = if trimmed.is_empty() { None } else { Some(trimmed) };
+
+                    let url = image_url.take().filter(|u| !u.is_empty());
+                    let decoded_image = url
+                        .as_deref()
+                        .filter(|u| u.starts_with("data:image/"))
+                        .and_then(|u| crate::extractors::markdown_utils::decode_data_uri_image(u, image_counter));
+
+                    // Data-URI images are decoded here so the builder can emit an
+                    // `ElementKind::Image` whose `image_index` actually resolves in `doc.images`.
+                    // Plain-URL images have no bytes to attach, and a placeholder element with an
+                    // unresolvable index is silently dropped by every renderer, so their
+                    // reference is preserved as visible text instead. ~keep
+                    if let Some(mut image) = decoded_image {
+                        image_counter += 1;
+                        image.description = desc.map(str::to_string);
+                        b.push_image(desc, image, None, None);
+                    } else {
+                        let display = match (&url, desc) {
+                            (Some(u), Some(d)) => format!("[Image: {d} ({u})]"),
+                            (Some(u), None) => format!("[Image: {u}]"),
+                            (None, Some(d)) => format!("[Image: {d}]"),
+                            (None, None) => String::new(),
+                        };
+                        if !display.is_empty() {
+                            b.push_paragraph(&display, vec![], None, None);
+                        }
                     }
-                    // Collect image URI
-                    if let Some(url) = image_url.take().filter(|u| !u.is_empty()) {
+
+                    if let Some(url) = url {
                         b.push_uri(ExtractedUri {
                             url,
-                            label: if desc.is_empty() { None } else { Some(desc.to_string()) },
+                            label: desc.map(str::to_string),
                             page: None,
                             kind: UriKind::Image,
                         });
@@ -451,6 +606,30 @@ impl MarkdownExtractor {
                         }
                     }
                     footnote_def_text.clear();
+                }
+                Event::Start(Tag::DefinitionListTitle) => {
+                    in_def_title = true;
+                    def_buf.clear();
+                }
+                Event::End(TagEnd::DefinitionListTitle) => {
+                    in_def_title = false;
+                    let trimmed = def_buf.trim();
+                    if !trimmed.is_empty() {
+                        b.push_definition_term(trimmed, None);
+                    }
+                    def_buf.clear();
+                }
+                Event::Start(Tag::DefinitionListDefinition) => {
+                    in_def_desc = true;
+                    def_buf.clear();
+                }
+                Event::End(TagEnd::DefinitionListDefinition) => {
+                    in_def_desc = false;
+                    let trimmed = def_buf.trim();
+                    if !trimmed.is_empty() {
+                        b.push_definition_description(trimmed, None);
+                    }
+                    def_buf.clear();
                 }
                 Event::Code(s) => {
                     if in_code_block {
@@ -475,6 +654,8 @@ impl MarkdownExtractor {
                         }
                     } else if footnote_def_label.is_some() {
                         footnote_def_text.push_str(s);
+                    } else if in_def_title || in_def_desc {
+                        def_buf.push_str(s);
                     } else if in_paragraph {
                         let start = paragraph_text.len() as u32;
                         paragraph_text.push_str(s);
@@ -497,8 +678,43 @@ impl MarkdownExtractor {
                         list_item_text.push_str(s);
                     } else if footnote_def_label.is_some() {
                         footnote_def_text.push_str(s);
+                    } else if in_def_title || in_def_desc {
+                        def_buf.push_str(s);
                     } else if in_paragraph {
                         paragraph_text.push_str(s);
+                    }
+                }
+                Event::InlineMath(s) => {
+                    if in_heading {
+                        heading_text.push('$');
+                        heading_text.push_str(s);
+                        heading_text.push('$');
+                    } else if in_table_cell {
+                        current_cell.push('$');
+                        current_cell.push_str(s);
+                        current_cell.push('$');
+                    } else if in_list_item {
+                        list_item_text.push('$');
+                        list_item_text.push_str(s);
+                        list_item_text.push('$');
+                    } else if footnote_def_label.is_some() {
+                        footnote_def_text.push('$');
+                        footnote_def_text.push_str(s);
+                        footnote_def_text.push('$');
+                    } else if in_def_title || in_def_desc {
+                        def_buf.push('$');
+                        def_buf.push_str(s);
+                        def_buf.push('$');
+                    } else if in_paragraph {
+                        paragraph_text.push('$');
+                        paragraph_text.push_str(s);
+                        paragraph_text.push('$');
+                    }
+                }
+                Event::DisplayMath(s) => {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        b.push_formula(trimmed, None, None);
                     }
                 }
                 Event::SoftBreak | Event::HardBreak => {
@@ -510,6 +726,8 @@ impl MarkdownExtractor {
                         list_item_text.push(' ');
                     } else if footnote_def_label.is_some() {
                         footnote_def_text.push(' ');
+                    } else if in_def_title || in_def_desc {
+                        def_buf.push(' ');
                     } else if in_paragraph {
                         paragraph_text.push(' ');
                     }
@@ -517,11 +735,43 @@ impl MarkdownExtractor {
                 Event::FootnoteReference(name) => {
                     b.push_footnote_ref(name, name, None);
                 }
-                Event::Html(s) => {
-                    if footnote_def_label.is_some() {
+                Event::InlineHtml(s) => {
+                    if in_heading {
+                        heading_text.push_str(s);
+                    } else if in_table_cell {
+                        current_cell.push_str(s);
+                    } else if in_list_item {
+                        list_item_text.push_str(s);
+                    } else if footnote_def_label.is_some() {
                         footnote_def_text.push_str(s);
+                    } else if in_def_title || in_def_desc {
+                        def_buf.push_str(s);
                     } else if in_paragraph {
                         paragraph_text.push_str(s);
+                    }
+                }
+                // Block-level raw HTML (e.g. a bare `<div>...</div>` between blank lines) is
+                // emitted by pulldown-cmark with no enclosing paragraph/heading/etc. buffer open.
+                // It used to be silently dropped in that case; it is now recorded as a raw block
+                // so callers can recover it. See issue #135.
+                Event::Html(s) => {
+                    if in_heading {
+                        heading_text.push_str(s);
+                    } else if in_table_cell {
+                        current_cell.push_str(s);
+                    } else if in_list_item {
+                        list_item_text.push_str(s);
+                    } else if footnote_def_label.is_some() {
+                        footnote_def_text.push_str(s);
+                    } else if in_def_title || in_def_desc {
+                        def_buf.push_str(s);
+                    } else if in_paragraph {
+                        paragraph_text.push_str(s);
+                    } else {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            b.push_raw_block("html", trimmed, None);
+                        }
                     }
                 }
                 Event::TaskListMarker(checked) if in_list_item => {
@@ -581,7 +831,7 @@ impl InternalDocumentExtractor for MarkdownExtractor {
         budget.account_text(content.len())?;
         let text = String::from_utf8_lossy(content).into_owned();
 
-        let (yaml, remaining_content) = extract_frontmatter(&text);
+        let (yaml, remaining_content, frontmatter_warning) = extract_frontmatter_with_warning(&text);
 
         let mut metadata = if let Some(ref yaml_value) = yaml {
             extract_metadata_from_yaml(yaml_value)
@@ -595,29 +845,16 @@ impl InternalDocumentExtractor for MarkdownExtractor {
             metadata.title = Some(title);
         }
 
-        let mut options = Options::ENABLE_TABLES;
-        options |= Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES;
-        let parser = Parser::new_ext(&remaining_content, options);
+        let parser = Parser::new_ext(&remaining_content, markdown_options());
         let events: Vec<Event> = parser.collect();
 
-        let mut extracted_images = Vec::new();
-        // Walk the AST only for images (data URI extraction)
-        let _ = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut extracted_images);
-
-        // Build InternalDocument from events and frontmatter
+        // Images (including data-URI decoding) are handled in-line inside
+        // `build_internal_document`, which pushes a correctly-indexed image element for each
+        // one, so no separate extraction/push pass is needed here.
         let mut doc = Self::build_internal_document(&events, &yaml);
         doc.metadata = metadata;
         doc.mime_type = mime_type.to_string();
-
-        // Tables are already pushed by `build_internal_document` via the builder,
-        // so we do NOT push them again here (that would create duplicates).
-
-        // Add extracted images to InternalDocument
-        if !extracted_images.is_empty() {
-            for image in extracted_images {
-                doc.push_image(image);
-            }
-        }
+        doc.processing_warnings.extend(frontmatter_warning);
 
         tracing::debug!(
             element_count = doc.elements.len(),
@@ -644,6 +881,15 @@ impl InternalDocumentExtractor for MarkdownExtractor {
             "text/x-commonmark",
             "text/x-markdown-extra",
             "text/x-multimarkdown",
+            "text/x-pandoc",
+            "text/x-quarto",
+            // `application/x-quarto` is declared as an alias of `text/x-quarto` in the
+            // static format table (core/mime.rs), so `validate_mime_type` accepts it —
+            // but the registry looks extractors up by exact string with no alias
+            // resolution, so an unclaimed alias reaches extraction and fails as
+            // UnsupportedFormat despite being advertised as supported (#229). ~keep
+            "application/x-quarto",
+            "text/x-r-markdown",
         ]
     }
 
@@ -669,10 +915,22 @@ mod tests {
         assert!(mime_types.contains(&"text/x-commonmark"));
         assert!(mime_types.contains(&"text/x-markdown-extra"));
         assert!(mime_types.contains(&"text/x-multimarkdown"));
+        assert!(mime_types.contains(&"text/x-pandoc"));
+        assert!(mime_types.contains(&"text/x-quarto"));
+        assert!(mime_types.contains(&"text/x-r-markdown"));
     }
 
-    #[test]
-    fn test_extract_simple_markdown() {
+    /// Render a document through the same path the extractor's callers use.
+    async fn render(content: &[u8]) -> String {
+        let doc = MarkdownExtractor::new()
+            .extract_content(content, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("extraction should succeed");
+        crate::rendering::render_markdown(&doc)
+    }
+
+    #[tokio::test]
+    async fn test_extract_simple_markdown() {
         let content =
             b"# Header\n\nThis is a paragraph with **bold** and *italic* text.\n\n## Subheading\n\nMore content here.";
         let text = String::from_utf8_lossy(content).into_owned();
@@ -681,9 +939,7 @@ mod tests {
         assert!(yaml.is_none());
         assert!(!remaining.is_empty());
 
-        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+        let extracted = render(content).await;
 
         assert!(extracted.contains("Header"));
         assert!(extracted.contains("This is a paragraph"));
@@ -768,8 +1024,8 @@ mod tests {
         assert_eq!(title, Some("Main Title".to_string()));
     }
 
-    #[test]
-    fn test_empty_document() {
+    #[tokio::test]
+    async fn test_empty_document() {
         let content = b"";
         let text = String::from_utf8_lossy(content).into_owned();
 
@@ -777,38 +1033,30 @@ mod tests {
         assert!(yaml.is_none());
         assert!(remaining.is_empty());
 
-        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
-        assert!(extracted.is_empty());
+        assert!(render(content).await.is_empty());
     }
 
-    #[test]
-    fn test_whitespace_only_document() {
+    #[tokio::test]
+    async fn test_whitespace_only_document() {
         let content = b"   \n\n  \n";
         let text = String::from_utf8_lossy(content).into_owned();
 
-        let (yaml, remaining) = extract_frontmatter(&text);
+        let (yaml, _remaining) = extract_frontmatter(&text);
         assert!(yaml.is_none());
 
-        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
-        assert!(extracted.trim().is_empty());
+        assert!(render(content).await.trim().is_empty());
     }
 
-    #[test]
-    fn test_unicode_content() {
+    #[tokio::test]
+    async fn test_unicode_content() {
         let content = "# 日本語のタイトル\n\nこれは日本語の内容です。\n\n## Español\n\nEste es un documento en español.\n\n## Русский\n\nЭто русский текст.".as_bytes();
 
         let text = String::from_utf8_lossy(content).into_owned();
 
-        let (yaml, remaining) = extract_frontmatter(&text);
+        let (yaml, _remaining) = extract_frontmatter(&text);
         assert!(yaml.is_none());
 
-        let parser = Parser::new_ext(&remaining, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+        let extracted = render(content).await;
 
         assert!(extracted.contains("日本語"));
         assert!(extracted.contains("Español"));
@@ -859,27 +1107,19 @@ mod tests {
         assert!(lines.len() >= 4);
     }
 
-    #[test]
-    fn test_extract_markdown_with_links() {
+    #[tokio::test]
+    async fn test_extract_markdown_with_links() {
         let content = b"# Page\n\nCheck [Google](https://google.com) and [Rust](https://rust-lang.org).";
-        let text = String::from_utf8_lossy(content).into_owned();
-
-        let parser = Parser::new_ext(&text, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+        let extracted = render(content).await;
 
         assert!(extracted.contains("Google"));
         assert!(extracted.contains("Rust"));
     }
 
-    #[test]
-    fn test_extract_markdown_with_code_blocks() {
+    #[tokio::test]
+    async fn test_extract_markdown_with_code_blocks() {
         let content = b"# Code Example\n\n```rust\nfn main() {\n    println!(\"Hello\");\n}\n```";
-        let text = String::from_utf8_lossy(content).into_owned();
-
-        let parser = Parser::new_ext(&text, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let extracted = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut Vec::new());
+        let extracted = render(content).await;
 
         assert!(extracted.contains("main"));
         assert!(extracted.contains("println"));
@@ -950,7 +1190,6 @@ nested:
 
     #[test]
     fn test_decode_data_uri_png() {
-        // 1x1 red PNG pixel (minimal valid PNG)
         let png_b64 =
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
         let uri = format!("data:image/png;base64,{png_b64}");
@@ -965,7 +1204,6 @@ nested:
 
     #[test]
     fn test_decode_data_uri_jpeg() {
-        // Minimal JPEG-like base64 (tests the decode path)
         let uri = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
 
         let image = crate::extractors::markdown_utils::decode_data_uri_image(uri, 3);
@@ -1003,33 +1241,19 @@ nested:
         assert!(image.is_none());
     }
 
-    #[test]
-    fn test_extract_text_collects_data_uri_images() {
-        let png_b64 =
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-        let md = format!("# Title\n\n![alt](data:image/png;base64,{png_b64})\n\nSome text.");
+    #[tokio::test]
+    async fn test_http_image_produces_no_extracted_image_bytes() {
+        let md = b"# Title\n\n![alt](https://example.com/photo.jpg)\n\nSome text.";
 
-        let parser = Parser::new_ext(&md, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let mut images = Vec::new();
-        let text = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut images);
+        let doc = MarkdownExtractor::new()
+            .extract_content(md, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("extraction should succeed");
 
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format.as_ref(), "png");
-        assert!(text.contains("[Image: data:image/png;base64,"));
-    }
-
-    #[test]
-    fn test_extract_text_skips_http_images() {
-        let md = "# Title\n\n![alt](https://example.com/photo.jpg)\n\nSome text.";
-
-        let parser = Parser::new_ext(md, Options::ENABLE_TABLES);
-        let events: Vec<Event> = parser.collect();
-        let mut images = Vec::new();
-        let text = crate::extractors::markdown_utils::extract_text_from_events(&events, &mut images);
-
-        assert!(images.is_empty());
-        assert!(text.contains("[Image: https://example.com/photo.jpg]"));
+        // A remote URL carries no bytes to decode, so nothing lands in `doc.images`; the
+        // reference itself is preserved as text (see
+        // `test_markdown_http_image_reference_preserved_in_output`).
+        assert!(doc.images.is_empty(), "unexpected images: {:?}", doc.images);
     }
 
     #[tokio::test]
@@ -1052,6 +1276,65 @@ nested:
         assert_eq!(imgs[0].format.as_ref(), "png");
     }
 
+    /// Regression test: `build_internal_document` used to create an `ElementKind::Image`
+    /// placeholder with a sentinel `image_index: u32::MAX` for every image, then a separate pass
+    /// in `extract_content` pushed the actual bytes via the raw, non-index-patching
+    /// `InternalDocument::push_image`. The placeholder's index was never fixed up, so every
+    /// renderer (which looks images up by walking `ElementKind::Image` elements) silently
+    /// dropped the image from rendered output even though `doc.images` had the data. Images are
+    /// now decoded and pushed in a single step with a correct index.
+    #[tokio::test]
+    async fn test_markdown_data_uri_image_renders_in_output() {
+        let png_b64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let md = format!("Intro.\n\n![a photo](data:image/png;base64,{png_b64})\n\nOutro.");
+
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(md.as_bytes(), "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("extraction should succeed");
+
+        assert_eq!(doc.images.len(), 1);
+        let image_element_count = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Image { .. }))
+            .count();
+        assert_eq!(
+            image_element_count, 1,
+            "expected one Image element in {:?}",
+            doc.elements
+        );
+
+        let markdown = crate::rendering::render_markdown(&doc);
+        assert!(
+            markdown.contains("a photo"),
+            "image description missing from rendered markdown: {markdown}"
+        );
+    }
+
+    /// Regression test: a plain (non-data-URI) image reference used to be dropped from rendered
+    /// output entirely (see `test_markdown_data_uri_image_renders_in_output`), since no bytes
+    /// were ever available to attach to its placeholder element. It is now preserved as visible
+    /// text instead of vanishing.
+    #[tokio::test]
+    async fn test_markdown_http_image_reference_preserved_in_output() {
+        let md = "Intro.\n\n![a photo](https://example.com/photo.jpg)\n\nOutro.";
+
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(md.as_bytes(), "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("extraction should succeed");
+
+        let markdown = crate::rendering::render_markdown(&doc);
+        assert!(
+            markdown.contains("a photo") && markdown.contains("https://example.com/photo.jpg"),
+            "image reference missing from rendered markdown: {markdown}"
+        );
+    }
+
     #[tokio::test]
     async fn test_extract_bytes_no_images() {
         let md = b"# Simple\n\nJust text, no images.";
@@ -1069,8 +1352,6 @@ nested:
 
     #[tokio::test]
     async fn test_trimmed_paragraph_with_emoji() {
-        // Trimming paragraph text with multi-byte emoji must not produce
-        // annotations pointing past the trimmed text end.
         let md = b"  **bold** \xf0\x9f\x8e\x89 text  ";
 
         let extractor = MarkdownExtractor::new();
@@ -1099,5 +1380,169 @@ nested:
 
         assert!(result.content.contains("太字"), "Bold CJK content present");
         assert!(result.content.contains("これは"), "Leading CJK preserved");
+    }
+
+    #[test]
+    fn test_normalize_fence_lang_strips_quarto_braces() {
+        assert_eq!(normalize_fence_lang("python"), Some("python".to_string()));
+        assert_eq!(normalize_fence_lang("{python}"), Some("python".to_string()));
+        assert_eq!(normalize_fence_lang("{r, echo=FALSE}"), Some("r".to_string()));
+        assert_eq!(
+            normalize_fence_lang("{.python .numberLines}"),
+            Some("python".to_string())
+        );
+        assert_eq!(normalize_fence_lang("  rust  "), Some("rust".to_string()));
+        assert_eq!(normalize_fence_lang(""), None);
+        assert_eq!(normalize_fence_lang("{}"), None);
+    }
+
+    #[tokio::test]
+    async fn test_quarto_executable_cells_render_as_clean_code() {
+        use crate::types::internal::ElementKind;
+        let content = b"---\ntitle: Quarto Doc\n---\n\nProse before.\n\n```{python}\nprint(\"hi\")\n```\n\n```{r, echo=FALSE}\nsummary(cars)\n```\n";
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(content, "text/x-quarto", &ExtractionConfig::default())
+            .await
+            .expect("should extract a Quarto document");
+
+        assert_eq!(doc.metadata.title.as_deref(), Some("Quarto Doc"));
+        let code_langs: Vec<Option<String>> = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Code))
+            .map(|e| e.attributes.as_ref().and_then(|a| a.get("language").cloned()))
+            .collect();
+        assert_eq!(
+            code_langs,
+            vec![Some("python".to_string()), Some("r".to_string())],
+            "executable cell braces are stripped to bare kernel languages"
+        );
+        let code_bodies: String = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Code))
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code_bodies.contains("print(\"hi\")"), "python cell body preserved");
+        assert!(code_bodies.contains("summary(cars)"), "r cell body preserved");
+    }
+
+    #[tokio::test]
+    async fn test_pandoc_full_elements_parsed() {
+        use crate::AnnotationKind;
+        use crate::types::internal::ElementKind;
+        let content = concat!(
+            "Marker ^sup^ and ~sub~ inline.\n\n",
+            "Inline $a^2 + b^2$ stays inline.\n\n",
+            "$$\\int_0^1 x\\,dx$$\n\n",
+            "Term 1\n: Definition of term 1.\n\n",
+            "- [x] done\n- [ ] todo\n\n",
+            "Here is a note[^1].\n\n[^1]: The footnote body.\n",
+        )
+        .as_bytes();
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(content, "text/x-pandoc", &ExtractionConfig::default())
+            .await
+            .expect("should extract pandoc-flavored markdown");
+
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| matches!(e.kind, ElementKind::Formula) && e.text.contains("\\int")),
+            "display math becomes a Formula element"
+        );
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| matches!(e.kind, ElementKind::DefinitionTerm) && e.text.contains("Term 1")),
+            "definition term parsed"
+        );
+        assert!(
+            doc.elements.iter().any(
+                |e| matches!(e.kind, ElementKind::DefinitionDescription) && e.text.contains("Definition of term 1")
+            ),
+            "definition description parsed"
+        );
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| matches!(e.kind, ElementKind::FootnoteDefinition)),
+            "footnote definition parsed"
+        );
+        let list_text: String = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::ListItem { .. }))
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            list_text.contains("[x]") && list_text.contains("[ ]"),
+            "task-list markers rendered: {list_text}"
+        );
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| matches!(e.kind, ElementKind::Paragraph) && e.text.contains("$a^2 + b^2$")),
+            "inline math preserved with $ delimiters"
+        );
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| e.annotations.iter().any(|a| a.kind == AnnotationKind::Superscript)),
+            "superscript (^sup^) recorded as an annotation"
+        );
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| e.annotations.iter().any(|a| a.kind == AnnotationKind::Subscript)),
+            "subscript (~sub~) recorded as an annotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gfm_alert_becomes_admonition() {
+        use crate::types::internal::ElementKind;
+        let content = b"> [!WARNING]\n> Be careful here.\n";
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(content, "text/x-gfm", &ExtractionConfig::default())
+            .await
+            .expect("should extract a GFM alert");
+        assert!(
+            doc.elements.iter().any(|e| matches!(e.kind, ElementKind::Admonition)),
+            "GFM alert renders as an admonition rather than losing the [!WARNING] marker"
+        );
+        assert!(
+            doc.elements.iter().any(|e| e.text.contains("Be careful here")),
+            "alert body text retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_smart_punctuation_rewrites_quotes() {
+        let content = "He said \"hello\" -- really.".as_bytes();
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(content, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("should extract");
+        let text: String = doc
+            .elements
+            .iter()
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains('\u{201C}') || text.contains('\u{201D}'),
+            "straight quotes become curly: {text}"
+        );
+        assert!(
+            text.contains('\u{2013}') || text.contains('\u{2014}'),
+            "-- becomes en/em dash: {text}"
+        );
     }
 }

@@ -1,3 +1,8 @@
+//! Smoke test for the GLM-OCR `process_image_with_task` paired-mode dispatch path,
+//! plus the shared degenerate-repeated-n-gram detector used across GLM-OCR tests.
+//! Ignored by default; downloads ~3GB of weights.
+
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "glm-ocr")]
 
 use xberg_candle_ocr::DevicePreference;
@@ -53,8 +58,6 @@ fn glm_ocr_paired_pipeline_smoke_via_process_image_with_task() {
 
     eprintln!("Engine constructed. Running process_image_with_task on test image...");
 
-    // Call process_image_with_task explicitly — this is the dispatch entry-point
-    // used by the paired-mode backend for each cropped region.
     let output = engine
         .process_image_with_task(image_bytes, GlmOcrTask::Ocr)
         .expect("Failed to process image with task");

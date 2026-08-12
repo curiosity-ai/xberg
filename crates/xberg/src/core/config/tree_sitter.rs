@@ -50,14 +50,29 @@ pub struct TreeSitterConfig {
     /// Custom cache directory for downloaded grammars.
     ///
     /// When `None`, uses the default: `~/.cache/tree-sitter-language-pack/v{version}/libs/`.
+    ///
+    /// Consumed both by the CLI (`tree-sitter download --from-config`,
+    /// `cache warm`) and by [`crate::extractors::code::CodeExtractor`] at
+    /// extraction time, so that a configured cache directory is honoured
+    /// wherever grammars are looked up or downloaded, not only during an
+    /// explicit CLI download.
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
 
     /// Languages to pre-download on init (e.g., `["python", "rust"]`).
+    ///
+    /// Consumed only by the CLI's `tree-sitter download --from-config` and
+    /// `cache warm` commands as a pre-download hint. Extraction itself does
+    /// not read this field: a given source file always processes with a
+    /// single, already auto-detected language, so there is nothing for a
+    /// language allowlist to gate at extraction time.
     #[serde(default)]
     pub languages: Option<Vec<String>>,
 
     /// Language groups to pre-download (e.g., `["web", "systems", "scripting"]`).
+    ///
+    /// Consumed only by the CLI's `tree-sitter download --from-config` and
+    /// `cache warm` commands, for the same reason as `languages` above.
     #[serde(default)]
     pub groups: Option<Vec<String>>,
 
@@ -99,6 +114,11 @@ pub struct TreeSitterProcessConfig {
     #[serde(default)]
     pub diagnostics: bool,
 
+    /// Extract a hierarchical key/value data tree from data-format files
+    /// (JSON, YAML, TOML, XML, CSV, etc.). Default: false.
+    #[serde(default)]
+    pub data_extraction: bool,
+
     /// Maximum chunk size in bytes. `None` disables chunking.
     #[serde(default)]
     pub chunk_max_size: Option<usize>,
@@ -130,6 +150,7 @@ impl Default for TreeSitterProcessConfig {
             docstrings: false,
             symbols: false,
             diagnostics: false,
+            data_extraction: false,
             chunk_max_size: None,
             content_mode: CodeContentMode::default(),
         }
@@ -154,8 +175,8 @@ impl From<&TreeSitterProcessConfig> for tree_sitter_language_pack::ProcessConfig
             docstrings: p.docstrings,
             symbols: p.symbols,
             diagnostics: p.diagnostics,
+            data_extraction: p.data_extraction,
             chunk_max_size: p.chunk_max_size,
-            ..Default::default()
         }
     }
 }

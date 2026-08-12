@@ -1,0 +1,24 @@
+---
+id: fixture_rust_code_shebang_detection
+language: rust
+target: rust
+level: typecheck
+requires: []
+side_effect: server
+---
+
+Test language detection from shebang line via bytes input
+
+```rust title="Rust"
+use xberg::extract;
+use xberg::ExtractInput;
+
+#[tokio::main]
+async fn main() {
+    let input_json: serde_json::Value = serde_json::from_str(r#"{"kind":"uri","mime_type":"text/x-source-code","uri":"https://example.com/code/script.sh"}"#).unwrap();
+    let input = serde_json::from_value::<ExtractInput>(input_json).unwrap();
+    let config = Default::default();
+    let _ = extract(input, &config).await;
+}
+
+```

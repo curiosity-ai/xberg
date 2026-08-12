@@ -26,7 +26,13 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+pub(crate) fn is_split_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".split.json"))
+}
 
 /// A fixture describing a test document
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,12 +109,7 @@ impl Fixture {
     ///   - Valid source type
     ///   - File existence check (relative to fixture directory)
     fn validate(&self, fixture_path: &Path) -> Result<()> {
-        if self.document.is_absolute() {
-            return Err(Error::InvalidFixture {
-                path: fixture_path.to_path_buf(),
-                reason: "document path must be relative".to_string(),
-            });
-        }
+        Self::validate_fixture_relative_path(fixture_path, &self.document, "document")?;
 
         if self.file_type.is_empty() {
             return Err(Error::InvalidFixture {
@@ -117,14 +118,36 @@ impl Fixture {
             });
         }
 
-        if let Some(gt) = &self.ground_truth {
-            if let Some(ref tf) = gt.text_file
-                && tf.is_absolute()
+        if let Some(language) = self.metadata.get("ocr_language") {
+            let Some(language) = language.as_str() else {
+                return Err(Error::InvalidFixture {
+                    path: fixture_path.to_path_buf(),
+                    reason: "metadata.ocr_language must be a string".to_string(),
+                });
+            };
+            let codes = crate::adapter::canonicalize_ocr_languages(language);
+            if codes.is_empty()
+                || codes
+                    .iter()
+                    .any(|code| !crate::adapter::is_valid_ocr_language_code(code))
             {
                 return Err(Error::InvalidFixture {
                     path: fixture_path.to_path_buf(),
-                    reason: "ground_truth.text_file must be relative".to_string(),
+                    reason: "metadata.ocr_language must contain '+'-separated Tesseract language codes".to_string(),
                 });
+            }
+        }
+
+        if let Some(gt) = &self.ground_truth {
+            for (field, relative_path) in [
+                ("ground_truth.text_file", gt.text_file.as_deref()),
+                ("ground_truth.markdown_file", gt.markdown_file.as_deref()),
+                ("ground_truth.fields_json", gt.fields_json.as_deref()),
+                ("ground_truth.formulas_json", gt.formulas_json.as_deref()),
+            ] {
+                if let Some(relative_path) = relative_path {
+                    Self::validate_fixture_relative_path(fixture_path, relative_path, field)?;
+                }
             }
 
             if !matches!(
@@ -155,6 +178,11 @@ impl Fixture {
                     | "omnidocbench"
                     | "mistral-pixtral"
                     | "nougat"
+                    | "readoc"
+                    | "parsebench"
+                    | "fintabnet"
+                    | "federal_register"
+                    | "apple_preview"
             ) {
                 return Err(Error::InvalidFixture {
                     path: fixture_path.to_path_buf(),
@@ -162,44 +190,89 @@ impl Fixture {
                 });
             }
 
-            // Validate that ground truth file exists at load time
-            // Use fixture directory as the base for relative paths
-            if let (Some(fixture_dir), Some(tf)) = (fixture_path.parent(), &gt.text_file) {
-                let ground_truth_path = fixture_dir.join(tf);
-                if !ground_truth_path.exists() {
-                    return Err(Error::InvalidFixture {
-                        path: fixture_path.to_path_buf(),
-                        reason: format!(
-                            "ground truth file not found: {} (resolved to {})",
-                            tf.display(),
-                            ground_truth_path.display()
-                        ),
-                    });
-                }
-
-                // Validate markdown ground truth file if specified
-                if let Some(ref md_file) = gt.markdown_file {
-                    if md_file.is_absolute() {
-                        return Err(Error::InvalidFixture {
-                            path: fixture_path.to_path_buf(),
-                            reason: "ground_truth.markdown_file must be relative".to_string(),
-                        });
-                    }
-                    let md_path = fixture_dir.join(md_file);
-                    if !md_path.exists() {
-                        return Err(Error::InvalidFixture {
-                            path: fixture_path.to_path_buf(),
-                            reason: format!(
-                                "ground truth markdown file not found: {} (resolved to {})",
-                                md_file.display(),
-                                md_path.display()
-                            ),
-                        });
-                    }
-                }
-            }
+            Self::validate_ground_truth_file(fixture_path, gt.text_file.as_deref(), "text")?;
+            Self::validate_ground_truth_file(fixture_path, gt.markdown_file.as_deref(), "markdown")?;
         }
 
+        Ok(())
+    }
+
+    /// Resolve a fixture-owned relative path without allowing it to escape its trust boundary.
+    ///
+    /// Repository fixtures intentionally use `../../../test_documents/...`, so their boundary is
+    /// the repository root. Standalone fixture trees use the fixture file's directory. Existing
+    /// paths are canonicalized as well, preventing a symlink inside either boundary from escaping.
+    /// ~keep
+    fn validate_fixture_relative_path(fixture_path: &Path, relative_path: &Path, field: &str) -> Result<PathBuf> {
+        if relative_path.is_absolute() {
+            return Err(Error::InvalidFixture {
+                path: fixture_path.to_path_buf(),
+                reason: format!("{field} must be relative"),
+            });
+        }
+
+        // A bare filename has an empty parent path, which must resolve relative to the current
+        // directory just like a missing parent. Keep the canonical trust boundary check below. ~keep
+        let fixture_dir = fixture_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let canonical_fixture_dir = fixture_dir.canonicalize().map_err(|error| Error::InvalidFixture {
+            path: fixture_path.to_path_buf(),
+            reason: format!("unable to resolve fixture directory {}: {error}", fixture_dir.display()),
+        })?;
+        // Resolve the checked-out repository from the runtime fixture location. The harness
+        // binary is cached and executed by separate CI jobs, so its build-time source path may
+        // not exist on the runner that validates fixtures. ~keep
+        let repository_root = repository_fixture_root(&canonical_fixture_dir);
+        let allowed_root = repository_root.as_deref().unwrap_or(&canonical_fixture_dir);
+        let resolved = normalize_path(&canonical_fixture_dir.join(relative_path));
+        if !resolved.starts_with(allowed_root) {
+            return Err(Error::InvalidFixture {
+                path: fixture_path.to_path_buf(),
+                reason: format!(
+                    "{field} escapes the fixture trust boundary: {}",
+                    relative_path.display()
+                ),
+            });
+        }
+
+        if resolved.exists() {
+            let canonical = resolved.canonicalize().map_err(|error| Error::InvalidFixture {
+                path: fixture_path.to_path_buf(),
+                reason: format!("unable to resolve {field} {}: {error}", relative_path.display()),
+            })?;
+            if !canonical.starts_with(allowed_root) {
+                return Err(Error::InvalidFixture {
+                    path: fixture_path.to_path_buf(),
+                    reason: format!(
+                        "{field} resolves outside the fixture trust boundary: {}",
+                        relative_path.display()
+                    ),
+                });
+            }
+            return Ok(canonical);
+        }
+        Ok(resolved)
+    }
+
+    pub(crate) fn validated_document_path(&self, fixture_path: &Path) -> Result<PathBuf> {
+        Self::validate_fixture_relative_path(fixture_path, &self.document, "document")
+    }
+
+    fn validate_ground_truth_file(fixture_path: &Path, relative_path: Option<&Path>, kind: &str) -> Result<()> {
+        let Some(relative_path) = relative_path else {
+            return Ok(());
+        };
+        let resolved_path = Self::validate_fixture_relative_path(fixture_path, relative_path, kind)?;
+        std::fs::read_to_string(&resolved_path).map_err(|error| Error::InvalidFixture {
+            path: fixture_path.to_path_buf(),
+            reason: format!(
+                "unable to read ground truth {kind} file {} (resolved to {}): {error}",
+                relative_path.display(),
+                resolved_path.display()
+            ),
+        })?;
         Ok(())
     }
 
@@ -224,17 +297,44 @@ impl Fixture {
 
     /// Determine if this fixture requires OCR based on file type and metadata
     pub fn requires_ocr(&self) -> bool {
-        // Check if explicitly marked in metadata
         if let Some(requires_ocr) = self.metadata.get("requires_ocr").and_then(|v| v.as_bool()) {
             return requires_ocr;
         }
 
-        // Infer from file type - images always need OCR
         matches!(
             self.file_type.to_lowercase().as_str(),
             "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "webp" | "jp2" | "jpx" | "jpm" | "mj2"
         )
     }
+
+    /// Return the fixture-specific OCR language code, if configured.
+    pub fn ocr_language(&self) -> Option<&str> {
+        self.metadata.get("ocr_language").and_then(|value| value.as_str())
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn repository_fixture_root(fixture_dir: &Path) -> Option<PathBuf> {
+    fixture_dir
+        .ancestors()
+        .find(|ancestor| {
+            let harness_root = ancestor.join("tools/benchmark-harness");
+            harness_root.join("Cargo.toml").is_file() && fixture_dir.starts_with(harness_root.join("fixtures"))
+        })
+        .map(Path::to_path_buf)
 }
 
 /// Manages loading and accessing fixtures
@@ -313,10 +413,11 @@ impl FixtureManager {
                 for (fixture_path, _) in temp_manager.fixtures {
                     all_fixtures.push(fixture_path);
                 }
-            } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            } else if path.extension().and_then(|s| s.to_str()) == Some("json") && !is_split_sidecar(&path) {
                 all_fixtures.push(path);
             }
         }
+        all_fixtures.sort();
 
         let total_fixtures = all_fixtures.len();
         let mut failed_fixtures: Vec<(PathBuf, String)> = Vec::new();
@@ -358,9 +459,7 @@ impl FixtureManager {
                     );
                     for fixture_path in all_fixtures {
                         match self.load_fixture(&fixture_path) {
-                            Ok(()) => {
-                                // Successfully loaded
-                            }
+                            Ok(()) => {}
                             Err(e) => {
                                 failed_fixtures.push((fixture_path.clone(), e.to_string()));
                             }
@@ -370,9 +469,7 @@ impl FixtureManager {
             } else {
                 for fixture_path in all_fixtures {
                     match self.load_fixture(&fixture_path) {
-                        Ok(()) => {
-                            // Successfully loaded
-                        }
+                        Ok(()) => {}
                         Err(e) => {
                             failed_fixtures.push((fixture_path.clone(), e.to_string()));
                         }
@@ -382,9 +479,7 @@ impl FixtureManager {
         } else {
             for fixture_path in all_fixtures {
                 match self.load_fixture(&fixture_path) {
-                    Ok(()) => {
-                        // Successfully loaded
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         failed_fixtures.push((fixture_path.clone(), e.to_string()));
                     }
@@ -392,16 +487,23 @@ impl FixtureManager {
             }
         }
 
-        // Report failed fixtures if any occurred
         if !failed_fixtures.is_empty() {
-            eprintln!(
-                "Warning: {} of {} fixtures failed to load:",
-                failed_fixtures.len(),
-                total_fixtures
-            );
-            for (path, error) in failed_fixtures {
-                eprintln!("  - {}: {}", path.display(), error);
-            }
+            let first_path = failed_fixtures[0].0.clone();
+            let details = failed_fixtures
+                .iter()
+                .take(10)
+                .map(|(path, error)| format!("{}: {error}", path.display()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(Error::InvalidFixture {
+                path: first_path,
+                reason: format!(
+                    "{} of {} requested fixtures failed validation: {}",
+                    failed_fixtures.len(),
+                    total_fixtures,
+                    details
+                ),
+            });
         }
 
         Ok(())
@@ -440,9 +542,8 @@ impl FixtureManager {
     /// `index` is 1-based (1..=total).
     pub fn retain_shard(&mut self, index: usize, total: usize) {
         assert!(index >= 1 && index <= total, "shard index must be 1..=total");
-        // Sort by path for deterministic assignment across jobs
         self.fixtures.sort_by(|a, b| a.0.cmp(&b.0));
-        let shard_index = index - 1; // convert to 0-based
+        let shard_index = index - 1;
         self.fixtures = self
             .fixtures
             .drain(..)
@@ -482,6 +583,45 @@ mod tests {
     }
 
     #[test]
+    fn fixture_validation_accepts_apple_preview_ground_truth() {
+        let root = TempDir::new().unwrap();
+        let fixture_path = root.path().join("fixture.json");
+        std::fs::write(root.path().join("expected.txt"), "cell value").unwrap();
+        let fixture = Fixture {
+            document: PathBuf::from("test.numbers"),
+            file_type: "numbers".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec!["xberg".to_string()],
+            metadata: HashMap::new(),
+            ground_truth: Some(GroundTruth {
+                text_file: Some(PathBuf::from("expected.txt")),
+                markdown_file: None,
+                fields_json: None,
+                formulas_json: None,
+                source: "apple_preview".to_string(),
+            }),
+        };
+
+        assert!(fixture.validate(&fixture_path).is_ok());
+    }
+
+    #[test]
+    fn fixture_ocr_language_validation_accepts_codes_and_rejects_paths() {
+        let make_fixture = |language: &str| Fixture {
+            document: PathBuf::from("test.pdf"),
+            file_type: "pdf".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec!["xberg".to_string()],
+            metadata: HashMap::from([("ocr_language".to_string(), serde_json::json!(language))]),
+            ground_truth: None,
+        };
+
+        assert!(make_fixture(" deu + eng ").validate(Path::new("fixture.json")).is_ok());
+        assert!(make_fixture("+").validate(Path::new("fixture.json")).is_err());
+        assert!(make_fixture("../deu").validate(Path::new("fixture.json")).is_err());
+    }
+
+    #[test]
     fn test_absolute_path_rejected() {
         #[cfg(windows)]
         let absolute_path = PathBuf::from("C:\\absolute\\path\\test.pdf");
@@ -498,6 +638,91 @@ mod tests {
         };
 
         assert!(fixture.validate(Path::new("fixture.json")).is_err());
+    }
+
+    #[test]
+    fn fixture_paths_cannot_escape_a_standalone_fixture_tree() {
+        let root = TempDir::new().unwrap();
+        let fixture_dir = root.path().join("fixtures");
+        std::fs::create_dir(&fixture_dir).unwrap();
+        std::fs::write(root.path().join("secret.txt"), "not fixture data").unwrap();
+        let fixture_path = fixture_dir.join("escape.json");
+        let fixture = Fixture {
+            document: PathBuf::from("../secret.txt"),
+            file_type: "txt".to_string(),
+            file_size: 16,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: None,
+        };
+
+        let error = fixture.validate(&fixture_path).unwrap_err().to_string();
+        assert!(error.contains("document escapes the fixture trust boundary"), "{error}");
+    }
+
+    #[test]
+    fn repository_fixture_boundary_is_derived_from_the_runtime_path() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture_dir = manifest_dir.join("fixtures/pdf").canonicalize().unwrap();
+        let expected_root = manifest_dir.join("../..").canonicalize().unwrap();
+
+        assert_eq!(repository_fixture_root(&fixture_dir), Some(expected_root));
+    }
+
+    #[test]
+    fn ground_truth_paths_cannot_escape_a_standalone_fixture_tree() {
+        let root = TempDir::new().unwrap();
+        let fixture_dir = root.path().join("fixtures");
+        std::fs::create_dir(&fixture_dir).unwrap();
+        std::fs::write(root.path().join("secret.txt"), "not fixture data").unwrap();
+        let fixture_path = fixture_dir.join("escape.json");
+        let fixture = Fixture {
+            document: PathBuf::from("document.txt"),
+            file_type: "txt".to_string(),
+            file_size: 16,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: Some(GroundTruth {
+                text_file: Some(PathBuf::from("../secret.txt")),
+                markdown_file: None,
+                fields_json: None,
+                formulas_json: None,
+                source: "manual".to_string(),
+            }),
+        };
+
+        let error = fixture.validate(&fixture_path).unwrap_err().to_string();
+        assert!(
+            error.contains("ground_truth.text_file escapes the fixture trust boundary"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_paths_cannot_escape_through_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let fixture_dir = root.path().join("fixtures");
+        std::fs::create_dir(&fixture_dir).unwrap();
+        std::fs::write(root.path().join("secret.txt"), "not fixture data").unwrap();
+        symlink(root.path().join("secret.txt"), fixture_dir.join("document.txt")).unwrap();
+        let fixture_path = fixture_dir.join("escape.json");
+        let fixture = Fixture {
+            document: PathBuf::from("document.txt"),
+            file_type: "txt".to_string(),
+            file_size: 16,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: None,
+        };
+
+        let error = fixture.validate(&fixture_path).unwrap_err().to_string();
+        assert!(
+            error.contains("document resolves outside the fixture trust boundary"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -592,6 +817,40 @@ mod tests {
         manager.load_fixtures_from_dir(temp_dir.path()).unwrap();
 
         assert_eq!(manager.len(), 3);
+    }
+
+    #[test]
+    fn test_fixture_discovery_is_sorted() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        unsafe {
+            std::env::remove_var("PROFILING_FIXTURES");
+        }
+
+        for fixture_name in ["zeta", "alpha", "middle"] {
+            let fixture = Fixture {
+                document: PathBuf::from(format!("{fixture_name}.pdf")),
+                file_type: "pdf".to_string(),
+                file_size: 1024,
+                expected_frameworks: vec![],
+                metadata: HashMap::new(),
+                ground_truth: None,
+            };
+            std::fs::write(
+                temp_dir.path().join(format!("{fixture_name}.json")),
+                serde_json::to_string(&fixture).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let mut manager = FixtureManager::new();
+        manager.load_fixtures_from_dir(temp_dir.path()).unwrap();
+        let loaded_names: Vec<_> = manager
+            .fixtures()
+            .iter()
+            .map(|(path, _)| path.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(loaded_names, ["alpha", "middle", "zeta"]);
     }
 
     #[test]
@@ -726,7 +985,6 @@ mod tests {
             ground_truth: None,
         };
 
-        // PDF normally doesn't require OCR, but metadata overrides this
         assert!(fixture.requires_ocr());
     }
 
@@ -744,7 +1002,6 @@ mod tests {
             ground_truth: None,
         };
 
-        // PNG normally requires OCR, but metadata overrides this
         assert!(!fixture.requires_ocr());
     }
 
@@ -784,15 +1041,71 @@ mod tests {
 
         std::fs::write(&fixture_path, serde_json::to_string(&fixture).unwrap()).unwrap();
 
-        // Should fail because ground truth file doesn't exist
         let result = Fixture::from_file(&fixture_path);
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFixture { reason, .. }) => {
-                assert!(reason.contains("ground truth file not found"));
+                assert!(reason.contains("unable to read ground truth text file"));
             }
-            _ => panic!("Expected InvalidFixture error with 'ground truth file not found'"),
+            _ => panic!("Expected InvalidFixture error for unreadable ground truth"),
         }
+    }
+
+    #[test]
+    fn test_markdown_only_ground_truth_is_validated() {
+        let temp_dir = TempDir::new().unwrap();
+        let fixture_path = temp_dir.path().join("test.json");
+        let fixture = Fixture {
+            document: PathBuf::from("test.pdf"),
+            file_type: "pdf".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: Some(GroundTruth {
+                text_file: None,
+                markdown_file: Some(PathBuf::from("missing.md")),
+                fields_json: None,
+                formulas_json: None,
+                source: "markdown_file".to_string(),
+            }),
+        };
+        std::fs::write(&fixture_path, serde_json::to_string(&fixture).unwrap()).unwrap();
+
+        let error = Fixture::from_file(&fixture_path).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidFixture { reason, .. }
+                if reason.contains("unable to read ground truth markdown file")
+        ));
+    }
+
+    #[test]
+    fn test_non_utf8_ground_truth_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let fixture_path = temp_dir.path().join("test.json");
+        std::fs::write(temp_dir.path().join("ground_truth.txt"), [0xff, 0xfe]).unwrap();
+        let fixture = Fixture {
+            document: PathBuf::from("test.pdf"),
+            file_type: "pdf".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: Some(GroundTruth {
+                text_file: Some(PathBuf::from("ground_truth.txt")),
+                markdown_file: None,
+                fields_json: None,
+                formulas_json: None,
+                source: "manual".to_string(),
+            }),
+        };
+        std::fs::write(&fixture_path, serde_json::to_string(&fixture).unwrap()).unwrap();
+
+        let error = Fixture::from_file(&fixture_path).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidFixture { reason, .. }
+                if reason.contains("unable to read ground truth text file")
+        ));
     }
 
     #[test]
@@ -801,7 +1114,6 @@ mod tests {
         let fixture_path = temp_dir.path().join("test.json");
         let ground_truth_path = temp_dir.path().join("ground_truth.txt");
 
-        // Create the ground truth file
         std::fs::write(&ground_truth_path, "Sample ground truth text").unwrap();
 
         let fixture = Fixture {
@@ -821,7 +1133,6 @@ mod tests {
 
         std::fs::write(&fixture_path, serde_json::to_string(&fixture).unwrap()).unwrap();
 
-        // Should succeed because ground truth file exists
         let result = Fixture::from_file(&fixture_path);
         assert!(result.is_ok());
     }
@@ -831,7 +1142,6 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
 
-        // Create valid fixture
         let valid_fixture_path = temp_dir.path().join("valid.json");
         let valid_fixture = Fixture {
             document: PathBuf::from("test.pdf"),
@@ -843,7 +1153,6 @@ mod tests {
         };
         std::fs::write(&valid_fixture_path, serde_json::to_string(&valid_fixture).unwrap()).unwrap();
 
-        // Create invalid fixture (missing ground truth file)
         let invalid_fixture_path = temp_dir.path().join("invalid.json");
         let invalid_fixture = Fixture {
             document: PathBuf::from("test.pdf"),
@@ -866,11 +1175,93 @@ mod tests {
         }
 
         let mut manager = FixtureManager::new();
-        // Should succeed overall (returns Ok), but report failed fixtures
         let result = manager.load_fixtures_from_dir(temp_dir.path());
-        assert!(result.is_ok());
+        assert!(result.is_err());
 
-        // Should have loaded only the valid fixture
         assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn nested_invalid_fixture_fails_the_entire_directory_load() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let nested_dir = temp_dir.path().join("nested");
+        std::fs::create_dir(&nested_dir).unwrap();
+        std::fs::write(
+            temp_dir.path().join("valid.json"),
+            serde_json::json!({
+                "document": "valid.pdf",
+                "file_type": "pdf",
+                "file_size": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(nested_dir.join("malformed.json"), "{not valid json").unwrap();
+
+        unsafe {
+            std::env::remove_var("PROFILING_FIXTURES");
+        }
+        let mut manager = FixtureManager::new();
+        let error = manager.load_fixtures_from_dir(temp_dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains("malformed.json"));
+        assert_eq!(
+            manager.len(),
+            0,
+            "nested failure must abort before the parent corpus loads"
+        );
+    }
+
+    #[test]
+    fn directory_load_skips_split_sidecars() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("fixture.json"),
+            serde_json::json!({
+                "document": "document.pdf",
+                "file_type": "pdf",
+                "file_size": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.path().join("document.split.json"),
+            serde_json::json!({
+                "document": "document.pdf",
+                "boundaries": [{"start_page": 1, "end_page": 2}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("PROFILING_FIXTURES");
+        }
+        let mut manager = FixtureManager::new();
+        manager.load_fixtures_from_dir(temp_dir.path()).unwrap();
+
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.fixtures()[0].0.file_name().unwrap(), "fixture.json");
+    }
+
+    #[test]
+    fn directory_load_rejects_partial_fixture_schema() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("incomplete.json"),
+            serde_json::json!({"document": "document.pdf"}).to_string(),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("PROFILING_FIXTURES");
+        }
+        let mut manager = FixtureManager::new();
+        let error = manager.load_fixtures_from_dir(temp_dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains("incomplete.json"));
     }
 }

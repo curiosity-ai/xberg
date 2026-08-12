@@ -1,6 +1,20 @@
 {
 	"id": "output_format_bytes_markdown",
 	"description": "Tests markdown output format via bytes extraction API",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests markdown output format via bytes extraction API",
+		"description": "Tests markdown output format via bytes extraction API",
+		"presentation": {
+			"files": [
+				{
+					"field": "/bytes",
+					"path": "test_documents/pdf/fake_memo.pdf"
+				}
+			]
+		},
+		"side_effects": "safe"
+	},
 	"tags": ["contract", "output_format", "bytes"],
 	"call": "extract",
 	"input": {

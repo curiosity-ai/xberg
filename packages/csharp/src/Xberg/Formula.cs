@@ -20,69 +20,75 @@ namespace Xberg;
 /// when the `layout-detection` feature is active and the document contains
 /// formula regions.
 /// </summary>
-public sealed record Formula
-{
-    /// <summary>
-    /// LaTeX source of the recognized formula, without surrounding `$$` delimiters.
-    ///
-    /// This field contains the raw LaTeX code as produced by the OCR backend.
-    /// To render the formula in Markdown or other formats, wrap with `$$..$$` delimiters as needed.
-    /// </summary>
-    [JsonPropertyName("latex")]
-    public required string Latex { get; init; }
+public sealed record Formula {
+  /// <summary>
+  /// LaTeX source of the recognized formula, without surrounding `$$`
+  /// delimiters.
+  ///
+  /// This field contains the raw LaTeX code as produced by the OCR backend.
+  /// To render the formula in Markdown or other formats, wrap with `$$..$$`
+  /// delimiters as needed.
+  /// </summary>
+  [JsonPropertyName("latex")]
+  public required string Latex { get; init; }
 
-    /// <summary>
-    /// Bounding box of the formula region on its page, in rendered-image pixel coordinates.
-    ///
-    /// The coordinates are in the space of the OCR-rendered page image at the OCR DPI
-    /// (typically 300 DPI). These coordinates are NOT comparable to bounding boxes from
-    /// native PDF text extraction, which use PDF point coordinates.
-    /// </summary>
-    [JsonPropertyName("bbox")]
-    public required BoundingBox Bbox { get; init; }
+  /// <summary>
+  /// Bounding box of the formula region on its page, in rendered-image pixel
+  /// coordinates.
+  ///
+  /// The coordinates are in the space of the OCR-rendered page image at the OCR
+  /// DPI (typically 300 DPI). These coordinates are NOT comparable to bounding
+  /// boxes from native PDF text extraction, which use PDF point coordinates.
+  /// </summary>
+  [JsonPropertyName("bbox")]
+  public required BoundingBox Bbox {
+    get; init;
+  }
 
-    /// <summary>
-    /// 1-indexed page number the formula appears on in the document.
-    ///
-    /// This is set by the extraction pipeline based on which page the formula was found on.
-    /// </summary>
-    [JsonPropertyName("page")]
-    public uint Page { get; init; } = 0;
+  /// <summary>
+  /// 1-indexed page number the formula appears on in the document.
+  ///
+  /// This is set by the extraction pipeline based on which page the formula was
+  /// found on.
+  /// </summary>
+  [JsonPropertyName("page")]
+  public uint Page {
+    get; init;
+  } = 0;
 
-
-    /// <summary>
-    /// Parse a <see cref="Formula"/> from a JSON string.
-    /// </summary>
-    /// <exception cref="XbergException">When the JSON cannot be deserialised.</exception>
-    public static Formula FromJson(string json)
-    {
-        try
-        {
-            return JsonSerializer.Deserialize<Formula>(json, JsonOptions)
-            ?? throw new XbergException($"Failed to parse Formula from JSON: deserializer returned null");
-        }
-        catch (XbergException)
-        {
-            throw;
-        }
-        catch (Exception e)
-        {
-            throw new XbergException($"Failed to parse Formula from JSON: {e.Message}", e);
-        }
+  /// <summary>
+  /// Parse a <see cref="Formula"/> from a JSON string.
+  /// </summary>
+  /// <exception cref="XbergException">When the JSON cannot be
+  /// deserialised.</exception>
+  public static Formula FromJson(string json) {
+    try {
+      return JsonSerializer.Deserialize<Formula>(json, JsonOptions) ??
+             throw new XbergException(
+                 $"Failed to parse Formula from JSON: deserializer returned null");
+    } catch (XbergException) {
+      throw;
+    } catch (Exception e) {
+      throw new XbergException(
+          $"Failed to parse Formula from JSON: {e.Message}", e);
     }
+  }
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault,
-        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower), new ByteArrayJsonConverter() },
-    };
+  private static readonly JsonSerializerOptions JsonOptions = new() {
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault,
+    Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower),
+                   new ByteArrayJsonConverter() },
+  };
 
-    /// <summary>Options for serializing config/input objects to FFI. Strips nulls
-    /// (nullable C# fields default to null and would override required Rust fields with
-    /// non-deserialisable nulls) but preserves explicit false/0 so caller intent is kept.</summary>
-    private static readonly JsonSerializerOptions JsonSerializationOptions = new()
-    {
+  /// <summary>Options for serializing config/input objects to FFI. Strips nulls
+  /// (nullable C# fields default to null and would override required Rust
+  /// fields with non-deserialisable nulls) but preserves explicit false/0 so
+  /// caller intent is kept.</summary>
+  private static readonly JsonSerializerOptions JsonSerializationOptions =
+      new() {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower), new ByteArrayJsonConverter() },
-    };
+        Converters = { new JsonStringEnumConverter(
+                           JsonNamingPolicy.SnakeCaseLower),
+                       new ByteArrayJsonConverter() },
+      };
 }

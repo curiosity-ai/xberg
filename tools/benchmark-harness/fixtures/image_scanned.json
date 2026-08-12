@@ -8,10 +8,11 @@
 		"category": "image-scanned",
 		"size_class": "medium",
 		"requires_ocr": true,
-		"languages": ["en", "ko"]
+		"languages": ["en", "ko"],
+		"ocr_language": "eng+kor"
 	},
 	"ground_truth": {
-		"text_file": "../../../test_documents/ground_truth/png/image_scanned.md",
-		"source": "mistral-pixtral"
+		"text_file": "../../../test_documents/ground_truth/images/english_and_korean.md",
+		"source": "manual"
 	}
 }

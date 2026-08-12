@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use crate::XbergError;
     use crate::plugins::Plugin;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::plugins::registry::test_support::RerankerRegistryGuard;
 
     struct MockRerankerBackend {
         name: String,
@@ -208,40 +208,43 @@ mod tests {
         }
     }
 
-    /// Unique per-test name so parallel test runs don't collide in the shared
-    /// global `RERANKER_BACKEND_REGISTRY`.
-    fn unique_name(suffix: &str) -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("mock-reranker-{suffix}-{id}")
-    }
-
     #[test]
     fn register_list_unregister_roundtrip() {
-        let name = unique_name("roundtrip");
+        let _guard = RerankerRegistryGuard::acquire();
+        let name = "mock-reranker-roundtrip".to_string();
         register_reranker_backend(Arc::new(MockRerankerBackend { name: name.clone() })).unwrap();
 
-        assert!(list_reranker_backends().unwrap().contains(&name));
+        assert_eq!(list_reranker_backends().unwrap(), vec![name.clone()]);
 
         unregister_reranker_backend(&name).unwrap();
-        assert!(!list_reranker_backends().unwrap().contains(&name));
+        assert!(list_reranker_backends().unwrap().is_empty());
     }
 
     #[test]
     fn empty_name_rejected_via_global_api() {
+        let _guard = RerankerRegistryGuard::acquire();
         let result = register_reranker_backend(Arc::new(MockRerankerBackend { name: String::new() }));
         assert!(matches!(result, Err(XbergError::Validation { .. })));
+        assert!(
+            list_reranker_backends().unwrap().is_empty(),
+            "a rejected registration must not leave anything behind"
+        );
     }
 
     #[test]
     fn duplicate_name_rejected_via_global_api() {
-        let name = unique_name("dup");
+        let _guard = RerankerRegistryGuard::acquire();
+        let name = "mock-reranker-dup".to_string();
         register_reranker_backend(Arc::new(MockRerankerBackend { name: name.clone() })).unwrap();
 
         let result = register_reranker_backend(Arc::new(MockRerankerBackend { name: name.clone() }));
         assert!(matches!(result, Err(XbergError::Plugin { .. })));
 
-        // Clean up.
+        assert_eq!(
+            list_reranker_backends().unwrap(),
+            vec![name.clone()],
+            "the rejected duplicate must not have been added alongside the original"
+        );
         unregister_reranker_backend(&name).unwrap();
     }
 
@@ -259,12 +262,13 @@ mod tests {
 
     #[test]
     fn register_list_clear_list_roundtrip() {
-        let name = unique_name("clear");
+        let _guard = RerankerRegistryGuard::acquire();
+        let name = "mock-reranker-clear".to_string();
         register_reranker_backend(Arc::new(MockRerankerBackend { name: name.clone() })).unwrap();
 
-        assert!(list_reranker_backends().unwrap().contains(&name));
+        assert_eq!(list_reranker_backends().unwrap(), vec![name]);
 
         clear_reranker_backends().unwrap();
-        assert!(!list_reranker_backends().unwrap().contains(&name));
+        assert!(list_reranker_backends().unwrap().is_empty());
     }
 }

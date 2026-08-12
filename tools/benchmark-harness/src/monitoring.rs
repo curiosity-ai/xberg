@@ -2,8 +2,8 @@
 //!
 //! This module provides real-time monitoring of CPU and memory usage during
 //! document extraction, with percentile calculations for performance analysis.
-//! When the "memory-profiling" feature is enabled, provides additional allocation
-//! hotspot analysis and heap snapshot tracking.
+//! When the "memory-profiling" feature is enabled, heap allocation snapshots
+//! are captured alongside RSS and virtual-memory samples.
 //!
 //! # Measurement Methodology
 //!
@@ -20,9 +20,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 /// Calculate adaptive sampling interval based on file size.
 ///
@@ -83,20 +85,6 @@ impl MemorySnapshot {
     }
 }
 
-/// Allocation site with count and size information
-///
-/// Only available when memory-profiling feature is enabled.
-#[cfg(feature = "memory-profiling")]
-#[derive(Debug, Clone)]
-pub struct AllocationSite {
-    /// Source location (file:line format)
-    pub location: String,
-    /// Total bytes allocated from this site
-    pub bytes_allocated: u64,
-    /// Number of allocations from this site
-    pub allocation_count: u64,
-}
-
 /// Sample of resource usage at a point in time
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceSample {
@@ -155,11 +143,9 @@ fn get_child_processes(parent_pid: Pid, system: &System) -> Vec<Pid> {
 fn collect_process_tree_memory(pid: Pid, system: &System) -> u64 {
     let mut total = 0;
 
-    // Add parent process memory
     if let Some(proc) = system.process(pid) {
         total += proc.memory();
 
-        // Recursively add all child processes
         for child_pid in get_child_processes(pid, system) {
             total += collect_process_tree_memory(child_pid, system);
         }
@@ -181,17 +167,47 @@ fn collect_process_tree_memory(pid: Pid, system: &System) -> u64 {
 fn collect_process_tree_vm(pid: Pid, system: &System) -> u64 {
     let mut total = 0;
 
-    // Add parent process VM
     if let Some(proc) = system.process(pid) {
         total += proc.virtual_memory();
 
-        // Recursively add all child processes
         for child_pid in get_child_processes(pid, system) {
             total += collect_process_tree_vm(child_pid, system);
         }
     }
 
     total
+}
+
+/// Approximate total CPU-time consumed by the process tree in core-seconds, via trapezoidal
+/// integration of the per-sample CPU percentage over the sampled timeline.
+///
+/// `ResourceSample::cpu_percent` is normalized to a fraction of total system capacity (divided
+/// by `logical_cores` in [`ResourceMonitor::collect_sample`]); this recovers the un-normalized
+/// (raw, `0..=100*logical_cores`) percentage before integrating, since core-seconds measures
+/// actual CPU-time consumed rather than a per-core-normalized rate.
+///
+/// `logical_cores` is taken as a parameter (rather than calling `num_cpus::get()` internally)
+/// so the integration math is independently unit-testable regardless of the host's actual core
+/// count. Precision is bounded by the sampling interval (1-10ms, adaptive on file size, see
+/// [`adaptive_sampling_interval_ms`]): CPU bursts shorter than the gap between two samples are
+/// smoothed by the trapezoidal average rather than captured exactly. Returns `0.0` when fewer
+/// than two samples are available, since there is no timeline to integrate over.
+fn integrate_cpu_core_seconds(samples: &[ResourceSample], logical_cores: f64) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+
+    samples
+        .windows(2)
+        .map(|pair| {
+            let (prev, curr) = (pair[0], pair[1]);
+            let delta_secs = curr.timestamp_ms.saturating_sub(prev.timestamp_ms) as f64 / 1000.0;
+            let prev_raw_percent = prev.cpu_percent * logical_cores;
+            let curr_raw_percent = curr.cpu_percent * logical_cores;
+            let avg_raw_percent = (prev_raw_percent + curr_raw_percent) / 2.0;
+            (avg_raw_percent / 100.0) * delta_secs
+        })
+        .sum()
 }
 
 /// Collect total CPU usage from a process and all its descendants
@@ -216,7 +232,6 @@ fn collect_process_tree_cpu(pid: Pid, system: &System) -> f64 {
     if let Some(proc) = system.process(pid) {
         total += proc.cpu_usage() as f64;
 
-        // Recursively add all child processes
         for child_pid in get_child_processes(pid, system) {
             total += collect_process_tree_cpu(child_pid, system);
         }
@@ -229,6 +244,18 @@ fn collect_process_tree_cpu(pid: Pid, system: &System) -> f64 {
 ///
 /// Tracks both low-level CPU/memory metrics and optional heap allocation data.
 /// Use the "memory-profiling" feature for enhanced allocation analysis.
+struct PreparedSampler {
+    system: System,
+    refresh_kind: ProcessRefreshKind,
+}
+
+#[derive(Default)]
+struct SamplerState {
+    prepared: Option<PreparedSampler>,
+    task: Option<JoinHandle<()>>,
+    stop_sender: Option<Sender<()>>,
+}
+
 pub struct ResourceMonitor {
     samples: Arc<Mutex<Vec<ResourceSample>>>,
     snapshots: Arc<Mutex<Vec<MemorySnapshot>>>,
@@ -237,6 +264,7 @@ pub struct ResourceMonitor {
     /// Baseline RSS captured at start(), used to compute delta-based memory metrics.
     /// This removes the effect of pre-loaded models/runtimes from per-extraction measurements.
     baseline_memory_bytes: Arc<Mutex<u64>>,
+    sampler: Mutex<SamplerState>,
 }
 
 impl ResourceMonitor {
@@ -252,6 +280,7 @@ impl ResourceMonitor {
             running: Arc::new(AtomicBool::new(false)),
             pid,
             baseline_memory_bytes: Arc::new(Mutex::new(0)),
+            sampler: Mutex::new(SamplerState::default()),
         }
     }
 
@@ -267,6 +296,7 @@ impl ResourceMonitor {
             running: Arc::new(AtomicBool::new(false)),
             pid: Pid::from_u32(pid),
             baseline_memory_bytes: Arc::new(Mutex::new(0)),
+            sampler: Mutex::new(SamplerState::default()),
         }
     }
 
@@ -286,6 +316,118 @@ impl ResourceMonitor {
         Some(allocated as u64)
     }
 
+    fn collect_sample(pid: Pid, system: &System, elapsed: Duration) -> Option<(ResourceSample, MemorySnapshot)> {
+        system.process(pid)?;
+        let tree_memory = collect_process_tree_memory(pid, system);
+        let tree_vm = collect_process_tree_vm(pid, system);
+        let tree_cpu = collect_process_tree_cpu(pid, system);
+        let sample = ResourceSample {
+            memory_bytes: tree_memory,
+            vm_size_bytes: tree_vm,
+            page_faults: 0,
+            cpu_percent: tree_cpu / num_cpus::get() as f64,
+            timestamp_ms: elapsed.as_millis() as u64,
+        };
+
+        #[cfg(feature = "memory-profiling")]
+        let snapshot = MemorySnapshot::new(elapsed, tree_memory, tree_vm, 0, Self::capture_heap_stats());
+        #[cfg(not(feature = "memory-profiling"))]
+        let snapshot = MemorySnapshot::new(elapsed, tree_memory, tree_vm, 0);
+
+        Some((sample, snapshot))
+    }
+
+    /// Prepare resource monitoring without recording a sample.
+    ///
+    /// Captures the target process tree's baseline RSS and retains the refreshed
+    /// system state for [`Self::activate`]. This is useful when a subprocess is
+    /// blocked behind a start barrier: the blocked shell remains baseline metadata
+    /// and is never counted as target workload RSS.
+    pub async fn prepare(&self) {
+        let mut sampler = self.sampler.lock().await;
+        if self.running.load(Ordering::SeqCst) || sampler.prepared.is_some() {
+            return;
+        }
+
+        let pid = self.pid;
+        let prepared = tokio::task::spawn_blocking(move || {
+            let mut system = System::new();
+            let refresh_kind = ProcessRefreshKind::nothing().with_memory().with_cpu();
+
+            system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+            let baseline_rss = collect_process_tree_memory(pid, &system);
+
+            (PreparedSampler { system, refresh_kind }, baseline_rss)
+        })
+        .await;
+        let Ok((prepared, baseline_rss)) = prepared else {
+            return;
+        };
+
+        *self.baseline_memory_bytes.lock().await = baseline_rss;
+        sampler.prepared = Some(prepared);
+    }
+
+    /// Activate periodic sampling after [`Self::prepare`].
+    ///
+    /// Resets the sampling clock and schedules the first target-window sample one
+    /// interval after activation. Delaying that first sample prevents a released
+    /// start-barrier shell from being mistaken for the target before it calls
+    /// `exec`. If the target exits before the first refresh, no sample is recorded.
+    pub async fn activate(&self, sample_interval: Duration) {
+        self.activate_prepared(sample_interval, false).await;
+    }
+
+    async fn activate_prepared(&self, sample_interval: Duration, record_initial_sample: bool) {
+        let mut sampler = self.sampler.lock().await;
+        if self.running.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(prepared) = sampler.prepared.take() else {
+            return;
+        };
+
+        let PreparedSampler {
+            mut system,
+            refresh_kind,
+        } = prepared;
+        let pid = self.pid;
+        let start = std::time::Instant::now();
+
+        if record_initial_sample && let Some((sample, snapshot)) = Self::collect_sample(pid, &system, start.elapsed()) {
+            self.samples.lock().await.push(sample);
+            self.snapshots.lock().await.push(snapshot);
+        }
+
+        let samples = Arc::clone(&self.samples);
+        let snapshots = Arc::clone(&self.snapshots);
+        let running = Arc::clone(&self.running);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        self.running.store(true, Ordering::SeqCst);
+        let task = tokio::task::spawn_blocking(move || {
+            let mut next_sample = std::time::Instant::now() + sample_interval;
+
+            while running.load(Ordering::SeqCst) {
+                let wait = next_sample.saturating_duration_since(std::time::Instant::now());
+                match stop_rx.recv_timeout(wait) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+                if let Some((sample, snapshot)) = Self::collect_sample(pid, &system, start.elapsed()) {
+                    samples.blocking_lock().push(sample);
+                    snapshots.blocking_lock().push(snapshot);
+                }
+                next_sample += sample_interval;
+            }
+        });
+        sampler.stop_sender = Some(stop_tx);
+        sampler.task = Some(task);
+    }
+
     /// Start monitoring resources in the background
     ///
     /// Spawns a background task that samples memory and CPU usage at the specified interval.
@@ -294,84 +436,8 @@ impl ResourceMonitor {
     /// # Arguments
     /// * `sample_interval` - How often to sample (e.g., Duration::from_millis(10))
     pub async fn start(&self, sample_interval: Duration) {
-        if self.running.swap(true, Ordering::SeqCst) {
-            return;
-        }
-
-        let samples = Arc::clone(&self.samples);
-        let snapshots = Arc::clone(&self.snapshots);
-        let running = Arc::clone(&self.running);
-        let baseline_memory = Arc::clone(&self.baseline_memory_bytes);
-        let pid = self.pid;
-
-        tokio::spawn(async move {
-            let mut system = System::new();
-            let start = std::time::Instant::now();
-
-            let refresh_kind = ProcessRefreshKind::nothing().with_memory().with_cpu();
-
-            // Establish baseline for CPU delta calculation.
-            // sysinfo computes cpu_usage() as a diff between two consecutive refreshes,
-            // so the first refresh after System::new() always returns 0.0.
-            // By doing a baseline refresh here, the first in-loop sample will have
-            // a prior measurement to compare against and yield real CPU values.
-            system.refresh_processes_specifics(ProcessesToUpdate::All, false, refresh_kind);
-
-            // Capture baseline RSS before extraction starts.
-            // This allows delta-based memory reporting: peak_during_extraction - baseline.
-            // Without this, pre-loaded models (e.g. PaddleOCR ~362MB) inflate every
-            // extraction's memory measurement, even for plain text files.
-            let baseline_rss = collect_process_tree_memory(pid, &system);
-            *baseline_memory.lock().await = baseline_rss;
-
-            tokio::time::sleep(sample_interval).await;
-
-            while running.load(Ordering::SeqCst) {
-                // Refresh all processes to track child processes spawned by the benchmark.
-                // Note: refresh_cpu_usage() is NOT called here — it refreshes global CPU counters,
-                // not per-process CPU. Per-process CPU is computed by refresh_processes_specifics
-                // as a delta between consecutive calls on the same System instance.
-                system.refresh_processes_specifics(ProcessesToUpdate::All, false, refresh_kind);
-
-                if system.process(pid).is_some() {
-                    let elapsed = start.elapsed();
-
-                    let cpu_count = num_cpus::get() as f64;
-                    // Collect CPU from entire process tree (parent + all children)
-                    // This mirrors collect_process_tree_memory to ensure CPU measurement
-                    // captures subprocess work, not just the idle parent process.
-                    let tree_cpu = collect_process_tree_cpu(pid, &system);
-                    let normalized_cpu_percent = tree_cpu / cpu_count;
-
-                    // Collect memory from entire process tree (parent + all children)
-                    let tree_memory = collect_process_tree_memory(pid, &system);
-                    let tree_vm = collect_process_tree_vm(pid, &system);
-
-                    let sample = ResourceSample {
-                        memory_bytes: tree_memory,
-                        vm_size_bytes: tree_vm,
-                        page_faults: 0,
-                        cpu_percent: normalized_cpu_percent,
-                        timestamp_ms: elapsed.as_millis() as u64,
-                    };
-
-                    #[cfg(feature = "memory-profiling")]
-                    let heap_allocated = Self::capture_heap_stats();
-                    #[cfg(not(feature = "memory-profiling"))]
-                    let _heap_allocated: Option<u64> = None;
-
-                    #[cfg(feature = "memory-profiling")]
-                    let snapshot = MemorySnapshot::new(elapsed, tree_memory, tree_vm, 0, heap_allocated);
-                    #[cfg(not(feature = "memory-profiling"))]
-                    let snapshot = MemorySnapshot::new(elapsed, tree_memory, tree_vm, 0);
-
-                    samples.lock().await.push(sample);
-                    snapshots.lock().await.push(snapshot);
-                }
-
-                tokio::time::sleep(sample_interval).await;
-            }
-        });
+        self.prepare().await;
+        self.activate_prepared(sample_interval, true).await;
     }
 
     /// Take a single synchronous memory and CPU measurement of the current process tree.
@@ -383,10 +449,8 @@ impl ResourceMonitor {
         let mut system = System::new();
         let refresh_kind = ProcessRefreshKind::nothing().with_memory().with_cpu();
 
-        // First refresh establishes the CPU baseline
         system.refresh_processes_specifics(ProcessesToUpdate::All, false, refresh_kind);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        // Second refresh computes the CPU delta
         system.refresh_processes_specifics(ProcessesToUpdate::All, false, refresh_kind);
 
         let tree_memory = collect_process_tree_memory(self.pid, &system);
@@ -406,9 +470,19 @@ impl ResourceMonitor {
 
     /// Stop monitoring and return collected samples
     pub async fn stop(&self) -> Vec<ResourceSample> {
-        self.running.store(false, Ordering::SeqCst);
+        let (stop_sender, task) = {
+            let mut sampler = self.sampler.lock().await;
+            self.running.store(false, Ordering::SeqCst);
+            sampler.prepared = None;
+            (sampler.stop_sender.take(), sampler.task.take())
+        };
+        if let Some(stop_sender) = stop_sender {
+            let _ = stop_sender.send(());
+        }
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(task) = task {
+            let _ = task.await;
+        }
 
         let samples = self.samples.lock().await;
         samples.clone()
@@ -486,27 +560,22 @@ impl ResourceMonitor {
 
     /// Calculate resource statistics from samples and snapshots
     ///
-    /// Memory values are reported as deltas from `baseline_bytes`, which represents
-    /// the process tree RSS before extraction started. This removes the effect of
-    /// pre-loaded models and runtimes from per-extraction measurements.
-    ///
-    /// Pass `baseline_bytes = 0` to get absolute RSS (legacy behavior).
+    /// Absolute RSS is the primary peak metric. `baseline_bytes` and the
+    /// corresponding peak delta are retained separately so callers can distinguish
+    /// total process footprint from memory added during extraction.
     pub fn calculate_stats(
         samples: &[ResourceSample],
         snapshots: &[MemorySnapshot],
         baseline_bytes: u64,
     ) -> ResourceStats {
         if samples.is_empty() {
-            // If no background samples but snapshots are available, use snapshot RSS as fallback
             if !snapshots.is_empty() {
-                let peak_rss = snapshots
-                    .iter()
-                    .map(|s| s.rss_bytes.saturating_sub(baseline_bytes))
-                    .max()
-                    .unwrap_or(0);
+                let peak_rss = snapshots.iter().map(|s| s.rss_bytes).max().unwrap_or(0);
                 let peak_vm = snapshots.iter().map(|s| s.vm_bytes).max().unwrap_or(0);
                 return ResourceStats {
+                    baseline_memory_bytes: baseline_bytes,
                     peak_memory_bytes: peak_rss,
+                    peak_memory_delta_bytes: peak_rss.saturating_sub(baseline_bytes),
                     peak_vm_bytes: peak_vm,
                     p50_memory_bytes: peak_rss,
                     p95_memory_bytes: peak_rss,
@@ -516,13 +585,16 @@ impl ResourceMonitor {
                     ..Default::default()
                 };
             }
-            return ResourceStats::default();
+            return ResourceStats {
+                baseline_memory_bytes: baseline_bytes,
+                ..Default::default()
+            };
         }
 
-        // Subtract baseline from memory samples to get delta (incremental cost of this extraction).
-        let memory_values: Vec<u64> = samples
+        let memory_values: Vec<u64> = samples.iter().map(|s| s.memory_bytes).collect();
+        let memory_delta_values: Vec<u64> = memory_values
             .iter()
-            .map(|s| s.memory_bytes.saturating_sub(baseline_bytes))
+            .map(|memory| memory.saturating_sub(baseline_bytes))
             .collect();
         let cpu_values: Vec<f64> = samples.iter().map(|s| s.cpu_percent).collect();
         let vm_values: Vec<u64> = samples.iter().map(|s| s.vm_size_bytes).collect();
@@ -571,18 +643,19 @@ impl ResourceMonitor {
         let total_page_faults = samples.last().map(|s| s.page_faults).unwrap_or(0);
 
         ResourceStats {
+            baseline_memory_bytes: baseline_bytes,
             peak_memory_bytes: peak_memory,
+            peak_memory_delta_bytes: memory_delta_values.iter().copied().max().unwrap_or(0),
             peak_vm_bytes: peak_vm,
             total_page_faults,
             memory_growth_rate_mb_s,
             avg_cpu_percent: avg_cpu,
+            cpu_seconds: integrate_cpu_core_seconds(samples, num_cpus::get() as f64),
             p50_memory_bytes: Self::calculate_percentile(memory_values.clone(), 0.50),
             p95_memory_bytes: Self::calculate_percentile(memory_values.clone(), 0.95),
             p99_memory_bytes: Self::calculate_percentile(memory_values, 0.99),
             sample_count: samples.len(),
             snapshots: snapshots.to_vec(),
-            #[cfg(feature = "memory-profiling")]
-            allocation_hotspots: Vec::new(), // TODO: Extract from jemalloc profiles
             leak_detected,
         }
     }
@@ -600,8 +673,12 @@ impl Default for ResourceMonitor {
 /// growth rates, and optional allocation hotspot analysis.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceStats {
-    /// Peak memory usage in bytes
+    /// RSS captured immediately after monitoring attached to the target.
+    pub baseline_memory_bytes: u64,
+    /// Absolute peak RSS in bytes.
     pub peak_memory_bytes: u64,
+    /// Peak RSS above the captured baseline in bytes.
+    pub peak_memory_delta_bytes: u64,
     /// Peak virtual memory size in bytes
     pub peak_vm_bytes: u64,
     /// Total major page faults
@@ -610,6 +687,9 @@ pub struct ResourceStats {
     pub memory_growth_rate_mb_s: f64,
     /// Average CPU usage percentage
     pub avg_cpu_percent: f64,
+    /// Total process-tree CPU time consumed, in core-seconds (trapezoidal integration of the
+    /// sampled timeline; see [`integrate_cpu_core_seconds`]).
+    pub cpu_seconds: f64,
     /// 50th percentile (median) memory usage
     pub p50_memory_bytes: u64,
     /// 95th percentile memory usage
@@ -620,9 +700,6 @@ pub struct ResourceStats {
     pub sample_count: usize,
     /// Complete memory snapshots for detailed analysis
     pub snapshots: Vec<MemorySnapshot>,
-    /// Memory allocation hotspots (only with memory-profiling feature)
-    #[cfg(feature = "memory-profiling")]
-    pub allocation_hotspots: Vec<AllocationSite>,
     /// Whether memory leak was detected (RSA growing without release)
     pub leak_detected: bool,
 }
@@ -695,19 +772,164 @@ mod tests {
         assert_eq!(ResourceMonitor::calculate_percentile(values, 0.5), 0);
     }
 
+    #[test]
+    fn integrate_cpu_core_seconds_returns_zero_for_fewer_than_two_samples() {
+        assert_eq!(integrate_cpu_core_seconds(&[], 4.0), 0.0);
+
+        let single = [ResourceSample {
+            memory_bytes: 0,
+            vm_size_bytes: 0,
+            page_faults: 0,
+            cpu_percent: 50.0,
+            timestamp_ms: 0,
+        }];
+        assert_eq!(integrate_cpu_core_seconds(&single, 4.0), 0.0);
+    }
+
+    #[test]
+    fn integrate_cpu_core_seconds_trapezoidal_two_samples() {
+        let samples = [
+            ResourceSample {
+                memory_bytes: 0,
+                vm_size_bytes: 0,
+                page_faults: 0,
+                cpu_percent: 25.0,
+                timestamp_ms: 0,
+            },
+            ResourceSample {
+                memory_bytes: 0,
+                vm_size_bytes: 0,
+                page_faults: 0,
+                cpu_percent: 50.0,
+                timestamp_ms: 1_000,
+            },
+        ];
+
+        let core_seconds = integrate_cpu_core_seconds(&samples, 2.0);
+
+        assert!(
+            (core_seconds - 0.75).abs() < 1e-9,
+            "expected 0.75 core-seconds, got {core_seconds}"
+        );
+    }
+
+    #[test]
+    fn integrate_cpu_core_seconds_sums_across_multiple_windows() {
+        let samples = [
+            ResourceSample {
+                memory_bytes: 0,
+                vm_size_bytes: 0,
+                page_faults: 0,
+                cpu_percent: 25.0,
+                timestamp_ms: 0,
+            },
+            ResourceSample {
+                memory_bytes: 0,
+                vm_size_bytes: 0,
+                page_faults: 0,
+                cpu_percent: 25.0,
+                timestamp_ms: 500,
+            },
+            ResourceSample {
+                memory_bytes: 0,
+                vm_size_bytes: 0,
+                page_faults: 0,
+                cpu_percent: 25.0,
+                timestamp_ms: 1_000,
+            },
+        ];
+
+        let core_seconds = integrate_cpu_core_seconds(&samples, 4.0);
+
+        assert!(
+            (core_seconds - 1.0).abs() < 1e-9,
+            "expected 1.0 core-second, got {core_seconds}"
+        );
+    }
+
     #[tokio::test]
     async fn test_resource_monitor_basic() {
         let monitor = ResourceMonitor::new();
 
-        // 25ms interval + 500ms sleep gives ~20 samples even on a slow CI
-        // runner; the previous 10/100ms ratio occasionally produced 0
-        // samples on macOS CI when the first tick missed the deadline.
         monitor.start(Duration::from_millis(25)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let samples = monitor.stop().await;
 
         assert!(!samples.is_empty(), "Should have collected samples");
         assert!(samples.len() >= 2, "Should have at least 2 samples");
+    }
+
+    #[tokio::test]
+    async fn start_waits_for_initial_sample() {
+        let monitor = ResourceMonitor::new();
+
+        monitor.start(Duration::from_secs(1)).await;
+        let baseline = monitor.baseline_memory().await;
+        let samples = tokio::time::timeout(Duration::from_millis(250), monitor.stop())
+            .await
+            .expect("stop must wake a sampler with a long interval promptly");
+
+        assert!(baseline > 0, "start must capture the baseline before returning");
+        assert_eq!(samples.len(), 1, "the initial sample must not depend on the interval");
+        assert_eq!(samples[0].memory_bytes, baseline);
+    }
+
+    #[tokio::test]
+    async fn prepare_captures_baseline_without_recording_a_sample() {
+        let monitor = ResourceMonitor::new();
+
+        monitor.prepare().await;
+        let baseline = monitor.baseline_memory().await;
+        let samples = monitor.stop().await;
+
+        assert!(baseline > 0, "prepare must capture baseline RSS");
+        assert!(samples.is_empty(), "prepare must not record baseline RSS as a sample");
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_does_not_poison_monitor_lifecycle() {
+        let monitor = Arc::new(ResourceMonitor::new());
+        let sampler_guard = monitor.sampler.lock().await;
+        let starting_monitor = Arc::clone(&monitor);
+        let start_task = tokio::spawn(async move {
+            starting_monitor.start(Duration::from_millis(1)).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!start_task.is_finished(), "start must be waiting for sampler ownership");
+
+        start_task.abort();
+        assert!(start_task.await.unwrap_err().is_cancelled());
+        drop(sampler_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), monitor.start(Duration::from_millis(1)))
+            .await
+            .expect("a cancelled start must not leave the monitor marked as running");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let samples = tokio::time::timeout(Duration::from_secs(1), monitor.stop())
+            .await
+            .expect("monitor must remain stoppable after restarting");
+        assert!(!samples.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sampling_does_not_starve_current_thread_runtime() {
+        const HEARTBEAT_COUNT: usize = 20;
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(2);
+        const HEARTBEAT_DEADLINE: Duration = Duration::from_millis(250);
+
+        let monitor = ResourceMonitor::new();
+        monitor.start(Duration::from_millis(1)).await;
+
+        let heartbeat = tokio::time::timeout(HEARTBEAT_DEADLINE, async {
+            for _ in 0..HEARTBEAT_COUNT {
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            }
+        })
+        .await;
+        let samples = monitor.stop().await;
+
+        assert!(heartbeat.is_ok(), "resource sampling starved the Tokio runtime");
+        assert!(samples.len() >= 2, "background sampling did not remain active");
     }
 
     #[tokio::test]
@@ -763,9 +985,11 @@ mod tests {
             ),
         ];
 
-        let stats = ResourceMonitor::calculate_stats(&samples, &snapshots, 0);
+        let stats = ResourceMonitor::calculate_stats(&samples, &snapshots, 100);
 
+        assert_eq!(stats.baseline_memory_bytes, 100);
         assert_eq!(stats.peak_memory_bytes, 200);
+        assert_eq!(stats.peak_memory_delta_bytes, 100);
         assert_eq!(stats.peak_vm_bytes, 600);
         assert_eq!(stats.total_page_faults, 25);
         assert_eq!(stats.p50_memory_bytes, 150);
@@ -773,13 +997,24 @@ mod tests {
         assert_eq!(stats.sample_count, 3);
         assert!(stats.memory_growth_rate_mb_s >= 0.0);
         assert_eq!(stats.snapshots.len(), 3);
+        // `calculate_stats` must wire `cpu_seconds` through the same integration function,
+        // called with the host's actual logical core count (not asserted as a machine-dependent
+        // literal, since `num_cpus::get()` varies across CI runners). ~keep
+        let expected_core_seconds = integrate_cpu_core_seconds(&samples, num_cpus::get() as f64);
+        assert!(
+            (stats.cpu_seconds - expected_core_seconds).abs() < 1e-9,
+            "expected cpu_seconds {expected_core_seconds}, got {}",
+            stats.cpu_seconds
+        );
     }
 
     #[tokio::test]
     async fn test_resource_stats_empty() {
-        let stats = ResourceMonitor::calculate_stats(&[], &[], 0);
+        let stats = ResourceMonitor::calculate_stats(&[], &[], 42);
+        assert_eq!(stats.baseline_memory_bytes, 42);
         assert_eq!(stats.peak_memory_bytes, 0);
         assert_eq!(stats.sample_count, 0);
+        assert_eq!(stats.cpu_seconds, 0.0);
     }
 
     #[tokio::test]

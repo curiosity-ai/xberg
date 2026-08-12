@@ -14,6 +14,10 @@ use std::borrow::Cow;
 use roxmltree::Node;
 use serde_json;
 
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+#[cfg(feature = "office")]
+const OPML_WARNING_SOURCE: &str = "opml";
+
 /// Extract OPML content and metadata from raw bytes.
 ///
 /// Parses the XML document structure, extracts metadata from the `<head>` section,
@@ -55,7 +59,6 @@ pub(crate) fn extract_content_and_metadata(
                 extracted_content.push('\n');
             }
 
-            // Collect feed URLs from outline attributes
             let mut feed_urls = Vec::new();
             for outline in body.children().filter(|n| n.tag_name().name() == "outline") {
                 budget.step()?;
@@ -198,11 +201,11 @@ fn collect_feed_urls(node: Node, urls: &mut Vec<serde_json::Value>, budget: &mut
     Ok(())
 }
 
-/// Extract OPML outline attributes (xmlUrl, htmlUrl, type, description) into a HashMap.
+/// Extract OPML outline attributes (xmlUrl, htmlUrl, type, description, _note) into a HashMap.
 #[cfg(feature = "office")]
 fn extract_outline_attributes(node: Node) -> AHashMap<String, String> {
     let mut attrs = AHashMap::new();
-    for attr_name in &["xmlUrl", "htmlUrl", "type", "description"] {
+    for attr_name in &["xmlUrl", "htmlUrl", "type", "description", "_note"] {
         if let Some(val) = node.attribute(*attr_name) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
@@ -226,19 +229,15 @@ fn convert_inline_html(text: &str) -> String {
 
     let mut result = text.to_string();
 
-    // Convert <strong>text</strong> and <b>text</b> to **text**
     let strong_re = Regex::new(r"<(?:strong|b)>(.*?)</(?:strong|b)>").expect("valid regex");
     result = strong_re.replace_all(&result, "**$1**").into_owned();
 
-    // Convert <em>text</em> and <i>text</i> to *text*
     let em_re = Regex::new(r"<(?:em|i)>(.*?)</(?:em|i)>").expect("valid regex");
     result = em_re.replace_all(&result, "*$1*").into_owned();
 
-    // Convert <a href="url">text</a> to [text](url)
     let link_re = Regex::new(r#"<a\s+href="([^"]*)"[^>]*>(.*?)</a>"#).expect("valid regex");
     result = link_re.replace_all(&result, "[$2]($1)").into_owned();
 
-    // Unescape \< and \>
     result = result.replace(r"\<", "<").replace(r"\>", ">");
 
     result
@@ -263,16 +262,36 @@ pub(crate) fn build_internal_document(
 
     let mut builder = InternalDocumentBuilder::new("opml");
 
-    if let Some(opml) = doc.root().children().find(|n| n.tag_name().name() == "opml")
-        && let Some(body) = opml.children().find(|n| n.tag_name().name() == "body")
-    {
-        for outline in body.children().filter(|n| n.tag_name().name() == "outline") {
-            budget.step()?;
-            build_outline_internal(outline, 1, &mut builder, budget)?;
-        }
+    // Both lookups failing silently is total loss: the file parsed as XML, so extraction
+    // returns `Ok`, but the document handed back is empty and the caller cannot tell that
+    // from an outline file that genuinely has no entries (#171).
+    let mut missing_structure: Option<&'static str> = None;
+    match doc.root().children().find(|n| n.tag_name().name() == "opml") {
+        Some(opml) => match opml.children().find(|n| n.tag_name().name() == "body") {
+            Some(body) => {
+                for outline in body.children().filter(|n| n.tag_name().name() == "outline") {
+                    budget.step()?;
+                    build_outline_internal(outline, 1, &mut builder, budget)?;
+                }
+            }
+            None => missing_structure = Some("<body>"),
+        },
+        None => missing_structure = Some("<opml> root"),
     }
 
-    Ok(builder.build())
+    let mut document = builder.build();
+    if let Some(missing) = missing_structure {
+        crate::core::diagnostics::push_warning(
+            &mut document.processing_warnings,
+            OPML_WARNING_SOURCE,
+            format!(
+                "The file parsed as XML but has no {missing} element, so no outline entries \
+                 could be read and the extracted document is empty"
+            ),
+        );
+    }
+
+    Ok(document)
 }
 
 /// Recursively build internal document from outline nodes.
@@ -285,10 +304,18 @@ fn build_outline_internal(
 ) -> Result<()> {
     budget.enter()?;
     let text = node.attribute("text").unwrap_or("").trim();
+    let note = node.attribute("_note").map(str::trim).filter(|n| !n.is_empty());
 
     let child_outlines: Vec<Node> = node.children().filter(|n| n.tag_name().name() == "outline").collect();
 
+    // An outline with no `text` still carries meaningful content when it has a
+    // `_note` (or other attributes/children); only truly empty nodes are skipped.
     if text.is_empty() {
+        if let Some(note) = note {
+            budget.check_attr("_note", note)?;
+            budget.account_text(note.len())?;
+            builder.push_paragraph(&convert_inline_html(note), Vec::new(), None, None);
+        }
         for child in child_outlines {
             budget.step()?;
             build_outline_internal(child, depth, builder, budget)?;
@@ -302,8 +329,7 @@ fn build_outline_internal(
 
     let attrs = extract_outline_attributes(node);
 
-    // Extract URIs from xmlUrl and htmlUrl attributes
-    let label = if text.is_empty() { None } else { Some(text.to_string()) };
+    let label = Some(text.to_string());
     if let Some(xml_url) = node.attribute("xmlUrl") {
         let trimmed = xml_url.trim();
         if !trimmed.is_empty() {

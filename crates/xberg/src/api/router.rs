@@ -7,6 +7,7 @@ use axum::{
     extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
 };
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
@@ -19,15 +20,43 @@ use tower_http::{
 
 use crate::{ExtractionConfig, core::ServerConfig, service::ExtractionServiceBuilder};
 
+#[cfg(feature = "prometheus")]
+use super::handlers::metrics_handler;
 use super::{
     handlers::{
-        cache_clear_handler, cache_manifest_handler, cache_stats_handler, cache_warm_handler, detect_handler,
-        extract_async_handler, extract_handler, formats_handler, health_handler, info_handler, job_status_handler,
-        not_found_handler, version_handler,
+        cache_clear_handler, cache_manifest_handler, cache_stats_handler, cache_warm_handler, cancel_job_handler,
+        detect_handler, extract_async_handler, extract_handler, formats_handler, health_handler, info_handler,
+        job_status_handler, not_found_handler, version_handler,
     },
     openweb::{openweb_docling_handler, openweb_external_handler},
     types::{ApiSizeLimits, ApiState},
 };
+
+/// Environment variable controlling the server's global concurrency limit.
+/// Set to `0` to disable the limit (unbounded concurrent requests).
+const MAX_CONCURRENT_REQUESTS_ENV: &str = "XBERG_MAX_CONCURRENT_REQUESTS";
+
+/// Resolve the maximum number of requests processed concurrently by the server.
+///
+/// Without a bound, every in-flight request buffers its body and extraction
+/// working set in memory, so a burst of large requests can exhaust RAM and OOM
+/// the process — especially in memory-limited containers. The default caps
+/// concurrency at twice the CPU count (clamped to `[4, 32]`), applying
+/// backpressure instead of unbounded growth. `XBERG_MAX_CONCURRENT_REQUESTS`
+/// overrides it; `0` disables the limit for deployments that bound concurrency
+/// upstream (e.g. a reverse proxy or queue).
+fn resolve_max_concurrent_requests() -> usize {
+    const MIN_DEFAULT: usize = 4;
+    const MAX_DEFAULT: usize = 32;
+
+    match std::env::var(MAX_CONCURRENT_REQUESTS_ENV) {
+        Ok(value) => value.trim().parse::<usize>().unwrap_or_else(|_| {
+            tracing::warn!("{MAX_CONCURRENT_REQUESTS_ENV}={value:?} is not a valid usize; using the computed default");
+            (num_cpus::get() * 2).clamp(MIN_DEFAULT, MAX_DEFAULT)
+        }),
+        Err(_) => (num_cpus::get() * 2).clamp(MIN_DEFAULT, MAX_DEFAULT),
+    }
+}
 
 /// Create the API router with all routes configured.
 ///
@@ -106,6 +135,10 @@ pub fn create_router_with_limits(config: ExtractionConfig, limits: ApiSizeLimits
 ///
 /// # Examples
 ///
+/// Not run as a doctest: `pub(crate)`, so it is unreachable from a downstream crate.
+/// [`create_router_with_limits`] is the public entry point with the same shape
+/// minus the server config.
+///
 /// ```ignore
 /// use xberg::{ExtractionConfig, api::{create_router_with_limits_and_server_config, ApiSizeLimits}, core::ServerConfig};
 ///
@@ -127,6 +160,16 @@ pub(crate) fn create_router_with_limits_and_server_config(
     limits: ApiSizeLimits,
     server_config: ServerConfig,
 ) -> Router {
+    // Fallback for embedders that only ever use this built-in router: install the
+    // Prometheus-backed meter provider before the extraction service (and therefore the
+    // `telemetry::metrics::get_metrics()` `OnceLock`) is built below. Callers who construct
+    // their own extraction pipeline outside this router must call
+    // `xberg::telemetry::init_prometheus()` themselves, before their first extraction —
+    // see that function's doc comment. This call is idempotent, so calling it again here
+    // after an embedder's own explicit call is harmless. ~keep
+    #[cfg(feature = "prometheus")]
+    let prometheus_registry = crate::telemetry::init_prometheus();
+
     let extraction_service = ExtractionServiceBuilder::new().with_tracing().with_metrics().build();
 
     let state = ApiState {
@@ -134,9 +177,10 @@ pub(crate) fn create_router_with_limits_and_server_config(
         extraction_service: Arc::new(std::sync::Mutex::new(extraction_service)),
         #[cfg(feature = "api")]
         job_store: Arc::new(super::jobs::JobStore::new()),
+        #[cfg(feature = "prometheus")]
+        prometheus_registry,
     };
 
-    // CORS configuration based on ServerConfig
     let cors_layer = if server_config.cors_allows_all() {
         tracing::warn!(
             "CORS configured to allow all origins (default). This permits CSRF attacks. \
@@ -169,7 +213,7 @@ pub(crate) fn create_router_with_limits_and_server_config(
     let mut router = Router::new()
         .route("/extract", post(extract_handler))
         .route("/extract-async", post(extract_async_handler))
-        .route("/jobs/{job_id}", get(job_status_handler))
+        .route("/jobs/{job_id}", get(job_status_handler).delete(cancel_job_handler))
         .route("/detect", post(detect_handler))
         .route("/formats", get(formats_handler))
         .route("/health", get(health_handler))
@@ -179,18 +223,21 @@ pub(crate) fn create_router_with_limits_and_server_config(
         .route("/cache/clear", delete(cache_clear_handler))
         .route("/cache/manifest", get(cache_manifest_handler))
         .route("/cache/warm", post(cache_warm_handler))
-        // OpenWebUI compatibility endpoints
         .route("/process", put(openweb_external_handler))
         .route("/v1/convert/file", post(openweb_docling_handler))
         .fallback(not_found_handler);
 
-    // Add OpenAPI schema endpoint if API feature is enabled
     #[cfg(feature = "api")]
     {
         router = router.route("/openapi.json", get(openapi_schema_handler));
     }
 
-    router
+    #[cfg(feature = "prometheus")]
+    {
+        router = router.route("/metrics", get(metrics_handler));
+    }
+
+    let router = router
         .layer(DefaultBodyLimit::max(limits.max_request_body_bytes))
         .layer(RequestBodyLimitLayer::new(limits.max_request_body_bytes))
         .layer(cors_layer)
@@ -200,17 +247,32 @@ pub(crate) fn create_router_with_limits_and_server_config(
         .layer(CatchPanicLayer::new())
         .layer(SetSensitiveHeadersLayer::new([axum::http::header::AUTHORIZATION]))
         // Per-request and per-response events are demoted to DEBUG so the default
-        // `tower_http=info` filter keeps them out of normal logs. Failures stay at
-        // WARN so they surface without needing RUST_LOG overrides. Full transport
-        // tracing is restored with RUST_LOG=tower_http=debug.
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(tracing::Level::DEBUG))
                 .on_request(DefaultOnRequest::new().level(tracing::Level::DEBUG))
                 .on_response(DefaultOnResponse::new().level(tracing::Level::DEBUG))
                 .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
-        )
-        .with_state(state)
+        );
+
+    // Outermost layer: cap how many requests process concurrently so a burst of
+    // large uploads applies backpressure instead of exhausting memory (#1368).
+    let max_concurrent_requests = resolve_max_concurrent_requests();
+    let router = if max_concurrent_requests > 0 {
+        tracing::info!(
+            max_concurrent_requests,
+            "API global concurrency limit active (set {MAX_CONCURRENT_REQUESTS_ENV}=0 to disable)"
+        );
+        router.layer(GlobalConcurrencyLimitLayer::new(max_concurrent_requests))
+    } else {
+        tracing::warn!(
+            "API global concurrency limit DISABLED ({MAX_CONCURRENT_REQUESTS_ENV}=0); \
+             concurrent requests are unbounded and may exhaust memory under load"
+        );
+        router
+    };
+
+    router.with_state(state)
 }
 
 /// OpenAPI schema handler.
@@ -269,5 +331,40 @@ mod tests {
             ..Default::default()
         };
         let _router = create_router_with_limits_and_server_config(extraction_config, limits, server_config);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn resolve_max_concurrent_requests_honors_env_and_defaults() {
+        let original = std::env::var(MAX_CONCURRENT_REQUESTS_ENV).ok();
+
+        unsafe {
+            std::env::set_var(MAX_CONCURRENT_REQUESTS_ENV, "7");
+            assert_eq!(resolve_max_concurrent_requests(), 7, "explicit value must be honored");
+
+            std::env::set_var(MAX_CONCURRENT_REQUESTS_ENV, "0");
+            assert_eq!(resolve_max_concurrent_requests(), 0, "0 must disable the limit");
+
+            std::env::set_var(MAX_CONCURRENT_REQUESTS_ENV, "not-a-number");
+            let fallback = resolve_max_concurrent_requests();
+            assert!(
+                (4..=32).contains(&fallback),
+                "invalid value must fall back to the bounded default"
+            );
+
+            std::env::remove_var(MAX_CONCURRENT_REQUESTS_ENV);
+            let default = resolve_max_concurrent_requests();
+            assert!(
+                (4..=32).contains(&default),
+                "unset default must be bounded (not unlimited), got {default}"
+            );
+        }
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var(MAX_CONCURRENT_REQUESTS_ENV, value),
+                None => std::env::remove_var(MAX_CONCURRENT_REQUESTS_ENV),
+            }
+        }
     }
 }

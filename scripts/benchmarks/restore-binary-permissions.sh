@@ -18,7 +18,6 @@ fi
 chmod +x "$BINARY_PATH"
 echo "✓ Restored executable permissions on: $BINARY_PATH"
 
-# Also restore xberg-cli if present (used by all xberg adapter pipelines)
 CLI_BINARY="$REPO_ROOT/target/release/xberg"
 if [ -f "$CLI_BINARY" ]; then
   chmod +x "$CLI_BINARY"

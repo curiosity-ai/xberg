@@ -23,8 +23,8 @@
   <a href="https://github.com/xberg-io/xberg/tree/main/packages/go">
     <img src="https://img.shields.io/github/v/tag/xberg-io/xberg?label=Go&color=007ec6&filter=v1*" alt="Go">
   </a>
-  <a href="https://www.nuget.org/packages/Xberg/">
-    <img src="https://img.shields.io/nuget/v/Xberg?label=C%23&color=007ec6" alt="C#">
+  <a href="https://www.nuget.org/packages/XbergIo.Xberg/">
+    <img src="https://img.shields.io/nuget/v/XbergIo.Xberg?label=C%23&color=007ec6" alt="C#">
   </a>
   <a href="https://packagist.org/packages/xberg-io/xberg">
     <img src="https://img.shields.io/packagist/v/xberg-io/xberg?label=PHP&color=007ec6" alt="PHP">
@@ -53,6 +53,9 @@
   <a href="https://github.com/xberg-io/xberg/pkgs/container/xberg">
     <img src="https://img.shields.io/badge/Docker-ghcr.io-007ec6?logo=docker&logoColor=white" alt="Docker">
   </a>
+  <a href="https://docs.xberg.io/guides/kubernetes/">
+    <img src="https://img.shields.io/badge/Helm-chart-007ec6?logo=helm&logoColor=white" alt="Helm chart">
+  </a>
   <!-- Project Info -->
   <a href="https://github.com/xberg-io/xberg/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-007ec6" alt="License">
@@ -79,7 +82,7 @@
 
 High-performance document intelligence for Go backed by the Rust core that powers every Xberg binding.
 
-> **Version 1.0.0-rc.9**
+> **Version 1.1.0**
 > Report issues at [github.com/xberg-io/xberg](https://github.com/xberg-io/xberg/issues).
 
 ## What This Package Provides
@@ -118,11 +121,15 @@ To use this package via `go get`:
 
 ```bash
 # Get the latest release
-go get github.com/xberg-io/xberg@latest
+go get github.com/xberg-io/xberg/packages/go@latest
 
 # Or a specific version
-go get github.com/xberg-io/xberg@v1.0.0-rc.9
+go get github.com/xberg-io/xberg/packages/go@v1.1.0
 ```
+
+> ⚠️ Do not run `go get github.com/xberg-io/xberg` — the repository root is not a Go module.
+> Always target the `/packages/go` subdirectory as shown above; the bare-root path resolves
+> against a stale Go module-proxy cache entry and fails.
 
 You'll need to provide the static library at build time. See [Building with Static Libraries](#building-with-static-libraries) below.
 
@@ -136,7 +143,7 @@ Download the static library for your platform from [GitHub Releases](https://git
 
 ```bash
 # Example: Linux x86_64
-curl -LO https://github.com/xberg-io/xberg/releases/download/v1.0.0-rc.9/go-ffi-linux-x86_64.tar.gz
+curl -LO https://github.com/xberg-io/xberg/releases/download/v1.1.0/go-ffi-linux-x86_64.tar.gz
 tar -xzf go-ffi-linux-x86_64.tar.gz
 
 # Copy to a permanent location
@@ -208,7 +215,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/xberg-io/xberg"
+	"github.com/xberg-io/xberg/packages/go"
 )
 
 func main() {
@@ -327,7 +334,7 @@ func init() {
 
 ## API Reference
 
-- **GoDoc**: [pkg.go.dev/github.com/xberg-io/xberg](<https://pkg.go.dev/github.com/xberg-io/xberg>)
+- **GoDoc**: [pkg.go.dev/github.com/xberg-io/xberg/packages/go](<https://pkg.go.dev/github.com/xberg-io/xberg/packages/go>)
 - **Full documentation**: [xberg.io](https://xberg.io) (configuration, formats, OCR backends)
 
 ## Troubleshooting
@@ -354,7 +361,7 @@ Need help? Join the [Discord](https://discord.gg/xt9WY3GnKR) or open an issue wi
 
 - [crawlberg](https://github.com/xberg-io/crawlberg) — web crawling and scraping with HTML→Markdown and headless-Chrome fallback.
 - [html-to-markdown](https://github.com/xberg-io/html-to-markdown) — fast, lossless HTML→Markdown engine.
-- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 143 providers.
+- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 165 providers.
 - [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-language-pack) — tree-sitter grammars and code-intelligence primitives.
 - [alef](https://github.com/xberg-io/alef) — the polyglot binding generator that produces this README and all per-language bindings.
 - [Discord](https://discord.gg/xt9WY3GnKR) — community, roadmap, announcements.

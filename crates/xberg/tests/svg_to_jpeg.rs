@@ -117,7 +117,6 @@ fn svg_to_jpeg_quality_parameter_affects_output_size() {
         "both quality runs must produce the same number of images"
     );
 
-    // For at least one image the low-quality output must be ≤ high-quality output.
     let any_smaller_or_equal = images_high
         .iter()
         .zip(images_low.iter())

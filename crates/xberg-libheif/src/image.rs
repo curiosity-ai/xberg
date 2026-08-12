@@ -239,16 +239,6 @@ impl Image {
         unsafe { lh::heif_image_has_channel(self.inner, channel as _) != 0 }
     }
 
-    //    pub fn channels(&self) -> Vec<Channel> {
-    //        let mut res = Vec::from_iter();
-    //        for channel in Channel::iter() {
-    //            if self.has_channel(channel) {
-    //                res.insert(channel);
-    //            }
-    //        }
-    //        res
-    //    }
-
     #[allow(unsafe_code)]
     pub fn color_space(&self) -> Option<ColorSpace> {
         unsafe {
@@ -312,14 +302,12 @@ impl Image {
         let mut result: Vec<u8> = Vec::with_capacity(size);
         let err = unsafe { lh::heif_image_get_raw_color_profile(self.inner, result.as_ptr() as _) };
         if err.code != 0 {
-            // Only one error is possible inside `libheif` - `ColorProfileDoesNotExist`
             return None;
         }
         unsafe {
             result.set_len(size);
         }
         let c_profile_type = unsafe { lh::heif_image_get_color_profile_type(self.inner) };
-        // `c_profile_type` on Windows will be i32, so we need to cast it to u32
         let profile_type = ColorProfileType::from(c_profile_type as u32);
 
         Some(ColorProfileRaw {
@@ -348,7 +336,6 @@ impl Image {
         let mut profile_ptr = MaybeUninit::<_>::uninit();
         let err = unsafe { lh::heif_image_get_nclx_color_profile(self.inner, profile_ptr.as_mut_ptr()) };
         if err.code != 0 {
-            // Only one error is possible inside `libheif` - `ColorProfileDoesNotExist`
             return None;
         }
         let profile_ptr = unsafe { profile_ptr.assume_init() };

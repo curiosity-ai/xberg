@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::super::acceleration::AccelerationConfig;
 use super::super::content_filter::ContentFilterConfig;
-use super::super::formats::OutputFormat;
-use super::super::ocr::OcrConfig;
+use super::super::formats::{JupyterCellRendering, OutputFormat};
+use super::super::ocr::{OcrConfig, OcrStrategy};
 use super::super::page::PageConfig;
 use super::super::processing::{ChunkingConfig, PostProcessorConfig};
 use super::file_config::FileExtractionConfig;
@@ -41,13 +41,26 @@ pub struct ExtractionConfig {
     #[serde(default = "default_true")]
     pub enable_quality_processing: bool,
 
-    /// OCR configuration (None = OCR disabled)
+    /// OCR configuration.
+    ///
+    /// `None` does not run OCR for documents that already have usable text. Under
+    /// `OcrStrategy::Auto`, a PDF with no text layer at all (a scan) is still routed
+    /// to OCR with default settings so it is not returned empty (#1338). Set
+    /// [`Self::disable_ocr`] to hard-disable OCR regardless of the detected content.
     #[serde(default)]
     pub ocr: Option<OcrConfig>,
 
     /// Force OCR even for searchable PDFs
     #[serde(default)]
     pub force_ocr: bool,
+
+    /// Which pages get OCR'd when neither `force_ocr` nor `force_ocr_pages` applies.
+    ///
+    /// Defaults to [`OcrStrategy::Auto`], which OCRs only pages whose native text
+    /// fails a quality check. Only applies to PDF documents. Cannot be
+    /// [`OcrStrategy::ScannedPages`] while `disable_ocr` is `true`.
+    #[serde(default, deserialize_with = "super::super::processing::deserialize_null_default")]
+    pub ocr_strategy: OcrStrategy,
 
     /// Force OCR on specific pages only (1-indexed page numbers, must be >= 1).
     ///
@@ -117,7 +130,6 @@ pub struct ExtractionConfig {
     /// list formatting, code block styles, and preprocessing options.
     #[cfg(feature = "html")]
     #[serde(default)]
-    #[cfg_attr(alef, alef(skip))]
     pub html_options: Option<html_to_markdown_rs::ConversionOptions>,
 
     /// Styled HTML output configuration.
@@ -137,17 +149,20 @@ pub struct ExtractionConfig {
     /// When set, each file in a batch will be canceled after this duration
     /// unless overridden by [`FileExtractionConfig::timeout_secs`].
     ///
-    /// Defaults to `Some(60)` to prevent pathological files (e.g. deeply
-    /// nested archives, documents with millions of cells) from running
-    /// indefinitely and exhausting caller resources. Set to `None` to
-    /// disable the timeout for trusted input or long-running workloads.
+    /// Defaults to `Some(600)` (10 minutes) to prevent pathological files
+    /// (e.g. deeply nested archives, documents with millions of cells) from
+    /// running indefinitely and exhausting caller resources, while still
+    /// giving slow paths (VLM-based OCR, large scanned documents) enough
+    /// headroom to finish. Set to `None` to disable the timeout for trusted
+    /// input or long-running workloads.
     #[serde(default = "default_extraction_timeout")]
     pub extraction_timeout_secs: Option<u64>,
 
-    /// Maximum concurrent extractions in batch operations (None = (num_cpus × 1.5).ceil()).
+    /// Maximum concurrent document extractions in batch operations.
     ///
-    /// Limits parallelism to prevent resource exhaustion when processing
-    /// large batches. Defaults to (num_cpus × 1.5).ceil() when not set.
+    /// This is a ceiling within the configured total thread budget, not an
+    /// independent pool size. When unset, the scheduler derives document and
+    /// per-document concurrency from `ConcurrencyConfig::max_threads`.
     #[serde(default)]
     pub max_concurrent_extractions: Option<usize>,
 
@@ -198,6 +213,50 @@ pub struct ExtractionConfig {
     #[serde(default)]
     pub output_format: OutputFormat,
 
+    /// Escape Markdown special characters in rendered prose (default: `true`).
+    ///
+    /// When `output_format` is `Markdown` or `Djot`, the renderer backslash-escapes
+    /// CommonMark-significant leading characters (e.g. `-`, `#`) so that literal
+    /// text such as `#06-18` or `- clause` round-trips safely through a CommonMark
+    /// parser instead of being reinterpreted as a heading or list marker.
+    ///
+    /// Table cell text is never escaped, so escaped prose can look inconsistent
+    /// with table cells containing the same characters. Set this to `false` to
+    /// disable prose escaping and make `content`, `pages[].content`, and
+    /// `chunks[].content` read identically to table cell text — useful for LLM
+    /// prompts or search indexing where CommonMark round-tripping does not matter.
+    ///
+    /// Defaults to `true` to preserve existing behavior.
+    #[serde(default = "default_true")]
+    pub escape_markdown: bool,
+
+    /// Emit an opt-in anchor marker before each table's rendered Markdown
+    /// block (default: `false`).
+    ///
+    /// When `output_format` is `Markdown` (or `Djot`) and this is `true`, the
+    /// renderer inserts a `[TABLE:{table_id}]` marker immediately before each
+    /// table's Markdown in `content`, `pages[].content`, and
+    /// `chunks[].content`, where `table_id` matches the corresponding
+    /// entry's [`crate::types::Table::table_id`]. This lets a consumer
+    /// reconcile a rendered Markdown table block with its structured
+    /// `tables[]` entry.
+    ///
+    /// Defaults to `false` so existing output is byte-identical unless
+    /// explicitly enabled.
+    #[serde(default)]
+    pub table_anchors: bool,
+
+    /// Controls how Jupyter notebook (`.ipynb`) code cells are rendered.
+    ///
+    /// - `Both` (default): code source plus the notebook's saved outputs
+    /// - `Source`: only the code source (fenced code blocks)
+    /// - `Outputs`: only the saved outputs
+    ///
+    /// Cells are never executed; `Outputs`/`Both` surface only outputs already
+    /// stored in the notebook.
+    #[serde(default)]
+    pub jupyter_cell_rendering: JupyterCellRendering,
+
     /// Layout detection configuration (None = layout detection disabled).
     ///
     /// When set, PDF pages and images are analyzed for document structure
@@ -228,12 +287,12 @@ pub struct ExtractionConfig {
 
     /// Run layout detection on the non-OCR PDF markdown path.
     ///
-    /// When `true` and `layout` is `Some(_)`, layout regions inform heading,
-    /// table, list, and figure detection in the structure pipeline that would
-    /// otherwise rely on font-clustering heuristics alone. Significantly
-    /// improves SF1 (structural F1) at the cost of inference latency
-    /// (~150-300ms/page CPU, ~20-50ms/page GPU). Default: `false`.
-    /// Requires the `layout-detection` feature.
+    /// When `true` and `layout` is `Some(_)`, layout regions inform reading
+    /// order, region grouping, and table detection while native font/tag
+    /// semantics remain authoritative for headings, lists, code, and formulas.
+    /// OCR layout classification is unchanged. This improves structural output
+    /// at the cost of inference latency (~150-300ms/page CPU, ~20-50ms/page
+    /// GPU). Default: `false`. Requires the `layout-detection` feature.
     #[serde(default)]
     pub use_layout_for_markdown: bool,
 
@@ -278,11 +337,20 @@ pub struct ExtractionConfig {
     #[serde(default)]
     pub email: Option<super::super::email::EmailConfig>,
 
+    /// CSV/TSV extraction configuration (None = use defaults).
+    ///
+    /// Lets callers set an explicit delimiter and declare comment-line
+    /// prefixes to skip, instead of relying solely on delimiter
+    /// auto-detection. See [`crate::core::config::CsvConfig`] for details.
+    #[serde(default)]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub csv: Option<super::super::csv::CsvConfig>,
+
     /// Concurrency limits for constrained environments (None = use defaults).
     ///
-    /// Controls Rayon thread pool size, ONNX Runtime intra-op threads, and
-    /// (when `max_concurrent_extractions` is unset) the batch concurrency
-    /// semaphore. See [`crate::core::config::ConcurrencyConfig`] for details.
+    /// Controls Rayon thread pool size, ONNX Runtime intra-op threads, and the
+    /// combined document/inner-task budget for batch extraction. See
+    /// [`crate::core::config::ConcurrencyConfig`] for details.
     #[serde(default)]
     #[cfg_attr(alef, alef(skip))]
     pub concurrency: Option<super::super::concurrency::ConcurrencyConfig>,
@@ -315,45 +383,52 @@ pub struct ExtractionConfig {
     /// Named-entity recognition configuration. When set, the NER post-processor runs at
     /// the Middle stage and populates `ExtractedDocument::entities`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "alef-meta", alef(since = "5.0.0"))]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub ner: Option<super::super::ner::NerConfig>,
 
     /// Redaction / anonymisation configuration. When set, the redaction post-processor
     /// runs at the Late stage and rewrites every textual field in `ExtractedDocument`,
     /// emitting an audit trail in `ExtractedDocument::redaction_report`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "alef-meta", alef(since = "5.0.0"))]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub redaction: Option<super::super::redaction::RedactionConfig>,
 
     /// Summarisation configuration. When set, the summarisation post-processor runs at
     /// the Middle stage and populates `ExtractedDocument::summary`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "alef-meta", alef(since = "5.0.0"))]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub summarization: Option<super::super::summarization::SummarizationConfig>,
 
     /// Translation configuration. When set, the translation post-processor runs at the
     /// Middle stage and populates `ExtractedDocument::translation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "alef-meta", alef(since = "5.0.0"))]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub translation: Option<super::super::translation::TranslationConfig>,
 
     /// Per-page classification configuration. When set, the classification post-processor
     /// runs at the Middle stage and populates `ExtractedDocument::page_classifications`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "alef-meta", alef(since = "5.0.0"))]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub page_classification: Option<super::super::classification::PageClassificationConfig>,
+
+    /// Per-chunk multi-label classification configuration. When set, the
+    /// chunk-classification post-processor runs at the Middle stage (after
+    /// chunking) and populates `ChunkMetadata::classifications` on every chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
+    pub chunk_classification: Option<super::super::chunk_classification::ChunkClassificationConfig>,
 
     /// VLM captioning configuration for extracted images. When set, the captioning
     /// post-processor runs at the Middle stage and writes a caption into each
     /// `ExtractedImage::caption`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "alef-meta", alef(since = "5.0.0"))]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub captioning: Option<super::super::captioning::CaptioningConfig>,
 
     /// Enable QR-code detection in extracted images. When `true`, the QR post-processor
     /// runs at the Middle stage and populates `ExtractedImage::qr_codes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "alef-meta", alef(since = "5.0.0"))]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub qr_codes: Option<bool>,
 
     /// Cancellation token for this extraction (None = no external cancellation).
@@ -393,6 +468,7 @@ impl Default for ExtractionConfig {
             enable_quality_processing: true,
             ocr: None,
             force_ocr: false,
+            ocr_strategy: OcrStrategy::Auto,
             force_ocr_pages: None,
             disable_ocr: false,
             chunking: None,
@@ -421,11 +497,15 @@ impl Default for ExtractionConfig {
             use_layout_for_markdown: false,
             result_format: crate::types::ResultFormat::Unified,
             output_format: OutputFormat::Plain,
+            escape_markdown: true,
+            table_anchors: false,
+            jupyter_cell_rendering: JupyterCellRendering::Both,
             include_document_structure: false,
             acceleration: None,
             cache_namespace: None,
             cache_ttl_secs: None,
             email: None,
+            csv: None,
             concurrency: None,
             url: UrlExtractionConfig::default(),
             max_archive_depth: default_archive_depth(),
@@ -437,6 +517,7 @@ impl Default for ExtractionConfig {
             summarization: None,
             translation: None,
             page_classification: None,
+            chunk_classification: None,
             captioning: None,
             qr_codes: None,
             cancel_token: None,
@@ -446,6 +527,33 @@ impl Default for ExtractionConfig {
 }
 
 impl ExtractionConfig {
+    /// Resolve layout acceleration, preferring an explicit nested setting.
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    pub(crate) fn resolved_layout_acceleration(&self) -> Option<&AccelerationConfig> {
+        self.layout
+            .as_ref()
+            .and_then(|layout| layout.acceleration.as_ref())
+            .or(self.acceleration.as_ref())
+    }
+
+    /// Resolve layout configuration with global acceleration as its fallback.
+    ///
+    /// An explicit layout-specific acceleration setting always takes precedence.
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    pub(crate) fn resolved_layout_config(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, super::super::layout::LayoutDetectionConfig>> {
+        let layout = self.layout.as_ref()?;
+        let acceleration = self.resolved_layout_acceleration();
+        if layout.acceleration.is_some() || acceleration.is_none() {
+            return Some(std::borrow::Cow::Borrowed(layout));
+        }
+
+        let mut resolved = layout.clone();
+        resolved.acceleration = acceleration.cloned();
+        Some(std::borrow::Cow::Owned(resolved))
+    }
+
     /// Create a new `ExtractionConfig` by applying per-file overrides from a
     /// [`FileExtractionConfig`]. Fields that are `Some` in the override replace the
     /// corresponding field in `self`; `None` fields keep the original value.
@@ -467,12 +575,11 @@ impl ExtractionConfig {
     /// assert!(resolved.force_ocr);
     /// ```
     pub(crate) fn with_file_overrides(&self, overrides: &FileExtractionConfig) -> Self {
-        // Destructure to ensure compile-time exhaustiveness: adding a field to
-        // FileExtractionConfig without handling it here will produce a compile error.
         let FileExtractionConfig {
             ref enable_quality_processing,
             ref ocr,
             ref force_ocr,
+            ref ocr_strategy,
             ref force_ocr_pages,
             ref disable_ocr,
             ref chunking,
@@ -507,6 +614,7 @@ impl ExtractionConfig {
             ref summarization,
             ref translation,
             ref page_classification,
+            ref chunk_classification,
             ref captioning,
             ref qr_codes,
         } = *overrides;
@@ -521,6 +629,9 @@ impl ExtractionConfig {
         }
         if let Some(v) = force_ocr {
             config.force_ocr = *v;
+        }
+        if let Some(v) = ocr_strategy {
+            config.ocr_strategy = v.clone();
         }
         if let Some(v) = force_ocr_pages {
             config.force_ocr_pages = Some(v.clone());
@@ -610,6 +721,9 @@ impl ExtractionConfig {
         if let Some(v) = page_classification {
             config.page_classification = Some(v.clone());
         }
+        if let Some(v) = chunk_classification {
+            config.chunk_classification = Some(v.clone());
+        }
         if let Some(v) = captioning {
             config.captioning = Some(v.clone());
         }
@@ -652,6 +766,67 @@ impl ExtractionConfig {
     /// Validate the configuration, returning an error if any settings are invalid.
     ///
     /// Checks:
+    /// - `ocr`: backend name, VLM backend/model requirements, language codes, and the
+    ///   `vlm_fallback` quality threshold (see [`OcrConfig::validate`]).
+    /// - `chunking`: `max_characters` is non-zero and `overlap` is smaller than it.
+    /// - `token_reduction`: `mode` is one of the recognized reduction levels.
+    /// - `images`: `target_dpi`, `min_dpi`, and `max_dpi` are all positive and within the
+    ///   supported range.
+    /// - `language_detection`: `min_confidence` is a `[0.0, 1.0]` value.
+    /// - `csv`: `delimiter`, when set, is exactly one ASCII character.
+    ///
+    /// Called automatically when a config is loaded from a file
+    /// ([`ExtractionConfig::from_file`] and friends) or built from a JSON override
+    /// (`crate::core::config::merge::merge_config_json`). A config assembled directly through
+    /// the typed Rust API or an FFI builder is **not** automatically validated — call this
+    /// method explicitly before use in that case.
+    ///
+    /// # Errors
+    ///
+    /// Returns `XbergError::Validation` describing the first invalid setting found.
+    pub fn validate(&self) -> Result<(), crate::XbergError> {
+        use crate::core::config_validation::{
+            validate_chunking_params, validate_confidence, validate_csv_delimiter, validate_dpi,
+            validate_token_reduction_level,
+        };
+
+        if let Some(ref ocr) = self.ocr {
+            ocr.validate()?;
+        }
+
+        if let Some(ref chunking) = self.chunking {
+            // Only meaningful when the raw fields are the ones that will be used. A `preset`
+            // replaces both `max_characters` and `overlap` in `ChunkingConfig::resolve_preset`,
+            // and both fields carry serde defaults, so validating them alongside a preset would
+            // reject a config on values the preset discards before anything reads them. ~keep
+            if chunking.preset.is_none() {
+                validate_chunking_params(chunking.max_characters, chunking.overlap)?;
+            }
+        }
+
+        if let Some(ref token_reduction) = self.token_reduction {
+            validate_token_reduction_level(&token_reduction.mode)?;
+        }
+
+        if let Some(ref images) = self.images {
+            validate_dpi(images.target_dpi)?;
+            validate_dpi(images.min_dpi)?;
+            validate_dpi(images.max_dpi)?;
+        }
+
+        if let Some(ref language_detection) = self.language_detection {
+            validate_confidence(language_detection.min_confidence)?;
+        }
+
+        if let Some(ref csv) = self.csv
+            && let Some(ref delimiter) = csv.delimiter
+        {
+            validate_csv_delimiter(delimiter)?;
+        }
+
+        Ok(())
+    }
+
     /// Returns the effective disable-OCR value, accounting for both the top-level
     /// `disable_ocr` flag and the `ocr.enabled` shorthand on [`OcrConfig`].
     ///
@@ -720,23 +895,114 @@ fn default_max_embedded_file_bytes() -> Option<u64> {
     Some(50 * 1024 * 1024)
 }
 
-/// Default extraction timeout: 60 seconds.
+/// Default extraction timeout: 600 seconds (10 minutes).
 ///
 /// Pathological files (deeply nested archives, sheets with millions of cells,
 /// adversarial PDFs) can otherwise run indefinitely and exhaust caller
-/// resources. 60 s is generous for legitimate documents while bounding the
-/// worst-case cost of a single untrusted input.
+/// resources. 600 s bounds the worst-case cost of a single untrusted input
+/// while giving legitimate but slow paths — VLM-based OCR, large scanned
+/// documents — enough headroom to finish instead of being cut off at the
+/// previous 60 s default.
 fn default_extraction_timeout() -> Option<u64> {
-    Some(60)
+    Some(600)
 }
 
 #[cfg(test)]
 mod tests {
+    /// Polyglot bindings serialize a zero-valued mirror struct with every field
+    /// present, so `ocr_strategy` arrives as an explicit `null`. `#[serde(default)]`
+    /// only covers a *missing* key; an internally-tagged enum rejects `null`.
+    /// Caught by the Go e2e suite: "invalid type: null, expected internally tagged
+    /// enum OcrStrategy".
+    #[test]
+    fn ocr_strategy_accepts_an_explicit_null() {
+        let config: ExtractionConfig =
+            serde_json::from_str(r#"{"ocr_strategy": null}"#).expect("null must deserialize");
+        assert_eq!(config.ocr_strategy, OcrStrategy::Auto);
+    }
+
+    #[test]
+    fn ocr_strategy_accepts_a_missing_key() {
+        let config: ExtractionConfig = serde_json::from_str("{}").expect("missing key must deserialize");
+        assert_eq!(config.ocr_strategy, OcrStrategy::Auto);
+    }
+
+    #[test]
+    fn ocr_strategy_round_trips_its_payload_variant() {
+        let json = r#"{"ocr_strategy": {"mode": "scanned_pages", "min_confidence": 0.7}}"#;
+        let config: ExtractionConfig = serde_json::from_str(json).expect("payload variant must deserialize");
+        assert_eq!(config.ocr_strategy, OcrStrategy::ScannedPages { min_confidence: 0.7 });
+    }
+
     use super::*;
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    use crate::core::config::{AccelerationConfig, ExecutionProviderType, LayoutDetectionConfig};
     use crate::core::config::{
         CaptioningConfig, LlmConfig, NerConfig, OcrConfig, PageClassificationConfig, RedactionConfig,
         SummarizationConfig, TranslationConfig,
     };
+
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    #[test]
+    fn resolved_layout_config_uses_global_acceleration_as_fallback() {
+        let config = ExtractionConfig {
+            layout: Some(Default::default()),
+            acceleration: Some(AccelerationConfig {
+                provider: ExecutionProviderType::Cpu,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved = config.resolved_layout_config().expect("layout must be enabled");
+        assert_eq!(
+            config
+                .resolved_layout_acceleration()
+                .map(|acceleration| &acceleration.provider),
+            Some(&ExecutionProviderType::Cpu)
+        );
+        assert_eq!(
+            resolved
+                .acceleration
+                .as_ref()
+                .map(|acceleration| &acceleration.provider),
+            Some(&ExecutionProviderType::Cpu)
+        );
+    }
+
+    #[cfg(all(feature = "pdf", feature = "layout-detection"))]
+    #[test]
+    fn resolved_layout_config_prefers_explicit_nested_auto_acceleration() {
+        let config = ExtractionConfig {
+            layout: Some(LayoutDetectionConfig {
+                acceleration: Some(AccelerationConfig {
+                    provider: ExecutionProviderType::Auto,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            acceleration: Some(AccelerationConfig {
+                provider: ExecutionProviderType::Cpu,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved = config.resolved_layout_config().expect("layout must be enabled");
+        assert_eq!(
+            config
+                .resolved_layout_acceleration()
+                .map(|acceleration| &acceleration.provider),
+            Some(&ExecutionProviderType::Auto)
+        );
+        assert_eq!(
+            resolved
+                .acceleration
+                .as_ref()
+                .map(|acceleration| &acceleration.provider),
+            Some(&ExecutionProviderType::Auto)
+        );
+    }
 
     #[test]
     fn test_effective_disable_ocr_from_top_level_flag() {
@@ -829,21 +1095,18 @@ mod tests {
     #[cfg(feature = "layout-detection")]
     #[test]
     fn test_use_layout_for_markdown_serde_default_false() {
-        // Field absent in JSON → should default to false.
         let json = r#"{}"#;
         let config: ExtractionConfig = serde_json::from_str(json).unwrap();
         assert!(!config.use_layout_for_markdown);
     }
 
-    // --- extraction_timeout_secs defaults ----------------------------------
-
     #[test]
-    fn test_default_extraction_timeout_is_sixty_seconds() {
+    fn test_default_extraction_timeout_is_six_hundred_seconds() {
         let config = ExtractionConfig::default();
         assert_eq!(
             config.extraction_timeout_secs,
-            Some(60),
-            "default timeout must be Some(60) to prevent unbounded extraction"
+            Some(600),
+            "default timeout must be Some(600) to bound unbounded extraction while leaving headroom for slow (VLM) paths"
         );
     }
 
@@ -868,14 +1131,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extraction_timeout_serde_absent_field_defaults_to_sixty() {
-        // When the JSON field is absent the serde default function must fire.
+    fn test_extraction_timeout_serde_absent_field_defaults_to_six_hundred() {
         let json = r#"{}"#;
         let config: ExtractionConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
             config.extraction_timeout_secs,
-            Some(60),
-            "absent field must use default_extraction_timeout() -> Some(60)"
+            Some(600),
+            "absent field must use default_extraction_timeout() -> Some(600)"
         );
     }
 
@@ -976,5 +1238,51 @@ mod tests {
         let html_output = resolved.html_output.expect("html output override should apply");
         assert_eq!(html_output.css.as_deref(), Some(".kb-p { color: red; }"));
         assert!(!html_output.embed_css);
+    }
+
+    #[test]
+    fn validate_accepts_a_single_ascii_char_csv_delimiter() {
+        let config = ExtractionConfig {
+            csv: Some(crate::core::config::CsvConfig {
+                delimiter: Some(";".to_string()),
+                comment_prefixes: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_csv_delimiter_with_a_helpful_message() {
+        let config = ExtractionConfig {
+            csv: Some(crate::core::config::CsvConfig {
+                delimiter: Some(String::new()),
+                comment_prefixes: vec![],
+            }),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("empty delimiter must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "Validation error: Invalid CSV delimiter ''. Must be exactly one ASCII character (e.g. ',', ';', '\\t', '|')."
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_multi_byte_csv_delimiter_with_a_helpful_message() {
+        let config = ExtractionConfig {
+            csv: Some(crate::core::config::CsvConfig {
+                delimiter: Some("::".to_string()),
+                comment_prefixes: vec![],
+            }),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("multi-character delimiter must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "Validation error: Invalid CSV delimiter '::'. Must be exactly one ASCII character (e.g. ',', ';', '\\t', '|')."
+        );
     }
 }

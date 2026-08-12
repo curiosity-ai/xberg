@@ -6,6 +6,25 @@
 
 mod config;
 
+// Shared `ExtractedDocument` construction (metadata, tables, detected_languages)
+// used by every candle-* backend below, so the same logic isn't pasted per
+// backend (issue #179).
+//
+// Gated on the union of the concrete backends that consume it, NOT on the umbrella
+// `candle-ocr` feature. The umbrella can be enabled on its own -- `xberg-cli`'s
+// `candle-ocr` feature profile does exactly that -- which compiles this module with
+// no backend to call into it, and every item here becomes dead code under
+// `-D warnings`. Same union the device-preference helpers below use. ~keep
+#[cfg(any(
+    feature = "candle-trocr",
+    feature = "candle-paddleocr-vl",
+    all(
+        not(target_arch = "wasm32"),
+        any(feature = "candle-glm-ocr", feature = "candle-deepseek-ocr")
+    )
+))]
+mod ocr_result;
+
 #[cfg(feature = "candle-trocr")]
 pub mod trocr_backend;
 
@@ -15,8 +34,8 @@ pub mod paddleocr_vl_backend;
 #[cfg(all(feature = "candle-glm-ocr", not(target_arch = "wasm32")))]
 pub mod glm_ocr_backend;
 
-#[cfg(all(feature = "candle-hunyuan-ocr", not(target_arch = "wasm32")))]
-pub mod hunyuan_ocr_backend;
+#[cfg(feature = "candle-paddleocr-vl")]
+pub(crate) mod model_stager;
 
 #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
 pub mod deepseek_ocr_backend;
@@ -32,15 +51,26 @@ pub use paddleocr_vl_backend::PaddleOcrVlBackend;
 #[cfg(all(feature = "candle-glm-ocr", not(target_arch = "wasm32")))]
 pub use glm_ocr_backend::GlmOcrBackend;
 
-#[cfg(all(feature = "candle-hunyuan-ocr", not(target_arch = "wasm32")))]
-pub use hunyuan_ocr_backend::HunyuanOcrBackend;
-
 #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
 pub use deepseek_ocr_backend::DeepseekOcrBackend;
 
-#[cfg(feature = "candle-ocr")]
+#[cfg(any(
+    feature = "candle-trocr",
+    feature = "candle-paddleocr-vl",
+    all(
+        not(target_arch = "wasm32"),
+        any(feature = "candle-glm-ocr", feature = "candle-deepseek-ocr")
+    )
+))]
 use crate::core::config::{AccelerationConfig, ExecutionProviderType, OcrConfig};
-#[cfg(feature = "candle-ocr")]
+#[cfg(any(
+    feature = "candle-trocr",
+    feature = "candle-paddleocr-vl",
+    all(
+        not(target_arch = "wasm32"),
+        any(feature = "candle-glm-ocr", feature = "candle-deepseek-ocr")
+    )
+))]
 use xberg_candle_ocr::DevicePreference;
 
 /// Resolve a candle [`DevicePreference`] from the centralised acceleration
@@ -60,9 +90,15 @@ use xberg_candle_ocr::DevicePreference;
 /// - `Cuda`     -> `DevicePreference::Cuda`
 /// - `CoreMl`   -> `DevicePreference::Metal` (Apple Neural Engine + GPU runs on Metal in candle)
 /// - `TensorRt` -> `DevicePreference::Cuda` (TensorRT runs on CUDA hardware; candle has no separate TRT path)
-#[cfg(feature = "candle-ocr")]
+#[cfg(any(
+    feature = "candle-trocr",
+    feature = "candle-paddleocr-vl",
+    all(
+        not(target_arch = "wasm32"),
+        any(feature = "candle-glm-ocr", feature = "candle-deepseek-ocr")
+    )
+))]
 pub(crate) fn resolve_device_preference(config: &OcrConfig) -> DevicePreference {
-    // 1. Inline override via backend_options
     if let Some(opts) = &config.backend_options
         && let Some(v) = opts.get("device").and_then(|v| v.as_str())
     {
@@ -75,12 +111,10 @@ pub(crate) fn resolve_device_preference(config: &OcrConfig) -> DevicePreference 
         }
     }
 
-    // 2. Central acceleration config
     if let Some(accel) = &config.acceleration {
         return device_preference_from_acceleration(accel);
     }
 
-    // 3. Default
     DevicePreference::Auto
 }
 
@@ -88,7 +122,14 @@ pub(crate) fn resolve_device_preference(config: &OcrConfig) -> DevicePreference 
 ///
 /// Lifted out of `resolve_device_preference` so the mapping is independently
 /// testable and reusable from future candle backends.
-#[cfg(feature = "candle-ocr")]
+#[cfg(any(
+    feature = "candle-trocr",
+    feature = "candle-paddleocr-vl",
+    all(
+        not(target_arch = "wasm32"),
+        any(feature = "candle-glm-ocr", feature = "candle-deepseek-ocr")
+    )
+))]
 fn device_preference_from_acceleration(accel: &AccelerationConfig) -> DevicePreference {
     match accel.provider {
         ExecutionProviderType::Auto => DevicePreference::Auto,

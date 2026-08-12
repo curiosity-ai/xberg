@@ -1,14 +1,9 @@
 name: CI GPU
 
 on:
-  # Manual dispatch only — this suite is heavy (real model weights, GPU
-  # inference across the candle model matrix). Trigger it explicitly.
   workflow_dispatch:
 
 concurrency:
-  # Heavy, dispatch-only suite (multi-GB model downloads, real GPU inference).
-  # Never cancel an in-flight run; queue re-dispatches instead so an expensive
-  # run is not killed mid-flight.
   group: ci-gpu-${{ github.ref }}
   cancel-in-progress: false
 
@@ -81,6 +76,13 @@ jobs:
         with:
           submodules: recursive
 
+      # gpu_acceleration.rs reads test_documents_dir().join("images/...") exclusively. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+        with:
+          include: |
+            images/**
+
       - name: Verify GPU
         run: |
           nvidia-smi || {
@@ -117,19 +119,10 @@ jobs:
           TEST_DOCUMENTS_DIR: ${{ github.workspace }}/test_documents
 
   build-candle:
-    # Compile the candle/CUDA test binaries on cheap, abundant ubuntu-latest
-    # runners (nvcc compiles CUDA kernels without needing a physical GPU). All
-    # five model builds fan out in parallel here, so the scarce GPU runner only
-    # ever runs inference — never a ~12-minute CUDA compile.
     name: "Build Candle (${{ matrix.model.name }})"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # candle-kernels' build script shells out to nvidia-smi to detect the GPU
-      # compute capability, but these compiles run on non-GPU ubuntu-latest
-      # runners (no nvidia-smi) → ComputeCapDetectionFailed. Pin it to the L4
-      # (sm_89) target used by the runner-gpu-l4 inference jobs so the CUDA
-      # kernels build without a physical GPU present.
       CUDA_COMPUTE_CAP: "89"
     strategy:
       fail-fast: false
@@ -137,7 +130,6 @@ jobs:
         model:
           - { name: trocr, feature: candle-trocr }
           - { name: glm-ocr, feature: candle-glm-ocr }
-          - { name: hunyuan-ocr, feature: candle-hunyuan-ocr }
           - { name: deepseek-ocr, feature: candle-deepseek-ocr }
           - { name: paddleocr-vl, feature: candle-paddleocr-vl }
 
@@ -158,8 +150,6 @@ jobs:
         uses: ./.github/actions/install-system-deps
 
       - name: Setup CUDA toolkit (nvcc)
-        # candle-cuda compiles CUDA kernels via cudarc at build time, which needs
-        # nvcc. ubuntu-latest has no CUDA toolkit; install it from NVIDIA's apt repo.
         run: |
           set -euxo pipefail
           if command -v nvcc >/dev/null 2>&1; then
@@ -191,7 +181,6 @@ jobs:
         run: nvcc --version
 
       - name: Setup ONNX Runtime
-        # candle-glm-ocr pulls layout-detection, which links ONNX Runtime.
         if: matrix.model.name == 'glm-ocr'
         uses: ./.github/actions/setup-onnx-runtime
         with:
@@ -216,15 +205,11 @@ jobs:
     name: "GPU Tests: Candle VLM-OCR (${{ matrix.model.name }})"
     needs: build-candle
     runs-on: runner-gpu-l4
-    # Inference + weight download only (the CUDA compile is offloaded to the
-    # build-candle fan-out on cheap runners). Generous ceiling: large VLM
-    # weights (multi-GB) plus first-token latency on cold model loads.
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         model:
-          # Auto-download models (weights fetched from HF Hub on first use).
           - name: trocr
             feature: candle-trocr
             test: candle_trocr_e2e_extraction
@@ -237,13 +222,6 @@ jobs:
             hf_repo: ""
             env_var: ""
             debug_env: XBERG_GLM_DEBUG
-          # Local-weight models (staged by the download step, cached per model).
-          - name: hunyuan-ocr
-            feature: candle-hunyuan-ocr
-            test: candle_hunyuan_ocr_e2e_extraction
-            hf_repo: tencent/HunyuanOCR
-            env_var: XBERG_HUNYUAN_OCR_MODEL_PATH
-            debug_env: XBERG_HUNYUAN_DEBUG
           - name: deepseek-ocr
             feature: candle-deepseek-ocr
             test: candle_deepseek_ocr_e2e_extraction
@@ -276,10 +254,6 @@ jobs:
         uses: ./.github/actions/install-system-deps
 
       - name: Setup CUDA runtime libraries
-        # The prebuilt candle-cuda test binary (compiled in build-candle) links
-        # libcudart at runtime. The L4 runner ships the driver (nvidia-smi) but no
-        # CUDA runtime libs, so install the toolkit package which provides them.
-        # No Rust toolchain or nvcc compile happens here — inference only.
         run: |
           set -euxo pipefail
           if command -v nvcc >/dev/null 2>&1; then
@@ -312,21 +286,21 @@ jobs:
         run: nvcc --version
 
       - name: Setup ONNX Runtime
-        # candle-glm-ocr pulls layout-detection, which links ONNX Runtime.
         if: matrix.model.name == 'glm-ocr'
         uses: ./.github/actions/setup-onnx-runtime
         with:
           ort-version: ${{ env.ORT_VERSION }}
 
-      - name: Cache model weights
+      - name: Restore cached model weights
         if: matrix.model.hf_repo != ''
         id: model-cache
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/models/${{ matrix.model.name }}
-          key: hf-weights-${{ matrix.model.name }}-v1
+          key: hf-weights-${{ matrix.model.name }}-${{ matrix.model.manifest != '' && hashFiles(matrix.model.manifest) || 'v1' }}
 
-      - name: Download model weights
+      - name: Download model weights (Hugging Face)
+        id: download-hf
         if: matrix.model.hf_repo != '' && steps.model-cache.outputs.cache-hit != 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -344,23 +318,33 @@ jobs:
             "${{ matrix.model.hf_repo }}" \
             --local-dir "${{ github.workspace }}/models/${{ matrix.model.name }}"
 
+      - name: Verify model weight checksums (sha256 manifest)
+        id: verify-weights
+        if: matrix.model.manifest != '' && steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # A checked-in sha256 manifest pins the exact bytes we expect from the
+          # (self-hosted) HF repo. Trust attaches to the hashes, not the host: a
+          # changed or tampered file fails the job instead of silently altering
+          # what CI tests. sha256sum -c checks only the listed files and ignores
+          # '#' comment lines; --strict fails on malformed ones.
+          dest="${{ github.workspace }}/models/${{ matrix.model.name }}"
+          (cd "$dest" && sha256sum --check --strict "${{ github.workspace }}/${{ matrix.model.manifest }}")
+
       - name: Download candle test binary
         uses: actions/download-artifact@v8
         with:
           name: candle-test-${{ matrix.model.name }}
 
       - name: Run ${{ matrix.model.name }} GPU inference
-        # XBERG_REQUIRE_MODELS=1 turns a missing model/weights into a hard failure
-        # instead of a silent skip, so a misconfigured matrix entry cannot pass green.
         env:
           XBERG_REQUIRE_MODELS: "1"
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          RUST_LOG: "xberg=debug,xberg_candle_ocr=debug"
-          # Per-model debug flags for tensor stats and empty-output detection.
-          # When set to "1", logs per-stage tensor shapes, NaN/Inf counts, min/max/mean stats.
+          # glm-ocr debug tensor stats now route through `tracing` at TRACE
+          # (the XBERG_GLM_DEBUG env gate was removed); trocr/deepseek/paddleocr
+          # still use their own XBERG_*_DEBUG env gates.
+          RUST_LOG: "xberg=debug,xberg_candle_ocr=trace"
           XBERG_TROCR_DEBUG: "1"
-          XBERG_GLM_DEBUG: "1"
-          XBERG_HUNYUAN_DEBUG: "1"
           XBERG_DEEPSEEK_DEBUG: "1"
           XBERG_PADDLEOCR_VL_DEBUG: "1"
         run: |
@@ -371,3 +355,12 @@ jobs:
           # Run the binary compiled in build-candle (no recompile on the GPU runner).
           chmod +x "candle-test-${{ matrix.model.name }}"
           "./candle-test-${{ matrix.model.name }}" "${{ matrix.model.test }}" --ignored --nocapture
+
+      - name: Save model weights cache
+        if: >-
+          always() && steps.model-cache.outputs.cache-hit != 'true' &&
+          steps.download-hf.outcome == 'success' && steps.verify-weights.outcome != 'failure'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/models/${{ matrix.model.name }}
+          key: hf-weights-${{ matrix.model.name }}-${{ matrix.model.manifest != '' && hashFiles(matrix.model.manifest) || 'v1' }}

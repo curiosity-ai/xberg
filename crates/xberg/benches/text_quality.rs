@@ -2,7 +2,6 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use xberg::text::quality::calculate_quality_score;
 
-// ~1 KiB of typical paragraph text — no script or style content.
 fn corpus_clean_1kib() -> String {
     let paragraph = "The document processing pipeline extracts structured content from a wide \
         variety of file formats including PDF, Office documents, plain text, and HTML. \
@@ -12,13 +11,11 @@ fn corpus_clean_1kib() -> String {
     paragraph.repeat(3)
 }
 
-// ~64 KiB — paragraph text interleaved with script/style noise blocks.
 fn corpus_noisy_64kib() -> String {
     let para = "This is a representative paragraph of body text extracted from a web page. \
         It contains normal prose with proper punctuation and sentence boundaries. \
         The quality scorer should assign this a high structural bonus. ";
 
-    // ~1 KiB JS function body
     let js_block = |n: usize| -> String {
         format!(
             "<script type=\"text/javascript\">\nfunction processDocument{}(input, options) {{\n  \
@@ -28,7 +25,6 @@ fn corpus_noisy_64kib() -> String {
         )
     };
 
-    // ~512 B CSS block
     let css_block = |n: usize| -> String {
         format!(
             "<style type=\"text/css\">\n.document-container-{n} {{ display: flex; \
@@ -38,7 +34,6 @@ fn corpus_noisy_64kib() -> String {
         )
     };
 
-    // Naked JS function chunk (triggers JS_FUNCTION_PATTERN)
     let js_func_chunk = |n: usize| -> String {
         format!(
             "\nfunction renderSection{}(element, data) {{ return element.innerHTML = data; }}\n",
@@ -48,25 +43,21 @@ fn corpus_noisy_64kib() -> String {
 
     let mut buf = String::with_capacity(66_000);
 
-    // 10 script blocks each ~1 KiB
     for i in 0..10 {
-        buf.push_str(&para.repeat(6)); // ~1.2 KiB prose between blocks
+        buf.push_str(&para.repeat(6));
         buf.push_str(&js_block(i));
     }
 
-    // 5 style blocks each ~512 B
     for i in 0..5 {
         buf.push_str(&para.repeat(4));
         buf.push_str(&css_block(i));
     }
 
-    // 3 naked JS function chunks
     for i in 0..3 {
         buf.push_str(&para.repeat(3));
         buf.push_str(&js_func_chunk(i));
     }
 
-    // Pad to ~64 KiB
     while buf.len() < 64 * 1024 {
         buf.push_str(para);
     }
@@ -74,7 +65,6 @@ fn corpus_noisy_64kib() -> String {
     buf
 }
 
-// ~1 MiB — same ratio as 64 KiB but 16× larger. This is the case that hits the backtracker.
 fn corpus_noisy_1mib() -> String {
     let para = "This is a representative paragraph of body text extracted from a web page. \
         It contains normal prose with proper punctuation and sentence boundaries. \
@@ -107,7 +97,6 @@ fn corpus_noisy_1mib() -> String {
 
     let mut buf = String::with_capacity(1_100_000);
 
-    // Scale up by 16×: 160 script blocks, 80 style blocks, 48 function chunks
     for i in 0..160 {
         buf.push_str(&para.repeat(6));
         buf.push_str(&js_block(i));

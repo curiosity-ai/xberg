@@ -34,12 +34,18 @@ pub struct RerankerConfig {
     pub batch_size: usize,
 
     /// Show model download progress (local ONNX path only).
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg::model_download` target while they download (#279). A warm
+    /// Hugging Face cache transfers nothing and so reports nothing. Ignored by
+    /// [`RerankerModelType::Llm`] and [`RerankerModelType::Plugin`], which download no model.
     #[serde(default)]
     pub show_download_progress: bool,
 
-    /// Custom cache directory for model files.
+    /// Optional alternate Hugging Face cache root for model files.
     ///
-    /// Defaults to `~/.cache/xberg/rerankers/` if not specified.
+    /// When unset, hf-hub follows the standard Hugging Face environment and
+    /// platform cache conventions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
 
@@ -83,6 +89,63 @@ impl Default for RerankerConfig {
     }
 }
 
+/// Selects how a local ONNX reranker's raw output tensor is turned into a score.
+///
+/// - [`RerankerHead::CrossEncoder`] — classic single-logit cross-encoder head:
+///   the model emits `[batch, 1]` (or `[batch]`) logits; the caller applies
+///   sigmoid to get a `[0, 1]` score. This is the original, unchanged path.
+/// - [`RerankerHead::Qwen3Generative`] — Qwen3 generative-reranker head: the
+///   model emits `[batch, seq, vocab]` logits; the score is `P("yes")` read
+///   from the last token's logits over the "yes"/"no" vocabulary entries,
+///   via a softmax over those two logits. Already a `[0, 1]` probability —
+///   no sigmoid is applied.
+///
+/// Since v5.0.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankerHead {
+    /// Single-logit cross-encoder head (sigmoid applied by the caller).
+    CrossEncoder,
+    /// Qwen3 generative-reranker head (softmax over yes/no token logits).
+    Qwen3Generative,
+}
+
+impl Default for RerankerHead {
+    /// Returns [`RerankerHead::CrossEncoder`], the original scoring path.
+    fn default() -> Self {
+        Self::CrossEncoder
+    }
+}
+
+/// Serialize the head as its serde `snake_case` tag.
+///
+/// The polyglot bindings represent this unit enum as a string when it appears
+/// as a field of the tagged [`RerankerModelType::Custom`] variant; the generated
+/// glue calls `.into()` to cross the FFI boundary, so both directions of the
+/// `String` conversion must exist.
+impl From<RerankerHead> for String {
+    fn from(head: RerankerHead) -> Self {
+        match head {
+            RerankerHead::CrossEncoder => "cross_encoder".to_string(),
+            RerankerHead::Qwen3Generative => "qwen3_generative".to_string(),
+        }
+    }
+}
+
+/// Parse the head from its serde `snake_case` tag.
+///
+/// Unknown values fall back to [`RerankerHead::CrossEncoder`] rather than
+/// erroring, matching the `.unwrap_or_default()` the binding glue applies. This
+/// is the inverse of [`From<RerankerHead>`] for [`String`].
+impl From<String> for RerankerHead {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "qwen3_generative" => RerankerHead::Qwen3Generative,
+            _ => RerankerHead::CrossEncoder,
+        }
+    }
+}
+
 /// Reranker model types supported by Xberg.
 ///
 /// Since v5.0.0.
@@ -116,9 +179,16 @@ pub enum RerankerModelType {
         /// Maximum token sequence length for the tokenizer.
         ///
         /// Stored as `i64` for FFI compatibility across language bindings.
-        /// Treated as a non-negative value; negative values are clamped to the model default.
+        /// Must be positive; a non-positive value is rejected with a validation error.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_length: Option<i64>,
+        /// Scoring head for the ONNX model's output tensor.
+        ///
+        /// Defaults to [`RerankerHead::CrossEncoder`]. Set to
+        /// [`RerankerHead::Qwen3Generative`] for Qwen3 generative-reranker
+        /// checkpoints (e.g. `Qwen/Qwen3-Reranker-0.6B`).
+        #[serde(default)]
+        head: RerankerHead,
     },
 
     /// Provider-hosted reranker via liter-llm (e.g. Cohere, Jina, Voyage).
@@ -127,7 +197,10 @@ pub enum RerankerModelType {
     /// (e.g. `"cohere/rerank-english-v3.0"`).
     Llm {
         /// LLM provider configuration specifying the model and API credentials.
-        llm: LlmConfig,
+        ///
+        /// Boxed for the same reason as `EmbeddingModelType::Llm` -- kept in step so the two
+        /// parallel enums present one shape to the generated bindings. ~keep
+        llm: Box<LlmConfig>,
     },
 
     /// In-process reranker registered via the plugin system.
@@ -139,7 +212,8 @@ pub enum RerankerModelType {
     ///
     /// When this variant is selected, only `max_rerank_duration_secs` applies.
     /// Model-loading fields (`batch_size`, `cache_dir`, `show_download_progress`,
-    /// `acceleration`) are ignored — the host owns the model lifecycle.
+    /// `acceleration`) are ignored — the host owns the model lifecycle, so there is
+    /// no download to report progress for.
     ///
     /// See [`crate::plugins::register_reranker_backend`].
     Plugin {
@@ -228,6 +302,7 @@ mod tests {
                 model_file: None,
                 additional_files: Vec::new(),
                 max_length: Some(512),
+                head: RerankerHead::CrossEncoder,
             },
             ..Default::default()
         };
@@ -236,6 +311,41 @@ mod tests {
         assert!(matches!(
             back.model,
             RerankerModelType::Custom { ref model_id, .. } if model_id.contains("ms-marco")
+        ));
+    }
+
+    #[test]
+    fn reranker_head_defaults_to_cross_encoder() {
+        assert_eq!(RerankerHead::default(), RerankerHead::CrossEncoder);
+    }
+
+    #[test]
+    fn reranker_head_serde_roundtrip() {
+        for head in [RerankerHead::CrossEncoder, RerankerHead::Qwen3Generative] {
+            let json = serde_json::to_string(&head).unwrap();
+            let back: RerankerHead = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, head);
+        }
+        assert_eq!(
+            serde_json::to_string(&RerankerHead::CrossEncoder).unwrap(),
+            "\"cross_encoder\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RerankerHead::Qwen3Generative).unwrap(),
+            "\"qwen3_generative\""
+        );
+    }
+
+    #[test]
+    fn custom_model_type_head_defaults_when_absent_from_json() {
+        let json = r#"{"type": "custom", "model_id": "cross-encoder/ms-marco-MiniLM-L6-v2"}"#;
+        let model: RerankerModelType = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            model,
+            RerankerModelType::Custom {
+                head: RerankerHead::CrossEncoder,
+                ..
+            }
         ));
     }
 

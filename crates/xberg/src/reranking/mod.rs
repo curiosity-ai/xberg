@@ -13,12 +13,11 @@
 //!
 //! # Download/cache machinery
 //!
-//! The ONNX path vendors both the download/lock machinery and the three ORT
-//! utility helpers (`onnx_runtime_install_message`, `panic_to_string`,
-//! `looks_like_ort_error`) from `crates/xberg/src/embeddings/mod.rs`.
-//! They are duplicated here because `crate::embeddings` requires the
-//! `embedding-presets` feature, which may be absent in a `reranker`-only build.
-//! Keep vendored copies in sync with `embeddings/mod.rs`.
+//! The ONNX path downloads models, loads the tokenizer, and builds the ORT
+//! session through the shared [`crate::onnx`] helpers (enabled by the
+//! `onnx-runtime` feature that `reranker` pulls in), so no download/lock or ORT
+//! diagnostic code is duplicated here — the cross-encoder pair encoding is the
+//! only reranker-specific step, applied at inference time via `EncodeInput::Dual`.
 //!
 //! Since v5.0.0.
 
@@ -52,7 +51,7 @@ static ENGINE_CACHE: LazyLock<RwLock<AHashMap<String, CachedEngine>>> = LazyLock
 /// Since v5.0.0.
 #[cfg(all(feature = "reranker", feature = "tokio-runtime"))]
 static RERANK_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
-    let budget = crate::core::config::concurrency::resolve_thread_budget(None);
+    let budget = crate::core::config::concurrency::resolve_batch_concurrency(None, true);
     Arc::new(tokio::sync::Semaphore::new(budget))
 });
 
@@ -99,6 +98,13 @@ pub struct RerankerPreset {
     pub max_length: usize,
     /// Human-readable description of the preset's intended use case.
     pub description: String,
+    /// Scoring head for the ONNX model's output tensor.
+    ///
+    /// Defaults to [`crate::core::config::reranker::RerankerHead::CrossEncoder`]
+    /// for all existing presets. Set to `Qwen3Generative` for Qwen3
+    /// generative-reranker checkpoints.
+    #[serde(default)]
+    pub head: crate::core::config::reranker::RerankerHead,
 }
 
 /// All available reranker presets.
@@ -115,49 +121,73 @@ pub struct RerankerPreset {
 /// fail loudly if any preset path 404s.
 ///
 /// Since v5.0.0.
-#[cfg(feature = "reranker-presets")]
+#[cfg(any(feature = "reranker", test))]
+/// SHA-256 manifest pinning every hosted reranker preset file, verified at
+/// download time by [`crate::onnx::download_model_files`].
+pub(crate) const RERANKER_SHA256_MANIFEST: &str = include_str!("presets.sha256sum");
+
+#[cfg(feature = "reranker")]
+const RERANKER_MODEL_REVISION: &str = "3d655b40f2e1e087460434a143b11afac4947318";
+
 pub static RERANKER_PRESETS: LazyLock<Vec<RerankerPreset>> = LazyLock::new(|| {
     vec![
         RerankerPreset {
             name: "bge-reranker-base".to_string(),
-            model_repo: "BAAI/bge-reranker-base".to_string(),
-            model_file: "onnx/model.onnx".to_string(),
+            model_repo: "xberg-io/reranker-models".to_string(),
+            model_file: "bge-reranker-base/model.onnx".to_string(),
             additional_files: Vec::new(),
             max_length: 512,
             description: "BGE cross-encoder base (~278M params, EN + ZH). Best for: \
                 general-purpose RAG, production deployments, English or Chinese documents."
                 .to_string(),
+            head: crate::core::config::reranker::RerankerHead::CrossEncoder,
         },
         RerankerPreset {
             name: "bge-reranker-v2-m3".to_string(),
-            model_repo: "rozgo/bge-reranker-v2-m3".to_string(),
-            model_file: "model.onnx".to_string(),
-            additional_files: vec!["model.onnx.data".to_string()],
+            model_repo: "xberg-io/reranker-models".to_string(),
+            model_file: "bge-reranker-v2-m3/model.onnx".to_string(),
+            additional_files: vec!["bge-reranker-v2-m3/model.onnx.data".to_string()],
             max_length: 8192,
             description: "BGE cross-encoder v2 M3 (568M params, 100+ languages, 8192 max-len). \
                 Best for: international documents, mixed-language retrieval. \
                 Mirror of the official BAAI model; the weight is split into model.onnx + model.onnx.data."
                 .to_string(),
+            head: crate::core::config::reranker::RerankerHead::CrossEncoder,
         },
         RerankerPreset {
             name: "jina-reranker-v1-turbo-en".to_string(),
-            model_repo: "jinaai/jina-reranker-v1-turbo-en".to_string(),
-            model_file: "onnx/model.onnx".to_string(),
+            model_repo: "xberg-io/reranker-models".to_string(),
+            model_file: "jina-reranker-v1-turbo-en/model.onnx".to_string(),
             additional_files: Vec::new(),
             max_length: 8192,
             description: "Jina reranker v1 turbo English (~37M params, 8192 max-len). \
                 Best for: low-latency reranking, English documents, long-context retrieval."
                 .to_string(),
+            head: crate::core::config::reranker::RerankerHead::CrossEncoder,
+        },
+        // NOTE: `jina-reranker-v2-base-multilingual` was REMOVED — its license is
+        RerankerPreset {
+            name: "qwen3-reranker-0.6b".to_string(),
+            model_repo: "xberg-io/reranker-models".to_string(),
+            model_file: "qwen3-reranker-0.6b/model.onnx".to_string(),
+            additional_files: vec!["qwen3-reranker-0.6b/model.onnx.data".to_string()],
+            max_length: 512,
+            description: "Qwen3 generative reranker (0.6B params, multilingual). Best for: \
+                instruction-aware relevance judgment via a causal-LM yes/no head, higher quality \
+                at higher latency than classic cross-encoders."
+                .to_string(),
+            head: crate::core::config::reranker::RerankerHead::Qwen3Generative,
         },
         RerankerPreset {
-            name: "jina-reranker-v2-base-multilingual".to_string(),
-            model_repo: "jinaai/jina-reranker-v2-base-multilingual".to_string(),
-            model_file: "onnx/model.onnx".to_string(),
+            name: "ettin-reranker-150m".to_string(),
+            model_repo: "xberg-io/reranker-models".to_string(),
+            model_file: "ettin-reranker-150m/model.onnx".to_string(),
             additional_files: Vec::new(),
-            max_length: 1024,
-            description: "Jina reranker v2 base multilingual (~278M params, 1024 max-len, 100+ languages). \
-                Best for: multilingual retrieval, balanced latency/quality."
+            max_length: 7999,
+            description: "Ettin cross-encoder (150M params, ModernBERT long-context, EN). Best for: \
+                high-quality English reranking with long documents at cross-encoder latency."
                 .to_string(),
+            head: crate::core::config::reranker::RerankerHead::CrossEncoder,
         },
     ]
 });
@@ -173,9 +203,9 @@ pub static RERANKER_PRESETS: LazyLock<Vec<RerankerPreset>> = LazyLock::new(|| {
 #[cfg(feature = "reranker-presets")]
 const PRESET_ALIASES: &[(&str, &str)] = &[
     ("fast", "jina-reranker-v1-turbo-en"),
-    ("balanced", "bge-reranker-base"),
+    ("balanced", "ettin-reranker-150m"),
     ("quality", "bge-reranker-v2-m3"),
-    ("multilingual", "jina-reranker-v2-base-multilingual"),
+    ("multilingual", "bge-reranker-v2-m3"),
 ];
 
 /// Get a preset by name (returns an owned clone for FFI compatibility).
@@ -197,7 +227,7 @@ pub(crate) fn get_preset(name: &str) -> Option<RerankerPreset> {
 /// List all available reranker preset names (owned clones for FFI compatibility).
 ///
 /// Returns the catalog short-names followed by the friendly aliases, so
-/// `list_presets()[..4]` is the catalog and `list_presets()[4..]` is aliases.
+/// `list_presets()[..5]` is the catalog and `list_presets()[5..]` is aliases.
 ///
 /// Since v5.0.0.
 #[cfg(feature = "reranker-presets")]
@@ -207,380 +237,74 @@ pub(crate) fn list_presets() -> Vec<String> {
     out
 }
 
-// ── ONNX Runtime helpers — vendored from embeddings/mod.rs ────────────────────
-// These three tiny helpers are inlined here rather than imported from
-// `crate::embeddings` because that module requires the `embedding-presets`
-// feature; a build with `reranker` but without `embedding-presets` would fail
-// to resolve `crate::embeddings::*`. Vendored copies kept in sync with
-// `embeddings/mod.rs`.
-
-/// Returns installation instructions for ONNX Runtime.
-///
-/// Vendored from `embeddings/mod.rs` — keep in sync.
+/// Module-tagged error constructor threaded into the shared onnx helpers.
 #[cfg(feature = "reranker")]
-fn onnx_runtime_install_message() -> String {
-    #[cfg(all(windows, target_env = "gnu"))]
-    {
-        return "ONNX Runtime reranking is not supported on Windows MinGW builds. \
-        ONNX Runtime requires MSVC toolchain. \
-        Please use Windows MSVC builds or disable reranker feature."
-            .to_string();
-    }
-
-    #[cfg(not(all(windows, target_env = "gnu")))]
-    {
-        "ONNX Runtime is required for reranking functionality. \
-        Install: \
-        macOS: 'brew install onnxruntime', \
-        Linux (Ubuntu/Debian): 'apt install libonnxruntime libonnxruntime-dev', \
-        Linux (Fedora): 'dnf install onnxruntime onnxruntime-devel', \
-        Linux (Arch): 'pacman -S onnxruntime', \
-        Windows (MSVC): Download from https://github.com/microsoft/onnxruntime/releases and add to PATH. \
-        \
-        Alternatively, set ORT_DYLIB_PATH environment variable to the ONNX Runtime library path."
-            .to_string()
-    }
+fn rerank_err(msg: String) -> crate::XbergError {
+    crate::XbergError::reranking(msg)
 }
 
-/// Check if an error message looks like an ONNX Runtime missing dependency.
+/// Resolve the single-token vocabulary id for an answer word (`"yes"`/`"no"`),
+/// robust to how different tokenizers encode a leading word.
 ///
-/// Vendored from `embeddings/mod.rs` — keep in sync.
+/// Qwen3's reference reranker looks up the bare `"yes"`/`"no"` vocab entry, which
+/// works for its own checkpoint. BPE/SentencePiece tokenizers, however, may only
+/// carry the word as a leading-space variant (`"Ġyes"`, `"▁yes"`) or capitalized,
+/// so this tries those direct vocab hits before falling back to encoding the bare
+/// word and taking its id when it tokenizes to exactly one token — mirroring how
+/// the model actually sees the answer token in context.
 #[cfg(feature = "reranker")]
-fn looks_like_ort_error(msg: &str) -> bool {
-    msg.contains("onnxruntime")
-        || msg.contains("ORT")
-        || msg.contains("libonnxruntime")
-        || msg.contains("onnxruntime.dll")
-        || msg.contains("Unable to load")
-        || msg.contains("library load failed")
-        || msg.contains("attempting to load")
-        || msg.contains("An error occurred while")
-}
-
-/// Convert a panic payload to a string message.
-///
-/// Vendored from `embeddings/mod.rs` — keep in sync.
-#[cfg(feature = "reranker")]
-fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "Unknown panic".to_string()
-    }
-}
-
-// ── Download / lock machinery — vendored from embeddings/mod.rs ───────────────
-
-/// How long a partial download must be idle before it is considered stale.
-#[cfg(feature = "reranker")]
-const STALE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-/// Remove stale `.lock` and `.part` files left behind by interrupted downloads.
-///
-/// Vendored from `embeddings/mod.rs` — keep in sync with that implementation.
-#[cfg(feature = "reranker")]
-fn cleanup_stale_locks(cache_dir: &std::path::Path, repo_name: &str) {
-    let folder = format!("models--{}", repo_name.replace('/', "--"));
-    let blobs_dir = cache_dir.join(folder).join("blobs");
-
-    let entries = match std::fs::read_dir(&blobs_dir) {
-        Ok(e) => e,
-        Err(_) => return,
+fn resolve_answer_token_id(tokenizer: &tokenizers::Tokenizer, word: &str) -> Option<u32> {
+    let capitalized = {
+        let mut chars = word.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => word.to_string(),
+        }
     };
-
-    let now = std::time::SystemTime::now();
-
-    for entry in entries.flatten() {
-        let lock_path = entry.path();
-        if lock_path.extension().is_some_and(|ext| ext == "lock") {
-            let part_path = lock_path.with_extension("part");
-            let probe_path = if part_path.exists() { &part_path } else { &lock_path };
-
-            let age = probe_path
-                .metadata()
-                .and_then(|m| m.modified())
-                .and_then(|modified| now.duration_since(modified).map_err(std::io::Error::other))
-                .unwrap_or(std::time::Duration::ZERO);
-
-            if age >= STALE_DOWNLOAD_TIMEOUT {
-                if std::fs::remove_file(&lock_path).is_ok() {
-                    tracing::info!(
-                        path = ?lock_path,
-                        idle_minutes = age.as_secs() / 60,
-                        "Removed stale download lock file",
-                    );
-                }
-                if part_path.exists() && std::fs::remove_file(&part_path).is_ok() {
-                    tracing::info!(path = ?part_path, "Removed stale partial download");
-                }
-            }
+    let variants = [
+        word.to_string(),
+        format!("\u{0120}{word}"),
+        format!("\u{2581}{word}"),
+        capitalized,
+    ];
+    for variant in &variants {
+        if let Some(id) = tokenizer.token_to_id(variant) {
+            return Some(id);
         }
     }
-}
-
-/// Build a human-readable hint to attach to a LockAcquisition error.
-#[cfg(feature = "reranker")]
-fn lock_acquisition_hint(cache_dir: &std::path::Path, repo_name: &str) -> String {
-    let folder = format!("models--{}", repo_name.replace('/', "--"));
-    format!(
-        "\n\nAnother process may be downloading this model. \
-        If no download is in progress, remove the stale files and retry:\n  \
-        rm -f {cache}/{folder}/blobs/*.lock\n  \
-        rm -f {cache}/{folder}/blobs/*.part",
-        cache = cache_dir.display(),
-        folder = folder,
-    )
-}
-
-/// A held cross-process advisory lock that serializes model downloads.
-///
-/// Vendored from `embeddings/mod.rs` — keep in sync with that implementation.
-#[cfg(feature = "reranker")]
-struct ProcessDownloadLock {
-    file: std::fs::File,
-}
-
-#[cfg(feature = "reranker")]
-impl ProcessDownloadLock {
-    fn acquire(cache_dir: &std::path::Path, repo_name: &str) -> Option<Self> {
-        let folder = format!("models--{}", repo_name.replace('/', "--"));
-        let model_dir = cache_dir.join(folder);
-        if let Err(error) = std::fs::create_dir_all(&model_dir) {
-            tracing::debug!(?error, "Could not create model dir for download lock");
-            return None;
-        }
-        let lock_path = model_dir.join(".kbz-reranker-download.lock");
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::debug!(?error, path = ?lock_path, "Could not open download lock file");
-                return None;
-            }
-        };
-
-        if !blocking_lock_exclusive(&file) {
-            tracing::debug!(path = ?lock_path, "Could not acquire cross-process download lock");
-            return None;
-        }
-
-        tracing::debug!(path = ?lock_path, "Acquired cross-process download lock");
-        Some(Self { file })
+    let encoding = tokenizer.encode(word, false).ok()?;
+    match encoding.get_ids() {
+        [single] => Some(*single),
+        _ => None,
     }
 }
 
+/// Resolve the tokenizer ids for "yes" / "no" used by the Qwen3 generative-reranker head.
+///
+/// Looked up from the tokenizer rather than hardcoded, since the exact ids are
+/// checkpoint-specific. Returns `(true_id, false_id)`.
+///
+/// # Errors
+///
+/// Returns `XbergError::Reranking` if either token cannot be resolved — this
+/// would indicate an incompatible checkpoint.
 #[cfg(feature = "reranker")]
-impl Drop for ProcessDownloadLock {
-    fn drop(&mut self) {
-        unlock_file(&self.file);
-    }
+fn resolve_qwen3_token_ids(tokenizer: &tokenizers::Tokenizer) -> crate::Result<(u32, u32)> {
+    let true_id = resolve_answer_token_id(tokenizer, "yes").ok_or_else(|| unresolved_answer_token_error("yes"))?;
+    let false_id = resolve_answer_token_id(tokenizer, "no").ok_or_else(|| unresolved_answer_token_error("no"))?;
+    Ok((true_id, false_id))
 }
 
-#[cfg(all(feature = "reranker", target_family = "unix"))]
-fn blocking_lock_exclusive(file: &std::fs::File) -> bool {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `file` is a live, open file owned by the caller for the duration
-    // of the call; `as_raw_fd()` yields a valid descriptor. `flock` with
-    // `LOCK_EX` (no `LOCK_NB`) blocks until the advisory lock is granted and
-    // mutates no Rust-visible state. The lock is released by `unlock_file` on
-    // drop or by the kernel when the process exits.
-    #[allow(unsafe_code)]
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    result == 0
-}
-
-#[cfg(all(feature = "reranker", target_family = "unix"))]
-fn unlock_file(file: &std::fs::File) {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `file` is a live, open file owned by the caller; `flock` with
-    // `LOCK_UN` releases any advisory lock and mutates no Rust-visible state.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-    }
-}
-
-#[cfg(all(feature = "reranker", not(target_family = "unix")))]
-fn blocking_lock_exclusive(_file: &std::fs::File) -> bool {
-    false
-}
-
-#[cfg(all(feature = "reranker", not(target_family = "unix")))]
-fn unlock_file(_file: &std::fs::File) {}
-
-/// Download model files from HuggingFace and return their local paths.
-///
-/// Returns `(model_path, tokenizer_path, config_path, special_tokens_path, tokenizer_config_path)`.
-///
-/// `additional_files` are sibling files that must accompany `model_file` (e.g.
-/// the `model.onnx.data` weight blob for `rozgo/bge-reranker-v2-m3`). They are
-/// downloaded into the same cache directory; their returned `PathBuf`s are
-/// discarded because ONNX Runtime locates them by sibling-name relative to
-/// `model_file` at load time.
-///
-/// Vendored from `embeddings/mod.rs` — keep in sync with that implementation.
+/// Build the error returned when an answer word cannot be resolved to a single vocabulary token.
 #[cfg(feature = "reranker")]
-fn download_model_files(
-    repo_name: &str,
-    model_file: &str,
-    additional_files: &[String],
-    cache_directory: &std::path::Path,
-) -> crate::Result<(
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-)> {
-    let _download_lock = ProcessDownloadLock::acquire(cache_directory, repo_name);
-    cleanup_stale_locks(cache_directory, repo_name);
-
-    let api = hf_hub::api::sync::ApiBuilder::from_env()
-        .with_cache_dir(cache_directory.to_path_buf())
-        .with_progress(true)
-        .build()
-        .map_err(|e| crate::XbergError::reranking(format!("Failed to create HF API client: {e}")))?;
-
-    let repo = api.model(repo_name.to_string());
-
-    let model_path = repo.get(model_file).map_err(|e| {
-        let hint = if matches!(e, hf_hub::api::sync::ApiError::LockAcquisition(_)) {
-            lock_acquisition_hint(cache_directory, repo_name)
-        } else {
-            String::new()
-        };
-        crate::XbergError::reranking(format!("Failed to download {model_file} from {repo_name}: {e}{hint}"))
-    })?;
-
-    // Sibling files (e.g. `model.onnx.data`) must be present in the same cache
-    // dir before ORT opens the model. hf-hub places them next to model_file
-    // because they share the repo's blobs/snapshots layout.
-    for sibling in additional_files {
-        repo.get(sibling).map_err(|e| {
-            crate::XbergError::reranking(format!(
-                "Failed to download sibling file {sibling} from {repo_name}: {e}"
-            ))
-        })?;
-    }
-
-    let tokenizer_path = repo
-        .get("tokenizer.json")
-        .map_err(|e| crate::XbergError::reranking(format!("Failed to download tokenizer.json: {e}")))?;
-
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| crate::XbergError::reranking(format!("Failed to download config.json: {e}")))?;
-
-    let special_tokens_path = repo
-        .get("special_tokens_map.json")
-        .unwrap_or_else(|_| std::path::PathBuf::new());
-
-    let tokenizer_config_path = repo
-        .get("tokenizer_config.json")
-        .unwrap_or_else(|_| std::path::PathBuf::new());
-
-    Ok((
-        model_path,
-        tokenizer_path,
-        config_path,
-        special_tokens_path,
-        tokenizer_config_path,
+fn unresolved_answer_token_error(word: &str) -> crate::XbergError {
+    crate::XbergError::reranking(format!(
+        "Qwen3 generative-reranker head could not resolve \"{word}\" to exactly one token in this \
+         tokenizer's vocabulary (no direct vocab match and encoding it did not yield a single token id) \
+         — this usually means the loaded tokenizer is incompatible with the Qwen3 generative-reranker \
+         head's yes/no scoring path (wrong tokenizer, or a merged/multi-token \"yes\"/\"no\"); check that \
+         the reranker checkpoint is the expected Qwen3 generative-reranker model"
     ))
-}
-
-/// Load and configure a tokenizer for cross-encoder pair encoding.
-///
-/// Adapted from `embeddings/mod.rs::load_tokenizer`. Cross-encoders need
-/// pair encoding, so the tokenizer is configured identically — the pair input
-/// is handled at call time via `EncodeInput::Dual`.
-#[cfg(feature = "reranker")]
-fn load_tokenizer(
-    tokenizer_path: &std::path::Path,
-    config_path: &std::path::Path,
-    special_tokens_path: &std::path::Path,
-    tokenizer_config_path: &std::path::Path,
-    max_length: usize,
-) -> crate::Result<tokenizers::Tokenizer> {
-    use tokenizers::{AddedToken, PaddingParams, PaddingStrategy, TruncationParams};
-
-    let config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(config_path)
-            .map_err(|e| crate::XbergError::reranking(format!("Failed to read config.json: {e}")))?,
-    )
-    .map_err(|e| crate::XbergError::reranking(format!("Failed to parse config.json: {e}")))?;
-
-    let tokenizer_config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(tokenizer_config_path)
-            .map_err(|e| crate::XbergError::reranking(format!("Failed to read tokenizer_config.json: {e}")))?,
-    )
-    .map_err(|e| crate::XbergError::reranking(format!("Failed to parse tokenizer_config.json: {e}")))?;
-
-    let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| crate::XbergError::reranking(format!("Failed to load tokenizer: {e}")))?;
-
-    let model_max_length = tokenizer_config["model_max_length"].as_f64().unwrap_or(512.0) as usize;
-    let max_length = max_length.min(model_max_length);
-    let pad_id = config["pad_token_id"].as_u64().unwrap_or(0) as u32;
-    let pad_token = tokenizer_config["pad_token"].as_str().unwrap_or("[PAD]").to_string();
-
-    tokenizer
-        .with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            pad_token,
-            pad_id,
-            ..Default::default()
-        }))
-        .with_truncation(Some(TruncationParams {
-            max_length,
-            ..Default::default()
-        }))
-        .map_err(|e| crate::XbergError::reranking(format!("Failed to configure tokenizer: {e}")))?;
-
-    if let Ok(special_tokens_data) = std::fs::read(special_tokens_path)
-        && let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&special_tokens_data)
-    {
-        for (_, value) in &map {
-            if let Some(content) = value.as_str() {
-                let _ = tokenizer.add_special_tokens([AddedToken {
-                    content: content.to_string(),
-                    special: true,
-                    ..Default::default()
-                }]);
-            } else if value.is_object()
-                && let (Some(content), Some(single_word), Some(lstrip), Some(rstrip), Some(normalized)) = (
-                    value["content"].as_str(),
-                    value["single_word"].as_bool(),
-                    value["lstrip"].as_bool(),
-                    value["rstrip"].as_bool(),
-                    value["normalized"].as_bool(),
-                )
-            {
-                let _ = tokenizer.add_special_tokens([AddedToken {
-                    content: content.to_string(),
-                    special: true,
-                    single_word,
-                    lstrip,
-                    rstrip,
-                    normalized,
-                }]);
-            }
-        }
-    }
-
-    Ok(tokenizer)
-}
-
-/// Resolve the cache directory for reranker models.
-#[cfg(feature = "reranker")]
-fn resolve_cache_dir(cache_dir: Option<std::path::PathBuf>) -> std::path::PathBuf {
-    cache_dir.unwrap_or_else(|| crate::cache_dir::resolve_cache_dir("rerankers"))
 }
 
 /// Get or initialize a reranker engine from cache.
@@ -588,21 +312,24 @@ fn resolve_cache_dir(cache_dir: Option<std::path::PathBuf>) -> std::path::PathBu
 /// Downloads model files from HuggingFace if needed, loads the tokenizer,
 /// creates an ORT session, and caches the engine for reuse.
 #[cfg(feature = "reranker")]
+#[allow(clippy::too_many_arguments)]
 fn get_or_init_engine(
     repo_name: &str,
     model_file: &str,
     additional_files: &[String],
     max_length: usize,
     cache_dir: Option<std::path::PathBuf>,
+    progress: crate::core::config::DownloadProgress,
     accel: Option<crate::core::config::acceleration::AccelerationConfig>,
+    head: crate::core::config::reranker::RerankerHead,
 ) -> crate::Result<Arc<RerankerEngine>> {
-    let cache_directory = resolve_cache_dir(cache_dir);
+    let revision = (repo_name == "xberg-io/reranker-models").then_some(RERANKER_MODEL_REVISION);
+    let cache_key = crate::model_download::hf_cache_key(cache_dir.as_deref());
     let engine_key = format!(
-        "{repo_name}_{model_file}_{cache_directory}",
-        cache_directory = cache_directory.display()
+        "{repo_name}_{model_file}_{}_{cache_key}_{head:?}",
+        revision.unwrap_or("main")
     );
 
-    // Fast path: read lock
     {
         match ENGINE_CACHE.read() {
             Ok(cache) => {
@@ -619,85 +346,63 @@ fn get_or_init_engine(
         }
     }
 
-    // Slow path: write lock + initialization
     {
         let mut cache = match ENGINE_CACHE.write() {
             Ok(guard) => guard,
             Err(poison_error) => poison_error.into_inner(),
         };
 
-        // Double-check after acquiring write lock
         if let Some(cached) = cache.get(&engine_key) {
             return Ok(Arc::clone(cached));
         }
 
         crate::ort_discovery::ensure_ort_available();
 
-        let (model_path, tokenizer_path, config_path, special_tokens_path, tokenizer_config_path) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                download_model_files(repo_name, model_file, additional_files, &cache_directory)
-            }))
-            .map_err(|panic_payload| {
-                let panic_msg = panic_to_string(panic_payload);
-                if looks_like_ort_error(&panic_msg) {
-                    crate::XbergError::MissingDependency(format!("ONNX Runtime - {}", onnx_runtime_install_message()))
-                } else {
-                    crate::XbergError::reranking(format!("Model download panicked: {panic_msg}"))
-                }
-            })??;
-
-        let tokenizer = load_tokenizer(
-            &tokenizer_path,
-            &config_path,
-            &special_tokens_path,
-            &tokenizer_config_path,
-            max_length,
+        let files = crate::onnx::download_model_files(
+            repo_name,
+            model_file,
+            additional_files,
+            revision,
+            cache_dir.as_deref(),
+            progress,
+            Some(RERANKER_SHA256_MANIFEST),
+            rerank_err,
         )?;
+        let tokenizer = crate::onnx::load_tokenizer(&files, max_length, rerank_err)?;
+        let session = crate::onnx::build_session(&files.model, accel.as_ref(), rerank_err)?;
 
-        let thread_budget = crate::core::config::concurrency::resolve_thread_budget(None);
-        let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut builder = ort::session::Session::builder()?;
-            builder = builder
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
-                .map_err(|e| ort::Error::new(e.message()))?;
-            builder = builder
-                .with_intra_threads(thread_budget)
-                .map_err(|e| ort::Error::new(e.message()))?;
-            builder = builder
-                .with_inter_threads(1)
-                .map_err(|e| ort::Error::new(e.message()))?;
-            builder = crate::ort_discovery::apply_execution_providers(builder, accel.as_ref())?;
-            builder.commit_from_file(&model_path)
-        }))
-        .map_err(|panic_payload| {
-            let panic_msg = panic_to_string(panic_payload);
-            if looks_like_ort_error(&panic_msg) {
-                crate::XbergError::MissingDependency(format!("ONNX Runtime - {}", onnx_runtime_install_message()))
-            } else {
-                crate::XbergError::reranking(format!("ONNX Runtime initialization panicked: {panic_msg}"))
+        let (true_token_id, false_token_id) = match head {
+            crate::core::config::reranker::RerankerHead::Qwen3Generative => {
+                let (true_id, false_id) = resolve_qwen3_token_ids(&tokenizer)?;
+                (Some(true_id), Some(false_id))
             }
-        })?
-        .map_err(|e| {
-            let error_msg = e.to_string();
-            if looks_like_ort_error(&error_msg) {
-                crate::XbergError::MissingDependency(format!("ONNX Runtime - {}", onnx_runtime_install_message()))
-            } else {
-                crate::XbergError::reranking(format!("Failed to create ONNX session: {e}"))
-            }
-        })?;
+            crate::core::config::reranker::RerankerHead::CrossEncoder => (None, None),
+        };
 
-        let new_engine = Arc::new(RerankerEngine::new(tokenizer, session));
+        let new_engine = Arc::new(RerankerEngine::new(
+            tokenizer,
+            session,
+            head,
+            true_token_id,
+            false_token_id,
+        ));
         cache.insert(engine_key, Arc::clone(&new_engine));
 
         Ok(new_engine)
     }
 }
 
-/// Resolve model info (repo, model file, additional_files, max_length) from a RerankerModelType config.
+/// Resolve model info (repo, model file, additional_files, max_length, head) from a RerankerModelType config.
 #[cfg(feature = "reranker")]
 fn resolve_model_info(
     model_type: &crate::core::config::RerankerModelType,
-) -> crate::Result<(String, String, Vec<String>, usize)> {
+) -> crate::Result<(
+    String,
+    String,
+    Vec<String>,
+    usize,
+    crate::core::config::reranker::RerankerHead,
+)> {
     match model_type {
         crate::core::config::RerankerModelType::Preset { name } => {
             let preset = get_preset(name)
@@ -707,6 +412,7 @@ fn resolve_model_info(
                 preset.model_file,
                 preset.additional_files,
                 preset.max_length,
+                preset.head,
             ))
         }
         crate::core::config::RerankerModelType::Custom {
@@ -714,6 +420,7 @@ fn resolve_model_info(
             model_file,
             additional_files,
             max_length,
+            head,
         } => {
             let len = match max_length.unwrap_or(512) {
                 n if n <= 0 => {
@@ -725,7 +432,7 @@ fn resolve_model_info(
                 n => n as usize,
             };
             let file = model_file.clone().unwrap_or_else(|| "onnx/model.onnx".to_string());
-            Ok((model_id.clone(), file, additional_files.clone(), len))
+            Ok((model_id.clone(), file, additional_files.clone(), len, *head))
         }
         crate::core::config::RerankerModelType::Llm { .. } => Err(crate::XbergError::reranking(
             "LLM rerankers have no local model to warm or download — the provider serves them over HTTP.",
@@ -759,25 +466,93 @@ pub(crate) fn sigmoid_f32(x: f32) -> f32 {
 }
 
 /// Build the sorted, optionally truncated result vector from raw logits.
+///
+/// Always applies sigmoid — used by callers (the Plugin backend path) that are
+/// guaranteed to hand back raw cross-encoder-style logits. The local ONNX path
+/// uses [`build_results_for_head`] instead, since its Qwen3 head already
+/// returns a `[0, 1]` probability that must NOT be sigmoided a second time.
 #[cfg(any(feature = "reranker", test))]
 fn build_results(documents: &[String], logits: Vec<f32>, top_k: Option<usize>) -> Vec<RerankedDocument> {
+    build_results_from_scores(documents, logits, top_k, sigmoid_f32)
+}
+
+/// Build the sorted, optionally truncated result vector from the local ONNX
+/// engine's raw output, applying the score transform appropriate to `head`.
+///
+/// - [`crate::core::config::reranker::RerankerHead::CrossEncoder`] — the engine
+///   returns raw logits; sigmoid is applied here to reach `[0, 1]`, exactly as
+///   the original single-head implementation did.
+/// - [`crate::core::config::reranker::RerankerHead::Qwen3Generative`] — the
+///   engine's `qwen3_scores` already performs a softmax internally and returns
+///   `P(yes)` in `[0, 1]`. Applying sigmoid again here would double-transform
+///   an already-bounded probability, compressing the score distribution toward
+///   0.5 and corrupting ranking. This path is a pass-through (identity) instead.
+#[cfg(any(feature = "reranker", test))]
+fn build_results_for_head(
+    documents: &[String],
+    raw_scores: Vec<f32>,
+    top_k: Option<usize>,
+    head: crate::core::config::reranker::RerankerHead,
+) -> Vec<RerankedDocument> {
+    match head {
+        crate::core::config::reranker::RerankerHead::CrossEncoder => {
+            build_results_from_scores(documents, raw_scores, top_k, sigmoid_f32)
+        }
+        crate::core::config::reranker::RerankerHead::Qwen3Generative => {
+            build_results_from_scores(documents, raw_scores, top_k, |already_a_probability| {
+                already_a_probability
+            })
+        }
+    }
+}
+
+/// Shared sort/truncate core for both [`build_results`] and [`build_results_for_head`].
+///
+/// Applies `transform` to each raw value to produce the final `[0, 1]` score,
+/// then sorts descending and truncates to `top_k`.
+///
+/// When `top_k` is smaller than the survivor count, this partitions with
+/// [`slice::select_nth_unstable_by`] (`O(n)`) to isolate the top-k elements and
+/// sorts only that k-slice (`O(k log k)`), instead of fully sorting all `n`
+/// results (`O(n log n)`) before truncating. The returned order is identical
+/// to a full sort followed by `truncate(k)` — same descending-by-score
+/// ordering, same tie-breaking (`partial_cmp` with `Equal` fallback) applied
+/// consistently by both the partition and the final sort.
+#[cfg(any(feature = "reranker", test))]
+fn build_results_from_scores(
+    documents: &[String],
+    raw_scores: Vec<f32>,
+    top_k: Option<usize>,
+    transform: impl Fn(f32) -> f32,
+) -> Vec<RerankedDocument> {
     let mut results: Vec<RerankedDocument> = documents
         .iter()
         .enumerate()
-        .zip(logits.iter())
-        .map(|((index, document), &logit)| RerankedDocument {
+        .zip(raw_scores.iter())
+        .map(|((index, document), &raw)| RerankedDocument {
             index,
-            score: sigmoid_f32(logit),
+            score: transform(raw),
             document: document.clone(),
         })
         .collect();
 
-    // Sort descending by score.
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    let cmp_desc =
+        |a: &RerankedDocument, b: &RerankedDocument| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal);
 
-    // Truncate to top_k if requested.
-    if let Some(k) = top_k {
-        results.truncate(k);
+    match top_k {
+        Some(k) if k < results.len() => {
+            if k > 0 {
+                results.select_nth_unstable_by(k - 1, cmp_desc);
+            }
+            results.truncate(k);
+            results.sort_by(cmp_desc);
+        }
+        _ => {
+            results.sort_by(cmp_desc);
+            if let Some(k) = top_k {
+                results.truncate(k);
+            }
+        }
     }
 
     results
@@ -814,16 +589,11 @@ pub fn rerank(
         });
     }
 
-    // Dispatch by model type.
     match &config.model {
         #[cfg(all(feature = "liter-llm", not(target_arch = "wasm32")))]
         crate::core::config::RerankerModelType::Llm { llm } => {
             let top_k = config.top_k;
             let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                // `block_in_place` requires a multi-thread runtime; calling it
-                // on a current-thread runtime panics. Detect via the runtime
-                // flavor and fall back to a nested current-thread runtime when
-                // we're embedded in one.
                 if matches!(handle.runtime_flavor(), tokio::runtime::RuntimeFlavor::CurrentThread) {
                     return Err(crate::XbergError::reranking(
                         "Synchronous rerank() with an LLM backend cannot be called from a current-thread Tokio runtime. \
@@ -834,9 +604,6 @@ pub fn rerank(
                     handle.block_on(crate::llm::rerank::rerank_via_llm(&query, &documents, llm, top_k))
                 })
             } else {
-                // No ambient runtime: drive the future on the shared, never-dropped
-                // global runtime. Building a per-call runtime here would panic on
-                // drop when this sync path runs inside a caller's blocking context.
                 crate::core::runtime::global_runtime()?
                     .block_on(crate::llm::rerank::rerank_via_llm(&query, &documents, llm, top_k))
             };
@@ -879,9 +646,6 @@ pub fn rerank(
                 }
                 tokio::task::block_in_place(|| handle.block_on(rerank_future))
             } else {
-                // No ambient runtime: drive the future on the shared, never-dropped
-                // global runtime. Building a per-call runtime here would panic on
-                // drop when this sync path runs inside a caller's blocking context.
                 crate::core::runtime::global_runtime()?.block_on(rerank_future)
             }?;
 
@@ -890,22 +654,24 @@ pub fn rerank(
         }
         crate::core::config::RerankerModelType::Preset { .. }
         | crate::core::config::RerankerModelType::Custom { .. } => {
-            let (repo, model_file, additional_files, max_length) = resolve_model_info(&config.model)?;
+            let (repo, model_file, additional_files, max_length, head) = resolve_model_info(&config.model)?;
             let engine = get_or_init_engine(
                 &repo,
                 &model_file,
                 &additional_files,
                 max_length,
                 config.cache_dir.clone(),
+                config.into(),
                 config.acceleration.clone(),
+                head,
             )?;
 
             let doc_refs: Vec<&str> = documents.iter().map(|d| d.as_str()).collect();
-            let logits = engine
+            let raw_scores = engine
                 .rerank(&query, &doc_refs, config.batch_size)
                 .map_err(|e| crate::XbergError::reranking(format!("ONNX inference failed: {e}")))?;
 
-            Ok(build_results(&documents, logits, config.top_k))
+            Ok(build_results_for_head(&documents, raw_scores, config.top_k, head))
         }
     }
 }
@@ -973,9 +739,7 @@ pub async fn rerank_async(
             return Ok(build_results(&documents, logits, config.top_k));
         }
         crate::core::config::RerankerModelType::Preset { .. }
-        | crate::core::config::RerankerModelType::Custom { .. } => {
-            // Fall through to ONNX path below.
-        }
+        | crate::core::config::RerankerModelType::Custom { .. } => {}
     }
 
     let _permit = RERANK_SEMAPHORE
@@ -993,6 +757,48 @@ pub async fn rerank_async(
 mod tests {
     use super::*;
 
+    /// Fail-closed guarantee: every hosted reranker preset's weight file (and any
+    /// external-data sibling) must be pinned in `presets.sha256sum`.
+    #[test]
+    fn every_preset_file_is_pinned_in_manifest() {
+        let manifest = crate::model_download::parse_sha256_manifest(RERANKER_SHA256_MANIFEST).unwrap();
+        let pinned: std::collections::HashSet<&str> = manifest.iter().map(|(p, _)| p.as_str()).collect();
+        for preset in RERANKER_PRESETS.iter() {
+            assert!(
+                pinned.contains(preset.model_file.as_str()),
+                "preset {} model_file {} is not pinned in presets.sha256sum",
+                preset.name,
+                preset.model_file
+            );
+            for sibling in &preset.additional_files {
+                assert!(
+                    pinned.contains(sibling.as_str()),
+                    "preset {} additional file {} is not pinned in presets.sha256sum",
+                    preset.name,
+                    sibling
+                );
+            }
+
+            let model_dir = std::path::Path::new(&preset.model_file)
+                .parent()
+                .and_then(|p| p.to_str())
+                .filter(|s| !s.is_empty());
+            let companion_path = |name: &str| match model_dir {
+                Some(dir) => format!("{dir}/{name}"),
+                None => name.to_string(),
+            };
+            for required in ["tokenizer.json", "config.json"] {
+                let path = companion_path(required);
+                assert!(
+                    pinned.contains(path.as_str()),
+                    "preset {} companion {} is not pinned in presets.sha256sum",
+                    preset.name,
+                    path
+                );
+            }
+        }
+    }
+
     #[test]
     fn empty_documents_returns_empty_vec() {
         let results = build_results(&[], vec![], None);
@@ -1002,12 +808,10 @@ mod tests {
     #[test]
     fn build_results_sorts_descending_by_score() {
         let documents = vec!["doc0".to_string(), "doc1".to_string(), "doc2".to_string()];
-        // Logits: -1.0, 2.0, 0.5 — sigmoid: ~0.27, ~0.88, ~0.62
         let logits = vec![-1.0_f32, 2.0_f32, 0.5_f32];
         let results = build_results(&documents, logits, None);
 
         assert_eq!(results.len(), 3);
-        // First result should have highest score (doc at index 1 with logit=2.0)
         assert_eq!(results[0].index, 1);
         assert!(results[0].score > results[1].score, "Results must be sorted descending");
         assert!(results[1].score > results[2].score, "Results must be sorted descending");
@@ -1020,7 +824,6 @@ mod tests {
         let results = build_results(&documents, logits, Some(2));
 
         assert_eq!(results.len(), 2, "top_k=2 should truncate to 2 results");
-        // Scores should still be descending
         assert!(results[0].score >= results[1].score);
     }
 
@@ -1046,9 +849,65 @@ mod tests {
         let logits = vec![0.0_f32, 1.0_f32];
         let results = build_results(&documents, logits, None);
 
-        // Results sorted: index 1 first (higher logit), then index 0
         assert_eq!(results[0].document, "foo bar");
         assert_eq!(results[1].document, "hello world");
+    }
+
+    #[test]
+    fn build_results_for_head_cross_encoder_applies_sigmoid() {
+        use crate::core::config::reranker::RerankerHead;
+
+        let documents = vec!["doc0".to_string(), "doc1".to_string()];
+        let raw_logits = vec![0.0_f32, 2.0_f32];
+        let results = build_results_for_head(&documents, raw_logits.clone(), None, RerankerHead::CrossEncoder);
+
+        let expected = build_results(&documents, raw_logits, None);
+        assert_eq!(results.len(), expected.len());
+        for (a, b) in results.iter().zip(expected.iter()) {
+            assert_eq!(a.index, b.index);
+            assert!((a.score - b.score).abs() < 1e-9);
+        }
+        let doc0 = results.iter().find(|r| r.index == 0).unwrap();
+        assert!(
+            (doc0.score - 0.5).abs() < 1e-6,
+            "cross-encoder head must sigmoid, got {}",
+            doc0.score
+        );
+    }
+
+    #[test]
+    fn build_results_for_head_qwen3_does_not_double_sigmoid() {
+        use crate::core::config::reranker::RerankerHead;
+
+        let documents = vec!["doc0".to_string(), "doc1".to_string()];
+        let already_probabilities = vec![0.9_f32, 0.1_f32];
+        let results = build_results_for_head(
+            &documents,
+            already_probabilities.clone(),
+            None,
+            RerankerHead::Qwen3Generative,
+        );
+
+        let doc0 = results.iter().find(|r| r.index == 0).unwrap();
+        let doc1 = results.iter().find(|r| r.index == 1).unwrap();
+        assert!(
+            (doc0.score - 0.9).abs() < 1e-6,
+            "Qwen3 score must pass through unchanged, got {}",
+            doc0.score
+        );
+        assert!(
+            (doc1.score - 0.1).abs() < 1e-6,
+            "Qwen3 score must pass through unchanged, got {}",
+            doc1.score
+        );
+
+        let wrongly_double_sigmoided = sigmoid_f32(0.9);
+        assert!(
+            (doc0.score - wrongly_double_sigmoided).abs() > 0.01,
+            "Qwen3 score must NOT be re-sigmoided"
+        );
+
+        assert!(doc0.score > doc1.score);
     }
 
     #[test]
@@ -1069,16 +928,33 @@ mod tests {
     #[test]
     fn preset_list_exposes_catalog_plus_aliases() {
         let presets = list_presets();
-        // 4 catalog + 4 friendly aliases.
         assert_eq!(presets.len(), RERANKER_PRESETS.len() + PRESET_ALIASES.len());
-        // Catalog names present.
         assert!(presets.iter().any(|n| n == "bge-reranker-base"));
         assert!(presets.iter().any(|n| n == "bge-reranker-v2-m3"));
         assert!(presets.iter().any(|n| n == "jina-reranker-v1-turbo-en"));
-        assert!(presets.iter().any(|n| n == "jina-reranker-v2-base-multilingual"));
-        // Friendly aliases present.
+        assert!(presets.iter().any(|n| n == "qwen3-reranker-0.6b"));
+        assert!(!presets.iter().any(|n| n == "jina-reranker-v2-base-multilingual"));
         for (alias, _) in PRESET_ALIASES {
             assert!(presets.iter().any(|n| n == *alias), "missing alias: {alias}");
+        }
+    }
+
+    #[cfg(feature = "reranker-presets")]
+    #[test]
+    fn qwen3_preset_uses_generative_head() {
+        use crate::core::config::reranker::RerankerHead;
+
+        let preset = get_preset("qwen3-reranker-0.6b").expect("qwen3 preset must exist");
+        assert_eq!(preset.model_repo, "xberg-io/reranker-models");
+        assert_eq!(preset.head, RerankerHead::Qwen3Generative);
+
+        for name in ["bge-reranker-base", "bge-reranker-v2-m3", "jina-reranker-v1-turbo-en"] {
+            let preset = get_preset(name).expect(name);
+            assert_eq!(
+                preset.head,
+                RerankerHead::CrossEncoder,
+                "{name} must remain on the original cross-encoder head"
+            );
         }
     }
 
@@ -1107,38 +983,145 @@ mod tests {
 
     #[cfg(feature = "reranker-presets")]
     #[test]
-    fn catalog_paths_match_fastembed_rs() {
-        // Source of truth: fastembed-rs `src/models/reranking.rs`. Lock these to
-        // catch accidental drift; if fastembed-rs updates we mirror it here.
+    fn catalog_paths_are_stable() {
         let by_name = |n: &str| get_preset(n).expect(n);
 
         let base = by_name("bge-reranker-base");
-        assert_eq!(base.model_repo, "BAAI/bge-reranker-base");
-        assert_eq!(base.model_file, "onnx/model.onnx");
+        assert_eq!(base.model_repo, "xberg-io/reranker-models");
+        assert_eq!(base.model_file, "bge-reranker-base/model.onnx");
         assert!(base.additional_files.is_empty());
 
         let m3 = by_name("bge-reranker-v2-m3");
-        assert_eq!(m3.model_repo, "rozgo/bge-reranker-v2-m3");
-        assert_eq!(m3.model_file, "model.onnx");
-        assert_eq!(m3.additional_files, vec!["model.onnx.data".to_string()]);
+        assert_eq!(m3.model_repo, "xberg-io/reranker-models");
+        assert_eq!(m3.model_file, "bge-reranker-v2-m3/model.onnx");
+        assert_eq!(
+            m3.additional_files,
+            vec!["bge-reranker-v2-m3/model.onnx.data".to_string()]
+        );
 
         let turbo = by_name("jina-reranker-v1-turbo-en");
-        assert_eq!(turbo.model_repo, "jinaai/jina-reranker-v1-turbo-en");
-        assert_eq!(turbo.model_file, "onnx/model.onnx");
+        assert_eq!(turbo.model_repo, "xberg-io/reranker-models");
+        assert_eq!(turbo.model_file, "jina-reranker-v1-turbo-en/model.onnx");
 
-        let multi = by_name("jina-reranker-v2-base-multilingual");
-        assert_eq!(multi.model_repo, "jinaai/jina-reranker-v2-base-multilingual");
-        assert_eq!(multi.model_file, "onnx/model.onnx");
+        let qwen3 = by_name("qwen3-reranker-0.6b");
+        assert_eq!(qwen3.model_repo, "xberg-io/reranker-models");
+        assert_eq!(qwen3.model_file, "qwen3-reranker-0.6b/model.onnx");
+        assert_eq!(
+            qwen3.additional_files,
+            vec!["qwen3-reranker-0.6b/model.onnx.data".to_string()]
+        );
+        assert_eq!(qwen3.head, crate::core::config::reranker::RerankerHead::Qwen3Generative);
+    }
+
+    #[cfg(feature = "reranker")]
+    fn build_wordlevel_tokenizer(vocab: &[(&str, u32)], lowercase: bool) -> tokenizers::Tokenizer {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::normalizers::utils::Lowercase;
+        use tokenizers::{AddedToken, Tokenizer};
+
+        let vocab: ahash::AHashMap<String, u32> = vocab.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("build WordLevel model");
+        let mut tokenizer = Tokenizer::new(model);
+        let _ = tokenizer.add_special_tokens([AddedToken::from("[UNK]", true)]);
+        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace {}));
+        if lowercase {
+            let _ = tokenizer.with_normalizer(Some(Lowercase));
+        }
+        tokenizer
+    }
+
+    #[cfg(feature = "reranker")]
+    #[test]
+    fn resolve_qwen3_token_ids_uses_direct_vocab_when_present() {
+        let tokenizer = build_wordlevel_tokenizer(&[("[UNK]", 0), ("yes", 1), ("no", 2)], false);
+
+        let (true_id, false_id) = resolve_qwen3_token_ids(&tokenizer).expect("must resolve both ids");
+
+        assert_eq!(true_id, 1, "\"yes\" must resolve to its direct vocab id");
+        assert_eq!(false_id, 2, "\"no\" must resolve to its direct vocab id");
+    }
+
+    #[cfg(feature = "reranker")]
+    #[test]
+    fn resolve_answer_token_id_falls_back_to_encoding_when_no_direct_vocab_entry() {
+        let tokenizer = build_wordlevel_tokenizer(&[("[UNK]", 0), ("yes", 7), ("no", 9)], true);
+
+        assert!(tokenizer.token_to_id("Yes").is_none());
+        assert!(tokenizer.token_to_id("Ġyes").is_none());
+        assert!(tokenizer.token_to_id("\u{2581}yes").is_none());
+        assert!(tokenizer.token_to_id("YES").is_none());
+
+        let true_id = resolve_answer_token_id(&tokenizer, "Yes").expect("encode fallback must resolve \"Yes\"");
+        let false_id = resolve_answer_token_id(&tokenizer, "No").expect("encode fallback must resolve \"No\"");
+
+        assert_eq!(
+            true_id, 7,
+            "\"Yes\" must resolve via the encode fallback to the lowercase vocab id"
+        );
+        assert_eq!(
+            false_id, 9,
+            "\"No\" must resolve via the encode fallback to the lowercase vocab id"
+        );
+    }
+
+    #[cfg(feature = "reranker")]
+    #[test]
+    fn resolve_qwen3_token_ids_errors_with_actionable_message_when_word_is_unresolvable() {
+        let tokenizer = build_wordlevel_tokenizer(&[("no", 1)], false);
+
+        let error = resolve_qwen3_token_ids(&tokenizer).expect_err("\"yes\" is unresolvable and must error");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("\"yes\""),
+            "error message must name the word that failed to resolve: {message}"
+        );
+        assert!(
+            message.contains("Qwen3 generative-reranker head"),
+            "error message must mention the Qwen3 generative-reranker head: {message}"
+        );
+        assert!(
+            message.contains("incompatible"),
+            "error message must suggest the checkpoint/tokenizer is incompatible: {message}"
+        );
+        assert!(
+            message.contains("reranker checkpoint"),
+            "error message must suggest checking the reranker checkpoint: {message}"
+        );
+    }
+
+    #[cfg(feature = "reranker")]
+    #[test]
+    fn resolve_answer_token_id_encode_fallback_rejects_unk_mapped_word() {
+        let tokenizer = build_wordlevel_tokenizer(&[("[UNK]", 0), ("no", 1)], false);
+
+        assert!(tokenizer.token_to_id("yes").is_none());
+        assert!(tokenizer.token_to_id("Ġyes").is_none());
+        assert!(tokenizer.token_to_id("\u{2581}yes").is_none());
+        assert!(tokenizer.token_to_id("Yes").is_none());
+
+        let result = resolve_answer_token_id(&tokenizer, "yes");
+        assert_eq!(
+            result,
+            Some(0),
+            "encode fallback resolves the absent word to the shared [UNK] id \
+             (current behavior — callers must not treat this as a genuine match)"
+        );
     }
 
     #[cfg(all(feature = "reranker", feature = "tokio-runtime"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn plugin_backend_rerank_roundtrip() {
         use crate::core::config::RerankerConfig;
+        use crate::plugins::registry::test_support::RerankerRegistryGuard;
         use crate::plugins::{Plugin, RerankerBackend, register_reranker_backend, unregister_reranker_backend};
         use async_trait::async_trait;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
 
         struct MockPlugin {
             name: String,
@@ -1162,7 +1145,6 @@ mod tests {
         #[async_trait]
         impl RerankerBackend for MockPlugin {
             async fn rerank(&self, _query: String, documents: Vec<String>) -> crate::Result<Vec<f32>> {
-                // Return descending logits so doc 0 wins.
                 Ok(documents
                     .iter()
                     .enumerate()
@@ -1171,9 +1153,11 @@ mod tests {
             }
         }
 
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let name = format!("test-mock-reranker-{id}");
+        // Shares the global reranker registry with `plugins::reranker`'s tests, so it takes the
+        // same lock: without it, that module's `clear_reranker_backends` can wipe this backend
+        // between registration and the `rerank_async` call below. ~keep
+        let _guard = RerankerRegistryGuard::acquire();
+        let name = "test-mock-reranker".to_string();
 
         register_reranker_backend(Arc::new(MockPlugin { name: name.clone() })).unwrap();
 
@@ -1192,7 +1176,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(results.len(), 2, "top_k=2 should limit to 2 results");
-        // Scores must be descending.
         assert!(results[0].score >= results[1].score);
 
         unregister_reranker_backend(&name).unwrap();

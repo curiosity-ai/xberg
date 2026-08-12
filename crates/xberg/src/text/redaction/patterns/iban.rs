@@ -9,8 +9,6 @@ use crate::types::redaction::PiiCategory;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-// Known IBAN-using country codes (ISO 3166-1 alpha-2). Filter cuts down the
-// false-positive surface that any two upper-case letters would otherwise allow.
 const IBAN_COUNTRIES: &[&str] = &[
     "AD", "AE", "AL", "AT", "AZ", "BA", "BE", "BG", "BH", "BR", "BY", "CH", "CR", "CY", "CZ", "DE", "DK", "DO", "EE",
     "EG", "ES", "FI", "FO", "FR", "GB", "GE", "GI", "GL", "GR", "GT", "HR", "HU", "IE", "IL", "IQ", "IS", "IT", "JO",
@@ -19,10 +17,8 @@ const IBAN_COUNTRIES: &[&str] = &[
     "VG", "XK",
 ];
 
-static RE_IBAN: Lazy<Regex> = Lazy::new(|| {
-    // Country (2 letters) + check (2 digits) + 11-30 alphanumeric BBAN with optional spaces.
-    Regex::new(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b").expect("iban regex compiles")
-});
+static RE_IBAN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b").expect("iban regex compiles"));
 
 /// Find all IBAN spans in `text`, validated against country-specific length rules.
 pub fn find_all(text: &str) -> Vec<PatternMatch> {
@@ -36,7 +32,6 @@ pub fn find_all(text: &str) -> Vec<PatternMatch> {
             if !IBAN_COUNTRIES.contains(&cc) {
                 return None;
             }
-            // Strip whitespace and verify total length is within the IBAN range (15-34 chars).
             let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
             if !(15..=34).contains(&compact.len()) {
                 return None;

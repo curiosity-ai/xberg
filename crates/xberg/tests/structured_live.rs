@@ -12,6 +12,7 @@
 //!
 //! `--test-threads=1` keeps concurrent provider calls below rate limits.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(all(feature = "structured", feature = "pdf", not(target_arch = "wasm32")))]
 
 use serde_json::json;

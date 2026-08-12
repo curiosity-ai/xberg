@@ -3,16 +3,17 @@
 //! This module handles the core OCR execution logic, including image processing,
 //! text extraction, and result formatting.
 
+use super::api_pool::TesseractApiPool;
 use super::config::{apply_tesseract_variables, hash_config};
 use super::validation::{
     resolve_all_installed_languages, resolve_tessdata_path, strip_control_characters, validate_language_and_traineddata,
 };
 use crate::core::config::ExtractionConfig;
-use crate::image::normalize_image_dpi;
+use crate::image::normalize_image_dpi_owned;
 use crate::ocr::cache::OcrCache;
 use crate::ocr::conversion::{TsvRow, iterator_word_to_element, tsv_row_to_element};
 use crate::ocr::error::OcrError;
-use crate::ocr::hocr_parser::parse_hocr_to_internal_document;
+use crate::ocr::hocr_parser::{HOCR_FONT_SIZE_ATTRIBUTE, parse_hocr_to_internal_document};
 #[cfg(feature = "pdf")]
 use crate::ocr::table::post_process_table;
 use crate::ocr::table::{extract_words_from_tsv, reconstruct_table, table_to_markdown};
@@ -21,91 +22,16 @@ use crate::ocr::types::BatchItemResult;
 use crate::ocr::types::TesseractConfig;
 use crate::types::internal::{ElementKind, InternalDocument};
 use crate::types::{OcrExtractionResult, OcrTable, OcrTableBoundingBox};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xberg_tesseract::{TessPageSegMode, TessPolyBlockType, TesseractAPI};
-
-/// Cached Tesseract API state, stored per-thread to avoid reloading tessdata (~100MB) for each image.
-struct CachedApi {
-    tessdata_path: String,
-    language: String,
-    api: TesseractAPI,
-}
-
-thread_local! {
-    /// Per-thread cache of an initialized `TesseractAPI`. Each thread owns at most one
-    /// cached instance. Because Tesseract is not thread-safe, the thread-local pattern
-    /// guarantees exclusive access without locking.
-    static CACHED_TESSERACT_API: RefCell<Option<CachedApi>> = const { RefCell::new(None) };
-}
-
-/// Returns an initialized `TesseractAPI` for the given `(tessdata_path, language)` pair.
-///
-/// If the thread-local cache already holds a matching API, `clear()` is called to reset
-/// image state and the cached instance is returned. Otherwise a fresh instance is created,
-/// initialized, and stored in the cache for subsequent calls.
-///
-/// The caller receives ownership of the `TesseractAPI` via the take-and-put-back pattern:
-/// the value is removed from the cache, used by the caller, and returned via
-/// [`return_api_to_cache`] when done.
-fn get_or_init_api(tessdata_path: &str, language: &str) -> Result<TesseractAPI, OcrError> {
-    // Try to take the cached API out for reuse.
-    let maybe_cached = CACHED_TESSERACT_API.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if let Some(cached) = slot.as_ref()
-            && cached.tessdata_path == tessdata_path
-            && cached.language == language
-        {
-            // Cache hit: take the API out so the caller owns it.
-            return slot.take();
-        }
-        // Cache miss or key mismatch: drop the old entry.
-        *slot = None;
-        None
-    });
-
-    if let Some(cached) = maybe_cached {
-        // Reset image/recognition state without reloading tessdata.
-        cached
-            .api
-            .clear()
-            .map_err(|e| OcrError::ProcessingFailed(format!("Failed to clear cached Tesseract API: {}", e)))?;
-        return Ok(cached.api);
-    }
-
-    // No valid cache entry — create and initialize a fresh API.
-    let api = TesseractAPI::new()
-        .map_err(|e| OcrError::TesseractInitializationFailed(format!("Failed to allocate Tesseract engine: {}", e)))?;
-    api.init(tessdata_path, language).map_err(|e| {
-        OcrError::TesseractInitializationFailed(format!("Failed to initialize language '{}': {}", language, e))
-    })?;
-    Ok(api)
-}
-
-/// Returns a `TesseractAPI` back to the thread-local cache after use.
-///
-/// If the cache already holds a different entry (e.g. due to a re-entrant call), the
-/// returned API is simply dropped.
-fn return_api_to_cache(api: TesseractAPI, tessdata_path: String, language: String) {
-    CACHED_TESSERACT_API.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        // Only cache if the slot is currently empty (no re-entrant replacement).
-        if slot.is_none() {
-            *slot = Some(CachedApi {
-                tessdata_path,
-                language,
-                api,
-            });
-        }
-    });
-}
 
 /// Process-global document-orientation classifier (ONNX PP-LCNet), shared by
 /// every tesseract-backend auto-rotate call. Session initialization is lazy and
 /// internally synchronized; `detect` is thread-safe.
-#[cfg(feature = "auto-rotate")]
+#[cfg(auto_rotate)]
 fn doc_orientation_detector() -> &'static crate::doc_orientation::DocOrientationDetector {
     static DETECTOR: std::sync::LazyLock<crate::doc_orientation::DocOrientationDetector> =
         std::sync::LazyLock::new(|| {
@@ -119,27 +45,25 @@ fn doc_orientation_detector() -> &'static crate::doc_orientation::DocOrientation
 
 use crate::types::OcrElement;
 
-#[cfg(feature = "auto-rotate")]
+#[cfg(auto_rotate)]
 /// Rotate raw RGB image data by the given degrees (0, 90, 180, 270).
 ///
 /// Returns the rotated pixel data and the new (width, height).
 /// For 90° and 270° rotations, width and height are swapped.
 fn rotate_rgb_image_data(data: &[u8], width: u32, height: u32, degrees: i32) -> (Vec<u8>, u32, u32) {
-    let bpp = 3usize; // bytes per pixel (RGB)
+    let bpp = 3usize;
     let w = width as usize;
     let h = height as usize;
 
     match degrees {
         0 => (data.to_vec(), width, height),
         90 => {
-            // 90° clockwise: new dimensions are (height, width)
             let new_w = h;
             let new_h = w;
             let mut out = vec![0u8; new_w * new_h * bpp];
             for y in 0..h {
                 for x in 0..w {
                     let src_idx = (y * w + x) * bpp;
-                    // (x, y) -> (h - 1 - y, x) in new coordinates
                     let dst_x = h - 1 - y;
                     let dst_y = x;
                     let dst_idx = (dst_y * new_w + dst_x) * bpp;
@@ -149,7 +73,6 @@ fn rotate_rgb_image_data(data: &[u8], width: u32, height: u32, degrees: i32) -> 
             (out, new_w as u32, new_h as u32)
         }
         180 => {
-            // 180°: same dimensions, pixels reversed
             let mut out = vec![0u8; w * h * bpp];
             for y in 0..h {
                 for x in 0..w {
@@ -163,14 +86,12 @@ fn rotate_rgb_image_data(data: &[u8], width: u32, height: u32, degrees: i32) -> 
             (out, width, height)
         }
         270 => {
-            // 270° clockwise (= 90° counter-clockwise): new dimensions are (height, width)
             let new_w = h;
             let new_h = w;
             let mut out = vec![0u8; new_w * new_h * bpp];
             for y in 0..h {
                 for x in 0..w {
                     let src_idx = (y * w + x) * bpp;
-                    // (x, y) -> (y, w - 1 - x) in new coordinates
                     let dst_x = y;
                     let dst_y = w - 1 - x;
                     let dst_idx = (dst_y * new_w + dst_x) * bpp;
@@ -202,13 +123,11 @@ fn parse_tsv_to_elements(tsv_data: &str, min_confidence: f64) -> Vec<OcrElement>
     let mut elements = Vec::new();
 
     for line in tsv_data.lines().skip(1) {
-        // Skip header row
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 12 {
             continue;
         }
 
-        // Parse fields
         let level = fields[0].parse::<i32>().unwrap_or(0);
         let page_num = fields[1].parse::<i32>().unwrap_or(1);
         let block_num = fields[2].parse::<i32>().unwrap_or(0);
@@ -222,14 +141,10 @@ fn parse_tsv_to_elements(tsv_data: &str, min_confidence: f64) -> Vec<OcrElement>
         let conf = fields[10].parse::<f64>().unwrap_or(-1.0);
         let text = fields[11].to_string();
 
-        // Skip low-confidence or empty entries
-        // Tesseract uses -1 for non-text levels
         if conf < 0.0 || conf < min_confidence || text.trim().is_empty() {
             continue;
         }
 
-        // Only include word-level (5) and line-level (4) entries
-        // Tesseract TSV levels: 1=page, 2=block, 3=paragraph, 4=line, 5=word
         if level != 4 && level != 5 {
             continue;
         }
@@ -274,6 +189,70 @@ where
     tracing::debug!(stage, timestamp = format!("{timestamp:.3}"), "{}", details());
 }
 
+/// Multiple of the page's average word height used as the vertical-gap
+/// threshold for splitting table candidate words into separate regions
+/// (#177). Normal row spacing inside one table rarely exceeds ~1.5x the
+/// average word height, so a wider multiple avoids splitting a single
+/// table's own row gaps while still separating genuinely distinct tables
+/// (or a table from surrounding prose) on the same page.
+const TABLE_REGION_GAP_HEIGHT_MULTIPLIER: u32 = 3;
+
+/// Minimum number of words for a spatial region to be treated as a table
+/// candidate. Mirrors the previous whole-page threshold so a single small
+/// table on an otherwise text-only page is not over-fabricated.
+const MIN_TABLE_CANDIDATE_WORDS: usize = 6;
+
+/// Split table-candidate words into vertically separated regions.
+///
+/// Tesseract's TSV output has no notion of "this is a separate table from
+/// that one" — [`reconstruct_table`] previously ran once over every
+/// table-confidence word on the page, producing at most one table whose
+/// bounding box spanned the union of all such words, even when the page had
+/// several independent tables separated by paragraphs of prose (#177).
+///
+/// This groups words by contiguous vertical extent: a gap between one row's
+/// bottom edge and the next word's top edge wider than
+/// `TABLE_REGION_GAP_HEIGHT_MULTIPLIER` times the average word height starts
+/// a new region. Each region is reconstructed independently, giving each
+/// table its own bounding box.
+fn cluster_words_into_table_regions(words: &[crate::table_core::HocrWord]) -> Vec<Vec<crate::table_core::HocrWord>> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted: Vec<&crate::table_core::HocrWord> = words.iter().collect();
+    sorted.sort_by(|a, b| a.top.cmp(&b.top).then(a.left.cmp(&b.left)));
+
+    let avg_height: u32 = {
+        let total: u32 = sorted.iter().map(|w| w.height).sum();
+        (total / sorted.len() as u32).max(1)
+    };
+    let region_gap_threshold = avg_height * TABLE_REGION_GAP_HEIGHT_MULTIPLIER;
+
+    let mut regions: Vec<Vec<crate::table_core::HocrWord>> = Vec::new();
+    let mut current_region: Vec<crate::table_core::HocrWord> = Vec::new();
+    let mut current_bottom: u32 = 0;
+
+    for word in sorted {
+        let word_bottom = word.top + word.height;
+        let is_new_region =
+            !current_region.is_empty() && word.top.saturating_sub(current_bottom) > region_gap_threshold;
+
+        if is_new_region {
+            regions.push(std::mem::take(&mut current_region));
+            current_bottom = 0;
+        }
+
+        current_bottom = current_bottom.max(word_bottom);
+        current_region.push(word.clone());
+    }
+    if !current_region.is_empty() {
+        regions.push(current_region);
+    }
+
+    regions
+}
+
 /// Build content with OCR tables inlined at their correct vertical positions.
 ///
 /// Parses TSV word positions to separate table words from non-table words,
@@ -289,10 +268,8 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
         return String::new();
     }
 
-    // Collect table bounding boxes
     let table_bboxes: Vec<_> = tables.iter().filter_map(|t| t.bounding_box.as_ref()).collect();
 
-    // Classify words as inside a table bbox or not
     let mut non_table_words = Vec::new();
     for word in &words {
         let in_table = table_bboxes.iter().any(|bbox| {
@@ -305,17 +282,13 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
         }
     }
 
-    // Group non-table words into lines by Y-proximity.
-    // Words on the same line have similar top values (within half the average word height).
     if non_table_words.is_empty() && tables.is_empty() {
         return String::new();
     }
 
-    // Sort non-table words by (top, left)
     let mut sorted_words = non_table_words;
     sorted_words.sort_by(|a, b| a.top.cmp(&b.top).then(a.left.cmp(&b.left)));
 
-    // Group into lines: words within line_threshold pixels vertically are on the same line
     let avg_height = if sorted_words.is_empty() {
         20
     } else {
@@ -345,7 +318,6 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
         });
     }
 
-    // Group lines into paragraphs: large Y-gap between consecutive lines = paragraph break
     let paragraph_gap = avg_height * 2;
 
     struct Paragraph {
@@ -357,11 +329,10 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
     for line in &lines {
         if let Some(last_para) = paragraphs.last_mut() {
             let last_y = last_para.y_start;
-            // Check gap - we use the line's y_center vs the last line added
             if line.y_center.saturating_sub(last_y) <= paragraph_gap {
                 last_para.text.push('\n');
                 last_para.text.push_str(&line.text);
-                last_para.y_start = line.y_center; // track last line position
+                last_para.y_start = line.y_center;
                 continue;
             }
         }
@@ -371,7 +342,6 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
         });
     }
 
-    // Build sorted elements: paragraphs + tables, ordered by Y-position
     enum ContentElement<'a> {
         Paragraph { y: u32, text: String },
         Table { y: u32, markdown: &'a str },
@@ -379,8 +349,6 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
 
     let mut elements: Vec<ContentElement> = Vec::new();
 
-    // Re-derive paragraph y_start from the first line in each paragraph
-    // We need the first y_center of the paragraph, which we track by rebuilding
     {
         let mut para_idx = 0;
         let mut line_idx = 0;
@@ -398,7 +366,7 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
             line_idx += line_count;
             para_idx += 1;
         }
-        let _ = para_idx; // suppress unused warning
+        let _ = para_idx;
     }
 
     for table in tables {
@@ -408,7 +376,6 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
                 markdown: &table.markdown,
             });
         } else {
-            // Tables without bbox go at the end
             elements.push(ContentElement::Table {
                 y: u32::MAX,
                 markdown: &table.markdown,
@@ -416,13 +383,11 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
         }
     }
 
-    // Sort by Y-position (ascending = top of image first)
     elements.sort_by_key(|e| match e {
         ContentElement::Paragraph { y, .. } => *y,
         ContentElement::Table { y, .. } => *y,
     });
 
-    // Join with double newlines
     let mut output = String::new();
     for elem in &elements {
         let text = match elem {
@@ -442,6 +407,67 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
     output
 }
 
+/// Minimum ratio of a paragraph's average hOCR font size (`x_fsize`) to the
+/// page's median paragraph font size before the paragraph is promoted to a
+/// markdown heading (#185). Chosen so ordinary size variation between body
+/// paragraphs doesn't trigger false positives, while genuinely larger
+/// heading text (typically >=1.3x body size) does.
+const HEADING_FONT_SIZE_RATIO: f64 = 1.3;
+
+/// Maximum word count for a large-font paragraph to still be treated as a
+/// heading. Headings are short by convention; a large-font paragraph with
+/// many words is more likely emphasized body text or a pull-quote.
+const HEADING_MAX_WORD_COUNT: usize = 12;
+
+/// Read the paragraph-average hOCR font size stored by `hocr_parser` (#185).
+fn element_font_size(element: &crate::types::internal::InternalElement) -> Option<f64> {
+    element
+        .attributes
+        .as_ref()?
+        .get(HOCR_FONT_SIZE_ATTRIBUTE)?
+        .parse::<f64>()
+        .ok()
+}
+
+/// Render hOCR-derived paragraphs to markdown, promoting large-font, short,
+/// single-line paragraphs to `##` headings using the average `x_fsize`
+/// captured per paragraph by `hocr_parser::parse_hocr_to_internal_document`
+/// (#185). Paragraphs without a captured font size, or on a page where no
+/// paragraph reports one, render unchanged — matching the previous flat
+/// paragraph-join behavior.
+fn render_hocr_elements_as_markdown(elements: &[crate::types::internal::InternalElement]) -> String {
+    let mut font_sizes: Vec<f64> = elements.iter().filter_map(element_font_size).collect();
+    let median_font_size = if font_sizes.is_empty() {
+        None
+    } else {
+        font_sizes.sort_by(f64::total_cmp);
+        Some(font_sizes[font_sizes.len() / 2])
+    };
+
+    elements
+        .iter()
+        .filter_map(|e| match e.kind {
+            ElementKind::PageBreak => None,
+            _ if !e.text.is_empty() => {
+                let is_heading = median_font_size.is_some_and(|median| {
+                    element_font_size(e).is_some_and(|size| {
+                        size >= median * HEADING_FONT_SIZE_RATIO
+                            && !e.text.contains('\n')
+                            && e.text.split_whitespace().count() <= HEADING_MAX_WORD_COUNT
+                    })
+                });
+                Some(if is_heading {
+                    format!("## {}", e.text)
+                } else {
+                    e.text.clone()
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Minimum confidence for accepting orientation detection results.
 ///
 /// Keep in sync with `doc_orientation::MIN_CONFIDENCE` (module is feature-gated,
@@ -450,12 +476,302 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
 /// 0° false positives above 0.35 are rare.
 const MIN_ORIENTATION_CONFIDENCE: f32 = 0.35;
 
-#[cfg(feature = "auto-rotate")]
+#[cfg(auto_rotate)]
 const _: () = assert!(MIN_ORIENTATION_CONFIDENCE == crate::doc_orientation::MIN_CONFIDENCE);
+
+/// Grayscale mean (0–255) below which the image is considered background-
+/// dark rather than background-light.
+///
+/// Scanned documents are background-dominated (background typically covers
+/// 85–95% of pixel area), so the grayscale mean tracks background tone far
+/// more than foreground text tone. A mean below this value means most of the
+/// image is dark, i.e. a plausible dark background.
+const DARK_BACKGROUND_MEAN_THRESHOLD: f64 = 100.0;
+
+/// Grayscale value (0–255) at or above which a pixel counts as "light" when
+/// computing the light-pixel fraction used to guard polarity auto-detection.
+const LIGHT_PIXEL_VALUE_THRESHOLD: u8 = 180;
+
+/// Minimum fraction of light pixels required, alongside a dark mean, before
+/// auto-detection treats an image as light-text-on-dark-background.
+///
+/// Without this guard, a naive `mean < threshold` check would also fire on
+/// uniformly dark, non-text images (e.g. a dark photograph or a heavily
+/// shadowed scan) where inverting would corrupt the image rather than fix
+/// it. Real text/foreground content typically covers at least a small
+/// fraction of a page, so requiring *some* light pixels alongside the dark
+/// mean distinguishes "light text on a dark background" from "uniformly
+/// dark image".
+const MIN_LIGHT_PIXEL_FRACTION_FOR_INVERT: f64 = 0.01;
+
+/// Sampling grid spacing (pixels) used when computing polarity statistics.
+/// Keeps polarity detection cheap on large scans while remaining
+/// representative.
+const POLARITY_SAMPLE_STRIDE: i32 = 4;
+
+/// Source resolution used when OCR receives the original image unchanged.
+const RAW_IMAGE_SOURCE_DPI: i32 = 72;
+/// Source resolution retained when explicit DPI normalization fails.
+const PREPROCESSING_FALLBACK_SOURCE_DPI: i32 = 300;
+/// Pixel stride used to classify whether an image resembles a clean document page.
+const DEFAULT_PREPROCESSING_SAMPLE_STRIDE: usize = 4;
+/// Minimum normalized mean luminance for automatic document-page preprocessing.
+const CLEAN_PAGE_MEAN_LUMINANCE_THRESHOLD: f64 = 0.90;
+/// Normalized luminance at which a sampled pixel counts as near-white.
+const CLEAN_PAGE_LIGHT_PIXEL_THRESHOLD: f64 = 0.90;
+/// Minimum near-white sample fraction for automatic document-page preprocessing.
+const CLEAN_PAGE_LIGHT_PIXEL_FRACTION_THRESHOLD: f64 = 0.80;
+/// Maximum value of an 8-bit RGB channel.
+const RGB_CHANNEL_MAX: f64 = u8::MAX as f64;
+/// Number of channels in an RGB pixel.
+const RGB_CHANNEL_COUNT: usize = 3;
+
+struct PreparedOcrImage {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    source_dpi: i32,
+    apply_pix_preprocessing: bool,
+}
+
+fn prepare_ocr_image(
+    rgb_data: Vec<u8>,
+    width: u32,
+    height: u32,
+    preprocessing: Option<&crate::types::ImagePreprocessingConfig>,
+    images_config: Option<&crate::core::config::ImageExtractionConfig>,
+    ci_debug_enabled: bool,
+) -> PreparedOcrImage {
+    let Some(preprocessing) = preprocessing else {
+        if should_apply_default_preprocessing(&rgb_data) {
+            return prepare_preprocessed_ocr_image(
+                rgb_data,
+                width,
+                height,
+                &crate::types::ImagePreprocessingConfig::default(),
+                images_config,
+                ci_debug_enabled,
+            );
+        }
+        return PreparedOcrImage {
+            data: rgb_data,
+            width,
+            height,
+            source_dpi: RAW_IMAGE_SOURCE_DPI,
+            apply_pix_preprocessing: false,
+        };
+    };
+
+    prepare_preprocessed_ocr_image(rgb_data, width, height, preprocessing, images_config, ci_debug_enabled)
+}
+
+/// Classify bright, page-like RGB images that benefit from the default OCR preprocessing path.
+fn should_apply_default_preprocessing(rgb_data: &[u8]) -> bool {
+    let mut luminance_sum = 0.0;
+    let mut light_pixels = 0usize;
+    let mut sample_count = 0usize;
+
+    for pixel in rgb_data
+        .chunks_exact(RGB_CHANNEL_COUNT)
+        .step_by(DEFAULT_PREPROCESSING_SAMPLE_STRIDE)
+    {
+        let luminance =
+            pixel.iter().map(|channel| f64::from(*channel)).sum::<f64>() / (RGB_CHANNEL_MAX * RGB_CHANNEL_COUNT as f64);
+        luminance_sum += luminance;
+        light_pixels += usize::from(luminance >= CLEAN_PAGE_LIGHT_PIXEL_THRESHOLD);
+        sample_count += 1;
+    }
+
+    if sample_count == 0 {
+        return false;
+    }
+    let sample_count = sample_count as f64;
+    luminance_sum / sample_count >= CLEAN_PAGE_MEAN_LUMINANCE_THRESHOLD
+        && light_pixels as f64 / sample_count >= CLEAN_PAGE_LIGHT_PIXEL_FRACTION_THRESHOLD
+}
+
+fn prepare_preprocessed_ocr_image(
+    rgb_data: Vec<u8>,
+    width: u32,
+    height: u32,
+    preprocessing: &crate::types::ImagePreprocessingConfig,
+    images_config: Option<&crate::core::config::ImageExtractionConfig>,
+    ci_debug_enabled: bool,
+) -> PreparedOcrImage {
+    // `target_dpi` always comes from the (Tesseract-specific) `preprocessing` config, which
+    // takes precedence when explicitly set. The dimension/auto-adjust limits have no home in
+    // `ImagePreprocessingConfig`, so they come from the real `ImageExtractionConfig` when the
+    // caller has one, instead of being silently defaulted (issue #209).
+    let dpi_config = match images_config {
+        Some(images_config) => crate::types::ImageDpiConfig {
+            target_dpi: preprocessing.target_dpi,
+            ..crate::types::ImageDpiConfig::from(images_config)
+        },
+        None => crate::types::ImageDpiConfig {
+            target_dpi: preprocessing.target_dpi,
+            ..Default::default()
+        },
+    };
+    match normalize_image_dpi_owned(rgb_data, width as usize, height as usize, &dpi_config, None) {
+        Ok(result) => {
+            let normalized_width = result.dimensions.0 as u32;
+            let normalized_height = result.dimensions.1 as u32;
+            let source_dpi = result.metadata.final_dpi;
+            log_ci_debug(ci_debug_enabled, "dpi_normalization", || {
+                format!(
+                    "original={}x{} normalized={}x{} target_dpi={} final_dpi={} resized={}",
+                    width,
+                    height,
+                    normalized_width,
+                    normalized_height,
+                    result.metadata.target_dpi,
+                    source_dpi,
+                    !result.metadata.skipped_resize
+                )
+            });
+            PreparedOcrImage {
+                data: result.rgb_data,
+                width: normalized_width,
+                height: normalized_height,
+                source_dpi,
+                apply_pix_preprocessing: true,
+            }
+        }
+        Err((error, data)) => {
+            tracing::warn!("DPI normalization failed, using original image: {}", error);
+            PreparedOcrImage {
+                data,
+                width,
+                height,
+                source_dpi: PREPROCESSING_FALLBACK_SOURCE_DPI,
+                apply_pix_preprocessing: true,
+            }
+        }
+    }
+}
+
+/// Decide whether an image should be inverted before OCR.
+///
+/// `force_invert` mirrors `ImagePreprocessingConfig.invert_colors`: `true`
+/// unconditionally forces inversion (an explicit override for cases where
+/// auto-detection disagrees); `false` (the default) falls back to
+/// auto-detection from `mean_gray` and `light_fraction` — see
+/// `DARK_BACKGROUND_MEAN_THRESHOLD` and `MIN_LIGHT_PIXEL_FRACTION_FOR_INVERT`.
+///
+/// This is a pure function so the polarity decision can be unit-tested
+/// without linking native Tesseract/Leptonica.
+fn should_invert_for_polarity(mean_gray: f64, light_fraction: f64, force_invert: bool) -> bool {
+    force_invert
+        || (mean_gray < DARK_BACKGROUND_MEAN_THRESHOLD && light_fraction >= MIN_LIGHT_PIXEL_FRACTION_FOR_INVERT)
+}
+
+/// Preprocess a raw Pix before handing it to Tesseract.
+///
+/// Order matters: polarity (light-on-dark vs. dark-on-light) is detected and
+/// corrected *first*, because `background_normalize` assumes a light
+/// background and Tesseract's own binarizer assumes dark text on a light
+/// background. `force_invert` mirrors `ImagePreprocessingConfig.invert_colors`
+/// (see [`should_invert_for_polarity`]).
+fn preprocess_pix(pix: xberg_tesseract::Pix, force_invert: bool) -> xberg_tesseract::Result<xberg_tesseract::Pix> {
+    let polarity_stats = pix
+        .to_grayscale()
+        .and_then(|gray| gray.grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE))
+        .ok();
+
+    let invert = match polarity_stats {
+        Some((mean_gray, light_fraction)) => should_invert_for_polarity(mean_gray, light_fraction, force_invert),
+        None => force_invert,
+    };
+
+    let source = if invert {
+        let inverted = pix.invert()?;
+        drop(pix);
+        inverted
+    } else {
+        pix
+    };
+
+    let normalized = source.background_normalize()?;
+    drop(source);
+
+    let sharpened = normalized.unsharp_mask(3, 0.5)?;
+    drop(normalized);
+
+    let grayscale = sharpened.to_grayscale()?;
+    drop(sharpened);
+    Ok(grayscale)
+}
 
 /// Check whether a center point (x, y) lies within a bounding box.
 fn point_in_bbox(x: i32, y: i32, left: i32, top: i32, right: i32, bottom: i32) -> bool {
     x >= left && x <= right && y >= top && y <= bottom
+}
+
+/// Result of [`extract_elements_via_iterator`]: the extracted elements plus
+/// counters distinguishing "nothing to extract" from "extraction degraded"
+/// (#192, #180).
+struct IteratorExtractionResult {
+    elements: Vec<OcrElement>,
+    /// Words the Tesseract result iterator itself failed to extract
+    /// (null pointer / invalid parameter / invalid UTF-8 per word), per
+    /// `ResultIterator::extract_all_words` (#192).
+    skipped_words: usize,
+    /// Words whose parent block is a non-flowing-text type (noise, an
+    /// embedded image region, or a ruling line) that are now retained in
+    /// `elements` instead of being silently dropped (#180).
+    non_text_block_word_count: usize,
+}
+
+/// Block types that historically caused a word to be dropped entirely from
+/// `ocr_elements`. Words in these blocks are now retained (tagged with their
+/// `block_type` via `iterator_word_to_element`) so text baked into figures,
+/// chart axis labels, pull-out captions, and ruling-line regions is not lost
+/// from OCR output (#180). Kept as a named set purely to identify and count
+/// them for the `non_text_block_word_count` signal.
+const NON_TEXT_BLOCK_TYPES: [TessPolyBlockType; 6] = [
+    TessPolyBlockType::PT_NOISE,
+    TessPolyBlockType::PT_FLOWING_IMAGE,
+    TessPolyBlockType::PT_HEADING_IMAGE,
+    TessPolyBlockType::PT_PULLOUT_IMAGE,
+    TessPolyBlockType::PT_HORZ_LINE,
+    TessPolyBlockType::PT_VERT_LINE,
+];
+
+/// Whether `auto_rotate` was requested by the caller but orientation detection
+/// could not run because the `auto-rotate` build feature is not compiled in.
+///
+/// Extracted as a pure function, separate from the surrounding OCR pipeline and
+/// its FFI calls, so the request-vs-availability logic is unit-testable without
+/// a live Tesseract API instance (#309).
+fn is_auto_rotate_requested_but_unavailable(auto_rotate_enabled: bool) -> bool {
+    #[cfg(auto_rotate)]
+    {
+        let _ = auto_rotate_enabled;
+        false
+    }
+    #[cfg(not(auto_rotate))]
+    {
+        auto_rotate_enabled
+    }
+}
+
+/// Inserts the `word_iterator_skipped_count` metadata key only when at least one
+/// word was actually skipped by the Tesseract result iterator, so callers can use
+/// the key's absence (rather than a `0` value) as the "clean extraction" signal.
+///
+/// Extracted as its own function, separate from the surrounding OCR pipeline, so
+/// the presence/absence and exact-value behaviour is unit-testable without a live
+/// Tesseract API instance (#192).
+fn insert_word_iterator_skipped_count_metadata(
+    metadata: &mut HashMap<String, serde_json::Value>,
+    skipped_words: usize,
+) {
+    if skipped_words > 0 {
+        metadata.insert(
+            "word_iterator_skipped_count".to_string(),
+            serde_json::Value::Number(skipped_words.into()),
+        );
+    }
 }
 
 /// Extract OcrElements via Tesseract's iterator APIs with rich metadata.
@@ -467,76 +783,101 @@ fn extract_elements_via_iterator(
     api: &TesseractAPI,
     page_number: u32,
     min_confidence: f64,
-) -> Result<Vec<OcrElement>, OcrError> {
-    // Obtain page iterator for block/paragraph spatial data.
+) -> Result<IteratorExtractionResult, OcrError> {
+    let empty = || IteratorExtractionResult {
+        elements: Vec::new(),
+        skipped_words: 0,
+        non_text_block_word_count: 0,
+    };
+
     let page_iter = match api.get_page_iterator() {
         Ok(iter) => iter,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Tesseract page iterator unavailable; falling back to TSV-based OCR element extraction");
+            return Ok(empty());
+        }
     };
 
     let blocks = match page_iter.extract_all_blocks() {
         Ok(b) => b,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to extract Tesseract page blocks; falling back to TSV-based OCR element extraction");
+            return Ok(empty());
+        }
     };
 
-    let paragraphs = match page_iter.extract_all_paragraphs() {
+    let paragraph_extraction = match page_iter.extract_all_paragraphs() {
         Ok(p) => p,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to extract Tesseract page paragraphs; falling back to TSV-based OCR element extraction");
+            return Ok(empty());
+        }
     };
 
-    // Obtain result iterator for word-level data (text, confidence, font attrs).
+    if paragraph_extraction.skipped_no_para_info > 0 || paragraph_extraction.skipped_no_bbox > 0 {
+        tracing::warn!(
+            skipped_no_para_info = paragraph_extraction.skipped_no_para_info,
+            skipped_no_bbox = paragraph_extraction.skipped_no_bbox,
+            extracted_paragraphs = paragraph_extraction.paragraphs.len(),
+            "Tesseract declined to describe some paragraphs; their words lose the is_crown, \
+             is_list_item and justification metadata"
+        );
+    }
+
+    let paragraphs = paragraph_extraction.paragraphs;
+
     let result_iter = match api.get_iterator() {
         Ok(iter) => iter,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Tesseract result iterator unavailable; falling back to TSV-based OCR element extraction");
+            return Ok(empty());
+        }
     };
 
-    let words = match result_iter.extract_all_words() {
+    let word_extraction = match result_iter.extract_all_words() {
         Ok(w) => w,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Tesseract result iterator failed; falling back to TSV-based OCR element extraction");
+            return Ok(empty());
+        }
     };
 
-    // Block types that should be filtered out (non-text / noise regions).
-    let skip_block_types = [
-        TessPolyBlockType::PT_NOISE,
-        TessPolyBlockType::PT_FLOWING_IMAGE,
-        TessPolyBlockType::PT_HEADING_IMAGE,
-        TessPolyBlockType::PT_PULLOUT_IMAGE,
-        TessPolyBlockType::PT_HORZ_LINE,
-        TessPolyBlockType::PT_VERT_LINE,
-    ];
+    if word_extraction.skipped > 0 {
+        tracing::warn!(
+            skipped_words = word_extraction.skipped,
+            extracted_words = word_extraction.words.len(),
+            "Tesseract result iterator failed to extract some words (null pointer, invalid \
+             parameter, or invalid UTF-8); they were dropped from OCR output"
+        );
+    }
 
     let mut elements = Vec::new();
+    let mut non_text_block_word_count = 0usize;
 
-    for word in &words {
-        // Skip low-confidence words.
+    for word in &word_extraction.words {
         if (word.confidence as f64) < min_confidence {
             continue;
         }
 
-        // Skip empty/whitespace-only text.
         if word.text.trim().is_empty() {
             continue;
         }
 
-        // Compute word center for spatial containment checks.
         let cx = (word.left + word.right) / 2;
         let cy = (word.top + word.bottom) / 2;
 
-        // Find parent block and determine its type.
         let parent_block = blocks
             .iter()
             .find(|b| point_in_bbox(cx, cy, b.left, b.top, b.right, b.bottom));
 
         let block_type = parent_block.map(|b| b.block_type);
 
-        // Skip words in non-text block types.
         if let Some(bt) = block_type
-            && skip_block_types.contains(&bt)
+            && NON_TEXT_BLOCK_TYPES.contains(&bt)
         {
-            continue;
+            non_text_block_word_count += 1;
         }
 
-        // Find parent paragraph for justification/list metadata.
         let para_info = paragraphs
             .iter()
             .find(|p| point_in_bbox(cx, cy, p.left, p.top, p.right, p.bottom));
@@ -545,7 +886,11 @@ fn extract_elements_via_iterator(
         elements.push(element);
     }
 
-    Ok(elements)
+    Ok(IteratorExtractionResult {
+        elements,
+        skipped_words: word_extraction.skipped,
+        non_text_block_word_count,
+    })
 }
 
 /// Perform OCR on an image using Tesseract.
@@ -569,6 +914,7 @@ fn extract_elements_via_iterator(
 pub(super) fn perform_ocr(
     image_bytes: &[u8],
     config: &TesseractConfig,
+    api_pool: &Arc<TesseractApiPool>,
     extraction_config: Option<&ExtractionConfig>,
 ) -> Result<OcrExtractionResult, OcrError> {
     let ci_debug_enabled = env::var_os("XBERG_CI_DEBUG").is_some();
@@ -582,67 +928,39 @@ pub(super) fn perform_ocr(
         )
     });
 
-    let img = crate::extraction::image::load_image_for_ocr(image_bytes)
-        .map_err(|e| OcrError::ImageProcessingFailed(e.to_string()))?;
-
-    let rgb_image = img.to_rgb8();
+    let rgb_image = {
+        let img = crate::extraction::image::load_image_for_ocr(image_bytes)
+            .map_err(|e| OcrError::ImageProcessingFailed(e.to_string()))?;
+        img.into_rgb8()
+    };
     let (orig_width, orig_height) = rgb_image.dimensions();
+    let rgb_data = rgb_image.into_raw();
 
     log_ci_debug(ci_debug_enabled, "image", || {
         format!("dimensions={}x{} color_type=RGB8", orig_width, orig_height)
     });
 
-    // Normalize image DPI: resize to target DPI and calculate the actual DPI
-    // of the image that will be passed to tesseract.
-    let dpi_config = config
-        .preprocessing
-        .as_ref()
-        .map(|p| crate::types::ImageDpiConfig {
-            target_dpi: p.target_dpi,
-            ..Default::default()
-        })
-        .unwrap_or_default();
-
-    let (image_data, width, height, source_dpi) = match normalize_image_dpi(
-        rgb_image.as_raw(),
-        orig_width as usize,
-        orig_height as usize,
-        &dpi_config,
-        None,
-    ) {
-        Ok(result) => {
-            let w = result.dimensions.0 as u32;
-            let h = result.dimensions.1 as u32;
-            let final_dpi = result.metadata.final_dpi;
-
-            log_ci_debug(ci_debug_enabled, "dpi_normalization", || {
-                format!(
-                    "original={}x{} normalized={}x{} target_dpi={} final_dpi={} resized={}",
-                    orig_width,
-                    orig_height,
-                    w,
-                    h,
-                    result.metadata.target_dpi,
-                    final_dpi,
-                    !result.metadata.skipped_resize
-                )
-            });
-
-            (result.rgb_data, w, h, final_dpi)
-        }
-        Err(e) => {
-            // If normalization fails, fall back to the original image with default 300 DPI
-            tracing::warn!("DPI normalization failed, using original image: {}", e);
-            let w = orig_width;
-            let h = orig_height;
-            (rgb_image.into_raw(), w, h, 300)
-        }
-    };
+    let images_config = extraction_config.and_then(|extraction_config| extraction_config.images.as_ref());
+    let prepared_image = prepare_ocr_image(
+        rgb_data,
+        orig_width,
+        orig_height,
+        config.preprocessing.as_ref(),
+        images_config,
+        ci_debug_enabled,
+    );
+    let image_data = prepared_image.data;
+    let width = prepared_image.width;
+    let height = prepared_image.height;
+    let source_dpi = prepared_image.source_dpi;
+    #[cfg_attr(not(auto_rotate), allow(unused_mut))]
+    let mut ocr_image_width = width;
+    #[cfg_attr(not(auto_rotate), allow(unused_mut))]
+    let mut ocr_image_height = height;
 
     let bytes_per_pixel: u32 = 3;
     let bytes_per_line = width * bytes_per_pixel;
 
-    // Parse language string (may contain "+" separators for multi-language)
     let languages: Vec<String> = config.language.split('+').map(|lang| lang.trim().to_string()).collect();
     let tessdata_path = resolve_tessdata_path(&languages, config.tessdata_path.as_deref())?;
 
@@ -673,39 +991,9 @@ pub(super) fn perform_ocr(
         format!("version={}", TesseractAPI::version())
     });
 
-    // Validate language and traineddata files
     validate_language_and_traineddata(&config.language, &tessdata_path)?;
 
-    // Obtain an initialized TesseractAPI from the per-thread cache. If the cache holds a
-    // matching (tessdata_path, language) entry, `clear()` is called to reset image state
-    // without reloading tessdata (~100MB). Otherwise a fresh API is created and initialized.
-    //
-    // The API is wrapped in a guard that returns it to the cache on drop (both on success
-    // and on any error path), preventing the cached state from being wasted on failures.
-    let api = get_or_init_api(&tessdata_path, &config.language)?;
-    struct ApiGuard {
-        api: Option<TesseractAPI>,
-        tessdata_path: String,
-        language: String,
-    }
-    impl Drop for ApiGuard {
-        fn drop(&mut self) {
-            if let Some(api) = self.api.take() {
-                return_api_to_cache(api, self.tessdata_path.clone(), self.language.clone());
-            }
-        }
-    }
-    impl std::ops::Deref for ApiGuard {
-        type Target = TesseractAPI;
-        fn deref(&self) -> &TesseractAPI {
-            self.api.as_ref().expect("ApiGuard consumed prematurely")
-        }
-    }
-    let api = ApiGuard {
-        api: Some(api),
-        tessdata_path: tessdata_path.clone(),
-        language: config.language.clone(),
-    };
+    let api = api_pool.checkout(&tessdata_path, &config.language)?;
 
     log_ci_debug(ci_debug_enabled, "init", || {
         format!("language={} datapath='{}'", config.language, tessdata_path)
@@ -737,40 +1025,18 @@ pub(super) fn perform_ocr(
 
     apply_tesseract_variables(&api, config)?;
 
-    // Attempt Leptonica preprocessing for improved OCR quality.
-    // This normalizes background, sharpens text, and converts to grayscale.
-    // Falls back to raw RGB if Leptonica processing fails.
-    //
-    // IMPORTANT: `pix_guard` must remain alive until AFTER `api.recognize()` completes
-    // because `TessBaseAPISetImage2` borrows the Pix pointer without taking ownership.
-    // Dropping the Pix while Tesseract holds the pointer would cause a use-after-free.
-    //
-    // DROP ORDER NOTE: `pix_guard` is declared AFTER `api` (the `ApiGuard`), so Rust
-    // drops it FIRST when the function returns (Rust drops locals in reverse declaration
-    // order). This means the Pix is freed *before* the ApiGuard fires, which in turn
-    // calls `return_api_to_cache`. The API therefore never enters the cache while still
-    // holding a dangling Pix pointer — the Pix is already freed at that point, and
-    // Tesseract's internal reference to it has been cleared by `api.clear()` (called at
-    // the top of `get_or_init_api` on the next reuse). No dangling pointer issue.
-    #[cfg_attr(not(feature = "auto-rotate"), allow(unused_mut))]
-    let mut pix_guard: Option<xberg_tesseract::Pix> = {
+    let force_invert_colors = config.preprocessing.as_ref().map(|p| p.invert_colors).unwrap_or(false);
+
+    let processed_pix: Option<xberg_tesseract::Pix> = if prepared_image.apply_pix_preprocessing {
         match xberg_tesseract::Pix::from_raw_rgb(&image_data, width, height) {
             Ok(mut pix) => {
-                // Ensure the Pix has a valid DPI before preprocessing.
-                // Some image sources (e.g. in-memory buffers) may have 0 DPI,
-                // which causes Leptonica operations to produce incorrect results.
                 if let Ok((xres, yres)) = pix.get_resolution()
                     && (xres == 0 || yres == 0)
                 {
                     let _ = pix.set_resolution(72, 72);
                 }
 
-                // Pipeline: background normalization → unsharp mask → grayscale.
-                // No binarization — Tesseract performs its own internal thresholding.
-                let processed = pix
-                    .background_normalize()
-                    .and_then(|p| p.unsharp_mask(3, 0.5))
-                    .and_then(|p| p.to_grayscale());
+                let processed = preprocess_pix(pix, force_invert_colors);
                 match processed {
                     Ok(p) => Some(p),
                     Err(e) => {
@@ -784,9 +1050,11 @@ pub(super) fn perform_ocr(
                 None
             }
         }
+    } else {
+        None
     };
 
-    if let Some(ref pix) = pix_guard {
+    if let Some(ref pix) = processed_pix {
         api.set_image_2(pix.as_ptr())
             .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set preprocessed image: {}", e)))?;
     } else {
@@ -799,10 +1067,8 @@ pub(super) fn perform_ocr(
         )
         .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set image: {}", e)))?;
     }
+    drop(processed_pix);
 
-    // Tell tesseract the source resolution based on our DPI normalization calculation.
-    // Clamp to minimum 70 DPI — tesseract's own fallback for invalid resolution.
-    // Raw images without DPI metadata may report 0, which crashes DetectOrientationScript.
     let source_dpi = source_dpi.max(70);
     api.set_source_resolution(source_dpi)
         .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set source resolution: {}", e)))?;
@@ -814,28 +1080,31 @@ pub(super) fn perform_ocr(
         )
     });
 
-    // Orientation detection and auto-rotation.
-    //
-    // Detection uses the ONNX PP-LCNet document-orientation classifier
-    // (`doc_orientation`, shared with the PaddleOCR backend) — NEVER Tesseract's
-    // `DetectOrientationScript`: that API corrupts engine memory in this build
-    // (out-of-range vector access on LSTM-only models; freed BLOCK/ROW walks on
-    // the legacy `osd` model) and kills the whole process past any exception
-    // barrier. When the `auto-rotate` feature is not compiled in, the request is
-    // honored with a warning and no rotation.
-    #[cfg_attr(not(feature = "auto-rotate"), allow(unused_mut))]
-    let mut detected_orientation: Option<(i32, f32, String, f32)> = None;
+    // Only (degrees, confidence): the ONNX PP-LCNet orientation classifier used
+    // here has no script-detection capability, unlike Tesseract's own
+    // `DetectOrientationScript()`/OSD, which this crate does not call (#184).
+    #[cfg_attr(not(auto_rotate), allow(unused_mut))]
+    let mut detected_orientation: Option<(i32, f32)> = None;
     let auto_rotate_enabled =
         config.preprocessing.as_ref().map(|p| p.auto_rotate).unwrap_or(false) || config.auto_rotate;
 
-    #[cfg(not(feature = "auto-rotate"))]
+    // Recorded into `metadata` below (once `metadata` exists) under the
+    // `auto_rotate_unavailable` key, mirroring `pre_formatted` and
+    // `word_iterator_skipped_count`: `OcrExtractionResult` has no dedicated
+    // warnings field, so `TesseractBackend` reads this key back out and turns
+    // it into a `ProcessingWarning` the caller actually sees (#309). Without
+    // it, a user's explicit `auto_rotate = true` silently does nothing on a
+    // build without the `auto-rotate` feature.
+    let auto_rotate_unavailable = is_auto_rotate_requested_but_unavailable(auto_rotate_enabled);
+
+    #[cfg(not(auto_rotate))]
     if auto_rotate_enabled {
         tracing::warn!(
             "auto_rotate requested but the `auto-rotate` feature is not compiled in; skipping orientation detection"
         );
     }
 
-    #[cfg(feature = "auto-rotate")]
+    #[cfg(auto_rotate)]
     if auto_rotate_enabled {
         let orientation_result = image::RgbImage::from_raw(width, height, image_data.clone())
             .ok_or_else(|| crate::error::XbergError::Ocr {
@@ -854,10 +1123,8 @@ pub(super) fn perform_ocr(
                 log_ci_debug(ci_debug_enabled, "orientation_detection", || {
                     format!("orientation={}° confidence={:.2}", orient_deg, orient_conf)
                 });
-                // The classifier detects orientation only; script fields stay empty.
-                detected_orientation = Some((orient_deg, orient_conf, String::new(), 0.0));
+                detected_orientation = Some((orient_deg, orient_conf));
 
-                // If orientation is non-zero with sufficient confidence, rotate the image
                 if orient_deg != 0 && orient_conf > MIN_ORIENTATION_CONFIDENCE {
                     tracing::info!(
                         "Auto-rotating image by {} degrees (confidence: {:.2})",
@@ -865,36 +1132,24 @@ pub(super) fn perform_ocr(
                         orient_conf
                     );
 
-                    // `degrees` is the image's clockwise skew; correct by rotating
-                    // the complement clockwise.
                     let correction_deg = (360 - orient_deg).rem_euclid(360);
                     let (rotated_data, new_width, new_height) =
                         rotate_rgb_image_data(&image_data, width, height, correction_deg);
                     let new_bytes_per_line = new_width * bytes_per_pixel;
 
-                    // Re-apply Leptonica preprocessing to the rotated image so the same
-                    // background normalisation / unsharp mask / grayscale pipeline is used.
-                    // If preprocessing succeeds we set the image via set_image_2; otherwise
-                    // we fall back to the raw rotated RGB bytes via set_image.
-                    //
-                    // Build a new preprocessed Pix from the rotated image data.
-                    // If preprocessing succeeds the result is assigned to `pix_guard` below,
-                    // replacing the un-rotated Pix so Tesseract keeps a valid image pointer.
-                    let rotated_pix = xberg_tesseract::Pix::from_raw_rgb(&rotated_data, new_width, new_height)
-                        .ok()
-                        .and_then(|pix| {
-                            pix.background_normalize()
-                                .and_then(|p| p.unsharp_mask(3, 0.5))
-                                .and_then(|p| p.to_grayscale())
-                                .ok()
-                        });
+                    let rotated_pix = if prepared_image.apply_pix_preprocessing {
+                        xberg_tesseract::Pix::from_raw_rgb(&rotated_data, new_width, new_height)
+                            .ok()
+                            .and_then(|pix| preprocess_pix(pix, force_invert_colors).ok())
+                    } else {
+                        None
+                    };
 
                     if let Some(ref pix) = rotated_pix {
                         api.set_image_2(pix.as_ptr()).map_err(|e| {
                             OcrError::ProcessingFailed(format!("Failed to set rotated preprocessed image: {}", e))
                         })?;
                     } else {
-                        // Leptonica preprocessing failed for the rotated image — use raw bytes.
                         api.set_image(
                             &rotated_data,
                             new_width as i32,
@@ -905,14 +1160,13 @@ pub(super) fn perform_ocr(
                         .map_err(|e| OcrError::ProcessingFailed(format!("Failed to set rotated image: {}", e)))?;
                     }
 
-                    // Replace the outer `pix_guard` with the rotated Pix so that it
-                    // stays alive until after `api.recognize()` completes. The previous
-                    // un-rotated Pix is dropped here when the old value is overwritten.
-                    pix_guard = rotated_pix;
+                    drop(rotated_pix);
 
                     api.set_source_resolution(source_dpi).map_err(|e| {
                         OcrError::ProcessingFailed(format!("Failed to set source resolution after rotation: {}", e))
                     })?;
+                    ocr_image_width = new_width;
+                    ocr_image_height = new_height;
 
                     log_ci_debug(ci_debug_enabled, "auto_rotate", || {
                         format!("rotated={}° new_dimensions={}x{}", orient_deg, new_width, new_height)
@@ -929,23 +1183,22 @@ pub(super) fn perform_ocr(
         }
     }
 
+    drop(image_data);
+
     api.recognize()
         .map_err(|e| OcrError::ProcessingFailed(format!("Failed to recognize text: {}", e)))?;
 
-    // Capture mean text confidence (0-100) immediately after recognition.
     let mean_text_conf = api.mean_text_conf().unwrap_or(-1);
 
     log_ci_debug(ci_debug_enabled, "recognize", || {
         format!("completed mean_text_conf={}", mean_text_conf)
     });
 
-    // Collect word-level confidence statistics from Tesseract for quality heuristics.
     let word_confidence_stats = match api.all_word_confidences() {
         Ok(confidences) if !confidences.is_empty() => {
             let word_count = confidences.len();
             let low_conf_word_count = confidences.iter().filter(|&&c| c < 50).count();
 
-            // Compute median
             let mut sorted = confidences.clone();
             sorted.sort_unstable();
             let median_word_conf = if word_count % 2 == 0 {
@@ -954,26 +1207,19 @@ pub(super) fn perform_ocr(
                 sorted[word_count / 2]
             };
 
-            // Compute 10th percentile (index = floor(0.1 * (n - 1)))
             let p10_idx = ((word_count as f64 - 1.0) * 0.1).floor() as usize;
             let p10_word_conf = sorted[p10_idx.min(word_count - 1)];
 
             Some((median_word_conf, p10_word_conf, word_count, low_conf_word_count))
         }
-        Ok(_) => {
-            // Empty confidences array — fall back to mean_text_conf
-            match api.mean_text_conf() {
-                Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
-                Err(_) => None,
-            }
-        }
-        Err(_) => {
-            // all_word_confidences failed — fall back to mean_text_conf
-            match api.mean_text_conf() {
-                Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
-                Err(_) => None,
-            }
-        }
+        Ok(_) => match api.mean_text_conf() {
+            Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
+            Err(_) => None,
+        },
+        Err(_) => match api.mean_text_conf() {
+            Ok(mean_conf) => Some((mean_conf, mean_conf, 0usize, 0usize)),
+            Err(_) => None,
+        },
     };
 
     let tsv_data_for_tables = if config.enable_table_detection || config.output_format == "tsv" {
@@ -999,25 +1245,10 @@ pub(super) fn perform_ocr(
                 .get_hocr_text(0)
                 .map_err(|e| OcrError::ProcessingFailed(format!("Failed to extract hOCR: {}", e)))?;
 
-            // Parse hOCR into structured InternalDocument and flatten to text.
-            // The InternalDocument is preserved for downstream layout classification.
             let internal_doc = parse_hocr_to_internal_document(&hocr);
-            let content = internal_doc
-                .elements
-                .iter()
-                .filter_map(|e| match e.kind {
-                    // Skip PageBreak: each page is OCR'd independently, so any
-                    // PageBreak elements within a single-page hOCR doc are
-                    // artefacts and should not produce thematic breaks.
-                    ElementKind::PageBreak => None,
-                    _ if !e.text.is_empty() => Some(e.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let content = render_hocr_elements_as_markdown(&internal_doc.elements);
             hocr_document = Some(internal_doc);
 
-            // Set mime_type based on actual output format
             let mime_type = extraction_config
                 .map(|c| match c.output_format {
                     crate::core::config::OutputFormat::Djot => "text/djot",
@@ -1050,12 +1281,18 @@ pub(super) fn perform_ocr(
 
     let mut metadata = HashMap::new();
     metadata.insert(
+        crate::ocr_metadata_keys::OCR_PROCESSED_IMAGE_WIDTH_METADATA_KEY.to_string(),
+        serde_json::Value::Number(ocr_image_width.into()),
+    );
+    metadata.insert(
+        crate::ocr_metadata_keys::OCR_PROCESSED_IMAGE_HEIGHT_METADATA_KEY.to_string(),
+        serde_json::Value::Number(ocr_image_height.into()),
+    );
+    metadata.insert(
         "language".to_string(),
         serde_json::Value::String(config.language.clone()),
     );
     metadata.insert("psm".to_string(), serde_json::Value::String(config.psm.to_string()));
-    // `output_format` is a typed field on `Metadata`; inserting it here into `additional`
-    // would produce a duplicate JSON key when both are serialized. Removed — see #703.
     metadata.insert("table_count".to_string(), serde_json::Value::Number(0.into()));
     metadata.insert("tables_detected".to_string(), serde_json::Value::Number(0.into()));
     if config.output_format == "markdown" {
@@ -1064,8 +1301,10 @@ pub(super) fn perform_ocr(
             serde_json::Value::String("hocr".to_string()),
         );
     }
+    if auto_rotate_unavailable {
+        metadata.insert("auto_rotate_unavailable".to_string(), serde_json::Value::Bool(true));
+    }
 
-    // Store mean text confidence (0-100) for quality scoring.
     if mean_text_conf >= 0 {
         metadata.insert(
             "mean_text_conf".to_string(),
@@ -1073,7 +1312,6 @@ pub(super) fn perform_ocr(
         );
     }
 
-    // Store word confidence statistics for quality heuristics.
     if let Some((median_conf, p10_conf, word_count, low_conf_count)) = word_confidence_stats {
         metadata.insert(
             "median_word_conf".to_string(),
@@ -1093,30 +1331,27 @@ pub(super) fn perform_ocr(
         );
     }
 
-    // Store orientation detection results in metadata.
-    if let Some((orient_deg, orient_conf, ref script_name, script_conf)) = detected_orientation {
+    // No `script_name`/`script_confidence` metadata: the ONNX PP-LCNet
+    // orientation classifier used here has no script-detection capability,
+    // unlike Tesseract's own `DetectOrientationScript()`/OSD (which this crate
+    // does not call). Emitting a placeholder script name would misrepresent
+    // real detection as having happened (#184). ~keep
+    if let Some((orient_deg, orient_conf)) = detected_orientation {
         metadata.insert(
-            "orientation_degrees".to_string(),
+            crate::ocr_metadata_keys::OCR_ORIENTATION_DEGREES_METADATA_KEY.to_string(),
             serde_json::Value::Number(serde_json::Number::from(orient_deg)),
         );
         metadata.insert(
-            "orientation_confidence".to_string(),
+            crate::ocr_metadata_keys::OCR_ORIENTATION_CONFIDENCE_METADATA_KEY.to_string(),
             serde_json::Value::Number(
                 serde_json::Number::from_f64(orient_conf as f64).unwrap_or(serde_json::Number::from(0)),
             ),
         );
-        metadata.insert(
-            "script_name".to_string(),
-            serde_json::Value::String(script_name.clone()),
-        );
-        metadata.insert(
-            "script_confidence".to_string(),
-            serde_json::Value::Number(
-                serde_json::Number::from_f64(script_conf as f64).unwrap_or(serde_json::Number::from(0)),
-            ),
-        );
         if orient_deg != 0 && orient_conf > MIN_ORIENTATION_CONFIDENCE {
-            metadata.insert("auto_rotated".to_string(), serde_json::Value::Bool(true));
+            metadata.insert(
+                crate::ocr_metadata_keys::OCR_AUTO_ROTATED_METADATA_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
     }
 
@@ -1127,66 +1362,85 @@ pub(super) fn perform_ocr(
         let tsv_data = tsv_data_for_tables.as_ref().unwrap();
 
         let words = extract_words_from_tsv(tsv_data, config.table_min_confidence)?;
+        let regions = cluster_words_into_table_regions(&words);
 
-        if words.len() >= 6 {
-            let table = reconstruct_table(&words, config.table_column_threshold, config.table_row_threshold_ratio);
-            if !table.is_empty() && !table[0].is_empty() {
-                // Apply full post-processing validation to reject false positives.
-                // post_process_table is only available with the pdf feature; without it, use table as-is.
-                #[cfg(feature = "pdf")]
-                let cleaned = post_process_table(table, false, false);
-                #[cfg(not(feature = "pdf"))]
-                let cleaned = Some(table);
-                if let Some(cleaned) = cleaned {
-                    metadata.insert("table_count".to_string(), serde_json::Value::Number(1.into()));
-                    metadata.insert("tables_detected".to_string(), serde_json::Value::Number(1.into()));
-                    metadata.insert(
-                        "table_rows".to_string(),
-                        serde_json::Value::Number(cleaned.len().into()),
-                    );
-                    metadata.insert(
-                        "table_cols".to_string(),
-                        serde_json::Value::Number(cleaned[0].len().into()),
-                    );
-
-                    let markdown_table = table_to_markdown(&cleaned);
-
-                    // Compute bounding box from the TSV words used for table reconstruction
-                    let bbox = if !words.is_empty() {
-                        let left = words.iter().map(|w| w.left).min().unwrap_or(0);
-                        let top = words.iter().map(|w| w.top).min().unwrap_or(0);
-                        let right = words.iter().map(|w| w.left + w.width).max().unwrap_or(0);
-                        let bottom = words.iter().map(|w| w.top + w.height).max().unwrap_or(0);
-                        Some(OcrTableBoundingBox {
-                            left,
-                            top,
-                            right,
-                            bottom,
-                        })
-                    } else {
-                        None
-                    };
-
-                    tables.push(OcrTable {
-                        cells: cleaned,
-                        markdown: markdown_table,
-                        page_number: 1,
-                        bounding_box: bbox,
-                    });
-                }
+        for region_words in regions {
+            if region_words.len() < MIN_TABLE_CANDIDATE_WORDS {
+                continue;
             }
+
+            let table = reconstruct_table(
+                &region_words,
+                config.table_column_threshold,
+                config.table_row_threshold_ratio,
+            );
+            if table.is_empty() || table[0].is_empty() {
+                continue;
+            }
+
+            #[cfg(feature = "pdf")]
+            let cleaned = post_process_table(table, false, false);
+            #[cfg(not(feature = "pdf"))]
+            let cleaned = Some(table);
+            let Some(cleaned) = cleaned else {
+                continue;
+            };
+
+            let markdown_table = table_to_markdown(&cleaned);
+
+            let left = region_words.iter().map(|w| w.left).min().unwrap_or(0);
+            let top = region_words.iter().map(|w| w.top).min().unwrap_or(0);
+            let right = region_words.iter().map(|w| w.left + w.width).max().unwrap_or(0);
+            let bottom = region_words.iter().map(|w| w.top + w.height).max().unwrap_or(0);
+
+            tables.push(OcrTable {
+                cells: cleaned,
+                markdown: markdown_table,
+                page_number: 1,
+                bounding_box: Some(OcrTableBoundingBox {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                }),
+            });
+        }
+
+        // Real count, not hardcoded to at-most-one (#177): a page can contain
+        // several independent tables separated by prose.
+        metadata.insert(
+            "table_count".to_string(),
+            serde_json::Value::Number(tables.len().into()),
+        );
+        metadata.insert(
+            "tables_detected".to_string(),
+            serde_json::Value::Number(tables.len().into()),
+        );
+        if let Some(first) = tables.first() {
+            metadata.insert(
+                "table_rows".to_string(),
+                serde_json::Value::Number(first.cells.len().into()),
+            );
+            metadata.insert(
+                "table_cols".to_string(),
+                serde_json::Value::Number(first.cells.first().map_or(0, Vec::len).into()),
+            );
         }
     }
 
-    // Extract structured OcrElements via Tesseract iterators (rich metadata:
-    // font attributes, block types, paragraph info).
-    let iterator_elements = extract_elements_via_iterator(&api, 1, config.min_confidence);
-    match iterator_elements {
-        Ok(elements) if !elements.is_empty() => {
-            ocr_elements = Some(elements);
+    let iterator_extraction = extract_elements_via_iterator(&api, 1, config.min_confidence);
+    match iterator_extraction {
+        Ok(extraction) if !extraction.elements.is_empty() => {
+            insert_word_iterator_skipped_count_metadata(&mut metadata, extraction.skipped_words);
+            if extraction.non_text_block_word_count > 0 {
+                metadata.insert(
+                    "non_text_block_word_count".to_string(),
+                    serde_json::Value::Number(extraction.non_text_block_word_count.into()),
+                );
+            }
+            ocr_elements = Some(extraction.elements);
         }
         _ => {
-            // Fallback: parse TSV if iterator extraction fails
             if let Some(ref tsv_data) = tsv_data_for_tables {
                 let elements = parse_tsv_to_elements(tsv_data, config.min_confidence);
                 if !elements.is_empty() {
@@ -1198,8 +1452,6 @@ pub(super) fn perform_ocr(
 
     let mut content = strip_control_characters(&raw_content).into_owned();
 
-    // When tables were detected and output is markdown, rebuild content with tables inlined
-    // at their correct vertical positions. This mirrors the PDF path's assemble_markdown_with_tables.
     let is_markdown_output = extraction_config
         .map(|c| c.output_format == crate::core::config::OutputFormat::Markdown)
         .unwrap_or(config.output_format == "markdown");
@@ -1211,8 +1463,6 @@ pub(super) fn perform_ocr(
         let rebuilt = build_content_with_inline_tables(tsv_data, &tables, config.table_min_confidence);
         if !rebuilt.is_empty() {
             content = rebuilt;
-            // Signal that content is already formatted as markdown so
-            // apply_output_format() in the pipeline skips re-conversion.
             metadata.insert(
                 "pre_formatted".to_string(),
                 serde_json::Value::String("markdown".to_string()),
@@ -1220,16 +1470,6 @@ pub(super) fn perform_ocr(
         }
     }
 
-    // SAFETY: Drop the Pix before returning the API to the cache. Although the current
-    // declaration order already guarantees this (pix_guard is declared after api, so Rust
-    // drops it first), the explicit drop makes the intent clear and guards against future
-    // refactoring that reorders locals. Freeing the Pix here ensures Tesseract's internal
-    // image reference is severed before the API re-enters the cache; the next caller's
-    // get_or_init_api invokes clear() to fully reset state.
-    drop(pix_guard);
-
-    // The ApiGuard's Drop impl returns the API to the thread-local cache automatically
-    // on all exit paths (success and error). Drop explicitly here for clarity.
     drop(api);
 
     Ok(OcrExtractionResult {
@@ -1258,11 +1498,12 @@ pub(super) fn process_image_file_with_cache(
     file_path: &str,
     config: &TesseractConfig,
     cache: &OcrCache,
+    api_pool: &Arc<TesseractApiPool>,
     output_format: Option<crate::core::config::OutputFormat>,
 ) -> Result<OcrExtractionResult, OcrError> {
     let image_bytes = std::fs::read(file_path)
         .map_err(|e| OcrError::IOError(format!("Failed to read file '{}': {}", file_path, e)))?;
-    process_image_with_cache(&image_bytes, config, cache, output_format)
+    process_image_with_cache(&image_bytes, config, cache, api_pool, output_format)
 }
 
 /// Check if a language value is the "all" wildcard (case-insensitive).
@@ -1278,7 +1519,6 @@ fn is_all_languages(lang: &str) -> bool {
 /// Otherwise returns `None`, indicating the original config should be used as-is.
 fn resolve_config_language(config: &TesseractConfig) -> Result<Option<TesseractConfig>, OcrError> {
     if is_all_languages(&config.language) {
-        // For "all" wildcard, resolve tessdata for English as a bootstrap language
         let bootstrap_langs = vec!["eng".to_string()];
         let tessdata_path = resolve_tessdata_path(&bootstrap_langs, config.tessdata_path.as_deref())?;
         let resolved = resolve_all_installed_languages(&tessdata_path)?;
@@ -1309,16 +1549,15 @@ pub(super) fn process_image_with_cache(
     image_bytes: &[u8],
     config: &TesseractConfig,
     cache: &OcrCache,
+    api_pool: &Arc<TesseractApiPool>,
     output_format: Option<crate::core::config::OutputFormat>,
 ) -> Result<OcrExtractionResult, OcrError> {
     config.validate().map_err(OcrError::InvalidConfiguration)?;
 
-    // Resolve "all" / "*" before hashing so cache keys reflect actual languages.
-    // If not a wildcard, resolved is None and we use the original config (no clone).
     let resolved = resolve_config_language(config)?;
     let config = resolved.as_ref().unwrap_or(config);
 
-    process_image_resolved(image_bytes, config, cache, output_format)
+    process_image_resolved(image_bytes, config, cache, api_pool, output_format)
 }
 
 /// Inner implementation operating on an already-resolved config.
@@ -1330,14 +1569,19 @@ fn process_image_resolved(
     image_bytes: &[u8],
     config: &TesseractConfig,
     cache: &OcrCache,
+    api_pool: &Arc<TesseractApiPool>,
     output_format: Option<crate::core::config::OutputFormat>,
 ) -> Result<OcrExtractionResult, OcrError> {
     let image_hash = crate::cache::blake3_hash_bytes(image_bytes);
 
     let config_str = hash_config(config);
 
+    // `output_format` is part of the cache identity: it selects the renderer and
+    // therefore the `content` and `mime_type` of the result. Omitting it served a
+    // document cached as one format for a request for another (#205).
     if config.use_cache
-        && let Some(cached_result) = cache.get_cached_result(&image_hash, "tesseract", &config_str)?
+        && let Some(cached_result) =
+            cache.get_cached_result(&image_hash, "tesseract", &config_str, output_format.as_ref())?
     {
         #[cfg(feature = "otel")]
         tracing::Span::current().record("cache.hit", true);
@@ -1347,16 +1591,17 @@ fn process_image_resolved(
     #[cfg(feature = "otel")]
     tracing::Span::current().record("cache.hit", false);
 
-    // Create minimal ExtractionConfig with just the output format if provided
-    let extraction_config = output_format.map(|fmt| ExtractionConfig {
-        output_format: fmt,
+    let extraction_config = output_format.as_ref().map(|fmt| ExtractionConfig {
+        output_format: fmt.clone(),
         ..Default::default()
     });
 
-    let result = perform_ocr(image_bytes, config, extraction_config.as_ref())?;
+    let result = perform_ocr(image_bytes, config, api_pool, extraction_config.as_ref())?;
 
-    if config.use_cache {
-        let _ = cache.set_cached_result(&image_hash, "tesseract", &config_str, &result);
+    if config.use_cache
+        && let Err(e) = cache.set_cached_result(&image_hash, "tesseract", &config_str, output_format.as_ref(), &result)
+    {
+        tracing::warn!(error = %e, "Failed to cache the OCR result; the next identical request will re-run OCR");
     }
 
     Ok(result)
@@ -1374,11 +1619,11 @@ pub(super) fn process_image_files_batch(
     file_paths: Vec<String>,
     config: &TesseractConfig,
     cache: &OcrCache,
+    api_pool: &Arc<TesseractApiPool>,
 ) -> Vec<BatchItemResult> {
     #[cfg(not(target_arch = "wasm32"))]
     use rayon::prelude::*;
 
-    // Validate once for the entire batch.
     if let Err(e) = config.validate().map_err(OcrError::InvalidConfiguration) {
         return file_paths
             .into_iter()
@@ -1391,7 +1636,6 @@ pub(super) fn process_image_files_batch(
             .collect();
     }
 
-    // Resolve "all" / "*" once for the entire batch.
     let resolved = match resolve_config_language(config) {
         Ok(r) => r,
         Err(e) => {
@@ -1426,7 +1670,7 @@ pub(super) fn process_image_files_batch(
                         };
                     }
                 };
-                match process_image_resolved(&image_bytes, config, cache, None) {
+                match process_image_resolved(&image_bytes, config, cache, api_pool, None) {
                     Ok(result) => BatchItemResult {
                         file_path: path.clone(),
                         success: true,
@@ -1461,7 +1705,7 @@ pub(super) fn process_image_files_batch(
                         };
                     }
                 };
-                match process_image_resolved(&image_bytes, config, cache, None) {
+                match process_image_resolved(&image_bytes, config, cache, api_pool, None) {
                     Ok(result) => BatchItemResult {
                         file_path: path.clone(),
                         success: true,
@@ -1484,6 +1728,173 @@ pub(super) fn process_image_files_batch(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Exact count: a known number of skipped words must produce exactly the
+    /// matching `word_iterator_skipped_count` value, not just a truthy presence
+    /// (#192 — catches off-by-one or double-counting regressions).
+    #[test]
+    fn should_insert_exact_skipped_count_when_words_were_skipped() {
+        let mut metadata = HashMap::new();
+
+        insert_word_iterator_skipped_count_metadata(&mut metadata, 3);
+
+        assert_eq!(
+            metadata.get("word_iterator_skipped_count"),
+            Some(&serde_json::Value::Number(3.into()))
+        );
+    }
+
+    /// When nothing was skipped, the metadata key must be entirely ABSENT, not
+    /// present with a value of `0` — callers rely on key absence as the
+    /// clean-extraction signal (#192).
+    #[test]
+    fn should_omit_skipped_count_key_when_nothing_was_skipped() {
+        let mut metadata = HashMap::new();
+
+        insert_word_iterator_skipped_count_metadata(&mut metadata, 0);
+
+        assert!(
+            !metadata.contains_key("word_iterator_skipped_count"),
+            "key must be absent, not present with value 0"
+        );
+        assert!(metadata.is_empty());
+    }
+
+    /// When `auto_rotate` is not requested, the flag must be `false`
+    /// regardless of which build compiled this test (#309).
+    #[test]
+    fn should_report_auto_rotate_available_when_not_requested() {
+        assert!(!is_auto_rotate_requested_but_unavailable(false));
+    }
+
+    /// When `auto_rotate` is requested, the flag reflects whether *this* build
+    /// has the `auto-rotate` feature compiled in — `true` (unavailable) on a
+    /// build without it, `false` (available) on a build with it (#309).
+    #[test]
+    fn should_report_auto_rotate_unavailable_only_without_the_feature() {
+        assert_eq!(is_auto_rotate_requested_but_unavailable(true), cfg!(not(auto_rotate)));
+    }
+
+    fn word_at(left: u32, top: u32, width: u32, height: u32, text: &str) -> crate::table_core::HocrWord {
+        crate::table_core::HocrWord {
+            text: text.to_string(),
+            left,
+            top,
+            width,
+            height,
+            confidence: 95.0,
+        }
+    }
+
+    /// Builds a grid of `rows * cols` words starting at `(left, top)`, each
+    /// cell `40x20` pixels, simulating one table's worth of OCR words.
+    fn table_grid_words(left: u32, top: u32, rows: u32, cols: u32) -> Vec<crate::table_core::HocrWord> {
+        let mut words = Vec::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                words.push(word_at(
+                    left + col * 60,
+                    top + row * 30,
+                    40,
+                    20,
+                    &format!("r{row}c{col}"),
+                ));
+            }
+        }
+        words
+    }
+
+    #[test]
+    fn cluster_words_into_table_regions_separates_two_distant_tables() {
+        // Two 3x3 grids of words (9 words each) far apart vertically: a real
+        // page with two independent tables separated by a paragraph of prose.
+        let mut words = table_grid_words(0, 0, 3, 3);
+        words.extend(table_grid_words(0, 1000, 3, 3));
+
+        let regions = cluster_words_into_table_regions(&words);
+
+        assert_eq!(regions.len(), 2, "two spatially distant grids should form two regions");
+        assert_eq!(regions[0].len(), 9);
+        assert_eq!(regions[1].len(), 9);
+    }
+
+    #[test]
+    fn cluster_words_into_table_regions_keeps_one_table_as_a_single_region() {
+        let words = table_grid_words(0, 0, 4, 3);
+
+        let regions = cluster_words_into_table_regions(&words);
+
+        assert_eq!(
+            regions.len(),
+            1,
+            "a single table's own row gaps must not be split into regions"
+        );
+        assert_eq!(regions[0].len(), 12);
+    }
+
+    #[test]
+    fn cluster_words_into_table_regions_empty_input_yields_no_regions() {
+        assert!(cluster_words_into_table_regions(&[]).is_empty());
+    }
+
+    fn text_element_with_font_size(text: &str, font_size: Option<f64>) -> crate::types::internal::InternalElement {
+        let mut elem = crate::types::internal::InternalElement::text(
+            ElementKind::OcrText {
+                level: crate::types::OcrElementLevel::Block,
+            },
+            text,
+            0,
+        );
+        if let Some(size) = font_size {
+            elem.attributes
+                .get_or_insert_with(Default::default)
+                .insert(HOCR_FONT_SIZE_ATTRIBUTE.to_string(), size.to_string());
+        }
+        elem
+    }
+
+    #[test]
+    fn render_hocr_elements_as_markdown_promotes_large_font_short_paragraph_to_heading() {
+        let elements = vec![
+            text_element_with_font_size("Chapter One", Some(28.0)),
+            text_element_with_font_size("Body text at normal size.", Some(12.0)),
+            text_element_with_font_size("More body text at normal size.", Some(12.0)),
+        ];
+
+        let markdown = render_hocr_elements_as_markdown(&elements);
+
+        assert_eq!(
+            markdown,
+            "## Chapter One\n\nBody text at normal size.\n\nMore body text at normal size."
+        );
+    }
+
+    #[test]
+    fn render_hocr_elements_as_markdown_does_not_promote_long_large_font_paragraph() {
+        let long_text = std::iter::repeat_n("word", HEADING_MAX_WORD_COUNT + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let elements = vec![
+            text_element_with_font_size(&long_text, Some(28.0)),
+            text_element_with_font_size("Normal paragraph.", Some(12.0)),
+        ];
+
+        let markdown = render_hocr_elements_as_markdown(&elements);
+
+        assert_eq!(markdown, format!("{long_text}\n\nNormal paragraph."));
+    }
+
+    #[test]
+    fn render_hocr_elements_as_markdown_leaves_content_unchanged_without_font_sizes() {
+        let elements = vec![
+            text_element_with_font_size("First paragraph.", None),
+            text_element_with_font_size("Second paragraph.", None),
+        ];
+
+        let markdown = render_hocr_elements_as_markdown(&elements);
+
+        assert_eq!(markdown, "First paragraph.\n\nSecond paragraph.");
+    }
 
     #[test]
     fn test_is_all_languages() {
@@ -1549,7 +1960,8 @@ mod tests {
             ..TesseractConfig::default()
         };
 
-        let result = process_image_file_with_cache("/nonexistent/file.png", &config, &cache, None);
+        let api_pool = TesseractApiPool::new();
+        let result = process_image_file_with_cache("/nonexistent/file.png", &config, &cache, &api_pool, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Failed to read file"));
     }
@@ -1566,14 +1978,220 @@ mod tests {
         };
 
         let invalid_data = vec![0, 1, 2, 3, 4];
-        let result = process_image_with_cache(&invalid_data, &config, &cache, None);
+        let api_pool = TesseractApiPool::new();
+        let result = process_image_with_cache(&invalid_data, &config, &cache, &api_pool, None);
 
         assert!(result.is_err());
     }
 
     #[test]
+    fn test_preprocess_pix_produces_grayscale_with_valid_resolution() {
+        let width = 32;
+        let height = 32;
+        let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if (x + y) % 2 == 0 { 32 } else { 224 };
+                rgb_data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        let mut pix = xberg_tesseract::Pix::from_raw_rgb(&rgb_data, width, height).unwrap();
+        pix.set_resolution(300, 300).unwrap();
+
+        let processed = preprocess_pix(pix, false).unwrap();
+
+        assert_eq!(processed.width(), width as i32);
+        assert_eq!(processed.height(), height as i32);
+        assert_eq!(processed.depth(), 8);
+        assert_eq!(processed.get_resolution().unwrap(), (72, 72));
+    }
+
+    #[test]
+    fn test_prepare_ocr_image_without_config_preserves_shadowed_rgb() {
+        let rgb_data = vec![0, 1, 2, 3, 4, 5];
+
+        let prepared = prepare_ocr_image(rgb_data.clone(), 2, 1, None, None, false);
+
+        assert_eq!(prepared.data, rgb_data);
+        assert_eq!(prepared.width, 2);
+        assert_eq!(prepared.height, 1);
+        assert_eq!(prepared.source_dpi, RAW_IMAGE_SOURCE_DPI);
+        assert!(!prepared.apply_pix_preprocessing);
+    }
+
+    #[test]
+    fn test_clean_white_rgb_selects_default_preprocessing() {
+        const SAMPLE_PIXEL_COUNT: usize = 16;
+        let rgb_data = vec![u8::MAX; SAMPLE_PIXEL_COUNT * RGB_CHANNEL_COUNT];
+
+        assert!(should_apply_default_preprocessing(&rgb_data));
+    }
+
+    #[test]
+    fn test_prepare_ocr_image_without_config_preprocesses_clean_white_rgb() {
+        const WIDTH: u32 = 4;
+        const HEIGHT: u32 = 4;
+        let rgb_data = vec![u8::MAX; WIDTH as usize * HEIGHT as usize * RGB_CHANNEL_COUNT];
+
+        let prepared = prepare_ocr_image(rgb_data, WIDTH, HEIGHT, None, None, false);
+
+        assert!(prepared.apply_pix_preprocessing);
+    }
+
+    #[test]
+    fn test_shadowed_rgb_skips_default_preprocessing() {
+        const SAMPLE_PIXEL_COUNT: usize = 16;
+        const SHADOWED_CHANNEL_VALUE: u8 = 128;
+        let rgb_data = vec![SHADOWED_CHANNEL_VALUE; SAMPLE_PIXEL_COUNT * RGB_CHANNEL_COUNT];
+
+        assert!(!should_apply_default_preprocessing(&rgb_data));
+    }
+
+    #[test]
+    fn test_prepare_ocr_image_with_config_keeps_preprocessing_enabled() {
+        let rgb_data = vec![255; 12];
+        let preprocessing = crate::types::ImagePreprocessingConfig {
+            target_dpi: 72,
+            ..Default::default()
+        };
+
+        let prepared = prepare_ocr_image(rgb_data, 2, 2, Some(&preprocessing), None, false);
+
+        assert!(prepared.apply_pix_preprocessing);
+    }
+
+    /// #209: when a caller supplies `ImageExtractionConfig`, its `max_image_dimension`
+    /// and `auto_adjust_dpi` must actually reach the DPI-normalization step instead of
+    /// being silently replaced by `ImageDpiConfig::default()`.
+    #[test]
+    fn test_prepare_preprocessed_ocr_image_honours_image_extraction_config_limits() {
+        const SOURCE_DIMENSION: u32 = 4;
+        let rgb_data = vec![255; SOURCE_DIMENSION as usize * SOURCE_DIMENSION as usize * RGB_CHANNEL_COUNT];
+        let preprocessing = crate::types::ImagePreprocessingConfig {
+            target_dpi: 300,
+            ..Default::default()
+        };
+        let images_config = crate::core::config::ImageExtractionConfig {
+            max_image_dimension: 2,
+            auto_adjust_dpi: false,
+            ..Default::default()
+        };
+
+        let prepared = prepare_preprocessed_ocr_image(
+            rgb_data,
+            SOURCE_DIMENSION,
+            SOURCE_DIMENSION,
+            &preprocessing,
+            Some(&images_config),
+            false,
+        );
+
+        assert_eq!(prepared.width, 2, "max_image_dimension=2 must clamp the resized width");
+        assert_eq!(
+            prepared.height, 2,
+            "max_image_dimension=2 must clamp the resized height"
+        );
+    }
+
+    #[test]
+    fn test_should_invert_for_polarity_dark_background_with_text() {
+        // Dark background (mean well below threshold) with a clear light-text
+        // fraction should trigger auto-detected inversion.
+        assert!(should_invert_for_polarity(40.0, 0.05, false));
+    }
+
+    #[test]
+    fn test_should_invert_for_polarity_light_background_not_inverted() {
+        // Typical dark-text-on-light-paper scan: high mean, no auto-invert.
+        assert!(!should_invert_for_polarity(220.0, 0.9, false));
+    }
+
+    #[test]
+    fn test_should_invert_for_polarity_uniformly_dark_image_not_inverted() {
+        // Dark mean but essentially no light pixels: a uniformly dark, non-text
+        // image (e.g. a dark photo) should NOT be auto-inverted.
+        assert!(!should_invert_for_polarity(20.0, 0.0, false));
+    }
+
+    #[test]
+    fn test_should_invert_for_polarity_force_true_overrides_light_background() {
+        // Explicit invert_colors=true forces inversion even on a light-mean image.
+        assert!(should_invert_for_polarity(220.0, 0.9, true));
+    }
+
+    #[test]
+    fn test_should_invert_for_polarity_force_false_still_auto_detects() {
+        assert!(should_invert_for_polarity(10.0, 0.5, false));
+    }
+
+    #[test]
+    fn test_preprocess_pix_inverts_light_on_dark_image() {
+        // Synthetic light-text-on-dark-background image: dark background (20)
+        // with a bright "text" region covering ~6% of the image.
+        let width = 40u32;
+        let height = 40u32;
+        let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let is_text = (10..13).contains(&y) && (5..25).contains(&x);
+                let value = if is_text { 230u8 } else { 20u8 };
+                rgb_data.extend_from_slice(&[value, value, value]);
+            }
+        }
+
+        let pix = xberg_tesseract::Pix::from_raw_rgb(&rgb_data, width, height).unwrap();
+        let original_gray = pix.to_grayscale().unwrap();
+        let (original_mean, _) = original_gray
+            .grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE)
+            .unwrap();
+        drop(original_gray);
+
+        // Auto-detection with no explicit override should invert: the result's
+        // background (post background_normalize + grayscale) should be light,
+        // i.e. brighter on average than the raw dark-background source.
+        let processed = preprocess_pix(pix, false).unwrap();
+        let (processed_mean, _) = processed
+            .grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE)
+            .unwrap();
+
+        assert!(
+            processed_mean > original_mean,
+            "expected inverted+normalized output to be brighter than the dark-background \
+             source (original_mean={original_mean}, processed_mean={processed_mean})"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_pix_does_not_invert_dark_on_light_image() {
+        // A normal dark-text-on-light-paper image should not be inverted:
+        // processing should keep (or increase) brightness, not flip polarity.
+        let width = 40u32;
+        let height = 40u32;
+        let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let is_text = (10..13).contains(&y) && (5..25).contains(&x);
+                let value = if is_text { 20u8 } else { 230u8 };
+                rgb_data.extend_from_slice(&[value, value, value]);
+            }
+        }
+
+        let pix = xberg_tesseract::Pix::from_raw_rgb(&rgb_data, width, height).unwrap();
+        let processed = preprocess_pix(pix, false).unwrap();
+        let (processed_mean, _) = processed
+            .grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE)
+            .unwrap();
+
+        assert!(
+            processed_mean > DARK_BACKGROUND_MEAN_THRESHOLD,
+            "expected light-background image to stay light after preprocessing (mean={processed_mean})"
+        );
+    }
+
+    #[cfg(auto_rotate)]
+    #[test]
+    #[cfg(auto_rotate)]
     fn test_rotate_rgb_image_data_identity() {
-        // 2x3 RGB image (6 pixels, 18 bytes)
         let data: Vec<u8> = (0..18).collect();
         let (out, w, h) = rotate_rgb_image_data(&data, 2, 3, 0);
         assert_eq!(out, data);
@@ -1581,32 +2199,30 @@ mod tests {
         assert_eq!(h, 3);
     }
 
+    #[cfg(auto_rotate)]
     #[test]
+    #[cfg(auto_rotate)]
     fn test_rotate_rgb_image_data_180() {
-        // 2x2 RGB image: pixels [A, B, C, D] reversed to [D, C, B, A]
-        let data = vec![
-            1, 2, 3, // pixel (0,0)
-            4, 5, 6, // pixel (1,0)
-            7, 8, 9, // pixel (0,1)
-            10, 11, 12, // pixel (1,1)
-        ];
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let (out, w, h) = rotate_rgb_image_data(&data, 2, 2, 180);
         assert_eq!(w, 2);
         assert_eq!(h, 2);
-        // 180° rotation reverses pixel order
         assert_eq!(out, vec![10, 11, 12, 7, 8, 9, 4, 5, 6, 1, 2, 3]);
     }
 
+    #[cfg(auto_rotate)]
     #[test]
+    #[cfg(auto_rotate)]
     fn test_rotate_rgb_image_data_90_swaps_dimensions() {
-        // 2x3 image -> 3x2 image after 90° rotation
         let data: Vec<u8> = (0..18).collect();
         let (_, w, h) = rotate_rgb_image_data(&data, 2, 3, 90);
-        assert_eq!(w, 3); // height becomes width
-        assert_eq!(h, 2); // width becomes height
+        assert_eq!(w, 3);
+        assert_eq!(h, 2);
     }
 
+    #[cfg(auto_rotate)]
     #[test]
+    #[cfg(auto_rotate)]
     fn test_rotate_rgb_image_data_270_swaps_dimensions() {
         let data: Vec<u8> = (0..18).collect();
         let (_, w, h) = rotate_rgb_image_data(&data, 2, 3, 270);
@@ -1614,7 +2230,9 @@ mod tests {
         assert_eq!(h, 2);
     }
 
+    #[cfg(auto_rotate)]
     #[test]
+    #[cfg(auto_rotate)]
     fn test_rotate_rgb_image_data_90_then_270_is_identity() {
         let data: Vec<u8> = (0..18).collect();
         let (rotated_90, w1, h1) = rotate_rgb_image_data(&data, 2, 3, 90);
@@ -1624,11 +2242,13 @@ mod tests {
         assert_eq!(back, data);
     }
 
+    #[cfg(auto_rotate)]
     #[test]
+    #[cfg(auto_rotate)]
     fn test_rotate_rgb_image_data_unsupported_angle() {
         let data: Vec<u8> = (0..12).collect();
         let (out, w, h) = rotate_rgb_image_data(&data, 2, 2, 45);
-        assert_eq!(out, data); // unchanged
+        assert_eq!(out, data);
         assert_eq!(w, 2);
         assert_eq!(h, 2);
     }

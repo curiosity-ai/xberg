@@ -22,79 +22,79 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcDocumentExtractorPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcEmbeddingBackendPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcOcrBackendPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcPostProcessorPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcRendererPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcRerankerBackendPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcTokenizerBackendPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ArcValidatorPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_DocumentExtractorDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_EmbeddingBackendDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_MetaSchemaPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_OcrBackendDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_PostProcessorDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_RegistryPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_RendererDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_RerankerBackendDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_TokenCounterPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_TokenizerBackendDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl;
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_ValidatorDartImplPtr => wire
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl;
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl;
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw);
@@ -426,6 +426,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Map<String, String> dco_decode_Map_String_String_None(dynamic raw);
 
   @protected
+  Map<String, double> dco_decode_Map_String_f_64_None(dynamic raw);
+
+  @protected
   Map<String, PlatformInt64> dco_decode_Map_String_i_64_None(dynamic raw);
 
   @protected
@@ -578,6 +581,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BBox dco_decode_b_box(dynamic raw);
 
   @protected
+  BedrockConfig dco_decode_bedrock_config(dynamic raw);
+
+  @protected
   BibtexMetadata dco_decode_bibtex_metadata(dynamic raw);
 
   @protected
@@ -605,6 +611,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AuthConfig dco_decode_box_autoadd_auth_config(dynamic raw);
 
   @protected
+  BedrockConfig dco_decode_box_autoadd_bedrock_config(dynamic raw);
+
+  @protected
   BibtexMetadata dco_decode_box_autoadd_bibtex_metadata(dynamic raw);
 
   @protected
@@ -617,16 +626,38 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   CaptioningConfig dco_decode_box_autoadd_captioning_config(dynamic raw);
 
   @protected
+  ChunkClassificationConfig dco_decode_box_autoadd_chunk_classification_config(
+    dynamic raw,
+  );
+
+  @protected
   ChunkingConfig dco_decode_box_autoadd_chunking_config(dynamic raw);
 
   @protected
   CitationMetadata dco_decode_box_autoadd_citation_metadata(dynamic raw);
 
   @protected
+  CodeDataNode dco_decode_box_autoadd_code_data_node(dynamic raw);
+
+  @protected
+  CodeMetadata dco_decode_box_autoadd_code_metadata(dynamic raw);
+
+  @protected
   ContentFilterConfig dco_decode_box_autoadd_content_filter_config(dynamic raw);
 
   @protected
+  ConversionOptions dco_decode_box_autoadd_conversion_options(dynamic raw);
+
+  @protected
   CoreProperties dco_decode_box_autoadd_core_properties(dynamic raw);
+
+  @protected
+  CredentialProviderConfig dco_decode_box_autoadd_credential_provider_config(
+    dynamic raw,
+  );
+
+  @protected
+  CsvConfig dco_decode_box_autoadd_csv_config(dynamic raw);
 
   @protected
   CsvMetadata dco_decode_box_autoadd_csv_metadata(dynamic raw);
@@ -636,6 +667,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   DjotContent dco_decode_box_autoadd_djot_content(dynamic raw);
+
+  @protected
+  DocumentContentEncoding dco_decode_box_autoadd_document_content_encoding(
+    dynamic raw,
+  );
 
   @protected
   DocumentStructure dco_decode_box_autoadd_document_structure(dynamic raw);
@@ -745,12 +781,31 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  LateInteractionConfig dco_decode_box_autoadd_late_interaction_config(
+    dynamic raw,
+  );
+
+  @protected
   LayoutDetectionConfig dco_decode_box_autoadd_layout_detection_config(
     dynamic raw,
   );
 
   @protected
+  LlmBudgetConfig dco_decode_box_autoadd_llm_budget_config(dynamic raw);
+
+  @protected
+  LlmCacheConfig dco_decode_box_autoadd_llm_cache_config(dynamic raw);
+
+  @protected
   LlmConfig dco_decode_box_autoadd_llm_config(dynamic raw);
+
+  @protected
+  LlmRateLimitConfig dco_decode_box_autoadd_llm_rate_limit_config(dynamic raw);
+
+  @protected
+  MultiVectorEmbedding dco_decode_box_autoadd_multi_vector_embedding(
+    dynamic raw,
+  );
 
   @protected
   NerConfig dco_decode_box_autoadd_ner_config(dynamic raw);
@@ -776,12 +831,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   OcrRotation dco_decode_box_autoadd_ocr_rotation(dynamic raw);
 
   @protected
+  OcrStrategy dco_decode_box_autoadd_ocr_strategy(dynamic raw);
+
+  @protected
   OcrTableBoundingBox dco_decode_box_autoadd_ocr_table_bounding_box(
     dynamic raw,
   );
 
   @protected
   OutputFormat dco_decode_box_autoadd_output_format(dynamic raw);
+
+  @protected
+  PaddleInferenceBackend dco_decode_box_autoadd_paddle_inference_backend(
+    dynamic raw,
+  );
 
   @protected
   PageClassificationConfig dco_decode_box_autoadd_page_classification_config(
@@ -843,6 +906,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SecurityLimits dco_decode_box_autoadd_security_limits(dynamic raw);
 
   @protected
+  SparseEmbedding dco_decode_box_autoadd_sparse_embedding(dynamic raw);
+
+  @protected
+  SparseEmbeddingConfig dco_decode_box_autoadd_sparse_embedding_config(
+    dynamic raw,
+  );
+
+  @protected
   StructuredExtractionConfig
   dco_decode_box_autoadd_structured_extraction_config(dynamic raw);
 
@@ -894,6 +965,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   YearRange dco_decode_box_autoadd_year_range(dynamic raw);
 
   @protected
+  BreadcrumbTarget dco_decode_breadcrumb_target(dynamic raw);
+
+  @protected
   BrowserBackend dco_decode_browser_backend(dynamic raw);
 
   @protected
@@ -919,6 +993,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Chunk dco_decode_chunk(dynamic raw);
+
+  @protected
+  ChunkClassificationConfig dco_decode_chunk_classification_config(dynamic raw);
+
+  @protected
+  ChunkClassificationDefinition dco_decode_chunk_classification_definition(
+    dynamic raw,
+  );
 
   @protected
   ChunkInfo dco_decode_chunk_info(dynamic raw);
@@ -951,7 +1033,25 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ClassificationLabel dco_decode_classification_label(dynamic raw);
 
   @protected
+  CodeBlockStyle dco_decode_code_block_style(dynamic raw);
+
+  @protected
+  CodeChunkInfo dco_decode_code_chunk_info(dynamic raw);
+
+  @protected
   CodeContentMode dco_decode_code_content_mode(dynamic raw);
+
+  @protected
+  CodeDataAttribute dco_decode_code_data_attribute(dynamic raw);
+
+  @protected
+  CodeDataNode dco_decode_code_data_node(dynamic raw);
+
+  @protected
+  CodeDataNodeKind dco_decode_code_data_node_kind(dynamic raw);
+
+  @protected
+  CodeMetadata dco_decode_code_metadata(dynamic raw);
 
   @protected
   ContentConfig dco_decode_content_config(dynamic raw);
@@ -966,10 +1066,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ContributorRole dco_decode_contributor_role(dynamic raw);
 
   @protected
+  ConversionOptions dco_decode_conversion_options(dynamic raw);
+
+  @protected
   CoreProperties dco_decode_core_properties(dynamic raw);
 
   @protected
   CrawlConfig dco_decode_crawl_config(dynamic raw);
+
+  @protected
+  CredentialProviderConfig dco_decode_credential_provider_config(dynamic raw);
+
+  @protected
+  CsvConfig dco_decode_csv_config(dynamic raw);
 
   @protected
   CsvMetadata dco_decode_csv_metadata(dynamic raw);
@@ -1005,7 +1114,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   DjotLink dco_decode_djot_link(dynamic raw);
 
   @protected
+  DoctorCheck dco_decode_doctor_check(dynamic raw);
+
+  @protected
+  DoctorReport dco_decode_doctor_report(dynamic raw);
+
+  @protected
   DocumentBoundary dco_decode_document_boundary(dynamic raw);
+
+  @protected
+  DocumentContentEncoding dco_decode_document_content_encoding(dynamic raw);
+
+  @protected
+  DocumentCounts dco_decode_document_counts(dynamic raw);
 
   @protected
   DocumentMetadata dco_decode_document_metadata(dynamic raw);
@@ -1066,6 +1187,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   EmbeddingModelType dco_decode_embedding_model_type(dynamic raw);
+
+  @protected
+  EmbeddingsEmbeddingBackend dco_decode_embeddings_embedding_backend(
+    dynamic raw,
+  );
 
   @protected
   Entity dco_decode_entity(dynamic raw);
@@ -1173,6 +1299,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   HeadingLevel dco_decode_heading_level(dynamic raw);
 
   @protected
+  HeadingStyle dco_decode_heading_style(dynamic raw);
+
+  @protected
   HeuristicsConfig dco_decode_heuristics_config(dynamic raw);
 
   @protected
@@ -1183,6 +1312,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   HierarchyConfig dco_decode_hierarchy_config(dynamic raw);
+
+  @protected
+  HighlightStyle dco_decode_highlight_style(dynamic raw);
+
+  @protected
+  HostMatcher dco_decode_host_matcher(dynamic raw);
 
   @protected
   HtmlMetadata dco_decode_html_metadata(dynamic raw);
@@ -1238,6 +1373,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   JatsMetadata dco_decode_jats_metadata(dynamic raw);
 
   @protected
+  JupyterCellRendering dco_decode_jupyter_cell_rendering(dynamic raw);
+
+  @protected
   Keyword dco_decode_keyword(dynamic raw);
 
   @protected
@@ -1247,7 +1385,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   KeywordConfig dco_decode_keyword_config(dynamic raw);
 
   @protected
+  LanguageConfidence dco_decode_language_confidence(dynamic raw);
+
+  @protected
   LanguageDetectionConfig dco_decode_language_detection_config(dynamic raw);
+
+  @protected
+  LateInteractionConfig dco_decode_late_interaction_config(dynamic raw);
+
+  @protected
+  LateInteractionMatch dco_decode_late_interaction_match(dynamic raw);
+
+  @protected
+  LateInteractionModelType dco_decode_late_interaction_model_type(dynamic raw);
+
+  @protected
+  LateInteractionPreset dco_decode_late_interaction_preset(dynamic raw);
 
   @protected
   LayoutClass dco_decode_layout_class(dynamic raw);
@@ -1262,7 +1415,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   LayoutRegion dco_decode_layout_region(dynamic raw);
 
   @protected
+  LayoutStrategy dco_decode_layout_strategy(dynamic raw);
+
+  @protected
   LinkMetadata dco_decode_link_metadata(dynamic raw);
+
+  @protected
+  LinkStyle dco_decode_link_style(dynamic raw);
 
   @protected
   LinkType dco_decode_link_type(dynamic raw);
@@ -1277,13 +1436,29 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<AssetCategory> dco_decode_list_asset_category(dynamic raw);
 
   @protected
+  List<BoundingBox> dco_decode_list_bounding_box(dynamic raw);
+
+  @protected
   List<CellChange> dco_decode_list_cell_change(dynamic raw);
 
   @protected
   List<Chunk> dco_decode_list_chunk(dynamic raw);
 
   @protected
+  List<ChunkClassificationDefinition>
+  dco_decode_list_chunk_classification_definition(dynamic raw);
+
+  @protected
   List<ClassificationLabel> dco_decode_list_classification_label(dynamic raw);
+
+  @protected
+  List<CodeChunkInfo> dco_decode_list_code_chunk_info(dynamic raw);
+
+  @protected
+  List<CodeDataAttribute> dco_decode_list_code_data_attribute(dynamic raw);
+
+  @protected
+  List<CodeDataNode> dco_decode_list_code_data_node(dynamic raw);
 
   @protected
   List<ContributorRole> dco_decode_list_contributor_role(dynamic raw);
@@ -1302,6 +1477,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<DjotLink> dco_decode_list_djot_link(dynamic raw);
+
+  @protected
+  List<DoctorCheck> dco_decode_list_doctor_check(dynamic raw);
 
   @protected
   List<DocumentNode> dco_decode_list_document_node(dynamic raw);
@@ -1367,13 +1545,27 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<HierarchicalBlock> dco_decode_list_hierarchical_block(dynamic raw);
 
   @protected
+  List<HostMatcher> dco_decode_list_host_matcher(dynamic raw);
+
+  @protected
   List<ImageMetadataType> dco_decode_list_image_metadata_type(dynamic raw);
+
+  @protected
+  ListIndentType dco_decode_list_indent_type(dynamic raw);
 
   @protected
   List<InlineElement> dco_decode_list_inline_element(dynamic raw);
 
   @protected
   List<Keyword> dco_decode_list_keyword(dynamic raw);
+
+  @protected
+  List<LanguageConfidence> dco_decode_list_language_confidence(dynamic raw);
+
+  @protected
+  List<LateInteractionMatch> dco_decode_list_late_interaction_match(
+    dynamic raw,
+  );
 
   @protected
   List<LayoutDetection> dco_decode_list_layout_detection(dynamic raw);
@@ -1391,7 +1583,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<Float64List> dco_decode_list_list_prim_f_64_strict(dynamic raw);
 
   @protected
+  List<LlmProviderConfig> dco_decode_list_llm_provider_config(dynamic raw);
+
+  @protected
   List<LlmUsage> dco_decode_list_llm_usage(dynamic raw);
+
+  @protected
+  List<MultiVectorEmbedding> dco_decode_list_multi_vector_embedding(
+    dynamic raw,
+  );
 
   @protected
   List<OcrElement> dco_decode_list_ocr_element(dynamic raw);
@@ -1421,6 +1621,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<PageSignals> dco_decode_list_page_signals(dynamic raw);
 
   @protected
+  List<PageSpan> dco_decode_list_page_span(dynamic raw);
+
+  @protected
   List<PdfAnnotation> dco_decode_list_pdf_annotation(dynamic raw);
 
   @protected
@@ -1448,7 +1651,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ProcessingWarning> dco_decode_list_processing_warning(dynamic raw);
 
   @protected
+  List<PropertyChange> dco_decode_list_property_change(dynamic raw);
+
+  @protected
   List<QrCode> dco_decode_list_qr_code(dynamic raw);
+
+  @protected
+  List<(String, double)> dco_decode_list_record_string_f_64(dynamic raw);
 
   @protected
   List<(String, PlatformInt64)> dco_decode_list_record_string_i_64(dynamic raw);
@@ -1497,7 +1706,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ListType dco_decode_list_type(dynamic raw);
 
   @protected
+  LlmBudgetConfig dco_decode_llm_budget_config(dynamic raw);
+
+  @protected
+  LlmCacheConfig dco_decode_llm_cache_config(dynamic raw);
+
+  @protected
   LlmConfig dco_decode_llm_config(dynamic raw);
+
+  @protected
+  LlmProviderConfig dco_decode_llm_provider_config(dynamic raw);
+
+  @protected
+  LlmRateLimitConfig dco_decode_llm_rate_limit_config(dynamic raw);
 
   @protected
   LlmUsage dco_decode_llm_usage(dynamic raw);
@@ -1518,6 +1739,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ModelPaths dco_decode_model_paths(dynamic raw);
 
   @protected
+  MultiVectorEmbedding dco_decode_multi_vector_embedding(dynamic raw);
+
+  @protected
   MultidocInput dco_decode_multidoc_input(dynamic raw);
 
   @protected
@@ -1528,6 +1752,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   NerConfig dco_decode_ner_config(dynamic raw);
+
+  @protected
+  NewlineStyle dco_decode_newline_style(dynamic raw);
 
   @protected
   NoChunkingReason dco_decode_no_chunking_reason(dynamic raw);
@@ -1575,6 +1802,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   OcrRotation dco_decode_ocr_rotation(dynamic raw);
 
   @protected
+  OcrStrategy dco_decode_ocr_strategy(dynamic raw);
+
+  @protected
   OcrTable dco_decode_ocr_table(dynamic raw);
 
   @protected
@@ -1582,6 +1812,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Map<String, String>? dco_decode_opt_Map_String_String_None(dynamic raw);
+
+  @protected
+  Map<String, double>? dco_decode_opt_Map_String_f_64_None(dynamic raw);
 
   @protected
   Map<String, PlatformInt64>? dco_decode_opt_Map_String_i_64_None(dynamic raw);
@@ -1608,6 +1841,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AuthConfig? dco_decode_opt_box_autoadd_auth_config(dynamic raw);
 
   @protected
+  BedrockConfig? dco_decode_opt_box_autoadd_bedrock_config(dynamic raw);
+
+  @protected
   bool? dco_decode_opt_box_autoadd_bool(dynamic raw);
 
   @protected
@@ -1617,7 +1853,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   CaptioningConfig? dco_decode_opt_box_autoadd_captioning_config(dynamic raw);
 
   @protected
+  ChunkClassificationConfig?
+  dco_decode_opt_box_autoadd_chunk_classification_config(dynamic raw);
+
+  @protected
   ChunkingConfig? dco_decode_opt_box_autoadd_chunking_config(dynamic raw);
+
+  @protected
+  CodeDataNode? dco_decode_opt_box_autoadd_code_data_node(dynamic raw);
 
   @protected
   ContentFilterConfig? dco_decode_opt_box_autoadd_content_filter_config(
@@ -1625,10 +1868,25 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ConversionOptions? dco_decode_opt_box_autoadd_conversion_options(dynamic raw);
+
+  @protected
   CoreProperties? dco_decode_opt_box_autoadd_core_properties(dynamic raw);
 
   @protected
+  CredentialProviderConfig?
+  dco_decode_opt_box_autoadd_credential_provider_config(dynamic raw);
+
+  @protected
+  CsvConfig? dco_decode_opt_box_autoadd_csv_config(dynamic raw);
+
+  @protected
   DjotContent? dco_decode_opt_box_autoadd_djot_content(dynamic raw);
+
+  @protected
+  DocumentContentEncoding? dco_decode_opt_box_autoadd_document_content_encoding(
+    dynamic raw,
+  );
 
   @protected
   DocumentStructure? dco_decode_opt_box_autoadd_document_structure(dynamic raw);
@@ -1709,12 +1967,33 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  LateInteractionConfig? dco_decode_opt_box_autoadd_late_interaction_config(
+    dynamic raw,
+  );
+
+  @protected
   LayoutDetectionConfig? dco_decode_opt_box_autoadd_layout_detection_config(
     dynamic raw,
   );
 
   @protected
+  LlmBudgetConfig? dco_decode_opt_box_autoadd_llm_budget_config(dynamic raw);
+
+  @protected
+  LlmCacheConfig? dco_decode_opt_box_autoadd_llm_cache_config(dynamic raw);
+
+  @protected
   LlmConfig? dco_decode_opt_box_autoadd_llm_config(dynamic raw);
+
+  @protected
+  LlmRateLimitConfig? dco_decode_opt_box_autoadd_llm_rate_limit_config(
+    dynamic raw,
+  );
+
+  @protected
+  MultiVectorEmbedding? dco_decode_opt_box_autoadd_multi_vector_embedding(
+    dynamic raw,
+  );
 
   @protected
   NerConfig? dco_decode_opt_box_autoadd_ner_config(dynamic raw);
@@ -1739,12 +2018,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   OcrRotation? dco_decode_opt_box_autoadd_ocr_rotation(dynamic raw);
 
   @protected
+  OcrStrategy? dco_decode_opt_box_autoadd_ocr_strategy(dynamic raw);
+
+  @protected
   OcrTableBoundingBox? dco_decode_opt_box_autoadd_ocr_table_bounding_box(
     dynamic raw,
   );
 
   @protected
   OutputFormat? dco_decode_opt_box_autoadd_output_format(dynamic raw);
+
+  @protected
+  PaddleInferenceBackend? dco_decode_opt_box_autoadd_paddle_inference_backend(
+    dynamic raw,
+  );
 
   @protected
   PageClassificationConfig?
@@ -1796,6 +2083,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SecurityLimits? dco_decode_opt_box_autoadd_security_limits(dynamic raw);
+
+  @protected
+  SparseEmbedding? dco_decode_opt_box_autoadd_sparse_embedding(dynamic raw);
+
+  @protected
+  SparseEmbeddingConfig? dco_decode_opt_box_autoadd_sparse_embedding_config(
+    dynamic raw,
+  );
 
   @protected
   StructuredExtractionConfig?
@@ -1852,6 +2147,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ArchiveEntry>? dco_decode_opt_list_archive_entry(dynamic raw);
 
   @protected
+  List<BoundingBox>? dco_decode_opt_list_bounding_box(dynamic raw);
+
+  @protected
   List<Chunk>? dco_decode_opt_list_chunk(dynamic raw);
 
   @protected
@@ -1873,10 +2171,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<Keyword>? dco_decode_opt_list_keyword(dynamic raw);
 
   @protected
+  List<LanguageConfidence>? dco_decode_opt_list_language_confidence(
+    dynamic raw,
+  );
+
+  @protected
   List<LayoutRegion>? dco_decode_opt_list_layout_region(dynamic raw);
 
   @protected
   List<List<String>>? dco_decode_opt_list_list_String(dynamic raw);
+
+  @protected
+  List<LlmProviderConfig>? dco_decode_opt_list_llm_provider_config(dynamic raw);
 
   @protected
   List<LlmUsage>? dco_decode_opt_list_llm_usage(dynamic raw);
@@ -1923,6 +2229,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   OutputFormat dco_decode_output_format(dynamic raw);
 
   @protected
+  PaddleInferenceBackend dco_decode_paddle_inference_backend(dynamic raw);
+
+  @protected
   PaddleLanguage dco_decode_paddle_language(dynamic raw);
 
   @protected
@@ -1954,6 +2263,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageSignals dco_decode_page_signals(dynamic raw);
+
+  @protected
+  PageSpan dco_decode_page_span(dynamic raw);
 
   @protected
   PageStructure dco_decode_page_structure(dynamic raw);
@@ -1995,6 +2307,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PptxMetadata dco_decode_pptx_metadata(dynamic raw);
 
   @protected
+  PreprocessingOptions dco_decode_preprocessing_options(dynamic raw);
+
+  @protected
+  PreprocessingPreset dco_decode_preprocessing_preset(dynamic raw);
+
+  @protected
   Preset dco_decode_preset(dynamic raw);
 
   @protected
@@ -2007,10 +2325,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PresetSummary dco_decode_preset_summary(dynamic raw);
 
   @protected
+  ProbeStatus dco_decode_probe_status(dynamic raw);
+
+  @protected
   ProcessingStage dco_decode_processing_stage(dynamic raw);
 
   @protected
   ProcessingWarning dco_decode_processing_warning(dynamic raw);
+
+  @protected
+  PropertyChange dco_decode_property_change(dynamic raw);
 
   @protected
   ProxyConfig dco_decode_proxy_config(dynamic raw);
@@ -2032,6 +2356,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RecognizedTable dco_decode_recognized_table(dynamic raw);
+
+  @protected
+  (String, double) dco_decode_record_string_f_64(dynamic raw);
 
   @protected
   (String, PlatformInt64) dco_decode_record_string_i_64(dynamic raw);
@@ -2081,6 +2408,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   RerankerConfig dco_decode_reranker_config(dynamic raw);
 
   @protected
+  RerankerHead dco_decode_reranker_head(dynamic raw);
+
+  @protected
   RerankerModelType dco_decode_reranker_model_type(dynamic raw);
 
   @protected
@@ -2112,6 +2442,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SitemapUrl dco_decode_sitemap_url(dynamic raw);
+
+  @protected
+  SparseEmbedding dco_decode_sparse_embedding(dynamic raw);
+
+  @protected
+  SparseEmbeddingConfig dco_decode_sparse_embedding_config(dynamic raw);
+
+  @protected
+  SparseEmbeddingModelType dco_decode_sparse_embedding_model_type(dynamic raw);
+
+  @protected
+  SparseEmbeddingPreset dco_decode_sparse_embedding_preset(dynamic raw);
 
   @protected
   SsrfPolicy dco_decode_ssrf_policy(dynamic raw);
@@ -2209,6 +2551,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   UriKind dco_decode_uri_kind(dynamic raw);
 
   @protected
+  UrlEscapeStyle dco_decode_url_escape_style(dynamic raw);
+
+  @protected
   UrlExtractionConfig dco_decode_url_extraction_config(dynamic raw);
 
   @protected
@@ -2225,6 +2570,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   WhisperModel dco_decode_whisper_model(dynamic raw);
+
+  @protected
+  WhitespaceMode dco_decode_whitespace_mode(dynamic raw);
 
   @protected
   XbergError dco_decode_xberg_error(dynamic raw);
@@ -2484,6 +2832,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  Map<String, double> sse_decode_Map_String_f_64_None(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   Map<String, PlatformInt64> sse_decode_Map_String_i_64_None(
     SseDeserializer deserializer,
   );
@@ -2642,6 +2995,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BBox sse_decode_b_box(SseDeserializer deserializer);
 
   @protected
+  BedrockConfig sse_decode_bedrock_config(SseDeserializer deserializer);
+
+  @protected
   BibtexMetadata sse_decode_bibtex_metadata(SseDeserializer deserializer);
 
   @protected
@@ -2675,6 +3031,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AuthConfig sse_decode_box_autoadd_auth_config(SseDeserializer deserializer);
 
   @protected
+  BedrockConfig sse_decode_box_autoadd_bedrock_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   BibtexMetadata sse_decode_box_autoadd_bibtex_metadata(
     SseDeserializer deserializer,
   );
@@ -2691,6 +3052,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ChunkClassificationConfig sse_decode_box_autoadd_chunk_classification_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   ChunkingConfig sse_decode_box_autoadd_chunking_config(
     SseDeserializer deserializer,
   );
@@ -2701,7 +3067,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CodeDataNode sse_decode_box_autoadd_code_data_node(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CodeMetadata sse_decode_box_autoadd_code_metadata(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   ContentFilterConfig sse_decode_box_autoadd_content_filter_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  ConversionOptions sse_decode_box_autoadd_conversion_options(
     SseDeserializer deserializer,
   );
 
@@ -2711,6 +3092,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CredentialProviderConfig sse_decode_box_autoadd_credential_provider_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CsvConfig sse_decode_box_autoadd_csv_config(SseDeserializer deserializer);
+
+  @protected
   CsvMetadata sse_decode_box_autoadd_csv_metadata(SseDeserializer deserializer);
 
   @protected
@@ -2718,6 +3107,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   DjotContent sse_decode_box_autoadd_djot_content(SseDeserializer deserializer);
+
+  @protected
+  DocumentContentEncoding sse_decode_box_autoadd_document_content_encoding(
+    SseDeserializer deserializer,
+  );
 
   @protected
   DocumentStructure sse_decode_box_autoadd_document_structure(
@@ -2873,12 +3267,37 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  LateInteractionConfig sse_decode_box_autoadd_late_interaction_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   LayoutDetectionConfig sse_decode_box_autoadd_layout_detection_config(
     SseDeserializer deserializer,
   );
 
   @protected
+  LlmBudgetConfig sse_decode_box_autoadd_llm_budget_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LlmCacheConfig sse_decode_box_autoadd_llm_cache_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   LlmConfig sse_decode_box_autoadd_llm_config(SseDeserializer deserializer);
+
+  @protected
+  LlmRateLimitConfig sse_decode_box_autoadd_llm_rate_limit_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MultiVectorEmbedding sse_decode_box_autoadd_multi_vector_embedding(
+    SseDeserializer deserializer,
+  );
 
   @protected
   NerConfig sse_decode_box_autoadd_ner_config(SseDeserializer deserializer);
@@ -2908,12 +3327,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   OcrRotation sse_decode_box_autoadd_ocr_rotation(SseDeserializer deserializer);
 
   @protected
+  OcrStrategy sse_decode_box_autoadd_ocr_strategy(SseDeserializer deserializer);
+
+  @protected
   OcrTableBoundingBox sse_decode_box_autoadd_ocr_table_bounding_box(
     SseDeserializer deserializer,
   );
 
   @protected
   OutputFormat sse_decode_box_autoadd_output_format(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  PaddleInferenceBackend sse_decode_box_autoadd_paddle_inference_backend(
     SseDeserializer deserializer,
   );
 
@@ -2999,6 +3426,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  SparseEmbedding sse_decode_box_autoadd_sparse_embedding(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  SparseEmbeddingConfig sse_decode_box_autoadd_sparse_embedding_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   StructuredExtractionConfig
   sse_decode_box_autoadd_structured_extraction_config(
     SseDeserializer deserializer,
@@ -3070,6 +3507,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   YearRange sse_decode_box_autoadd_year_range(SseDeserializer deserializer);
 
   @protected
+  BreadcrumbTarget sse_decode_breadcrumb_target(SseDeserializer deserializer);
+
+  @protected
   BrowserBackend sse_decode_browser_backend(SseDeserializer deserializer);
 
   @protected
@@ -3095,6 +3535,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Chunk sse_decode_chunk(SseDeserializer deserializer);
+
+  @protected
+  ChunkClassificationConfig sse_decode_chunk_classification_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  ChunkClassificationDefinition sse_decode_chunk_classification_definition(
+    SseDeserializer deserializer,
+  );
 
   @protected
   ChunkInfo sse_decode_chunk_info(SseDeserializer deserializer);
@@ -3129,7 +3579,27 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CodeBlockStyle sse_decode_code_block_style(SseDeserializer deserializer);
+
+  @protected
+  CodeChunkInfo sse_decode_code_chunk_info(SseDeserializer deserializer);
+
+  @protected
   CodeContentMode sse_decode_code_content_mode(SseDeserializer deserializer);
+
+  @protected
+  CodeDataAttribute sse_decode_code_data_attribute(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CodeDataNode sse_decode_code_data_node(SseDeserializer deserializer);
+
+  @protected
+  CodeDataNodeKind sse_decode_code_data_node_kind(SseDeserializer deserializer);
+
+  @protected
+  CodeMetadata sse_decode_code_metadata(SseDeserializer deserializer);
 
   @protected
   ContentConfig sse_decode_content_config(SseDeserializer deserializer);
@@ -3146,10 +3616,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ContributorRole sse_decode_contributor_role(SseDeserializer deserializer);
 
   @protected
+  ConversionOptions sse_decode_conversion_options(SseDeserializer deserializer);
+
+  @protected
   CoreProperties sse_decode_core_properties(SseDeserializer deserializer);
 
   @protected
   CrawlConfig sse_decode_crawl_config(SseDeserializer deserializer);
+
+  @protected
+  CredentialProviderConfig sse_decode_credential_provider_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CsvConfig sse_decode_csv_config(SseDeserializer deserializer);
 
   @protected
   CsvMetadata sse_decode_csv_metadata(SseDeserializer deserializer);
@@ -3185,7 +3666,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   DjotLink sse_decode_djot_link(SseDeserializer deserializer);
 
   @protected
+  DoctorCheck sse_decode_doctor_check(SseDeserializer deserializer);
+
+  @protected
+  DoctorReport sse_decode_doctor_report(SseDeserializer deserializer);
+
+  @protected
   DocumentBoundary sse_decode_document_boundary(SseDeserializer deserializer);
+
+  @protected
+  DocumentContentEncoding sse_decode_document_content_encoding(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  DocumentCounts sse_decode_document_counts(SseDeserializer deserializer);
 
   @protected
   DocumentMetadata sse_decode_document_metadata(SseDeserializer deserializer);
@@ -3252,6 +3747,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   EmbeddingModelType sse_decode_embedding_model_type(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  EmbeddingsEmbeddingBackend sse_decode_embeddings_embedding_backend(
     SseDeserializer deserializer,
   );
 
@@ -3373,6 +3873,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   HeadingLevel sse_decode_heading_level(SseDeserializer deserializer);
 
   @protected
+  HeadingStyle sse_decode_heading_style(SseDeserializer deserializer);
+
+  @protected
   HeuristicsConfig sse_decode_heuristics_config(SseDeserializer deserializer);
 
   @protected
@@ -3383,6 +3886,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   HierarchyConfig sse_decode_hierarchy_config(SseDeserializer deserializer);
+
+  @protected
+  HighlightStyle sse_decode_highlight_style(SseDeserializer deserializer);
+
+  @protected
+  HostMatcher sse_decode_host_matcher(SseDeserializer deserializer);
 
   @protected
   HtmlMetadata sse_decode_html_metadata(SseDeserializer deserializer);
@@ -3446,6 +3955,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   JatsMetadata sse_decode_jats_metadata(SseDeserializer deserializer);
 
   @protected
+  JupyterCellRendering sse_decode_jupyter_cell_rendering(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   Keyword sse_decode_keyword(SseDeserializer deserializer);
 
   @protected
@@ -3455,7 +3969,32 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   KeywordConfig sse_decode_keyword_config(SseDeserializer deserializer);
 
   @protected
+  LanguageConfidence sse_decode_language_confidence(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   LanguageDetectionConfig sse_decode_language_detection_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LateInteractionConfig sse_decode_late_interaction_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LateInteractionMatch sse_decode_late_interaction_match(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LateInteractionModelType sse_decode_late_interaction_model_type(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LateInteractionPreset sse_decode_late_interaction_preset(
     SseDeserializer deserializer,
   );
 
@@ -3474,7 +4013,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   LayoutRegion sse_decode_layout_region(SseDeserializer deserializer);
 
   @protected
+  LayoutStrategy sse_decode_layout_strategy(SseDeserializer deserializer);
+
+  @protected
   LinkMetadata sse_decode_link_metadata(SseDeserializer deserializer);
+
+  @protected
+  LinkStyle sse_decode_link_style(SseDeserializer deserializer);
 
   @protected
   LinkType sse_decode_link_type(SseDeserializer deserializer);
@@ -3493,13 +4038,35 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<BoundingBox> sse_decode_list_bounding_box(SseDeserializer deserializer);
+
+  @protected
   List<CellChange> sse_decode_list_cell_change(SseDeserializer deserializer);
 
   @protected
   List<Chunk> sse_decode_list_chunk(SseDeserializer deserializer);
 
   @protected
+  List<ChunkClassificationDefinition>
+  sse_decode_list_chunk_classification_definition(SseDeserializer deserializer);
+
+  @protected
   List<ClassificationLabel> sse_decode_list_classification_label(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<CodeChunkInfo> sse_decode_list_code_chunk_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<CodeDataAttribute> sse_decode_list_code_data_attribute(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<CodeDataNode> sse_decode_list_code_data_node(
     SseDeserializer deserializer,
   );
 
@@ -3524,6 +4091,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<DjotLink> sse_decode_list_djot_link(SseDeserializer deserializer);
+
+  @protected
+  List<DoctorCheck> sse_decode_list_doctor_check(SseDeserializer deserializer);
 
   @protected
   List<DocumentNode> sse_decode_list_document_node(
@@ -3619,9 +4189,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<HostMatcher> sse_decode_list_host_matcher(SseDeserializer deserializer);
+
+  @protected
   List<ImageMetadataType> sse_decode_list_image_metadata_type(
     SseDeserializer deserializer,
   );
+
+  @protected
+  ListIndentType sse_decode_list_indent_type(SseDeserializer deserializer);
 
   @protected
   List<InlineElement> sse_decode_list_inline_element(
@@ -3630,6 +4206,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<Keyword> sse_decode_list_keyword(SseDeserializer deserializer);
+
+  @protected
+  List<LanguageConfidence> sse_decode_list_language_confidence(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<LateInteractionMatch> sse_decode_list_late_interaction_match(
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<LayoutDetection> sse_decode_list_layout_detection(
@@ -3655,7 +4241,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<LlmProviderConfig> sse_decode_list_llm_provider_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<LlmUsage> sse_decode_list_llm_usage(SseDeserializer deserializer);
+
+  @protected
+  List<MultiVectorEmbedding> sse_decode_list_multi_vector_embedding(
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<OcrElement> sse_decode_list_ocr_element(SseDeserializer deserializer);
@@ -3689,6 +4285,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<PageSignals> sse_decode_list_page_signals(SseDeserializer deserializer);
+
+  @protected
+  List<PageSpan> sse_decode_list_page_span(SseDeserializer deserializer);
 
   @protected
   List<PdfAnnotation> sse_decode_list_pdf_annotation(
@@ -3726,7 +4325,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<PropertyChange> sse_decode_list_property_change(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<QrCode> sse_decode_list_qr_code(SseDeserializer deserializer);
+
+  @protected
+  List<(String, double)> sse_decode_list_record_string_f_64(
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<(String, PlatformInt64)> sse_decode_list_record_string_i_64(
@@ -3791,7 +4400,23 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ListType sse_decode_list_type(SseDeserializer deserializer);
 
   @protected
+  LlmBudgetConfig sse_decode_llm_budget_config(SseDeserializer deserializer);
+
+  @protected
+  LlmCacheConfig sse_decode_llm_cache_config(SseDeserializer deserializer);
+
+  @protected
   LlmConfig sse_decode_llm_config(SseDeserializer deserializer);
+
+  @protected
+  LlmProviderConfig sse_decode_llm_provider_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LlmRateLimitConfig sse_decode_llm_rate_limit_config(
+    SseDeserializer deserializer,
+  );
 
   @protected
   LlmUsage sse_decode_llm_usage(SseDeserializer deserializer);
@@ -3812,6 +4437,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ModelPaths sse_decode_model_paths(SseDeserializer deserializer);
 
   @protected
+  MultiVectorEmbedding sse_decode_multi_vector_embedding(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MultidocInput sse_decode_multidoc_input(SseDeserializer deserializer);
 
   @protected
@@ -3824,6 +4454,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   NerConfig sse_decode_ner_config(SseDeserializer deserializer);
+
+  @protected
+  NewlineStyle sse_decode_newline_style(SseDeserializer deserializer);
 
   @protected
   NoChunkingReason sse_decode_no_chunking_reason(SseDeserializer deserializer);
@@ -3879,6 +4512,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   OcrRotation sse_decode_ocr_rotation(SseDeserializer deserializer);
 
   @protected
+  OcrStrategy sse_decode_ocr_strategy(SseDeserializer deserializer);
+
+  @protected
   OcrTable sse_decode_ocr_table(SseDeserializer deserializer);
 
   @protected
@@ -3888,6 +4524,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Map<String, String>? sse_decode_opt_Map_String_String_None(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  Map<String, double>? sse_decode_opt_Map_String_f_64_None(
     SseDeserializer deserializer,
   );
 
@@ -3920,6 +4561,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  BedrockConfig? sse_decode_opt_box_autoadd_bedrock_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
@@ -3933,7 +4579,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ChunkClassificationConfig?
+  sse_decode_opt_box_autoadd_chunk_classification_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   ChunkingConfig? sse_decode_opt_box_autoadd_chunking_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CodeDataNode? sse_decode_opt_box_autoadd_code_data_node(
     SseDeserializer deserializer,
   );
 
@@ -3943,12 +4600,33 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ConversionOptions? sse_decode_opt_box_autoadd_conversion_options(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   CoreProperties? sse_decode_opt_box_autoadd_core_properties(
     SseDeserializer deserializer,
   );
 
   @protected
+  CredentialProviderConfig?
+  sse_decode_opt_box_autoadd_credential_provider_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CsvConfig? sse_decode_opt_box_autoadd_csv_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   DjotContent? sse_decode_opt_box_autoadd_djot_content(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  DocumentContentEncoding? sse_decode_opt_box_autoadd_document_content_encoding(
     SseDeserializer deserializer,
   );
 
@@ -4061,12 +4739,37 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  LateInteractionConfig? sse_decode_opt_box_autoadd_late_interaction_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   LayoutDetectionConfig? sse_decode_opt_box_autoadd_layout_detection_config(
     SseDeserializer deserializer,
   );
 
   @protected
+  LlmBudgetConfig? sse_decode_opt_box_autoadd_llm_budget_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LlmCacheConfig? sse_decode_opt_box_autoadd_llm_cache_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   LlmConfig? sse_decode_opt_box_autoadd_llm_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  LlmRateLimitConfig? sse_decode_opt_box_autoadd_llm_rate_limit_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MultiVectorEmbedding? sse_decode_opt_box_autoadd_multi_vector_embedding(
     SseDeserializer deserializer,
   );
 
@@ -4101,12 +4804,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  OcrStrategy? sse_decode_opt_box_autoadd_ocr_strategy(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   OcrTableBoundingBox? sse_decode_opt_box_autoadd_ocr_table_bounding_box(
     SseDeserializer deserializer,
   );
 
   @protected
   OutputFormat? sse_decode_opt_box_autoadd_output_format(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  PaddleInferenceBackend? sse_decode_opt_box_autoadd_paddle_inference_backend(
     SseDeserializer deserializer,
   );
 
@@ -4190,6 +4903,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  SparseEmbedding? sse_decode_opt_box_autoadd_sparse_embedding(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  SparseEmbeddingConfig? sse_decode_opt_box_autoadd_sparse_embedding_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   StructuredExtractionConfig?
   sse_decode_opt_box_autoadd_structured_extraction_config(
     SseDeserializer deserializer,
@@ -4264,6 +4987,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<BoundingBox>? sse_decode_opt_list_bounding_box(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<Chunk>? sse_decode_opt_list_chunk(SseDeserializer deserializer);
 
   @protected
@@ -4291,12 +5019,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<Keyword>? sse_decode_opt_list_keyword(SseDeserializer deserializer);
 
   @protected
+  List<LanguageConfidence>? sse_decode_opt_list_language_confidence(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<LayoutRegion>? sse_decode_opt_list_layout_region(
     SseDeserializer deserializer,
   );
 
   @protected
   List<List<String>>? sse_decode_opt_list_list_String(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<LlmProviderConfig>? sse_decode_opt_list_llm_provider_config(
     SseDeserializer deserializer,
   );
 
@@ -4355,6 +5093,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   OutputFormat sse_decode_output_format(SseDeserializer deserializer);
 
   @protected
+  PaddleInferenceBackend sse_decode_paddle_inference_backend(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   PaddleLanguage sse_decode_paddle_language(SseDeserializer deserializer);
 
   @protected
@@ -4390,6 +5133,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PageSignals sse_decode_page_signals(SseDeserializer deserializer);
+
+  @protected
+  PageSpan sse_decode_page_span(SseDeserializer deserializer);
 
   @protected
   PageStructure sse_decode_page_structure(SseDeserializer deserializer);
@@ -4439,6 +5185,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PptxMetadata sse_decode_pptx_metadata(SseDeserializer deserializer);
 
   @protected
+  PreprocessingOptions sse_decode_preprocessing_options(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  PreprocessingPreset sse_decode_preprocessing_preset(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   Preset sse_decode_preset(SseDeserializer deserializer);
 
   @protected
@@ -4451,10 +5207,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PresetSummary sse_decode_preset_summary(SseDeserializer deserializer);
 
   @protected
+  ProbeStatus sse_decode_probe_status(SseDeserializer deserializer);
+
+  @protected
   ProcessingStage sse_decode_processing_stage(SseDeserializer deserializer);
 
   @protected
   ProcessingWarning sse_decode_processing_warning(SseDeserializer deserializer);
+
+  @protected
+  PropertyChange sse_decode_property_change(SseDeserializer deserializer);
 
   @protected
   ProxyConfig sse_decode_proxy_config(SseDeserializer deserializer);
@@ -4476,6 +5238,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RecognizedTable sse_decode_recognized_table(SseDeserializer deserializer);
+
+  @protected
+  (String, double) sse_decode_record_string_f_64(SseDeserializer deserializer);
 
   @protected
   (String, PlatformInt64) sse_decode_record_string_i_64(
@@ -4531,6 +5296,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   RerankerConfig sse_decode_reranker_config(SseDeserializer deserializer);
 
   @protected
+  RerankerHead sse_decode_reranker_head(SseDeserializer deserializer);
+
+  @protected
   RerankerModelType sse_decode_reranker_model_type(
     SseDeserializer deserializer,
   );
@@ -4564,6 +5332,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SitemapUrl sse_decode_sitemap_url(SseDeserializer deserializer);
+
+  @protected
+  SparseEmbedding sse_decode_sparse_embedding(SseDeserializer deserializer);
+
+  @protected
+  SparseEmbeddingConfig sse_decode_sparse_embedding_config(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  SparseEmbeddingModelType sse_decode_sparse_embedding_model_type(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  SparseEmbeddingPreset sse_decode_sparse_embedding_preset(
+    SseDeserializer deserializer,
+  );
 
   @protected
   SsrfPolicy sse_decode_ssrf_policy(SseDeserializer deserializer);
@@ -4681,6 +5467,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   UriKind sse_decode_uri_kind(SseDeserializer deserializer);
 
   @protected
+  UrlEscapeStyle sse_decode_url_escape_style(SseDeserializer deserializer);
+
+  @protected
   UrlExtractionConfig sse_decode_url_extraction_config(
     SseDeserializer deserializer,
   );
@@ -4703,6 +5492,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   WhisperModel sse_decode_whisper_model(SseDeserializer deserializer);
+
+  @protected
+  WhitespaceMode sse_decode_whitespace_mode(SseDeserializer deserializer);
 
   @protected
   XbergError sse_decode_xberg_error(SseDeserializer deserializer);
@@ -5118,6 +5910,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_Map_String_f_64_None(
+    Map<String, double> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_Map_String_i_64_None(
     Map<String, PlatformInt64> self,
     SseSerializer serializer,
@@ -5305,6 +6103,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_b_box(BBox self, SseSerializer serializer);
 
   @protected
+  void sse_encode_bedrock_config(BedrockConfig self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bibtex_metadata(
     BibtexMetadata self,
     SseSerializer serializer,
@@ -5350,6 +6151,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_bedrock_config(
+    BedrockConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_bibtex_metadata(
     BibtexMetadata self,
     SseSerializer serializer,
@@ -5371,6 +6178,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_chunk_classification_config(
+    ChunkClassificationConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_chunking_config(
     ChunkingConfig self,
     SseSerializer serializer,
@@ -5383,14 +6196,44 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_code_data_node(
+    CodeDataNode self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_code_metadata(
+    CodeMetadata self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_content_filter_config(
     ContentFilterConfig self,
     SseSerializer serializer,
   );
 
   @protected
+  void sse_encode_box_autoadd_conversion_options(
+    ConversionOptions self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_core_properties(
     CoreProperties self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_credential_provider_config(
+    CredentialProviderConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_csv_config(
+    CsvConfig self,
     SseSerializer serializer,
   );
 
@@ -5409,6 +6252,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_djot_content(
     DjotContent self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_document_content_encoding(
+    DocumentContentEncoding self,
     SseSerializer serializer,
   );
 
@@ -5602,14 +6451,44 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_late_interaction_config(
+    LateInteractionConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_layout_detection_config(
     LayoutDetectionConfig self,
     SseSerializer serializer,
   );
 
   @protected
+  void sse_encode_box_autoadd_llm_budget_config(
+    LlmBudgetConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_llm_cache_config(
+    LlmCacheConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_llm_config(
     LlmConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_llm_rate_limit_config(
+    LlmRateLimitConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_multi_vector_embedding(
+    MultiVectorEmbedding self,
     SseSerializer serializer,
   );
 
@@ -5656,6 +6535,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_ocr_strategy(
+    OcrStrategy self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_ocr_table_bounding_box(
     OcrTableBoundingBox self,
     SseSerializer serializer,
@@ -5664,6 +6549,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_output_format(
     OutputFormat self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_paddle_inference_backend(
+    PaddleInferenceBackend self,
     SseSerializer serializer,
   );
 
@@ -5779,6 +6670,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_sparse_embedding(
+    SparseEmbedding self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_sparse_embedding_config(
+    SparseEmbeddingConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_structured_extraction_config(
     StructuredExtractionConfig self,
     SseSerializer serializer,
@@ -5875,6 +6778,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_breadcrumb_target(
+    BreadcrumbTarget self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_browser_backend(
     BrowserBackend self,
     SseSerializer serializer,
@@ -5906,6 +6815,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_chunk(Chunk self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_chunk_classification_config(
+    ChunkClassificationConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_chunk_classification_definition(
+    ChunkClassificationDefinition self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_chunk_info(ChunkInfo self, SseSerializer serializer);
@@ -5950,10 +6871,37 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_code_block_style(
+    CodeBlockStyle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_code_chunk_info(CodeChunkInfo self, SseSerializer serializer);
+
+  @protected
   void sse_encode_code_content_mode(
     CodeContentMode self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_code_data_attribute(
+    CodeDataAttribute self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_code_data_node(CodeDataNode self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_code_data_node_kind(
+    CodeDataNodeKind self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_code_metadata(CodeMetadata self, SseSerializer serializer);
 
   @protected
   void sse_encode_content_config(ContentConfig self, SseSerializer serializer);
@@ -5974,6 +6922,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_conversion_options(
+    ConversionOptions self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_core_properties(
     CoreProperties self,
     SseSerializer serializer,
@@ -5981,6 +6935,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_crawl_config(CrawlConfig self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_credential_provider_config(
+    CredentialProviderConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_csv_config(CsvConfig self, SseSerializer serializer);
 
   @protected
   void sse_encode_csv_metadata(CsvMetadata self, SseSerializer serializer);
@@ -6022,8 +6985,26 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_djot_link(DjotLink self, SseSerializer serializer);
 
   @protected
+  void sse_encode_doctor_check(DoctorCheck self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_doctor_report(DoctorReport self, SseSerializer serializer);
+
+  @protected
   void sse_encode_document_boundary(
     DocumentBoundary self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_document_content_encoding(
+    DocumentContentEncoding self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_document_counts(
+    DocumentCounts self,
     SseSerializer serializer,
   );
 
@@ -6120,6 +7101,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_embedding_model_type(
     EmbeddingModelType self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_embeddings_embedding_backend(
+    EmbeddingsEmbeddingBackend self,
     SseSerializer serializer,
   );
 
@@ -6292,6 +7279,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_heading_level(HeadingLevel self, SseSerializer serializer);
 
   @protected
+  void sse_encode_heading_style(HeadingStyle self, SseSerializer serializer);
+
+  @protected
   void sse_encode_heuristics_config(
     HeuristicsConfig self,
     SseSerializer serializer,
@@ -6314,6 +7304,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     HierarchyConfig self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_highlight_style(
+    HighlightStyle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_host_matcher(HostMatcher self, SseSerializer serializer);
 
   @protected
   void sse_encode_html_metadata(HtmlMetadata self, SseSerializer serializer);
@@ -6385,6 +7384,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_jats_metadata(JatsMetadata self, SseSerializer serializer);
 
   @protected
+  void sse_encode_jupyter_cell_rendering(
+    JupyterCellRendering self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_keyword(Keyword self, SseSerializer serializer);
 
   @protected
@@ -6397,8 +7402,38 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_keyword_config(KeywordConfig self, SseSerializer serializer);
 
   @protected
+  void sse_encode_language_confidence(
+    LanguageConfidence self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_language_detection_config(
     LanguageDetectionConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_late_interaction_config(
+    LateInteractionConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_late_interaction_match(
+    LateInteractionMatch self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_late_interaction_model_type(
+    LateInteractionModelType self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_late_interaction_preset(
+    LateInteractionPreset self,
     SseSerializer serializer,
   );
 
@@ -6421,7 +7456,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_layout_region(LayoutRegion self, SseSerializer serializer);
 
   @protected
+  void sse_encode_layout_strategy(
+    LayoutStrategy self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_link_metadata(LinkMetadata self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_link_style(LinkStyle self, SseSerializer serializer);
 
   @protected
   void sse_encode_link_type(LinkType self, SseSerializer serializer);
@@ -6442,6 +7486,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_bounding_box(
+    List<BoundingBox> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_cell_change(
     List<CellChange> self,
     SseSerializer serializer,
@@ -6451,8 +7501,32 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_list_chunk(List<Chunk> self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_chunk_classification_definition(
+    List<ChunkClassificationDefinition> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_classification_label(
     List<ClassificationLabel> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_code_chunk_info(
+    List<CodeChunkInfo> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_code_data_attribute(
+    List<CodeDataAttribute> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_code_data_node(
+    List<CodeDataNode> self,
     SseSerializer serializer,
   );
 
@@ -6482,6 +7556,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_list_djot_link(List<DjotLink> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_doctor_check(
+    List<DoctorCheck> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_document_node(
@@ -6595,8 +7675,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_host_matcher(
+    List<HostMatcher> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_image_metadata_type(
     List<ImageMetadataType> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_indent_type(
+    ListIndentType self,
     SseSerializer serializer,
   );
 
@@ -6608,6 +7700,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_list_keyword(List<Keyword> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_language_confidence(
+    List<LanguageConfidence> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_late_interaction_match(
+    List<LateInteractionMatch> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_layout_detection(
@@ -6640,7 +7744,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_llm_provider_config(
+    List<LlmProviderConfig> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_llm_usage(List<LlmUsage> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_multi_vector_embedding(
+    List<MultiVectorEmbedding> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_ocr_element(
@@ -6689,6 +7805,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     List<PageSignals> self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_list_page_span(List<PageSpan> self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_pdf_annotation(
@@ -6742,7 +7861,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_property_change(
+    List<PropertyChange> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_qr_code(List<QrCode> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_record_string_f_64(
+    List<(String, double)> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_record_string_i_64(
@@ -6823,7 +7954,31 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_list_type(ListType self, SseSerializer serializer);
 
   @protected
+  void sse_encode_llm_budget_config(
+    LlmBudgetConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_llm_cache_config(
+    LlmCacheConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_llm_config(LlmConfig self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_llm_provider_config(
+    LlmProviderConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_llm_rate_limit_config(
+    LlmRateLimitConfig self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_llm_usage(LlmUsage self, SseSerializer serializer);
@@ -6844,6 +7999,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_model_paths(ModelPaths self, SseSerializer serializer);
 
   @protected
+  void sse_encode_multi_vector_embedding(
+    MultiVectorEmbedding self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_multidoc_input(MultidocInput self, SseSerializer serializer);
 
   @protected
@@ -6860,6 +8021,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_ner_config(NerConfig self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_newline_style(NewlineStyle self, SseSerializer serializer);
 
   @protected
   void sse_encode_no_chunking_reason(
@@ -6934,6 +8098,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_ocr_rotation(OcrRotation self, SseSerializer serializer);
 
   @protected
+  void sse_encode_ocr_strategy(OcrStrategy self, SseSerializer serializer);
+
+  @protected
   void sse_encode_ocr_table(OcrTable self, SseSerializer serializer);
 
   @protected
@@ -6945,6 +8112,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_Map_String_String_None(
     Map<String, String>? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_Map_String_f_64_None(
+    Map<String, double>? self,
     SseSerializer serializer,
   );
 
@@ -6982,6 +8155,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_bedrock_config(
+    BedrockConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer);
 
   @protected
@@ -6997,8 +8176,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_chunk_classification_config(
+    ChunkClassificationConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_chunking_config(
     ChunkingConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_code_data_node(
+    CodeDataNode? self,
     SseSerializer serializer,
   );
 
@@ -7009,14 +8200,38 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_conversion_options(
+    ConversionOptions? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_core_properties(
     CoreProperties? self,
     SseSerializer serializer,
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_credential_provider_config(
+    CredentialProviderConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_csv_config(
+    CsvConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_djot_content(
     DjotContent? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_document_content_encoding(
+    DocumentContentEncoding? self,
     SseSerializer serializer,
   );
 
@@ -7150,14 +8365,44 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_late_interaction_config(
+    LateInteractionConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_layout_detection_config(
     LayoutDetectionConfig? self,
     SseSerializer serializer,
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_llm_budget_config(
+    LlmBudgetConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_llm_cache_config(
+    LlmCacheConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_llm_config(
     LlmConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_llm_rate_limit_config(
+    LlmRateLimitConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_multi_vector_embedding(
+    MultiVectorEmbedding? self,
     SseSerializer serializer,
   );
 
@@ -7198,6 +8443,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_ocr_strategy(
+    OcrStrategy? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_ocr_table_bounding_box(
     OcrTableBoundingBox? self,
     SseSerializer serializer,
@@ -7206,6 +8457,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_output_format(
     OutputFormat? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_paddle_inference_backend(
+    PaddleInferenceBackend? self,
     SseSerializer serializer,
   );
 
@@ -7306,6 +8563,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_sparse_embedding(
+    SparseEmbedding? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_sparse_embedding_config(
+    SparseEmbeddingConfig? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_structured_extraction_config(
     StructuredExtractionConfig? self,
     SseSerializer serializer,
@@ -7393,6 +8662,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_list_bounding_box(
+    List<BoundingBox>? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_list_chunk(List<Chunk>? self, SseSerializer serializer);
 
   @protected
@@ -7429,6 +8704,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_list_language_confidence(
+    List<LanguageConfidence>? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_list_layout_region(
     List<LayoutRegion>? self,
     SseSerializer serializer,
@@ -7437,6 +8718,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_list_list_String(
     List<List<String>>? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_list_llm_provider_config(
+    List<LlmProviderConfig>? self,
     SseSerializer serializer,
   );
 
@@ -7522,6 +8809,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_output_format(OutputFormat self, SseSerializer serializer);
 
   @protected
+  void sse_encode_paddle_inference_backend(
+    PaddleInferenceBackend self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_paddle_language(
     PaddleLanguage self,
     SseSerializer serializer,
@@ -7565,6 +8858,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_page_signals(PageSignals self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_page_span(PageSpan self, SseSerializer serializer);
 
   @protected
   void sse_encode_page_structure(PageStructure self, SseSerializer serializer);
@@ -7618,6 +8914,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_pptx_metadata(PptxMetadata self, SseSerializer serializer);
 
   @protected
+  void sse_encode_preprocessing_options(
+    PreprocessingOptions self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_preprocessing_preset(
+    PreprocessingPreset self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_preset(Preset self, SseSerializer serializer);
 
   @protected
@@ -7633,6 +8941,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_preset_summary(PresetSummary self, SseSerializer serializer);
 
   @protected
+  void sse_encode_probe_status(ProbeStatus self, SseSerializer serializer);
+
+  @protected
   void sse_encode_processing_stage(
     ProcessingStage self,
     SseSerializer serializer,
@@ -7641,6 +8952,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_processing_warning(
     ProcessingWarning self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_property_change(
+    PropertyChange self,
     SseSerializer serializer,
   );
 
@@ -7665,6 +8982,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_recognized_table(
     RecognizedTable self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_record_string_f_64(
+    (String, double) self,
     SseSerializer serializer,
   );
 
@@ -7753,6 +9076,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_reranker_head(RerankerHead self, SseSerializer serializer);
+
+  @protected
   void sse_encode_reranker_model_type(
     RerankerModelType self,
     SseSerializer serializer,
@@ -7799,6 +9125,30 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_sitemap_url(SitemapUrl self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_sparse_embedding(
+    SparseEmbedding self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_sparse_embedding_config(
+    SparseEmbeddingConfig self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_sparse_embedding_model_type(
+    SparseEmbeddingModelType self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_sparse_embedding_preset(
+    SparseEmbeddingPreset self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_ssrf_policy(SsrfPolicy self, SseSerializer serializer);
@@ -7948,6 +9298,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_uri_kind(UriKind self, SseSerializer serializer);
 
   @protected
+  void sse_encode_url_escape_style(
+    UrlEscapeStyle self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_url_extraction_config(
     UrlExtractionConfig self,
     SseSerializer serializer,
@@ -7976,6 +9332,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_whisper_model(WhisperModel self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_whitespace_mode(
+    WhitespaceMode self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_xberg_error(XbergError self, SseSerializer serializer);
@@ -8011,305 +9373,305 @@ class RustLibWire implements BaseWire {
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynDocumentExtractorSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynEmbeddingBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynOcrBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynPostProcessorSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRendererSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynRerankerBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynTokenizerBackendSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerArcdynValidatorSendSync(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerDocumentExtractorDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEmbeddingBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMetaSchema(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOcrBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPostProcessorDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRegistry(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRendererDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRerankerBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenCounter(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTokenizerBackendDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl(
-    ptr,
-  );
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl(
+        ptr,
+      );
 
   void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl(
     int ptr,
   ) => wasmModule
-  .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl(
-    ptr,
-  );
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerValidatorDartImpl(
+        ptr,
+      );
 }
 
 @JS('wasm_bindgen')

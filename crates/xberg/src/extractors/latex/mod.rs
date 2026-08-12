@@ -68,6 +68,9 @@ static HEADING_LEVELS_NO_CHAPTERS: LazyLock<ahash::AHashMap<&'static str, u8>> =
     m
 });
 
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+const LATEX_WARNING_SOURCE: &str = "latex";
+
 /// LaTeX document extractor
 #[cfg_attr(alef, alef(skip))]
 pub struct LatexExtractor;
@@ -97,14 +100,11 @@ impl LatexExtractor {
 
         while pos < len {
             if bytes[pos] == b'\\' {
-                // Try to match known inline commands
                 if let Some((kind, content, new_pos)) = Self::try_parse_inline_command(&input[pos..]) {
                     let start = output.len() as u32;
-                    // Recursively strip inner commands
                     let (inner_text, inner_anns) = Self::strip_inline_commands(&content);
                     output.push_str(&inner_text);
                     let end = output.len() as u32;
-                    // Adjust inner annotations to absolute offsets
                     for mut ann in inner_anns {
                         ann.start += start;
                         ann.end += start;
@@ -117,15 +117,12 @@ impl LatexExtractor {
                     continue;
                 }
 
-                // Try to match special character / replacement commands
                 if let Some((replacement, consumed)) = Self::try_parse_special_command(&input[pos..]) {
                     output.push_str(&replacement);
                     pos += consumed;
                     continue;
                 }
 
-                // Not a recognized command — try to skip the command name and
-                // output its braced argument (if any) as plain text.
                 if let Some((plain, consumed)) = Self::try_skip_unknown_command(&input[pos..]) {
                     if !plain.is_empty() {
                         let (inner_text, inner_anns) = Self::strip_inline_commands(&plain);
@@ -141,11 +138,9 @@ impl LatexExtractor {
                     continue;
                 }
 
-                // Bare backslash followed by non-alpha — copy as-is
                 output.push('\\');
                 pos += 1;
             } else if bytes[pos] == b'$' {
-                // Preserve inline math $...$ as-is
                 output.push('$');
                 pos += 1;
                 while pos < len && bytes[pos] != b'$' {
@@ -158,27 +153,21 @@ impl LatexExtractor {
                     pos += 1;
                 }
             } else if bytes[pos] == b'-' && pos + 2 < len && bytes[pos + 1] == b'-' && bytes[pos + 2] == b'-' {
-                // --- → em dash
                 output.push('\u{2014}');
                 pos += 3;
             } else if bytes[pos] == b'-' && pos + 1 < len && bytes[pos + 1] == b'-' {
-                // -- → en dash
                 output.push('\u{2013}');
                 pos += 2;
             } else if bytes[pos] == b'`' && pos + 1 < len && bytes[pos + 1] == b'`' {
-                // `` → left double quote
                 output.push('\u{201C}');
                 pos += 2;
             } else if bytes[pos] == b'\'' && pos + 1 < len && bytes[pos + 1] == b'\'' {
-                // '' → right double quote
                 output.push('\u{201D}');
                 pos += 2;
             } else if bytes[pos] == b'`' {
-                // ` → left single quote
                 output.push('\u{2018}');
                 pos += 1;
             } else if bytes[pos] == b'\'' {
-                // ' → right single quote
                 output.push('\u{2019}');
                 pos += 1;
             } else {
@@ -195,7 +184,6 @@ impl LatexExtractor {
     ///
     /// Returns `Some((kind, braced_content, bytes_consumed))` on success.
     fn try_parse_inline_command(text: &str) -> Option<(AnnotationKind, String, usize)> {
-        // Map command names to annotation kinds
         let commands: &[(&str, AnnotationKind)] = &[
             ("\\textbf{", AnnotationKind::Bold),
             ("\\emph{", AnnotationKind::Italic),
@@ -212,7 +200,6 @@ impl LatexExtractor {
             }
         }
 
-        // Handle \href{url}{text}
         if let Some(after_href) = text.strip_prefix("\\href{")
             && let Some((url, url_consumed)) = Self::read_braced_content(after_href)
         {
@@ -225,7 +212,6 @@ impl LatexExtractor {
             }
         }
 
-        // Handle \url{url} — URL is both content and link target
         if let Some(after_url_cmd) = text.strip_prefix("\\url{")
             && let Some((url, consumed)) = Self::read_braced_content(after_url_cmd)
         {
@@ -240,7 +226,6 @@ impl LatexExtractor {
             ));
         }
 
-        // Handle \verb!...! (or \verb|...|, \verb+...+, etc.)
         if let Some(after_verb) = text.strip_prefix("\\verb")
             && let Some(delim) = after_verb.chars().next()
             && !delim.is_alphabetic()
@@ -261,7 +246,6 @@ impl LatexExtractor {
     ///
     /// Returns `Some((replacement_string, bytes_consumed))` on success.
     fn try_parse_special_command(text: &str) -> Option<(String, usize)> {
-        // Commands with braces: \textgreater{}, \textless{}, \textbackslash{}, \ldots{}, etc.
         let braced_replacements: &[(&str, &str)] = &[
             ("\\textgreater{}", ">"),
             ("\\textless{}", "<"),
@@ -280,7 +264,6 @@ impl LatexExtractor {
             }
         }
 
-        // Commands without braces (but may have {})
         let simple_replacements: &[(&str, &str)] = &[
             ("\\ldots", "\u{2026}"),
             ("\\dots", "\u{2026}"),
@@ -305,7 +288,6 @@ impl LatexExtractor {
             }
         }
 
-        // \ensuremath{content} — pass through content as-is (inline math)
         if let Some(after) = text.strip_prefix("\\ensuremath{")
             && let Some((content, consumed)) = Self::read_braced_content(after)
         {
@@ -327,18 +309,16 @@ impl LatexExtractor {
         }
 
         let after_backslash = &text[1..];
-        // Collect alphabetic command name
         let cmd_end = after_backslash
             .find(|c: char| !c.is_alphabetic())
             .unwrap_or(after_backslash.len());
 
         if cmd_end == 0 {
-            return None; // Not an alpha command
+            return None;
         }
 
-        let total_cmd = 1 + cmd_end; // backslash + command name
+        let total_cmd = 1 + cmd_end;
 
-        // Check for optional argument [...]
         let rest = &text[total_cmd..];
         let mut consumed = total_cmd;
         let rest = if rest.starts_with('[') {
@@ -352,7 +332,6 @@ impl LatexExtractor {
             rest
         };
 
-        // If followed by braced content, extract it
         if let Some(inner) = rest.strip_prefix('{')
             && let Some((content, brace_consumed)) = Self::read_braced_content(inner)
         {
@@ -360,7 +339,6 @@ impl LatexExtractor {
             return Some((content, consumed));
         }
 
-        // No braced arg — just skip the command name
         Some((String::new(), consumed))
     }
 
@@ -401,7 +379,6 @@ impl LatexExtractor {
         let prefix = "\\includegraphics";
         let start = line.find(prefix)?;
         let after = &line[start + prefix.len()..];
-        // Skip optional [...]
         let rest = if after.starts_with('[') {
             let bracket_end = after.find(']')?;
             &after[bracket_end + 1..]
@@ -445,7 +422,6 @@ impl LatexExtractor {
             &*HEADING_LEVELS_NO_CHAPTERS
         };
 
-        // Extract metadata from preamble
         let mut metadata_entries: Vec<(String, String)> = Vec::new();
         for &cmd in &["title", "author", "date"] {
             if let Some(value) = utilities::extract_braced(source, cmd)
@@ -479,7 +455,6 @@ impl LatexExtractor {
                 continue;
             }
 
-            // Handle environments
             if (trimmed.contains("\\begin{") || trimmed.contains("\\begin {"))
                 && let Some(env_name) = extract_env_name(trimmed)
             {
@@ -493,11 +468,20 @@ impl LatexExtractor {
                         i = new_i;
                         continue;
                     }
-                    "tabular" => {
-                        let (env_content, new_i) = collect_environment(&lines, i, "tabular");
+                    "tabular" | "longtable" | "tabularx" | "tabulary" => {
+                        let (env_content, new_i) = collect_environment(&lines, i, &env_name);
                         let cells = Self::parse_tabular_cells(&env_content);
                         if !cells.is_empty() {
-                            b.push_table_from_cells(&cells, None, None);
+                            let caption = Self::extract_caption(&env_content);
+                            let label = Self::extract_label(&env_content);
+                            let idx = b.push_table_from_cells(&cells, None, None);
+                            if let Some(lbl) = label {
+                                b.set_anchor(idx, &lbl);
+                            }
+                            if let Some(cap) = caption {
+                                let cap_idx = b.push_paragraph(&cap, vec![], None, None);
+                                b.push_relationship(cap_idx, RelationshipTarget::Index(idx), RelationshipKind::Caption);
+                            }
                         }
                         i = new_i;
                         continue;
@@ -553,6 +537,16 @@ impl LatexExtractor {
                                     );
                                 }
                             }
+                        } else {
+                            // No `\includegraphics`: the whole `figure` body (a caption-only
+                            // figure, a sub-figure wrapper, a `\resizebox`'d graphic, ...) was
+                            // otherwise dropped without a trace, since this arm's only other
+                            // output path is the image placeholder above (#171).
+                            b.add_warning(crate::core::diagnostics::warning(
+                                LATEX_WARNING_SOURCE,
+                                "A figure environment without \\includegraphics was skipped; \
+                                 its body and caption are missing from the extracted text",
+                            ));
                         }
                         i = new_i;
                         continue;
@@ -562,7 +556,6 @@ impl LatexExtractor {
                         let (env_content, new_i) = collect_environment(&lines, i, &env_name);
                         let formula_text = format!("\\begin{{{}}}\n{}\\end{{{}}}", env_name, env_content, env_name);
                         let idx = b.push_formula(&formula_text, None, None);
-                        // Check for \label inside math environments
                         if let Some(lbl) = Self::extract_label(&env_content) {
                             b.set_anchor(idx, &lbl);
                         }
@@ -583,7 +576,6 @@ impl LatexExtractor {
                     "quote" | "quotation" => {
                         let (env_content, new_i) = collect_environment(&lines, i, &env_name);
                         b.push_quote_start();
-                        // Recursively process the quote content
                         let inner_lines: Vec<&str> = env_content.lines().collect();
                         Self::build_internal_body(&mut b, &inner_lines, heading_map, inject_placeholders);
                         b.push_quote_end();
@@ -592,7 +584,6 @@ impl LatexExtractor {
                     }
                     "obeylines" => {
                         let (env_content, new_i) = collect_environment(&lines, i, &env_name);
-                        // Process content line by line preserving line breaks
                         for line in env_content.lines() {
                             let line_trimmed = line.trim();
                             if !line_trimmed.is_empty() {
@@ -606,13 +597,11 @@ impl LatexExtractor {
                         continue;
                     }
                     "center" => {
-                        // \begin{center}\rule{...}{...}\end{center} is a horizontal rule
                         let (env_content, new_i) = collect_environment(&lines, i, "center");
                         let content_trimmed = env_content.trim();
                         if content_trimmed.starts_with("\\rule{") || content_trimmed.starts_with("\\rule ") {
                             b.push_paragraph("---", vec![], None, None);
                         } else {
-                            // Process center content normally
                             let inner_lines: Vec<&str> = env_content.lines().collect();
                             Self::build_internal_body(&mut b, &inner_lines, heading_map, inject_placeholders);
                         }
@@ -620,7 +609,6 @@ impl LatexExtractor {
                         continue;
                     }
                     _ => {
-                        // For unknown environments, try to extract text content
                         let (env_content, new_i) = collect_environment(&lines, i, &env_name);
                         let inner_lines: Vec<&str> = env_content.lines().collect();
                         Self::build_internal_body(&mut b, &inner_lines, heading_map, inject_placeholders);
@@ -649,7 +637,6 @@ impl LatexExtractor {
         while i < lines.len() {
             let trimmed = lines[i].trim();
 
-            // Handle environments
             if (trimmed.contains("\\begin{") || trimmed.contains("\\begin {"))
                 && let Some(env_name) = extract_env_name(trimmed)
             {
@@ -663,11 +650,20 @@ impl LatexExtractor {
                         i = new_i;
                         continue;
                     }
-                    "tabular" => {
-                        let (env_content, new_i) = collect_environment(lines, i, "tabular");
+                    "tabular" | "longtable" | "tabularx" | "tabulary" => {
+                        let (env_content, new_i) = collect_environment(lines, i, &env_name);
                         let cells = Self::parse_tabular_cells(&env_content);
                         if !cells.is_empty() {
-                            b.push_table_from_cells(&cells, None, None);
+                            let caption = Self::extract_caption(&env_content);
+                            let label = Self::extract_label(&env_content);
+                            let idx = b.push_table_from_cells(&cells, None, None);
+                            if let Some(lbl) = label {
+                                b.set_anchor(idx, &lbl);
+                            }
+                            if let Some(cap) = caption {
+                                let cap_idx = b.push_paragraph(&cap, vec![], None, None);
+                                b.push_relationship(cap_idx, RelationshipTarget::Index(idx), RelationshipKind::Caption);
+                            }
                         }
                         i = new_i;
                         continue;
@@ -763,6 +759,39 @@ impl LatexExtractor {
         "VerbatimFootnotes",
     ];
 
+    /// If `trimmed` is an `\input{file}` or `\include{file}` command, return the
+    /// command name and the referenced file argument.
+    ///
+    /// Both commands are in [`Self::SKIP_COMMANDS`] because this extractor works
+    /// line-by-line over a single file and has no way to resolve or read the
+    /// referenced file — so the entire referenced document's content vanishes
+    /// with no trace (#171). That is a real, guaranteed loss on every match, not
+    /// a heuristic, so it is always worth naming.
+    fn extract_input_include_target(trimmed: &str) -> Option<(&'static str, String)> {
+        let after_backslash = trimmed.strip_prefix('\\')?;
+        // Match the command-name boundary exactly as `is_skip_command` does, so
+        // `\inputenc{...}` (a real, unrelated command) is never mistaken for
+        // `\input{...}`.
+        let cmd_end = after_backslash
+            .find(|c: char| !c.is_alphabetic())
+            .unwrap_or(after_backslash.len());
+        let cmd = match &after_backslash[..cmd_end] {
+            "input" => "input",
+            "include" => "include",
+            _ => return None,
+        };
+        let after = after_backslash[cmd_end..].trim_start();
+        let target = if let Some(braced) = after.strip_prefix('{') {
+            braced.split('}').next()?.trim()
+        } else {
+            after.trim()
+        };
+        if target.is_empty() {
+            return None;
+        }
+        Some((cmd, target.to_string()))
+    }
+
     /// Check if a line starts with a command that should be silently skipped.
     fn is_skip_command(trimmed: &str) -> bool {
         if !trimmed.starts_with('\\') {
@@ -787,12 +816,21 @@ impl LatexExtractor {
             return;
         }
 
-        // Skip known non-content commands
+        if let Some((cmd, target)) = Self::extract_input_include_target(trimmed) {
+            b.add_warning(crate::core::diagnostics::warning(
+                LATEX_WARNING_SOURCE,
+                format!(
+                    "\\{cmd}{{{target}}} references an external file that was not read; \
+                     its content is missing from the extracted text"
+                ),
+            ));
+            return;
+        }
+
         if Self::is_skip_command(trimmed) {
             return;
         }
 
-        // Handle heading commands
         if let Some(after_backslash) = trimmed.strip_prefix('\\') {
             let cmd_end = after_backslash
                 .find(|c: char| c == '{' || c == '[' || c.is_whitespace())
@@ -804,9 +842,7 @@ impl LatexExtractor {
                     if let Some(title) = extract_heading_title(trimmed, cmd_name) {
                         let (title_text, title_anns) = Self::strip_inline_commands(&title);
                         let idx = b.push_heading(level, &title_text, None, None);
-                        // Store heading annotations
                         if !title_anns.is_empty() {
-                            // Push annotations via a helper if available, or store on heading
                             for ann in &title_anns {
                                 if let AnnotationKind::Link { url, .. } = &ann.kind
                                     && !url.is_empty()
@@ -827,7 +863,6 @@ impl LatexExtractor {
             }
         }
 
-        // \includegraphics outside figure
         if trimmed.contains("\\includegraphics")
             && let Some(path) = Self::extract_includegraphics_path(trimmed)
         {
@@ -838,12 +873,9 @@ impl LatexExtractor {
             return;
         }
 
-        // \ref{} → CrossReference
         Self::extract_refs(trimmed, b, "\\ref{", RelationshipKind::CrossReference);
-        // \cite{} → CitationReference
         Self::extract_refs(trimmed, b, "\\cite{", RelationshipKind::CitationReference);
 
-        // Display math \[...\]
         if trimmed.starts_with("\\[") {
             let mut math_content = trimmed.to_string();
             if !trimmed.contains("\\]") {
@@ -864,7 +896,6 @@ impl LatexExtractor {
             return;
         }
 
-        // All other content: extract footnotes, then strip inline commands
         let mut line_text = trimmed.to_string();
         while let Some(fn_start) = line_text.find("\\footnote{") {
             let after = &line_text[fn_start + "\\footnote{".len()..];
@@ -887,7 +918,6 @@ impl LatexExtractor {
             let (text, annotations) = Self::strip_inline_commands(line_text);
             let text = text.trim();
             if !text.is_empty() {
-                // Extract URIs from link annotations
                 for ann in &annotations {
                     if let AnnotationKind::Link { url, .. } = &ann.kind
                         && !url.is_empty()
@@ -919,11 +949,9 @@ impl LatexExtractor {
             let abs_pos = search_from + pos;
             let after = &text[abs_pos + prefix.len()..];
             if let Some((key, consumed)) = Self::read_braced_content(after) {
-                // For \cite, handle comma-separated keys
                 let keys: Vec<&str> = key.split(',').map(|k| k.trim()).collect();
                 for k in keys {
                     if !k.is_empty() {
-                        // Push a reference marker element
                         let ref_text = format!("[{}]", k);
                         let idx = b.push_paragraph(&ref_text, vec![], None, None);
                         b.push_relationship(idx, RelationshipTarget::Key(k.to_string()), kind);
@@ -944,7 +972,6 @@ impl LatexExtractor {
         while i < all_lines.len() {
             let trimmed = all_lines[i].trim();
 
-            // Handle nested list environments
             if (trimmed.contains("\\begin{itemize}")
                 || trimmed.contains("\\begin{enumerate}")
                 || trimmed.contains("\\begin{description}"))
@@ -962,7 +989,6 @@ impl LatexExtractor {
             if trimmed.starts_with("\\item") {
                 let after = trimmed.strip_prefix("\\item").unwrap_or("").trim();
 
-                // Collect continuation lines (lines until next \item, \begin, or \end)
                 let mut item_parts = Vec::new();
                 let first_part = if after.starts_with('[') {
                     if let Some(bracket_end) = after.find(']') {
@@ -984,7 +1010,6 @@ impl LatexExtractor {
                     item_parts.push(first_part);
                 }
 
-                // Collect continuation lines
                 i += 1;
                 while i < all_lines.len() {
                     let next = all_lines[i].trim();
@@ -1011,21 +1036,23 @@ impl LatexExtractor {
                 continue;
             }
 
-            // Skip non-item lines (empty, comments, setcounter, etc.)
             i += 1;
         }
     }
 
-    /// Parse tabular cells from environment content.
+    /// Parse table cells from `tabular`, `longtable`, `tabularx`, or
+    /// `tabulary` environment content.
+    ///
+    /// All four environments share the same `&`-separated cell / `\\`-terminated
+    /// row grid; they differ only in their column-spec argument syntax (already
+    /// stripped out by [`collect_environment`]) and in `longtable`'s extra
+    /// page-break markers (`\endhead`, `\endfoot`, ...), which are skipped via
+    /// [`utilities::is_table_structural_line`].
     fn parse_tabular_cells(content: &str) -> Vec<Vec<String>> {
         let mut rows = Vec::new();
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("\\hline")
-                || trimmed.is_empty()
-                || trimmed.contains("\\begin{tabular}")
-                || trimmed.contains("\\end{tabular}")
-            {
+            if utilities::is_table_structural_line(trimmed) {
                 continue;
             }
             let row_str = trimmed.replace("\\\\", "").replace("\\hline", "");
@@ -1043,7 +1070,6 @@ impl LatexExtractor {
 
     /// Extract language from code environment options.
     fn extract_code_language(begin_line: &str) -> Option<&str> {
-        // \begin{lstlisting}[language=Python] or \begin{minted}{python}
         if let Some(lang_pos) = begin_line.find("language=") {
             let after = &begin_line[lang_pos + 9..];
             let end = after.find([',', ']', '}']).unwrap_or(after.len());
@@ -1052,7 +1078,6 @@ impl LatexExtractor {
                 return Some(lang);
             }
         }
-        // \begin{minted}{python}
         if begin_line.contains("minted")
             && let Some(brace_start) = begin_line.rfind('{')
         {
@@ -1203,7 +1228,6 @@ mod tests {
         let (text, anns) = LatexExtractor::strip_inline_commands("\\textbf{\\emph{nested}}");
         assert_eq!(text, "nested");
         assert_eq!(anns.len(), 2);
-        // Both annotations should cover the same range
         assert!(anns.iter().any(|a| matches!(a.kind, AnnotationKind::Bold)));
         assert!(anns.iter().any(|a| matches!(a.kind, AnnotationKind::Italic)));
     }
@@ -1284,6 +1308,119 @@ mod tests {
         assert!(
             !has_image,
             "expected no image placeholder with inject_placeholders=false"
+        );
+    }
+
+    fn latex_warnings(doc: &InternalDocument) -> Vec<String> {
+        doc.processing_warnings
+            .iter()
+            .filter(|w| w.source == LATEX_WARNING_SOURCE)
+            .map(|w| w.message.to_string())
+            .collect()
+    }
+
+    /// #171: `\input`/`\include` are silently skipped because this extractor
+    /// only ever sees a single in-memory file; the referenced file's content
+    /// never appears anywhere in the output.
+    #[test]
+    fn should_warn_when_latex_input_command_is_skipped() {
+        let latex = r#"\documentclass{article}
+\begin{document}
+\input{chapter1}
+\end{document}"#;
+        let doc = LatexExtractor::build_internal_document(latex, true);
+
+        let warnings = latex_warnings(&doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one latex warning, got {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("\\input{chapter1}") && warnings[0].contains("was not read"),
+            "warning must name the skipped \\input target, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn should_warn_when_latex_include_command_is_skipped() {
+        let latex = r#"\documentclass{article}
+\begin{document}
+\include{appendix}
+\end{document}"#;
+        let doc = LatexExtractor::build_internal_document(latex, true);
+
+        let warnings = latex_warnings(&doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one latex warning, got {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("\\include{appendix}"),
+            "warning must name the skipped \\include target, got {warnings:?}"
+        );
+    }
+
+    /// A document with no `\input`/`\include` must not warn.
+    #[test]
+    fn should_not_warn_for_latex_document_without_input_or_include() {
+        let latex = r#"\documentclass{article}
+\begin{document}
+\section{Introduction}
+Plain body text.
+\end{document}"#;
+        let doc = LatexExtractor::build_internal_document(latex, true);
+
+        assert!(
+            latex_warnings(&doc).is_empty(),
+            "a document without \\input/\\include must not warn, got {:?}",
+            latex_warnings(&doc)
+        );
+    }
+
+    /// #171: a `figure` environment with no `\includegraphics` (a caption-only
+    /// figure, a `\resizebox`'d graphic, a sub-figure wrapper, ...) previously
+    /// vanished with no trace — the arm's only other output path is the image
+    /// placeholder.
+    #[test]
+    fn should_warn_when_latex_figure_without_includegraphics_is_skipped() {
+        let latex = r#"\documentclass{article}
+\begin{document}
+\begin{figure}
+\caption{A figure with no graphic}
+\end{figure}
+\end{document}"#;
+        let doc = LatexExtractor::build_internal_document(latex, true);
+
+        let warnings = latex_warnings(&doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one latex warning, got {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("figure environment without \\includegraphics"),
+            "warning must describe the skipped figure, got {warnings:?}"
+        );
+    }
+
+    /// A figure that does contain `\includegraphics` must not warn.
+    #[test]
+    fn should_not_warn_for_latex_figure_with_includegraphics() {
+        let latex = r#"\documentclass{article}
+\begin{document}
+\begin{figure}
+\includegraphics{photo.png}
+\caption{A photo}
+\end{figure}
+\end{document}"#;
+        let doc = LatexExtractor::build_internal_document(latex, true);
+
+        assert!(
+            latex_warnings(&doc).is_empty(),
+            "a figure with \\includegraphics must not warn, got {:?}",
+            latex_warnings(&doc)
         );
     }
 }

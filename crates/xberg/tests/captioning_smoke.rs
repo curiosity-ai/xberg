@@ -11,6 +11,7 @@
 //!   --test captioning_smoke -- --nocapture --test-threads=1
 //! ```
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(all(feature = "captioning", not(target_os = "windows")))]
 
 mod helpers;
@@ -50,7 +51,6 @@ fn captioning_config(model: &str, api_key: String) -> CaptioningConfig {
     CaptioningConfig {
         llm: llm(model, api_key),
         prompt: None,
-        // The test PDF may contain small images; allow anything non-zero through.
         min_image_area: 0,
     }
 }
@@ -64,9 +64,6 @@ async fn run_captioning_against_pdf(model: &str, api_key: String) {
         }),
         ..Default::default()
     };
-    // Ensure the captioning post-processor is registered for this test
-    // (the orchestrator wires `register_builtin()` later; the smoke test
-    // explicitly registers so it can verify behaviour in isolation).
     xberg::plugins::processor::builtin::register_builtin().expect("register_builtin failed");
 
     let result = extract_uri_document(IMAGES_PDF, None, &config)
@@ -127,7 +124,6 @@ async fn captioning_post_processor_is_noop_without_images() {
         ..Default::default()
     };
 
-    // No images vector at all.
     let mut result = ExtractedDocument::default();
     result.content = String::new();
     result.mime_type = Cow::Borrowed("text/plain");
@@ -137,7 +133,6 @@ async fn captioning_post_processor_is_noop_without_images() {
         .expect("processor must succeed on result without images");
     assert!(result.llm_usage.is_none(), "no images means no usage rows");
 
-    // Empty images vector.
     result.images = Some(Vec::new());
     CaptioningProcessor
         .process(&mut result, &cfg)

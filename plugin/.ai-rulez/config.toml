@@ -1,0 +1,45 @@
+version = "4.0"
+name = "xberg"
+description = "Local document extraction: text, tables, metadata, images from 101 formats with optional OCR."
+
+[plugin]
+name = "xberg"
+version = "1.1.0"
+display_name = "Xberg"
+description = "Local document extraction: text, tables, metadata, images from 101 formats with optional OCR."
+homepage = "https://xberg.io"
+repository = "https://github.com/xberg-io/xberg"
+license = "MIT"
+category = "document-intelligence"
+brand_color = "#1F6FEB"
+icon = "./assets/icon.svg"
+logo = "./assets/logo.png"
+keywords = ["document-intelligence", "extraction", "ocr", "pdf", "tables"]
+
+[plugin.author]
+name = "Kreuzberg, Inc."
+email = "contact@xberg.io"
+url = "https://xberg.io"
+
+[[plugin.mcp]]
+name = "xberg"
+command = "${PLUGIN_ROOT}/scripts/mcp-launch.sh"
+args = ["mcp", "--transport", "stdio"]
+
+[plugin.interface]
+display_name = "Xberg"
+short_description = "Local document extraction for 101 formats"
+long_description = "Extract text, tables, metadata, and images from PDFs, Office files, images, HTML, email, archives, and academic formats. Runs locally via the xberg CLI and an auto-registered MCP server. Plugin ships skills covering the CLI surface, OCR backends, table extraction, and output-format selection."
+developer_name = "Kreuzberg, Inc."
+category = "document-intelligence"
+capabilities = ["Read"]
+default_prompt = ["Extract text from this PDF", "OCR a scanned image", "List supported formats"]
+website_url = "https://xberg.io"
+privacy_policy_url = "https://xberg.io/privacy"
+terms_of_service_url = "https://xberg.io/terms"
+composer_icon = "./assets/icon.svg"
+logo = "./assets/logo.png"
+brand_color = "#1F6FEB"
+
+[plugin.gemini]
+context_file_name = "GEMINI.md"

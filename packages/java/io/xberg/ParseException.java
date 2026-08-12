@@ -5,15 +5,13 @@ package io.xberg;
  * The file is not valid JSON.
  */
 public class ParseException extends LoadErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new ParseException with the given message. */
-    public ParseException(final String message) {
-        super(message);
-    }
+  /** Creates a new ParseException with the given message. */
+  public ParseException(final String message) { super(message); }
 
-    /** Creates a new ParseException with the given message and cause. */
-    public ParseException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new ParseException with the given message and cause. */
+  public ParseException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

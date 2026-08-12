@@ -2,6 +2,12 @@
 	"id": "ocr_backends_clear",
 	"category": "ocr_backend_management",
 	"description": "Clear all OCR backends and verify list is empty",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "Clear all OCR backends and verify list is empty",
+		"description": "Clear all OCR backends and verify list is empty",
+		"side_effects": "safe"
+	},
 	"tags": ["ocr", "plugin_management", "clear", "trait-bridge"],
 	"call": "clear_ocr_backends",
 	"assertions": [

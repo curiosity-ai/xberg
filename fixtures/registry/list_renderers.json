@@ -2,6 +2,12 @@
 	"id": "list_renderers",
 	"category": "registry",
 	"description": "List renderers",
+	"docs": {
+		"topic": "registry",
+		"title": "List renderers",
+		"description": "List renderers",
+		"side_effects": "safe"
+	},
 	"tags": ["registry"],
 	"call": "list_renderers",
 	"input": {},

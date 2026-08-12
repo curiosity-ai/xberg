@@ -1,7 +1,6 @@
 //! Renderer registry.
 
 use crate::plugins::{InternalRenderer, Plugin, Renderer};
-use crate::types::ExtractedDocument;
 use crate::types::internal::InternalDocument;
 use crate::{Result, XbergError};
 use ahash::AHashMap;
@@ -36,7 +35,20 @@ impl RegisteredRenderer {
             return internal.render(doc);
         }
 
-        let result = ExtractedDocument::from(doc.clone());
+        // Public renderers only ever see `ExtractedDocument`. The plain `From` conversion
+        // derives without document structure and never fills in `elements`, which strips
+        // every layout signal a renderer needs. Derive the structure tree explicitly and
+        // attach both the element list and the source document so a foreign renderer can
+        // do layout-aware rendering.
+        let mut result = crate::extraction::derive::derive_extraction_result(
+            doc.clone(),
+            true,
+            crate::core::config::OutputFormat::Plain,
+        );
+        result.internal_document = Some(doc.clone());
+        result.elements = Some(crate::extraction::transform::transform_extraction_result_to_elements(
+            &result,
+        ));
         self.renderer.render_result(&result)
     }
 }
@@ -86,6 +98,36 @@ impl InternalRenderer for DjotRenderer {
     }
 }
 
+/// Built-in Docling DocTags renderer.
+struct DocTagsRenderer;
+
+impl Plugin for DocTagsRenderer {
+    fn name(&self) -> &str {
+        "doctags"
+    }
+}
+
+impl InternalRenderer for DocTagsRenderer {
+    fn render(&self, doc: &InternalDocument) -> Result<String> {
+        Ok(crate::rendering::render_doctags(doc))
+    }
+}
+
+/// Built-in Graphviz DOT renderer.
+struct DotRenderer;
+
+impl Plugin for DotRenderer {
+    fn name(&self) -> &str {
+        "dot"
+    }
+}
+
+impl InternalRenderer for DotRenderer {
+    fn render(&self, doc: &InternalDocument) -> Result<String> {
+        Ok(crate::rendering::render_dot(doc))
+    }
+}
+
 /// Built-in plain text renderer.
 struct PlainRenderer;
 
@@ -117,7 +159,7 @@ impl InternalRenderer for PlainRenderer {
 ///
 /// let registry = RendererRegistry::new();
 /// let available = registry.list();
-/// // Built-in renderers: "markdown", "html", "djot", "plain"
+/// // Built-in renderers: "markdown", "html", "djot", "doctags", "dot", "plain"
 /// ```
 #[cfg_attr(alef, alef(skip))]
 pub struct RendererRegistry {
@@ -131,6 +173,8 @@ impl RendererRegistry {
     /// - `markdown` — GFM Markdown (via comrak)
     /// - `html` — HTML5 (via comrak)
     /// - `djot` — Djot markup
+    /// - `doctags` — Docling DocTags (tables as OTSL)
+    /// - `dot` — Graphviz DOT (diagrams recovered from vector sources)
     /// - `plain` — Plain text (no formatting)
     pub fn new() -> Self {
         let mut registry = Self {
@@ -152,8 +196,6 @@ impl RendererRegistry {
 
     /// Register built-in renderers.
     fn register_builtins(&mut self) {
-        // Built-in renderers do not go through validate_plugin_name
-        // since they are known-good names.
         self.renderers.insert(
             "markdown".to_string(),
             RegisteredRenderer::internal(Arc::new(MarkdownRenderer)),
@@ -162,6 +204,12 @@ impl RendererRegistry {
             .insert("html".to_string(), RegisteredRenderer::internal(Arc::new(HtmlRenderer)));
         self.renderers
             .insert("djot".to_string(), RegisteredRenderer::internal(Arc::new(DjotRenderer)));
+        self.renderers.insert(
+            "doctags".to_string(),
+            RegisteredRenderer::internal(Arc::new(DocTagsRenderer)),
+        );
+        self.renderers
+            .insert("dot".to_string(), RegisteredRenderer::internal(Arc::new(DotRenderer)));
         self.renderers.insert(
             "plain".to_string(),
             RegisteredRenderer::internal(Arc::new(PlainRenderer)),
@@ -292,6 +340,7 @@ mod tests {
         assert!(names.contains(&"markdown".to_string()));
         assert!(names.contains(&"html".to_string()));
         assert!(names.contains(&"djot".to_string()));
+        assert!(names.contains(&"doctags".to_string()));
         assert!(names.contains(&"plain".to_string()));
     }
 
@@ -421,8 +470,6 @@ mod tests {
         let doc = InternalDocument::new("text/plain");
 
         let result = registry.render("markdown", &doc).unwrap();
-        // Should not panic; empty doc produces empty or minimal output
-        // Verify rendering succeeds without panic
         let _ = result;
     }
 
@@ -432,7 +479,6 @@ mod tests {
         let doc = InternalDocument::new("text/plain");
 
         let result = registry.render("html", &doc).unwrap();
-        // Verify rendering succeeds without panic
         let _ = result;
     }
 
@@ -442,8 +488,16 @@ mod tests {
         let doc = InternalDocument::new("text/plain");
 
         let result = registry.render("djot", &doc).unwrap();
-        // Verify rendering succeeds without panic
         let _ = result;
+    }
+
+    #[test]
+    fn test_renderer_registry_builtin_doctags_renders() {
+        let registry = RendererRegistry::new();
+        let doc = InternalDocument::new("text/plain");
+
+        let result = registry.render("doctags", &doc).unwrap();
+        assert_eq!(result, "<doctag></doctag>");
     }
 
     #[test]
@@ -452,7 +506,6 @@ mod tests {
         let doc = InternalDocument::new("text/plain");
 
         let result = registry.render("plain", &doc).unwrap();
-        // Verify rendering succeeds without panic
         let _ = result;
     }
 }

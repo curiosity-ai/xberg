@@ -18,10 +18,6 @@ pub(crate) fn build_document_structure(html: &str) -> DocumentStructure {
     builder.build()
 }
 
-// ---------------------------------------------------------------------------
-// Internal parser state
-// ---------------------------------------------------------------------------
-
 /// Tracks the kind of inline formatting active at a given byte offset.
 #[derive(Debug, Clone)]
 struct InlineSpan {
@@ -158,12 +154,10 @@ struct HtmlWalker<'a, 'b> {
     pos: usize,
     builder: &'b mut DocumentStructureBuilder,
 
-    // Paragraph / inline accumulation
     text_buf: String,
     inline_stack: Vec<InlineSpan>,
     annotations: Vec<TextAnnotation>,
 
-    // Container state
     in_pre: bool,
     pre_block: Option<PreBlock>,
     table: Option<TableAccumulator>,
@@ -179,7 +173,6 @@ struct HtmlWalker<'a, 'b> {
     in_head: bool,
     meta_entries: Vec<(String, String)>,
 
-    // CSS class tracking for the last opened element
     pending_classes: Option<String>,
 }
 
@@ -210,14 +203,9 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Top-level walk
-    // -----------------------------------------------------------------------
-
     fn walk(&mut self) {
         while self.pos < self.src.len() {
             if self.src[self.pos..].starts_with("<!--") {
-                // Skip HTML comments
                 if let Some(end) = self.src[self.pos..].find("-->") {
                     self.pos += end + 3;
                 } else {
@@ -234,10 +222,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         }
         self.flush_paragraph();
     }
-
-    // -----------------------------------------------------------------------
-    // Text accumulation
-    // -----------------------------------------------------------------------
 
     fn handle_text(&mut self) {
         let start = self.pos;
@@ -283,13 +267,8 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         self.text_buf.push_str(&decoded);
     }
 
-    // -----------------------------------------------------------------------
-    // Tag handling
-    // -----------------------------------------------------------------------
-
     fn handle_tag(&mut self) {
         let tag_start = self.pos;
-        // Find closing >
         let Some(end) = self.src[self.pos..].find('>') else {
             self.pos = self.src.len();
             return;
@@ -297,7 +276,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         let tag_content = &self.src[self.pos + 1..self.pos + end];
         self.pos += end + 1;
 
-        // Self-closing or doctype / processing instruction
         if tag_content.starts_with('!') || tag_content.starts_with('?') {
             return;
         }
@@ -305,10 +283,8 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         let is_closing = tag_content.starts_with('/');
         let content = if is_closing { &tag_content[1..] } else { tag_content };
 
-        // Strip trailing / for self-closing tags like <br/>
         let content = content.trim_end_matches('/').trim();
 
-        // Split into tag name and attributes
         let (tag_name, attrs_str) = split_tag_name(content);
         let tag_lower = tag_name.to_ascii_lowercase();
 
@@ -320,11 +296,10 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         }
     }
 
-    fn handle_open_tag(&mut self, tag: &str, attrs_str: &str, _is_self_closing: bool) {
+    fn handle_open_tag(&mut self, tag: &str, attrs_str: &str, is_self_closing: bool) {
         match tag {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.flush_paragraph();
-                // We'll collect heading text until closing tag
                 self.text_buf.clear();
                 self.annotations.clear();
                 self.pending_classes = extract_attr(attrs_str, "class").map(|s| s.to_string());
@@ -341,9 +316,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                 } else if self.in_list_item {
                     self.list_item_text.push('\n');
                 } else {
-                    // Use sentinel \x01 to mark intentional line breaks from <br> tags.
-                    // normalize_whitespace will convert these to real newlines while
-                    // collapsing all other whitespace (including source HTML newlines).
                     self.text_buf.push('\x01');
                 }
             }
@@ -351,7 +323,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             "em" | "i" => self.push_inline(InlineKind::Italic),
             "code" => {
                 if self.in_pre {
-                    // <pre><code> — start collecting code block
                     let lang = extract_attr(attrs_str, "class").and_then(|c| extract_language_from_class(c));
                     self.pre_block = Some(PreBlock {
                         language: lang.map(|s| s.to_string()),
@@ -374,7 +345,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             "pre" => {
                 self.flush_paragraph();
                 self.in_pre = true;
-                // If no <code> child, we still accumulate
                 self.pre_block = Some(PreBlock {
                     language: None,
                     text: String::new(),
@@ -383,7 +353,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             "blockquote" => {
                 self.flush_paragraph();
                 let idx = self.builder.push_quote(None);
-                // Store cite attribute if present
                 if let Some(cite) = extract_attr(attrs_str, "cite") {
                     let mut attrs = AHashMap::new();
                     attrs.insert("cite".to_string(), cite.to_string());
@@ -398,7 +367,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             "ol" => {
                 self.flush_paragraph();
                 let idx = self.builder.push_list(true, None);
-                // Store start attribute if present
                 if let Some(start_val) = extract_attr(attrs_str, "start") {
                     let mut attrs = AHashMap::new();
                     attrs.insert("start".to_string(), start_val.to_string());
@@ -439,7 +407,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                 let width = extract_attr(attrs_str, "width").map(|s| s.to_string());
                 let height = extract_attr(attrs_str, "height").map(|s| s.to_string());
 
-                // If inside a <figure>, accumulate rather than emitting immediately
                 if let Some(ref mut fig) = self.figure {
                     fig.img_alt = alt.map(|s| s.to_string());
                     fig.img_src = src;
@@ -486,14 +453,12 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                 });
             }
             "dt" => {
-                // Flush any previous dd
                 self.flush_definition_item();
                 self.in_dt = true;
                 self.dt_text.clear();
             }
             "dd" => {
                 self.in_dt = false;
-                // Store the term text we just collected
                 if let Some(ref mut dl) = self.def_list {
                     let term = normalize_whitespace(&self.dt_text);
                     if !term.is_empty() {
@@ -516,7 +481,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                 }
             }
             "script" | "style" => {
-                // Skip content — find closing tag
                 let close_tag = format!("</{tag}>");
                 if let Some(close_pos) = self.src[self.pos..].find(&close_tag) {
                     let block_content = &self.src[self.pos..self.pos + close_pos];
@@ -527,25 +491,35 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                 }
             }
             "video" | "audio" => {
-                // Skip entire element including fallback text children.
-                // EPUB files embed fallback text like "Your Reading System does
-                // not support..." which should never appear in extracted content.
                 let close_tag = format!("</{tag}>");
                 if let Some(close_pos) = self.src[self.pos..].find(&close_tag) {
                     self.pos += close_pos + close_tag.len();
                 }
             }
+            "math" => {
+                self.flush_paragraph();
+                if !is_self_closing {
+                    let close_tag = "</math>";
+                    if let Some(close_pos) = self.src[self.pos..].find(close_tag) {
+                        let inner = &self.src[self.pos..self.pos + close_pos];
+                        let raw_xml = if attrs_str.is_empty() {
+                            format!("<math>{inner}</math>")
+                        } else {
+                            format!("<math {attrs_str}>{inner}</math>")
+                        };
+                        self.pos += close_pos + close_tag.len();
+                        if let Some(latex) = convert_math_subtree_to_latex(&raw_xml) {
+                            self.builder.push_formula(&latex, None);
+                        }
+                    }
+                }
+            }
             "hr" => {
                 self.flush_paragraph();
-                // HR is just a separator; we don't have a dedicated node type,
-                // so we skip it.
             }
-            // Block-level structural containers: flush any accumulated text
-            // so that each block boundary produces a paragraph break.
             "div" | "section" | "article" | "main" | "aside" | "header" | "footer" | "nav" | "details" | "summary" => {
                 self.flush_paragraph();
             }
-            // Inline / root-level elements we pass through without flushing
             "span" | "html" | "body" | "title" | "link" => {}
             _ => {}
         }
@@ -575,7 +549,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             "em" | "i" => self.pop_inline(InlineKind::Italic),
             "code" => {
                 if self.in_pre {
-                    // End of <pre><code> — handled in </pre>
                 } else {
                     self.pop_inline(InlineKind::Code);
                 }
@@ -586,7 +559,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             "sup" => self.pop_inline(InlineKind::Superscript),
             "mark" => self.pop_inline(InlineKind::Highlight),
             "a" => {
-                // Pop the link inline — we need to find it on the stack
                 self.pop_inline_link();
             }
             "pre" => {
@@ -611,7 +583,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             }
             "table" => {
                 if let Some(mut table) = self.table.take() {
-                    // Close any open row/cell
                     table.close_cell();
                     table.close_row();
                     if !table.rows.is_empty() {
@@ -638,12 +609,16 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                 self.in_dt = false;
             }
             "dd" => {
-                self.in_dd = false;
+                // `flush_definition_item` gates its `dd` branch on `self.in_dd` still being
+                // `true` (it's what tells it there's a pending definition to push) — it must
+                // run before that flag is cleared, or the definition item is silently
+                // dropped (issue #127: this was the actual reason `<dl>/<dt>/<dd>` content
+                // never reached `DefinitionItem` nodes at all).
                 self.flush_definition_item();
+                self.in_dd = false;
             }
             "figure" => {
                 if let Some(fig) = self.figure.take() {
-                    // Use caption as description if present, otherwise use alt text
                     let desc = fig
                         .caption
                         .as_deref()
@@ -678,7 +653,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                     self.builder.push_metadata_block(entries, None);
                 }
             }
-            // Block-level structural containers: flush accumulated text on close
             "div" | "section" | "article" | "main" | "aside" | "header" | "footer" | "nav" | "details" | "summary" => {
                 self.flush_paragraph();
             }
@@ -691,16 +665,10 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         use crate::types::document_structure::{GridCell, TableGrid};
 
         let num_rows = rows.len() as u32;
-        let num_cols = rows
-            .iter()
-            .map(|r| r.iter().map(|c| c.col_span).sum::<u32>())
-            .max()
-            .unwrap_or(0);
 
         let has_spans = rows.iter().any(|r| r.iter().any(|c| c.col_span > 1 || c.row_span > 1));
 
         if !has_spans {
-            // Fast path: no spans, use simple grid
             let simple: Vec<Vec<String>> = rows
                 .iter()
                 .map(|r| r.iter().map(|c| c.text.clone()).collect())
@@ -710,33 +678,30 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         }
 
         let mut grid_cells = Vec::new();
-        for (row_idx, row) in rows.iter().enumerate() {
-            let mut col_offset: u32 = 0;
-            for cell in row {
+        let cols = crate::extraction::grid_flatten::resolve_span_grid(
+            rows,
+            |c| c.col_span,
+            |c| c.row_span,
+            |row_idx, col, cell| {
                 grid_cells.push(GridCell {
                     content: cell.text.clone(),
-                    row: row_idx as u32,
-                    col: col_offset,
+                    row: row_idx,
+                    col,
                     row_span: cell.row_span,
                     col_span: cell.col_span,
                     is_header: cell.is_header,
                     bbox: None,
                 });
-                col_offset += cell.col_span;
-            }
-        }
+            },
+        );
 
         let grid = TableGrid {
             rows: num_rows,
-            cols: num_cols,
+            cols,
             cells: grid_cells,
         };
         self.builder.push_table(grid, None, None);
     }
-
-    // -----------------------------------------------------------------------
-    // Inline formatting helpers
-    // -----------------------------------------------------------------------
 
     fn push_inline(&mut self, kind: InlineKind) {
         let offset = if self.in_list_item {
@@ -751,7 +716,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
     }
 
     fn pop_inline(&mut self, expected: InlineKind) {
-        // Find the matching span on the stack (searching from top)
         let idx = self
             .inline_stack
             .iter()
@@ -785,8 +749,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                         end,
                         kind: crate::types::document_structure::AnnotationKind::Highlight,
                     },
-                    // INVARIANT: callers must use `pop_inline_link` for Link spans;
-                    // `pop_inline` must never be called with a Link variant.
                     InlineKind::Link { .. } => unreachable!("Links handled separately by pop_inline_link"),
                 };
                 self.annotations.push(annotation);
@@ -814,10 +776,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             }
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Flush helpers
-    // -----------------------------------------------------------------------
 
     fn flush_paragraph(&mut self) {
         let text = normalize_whitespace(&self.text_buf);
@@ -847,11 +805,9 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             self.builder.push_list_item(ctx.node_idx, &text, None);
         }
         self.list_item_text.clear();
-        // Annotations inside list items are not tracked yet (would need per-item annotations)
     }
 
     fn flush_definition_item(&mut self) {
-        // If we have a current dd accumulated, emit the definition item
         if self.in_dd {
             self.in_dd = false;
             if let Some(ref mut dl) = self.def_list {
@@ -862,7 +818,6 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             }
             self.dd_text.clear();
         }
-        // If we're still in dt, store the text for later
         if self.in_dt {
             self.in_dt = false;
             if let Some(ref mut dl) = self.def_list {
@@ -876,11 +831,28 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Utility functions
-// ---------------------------------------------------------------------------
-
 /// Split a tag body into (name, rest-of-attributes).
+/// Convert a raw `<math>...</math>` XHTML subtree to LaTeX via the shared
+/// MathML converter (`crate::extraction::mathml`, gated by the `office`
+/// feature). Returns `None` if the fragment fails to parse, converts to empty
+/// output, or the security budget is exhausted on hostile input.
+#[cfg(feature = "office")]
+fn convert_math_subtree_to_latex(raw_xml: &str) -> Option<String> {
+    let mut budget = crate::extractors::security::SecurityBudget::from_limits(
+        &crate::extractors::security::SecurityLimits::default(),
+    );
+    crate::extraction::mathml::convert_mathml_str_to_latex(raw_xml, &mut budget)
+        .ok()
+        .filter(|latex| !latex.trim().is_empty())
+}
+
+/// The `mathml` converter lives behind the `office` feature; without it, `math`
+/// elements are dropped rather than mangled into stray inline text.
+#[cfg(not(feature = "office"))]
+fn convert_math_subtree_to_latex(_raw_xml: &str) -> Option<String> {
+    None
+}
+
 fn split_tag_name(content: &str) -> (&str, &str) {
     let content = content.trim();
     if let Some(space_pos) = content.find(|c: char| c.is_ascii_whitespace()) {
@@ -895,8 +867,6 @@ fn split_tag_name(content: &str) -> (&str, &str) {
 /// Handles both `attr="value"` and `attr='value'` forms.
 fn extract_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
     let search = format!("{name}=");
-    // Find the attribute, ensuring it's not a suffix of another attribute name
-    // (e.g. searching for "class=" should not match "subclass=").
     let mut search_from = 0;
     let idx = loop {
         let candidate = attrs[search_from..].find(&search)?;
@@ -917,7 +887,6 @@ fn extract_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
         let end = rest.find(quote as char)?;
         Some(&rest[..end])
     } else {
-        // Unquoted — take until whitespace or >
         let end = after_eq
             .find(|c: char| c.is_ascii_whitespace() || c == '>')
             .unwrap_or(after_eq.len());
@@ -954,7 +923,6 @@ fn decode_entities(s: &str) -> String {
                 }
                 entity.push(ec);
                 if entity.len() > 10 {
-                    // Not a real entity, emit raw
                     out.push('&');
                     out.push_str(&entity);
                     entity.clear();
@@ -979,7 +947,6 @@ fn decode_entities(s: &str) -> String {
                 "laquo" => out.push('\u{00AB}'),
                 "raquo" => out.push('\u{00BB}'),
                 "hellip" => out.push('\u{2026}'),
-                // Common accented characters
                 "eacute" => out.push('\u{00E9}'),
                 "egrave" => out.push('\u{00E8}'),
                 "ecirc" => out.push('\u{00EA}'),
@@ -994,14 +961,12 @@ fn decode_entities(s: &str) -> String {
                 "uuml" => out.push('\u{00FC}'),
                 "ntilde" => out.push('\u{00F1}'),
                 "ccedil" => out.push('\u{00E7}'),
-                // Typographic
                 "ldquo" => out.push('\u{201C}'),
                 "rdquo" => out.push('\u{201D}'),
                 "lsquo" => out.push('\u{2018}'),
                 "rsquo" => out.push('\u{2019}'),
                 "bull" => out.push('\u{2022}'),
                 "middot" => out.push('\u{00B7}'),
-                // Currency and math
                 "euro" => out.push('\u{20AC}'),
                 "pound" => out.push('\u{00A3}'),
                 "yen" => out.push('\u{00A5}'),
@@ -1022,7 +987,6 @@ fn decode_entities(s: &str) -> String {
                             continue;
                         }
                     }
-                    // Unknown entity — preserve raw
                     out.push('&');
                     out.push_str(other);
                     out.push(';');
@@ -1042,17 +1006,15 @@ fn decode_entities(s: &str) -> String {
 /// while all other whitespace (including source HTML newlines) is collapsed.
 fn normalize_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut last_was_space = true; // trim leading
+    let mut last_was_space = true;
 
     for c in s.chars() {
         if c == '\x01' {
-            // Sentinel from <br> — convert to real newline.
-            // Trim trailing horizontal whitespace before the newline.
             while out.ends_with(' ') {
                 out.pop();
             }
             out.push('\n');
-            last_was_space = true; // trim leading whitespace on next line
+            last_was_space = true;
         } else if c.is_ascii_whitespace() {
             if !last_was_space {
                 out.push(' ');
@@ -1063,16 +1025,11 @@ fn normalize_whitespace(s: &str) -> String {
             last_was_space = false;
         }
     }
-    // Trim trailing space
     if out.ends_with(' ') {
         out.pop();
     }
     out
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1084,7 +1041,6 @@ mod tests {
         let html = "<h1>Title</h1><h2>Subtitle</h2>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // h1 group at root, h2 nested under it
         assert_eq!(doc.body_roots().count(), 1);
     }
 
@@ -1110,7 +1066,6 @@ mod tests {
         }
         assert_eq!(para.annotations.len(), 1);
         assert_eq!(para.annotations[0].kind, AnnotationKind::Bold);
-        // "Hello " = 6 bytes, "world" = 5 bytes -> bold at 6..11
         assert_eq!(para.annotations[0].start, 6);
         assert_eq!(para.annotations[0].end, 11);
     }
@@ -1159,11 +1114,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "office")]
+    fn test_math_converts_to_latex_formula_node() {
+        let html = r#"<p>Before</p><math xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mn>1</mn><mn>2</mn></mfrac></math><p>After</p>"#;
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        let formula = doc
+            .nodes
+            .iter()
+            .find_map(|node| match &node.content {
+                NodeContent::Formula { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("expected a Formula node");
+        assert_eq!(formula, "\\frac{1}{2}");
+
+        assert!(
+            doc.nodes
+                .iter()
+                .all(|node| !format!("{:?}", node.content).contains("mfrac")),
+            "raw MathML tag names must not leak into any node"
+        );
+    }
+
+    #[test]
     fn test_unordered_list() {
         let html = "<ul><li>One</li><li>Two</li><li>Three</li></ul>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // 1 list + 3 items
         assert_eq!(doc.len(), 4);
         match &doc.nodes[0].content {
             NodeContent::List { ordered } => assert!(!ordered),
@@ -1210,14 +1189,12 @@ mod tests {
 
     #[test]
     fn test_blockquote_with_divs() {
-        // Simulates EPUB verse structure: blockquote > div > div lines
         let html = r#"<div>Before</div>
 <blockquote><div><div>Line one</div><div>Line two</div></div></blockquote>
 <div>After</div>"#;
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok(), "validate: {:?}", doc.validate());
 
-        // Should have: Paragraph("Before"), Quote with children, Paragraph("After")
         let roots: Vec<_> = doc.body_roots().collect();
         println!("=== ALL NODES ===");
         for (i, node) in doc.nodes.iter().enumerate() {
@@ -1227,7 +1204,6 @@ mod tests {
             );
         }
 
-        // Find the Quote node
         let quote_idx = doc.nodes.iter().position(|n| matches!(n.content, NodeContent::Quote));
         assert!(
             quote_idx.is_some(),
@@ -1240,7 +1216,6 @@ mod tests {
             "Quote should have children with div content"
         );
 
-        // The paragraphs inside the blockquote should be children of the Quote
         let child_texts: Vec<_> = quote
             .children
             .iter()
@@ -1305,7 +1280,6 @@ mod tests {
         let html = "<h1>Top</h1><p>Intro</p><h2>Sub</h2><p>Detail</p><h1>Next</h1><p>More</p>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // Two h1 groups at root
         assert_eq!(doc.body_roots().count(), 2);
     }
 
@@ -1335,7 +1309,6 @@ mod tests {
         let html = "<script>var x = 1;</script><p>Content</p>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // Raw block + paragraph
         assert_eq!(doc.body_roots().count(), 2);
         match &doc.nodes[0].content {
             NodeContent::RawBlock { format, content } => {
@@ -1378,22 +1351,18 @@ mod tests {
 
     #[test]
     fn test_unclosed_tags() {
-        // Malformed HTML: unclosed <strong> should not crash
         let html = "<p>Hello <strong>bold text</p><p>Next paragraph</p>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // Should produce at least one paragraph
         assert!(!doc.is_empty());
     }
 
     #[test]
     fn test_nested_same_tags() {
-        // Nested <strong> tags
         let html = "<p><strong>outer <strong>inner</strong> text</strong></p>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
         let para = &doc.nodes[0];
-        // Both bold spans should be captured
         assert!(!para.annotations.is_empty());
     }
 
@@ -1402,7 +1371,6 @@ mod tests {
         let html = "<p>Before<br/>After</p><hr/><img src='x.png' alt='photo'/>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // Should have paragraph + image (hr is skipped)
         assert!(doc.len() >= 2);
     }
 
@@ -1411,11 +1379,9 @@ mod tests {
         let html = "<blockquote><p>Outer</p><blockquote><p>Inner</p></blockquote></blockquote>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // Root should have one blockquote
         assert_eq!(doc.body_roots().count(), 1);
         let outer = &doc.nodes[0];
         assert!(matches!(outer.content, NodeContent::Quote));
-        // Outer blockquote should have children including inner blockquote
         assert!(
             outer.children.len() >= 2,
             "Outer quote should have paragraph + inner quote"
@@ -1441,14 +1407,12 @@ mod tests {
 
     #[test]
     fn test_table_missing_cells() {
-        // Ragged table: second row has fewer cells
         let html = "<table><tr><td>A</td><td>B</td><td>C</td></tr><tr><td>X</td></tr></table>";
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
         match &doc.nodes[0].content {
             NodeContent::Table { grid } => {
                 assert_eq!(grid.rows, 2);
-                // The grid should still be built from the data
                 assert!(grid.cols >= 1);
             }
             other => panic!("Expected Table, got {:?}", other),
@@ -1457,7 +1421,6 @@ mod tests {
 
     #[test]
     fn test_attr_extraction_no_false_match() {
-        // Verify that extracting "class" doesn't match "subclass"
         assert_eq!(
             extract_attr(r#"subclass="wrong" class="right""#, "class"),
             Some("right")
@@ -1492,8 +1455,27 @@ mod tests {
         "#;
         let doc = build_document_structure(html);
         assert!(doc.validate().is_ok());
-        // Should have 1 root h1 group
         assert_eq!(doc.body_roots().count(), 1);
         assert!(doc.len() > 10, "Complex doc should have many nodes, got {}", doc.len());
+    }
+
+    /// Regression test for issue #127: `flush_definition_item`'s `dd` branch checks
+    /// `self.in_dd`, so it must run before the `</dd>` close-tag handler clears that flag —
+    /// otherwise the definition item is silently dropped and only an empty `DefinitionList`
+    /// marker node is produced.
+    #[test]
+    fn test_dl_dt_dd_produces_definition_item_node() {
+        let html = r#"<html><body><h1>Glossary</h1><dl><dt>DEFTERM</dt><dd>DEFDESCRIPTION explaining the term.</dd></dl></body></html>"#;
+        let doc = build_document_structure(html);
+        let item = doc
+            .nodes
+            .iter()
+            .find_map(|n| match &n.content {
+                NodeContent::DefinitionItem { term, definition } => Some((term.clone(), definition.clone())),
+                _ => None,
+            })
+            .expect("expected a DefinitionItem node");
+        assert_eq!(item.0, "DEFTERM");
+        assert_eq!(item.1, "DEFDESCRIPTION explaining the term.");
     }
 }

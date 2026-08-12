@@ -5,6 +5,10 @@ use anyhow::{Context, Result};
 use crate::{WireFormat, style};
 
 /// Execute the chunk command: split text into chunks.
+#[expect(
+    clippy::print_stdout,
+    reason = "chunk results are the command's stdout result output"
+)]
 pub fn chunk_command(text: String, config: xberg::ChunkingConfig, format: WireFormat) -> Result<()> {
     if text.is_empty() {
         anyhow::bail!("No text provided for chunking. Provide --text or pipe text via stdin.");

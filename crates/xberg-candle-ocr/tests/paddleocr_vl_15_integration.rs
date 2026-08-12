@@ -20,6 +20,7 @@
 //!     -- --ignored
 //! ```
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(all(feature = "paddleocr-vl", not(target_arch = "wasm32")))]
 
 use candle_core::{DType, Device};
@@ -106,15 +107,12 @@ fn paddleocr_vl_15_extracts_text_from_sample_image() {
         "PaddleOCR-VL should set is_structured_markdown = true"
     );
 
-    // Keyword check: the fixture renders "hello" and "world".
     let lower = content.to_lowercase();
     assert!(
         lower.contains("hello") || lower.contains("world"),
         "Expected \"hello\" or \"world\" in output; got: {content:?}"
     );
 
-    // Degenerate-repeat detector: a healthy output should not repeat the same
-    // 3-gram more than 4 consecutive times (catches nucleus-collapse failure mode).
     assert!(
         longest_repeated_ngram_run(content, 3) < 5,
         "Detected degenerate-repeat output (3-gram run ≥ 5): {}...",
@@ -144,7 +142,5 @@ fn paddleocr_vl_15_table_task_produces_output() {
         .process_image(image_bytes)
         .expect("Table task process_image should not error on a valid image");
 
-    // The fixture has no table structure; we only assert the engine doesn't panic or
-    // return an error. Non-empty output would be a bonus.
     println!("Table task output ({} chars): {}", output.content.len(), output.content);
 }

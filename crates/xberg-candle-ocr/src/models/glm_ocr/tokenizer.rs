@@ -67,16 +67,12 @@ mod imp {
             .token_to_id("<|image|>")
             .ok_or_else(|| CandleOcrError::Tokenizer("<|image|> not in vocab".to_string()))?;
 
-        // Collect all EOS tokens. Primary is <|endoftext|>; the secondary is
-        // <|user|> (= 59253 in upstream vocab), which marks a turn boundary the
-        // decoder must never cross during generation.
         let mut eos_token_ids = vec![eos];
         if let Some(user_token) = tokenizer.token_to_id("<|user|>") {
             if !eos_token_ids.contains(&user_token) {
                 eos_token_ids.push(user_token);
             }
         } else {
-            // Hardcoded fallback matching upstream config.json eos_token_id list.
             let fallback_user_token: u32 = 59253;
             if !eos_token_ids.contains(&fallback_user_token) {
                 eos_token_ids.push(fallback_user_token);
@@ -124,7 +120,6 @@ mod imp {
             .position(|&id| id == special.image_token)
             .ok_or_else(|| CandleOcrError::Tokenizer("No <|image|> placeholder in encoded prompt".to_string()))?;
 
-        // Defensive: ensure the encoder produced exactly num_image_tokens consecutive placeholders.
         let observed = ids[image_tokens_start..]
             .iter()
             .take_while(|&&id| id == special.image_token)

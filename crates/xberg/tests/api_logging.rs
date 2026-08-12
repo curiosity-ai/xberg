@@ -16,10 +16,6 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
 
 use xberg::{ExtractionConfig, api::create_router};
 
-// ---------------------------------------------------------------------------
-// Captured-event layer
-// ---------------------------------------------------------------------------
-
 /// A tracing `Layer` that records the target + level of every emitted event.
 #[derive(Clone, Default)]
 struct EventCapture {
@@ -43,10 +39,6 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn captured_events(capture: &EventCapture) -> Vec<CapturedEvent> {
     capture.events.lock().unwrap().clone()
 }
@@ -66,10 +58,6 @@ async fn get_health(router: axum::Router) -> StatusCode {
     response.status()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 /// At default subscriber level (INFO), the TraceLayer must not emit any
 /// per-request or per-response events from `tower_http::trace`.
 ///
@@ -84,13 +72,9 @@ fn tower_http_trace_events_suppressed_at_info() {
     let capture = EventCapture::default();
     let capture_clone = capture.clone();
 
-    // Build a subscriber with tower_http capped at info — mirrors the default
-    // xberg-cli filter (tower_http=info).
     let filter = EnvFilter::new("info,tower_http=info");
     let subscriber = tracing_subscriber::registry().with(filter).with(capture_clone);
 
-    // with_default sets the subscriber for the closure's duration. We build and
-    // drive the runtime *inside* so all tracing spans are recorded by `subscriber`.
     let status = tracing::subscriber::with_default(subscriber, || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -104,7 +88,6 @@ fn tower_http_trace_events_suppressed_at_info() {
 
     assert_eq!(status, StatusCode::OK, "/health must return 200");
 
-    // No events from tower_http::trace should have been captured.
     let events = captured_events(&capture);
     let tower_trace_events: Vec<_> = events
         .iter()
@@ -142,7 +125,6 @@ fn tower_http_trace_events_visible_at_debug() {
 
     assert_eq!(status, StatusCode::OK, "/health must return 200");
 
-    // At least one event from tower_http::trace must be present.
     let events = captured_events(&capture);
     let tower_trace_events: Vec<_> = events.iter().filter(|e| e.target.starts_with("tower_http")).collect();
     assert!(

@@ -26,6 +26,7 @@
 //! }
 //! ```
 
+mod allowed_hosts;
 mod errors;
 mod format;
 mod params;
@@ -34,7 +35,7 @@ pub(crate) mod resources;
 pub(crate) mod schema;
 mod server;
 
-// Re-export public API for backward compatibility
+pub use allowed_hosts::{MCP_ALLOWED_HOSTS_ENV, read_mcp_allowed_hosts_from_file, resolve_extra_allowed_hosts};
 
 #[allow(unused_imports)]
 pub use server::start_mcp_server;

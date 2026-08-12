@@ -9,33 +9,51 @@
 //! - `chunk` - Text chunking commands
 
 use anyhow::{Context, Result};
+#[cfg(any(feature = "core-cli", feature = "embeddings"))]
 use std::io::Read;
 
 pub mod cache;
+#[cfg(feature = "core-cli")]
 pub mod chunk;
 pub mod config;
+pub mod doctor;
 #[cfg(feature = "embeddings")]
 pub mod embed;
 pub mod extract;
+pub mod formats;
 #[cfg(feature = "ner-onnx")]
 pub mod ner;
 pub mod overrides;
 #[cfg(any(feature = "api", feature = "mcp"))]
 pub mod server;
+#[cfg(feature = "tree-sitter")]
+pub mod tree_sitter;
 
-// Re-export command functions for convenience
-pub use cache::{clear_command, manifest_command, stats_command, warm_command};
+#[cfg(any(
+    feature = "embeddings",
+    feature = "layout-detection",
+    feature = "paddle-ocr",
+    feature = "tree-sitter",
+    feature = "ner-onnx"
+))]
+pub use cache::warm_command;
+pub use cache::{clear_command, manifest_command, stats_command};
+#[cfg(feature = "core-cli")]
 pub use chunk::chunk_command;
 pub use config::load_config;
+pub use doctor::doctor_command;
 #[cfg(feature = "embeddings")]
 pub use embed::embed_command;
 pub use extract::{
     BatchInputFormat, ExtractInputSource, batch_command, extract_command, load_batch_input_manifest, uri_to_local_path,
 };
-#[cfg(feature = "mcp")]
-pub use server::mcp_command;
+pub use formats::compiled_in_formats;
 #[cfg(feature = "api")]
 pub use server::serve_command;
+#[cfg(feature = "mcp")]
+pub use server::{mcp_command, resolve_mcp_allowed_hosts};
+#[cfg(feature = "tree-sitter")]
+pub use tree_sitter::{cache_dir_command, clean_command, download_command, list_command};
 
 /// Validates that a directory exists and is accessible.
 ///
@@ -73,6 +91,7 @@ pub fn validate_file_exists(path: &std::path::Path) -> Result<()> {
 }
 
 /// Validates chunking parameters for correctness.
+#[cfg(feature = "core-cli")]
 pub fn validate_chunk_params(chunk_size: Option<usize>, chunk_overlap: Option<usize>) -> Result<()> {
     if let Some(size) = chunk_size {
         if size == 0 {
@@ -111,6 +130,7 @@ pub fn validate_batch_paths(paths: &[std::path::PathBuf]) -> Result<()> {
 }
 
 /// Read text from stdin, trimming whitespace.
+#[cfg(any(feature = "core-cli", feature = "embeddings"))]
 pub fn read_stdin() -> Result<String> {
     let mut input = String::new();
     std::io::stdin()

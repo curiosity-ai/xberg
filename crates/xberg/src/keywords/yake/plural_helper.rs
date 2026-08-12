@@ -1,5 +1,3 @@
-// Vendored from yake-rust 1.0.3 (MIT) — https://github.com/quesurifn/yake-rust
-
 pub(crate) trait PluralHelper {
     /// Strip trailing 's'/'S' from words longer than 3 characters.
     fn to_single(self) -> Self;

@@ -207,6 +207,51 @@ pub const CaptioningConfig = struct {
     min_image_area: u32,
 };
 
+/// A single labeled definition the chunk classifier may emit.
+///
+/// Unlike `PageClassificationConfig.labels` (bare label names), chunk
+/// classification targets potentially large domain taxonomies where every
+/// label carries its own semantic description, letting the LLM disambiguate
+/// similarly named labels without relying on the label string alone.
+pub const ChunkClassificationDefinition = struct {
+    /// Label name returned in `ChunkMetadata.classifications`.
+    label: []const u8,
+    /// Semantic description of when this label applies. Injected verbatim into
+    /// the classification prompt next to the label name.
+    description: []const u8,
+};
+
+/// Configuration for the chunk-classification post-processor.
+///
+/// Chunk classification is always multi-label: a chunk may match zero, one, or
+/// many of the configured definitions. This is the chunk-level equivalent of
+/// `PageClassificationConfig`, but scoped to individual chunks
+/// (`ExtractedDocument.chunks`) rather than whole pages, and built for large
+/// taxonomies where each label needs its own description rather than a bare name.
+pub const ChunkClassificationConfig = struct {
+    /// Minijinja prompt template. Receives `{{ definitions }}` (rendered label +
+    /// description list) and `{{ chunks }}` (a numbered list of chunk texts in
+    /// the current batch) variables. `null` lets the backend pick a sensible
+    /// default.
+    prompt_template: ?[]const u8,
+    /// The set of label definitions the classifier may emit. Must contain at
+    /// least one entry.
+    definitions: []const ChunkClassificationDefinition,
+    /// LLM configuration used for classification.
+    llm: LlmConfig,
+    /// Number of chunks batched into a single LLM request.
+    ///
+    /// Larger batches amortize the fixed prompt cost (definitions block) across
+    /// more chunks, at the risk of exceeding the model's context window for
+    /// very large taxonomies or chunk texts. Defaults to `DEFAULT_BATCH_SIZE`.
+    batch_size: u64,
+    /// Maximum number of in-flight batch requests.
+    ///
+    /// Bounds concurrency against the configured LLM provider. Defaults to
+    /// `DEFAULT_MAX_CONCURRENCY`.
+    max_concurrency: u64,
+};
+
 /// Configuration for the page-classification post-processor.
 pub const PageClassificationConfig = struct {
     /// Minijinja prompt template. Receives `{{ labels }}` (joined list), `{{ page_text }}`
@@ -252,6 +297,17 @@ pub const ContentFilterConfig = struct {
     ///
     /// Default: `false` (footers are stripped or excluded).
     include_footers: bool,
+    /// Include footnote bodies in extraction output.
+    ///
+    /// - PDF: Prevents the layout model from treating `Footnote`-classified
+    ///   regions as furniture, so footnote bodies survive alongside the main
+    ///   text instead of being silently dropped.
+    ///
+    /// - Other formats: No effect currently.
+    ///
+    /// Default: `false` (footnotes are stripped), matching the existing
+    /// `include_headers` / `include_footers` defaults.
+    include_footnotes: bool,
     /// Enable the heuristic cross-page repeating text detector.
     ///
     /// When `true` (default), text that repeats verbatim across a supermajority
@@ -259,9 +315,10 @@ pub const ContentFilterConfig = struct {
     /// names or repeated headings are being incorrectly removed by the heuristic.
     ///
     /// Note: when a layout-detection model is active, the model may independently
-    /// classify page-header / page-footer regions as furniture on a per-page basis.
-    /// To preserve those regions, set `include_headers = true`, `include_footers = true`,
-    /// or both, in addition to disabling this flag.
+    /// classify page-header / page-footer / footnote regions as furniture on a
+    /// per-page basis. To preserve those regions, set `include_headers = true`,
+    /// `include_footers = true`, `include_footnotes = true`, or any combination,
+    /// in addition to disabling this flag.
     ///
     /// Primarily affects PDF extraction.
     ///
@@ -274,6 +331,30 @@ pub const ContentFilterConfig = struct {
     ///
     /// Default: `false` (watermarks are stripped).
     include_watermarks: bool,
+};
+
+/// Configuration for CSV/TSV extraction.
+///
+/// When unset (`ExtractionConfig.csv == None`), the extractor keeps its
+/// existing default behavior: the delimiter is auto-detected by sampling the
+/// file (comma, tab, pipe, or semicolon), and no line is treated as a comment.
+pub const CsvConfig = struct {
+    /// Field delimiter, as a single-character string (e.g. `","`, `";"`,
+    /// `"\t"`, `"|"`). When `null` (default), the delimiter is auto-detected
+    /// from a sample of the file.
+    ///
+    /// Must be exactly one ASCII byte when set — `ExtractionConfig.validate`
+    /// rejects an empty string or a multi-byte value with a helpful error.
+    /// The TSV MIME type (`text/tab-separated-values`) always forces `\t`
+    /// regardless of this setting.
+    delimiter: ?[]const u8,
+    /// Line prefixes that mark a comment line to skip entirely during row
+    /// parsing (e.g. `["#"]`). A line is treated as a comment when its
+    /// trimmed start matches any of these prefixes exactly.
+    ///
+    /// Default: empty, meaning no line is treated as a comment (matches the
+    /// pre-existing extractor behavior).
+    comment_prefixes: []const []const u8,
 };
 
 /// Configuration for email extraction.
@@ -309,10 +390,21 @@ pub const ExtractionConfig = struct {
     use_cache: bool,
     /// Enable quality post-processing
     enable_quality_processing: bool,
-    /// OCR configuration (None = OCR disabled)
+    /// OCR configuration.
+    ///
+    /// `null` does not run OCR for documents that already have usable text. Under
+    /// `OcrStrategy.Auto`, a PDF with no text layer at all (a scan) is still routed
+    /// to OCR with default settings so it is not returned empty (#1338). Set
+    /// `Self.disable_ocr` to hard-disable OCR regardless of the detected content.
     ocr: ?OcrConfig,
     /// Force OCR even for searchable PDFs
     force_ocr: bool,
+    /// Which pages get OCR'd when neither `force_ocr` nor `force_ocr_pages` applies.
+    ///
+    /// Defaults to `OcrStrategy.Auto`, which OCRs only pages whose native text
+    /// fails a quality check. Only applies to PDF documents. Cannot be
+    /// `OcrStrategy.ScannedPages` while `disable_ocr` is `true`.
+    ocr_strategy: OcrStrategy,
     /// Force OCR on specific pages only (1-indexed page numbers, must be >= 1).
     ///
     /// When set, only the listed pages are OCR'd regardless of text layer quality.
@@ -350,6 +442,11 @@ pub const ExtractionConfig = struct {
     keywords: ?KeywordConfig,
     /// Post-processor configuration (None = use defaults)
     postprocessor: ?PostProcessorConfig,
+    /// HTML to Markdown conversion options (None = use defaults)
+    ///
+    /// Configure how HTML documents are converted to Markdown, including heading styles,
+    /// list formatting, code block styles, and preprocessing options.
+    html_options: ?ConversionOptions,
     /// Styled HTML output configuration.
     ///
     /// When set alongside `output_format = OutputFormat.Html`, the extraction
@@ -364,15 +461,18 @@ pub const ExtractionConfig = struct {
     /// When set, each file in a batch will be canceled after this duration
     /// unless overridden by `FileExtractionConfig.timeout_secs`.
     ///
-    /// Defaults to `Some(60)` to prevent pathological files (e.g. deeply
-    /// nested archives, documents with millions of cells) from running
-    /// indefinitely and exhausting caller resources. Set to `null` to
-    /// disable the timeout for trusted input or long-running workloads.
+    /// Defaults to `Some(600)` (10 minutes) to prevent pathological files
+    /// (e.g. deeply nested archives, documents with millions of cells) from
+    /// running indefinitely and exhausting caller resources, while still
+    /// giving slow paths (VLM-based OCR, large scanned documents) enough
+    /// headroom to finish. Set to `null` to disable the timeout for trusted
+    /// input or long-running workloads.
     extraction_timeout_secs: ?u64,
-    /// Maximum concurrent extractions in batch operations (None = (num_cpus × 1.5).ceil()).
+    /// Maximum concurrent document extractions in batch operations.
     ///
-    /// Limits parallelism to prevent resource exhaustion when processing
-    /// large batches. Defaults to (num_cpus × 1.5).ceil() when not set.
+    /// This is a ceiling within the configured total thread budget, not an
+    /// independent pool size. When unset, the scheduler derives document and
+    /// per-document concurrency from `ConcurrencyConfig.max_threads`.
     max_concurrent_extractions: ?u64,
     /// Result structure format
     ///
@@ -414,6 +514,44 @@ pub const ExtractionConfig = struct {
     /// formatted output. The `formatted_content` field may be populated
     /// when format conversion is applied.
     output_format: OutputFormat,
+    /// Escape Markdown special characters in rendered prose (default: `true`).
+    ///
+    /// When `output_format` is `Markdown` or `Djot`, the renderer backslash-escapes
+    /// CommonMark-significant leading characters (e.g. `-`, `#`) so that literal
+    /// text such as `#06-18` or `- clause` round-trips safely through a CommonMark
+    /// parser instead of being reinterpreted as a heading or list marker.
+    ///
+    /// Table cell text is never escaped, so escaped prose can look inconsistent
+    /// with table cells containing the same characters. Set this to `false` to
+    /// disable prose escaping and make `content`, `pages[].content`, and
+    /// `chunks[].content` read identically to table cell text — useful for LLM
+    /// prompts or search indexing where CommonMark round-tripping does not matter.
+    ///
+    /// Defaults to `true` to preserve existing behavior.
+    escape_markdown: bool,
+    /// Emit an opt-in anchor marker before each table's rendered Markdown
+    /// block (default: `false`).
+    ///
+    /// When `output_format` is `Markdown` (or `Djot`) and this is `true`, the
+    /// renderer inserts a `[TABLE:{table_id}]` marker immediately before each
+    /// table's Markdown in `content`, `pages[].content`, and
+    /// `chunks[].content`, where `table_id` matches the corresponding
+    /// entry's `table_id`. This lets a consumer
+    /// reconcile a rendered Markdown table block with its structured
+    /// `tables[]` entry.
+    ///
+    /// Defaults to `false` so existing output is byte-identical unless
+    /// explicitly enabled.
+    table_anchors: bool,
+    /// Controls how Jupyter notebook (`.ipynb`) code cells are rendered.
+    ///
+    /// - `Both` (default): code source plus the notebook's saved outputs
+    /// - `Source`: only the code source (fenced code blocks)
+    /// - `Outputs`: only the saved outputs
+    ///
+    /// Cells are never executed; `Outputs`/`Both` surface only outputs already
+    /// stored in the notebook.
+    jupyter_cell_rendering: JupyterCellRendering,
     /// Layout detection configuration (None = layout detection disabled).
     ///
     /// When set, PDF pages and images are analyzed for document structure
@@ -438,12 +576,12 @@ pub const ExtractionConfig = struct {
     transcription: ?TranscriptionConfig,
     /// Run layout detection on the non-OCR PDF markdown path.
     ///
-    /// When `true` and `layout` is `Some(_)`, layout regions inform heading,
-    /// table, list, and figure detection in the structure pipeline that would
-    /// otherwise rely on font-clustering heuristics alone. Significantly
-    /// improves SF1 (structural F1) at the cost of inference latency
-    /// (~150-300ms/page CPU, ~20-50ms/page GPU). Default: `false`.
-    /// Requires the `layout-detection` feature.
+    /// When `true` and `layout` is `Some(_)`, layout regions inform reading
+    /// order, region grouping, and table detection while native font/tag
+    /// semantics remain authoritative for headings, lists, code, and formulas.
+    /// OCR layout classification is unchanged. This improves structural output
+    /// at the cost of inference latency (~150-300ms/page CPU, ~20-50ms/page
+    /// GPU). Default: `false`. Requires the `layout-detection` feature.
     use_layout_for_markdown: bool,
     /// Enable structured document tree output.
     ///
@@ -476,6 +614,12 @@ pub const ExtractionConfig = struct {
     /// Currently supports configuring the fallback codepage for MSG files
     /// that do not specify one. See `EmailConfig` for details.
     email: ?EmailConfig,
+    /// CSV/TSV extraction configuration (None = use defaults).
+    ///
+    /// Lets callers set an explicit delimiter and declare comment-line
+    /// prefixes to skip, instead of relying solely on delimiter
+    /// auto-detection. See `CsvConfig` for details.
+    csv: ?CsvConfig,
     /// URL ingestion and crawl configuration.
     url: UrlExtractionConfig,
     /// Maximum recursion depth for archive extraction (default: 3).
@@ -508,6 +652,10 @@ pub const ExtractionConfig = struct {
     /// Per-page classification configuration. When set, the classification post-processor
     /// runs at the Middle stage and populates `ExtractedDocument.page_classifications`.
     page_classification: ?PageClassificationConfig,
+    /// Per-chunk multi-label classification configuration. When set, the
+    /// chunk-classification post-processor runs at the Middle stage (after
+    /// chunking) and populates `ChunkMetadata.classifications` on every chunk.
+    chunk_classification: ?ChunkClassificationConfig,
     /// VLM captioning configuration for extracted images. When set, the captioning
     /// post-processor runs at the Middle stage and writes a caption into each
     /// `ExtractedImage.caption`.
@@ -539,6 +687,8 @@ pub const FileExtractionConfig = struct {
     ocr: ?OcrConfig,
     /// Override force OCR for this file.
     force_ocr: ?bool,
+    /// Override the OCR page-selection strategy for this file.
+    ocr_strategy: ?OcrStrategy,
     /// Override force OCR pages for this file (1-indexed page numbers).
     force_ocr_pages: ?[]const u32,
     /// Override disable OCR for this file.
@@ -599,6 +749,8 @@ pub const FileExtractionConfig = struct {
     translation: ?TranslationConfig,
     /// Override per-page classification configuration for this file.
     page_classification: ?PageClassificationConfig,
+    /// Override per-chunk classification configuration for this file.
+    chunk_classification: ?ChunkClassificationConfig,
     /// Override VLM captioning configuration for this file.
     captioning: ?CaptioningConfig,
     /// Override QR-code detection for this file.
@@ -829,12 +981,60 @@ pub const HtmlOutputConfig = struct {
     embed_css: bool,
 };
 
+/// Configuration for the late-interaction (ColBERT) pipeline.
+///
+/// Controls which model to use, batching, and download/cache behavior for the
+/// local ONNX ColBERT model.
+///
+/// Since v5.0.
+pub const LateInteractionConfig = struct {
+    /// The late-interaction model to use (defaults to the "gte-moderncolbert" preset).
+    model: LateInteractionModelType,
+    /// Batch size for local ONNX inference.
+    ///
+    /// ColBERT emits a `[seq, dim]` multi-vector embedding per document, so
+    /// memory scales with batch size — keep this modest.
+    batch_size: u64,
+    /// Maximum token sequence length for the tokenizer (documents).
+    max_length: u64,
+    /// Fixed padded length for query augmentation.
+    ///
+    /// ColBERT queries are padded (with the mask token, kept attention-live)
+    /// to exactly this many tokens rather than truncated/left as-is — this is
+    /// the "query augmentation" trick from the ColBERT paper.
+    query_max_length: u64,
+    /// Show model download progress (local ONNX path only).
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). A warm
+    /// Hugging Face cache transfers nothing and so reports nothing. Ignored by
+    /// `LateInteractionModelType.Plugin`, which downloads no model.
+    show_download_progress: bool,
+    /// Optional alternate Hugging Face cache root for model files.
+    ///
+    /// When unset, hf-hub follows the standard Hugging Face environment and
+    /// platform cache conventions.
+    cache_dir: ?[]const u8,
+    /// Hardware acceleration for the late-interaction ONNX model.
+    acceleration: ?AccelerationConfig,
+    /// Maximum wall-clock duration (in seconds) for a single embed call when
+    /// using `LateInteractionModelType.Plugin`. `null` disables the timeout.
+    max_embed_duration_secs: ?u64,
+};
+
 /// Layout detection configuration.
 ///
 /// Controls layout detection behavior in the extraction pipeline.
 /// When set on `ExtractionConfig`, layout detection
 /// is enabled for PDF extraction.
 pub const LayoutDetectionConfig = struct {
+    /// Which pages the layout model runs on.
+    ///
+    /// Defaults to `LayoutStrategy.Always`, the historical behavior:
+    /// every page is rendered and inferred. `LayoutStrategy.Auto`
+    /// pre-screens pages with cheap signals and skips the model where it
+    /// cannot help.
+    strategy: LayoutStrategy,
     /// Confidence threshold override (None = use model default).
     confidence_threshold: ?f32,
     /// Whether to apply postprocessing heuristics (default: true).
@@ -870,6 +1070,9 @@ pub const LayoutDetectionConfig = struct {
 ///
 /// Each feature (VLM OCR, VLM embeddings, structured extraction) carries
 /// its own `LlmConfig`, allowing different providers per feature.
+///
+/// `Debug` is implemented by hand so `api_key`, header values, and the AWS
+/// credentials in `BedrockConfig` are never printed.
 pub const LlmConfig = struct {
     /// Provider/model string using liter-llm routing format.
     ///
@@ -881,7 +1084,9 @@ pub const LlmConfig = struct {
     api_key: ?[]const u8,
     /// Custom base URL override for the provider endpoint.
     base_url: ?[]const u8,
-    /// Request timeout in seconds (default: 60).
+    /// Request timeout in seconds. When `null`, liter-llm's built-in 60s default
+    /// applies, except the VLM OCR path which uses a 300s default (a single page
+    /// image transcription routinely exceeds 60s). Set explicitly to override.
     timeout_secs: ?u64,
     /// Maximum retry attempts (default: 3).
     max_retries: ?u32,
@@ -889,6 +1094,242 @@ pub const LlmConfig = struct {
     temperature: ?f64,
     /// Maximum tokens to generate.
     max_tokens: ?u64,
+    /// Nucleus sampling parameter for generation tasks, applied to individual
+    /// requests built from this config. Restricts sampling to the smallest set of
+    /// tokens whose cumulative probability mass is at least this value; lower is
+    /// more focused. Validated to `[0.0, 1.0]` by `LlmConfig.validate`.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.top_p`. A request-time
+    /// parameter like `temperature`/`max_tokens` above, not a client-level
+    /// setting.
+    top_p: ?f64,
+    /// Stop sequence(s) that halt token generation, applied to individual requests
+    /// built from this config.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.stop`
+    /// (`types.common.StopSequence`), which liter-llm represents as either a
+    /// single string or a list of strings via an untagged enum. Always expressed
+    /// here as a list — even one stop sequence is `["..."]` — so the field has a
+    /// single, FFI-friendly shape across every language binding instead of a
+    /// single-or-list union type. Converted to liter-llm's
+    /// `StopSequence.Multiple` at each request-building call site; see
+    /// `to_stop_sequence`.
+    stop: ?[]const []const u8,
+    /// Random seed for reproducible outputs, applied to individual requests built
+    /// from this config. Provider support varies — some silently ignore it.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.seed`.
+    seed: ?i64,
+    /// Presence penalty for generation tasks, applied to individual requests
+    /// built from this config. Positive values discourage the model from
+    /// repeating topics already present in the conversation. Validated to
+    /// `[-2.0, 2.0]` by `LlmConfig.validate`.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.presence_penalty`.
+    presence_penalty: ?f64,
+    /// Frequency penalty for generation tasks, applied to individual requests
+    /// built from this config. Positive values discourage the model from
+    /// repeating the same tokens verbatim. Validated to `[-2.0, 2.0]` by
+    /// `LlmConfig.validate`.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.frequency_penalty`.
+    frequency_penalty: ?f64,
+    /// Reasoning effort level for extended-thinking models, applied to individual
+    /// requests built from this config.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.reasoning_effort`
+    /// (`types.chat.ReasoningEffort`). A request-time parameter like `temperature`/
+    /// `max_tokens` above, not a client-level setting — `into_client_builder` does not
+    /// map it. Accepted as a plain string — one of `"low"`, `"medium"`, `"high"`,
+    /// `"minimal"`, `"max"` (case-insensitive; liter-llm's own
+    /// `#[serde(rename_all = "lowercase")]` spelling) — rather than importing
+    /// liter-llm's enum, because this module compiles even when the `liter-llm`
+    /// feature is disabled. See `parse_reasoning_effort` for the
+    /// conversion into `liter_llm.ReasoningEffort`.
+    reasoning_effort: ?[]const u8,
+    /// Provider-specific extra parameters merged into the request body (guardrails,
+    /// safety settings, grounding config, etc.), applied to individual requests built
+    /// from this config.
+    ///
+    /// Mirrors liter-llm's `ChatCompletionRequest.extra_body`. A request-time
+    /// parameter like `temperature`/`max_tokens` above, not a client-level setting.
+    extra_body: ?[]const u8,
+    /// Whether liter-llm should load provider credentials from environment variables.
+    ///
+    /// Mirrors liter-llm's `ClientConfigBuilder.load_env`. When `null`, liter-llm's
+    /// own default behavior applies.
+    load_env: ?bool,
+    /// Extra HTTP headers sent with every request to the provider.
+    ///
+    /// Mirrors liter-llm's `ClientConfigBuilder.header`, for gateways or providers
+    /// that require custom auth/routing headers.
+    headers: ?std.StringHashMap([]const u8),
+    /// Custom provider configurations, in addition to liter-llm's built-in providers.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.providers`, for OpenAI-compatible gateways
+    /// and self-hosted model servers that are not in the built-in provider catalog.
+    providers: ?[]const LlmProviderConfig,
+    /// Response cache configuration.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.cache`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    ///
+    /// Boxed for the same reason as `bedrock` (a4579589ac): `LlmConfig` is the payload
+    /// of `EmbeddingModelType.Llm` and `RerankerModelType.Llm`, whose other variants
+    /// are tens of bytes. Inlining this and the two sub-configs below pushed that
+    /// variant to 480 bytes and tripped `clippy.large_enum_variant` on the
+    /// `--features full` leg. ~keep
+    cache: ?LlmCacheConfig,
+    /// Budget enforcement configuration.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.budget`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    budget: ?LlmBudgetConfig,
+    /// Per-model rate limiting configuration.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.rate_limit`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    rate_limit: ?LlmRateLimitConfig,
+    /// Enable per-request cost tracking.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.cost_tracking`. Only takes effect when
+    /// liter-llm's `tower` feature is compiled in; otherwise the value is accepted
+    /// but unused.
+    cost_tracking: ?bool,
+    /// Enable OpenTelemetry-compatible tracing spans.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.tracing`. Only takes effect when liter-llm's
+    /// `tower` feature is compiled in; otherwise the value is accepted but unused.
+    tracing: ?bool,
+    /// Cooldown duration after transient errors, in seconds.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.cooldown_secs`. Only takes effect when
+    /// liter-llm's `tower` feature is compiled in; otherwise the value is accepted
+    /// but unused.
+    cooldown_secs: ?u64,
+    /// Background health check interval, in seconds.
+    ///
+    /// Mirrors liter-llm's `LlmConfig.health_check_secs`. Only takes effect when
+    /// liter-llm's `tower` feature is compiled in; otherwise the value is accepted
+    /// but unused.
+    health_check_secs: ?u64,
+    /// AWS Bedrock settings (region, cross-region routing, explicit credentials).
+    ///
+    /// Only consulted for `bedrock/`-prefixed models. When `null` — or when an
+    /// individual field inside it is `null` — liter-llm falls back to the standard
+    /// AWS environment variables and the default credential chain.
+    bedrock: ?BedrockConfig,
+    /// Managed OAuth2/STS credential provider for auth modes liter-llm cannot express via a
+    /// static `api_key` — Azure AD, Vertex AI OAuth2, Vertex AI Application Default
+    /// Credentials, and AWS STS Web Identity (EKS IRSA) for Bedrock.
+    ///
+    /// Mirrors liter-llm's `client.ClientConfigBuilder.credential_provider`, which takes an
+    /// `Arc<dyn liter_llm.auth.CredentialProvider>` trait object — that cannot appear in a
+    /// serde DTO. Every `CredentialProviderConfig` variant is plain data instead, so it
+    /// round-trips through TOML/JSON/YAML and every language binding like the rest of
+    /// `LlmConfig`.
+    ///
+    /// Inert on `wasm32`: `crate.llm` (the module that reads this field —
+    /// `build_credential_provider` and friends) is compiled out
+    /// entirely on that target, via the crate-root `#[cfg(all(feature = "liter-llm",
+    /// not(target_arch = "wasm32")))] pub mod llm;` gate in `lib.rs`. Every variant needs
+    /// liter-llm's `native-http`-backed auth modules, and wasm32 builds request only
+    /// `wasm-http` (see the `liter-llm` dependency comment in Cargo.toml), so there is no
+    /// code path left on that target to construct a provider from this field, or to reject
+    /// it. This type (`core.config.llm`) has no `liter-llm` dependency itself and compiles
+    /// on every target, so setting this field on a wasm32 build is accepted by serde and
+    /// silently ignored — a plain no-op, not a `Validation`. Reject a
+    /// wasm32 build that sets this field yourself if that silence is a problem for your use
+    /// case; xberg does not do it for you.
+    ///
+    /// GitHub Copilot's device-flow provider has no variant here: it takes no configuration at
+    /// all (`liter_llm.auth.github_copilot.GithubCopilotCredentialProvider.new` accepts only
+    /// an HTTP client) and drives an interactive terminal prompt, so it cannot be expressed as
+    /// data. A Rust embedder who needs it — or any other fully custom `CredentialProvider` — can
+    /// call `xberg.llm.client.create_client_with_credential_provider` directly with a
+    /// `liter-llm` dependency of their own.
+    credential_provider: ?CredentialProviderConfig,
+};
+
+/// A custom provider configuration entry, in addition to liter-llm's built-in providers.
+///
+/// Mirrors liter-llm's `LlmProviderConfig`.
+pub const LlmProviderConfig = struct {
+    /// Provider name, used to key model prefix matching.
+    name: []const u8,
+    /// Base URL for the provider's OpenAI-compatible API.
+    base_url: []const u8,
+    /// Header name used to carry the API key (defaults to `Authorization` when unset).
+    auth_header: ?[]const u8,
+    /// Model name prefixes routed to this provider (e.g. `["my-provider/"]`).
+    model_prefixes: []const []const u8,
+};
+
+/// Response cache configuration.
+///
+/// Mirrors liter-llm's `LlmCacheConfig`. Only takes effect when liter-llm's `tower`
+/// feature is compiled in; otherwise the value round-trips through configuration
+/// but is not consulted at request time.
+pub const LlmCacheConfig = struct {
+    /// Maximum number of cached entries.
+    max_entries: ?u64,
+    /// Cache entry time-to-live, in seconds.
+    ttl_seconds: ?u64,
+    /// Cache backend name (e.g. `"memory"`, or an `opendal` scheme).
+    backend: ?[]const u8,
+    /// Backend-specific configuration key/value pairs.
+    backend_config: ?std.StringHashMap([]const u8),
+};
+
+/// Budget enforcement configuration.
+///
+/// Mirrors liter-llm's `LlmBudgetConfig`. Only takes effect when liter-llm's `tower`
+/// feature is compiled in; otherwise the value round-trips through configuration
+/// but is not enforced at request time.
+pub const LlmBudgetConfig = struct {
+    /// Global spend limit in USD.
+    global_limit: ?f64,
+    /// Per-model spend limits in USD, keyed by model name.
+    model_limits: ?std.StringHashMap(f64),
+    /// Enforcement mode: `"hard"` (reject over-budget requests) or `"soft"` (log only).
+    enforcement: ?[]const u8,
+};
+
+/// Per-model rate limiting configuration.
+///
+/// Mirrors liter-llm's `LlmRateLimitConfig`. Only takes effect when liter-llm's
+/// `tower` feature is compiled in; otherwise the value round-trips through
+/// configuration but is not enforced at request time.
+pub const LlmRateLimitConfig = struct {
+    /// Requests per minute limit.
+    rpm: ?u32,
+    /// Tokens per minute limit.
+    tpm: ?u64,
+    /// Rate limit window, in seconds.
+    window_seconds: ?u64,
+};
+
+/// AWS Bedrock configuration for `bedrock/`-prefixed models.
+///
+/// Mirrors liter-llm's `BedrockConfig`. Every field is optional: anything left
+/// unset falls back to the standard AWS environment variables
+/// (`AWS_DEFAULT_REGION` / `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+/// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `BEDROCK_CROSS_REGION`) and the
+/// default AWS credential chain. Leave the credential fields unset unless you
+/// have an explicit reason to pin them.
+///
+/// `Debug` is implemented by hand so the three credential fields are never printed.
+pub const BedrockConfig = struct {
+    /// AWS region (e.g. `"us-east-1"`).
+    region: ?[]const u8,
+    /// Cross-region inference profile prefix (e.g. `"us"`).
+    cross_region_prefix: ?[]const u8,
+    /// Explicit AWS access key ID. Secret — never logged.
+    access_key_id: ?[]const u8,
+    /// Explicit AWS secret access key. Secret — never logged.
+    secret_access_key: ?[]const u8,
+    /// Explicit AWS session token for temporary credentials. Secret — never logged.
+    session_token: ?[]const u8,
 };
 
 /// Configuration for LLM-based structured data extraction.
@@ -981,16 +1422,43 @@ pub const OcrQualityThresholds = struct {
     /// Minimum quality score (0.0-1.0) for a pipeline stage result to be accepted.
     /// If the result from a backend scores below this, try the next backend.
     pipeline_min_quality: f64,
+    /// Minimum fraction of non-whitespace characters that are undecodable
+    /// (Unicode Private Use Area, replacement characters, or non-whitespace
+    /// control characters) before a page's text layer is treated as
+    /// unreadable and routed to OCR (issue #1254). Gated by
+    /// `min_total_non_whitespace` so short snippets with a stray symbol or
+    /// two do not trip this check.
+    min_undecodable_ratio: f64,
+    /// Whether to route a page to OCR when pdf_oxide reports that a high
+    /// fraction of its text was fabricated rather than read from the file
+    /// (`MappingProvenance.Fallback`, pdf_oxide 0.3.75+, issue #1254). This is
+    /// a direct fact from the extractor's ISO 32000-1 §9.10.2 mapping cascade,
+    /// distinct from the character-heuristic proxy behind `min_undecodable_ratio`.
+    /// Defaults to `true`.
+    enable_provenance_ocr_routing: bool,
+    /// Minimum fraction of a page's non-whitespace characters with
+    /// `MappingProvenance.Fallback` provenance before the page is treated as
+    /// having a fabricated text layer and routed to OCR (issue #1254). Gated by
+    /// `min_total_non_whitespace` so a short page with a stray fallback
+    /// character cannot trip it. Only used when `enable_provenance_ocr_routing`
+    /// is `true`.
+    min_provenance_fallback_ratio: f64,
 };
 
 /// A single backend stage in the OCR pipeline.
 pub const OcrPipelineStage = struct {
-    /// Backend name: "tesseract", "paddleocr", "paddle-ocr", "vlm", or a custom registered name.
+    /// Backend name: "tesseract", "paddleocr", "paddle-ocr", "sceptre", "vlm", or a custom registered name.
+    /// Sceptre uses ONNX Runtime on desktop/server and tract on Android/iOS; browser WebAssembly has a separate
+    /// byte-fed engine because the normal async OCR registry assumes native model storage.
     backend: []const u8,
     /// Priority weight (higher = tried first). Stages are sorted by priority descending.
     priority: u32,
     /// Language override for this stage (None = use parent OcrConfig.language).
-    /// Accepts either a single language code ("eng") or a list (["eng", "deu"]).
+    ///
+    /// A list is the canonical form and the only form accepted by the binding
+    /// object APIs: `["eng", "deu"]`. When deserializing from a config file,
+    /// JSON body, or the REST/MCP API, a single string is also accepted,
+    /// either as one code ("eng") or "+"-joined ("eng+deu").
     language: ?[]const []const u8,
     /// Tesseract-specific config override for this stage.
     tesseract_config: ?TesseractConfig,
@@ -1017,7 +1485,10 @@ pub const OcrPipelineStage = struct {
 ///
 /// Backends are tried in priority order (highest first). After each backend
 /// produces output, quality is evaluated. If it meets `quality_thresholds.pipeline_min_quality`,
-/// the result is accepted. Otherwise the next backend is tried.
+/// the result is accepted. Otherwise the next backend is tried; if none clears the
+/// threshold, an internal selection policy derived from the `OcrConfig` decides which
+/// stage's result is returned as the best effort (`vlm_fallback` pipelines prefer their
+/// last non-empty stage; explicit and classical pipelines stay score-based).
 pub const OcrPipelineConfig = struct {
     /// Ordered list of backends to try. Sorted by priority (descending) at runtime.
     stages: []const OcrPipelineStage,
@@ -1035,17 +1506,37 @@ pub const OcrConfig = struct {
     ///
     /// Defaults to `true`. When `false`, all other OCR settings are ignored.
     enabled: bool,
-    /// OCR backend: tesseract, paddleocr, paddle-ocr, or vlm
+    /// OCR backend: tesseract, paddleocr, paddle-ocr, sceptre, or vlm.
+    /// Sceptre uses ONNX Runtime on desktop/server and tract on supported mobile builds.
+    /// Browser WebAssembly uses the separate byte-fed Sceptre worker API.
     backend: []const u8,
-    /// Language code(s) for OCR recognition.
-    /// Accepts either a single language code ("eng") or a list (["eng", "deu"]).
-    /// Defaults to ["eng"]. For Tesseract, languages are joined with "+".
+    /// Language code(s) for OCR recognition. Defaults to `["eng"]`. For Tesseract,
+    /// languages are joined with "+".
+    ///
+    /// A list is the canonical form and the only form accepted by the binding
+    /// object APIs (Python, Node, PHP, WASM, etc.): `["eng", "deu"]`. When
+    /// deserializing from a config file, JSON body, or the REST/MCP API, a
+    /// single string is also accepted, either as one code ("eng") or
+    /// "+"-joined ("eng+deu").
     language: []const []const u8,
     /// Tesseract-specific configuration (optional)
     tesseract_config: ?TesseractConfig,
     /// Output format for OCR results (optional, for format conversion)
     output_format: ?OutputFormat,
-    /// PaddleOCR-specific configuration (optional, JSON passthrough)
+    /// PaddleOCR-specific configuration (optional, JSON passthrough).
+    ///
+    /// Deserialized into a `PaddleOcrConfig`, so any of its fields can be
+    /// overridden here — most notably `model_version` (`"pp-ocrv6"` default / `"pp-ocrv5"`) and
+    /// `model_tier`. In TOML:
+    ///
+    /// ```toml
+    /// [ocr.paddle_ocr_config]
+    /// model_version = "pp-ocrv5"
+    /// model_tier = "server"
+    /// ```
+    ///
+    /// The `XBERG_OCR_MODEL_VERSION` / `XBERG_OCR_MODEL_TIER` environment variables set the same two
+    /// keys for env-configured servers (issue #1279).
     paddle_ocr_config: ?[]const u8,
     /// Arbitrary per-call options passed through to the backend unchanged.
     ///
@@ -1204,8 +1695,17 @@ pub const PdfConfig = struct {
     ///
     /// When `true`, projects text spans onto layout-detected regions, performs
     /// column detection, and emits spans in natural reading order (important
-    /// for multi-column academic PDFs). Requires the `layout-detection`
-    /// feature; has no effect without it. Defaults to `false`.
+    /// for multi-column academic PDFs). It also repairs 90/180/270-degree
+    /// rotated text runs — sideways tables and captions — that otherwise read
+    /// word-reversed and glued (GH#1358); see
+    /// `crate.extractors.pdf.reading_order` for the rotation-handling
+    /// details and its limits. Requires the `layout-detection` feature and a
+    /// page for which layout detection actually produces hints: a page with
+    /// no detected regions falls back to the original, unrepaired extraction
+    /// order even with this enabled. Independent of
+    /// `LayoutStrategy`, which only
+    /// controls whether layout detection runs at all — enabling `Always` or
+    /// `Auto` alone does not turn reordering on. Defaults to `false`.
     reading_order: bool,
 };
 
@@ -1224,12 +1724,6 @@ pub const HierarchyConfig = struct {
     k_clusters: u64,
     /// Include bounding box information in hierarchy blocks
     include_bbox: bool,
-    /// OCR coverage threshold for smart OCR triggering (0.0-1.0)
-    ///
-    /// Determines when OCR should be triggered based on text block coverage.
-    /// OCR is triggered when text blocks cover less than this fraction of the page.
-    /// Default: 0.5 (trigger OCR if less than 50% of page has text)
-    ocr_coverage_threshold: ?f32,
 };
 
 /// Post-processor configuration.
@@ -1274,6 +1768,25 @@ pub const ChunkingConfig = struct {
     chunker_type: ChunkerType,
     /// Optional embedding configuration for chunk embeddings.
     embedding: ?EmbeddingConfig,
+    /// Optional sparse (SPLADE) embedding configuration for chunk embeddings.
+    ///
+    /// When set, sparse vectors are generated for each chunk's content and attached
+    /// via `sparse_embedding`. Requires the `sparse-embeddings`
+    /// feature; without it, a warning is emitted and no sparse vectors are attached.
+    ///
+    /// Config-file only: like `RerankerConfig` and the local-ONNX branch of
+    /// `embedding`, this has no CLI flag and no environment variable. Only the secret/identity
+    /// fields of LLM-routed configs (model, API key, base URL) get that reach. ~keep
+    sparse_embedding: ?SparseEmbeddingConfig,
+    /// Optional late-interaction (ColBERT) embedding configuration for chunk embeddings.
+    ///
+    /// When set, multi-vector embeddings are generated for each chunk's content and
+    /// attached via `late_interaction`. Requires the
+    /// `late-interaction` feature; without it, a warning is emitted and no
+    /// late-interaction vectors are attached.
+    ///
+    /// Config-file only, for the same reason as `sparse_embedding` above. ~keep
+    late_interaction: ?LateInteractionConfig,
     /// Use a preset configuration (overrides individual settings if provided).
     preset: ?[]const u8,
     /// How to measure chunk size.
@@ -1281,11 +1794,24 @@ pub const ChunkingConfig = struct {
     /// Default: `Characters` (Unicode character count).
     /// Enable `chunking-tiktoken` or `chunking-tokenizers` features for token-based sizing.
     sizing: ChunkSizing,
-    /// When `true` and `chunker_type` is `Markdown`, prepend the heading hierarchy
-    /// path (e.g. `"# Title > ## Section\n\n"`) to each chunk's content string.
+    /// **Deprecated and inert** (#1393): no longer prepends anything into
+    /// `content`. Setting this field has no observable effect on chunking output
+    /// any more.
     ///
-    /// This is useful for RAG pipelines where each chunk needs self-contained
-    /// context about its position in the document structure.
+    /// Previously, when `true` and `chunker_type` was `Markdown`, this prepended
+    /// the heading hierarchy path (e.g. `"# Title > ## Section\n\n"`) directly
+    /// into each chunk's `content` string. `content` now always equals the exact
+    /// `[byte_start, byte_end)` source span regardless of this flag — see
+    /// `BreadcrumbTarget` for
+    /// the full rationale. `heading_context`/`heading_path` on `ChunkMetadata` are
+    /// populated independently of this flag, so callers lose no information —
+    /// only the in-place mutation is gone.
+    ///
+    /// Call `render_heading_breadcrumb`
+    /// explicitly at index time instead, for the retrieval consumer that wants the
+    /// breadcrumb inline.
+    ///
+    /// Kept only so existing callers keep compiling.
     ///
     /// Default: `false`
     prepend_heading_context: bool,
@@ -1309,6 +1835,15 @@ pub const ChunkingConfig = struct {
     ///
     /// Default: `Split`
     table_chunking: TableChunkingMode,
+    /// **Deprecated and inert** (#1393): see
+    /// `BreadcrumbTarget` for
+    /// the full explanation. Neither variant has any effect on `content` any
+    /// more — call
+    /// `render_heading_breadcrumb`
+    /// explicitly at index time instead. Kept only for backward compatibility.
+    ///
+    /// Default: `Content`.
+    breadcrumb_target: BreadcrumbTarget,
 };
 
 /// Embedding configuration for text chunks.
@@ -1316,18 +1851,25 @@ pub const ChunkingConfig = struct {
 /// Configures embedding generation using ONNX models via the vendored embedding engine.
 /// Requires the `embeddings` feature to be enabled.
 pub const EmbeddingConfig = struct {
-    /// The embedding model to use (defaults to "balanced" preset if not specified)
+    /// The embedding model to use (defaults to "gte-modernbert-base" preset if not specified)
     model: EmbeddingModelType,
     /// Whether to normalize embedding vectors (recommended for cosine similarity)
     normalize: bool,
     /// Batch size for embedding generation
     batch_size: u64,
-    /// Show model download progress
-    show_download_progress: bool,
-    /// Custom cache directory for model files
+    /// Show model download progress.
     ///
-    /// Defaults to `~/.cache/xberg/embeddings/` if not specified.
-    /// Allows full customization of model download location.
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). Covers both
+    /// local backends (ONNX and static/model2vec). A warm Hugging Face cache transfers nothing and
+    /// so reports nothing. Ignored by `EmbeddingModelType.Llm` and
+    /// `EmbeddingModelType.Plugin`, which download no model.
+    show_download_progress: bool,
+    /// Optional alternate Hugging Face cache root for model files.
+    ///
+    /// When unset, hf-hub follows `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`,
+    /// `HF_HOME`, XDG, and platform defaults. Prefer those environment variables
+    /// when configuring the cache process-wide.
     cache_dir: ?[]const u8,
     /// Hardware acceleration for the embedding ONNX model.
     ///
@@ -1346,6 +1888,19 @@ pub const EmbeddingConfig = struct {
     /// for common in-process inference; increase for large batches on slow
     /// hardware.
     max_embed_duration_secs: ?u64,
+    /// Maximum number of tokens fed to the tokenizer before truncation when
+    /// embedding a chunk with a local ONNX model (Preset/Custom).
+    ///
+    /// A chunk longer than this many tokens has its tail dropped before
+    /// inference, so only the prefix contributes to the stored vector. `null`
+    /// falls back to 512 (the historical default). The effective value is
+    /// always capped at the model's own `model_max_length`, so raising it past
+    /// what the model supports has no effect — set it to match a long-context
+    /// model (e.g. 8192 for Jina/Nomic) so long chunks embed in full.
+    ///
+    /// Ignored by the `Llm` and `Plugin` model types, which own their own
+    /// tokenization.
+    max_sequence_length: ?u64,
 };
 
 /// Configuration for the redaction post-processor.
@@ -1424,10 +1979,16 @@ pub const RerankerConfig = struct {
     /// Batch size for local ONNX cross-encoder inference.
     batch_size: u64,
     /// Show model download progress (local ONNX path only).
-    show_download_progress: bool,
-    /// Custom cache directory for model files.
     ///
-    /// Defaults to `~/.cache/xberg/rerankers/` if not specified.
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). A warm
+    /// Hugging Face cache transfers nothing and so reports nothing. Ignored by
+    /// `RerankerModelType.Llm` and `RerankerModelType.Plugin`, which download no model.
+    show_download_progress: bool,
+    /// Optional alternate Hugging Face cache root for model files.
+    ///
+    /// When unset, hf-hub follows the standard Hugging Face environment and
+    /// platform cache conventions.
     cache_dir: ?[]const u8,
     /// Hardware acceleration for the reranker ONNX model.
     ///
@@ -1445,6 +2006,41 @@ pub const RerankerConfig = struct {
     /// for common in-process inference; increase for large document sets on slow
     /// hardware.
     max_rerank_duration_secs: ?u64,
+};
+
+/// Configuration for the sparse-embedding pipeline.
+///
+/// Controls which model to use, batching, and download/cache behavior for the
+/// local ONNX SPLADE model.
+///
+/// Since v5.0.
+pub const SparseEmbeddingConfig = struct {
+    /// The sparse-embedding model to use (defaults to the "opensearch-v3-distill" preset).
+    model: SparseEmbeddingModelType,
+    /// Batch size for local ONNX inference.
+    ///
+    /// SPLADE emits a `[seq, vocab]` logit tensor per document, so memory scales
+    /// with batch size — keep this modest.
+    batch_size: u64,
+    /// Maximum token sequence length for the tokenizer.
+    max_length: u64,
+    /// Show model download progress (local ONNX path only).
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg.model_download` target while they download (#279). A warm
+    /// Hugging Face cache transfers nothing and so reports nothing. Ignored by
+    /// `SparseEmbeddingModelType.Plugin`, which downloads no model.
+    show_download_progress: bool,
+    /// Optional alternate Hugging Face cache root for model files.
+    ///
+    /// When unset, hf-hub follows the standard Hugging Face environment and
+    /// platform cache conventions.
+    cache_dir: ?[]const u8,
+    /// Hardware acceleration for the sparse-embedding ONNX model.
+    acceleration: ?AccelerationConfig,
+    /// Maximum wall-clock duration (in seconds) for a single embed call when
+    /// using `SparseEmbeddingModelType.Plugin`. `null` disables the timeout.
+    max_embed_duration_secs: ?u64,
 };
 
 /// Configuration for the summarisation post-processor.
@@ -1476,8 +2072,12 @@ pub const SummarizationConfig = struct {
 /// model = "tiny"
 /// ```
 pub const TranscriptionConfig = struct {
-    /// Master switch. When false the block is ignored and audio files fall back
-    /// to the normal "unsupported format" path.
+    /// Master switch. When `false`, the transcription pipeline is not run.
+    ///
+    /// The extractor is registered for audio/video MIME types whenever the `transcription`
+    /// feature is compiled in, independently of this flag, so an audio/video input with
+    /// `enabled = false` fails with an `XbergError.Transcription` explaining how to turn
+    /// transcription on — it does not fall through to another extractor.
     enabled: bool,
     /// Whisper model size to use.
     ///
@@ -1491,8 +2091,10 @@ pub const TranscriptionConfig = struct {
     language: ?[]const u8,
     /// Whether to request segment-level timestamps.
     ///
-    /// Accepted for forward compatibility. The current engine always uses
-    /// `<|notimestamps|>` and does not emit segment metadata yet.
+    /// When `true`, the decoder prompt omits `<|notimestamps|>` so the model emits
+    /// `<|x.xx|>` tokens, and each transcript segment becomes its own paragraph element
+    /// carrying `start_ms` / `end_ms` attributes. When `false` (default), all segment
+    /// text is joined into a single flat paragraph with no timing attributes.
     timestamps: bool,
     /// Hard safety limit on input duration (milliseconds).
     ///
@@ -1506,14 +2108,20 @@ pub const TranscriptionConfig = struct {
     max_bytes: ?u64,
     /// Wall-clock timeout for the entire transcription operation (ms).
     ///
-    /// Default: 10 minutes. Reserved for timeout enforcement; the current
-    /// extractor does not enforce this field yet.
-    timeout_ms: ?u64,
-    /// Override the directory used for Whisper model cache.
+    /// Bounds audio decode, model resolution/download, and inference together. On expiry
+    /// the extraction fails with an `XbergError.Transcription`. `null` disables the bound
+    /// and lets the operation run unbounded (not recommended for untrusted input).
     ///
-    /// When `null`, uses the centralized resolver:
-    /// `XBERG_CACHE_DIR/whisper` or the platform default
-    /// (`~/.cache/xberg/whisper` on Linux, etc.).
+    /// Enforced on the async extraction path only; the size and duration caps
+    /// (`max_bytes`, `max_duration_ms`) are checked on every path.
+    ///
+    /// Default: 10 minutes.
+    timeout_ms: ?u64,
+    /// Optional alternate Hugging Face cache root for Whisper models.
+    ///
+    /// When unset, hf-hub follows `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`,
+    /// `HF_HOME`, XDG, and platform defaults. Files remain in the standard
+    /// content-addressed snapshot layout and are not copied into an Xberg cache.
     model_cache_dir: ?[]const u8,
     /// Allow network access to download models from Hugging Face Hub.
     ///
@@ -1522,8 +2130,10 @@ pub const TranscriptionConfig = struct {
     allow_network: bool,
     /// Request SHA256 verification of downloaded model files.
     ///
-    /// Reserved for the checksum table follow-up. The current resolver logs a
-    /// warning and treats this as a no-op.
+    /// Defaults to `false` because the resolver downloads from mutable Hugging
+    /// Face refs unless callers pin and verify models out-of-band. Explicit
+    /// `true` requests are rejected by the model resolver until pinned checksum
+    /// metadata is available.
     verify_hash: bool,
 };
 
@@ -1565,10 +2175,25 @@ pub const TreeSitterConfig = struct {
     /// Custom cache directory for downloaded grammars.
     ///
     /// When `null`, uses the default: `~/.cache/tree-sitter-language-pack/v{version}/libs/`.
+    ///
+    /// Consumed both by the CLI (`tree-sitter download --from-config`,
+    /// `cache warm`) and by `CodeExtractor` at
+    /// extraction time, so that a configured cache directory is honoured
+    /// wherever grammars are looked up or downloaded, not only during an
+    /// explicit CLI download.
     cache_dir: ?[]const u8,
     /// Languages to pre-download on init (e.g., `["python", "rust"]`).
+    ///
+    /// Consumed only by the CLI's `tree-sitter download --from-config` and
+    /// `cache warm` commands as a pre-download hint. Extraction itself does
+    /// not read this field: a given source file always processes with a
+    /// single, already auto-detected language, so there is nothing for a
+    /// language allowlist to gate at extraction time.
     languages: ?[]const []const u8,
     /// Language groups to pre-download (e.g., `["web", "systems", "scripting"]`).
+    ///
+    /// Consumed only by the CLI's `tree-sitter download --from-config` and
+    /// `cache warm` commands, for the same reason as `languages` above.
     groups: ?[]const []const u8,
     /// Processing options for code analysis.
     process: TreeSitterProcessConfig,
@@ -1592,6 +2217,9 @@ pub const TreeSitterProcessConfig = struct {
     symbols: bool,
     /// Include parse diagnostics. Default: false.
     diagnostics: bool,
+    /// Extract a hierarchical key/value data tree from data-format files
+    /// (JSON, YAML, TOML, XML, CSV, etc.). Default: false.
+    data_extraction: bool,
     /// Maximum chunk size in bytes. `null` disables chunking.
     chunk_max_size: ?u64,
     /// Content rendering mode for code extraction.
@@ -1647,6 +2275,17 @@ pub const StructuredDataResult = struct {
     metadata: std.StringHashMap([]const u8),
     /// JSON paths of fields that were classified as text-bearing.
     text_fields: []const []const u8,
+    /// The parsed document as a canonical `serde_json.Value` tree, when the
+    /// source format could be represented as one. `null` only for TOML inputs
+    /// whose `toml.Value` fails to round-trip through `serde_json.Value`
+    /// (xberg-io/xberg#155): the extractor falls back to a raw code block in
+    /// that case.
+    value: ?[]const u8,
+    /// Flattened `path: value` renderings for every leaf field, in traversal
+    /// order. Previously computed and discarded (xberg-io/xberg#166); now
+    /// surfaced so callers get a full-text view even when the structured
+    /// renderer only emits headings/lists for a subset of fields.
+    flattened: []const []const u8,
 };
 
 /// Application properties from docProps/app.xml for DOCX
@@ -1837,6 +2476,15 @@ pub const TokenReductionConfig = struct {
     target_reduction: ?f32,
     /// Group semantically similar sentences and emit only one per cluster.
     enable_semantic_clustering: bool,
+    /// Skip removal of words with "important" characteristics (all-caps
+    /// acronyms, words containing digits, mixed-case identifiers, very long
+    /// words) during the `Aggressive`/`Maximum` common-word removal pass.
+    ///
+    /// `true` (the default) protects those words even when they would
+    /// otherwise be dropped as low-value filler; `false` lets the frequency/
+    /// length heuristics apply uniformly to every word, including ones that
+    /// look like acronyms or technical terms (#269).
+    preserve_important_words: bool,
 };
 
 /// One detected PII span in the input text.
@@ -1908,6 +2556,25 @@ pub const PdfAnnotation = struct {
     page_number: u32,
     /// Bounding box of the annotation on the page.
     bounding_box: ?BoundingBox,
+    /// Author/creator of the annotation (PDF `/T` entry).
+    author: ?[]const u8,
+    /// Last modification date of the annotation (PDF `/M` entry), as a raw
+    /// PDF date string (e.g. `"D:20240115120000Z"`).
+    modified: ?[]const u8,
+    /// Annotation colour (PDF `/C` entry), normalised to a CSS-compatible
+    /// `#rrggbb` hex string. Gray and CMYK colour spaces are converted to RGB.
+    color: ?[]const u8,
+    /// Subject of the annotation (PDF `/Subj` entry).
+    subject: ?[]const u8,
+    /// Per-line bounding boxes derived from the annotation's `/QuadPoints`
+    /// entry. Present for text markup annotations (Highlight, Underline,
+    /// StrikeOut, Squiggly), one box per marked line/run of text.
+    quad_points: ?[]const BoundingBox,
+    /// The document text covered by `Self.quad_points`, recovered from the
+    /// page content underneath the marked-up region. Populated for
+    /// Highlight, Underline, StrikeOut, and Squiggly annotations when the
+    /// underlying text could be recovered.
+    marked_text: ?[]const u8,
 };
 
 /// Classification result for a single page.
@@ -2064,6 +2731,17 @@ pub const DocumentRelationship = struct {
 /// Each node has deterministic `id`, typed `content`, optional `parent`/`children`
 /// for tree structure, and metadata like page number, bounding box, and content layer.
 pub const DocumentNode = struct {
+    /// Deterministic identifier (hash of node type + text + page + position).
+    ///
+    /// Stable and unique within a single extraction response: every internal
+    /// construction path threads the node's position (its index in
+    /// `DocumentStructure.nodes`) into the hash, so identical
+    /// `(node_type, text, page)` tuples at different positions never collide.
+    /// Always serialised — `ChunkMetadata.node_ids` references it to join
+    /// chunks back to the nodes they were derived from.
+    /// `#[serde(default)]` covers the missing-field case on inbound JSON
+    /// (e.g. documents serialised before this field existed).
+    id: []const u8,
     /// Node content — tagged enum, type-specific data only.
     content: NodeContent,
     /// Parent node index (`null` = root-level node).
@@ -2152,6 +2830,59 @@ pub const Entity = struct {
     confidence: ?f32,
 };
 
+/// Cheap structural counts for an extracted document.
+///
+/// Populated on every `ExtractedDocument` returned by `extract` /
+/// `extract_batch`, regardless of whether the heavy `pages` / `images`
+/// collections are materialized. A caller that only needs "how many pages /
+/// tables / images did this document have?" (reporting, cost estimation,
+/// progress, quotas) can read these without enabling per-page or per-image
+/// extraction.
+///
+/// The page count comes from the parse (the extractor already walks the page
+/// tree); it does not require opting into per-page content. `pages` is `0` for
+/// inputs that are not page-addressable (e.g. plain text).
+pub const DocumentCounts = struct {
+    /// Total pages in the source document (`0` when not page-addressable).
+    pages: u64,
+    /// Tables detected in the document.
+    tables: u64,
+    /// Images detected in the document.
+    images: u64,
+};
+
+/// Structured per-language detection result: confidence, document share, and script —
+/// the information the ISO-code-only `detected_languages` list cannot convey (#261).
+///
+/// Populated by `language_detection` alongside `detected_languages`, with one
+/// entry per language, in the same order as `detected_languages`.
+pub const LanguageConfidence = struct {
+    /// ISO 639-3 language code, matching the corresponding entry in `detected_languages`.
+    language: []const u8,
+    /// Confidence for this language, in `[0.0, 1.0]`.
+    ///
+    /// In single-language mode this is whatlang's `Info.confidence()` for the whole
+    /// document. In multi-language mode this is the average whatlang confidence across
+    /// the document's 200-character chunks that were classified as this language.
+    confidence: f64,
+    /// Share of the document's analyzed content classified as this language, in `[0.0, 1.0]`.
+    ///
+    /// In single-language mode this is always `1.0`. In multi-language mode this is the
+    /// fraction of 200-character chunks classified as this language (chunks that did not
+    /// meet `min_confidence` for any language are excluded from the count but still count
+    /// toward the denominator).
+    proportion: f64,
+    /// Writing system whatlang detected for this language (e.g. `"Latin"`, `"Cyrillic"`).
+    script: []const u8,
+    /// Whether this detection is considered reliable.
+    ///
+    /// In single-language mode this is whatlang's own `Info.is_reliable()` (confidence
+    /// above whatlang's internal 0.9 threshold). In multi-language mode this is the
+    /// chunk-averaged `confidence` above that same 0.9 threshold, since whatlang's
+    /// `is_reliable()` only applies to a single detection.
+    reliable: bool,
+};
+
 /// Document extracted by the core extraction pipeline.
 ///
 /// `extract` and `extract_batch` return an `ExtractionResult` envelope whose
@@ -2170,8 +2901,20 @@ pub const ExtractedDocument = struct {
     extraction_method: ?ExtractionMethod,
     /// Tables extracted from the document, each with structured cell data.
     tables: []const Table,
+    /// Cheap structural counts (pages, tables, images).
+    ///
+    /// Always populated by the extraction pipeline, even when the `pages` /
+    /// `images` collections are `null`. See `DocumentCounts`.
+    counts: DocumentCounts,
     /// ISO 639-1 language codes detected in the document content.
     detected_languages: ?[]const []const u8,
+    /// Structured per-language detection results: confidence, document share, script,
+    /// and reliability, alongside the ISO-code-only `detected_languages` (#261).
+    ///
+    /// One entry per language in `detected_languages`, in the same order. `null` under
+    /// the same conditions as `detected_languages`: detection disabled, empty input
+    /// text, or no language met the configured `min_confidence`.
+    detected_language_confidences: ?[]const LanguageConfidence,
     /// Text chunks when chunking is enabled.
     ///
     /// When chunking configuration is provided, the content is split into
@@ -2354,12 +3097,6 @@ pub const ExtractedDocument = struct {
     /// Populated by the PDF extractor when `PdfConfig.extract_form_fields` is
     /// enabled (default) and the document is a fillable form. Empty otherwise.
     form_fields: []const PdfFormField,
-    /// Pre-rendered content in the requested output format.
-    ///
-    /// Populated during `derive_extraction_result` before tree derivation consumes
-    /// element data. `apply_output_format` swaps this into `content` at the end
-    /// of the pipeline, after post-processors have operated on plain text.
-    formatted_content: ?[]const u8,
 };
 
 /// A single file extracted from an archive.
@@ -2428,6 +3165,27 @@ pub const Chunk = struct {
     /// Only populated when `EmbeddingConfig` is provided in chunking configuration.
     /// The dimensionality depends on the chosen embedding model.
     embedding: ?[]const f32,
+    /// Optional sparse (SPLADE) learned embedding for this chunk.
+    ///
+    /// Only populated when sparse-embedding generation is configured for chunking.
+    /// `null` otherwise, including on builds without the `sparse-embeddings` feature.
+    ///
+    /// Uses the crate-root `SparseEmbedding` alias rather than
+    /// `crate.sparse_embeddings.SparseEmbedding` directly: the `sparse_embeddings`
+    /// module itself only compiles under `sparse-embeddings`/`sparse-embedding-presets`,
+    /// while the crate-root alias is always defined (a field-compatible stub on builds
+    /// without either feature), so this field — and `Chunk` itself — compiles on every
+    /// feature combination, including the crate's default features.
+    sparse_embedding: ?SparseEmbedding,
+    /// Optional ColBERT-style multi-vector (late-interaction) embedding for this chunk.
+    ///
+    /// Only populated when late-interaction embedding generation is configured for
+    /// chunking. `null` otherwise, including on builds without the `late-interaction`
+    /// feature.
+    ///
+    /// Uses the crate-root `MultiVectorEmbedding` alias for the same reason
+    /// `sparse_embedding` uses `SparseEmbedding` — see that field's docs.
+    late_interaction: ?MultiVectorEmbedding,
     /// Metadata about this chunk's position and properties.
     metadata: ChunkMetadata,
 };
@@ -2489,6 +3247,43 @@ pub const ChunkMetadata = struct {
     /// image whose `page_number` falls within `[first_page, last_page]`.
     /// Empty when image extraction is disabled or the chunk spans no pages with images.
     image_indices: []const u32,
+    /// Ids of the `DocumentNode`s
+    /// this chunk was derived from.
+    ///
+    /// Joins a chunk back to the structured document tree via
+    /// `DocumentNode.id`.
+    /// Empty until the node-to-rendered-offset mapping needed to compute the
+    /// intersection is implemented (tracked under #1294/#1295); this field is
+    /// the wire-format foundation for that follow-up.
+    node_ids: []const []const u8,
+    /// Per-page bounding-box spans this chunk covers, for viewer highlighting (#1295).
+    ///
+    /// One entry per page the chunk overlaps, in page order — the first and last entries'
+    /// `page` fields equal `first_page`/`last_page`.
+    /// Populated whenever page-boundary provenance is available (the same condition under
+    /// which `first_page`/`last_page` are populated); each entry's `bbox` is additionally
+    /// populated when the document's structured node tree (`ExtractedDocument.document`) is
+    /// available, as the union of that page's body-layer node bounding boxes found within this
+    /// chunk. Empty when page-boundary provenance is unavailable (mirrors `first_page`/
+    /// `last_page` being `null`).
+    page_spans: []const PageSpan,
+    /// Multi-label classification result for this chunk.
+    ///
+    /// Populated by the chunk-classification post-processor when
+    /// `ExtractionConfig.chunk_classification`
+    /// is set. A chunk may match zero, one, or many of the configured label
+    /// definitions. Empty when chunk classification was not configured.
+    classifications: []const ClassificationLabel,
+};
+
+/// A single page covered by a chunk, with an optional bounding box on that page.
+///
+/// See `ChunkMetadata.page_spans` (#1295) for population semantics.
+pub const PageSpan = struct {
+    /// Page number (1-indexed).
+    page: u32,
+    /// Bounding box on this page, if known.
+    bbox: ?BoundingBox,
 };
 
 /// Extracted image from a document.
@@ -2858,9 +3653,13 @@ pub const ImagePreprocessingConfig = struct {
 /// Most users can use the defaults, but these settings allow optimization
 /// for specific document types (invoices, handwriting, etc.).
 pub const TesseractConfig = struct {
-    /// Language code(s) for OCR recognition.
-    /// Accepts either a single language code ("eng") or a list (["eng", "deu"]).
-    /// For Tesseract backend, languages are joined with "+".
+    /// Language code(s) for OCR recognition. For Tesseract, languages are joined with "+".
+    ///
+    /// A list is the canonical form and the only form accepted by the binding
+    /// object APIs (Python, Node, PHP, WASM, etc.): `["eng", "deu"]`. When
+    /// deserializing from a config file, JSON body, or the REST/MCP API, a
+    /// single string is also accepted, either as one code ("eng") or
+    /// "+"-joined ("eng+deu").
     language: []const []const u8,
     /// Page Segmentation Mode (0-13).
     ///
@@ -2969,6 +3768,79 @@ pub const Formula = struct {
     ///
     /// This is set by the extraction pipeline based on which page the formula was found on.
     page: u32,
+};
+
+/// Code-format metadata: the structural chunks produced by tree-sitter parsing.
+///
+/// Wrapped by `FormatMetadata.Code`. Kept as a named struct (rather than an inline
+/// enum-variant body) so serde can tag it under internal tagging and utoipa can emit a
+/// referenceable `CodeMetadata` component in the OpenAPI schema.
+pub const CodeMetadata = struct {
+    /// Structural code chunks (function/class/module boundaries).
+    chunks: []const CodeChunkInfo,
+    /// Hierarchical key/value data tree extracted from data-format source
+    /// (JSON, YAML, TOML, XML, CSV, etc.), when data extraction was enabled.
+    data: ?CodeDataNode,
+};
+
+/// A single structurally-meaningful code chunk produced by tree-sitter parsing.
+///
+/// Purpose-built payload owned by xberg — deliberately does not expose the upstream
+/// `tree_sitter_language_pack` types, so binding generators never need to resolve an
+/// external crate's types across FFI/language boundaries.
+pub const CodeChunkInfo = struct {
+    /// The raw source text of this chunk.
+    text: []const u8,
+    /// Hierarchical path of enclosing structural items (e.g. `["MyClass", "my_method"]`).
+    context_path: []const []const u8,
+    /// Tree-sitter node kinds that appear at the top level of this chunk (e.g.
+    /// `"function_definition"`, `"class_definition"`).
+    node_types: []const []const u8,
+    /// Inclusive start byte offset of this chunk in the original source.
+    byte_start: u64,
+    /// Exclusive end byte offset of this chunk in the original source.
+    byte_end: u64,
+};
+
+/// An XML-style attribute attached to an `Element` node.
+///
+/// Populated only for `CodeDataNodeKind.Element`; always empty for `KeyValue` and
+/// `Sequence` nodes.
+pub const CodeDataAttribute = struct {
+    /// Attribute name (e.g. `"class"`, `"href"`).
+    name: []const u8,
+    /// Attribute value as a raw string (quotes stripped).
+    value: []const u8,
+    /// Inclusive start byte offset of the `name="value"` attribute token.
+    byte_start: u64,
+    /// Exclusive end byte offset of the `name="value"` attribute token.
+    byte_end: u64,
+};
+
+/// A node in the hierarchical data tree produced by data-format extraction.
+///
+/// Purpose-built payload owned by xberg — mirrors
+/// `tree_sitter_language_pack.DataNode` but flattens its `Span` down to plain byte
+/// offsets, so binding generators never need to resolve an external crate's types
+/// across FFI/language boundaries.
+pub const CodeDataNode = struct {
+    /// Whether this node is a key/value pair, XML element, or sequence item.
+    kind: CodeDataNodeKind,
+    /// Key, attribute name, tag name, or positional index (`"0"`, `"1"`, …).
+    /// `null` at the document root.
+    key: ?[]const u8,
+    /// Leaf scalar value, if any. `null` for containers (objects, arrays, XML
+    /// elements with child elements).
+    value: ?[]const u8,
+    /// Attributes on element-shape nodes (XML `STag` attributes). Empty for all
+    /// other kinds.
+    attributes: []const CodeDataAttribute,
+    /// Children for nested containers and XML element bodies.
+    children: []const CodeDataNode,
+    /// Inclusive start byte offset of this node in the original source.
+    byte_start: u64,
+    /// Exclusive end byte offset of this node in the original source.
+    byte_end: u64,
 };
 
 /// Extraction result metadata.
@@ -3741,6 +4613,21 @@ pub const CellChange = struct {
     to: []const u8,
 };
 
+/// A single run-level or style-level property change.
+///
+/// Used for revisions that change formatting rather than text content. `from`
+/// and `to` store normalized property values when the source format exposes
+/// them; either side may be absent when the format only records one side of the
+/// change.
+pub const PropertyChange = struct {
+    /// Property name, such as `"bold"`, `"italic"`, `"font_size"`, or `"font_color"`.
+    name: []const u8,
+    /// Value before the change, when available.
+    from: ?[]const u8,
+    /// Value after the change, when available.
+    to: ?[]const u8,
+};
+
 /// A single tracked change embedded in a document.
 ///
 /// Populated by per-format extractors that understand change-tracking metadata
@@ -3779,13 +4666,15 @@ pub const DocumentRevision = struct {
 ///
 /// For insertions and deletions the `content` field carries the added/removed
 /// lines as `DiffLine.Added` / `DiffLine.Removed` entries. For format
-/// changes, `content` is empty — the property diff is left as a TODO for a
-/// later enrichment pass.
+/// changes, `property_changes` carries normalized before/after formatting
+/// values when the source document exposes them.
 pub const RevisionDelta = struct {
     /// Line-level content changes for this revision.
     content: []const DiffLine,
     /// Cell-level table changes for this revision.
     table_changes: []const CellChange,
+    /// Formatting or metadata property changes for this revision.
+    property_changes: []const PropertyChange,
 };
 
 /// Summary of an extracted document.
@@ -3812,6 +4701,32 @@ pub const Table = struct {
     /// Bounding box of the table on the page (PDF coordinates: x0=left, y0=bottom, x1=right, y1=top).
     /// Only populated for PDF-extracted tables when position data is available.
     bounding_box: ?BoundingBox,
+    /// Stable identifier shared by every `tables[]` entry that represents a
+    /// fragment of the same physical table.
+    ///
+    /// Assigned deterministically by the extraction pipeline (e.g. a
+    /// sequential `"table-N"` in document order); never derived from
+    /// randomness or wall-clock time, so the same input document always
+    /// produces the same ids. Consumers can use it to reconcile the markdown
+    /// blocks in `content` / `pages[].content` / `chunks[].content` with the
+    /// structured entries in `tables[]`. `null` when the extractor did not
+    /// assign one.
+    ///
+    /// Today, same-page fragments of one physical table are already merged
+    /// into a single `tables[]` entry before ids are assigned (see PDF table
+    /// stitching), so in practice `table_id` is unique per entry rather than
+    /// shared across several. A table split across a page boundary is
+    /// intentionally *not* linked — its per-page pieces get separate ids.
+    /// Sharing one id across page-boundary fragments is a known possible
+    /// future extension, not implemented yet.
+    table_id: ?[]const u8,
+    /// Header cells for this fragment, i.e. the first row of `cells`.
+    ///
+    /// Populated even when this fragment's own header row was merged away or
+    /// physically lives in a sibling fragment (see `table_id`), so a single
+    /// fragment is interpretable in isolation. `null` when no header row
+    /// could be determined.
+    columns: ?[]const []const u8,
 };
 
 /// Individual table cell with content and optional styling.
@@ -3966,6 +4881,89 @@ pub const RerankedDocument = struct {
     score: f32,
     /// The document text.
     document: []const u8,
+};
+
+/// A sparse learned embedding: vocabulary term indices and their weights.
+///
+/// `indices` are ascending vocabulary token ids; `values[i]` is the weight for
+/// `indices[i]`. The two arrays always have equal length. Only strictly-positive
+/// terms are retained, so the representation is genuinely sparse.
+///
+/// Since v5.0.
+pub const SparseEmbedding = struct {
+    /// Vocabulary token ids with non-zero weight, ascending.
+    indices: []const u32,
+    /// Weights parallel to `SparseEmbedding.indices`.
+    values: []const f32,
+};
+
+/// Static metadata for a bundled SPLADE preset (WASM/Android-safe, no ORT).
+///
+/// Since v5.0.
+pub const SparseEmbeddingPreset = struct {
+    /// Stable preset name referenced from config.
+    name: []const u8,
+    /// HuggingFace repository hosting the ONNX model.
+    model_repo: []const u8,
+    /// Path to the ONNX file within the repo.
+    model_file: []const u8,
+    /// Sibling files that must be downloaded alongside `model_file`.
+    additional_files: []const []const u8,
+    /// Maximum token sequence length.
+    max_length: u64,
+    /// Human-readable description.
+    description: []const u8,
+};
+
+/// A ColBERT multi-vector embedding: one row per attention-live token.
+///
+/// `data` is a flat, row-major buffer of length `num_tokens * dim` — row `i`
+/// (the embedding for token `i`) occupies `data[i*dim .. (i+1)*dim]`. Flat
+/// storage keeps the type FFI-friendly across binding boundaries; use
+/// `MultiVectorEmbedding.rows` internally to iterate per-token slices.
+///
+/// Since v5.0.
+pub const MultiVectorEmbedding = struct {
+    /// Number of attention-live token rows (padding rows are dropped, not
+    /// zeroed — see `engine.normalize_tokens`).
+    num_tokens: u32,
+    /// Dimensionality of each per-token vector.
+    dim: u32,
+    /// Flat row-major buffer, length `num_tokens * dim`.
+    data: []const f32,
+};
+
+/// Static metadata for a bundled ColBERT preset (WASM/Android-safe, no ORT).
+///
+/// Since v5.0.
+pub const LateInteractionPreset = struct {
+    /// Stable preset name referenced from config.
+    name: []const u8,
+    /// HuggingFace repository hosting the ONNX model.
+    model_repo: []const u8,
+    /// Path to the ONNX file within the repo.
+    model_file: []const u8,
+    /// Sibling files that must be downloaded alongside `model_file`.
+    additional_files: []const []const u8,
+    /// Maximum document token sequence length.
+    max_length: u64,
+    /// Fixed padded query length (ColBERT query augmentation).
+    query_max_length: u64,
+    /// Per-token embedding dimensionality.
+    dim: u64,
+    /// Human-readable description.
+    description: []const u8,
+};
+
+/// A single document match returned by `max_sim_rank`, with its position in
+/// the input and MaxSim score.
+///
+/// Since v5.0.
+pub const LateInteractionMatch = struct {
+    /// Position of this document in the original input slice.
+    index: u64,
+    /// MaxSim relevance score. Higher means more relevant to the query.
+    score: f32,
 };
 
 /// YAKE-specific parameters.
@@ -4282,6 +5280,22 @@ pub const PresetSummary = struct {
     fingerprint: []const u8,
 };
 
+/// A single doctor verdict: what was checked, the outcome, and why.
+pub const DoctorCheck = struct {
+    /// Check identifier, e.g. `ocr.tesseract` or `layout.rtdetr`.
+    name: []const u8,
+    /// Pass / warn / fail / skip verdict.
+    status: ProbeStatus,
+    /// One-line reason or detail (e.g. missing language, resolved path, error).
+    message: []const u8,
+};
+
+/// Aggregate doctor report over all configured backends and settings.
+pub const DoctorReport = struct {
+    /// Individual check verdicts, in execution order.
+    checks: []const DoctorCheck,
+};
+
 /// Configuration for PaddleOCR backend.
 ///
 /// Configures PaddleOCR text detection and recognition with multi-language support.
@@ -4289,7 +5303,10 @@ pub const PresetSummary = struct {
 pub const PaddleOcrConfig = struct {
     /// Language code (e.g., "en", "ch", "jpn", "kor", "deu", "fra")
     language: []const u8,
-    /// Optional custom cache directory for model files
+    /// Optional Hugging Face Hub cache root for model files.
+    ///
+    /// When unset, the standard `HF_HUB_CACHE`, legacy
+    /// `HUGGINGFACE_HUB_CACHE`, and `HF_HOME` conventions are used.
     cache_dir: ?[]const u8,
     /// Enable angle classification for rotated text (default: false).
     /// Can misfire on short text regions, rotating crops incorrectly before recognition.
@@ -4305,7 +5322,7 @@ pub const PaddleOcrConfig = struct {
     /// Unclip ratio for expanding text bounding boxes (default: 1.6)
     /// Controls the expansion of detected text regions
     det_db_unclip_ratio: f32,
-    /// Maximum side length for detection image (default: 960)
+    /// Maximum side length for detection image (default: 1024)
     /// Larger images may be resized to this limit for faster inference
     det_limit_side_len: u32,
     /// Batch size for recognition inference (default: 6)
@@ -4321,18 +5338,41 @@ pub const PaddleOcrConfig = struct {
     drop_score: f32,
     /// Model tier controlling detection/recognition model size and accuracy trade-off.
     ///
+    /// For PP-OCRv5 (`model_version = "pp-ocrv5"`):
+    ///
     /// - `"mobile"` (default): Lightweight models (~4.5MB detection, ~16.5MB recognition), fast download and inference
     /// - `"server"`: Large, high-accuracy models (~88MB detection, ~84MB recognition), best for GPU or complex documents
+    ///
+    /// For PP-OCRv6 (`model_version = "pp-ocrv6"`): `"medium"` (default), `"small"`, or `"tiny"`.
+    /// A legacy `"mobile"`/`"server"` tier under v6 falls back to `"medium"`.
     model_tier: []const u8,
+    /// Model generation: `"pp-ocrv6"` (default) or `"pp-ocrv5"`.
+    ///
+    /// PP-OCRv6 adds a unified CJK+Latin+JA/KO recognition model with `medium`/`small`/`tiny`
+    /// tiers (see `model_tier`). Scripts outside the v6 unified coverage (Arabic, Cyrillic,
+    /// Devanagari, Greek, Tamil, Telugu, Thai) transparently fall back to the PP-OCRv5
+    /// per-script recognition models. Defaults to `"pp-ocrv6"`; the default `model_tier`
+    /// (`"mobile"`) resolves to the v6 `"medium"` tier. Select `"pp-ocrv5"` to pin the
+    /// legacy per-script/unified fleet.
+    model_version: []const u8,
+    /// Explicit inference engine choice.
+    ///
+    /// `null` (the default) resolves to the compiled default: `ort` when the
+    /// `paddle-ocr-ort` feature is compiled in, otherwise `tract`. An explicit choice
+    /// is validated against the compiled features when the OCR engine is constructed
+    /// (see `crate.paddle_ocr.backend.effective_backend`); requesting an engine
+    /// whose feature is not compiled in is a clear configuration error rather than a
+    /// silent fallback.
+    inference_backend: ?PaddleInferenceBackend,
 };
 
 /// Combined paths to all models needed for OCR (backward compatibility).
 pub const ModelPaths = struct {
-    /// Path to the detection model directory.
+    /// Exact path to the detection ONNX model in the Hugging Face snapshot.
     det_model: []const u8,
-    /// Path to the classification model directory.
+    /// Exact path to the classification ONNX model in the Hugging Face snapshot.
     cls_model: []const u8,
-    /// Path to the recognition model directory.
+    /// Exact path to the recognition ONNX model in the Hugging Face snapshot.
     rec_model: []const u8,
     /// Path to the character dictionary file.
     dict_file: []const u8,
@@ -4426,6 +5466,27 @@ pub const PdfMetadata = struct {
     height: ?i64,
     /// Total number of pages in the PDF document
     page_count: ?u32,
+    /// How strongly the document's most scan-like page resembles a scan, in `[0.0, 1.0]`.
+    ///
+    /// `null` when the document could not be inspected. A full-page raster with no
+    /// visible text scores at least `0.85`; a born-digital slide with a full-bleed
+    /// background image scores `0.50`.
+    scanned_confidence: ?f32,
+    /// Pages that look like scans (1-indexed), using the default confidence threshold.
+    ///
+    /// `null` when the document could not be inspected; empty when no page qualifies.
+    scanned_pages: ?[]const u32,
+    /// Pages the `auto` layout strategy skipped (1-indexed).
+    ///
+    /// `null` unless layout detection ran with `LayoutStrategy.Auto`; empty
+    /// when the gate selected every page.
+    layout_gated_pages: ?[]const u32,
+    /// Why the `auto` layout gate selected or skipped each page.
+    ///
+    /// Index `i` is page `i + 1`. Snake_case values such as `multi_column`,
+    /// `table_grid`, or `plain_text` (the skip reason). `null` unless layout
+    /// detection ran with `LayoutStrategy.Auto`.
+    layout_gate_reasons: ?[]const []const u8,
 };
 
 /// Proxy configuration for HTTP requests.
@@ -4457,7 +5518,7 @@ pub const ContentConfig = struct {
     /// Remove form elements. Default: `true`.
     remove_forms: bool,
     /// HTML tag names to strip (render children only, remove the tag wrapper).
-    /// Default: `["noscript"]`.
+    /// Default: `[]`.
     strip_tags: []const []const u8,
     /// HTML tag names to preserve as raw HTML in output.
     preserve_tags: []const []const u8,
@@ -4466,6 +5527,12 @@ pub const ContentConfig = struct {
     /// Unlike `strip_tags` (which removes the wrapper but keeps children),
     /// excluded elements and all descendants are dropped. Supports CSS selectors:
     /// `.class`, `#id`, `[attribute]`, compound selectors.
+    ///
+    /// Default: `["noscript"]`. `<noscript>` fallback content (no-JS notices,
+    /// tracking pixels, GTM iframes) is meant for browsers with JavaScript
+    /// disabled, not for a markdown reader, and `strip_tags` cannot drop it —
+    /// on `preprocessing_preset: "standard"` (crawlberg's only path) it only
+    /// removes the wrapper and still renders the children. ~keep
     ///
     /// Example: `[".cookie-banner", "#ad-container", "[role='complementary']"]`
     exclude_selectors: []const []const u8,
@@ -4528,6 +5595,11 @@ pub const CrawlConfig = struct {
     max_depth: ?u64,
     /// Maximum number of pages to crawl.
     max_pages: ?u64,
+    /// Maximum links enqueued from a single page. Defaults to 10000.
+    ///
+    /// Bounds the work one hostile or pathological page can create; links past the
+    /// cap are dropped and a warning is logged.
+    max_links_per_page: ?u64,
     /// Maximum number of concurrent requests.
     max_concurrent: ?u64,
     /// Whether to respect robots.txt directives.
@@ -4590,6 +5662,14 @@ pub const CrawlConfig = struct {
     /// List of user-agent strings for rotation. If non-empty, overrides `user_agent`.
     user_agents: []const []const u8,
     /// Whether to capture a screenshot when using the browser.
+    ///
+    /// Only supported by `scrape()` with `BrowserBackend.Chromiumoxide` and
+    /// `BrowserMode.Always` or `Stealth`. A screenshot is 100–500 KB of PNG per page,
+    /// so `crawl()` does not carry screenshots in `CrawlPageResult`/`CrawlResult` at
+    /// all — a multi-thousand-page crawl holding one per page in memory is not a safe
+    /// default. Setting this with any other configuration (a different backend,
+    /// `BrowserMode.Auto`/`Never`, or during `crawl()`) has no effect and logs a
+    /// warning rather than silently doing nothing.
     capture_screenshot: bool,
     /// Re-enqueue discovered `LinkType.Document` URLs into the crawl frontier so
     /// the crawl follows links *from* document pages (PDFs, etc.) as it would
@@ -4601,24 +5681,68 @@ pub const CrawlConfig = struct {
     /// outer `max_depth` and (if set) `document_url_depth` permit it.
     document_url_depth: ?u32,
     /// Whether to download non-HTML documents (PDF, DOCX, images, code, etc.) instead of skipping them.
+    /// Defaults to `true` — unlike `download_assets` and `capture_screenshot`, which default to `false`.
     download_documents: bool,
     /// Maximum size in bytes for document downloads. Defaults to 50 MB.
     document_max_size: ?u64,
     /// Allowlist of MIME types to download. If empty, uses built-in defaults.
     document_mime_types: []const []const u8,
+    /// Directory to stream downloaded document bytes into instead of holding them in
+    /// memory on `DownloadedDocument.content`. When set, `content` is left empty and
+    /// `DownloadedDocument.content_path` is populated with `<dir>/<content_hash>.<ext>`.
+    /// `null` (default) preserves today's in-memory-only behavior. Has no effect on
+    /// wasm32, which has no filesystem — use `document_content_encoding` there instead.
+    document_output_dir: ?[]const u8,
+    /// Opt-in encoding that duplicates `DownloadedDocument.content` into a serializable
+    /// field for language bindings that need the bytes in-memory (`content` itself is
+    /// `alef(skip)`ed). `null` (default) means no encoding is produced. Independent of
+    /// `document_output_dir` — set both to get a file on disk and an in-memory copy.
+    document_content_encoding: ?DocumentContentEncoding,
     /// Path to write WARC output. If `null`, WARC output is disabled.
     warc_output: ?[]const u8,
     /// Named browser profile for persistent sessions (cookies, localStorage).
+    ///
+    /// Chromiumoxide backend only. The native backend runs an in-process JavaScript
+    /// engine with no Chrome process and therefore no profile directory, so this is
+    /// ignored there and logs a warning. It is also ignored — with a warning — when a
+    /// shared browser pool is in use (the pool launches before any per-crawl config
+    /// exists) or when connecting to an external CDP endpoint whose process crawlberg
+    /// does not own.
     browser_profile: ?[]const u8,
     /// Whether to save changes back to the browser profile on exit.
     save_browser_profile: bool,
     /// SSRF policy for outbound network requests. Default: deny private networks,
     /// allow http/https only, max 5 redirects.
     ///
-    /// Phase 1: `deny_private` and `max_redirects` are exposed to all language
-    /// bindings. `allowlist` is skipped (see `SsrfPolicy` fields) and will be
-    /// added in a follow-up when `HostMatcher`'s tagged-enum FFI form is decided.
+    /// `deny_private`, `allowlist` and `max_redirects` are exposed to all language
+    /// bindings. `scheme_allowlist` stays Rust-only — see `SsrfPolicy`.
+    ///
+    /// **wasm32 (including Node.js): `deny_private` does not stop hostname-based
+    /// requests.** There is no DNS resolution on this target, so only a literal IP host is
+    /// checked against the policy — a domain name is always permitted, regardless of
+    /// `deny_private`. Under Node, where `fetch` enforces no CORS, this means a service
+    /// embedding the wasm binding can be driven to internal hosts by domain name even with
+    /// `deny_private = true`. Enforce egress restrictions at the network layer for that
+    /// deployment target; do not rely on this field. See `crawlberg.net.validate_url`.
     ssrf: SsrfPolicy,
+    /// Pins `SsrfPolicy.deny_private` to a caller-chosen value, bypassing the
+    /// `CRAWLBERG_ALLOW_PRIVATE_NETWORK` operator override entirely for this config.
+    ///
+    /// `ssrf.deny_private` is a plain, always-serialized `bool`: several alef-generated
+    /// bindings construct `SsrfPolicy.default()` (hardcoding `deny_private: true`)
+    /// whenever their caller never touches SSRF settings at all, so `true` on that field
+    /// alone cannot distinguish "the caller wants private networks denied" from "the
+    /// binding's own structural default landed on `true`". The environment variable
+    /// exists precisely to resolve that ambiguity in the common case by treating any
+    /// `true` as inconclusive and deferring to the operator.
+    ///
+    /// Set this field when that default-deferral is wrong for your call — e.g. a test
+    /// that must prove `deny_private: true` still denies even while the operator has set
+    /// `CRAWLBERG_ALLOW_PRIVATE_NETWORK` suite-wide for every other call. `null` (default)
+    /// preserves today's behavior: the environment variable may still flip
+    /// `ssrf.deny_private` to `false`. `Some(value)` pins `ssrf.deny_private` to `value`
+    /// and the environment variable is not consulted for this config.
+    ssrf_deny_private_explicit: ?bool,
 };
 
 /// A URL entry from a sitemap.
@@ -4643,8 +5767,175 @@ pub const MapResult = struct {
 pub const SsrfPolicy = struct {
     /// If true, reject URLs that resolve to private/metadata IP ranges.
     deny_private: bool,
+    /// Hostnames and IP ranges permitted regardless of `deny_private`.
+    ///
+    /// The allowlist is an *override* of `deny_private`, not an intersection with it.
+    /// Precedence, in order:
+    ///
+    /// 1. `deny_private == false` permits everything; the allowlist is not consulted.
+    /// 2. A hostname matching an `Exact` or `Suffix` entry is permitted immediately,
+    ///    *before* DNS resolution — so the deny-list is never applied to it. This trusts
+    ///    the host string: a name that resolves into private space is still permitted.
+    ///
+    /// 3. A literal or resolved IP inside a `Cidr` entry is permitted even though it is
+    ///    in the default deny-list.
+    ///
+    /// 4. Otherwise the default deny-list decides.
+    ///
+    /// An empty allowlist therefore denies nothing by itself — it simply leaves
+    /// `deny_private` and the deny-list in sole control.
+    allowlist: []const HostMatcher,
     /// Maximum number of HTTP redirects to follow during validation.
     max_redirects: u8,
+};
+
+/// Main conversion options for HTML to Markdown conversion.
+///
+/// Use `ConversionOptions.builder()` to construct, or `the default constructor` for defaults.
+pub const ConversionOptions = struct {
+    /// Heading style to use in Markdown output (ATX `#` or Setext underline).
+    heading_style: HeadingStyle,
+    /// How to indent nested list items (spaces or tab).
+    list_indent_type: ListIndentType,
+    /// Number of spaces (or tabs) to use for each level of list indentation.
+    list_indent_width: u64,
+    /// Bullet character(s) to use for unordered list items (e.g. `"-"`, `"*"`).
+    bullets: []const u8,
+    /// Character used for bold/italic emphasis markers (`*` or `_`).
+    strong_em_symbol: []const u8,
+    /// Escape `*` characters in plain text to avoid unintended bold/italic.
+    escape_asterisks: bool,
+    /// Escape `_` characters in plain text to avoid unintended bold/italic.
+    escape_underscores: bool,
+    /// Escape miscellaneous Markdown metacharacters (`[]()#` etc.) in plain text.
+    escape_misc: bool,
+    /// Escape ASCII characters that have special meaning in certain Markdown dialects.
+    escape_ascii: bool,
+    /// Default language annotation for fenced code blocks that have no language hint.
+    code_language: []const u8,
+    /// Automatically convert bare URLs into Markdown autolinks.
+    autolinks: bool,
+    /// Emit a default title when no `<title>` tag is present.
+    default_title: bool,
+    /// Render `<br>` elements inside table cells as literal line breaks.
+    br_in_tables: bool,
+    /// Emit tables without column padding (compact GFM format).
+    ///
+    /// When `true`, column widths are not computed and cells are emitted with
+    /// no trailing spaces. Separator rows use exactly `---` per column.
+    /// Produces token-efficient output suitable for RAG / LLM contexts.
+    ///
+    /// Default `false` (aligned padding preserved).
+    compact_tables: bool,
+    /// Style used for `<mark>` / highlighted text (e.g. `==text==`).
+    highlight_style: HighlightStyle,
+    /// Populate `result.metadata` with `<head>` / `<meta>` extraction
+    /// (title, description, Open Graph, Twitter Card, JSON-LD, …).
+    ///
+    /// Default `true`. Disabling skips the metadata pass only — table
+    /// extraction into `result.tables` runs unconditionally.
+    extract_metadata: bool,
+    /// Controls how whitespace sequences are normalised in the converted output.
+    ///
+    /// - `WhitespaceMode.Normalized` (default) — collapses consecutive whitespace characters
+    ///   (spaces, tabs, newlines) to a single space, matching browser rendering behaviour.
+    ///
+    /// - `WhitespaceMode.Strict` — preserves all whitespace exactly as it appears in the
+    ///   source HTML, including runs of spaces and embedded newlines.
+    ///
+    /// Choose `Strict` only when the source HTML uses deliberate whitespace (e.g. pre-formatted
+    /// content outside `<pre>` tags). For most documents `Normalized` produces cleaner output.
+    whitespace_mode: WhitespaceMode,
+    /// Strip all newlines from the output, producing a single-line result.
+    strip_newlines: bool,
+    /// Wrap long lines at `wrap_width` characters.
+    wrap: bool,
+    /// Maximum output line width in characters when `wrap` is `true` (default `80`).
+    ///
+    /// Lines are broken at word boundaries so that no line exceeds this length. A value of `0`
+    /// is treated as "no limit" — equivalent to leaving `wrap` disabled. Has no
+    /// effect when `wrap` is `false`.
+    wrap_width: u64,
+    /// Treat the entire document as inline content (no block-level wrappers).
+    convert_as_inline: bool,
+    /// Markdown notation for subscript text (e.g. `"~"`).
+    sub_symbol: []const u8,
+    /// Markdown notation for superscript text (e.g. `"^"`).
+    sup_symbol: []const u8,
+    /// How to encode hard line breaks (`<br>`) in Markdown.
+    newline_style: NewlineStyle,
+    /// Style used for fenced code blocks (backticks or tilde).
+    code_block_style: CodeBlockStyle,
+    /// HTML tag names whose `<img>` children are kept inline instead of block.
+    keep_inline_images_in: []const []const u8,
+    /// Options for the HTML pre-processing pass applied before conversion begins.
+    ///
+    /// Pre-processing runs before the HTML is handed to the converter and can perform operations
+    /// such as unwrapping redundant wrapper elements, removing tracking pixels, and normalising
+    /// vendor-specific markup. See `PreprocessingOptions` for the full set of knobs.
+    ///
+    /// Defaults to the standard preprocessing options, which enables the standard cleaning
+    /// passes. Set individual fields on `PreprocessingOptions` (or construct via
+    /// `ConversionOptions.builder`) to opt in or out of specific passes.
+    preprocessing: PreprocessingOptions,
+    /// Expected character encoding of the input HTML (default `"utf-8"`).
+    encoding: []const u8,
+    /// Emit debug information during conversion.
+    debug: bool,
+    /// HTML tag names whose content is stripped from the output entirely.
+    strip_tags: []const []const u8,
+    /// HTML tag names that are preserved verbatim in the output.
+    preserve_tags: []const []const u8,
+    /// Skip conversion of `<img>` elements (omit images from output).
+    skip_images: bool,
+    /// URL encoding strategy for link and image destinations.
+    ///
+    /// Controls how special characters in URL destinations are escaped:
+    ///
+    /// - `UrlEscapeStyle.Angle` (default) — wraps the destination in angle brackets when it
+    ///   contains spaces or newlines. Some parsers misinterpret `>` inside such a destination.
+    ///
+    /// - `UrlEscapeStyle.Percent` — percent-encodes every character that is not an RFC 3986
+    ///   unreserved character or `/`, producing a destination that all Markdown parsers handle
+    ///   correctly even when the URL contains `<`, `>`, spaces, or parentheses.
+    url_escape_style: UrlEscapeStyle,
+    /// Link rendering style (inline or reference).
+    link_style: LinkStyle,
+    /// Maximum decoded image size in bytes (default 5MB).
+    max_image_size: u64,
+    /// Capture SVG elements as images.
+    capture_svg: bool,
+    /// Infer image dimensions from data.
+    infer_dimensions: bool,
+    /// Maximum DOM traversal depth.
+    ///
+    /// `null` uses the library's internal native-stack safety limit. Explicit
+    /// values above that safety limit are clamped to prevent process-aborting
+    /// stack overflows on pathologically deep DOM trees.
+    max_depth: ?u64,
+    /// CSS selectors for elements to exclude entirely (element + all content).
+    ///
+    /// Unlike `strip_tags` (which removes the tag wrapper but keeps children),
+    /// excluded elements and all their descendants are dropped from the output.
+    /// Supports any CSS selector that `tl` supports: tag names, `.class`,
+    /// `#id`, `[attribute]`, etc.
+    ///
+    /// Invalid selectors are silently skipped at conversion time.
+    ///
+    /// Example: `[".cookie-banner", "#ad-container", "[role='complementary']"]`
+    exclude_selectors: []const []const u8,
+};
+
+/// HTML preprocessing options for document cleanup before conversion.
+pub const PreprocessingOptions = struct {
+    /// Enable HTML preprocessing globally
+    enabled: bool,
+    /// Preprocessing preset level (Minimal, Standard, Aggressive)
+    preset: PreprocessingPreset,
+    /// Remove navigation elements (nav, breadcrumbs, menus, sidebars)
+    remove_navigation: bool,
+    /// Remove form elements (forms, inputs, buttons, etc.)
+    remove_forms: bool,
 };
 
 /// ONNX Runtime execution provider type.
@@ -4736,13 +6027,65 @@ pub const UrlExtractionMode = enum {
     crawl,
 };
 
+/// **Deprecated and inert.** Chunking no longer writes a heading breadcrumb into
+/// `content` for either variant of this enum — see the revised design adopted in
+/// <https://github.com/xberg-io/xberg/issues/1393>. Setting this field has no
+/// effect on chunking output any more. It is kept only so the ~15 alef-generated
+/// binding packages that construct it keep compiling; removing it outright is a
+/// separate, coordinated breaking change.
+///
+/// # Why this became inert
+///
+/// The original design (this enum, plus
+/// `ChunkingConfig.prepend_heading_context`)
+/// let `Content` mode prepend the heading breadcrumb directly into a chunk's
+/// `content`. GH#1393's follow-up discussion argued that a single flag on the
+/// chunker cannot serve all three retrieval consumers of the same chunk: dense/
+/// embedding retrieval wants the breadcrumb inline, but lexical (BM25/TF-IDF) and
+/// sparse learned (SPLADE) retrieval are actively harmed by it — SPLADE worse
+/// than BM25, because its term-expansion pulls each heading's whole learned
+/// neighbourhood (e.g. `"Authentication"` → `auth`, `login`, `credential`,
+/// `oauth`) into every chunk of that section, and that damage cannot be
+/// corrected by re-indexing since the expansion comes from a pretrained encoder,
+/// not the collection being indexed. Mutating `content` also desynced it from
+/// `byte_start`/`byte_end` (#1294): `chunk.content.len() != byte_end - byte_start`
+/// whenever a breadcrumb had been prepended, so slicing the source document by a
+/// chunk's own offsets silently returned different text than `content`.
+///
+/// The revised design removes the mutation entirely: `chunk.content` now always
+/// equals the exact `[byte_start, byte_end)` source span, regardless of this
+/// enum's value or `prepend_heading_context`.
+///
+/// # What to do instead
+///
+/// Call `render_heading_breadcrumb`
+/// explicitly at index time, with a chunk's (always-clean) `content` and its
+/// `heading_context` — only for
+/// the consumer that wants the breadcrumb inline (typically dense/embedding).
+/// BM25 and SPLADE consumers need no special handling: index `chunk.content` as
+/// returned. See the `rag` module docs for the full
+/// per-consumer guidance.
+pub const BreadcrumbTarget = enum {
+    /// Inert (#1393). Previously prepended the heading breadcrumb into chunk
+    /// `content`; no longer has any effect — `content` is left untouched, exactly
+    /// like `Metadata`. Kept as the default only for wire/API compatibility.
+    content,
+    /// Inert (#1393), and was already a no-op on `content` before this change.
+    /// Kept only for backward compatibility, since `Content` is no longer
+    /// distinguishable from it.
+    metadata,
+};
+
 /// Output format for extraction results.
 ///
 /// Controls the format of the `content` field in `ExtractedDocument`.
 /// When set to `Markdown`, `Djot`, or `Html`, the output uses that format.
 /// `Plain` returns the raw extracted text.
-/// `Structured` returns JSON with full OCR element data including bounding
-/// boxes and confidence scores.
+/// `Structured` is currently a metadata-only label: `derive_extraction_result`
+/// returns `null` for it (see `extraction/derive.rs`), so no renderer runs and
+/// the content is left exactly as `Plain` would leave it. Only
+/// `metadata.output_format` differs. It does NOT attach OCR element data,
+/// bounding boxes or confidence scores.
 pub const OutputFormat = union(enum) {
     /// Plain text content only (default)
     plain: void,
@@ -4754,11 +6097,36 @@ pub const OutputFormat = union(enum) {
     html: void,
     /// JSON tree format with heading-driven sections.
     json: void,
-    /// Structured JSON format with full OCR element metadata.
+    /// Metadata-only label; content is identical to `OutputFormat.Plain`.
+    /// No dedicated renderer exists yet, so this attaches no OCR element
+    /// metadata. See the enum-level docs above.
     structured: void,
+    /// Docling DocTags format (tables rendered as OTSL).
+    doctags: void,
     /// Custom renderer registered via the RendererRegistry.
     /// The string is the renderer name (e.g., "docx", "latex").
     custom: []const u8,
+};
+
+/// Controls how Jupyter notebook code cells are rendered during extraction.
+///
+/// A code cell carries both its **source** and any **outputs** that were saved in
+/// the notebook. Callers ingesting notebooks for AI agents want different slices of
+/// this depending on the task. Xberg never executes cells — `Outputs` and `Both`
+/// only surface outputs already stored in the `.ipynb`.
+///
+/// This toggle governs a code cell's **source body** and its **saved outputs**.
+/// Markdown (prose) cells and structural markers (kernel language, cell id, tags,
+/// execution count) are unaffected — prose always renders and markers orient the
+/// reader regardless of mode.
+pub const JupyterCellRendering = enum {
+    /// Render the code source as a fenced code block; omit saved outputs.
+    source,
+    /// Omit the code source; render only the saved cell outputs.
+    outputs,
+    /// Render both the code source and the saved outputs (default; preserves the
+    /// historical behavior).
+    both,
 };
 
 /// Built-in HTML theme selection.
@@ -4776,6 +6144,23 @@ pub const HtmlTheme = enum {
     /// No built-in stylesheet emitted. CSS custom properties are still defined
     /// on `:root` so user stylesheets can reference `var(--kb-*)` tokens.
     unstyled,
+};
+
+/// Late-interaction model types supported by Xberg.
+///
+/// Since v5.0.
+pub const LateInteractionModelType = union(enum) {
+    /// Use a preset ColBERT model (recommended).
+    preset: []const u8,
+    /// Use a custom ColBERT ONNX model from HuggingFace.
+    custom: struct {
+    model_id: []const u8,
+        model_file: ?[]const u8,
+        additional_files: []const []const u8,
+        max_length: ?i64,
+    },
+    /// In-process late-interaction backend registered via the plugin system.
+    plugin: []const u8,
 };
 
 /// Which table structure recognition model to use.
@@ -4816,6 +6201,65 @@ pub const TableOverlapPreference = enum {
     native,
     /// Prefer the layout (TATR/SLANeXT) table when it overlaps a native table.
     layout,
+};
+
+/// Which PDF pages the layout model runs on.
+///
+/// Layout detection renders each selected page to a raster and runs ONNX
+/// inference on it, which dominates extraction cost. This controls page
+/// selection; `LayoutStrategy.Always` preserves the historical behavior of
+/// running on every page. Wire format is snake_case in all serializers
+/// (JSON, TOML, YAML).
+pub const LayoutStrategy = enum {
+    /// Run layout detection unconditionally on every page.
+    always,
+    /// Pre-screen each page with cheap geometry signals and run the model
+    /// only on pages likely to benefit (multi-column, table-bearing,
+    /// figure-heavy, form-like, or rotated pages).
+    ///
+    /// Pages the pre-screen skips are processed exactly like pages where the
+    /// model ran and found no regions. On the OCR path only inference is
+    /// skipped; page rasters are still produced because OCR consumes them.
+    /// For non-PDF inputs `Auto` behaves as `LayoutStrategy.Always`.
+    auto,
+};
+
+/// Managed credential-provider configuration for OAuth2/STS-based authentication modes liter-llm
+/// cannot express via a static `api_key`. See `LlmConfig.credential_provider`.
+///
+/// `Debug` is implemented by hand: `CredentialProviderConfig.AzureAd`'s `client_secret` is a
+/// credential and must never be printed, matching `LlmConfig`'s own redaction policy. The
+/// other variants carry no secret material — `CredentialProviderConfig.VertexOauth2` and
+/// `CredentialProviderConfig.BedrockWebIdentity` reference a *file path*, never the key or
+/// token itself.
+pub const CredentialProviderConfig = union(enum) {
+    /// Azure AD OAuth2 client-credentials flow (Azure OpenAI / Azure Cognitive Services).
+    azure_ad: struct {
+    tenant_id: []const u8,
+        client_id: []const u8,
+        client_secret: []const u8,
+        scope: ?[]const u8,
+    },
+    /// Google Vertex AI OAuth2 via a service-account JSON key file on disk.
+    ///
+    /// Points at a file path rather than embedding the key inline: the key file contains an
+    /// RSA private key — stronger secret material than an API key — and `LlmConfig` must never
+    /// carry that directly, matching the credential-handling policy the rest of this module
+    /// follows.
+    vertex_oauth2: struct {
+    service_account_key_file: []const u8,
+        scope: ?[]const u8,
+    },
+    /// Google Vertex AI Application Default Credentials, resolved from the GCE/GKE/Cloud Run
+    /// metadata server. Carries no secret material at all.
+    vertex_adc: ?[]const u8,
+    /// AWS STS `AssumeRoleWithWebIdentity` (EKS IRSA / OIDC federation) for Bedrock.
+    bedrock_web_identity: struct {
+    role_arn: []const u8,
+        token_file: []const u8,
+        session_name: ?[]const u8,
+        region: ?[]const u8,
+    },
 };
 
 /// How a structured-extraction preset is dispatched to the model.
@@ -4891,6 +6335,26 @@ pub const VlmFallbackPolicy = union(enum) {
     on_low_quality: f64,
     /// Skip the classical OCR backend entirely. Every page is sent to the VLM.
     always: void,
+};
+
+/// Which pages of a PDF get OCR'd when neither `force_ocr` nor `force_ocr_pages` applies.
+pub const OcrStrategy = union(enum) {
+    /// OCR only when the native text layer fails a quality check (default).
+    ///
+    /// A scanner's invisible OCR sidecar passes that check, so scanned pages
+    /// carrying one are extracted natively. Use `OcrStrategy.ScannedPages`
+    /// to OCR them instead.
+    auto: void,
+    /// Additionally OCR every page that looks like a scan.
+    ///
+    /// Pages are graded on raster coverage, whether the text layer is invisible
+    /// or absent, the image codec, and the producer. Pages at or above
+    /// `min_confidence` are OCR'd; the rest keep native text and still go through
+    /// the `Auto` quality check.
+    ///
+    /// Detects that a text layer came from a scanner, not whether it is accurate,
+    /// so a page carrying a good sidecar is OCR'd too.
+    scanned_pages: f64,
 };
 
 /// Controls how markdown tables are handled when they exceed the chunk size limit.
@@ -4987,7 +6451,7 @@ pub const EmbeddingModelType = union(enum) {
     /// apply: `normalize` (post-call L2 normalization) and `max_embed_duration_secs`
     /// (dispatcher timeout). Model-loading fields (`batch_size`, `cache_dir`,
     /// `show_download_progress`, `acceleration`) are ignored — the host owns the
-    /// model lifecycle.
+    /// model lifecycle, so there is no download to report progress for.
     ///
     /// Semantic chunking falls back to `ChunkingConfig.max_characters` when this variant
     /// is used, since there is no preset to look a chunk-size ceiling up against — size your
@@ -4995,6 +6459,26 @@ pub const EmbeddingModelType = union(enum) {
     ///
     /// See `register_embedding_backend`.
     plugin: []const u8,
+};
+
+/// Selects how a local ONNX reranker's raw output tensor is turned into a score.
+///
+/// - `RerankerHead.CrossEncoder` — classic single-logit cross-encoder head:
+///   the model emits `[batch, 1]` (or `[batch]`) logits; the caller applies
+///   sigmoid to get a `[0, 1]` score. This is the original, unchanged path.
+///
+/// - `RerankerHead.Qwen3Generative` — Qwen3 generative-reranker head: the
+///   model emits `[batch, seq, vocab]` logits; the score is `P("yes")` read
+///   from the last token's logits over the "yes"/"no" vocabulary entries,
+///   via a softmax over those two logits. Already a `[0, 1]` probability —
+///   no sigmoid is applied.
+///
+/// Since v5.0.
+pub const RerankerHead = enum {
+    /// Single-logit cross-encoder head (sigmoid applied by the caller).
+    cross_encoder,
+    /// Qwen3 generative-reranker head (softmax over yes/no token logits).
+    qwen3_generative,
 };
 
 /// Reranker model types supported by Xberg.
@@ -5009,6 +6493,7 @@ pub const RerankerModelType = union(enum) {
         model_file: ?[]const u8,
         additional_files: []const []const u8,
         max_length: ?i64,
+        head: RerankerHead,
     },
     /// Provider-hosted reranker via liter-llm (e.g. Cohere, Jina, Voyage).
     ///
@@ -5024,9 +6509,27 @@ pub const RerankerModelType = union(enum) {
     ///
     /// When this variant is selected, only `max_rerank_duration_secs` applies.
     /// Model-loading fields (`batch_size`, `cache_dir`, `show_download_progress`,
-    /// `acceleration`) are ignored — the host owns the model lifecycle.
+    /// `acceleration`) are ignored — the host owns the model lifecycle, so there is
+    /// no download to report progress for.
     ///
     /// See `register_reranker_backend`.
+    plugin: []const u8,
+};
+
+/// Sparse-embedding model types supported by Xberg.
+///
+/// Since v5.0.
+pub const SparseEmbeddingModelType = union(enum) {
+    /// Use a preset SPLADE model (recommended).
+    preset: []const u8,
+    /// Use a custom SPLADE (`BertForMaskedLM`) ONNX model from HuggingFace.
+    custom: struct {
+    model_id: []const u8,
+        model_file: ?[]const u8,
+        additional_files: []const []const u8,
+        max_length: ?i64,
+    },
+    /// In-process sparse-embedding backend registered via the plugin system.
     plugin: []const u8,
 };
 
@@ -5081,7 +6584,7 @@ pub const OcrBackendType = enum {
     paddle_ocr,
     /// Candle-based VLM OCR (TrOCR, PaddleOCR-VL).
     candle,
-    /// Custom/third-party OCR backend
+    /// Name-selected built-in or third-party OCR backend.
     custom,
 };
 
@@ -5147,6 +6650,28 @@ pub const PdfAnnotationType = enum {
     underline,
     /// Strikeout text markup
     strike_out,
+    /// Squiggly (wavy) underline text markup
+    squiggly,
+    /// Freehand drawing (ink) annotation
+    ink,
+    /// Rectangle/box shape annotation
+    square,
+    /// Ellipse/oval shape annotation
+    circle,
+    /// Closed polygon shape annotation
+    polygon,
+    /// Open polyline shape annotation
+    poly_line,
+    /// Line annotation
+    line,
+    /// Caret (text-insertion marker) annotation
+    caret,
+    /// Embedded file attachment annotation
+    file_attachment,
+    /// Embedded sound annotation
+    sound,
+    /// Embedded movie annotation
+    movie,
     /// Any other annotation type
     other,
 };
@@ -5292,6 +6817,12 @@ pub const NodeContent = union(enum) {
     formula: []const u8,
     /// Footnote reference content.
     footnote: []const u8,
+    /// Reviewer/editor comment content (e.g. DOCX comments).
+    ///
+    /// Distinct from `NodeContent.Footnote` (xberg-io/xberg#300): comments and
+    /// footnotes both reach the internal document via a marker/definition pair, but
+    /// a consumer needs to tell a reviewer comment apart from an authored footnote.
+    comment: []const u8,
     /// Logical grouping container (section, key-value area).
     ///
     /// `heading_level` + `heading_text` capture the section heading directly
@@ -5436,6 +6967,12 @@ pub const ChunkType = enum {
     formula,
     /// Code block or preformatted content.
     code_block,
+    /// Function or method definition (tree-sitter structured code chunking).
+    function,
+    /// Class, struct, interface, or trait definition (tree-sitter structured code chunking).
+    class,
+    /// Module, namespace, or top-level file scope (tree-sitter structured code chunking).
+    module,
     /// Embedded or referenced image content.
     image,
     /// Organizational chart or hierarchy diagram.
@@ -5581,9 +7118,34 @@ pub const FormatMetadata = union(enum) {
     pst: PstMetadata,
     /// Metadata extracted from an audio or video file.
     audio: AudioMetadata,
-    /// Code (tree-sitter analyzable source). The structured analysis result is exposed
-    /// via `ExtractedDocument.code_intelligence`; this variant only tags the format.
-    code: void,
+    /// Code (tree-sitter analyzable source). Carries the structural chunks (function,
+    /// class, and module boundaries) produced by the tree-sitter extractor, consumed by
+    /// the chunking pipeline to emit structure-aware `Chunk`s instead of falling back to
+    /// text-based splitting.
+    ///
+    /// Wraps `CodeMetadata` (a named struct) rather than `[]const CodeChunkInfo` directly:
+    /// `FormatMetadata` is internally tagged (`#[serde(tag = "format_type")]`), and serde
+    /// cannot serialize a tagged newtype variant that wraps a sequence — the tag has no
+    /// map to live in. Wrapping a struct gives serde a map to hold the tag, and keeps this
+    /// variant shape consistent with every sibling (`Variant(XMetadata)`) so the derived
+    /// OpenAPI discriminator can reference a named component schema.
+    code: CodeMetadata,
+};
+
+/// Discriminates the shape of a `CodeDataNode`.
+///
+/// Purpose-built mirror of `tree_sitter_language_pack.DataNodeKind` — kept as an
+/// xberg-owned type so binding generators never need to resolve the upstream crate's
+/// types across FFI/language boundaries.
+pub const CodeDataNodeKind = enum {
+    /// A key/value pair or mapping (JSON/TOML/properties/YAML/HCL/CUE/KDL pair, or a
+    /// wrapper "object"/"mapping" container).
+    key_value,
+    /// An XML element with a tag name in `key` and attributes in `attributes`.
+    element,
+    /// A positional sequence item (JSON array element, YAML block sequence item,
+    /// CSV/PSV row or cell).
+    sequence,
 };
 
 /// Text direction enumeration for HTML documents.
@@ -5836,6 +7398,22 @@ pub const RegionKind = enum {
     caption,
 };
 
+/// Inference backend that an `EmbeddingPreset` runs on.
+///
+/// `Onnx` presets require the `embeddings` feature (ONNX Runtime, not available on
+/// WASM/Android x86_64 emulator). `Static` presets require `static-embeddings`
+/// (pure-Rust model2vec inference, no ORT — the only dense-embedding backend
+/// available on `no-ort-target`).
+///
+/// Defaults to `Onnx` via `#[serde(default)]` so every existing preset payload
+/// (which predates this field) keeps deserializing without change.
+pub const EmbeddingsEmbeddingBackend = enum {
+    /// ONNX Runtime transformer inference (the historical, default backend).
+    onnx,
+    /// Pure-Rust static (model2vec) inference — no ONNX Runtime.
+    static,
+};
+
 /// Keyword algorithm selection.
 pub const KeywordAlgorithm = enum {
     /// YAKE (Yet Another Keyword Extractor) - statistical approach
@@ -5964,6 +7542,33 @@ pub const PSMMode = enum {
     single_char,
 };
 
+/// Outcome of a single doctor check.
+pub const ProbeStatus = enum {
+    /// The backend or setting will work as configured.
+    pass,
+    /// The check ran and found something actionable, but nothing is broken
+    /// (e.g. stray cache files, stale model revisions). Never fails the report.
+    warn,
+    /// The configured setup will not work (or will silently degrade) on this host.
+    fail,
+    /// The check cannot run locally (e.g. model not cached, feature not compiled in);
+    /// first real use decides, possibly after a download.
+    skip,
+};
+
+/// Which concrete ONNX inference engine PaddleOCR model loading uses.
+///
+/// Mirrors `sceptre.Backend` for the PaddleOCR backend: `Ort` is the native,
+/// full-featured path (acceleration/execution-provider hook, ONNX-embedded
+/// dictionary metadata); `Tract` is the pure-Rust, CPU-only path used on targets
+/// where `ort` cannot link (Android x86_64 emulator, WASM once wired).
+pub const PaddleInferenceBackend = enum {
+    /// Native ONNX Runtime (requires the `paddle-ocr-ort` feature).
+    ort,
+    /// Pure-Rust ONNX via `tract` (requires the `paddle-ocr-tract` feature).
+    tract,
+};
+
 /// Supported languages in PaddleOCR.
 ///
 /// Maps user-friendly language codes to paddle-ocr-rs language identifiers.
@@ -6090,6 +7695,17 @@ pub const BrowserBackend = enum {
     native,
 };
 
+/// Opt-in encoding applied to a downloaded document's bytes for callers who need the
+/// content available in a serializable field rather than reading it from disk.
+///
+/// `null` (the `CrawlConfig.document_content_encoding` default) produces neither — unlike
+/// screenshots, base64-encoding a document by default would duplicate an already
+/// up-to-`document_max_size` buffer (50 MB default) in memory per document.
+pub const DocumentContentEncoding = enum {
+    /// Populate `DownloadedDocument.content_base64` with a base64-encoded copy.
+    base64,
+};
+
 /// Authentication configuration.
 pub const AuthConfig = union(enum) {
     /// HTTP Basic authentication.
@@ -6128,6 +7744,140 @@ pub const AssetCategory = enum {
     data,
     /// An unrecognized asset type.
     other,
+};
+
+/// Hostname/IP allowlist matcher for SSRF policy.
+///
+/// Serializes as an internally-tagged object so each variant is distinguishable on the
+/// wire and round-trips losslessly:
+///
+/// ```json
+/// {"type": "exact",  "value": "api.example.com"}
+/// {"type": "suffix", "value": ".example.com"}
+/// {"type": "cidr",   "value": "10.0.0.0/8"}
+/// ```
+///
+/// A bare JSON string is still accepted on deserialization and resolves to `Exact`,
+/// preserving configs written against the previous untagged representation.
+///
+/// `Exact`: HostMatcher.Exact
+pub const HostMatcher = union(enum) {
+    /// Exact hostname match (case-insensitive).
+    exact: []const u8,
+    /// Suffix match: ".xberg.io" matches "api.xberg.io" and "xberg.io".
+    suffix: []const u8,
+    /// CIDR match: "10.0.0.0/8" matches IP addresses in that range.
+    cidr: []const u8,
+};
+
+/// HTML preprocessing aggressiveness level.
+///
+/// Controls the extent of cleanup performed before conversion. Higher levels remove more elements.
+pub const PreprocessingPreset = enum {
+    /// Minimal cleanup. Remove only essential noise (scripts, styles).
+    minimal,
+    /// Standard cleanup. Default. Removes navigation, forms, and other auxiliary content.
+    standard,
+    /// Aggressive cleanup. Remove extensive non-content elements and structure.
+    aggressive,
+};
+
+/// Heading style options for Markdown output.
+///
+/// Controls how headings (h1-h6) are rendered in the output Markdown.
+pub const HeadingStyle = enum {
+    /// Underlined style (=== for h1, --- for h2).
+    underlined,
+    /// ATX style (# for h1, ## for h2, etc.). Default.
+    atx,
+    /// ATX closed style (# title #, with closing hashes).
+    atx_closed,
+};
+
+/// List indentation character type.
+///
+/// Controls whether list items are indented with spaces or tabs.
+pub const ListIndentType = enum {
+    /// Use spaces for indentation. Default. Width controlled by `list_indent_width`.
+    spaces,
+    /// Use tabs for indentation.
+    tabs,
+};
+
+/// Whitespace handling strategy during conversion.
+///
+/// Determines how sequences of whitespace characters (spaces, tabs, newlines) are processed.
+pub const WhitespaceMode = enum {
+    /// Collapse multiple whitespace characters to single spaces. Default. Matches browser behavior.
+    normalized,
+    /// Preserve all whitespace exactly as it appears in the HTML.
+    strict,
+};
+
+/// Line break syntax in Markdown output.
+///
+/// Controls how soft line breaks (from `<br>` or line breaks in source) are rendered.
+pub const NewlineStyle = enum {
+    /// Two trailing spaces at end of line. Default. Standard Markdown syntax.
+    spaces,
+    /// Backslash at end of line. Alternative Markdown syntax.
+    backslash,
+};
+
+/// Code block fence style in Markdown output.
+///
+/// Determines how code blocks (`<pre><code>`) are rendered in Markdown.
+pub const CodeBlockStyle = enum {
+    /// Indented code blocks (4 spaces). `CommonMark` standard.
+    indented,
+    /// Fenced code blocks with triple backticks. Default (GFM). Supports language hints.
+    backticks,
+    /// Fenced code blocks with tildes (~~~). Supports language hints.
+    tildes,
+};
+
+/// Highlight rendering style for `<mark>` elements.
+///
+/// Controls how highlighted text is rendered in Markdown output.
+pub const HighlightStyle = enum {
+    /// Double equals syntax (==text==). Default. Pandoc-compatible.
+    double_equal,
+    /// Preserve as HTML (==text==). Original HTML tag.
+    html,
+    /// Render as bold (**text**). Uses strong emphasis.
+    bold,
+    /// Strip formatting, render as plain text. No markup.
+    none,
+};
+
+/// Link rendering style in Markdown output.
+///
+/// Controls whether links and images use inline `[text](url)` syntax or
+/// reference-style `[text][1]` syntax with definitions collected at the end.
+pub const LinkStyle = enum {
+    /// Inline links: `[text](url)`. Default.
+    inline_,
+    /// Reference-style links: `[text][1]` with `[1]: url` at end of document.
+    reference,
+};
+
+/// URL encoding strategy for link and image destinations.
+///
+/// Controls how special characters in URL destinations are handled when they
+/// require escaping to produce valid Markdown.
+///
+/// The `Angle` variant (default) wraps the destination in angle brackets:
+/// `[text](<url with spaces>)`. This is the CommonMark-specified escape hatch
+/// but breaks when the URL itself contains `>`.
+///
+/// The `Percent` variant percent-encodes every character that is not an RFC 3986
+/// unreserved character or `/`, producing a destination safe for all Markdown
+/// parsers: `[text](url%20with%20spaces)`.
+pub const UrlEscapeStyle = enum {
+    /// Wrap destinations that contain spaces or newlines in angle brackets. Default.
+    angle,
+    /// Percent-encode all characters that are not RFC 3986 unreserved or `/`.
+    percent,
 };
 
 /// Extract content from a single bytes or URI input.
@@ -6243,11 +7993,21 @@ pub fn map_url(uri: []const u8, config: []const u8) XbergError![]u8 {
 /// Formats that have no registered file extension (such as source code,
 /// which is detected dynamically) are not included.
 ///
+/// The static `EXT_TO_MIME` table lists every format the *codebase* knows how
+/// to describe, regardless of which Cargo features were compiled in. Advertising
+/// that table directly would claim support for extractors that may not exist in
+/// this build (see GH#1387). To keep the advertised catalogue honest, the table
+/// is intersected with the document extractor registry: an extension is only
+/// included if some registered extractor actually claims its MIME type in this
+/// build. This can never drift from reality and automatically covers
+/// third-party extractors registered at runtime.
+///
 /// The list is sorted alphabetically by file extension.
 ///
 /// **Returns:**
 ///
-/// A vector of `SupportedFormat` entries sorted by extension.
+/// A vector of `SupportedFormat` entries sorted by extension, limited to
+/// formats with a registered extractor in this build.
 pub fn list_supported_formats() error{OutOfMemory}![]u8 {
     const _result = c.xberg_list_supported_formats();
     const _result_len = c.xberg_list_supported_formats_len();
@@ -6258,6 +8018,23 @@ pub fn list_supported_formats() error{OutOfMemory}![]u8 {
         break :blk owned;
     }
     ;
+}
+
+/// Ensure built-in extractors are registered.
+///
+/// This function is called automatically on first extraction operation.
+/// It's safe to call multiple times - registration only happens once,
+/// unless the registry was cleared, in which case extractors are re-registered.
+///
+/// Public so a caller that wants to *inspect* the registry — rather than extract —
+/// can populate it directly. Without this the only way to trigger registration is to
+/// run a real extraction, which `xberg formats` would otherwise have to fake (#233).
+pub fn ensure_initialized() XbergError!void {
+    _ = c.xberg_ensure_initialized();
+    if (c.xberg_last_error_code() != 0) {
+        return _error_with_message(XbergError);
+    }
+    return;
 }
 
 /// List the names of all registered embedding backends.
@@ -6449,6 +8226,42 @@ pub fn list_validators() XbergError![]u8 {
     ;
 }
 
+/// Run chunk classification against an extraction result.
+///
+/// Mutates `ChunkMetadata.classifications` on every chunk in
+/// `result.chunks` and appends every LLM call's usage to `result.llm_usage`.
+/// A chunk whose classification batch call fails (or that the model omitted
+/// from its response) is simply left with an empty `classifications` vector for
+/// that chunk, unless the failure is a validation error (empty config) or every
+/// batch task fails, in which case the first error is returned.
+///
+/// **Errors:**
+///
+/// Returns `Validation` when `config.definitions` is empty.
+/// Returns the first batch error encountered when rendering the prompt or
+/// calling the LLM fails for every batch; partial failures on a subset of
+/// batches are recorded here as a `ProcessingWarning` on `result` instead of
+/// aborting the whole run.
+pub fn classify_chunks(result: []const u8, config: []const u8) XbergError!void {
+    const result_z = try std.fmt.allocPrintSentinel(
+        std.heap.c_allocator, "{s}", .{result}, 0);
+    defer std.heap.c_allocator.free(result_z);
+    const result_handle = c.xberg_extracted_document_from_json(result_z);
+    if (result_handle == null) return _error_with_message(XbergError);
+    defer c.xberg_extracted_document_free(result_handle);
+    const config_z = try std.fmt.allocPrintSentinel(
+        std.heap.c_allocator, "{s}", .{config}, 0);
+    defer std.heap.c_allocator.free(config_z);
+    const config_handle = c.xberg_chunk_classification_config_from_json(config_z);
+    if (config_handle == null) return _error_with_message(XbergError);
+    defer c.xberg_chunk_classification_config_free(config_handle);
+    _ = c.xberg_classify_chunks(result_handle, config_handle);
+    if (c.xberg_last_error_code() != 0) {
+        return _error_with_message(XbergError);
+    }
+    return;
+}
+
 /// Find unmarked claims in markdown text.
 ///
 /// Returns lines that assert a claim but carry neither a footnote citation anchor (`[^...]`)
@@ -6494,6 +8307,191 @@ pub fn verify_excerpt(excerpt: []const u8, source_text: []const u8) error{OutOfM
     defer std.heap.c_allocator.free(source_text_z);
     const _result = c.xberg_verify_excerpt(excerpt_z, source_text_z);
     return _result != 0;
+}
+
+/// Score a query against a document using ColBERT's MaxSim operator: for each
+/// query token vector, take the maximum dot product against any document
+/// token vector, then sum across query tokens.
+///
+/// Returns `0.0` if `query` and `doc` have mismatched dimensionality, if either
+/// has zero tokens, or if either is not well-formed per
+/// `MultiVectorEmbedding.is_well_formed` (its `data` length does not match
+/// `num_tokens * dim`).
+///
+/// Pure CPU primitive — available without ONNX Runtime.
+///
+/// Since v5.0.
+pub fn max_sim_score(query: []const u8, doc: []const u8) error{OutOfMemory,InvalidJson}!f64 {
+    const query_z = try std.fmt.allocPrintSentinel(
+        std.heap.c_allocator, "{s}", .{query}, 0);
+    defer std.heap.c_allocator.free(query_z);
+    const query_handle = c.xberg_multi_vector_embedding_from_json(query_z);
+    if (query_handle == null) return error.InvalidJson;
+    defer c.xberg_multi_vector_embedding_free(query_handle);
+    const doc_z = try std.fmt.allocPrintSentinel(
+        std.heap.c_allocator, "{s}", .{doc}, 0);
+    defer std.heap.c_allocator.free(doc_z);
+    const doc_handle = c.xberg_multi_vector_embedding_from_json(doc_z);
+    if (doc_handle == null) return error.InvalidJson;
+    defer c.xberg_multi_vector_embedding_free(doc_handle);
+    const _result = c.xberg_max_sim_score(query_handle, doc_handle);
+    return _result;
+}
+
+/// Rank a set of documents against a query by MaxSim score, descending.
+///
+/// Mirrors the sort/truncate shape of `crate.reranking`'s `build_results`,
+/// minus top-k truncation (callers slice the returned `Vec` themselves).
+///
+/// Pure CPU primitive — available without ONNX Runtime.
+///
+/// Since v5.0.
+pub fn max_sim_rank(query: []const u8, docs: []const u8) error{OutOfMemory,InvalidJson}![]u8 {
+    const query_z = try std.fmt.allocPrintSentinel(
+        std.heap.c_allocator, "{s}", .{query}, 0);
+    defer std.heap.c_allocator.free(query_z);
+    const query_handle = c.xberg_multi_vector_embedding_from_json(query_z);
+    if (query_handle == null) return error.InvalidJson;
+    defer c.xberg_multi_vector_embedding_free(query_handle);
+    // Vec/Map parameters are passed as JSON strings across the FFI boundary.
+    const docs_z = try std.fmt.allocPrintSentinel(
+        std.heap.c_allocator, "{s}", .{docs}, 0);
+    defer std.heap.c_allocator.free(docs_z);
+    const _result = c.xberg_max_sim_rank(query_handle, docs_z);
+    const _result_len = c.xberg_max_sim_rank_len(query_handle, docs_z);
+    return blk: {
+        const slice = _result[0.._result_len];
+        const owned = try std.heap.c_allocator.dupe(u8, slice);
+        _free_string(_result);
+        break :blk owned;
+    }
+    ;
+}
+
+/// Probe the backends and settings in `config` and report what will actually
+/// execute on this host.
+///
+/// Runs no downloads and no billable API calls. Backends that are not compiled
+/// in or whose models are not cached report `Skip` rather than failing.
+pub fn doctor(config: []const u8) error{OutOfMemory,InvalidJson}![]u8 {
+    const config_z = try std.fmt.allocPrintSentinel(
+        std.heap.c_allocator, "{s}", .{config}, 0);
+    defer std.heap.c_allocator.free(config_z);
+    const config_handle = c.xberg_extraction_config_from_json(config_z);
+    if (config_handle == null) return error.InvalidJson;
+    defer c.xberg_extraction_config_free(config_handle);
+    const _result = c.xberg_doctor(config_handle);
+    return blk: {
+        const _json_ptr = c.xberg_doctor_report_to_json(_result.?);
+        c.xberg_doctor_report_free(_result.?);
+        defer _free_string(_json_ptr);
+        const slice = std.mem.sliceTo(_json_ptr, 0);
+        const owned = try std.heap.c_allocator.dupe(u8, slice);
+        break :blk owned;
+    }
+    ;
+}
+
+/// Install `PdfOxideWarningCapture` as the process-wide `log` backend,
+/// exactly once.
+///
+/// If another component already installed a `log.Log` implementation (an
+/// application wiring `env_logger`, for instance), `log.set_boxed_logger`
+/// fails and this is a no-op: we do not fight over ownership of the global
+/// logger slot, and we do not touch `log.set_max_level` unless our install
+/// won, so we never silently raise or lower a level someone else configured.
+/// In that case `pdf_oxide`'s glyph-drop records go wherever that other
+/// logger sends them instead of into `take_pdf_oxide_render_warnings`.
+/// **Opt-in.** Nothing calls this automatically, and that is deliberate: xberg
+/// is a library, and `log` has exactly one global backend slot per process. A
+/// library that claims it on its own behalf breaks its embedder — a host that
+/// later calls `env_logger.init()` panics, and until this returns, every
+/// `log` record in the process is routed here rather than wherever the host
+/// intended. That decision belongs to the application, so it is exposed as a
+/// call an application makes knowingly.
+///
+/// Returns `true` if this call (or an earlier one) installed the capture, and
+/// `false` if some other component already owns the `log` backend — in which
+/// case `pdf_oxide`'s glyph-drop records go to that logger and
+/// `take_pdf_oxide_render_warnings` stays empty.
+///
+/// Without this call the #1364 warnings are not produced. The glyph drop
+/// itself is decided inside `pdf_oxide`, which reports it only through
+/// `log.warn!`; there is no return-value channel to read instead.
+pub fn install_pdf_render_diagnostics() bool {
+    const _result = c.xberg_install_pdf_render_diagnostics();
+    return _result != 0;
+}
+
+/// Drain the glyph-drop `ProcessingWarning`s accumulated on this thread by
+/// render calls since the last call to this function.
+///
+/// Callers that render pages as part of extraction should call this after
+/// their render pass and merge the result into
+/// `InternalDocument.processing_warnings` (see the module-level convention
+/// in `crate.core.diagnostics`) so a page with missing glyphs is never
+/// returned to the user without a signal. Warnings are already deduped
+/// per-thread across all pages rendered before this call.
+///
+/// `pub` (rather than `pub(crate)`) so both in-tree render-consumers and the
+/// regression test for #1364 can observe capture without depending on any
+/// one extractor's internal state.
+///
+/// As of #340, `crate.extractors.pdf.mod` drains this unconditionally right
+/// after assembling a document's `processing_warnings`, so every PDF
+/// extraction that renders at least one page picks up any captured
+/// glyph-drop warnings for free. ~keep: that drain only ever observes
+/// warnings from render calls that happened on the *same OS thread* before it
+/// ran, because `PDF_OXIDE_PENDING_WARNINGS` is thread-local. OCR page
+/// rendering runs inline on the extracting task's thread, so it is covered.
+/// Layout-detection rasterization runs inside `tokio.task.spawn_blocking`,
+/// which always executes on a different OS thread, so this function alone
+/// would never see those warnings. As of #353,
+/// `extractors.pdf.layout_runner.run_layout_for_pdf_pages_async` drains
+/// this function itself from inside its `spawn_blocking` closure — the only
+/// place that can observe the blocking-pool thread's thread-local buffer —
+/// and threads the drained warnings back through its return value for the
+/// caller in `extractors.pdf.mod` to merge, so layout-path glyph drops are
+/// no longer silently lost.
+pub fn take_pdf_oxide_render_warnings() error{OutOfMemory}![]u8 {
+    const _result = c.xberg_take_pdf_oxide_render_warnings();
+    const _result_len = c.xberg_take_pdf_oxide_render_warnings_len();
+    return blk: {
+        const slice = _result[0.._result_len];
+        const owned = try std.heap.c_allocator.dupe(u8, slice);
+        _free_string(_result);
+        break :blk owned;
+    }
+    ;
+}
+
+/// Build the four (or three) token Whisper decoder prompt.
+///
+/// The canonical Whisper prompt is
+/// `[<|startoftranscript|>, <|{lang}|>, <|transcribe|>, <|notimestamps|>]`.
+/// When `timestamps` is `true`, the trailing `no_timestamps` token is omitted
+/// so the model is free to emit `<|x.xx|>` timestamp tokens in its output
+/// instead of being forced to suppress them.
+pub fn build_decoder_prompt_tokens(start_of_transcript: u32, lang_id: u32, transcribe: u32, no_timestamps: u32, timestamps: bool) error{OutOfMemory}![]u8 {
+    const _result = c.xberg_build_decoder_prompt_tokens(start_of_transcript, lang_id, transcribe, no_timestamps, timestamps);
+    const _result_len = c.xberg_build_decoder_prompt_tokens_len(start_of_transcript, lang_id, transcribe, no_timestamps, timestamps);
+    return blk: {
+        const slice = _result[0.._result_len];
+        const owned = try std.heap.c_allocator.dupe(u8, slice);
+        _free_string(_result);
+        break :blk owned;
+    }
+    ;
+}
+
+/// Convert a raw Whisper timestamp token ID to a millisecond offset from the
+/// start of the 30-second chunk it was decoded in.
+///
+/// `token_id` must be `>= timestamp_begin_id`; IDs below that are ordinary
+/// vocabulary tokens, not timestamps.
+pub fn timestamp_token_to_ms(token_id: u32, timestamp_begin_id: u32) u32 {
+    const _result = c.xberg_timestamp_token_to_ms(token_id, timestamp_begin_id);
+    return _result;
 }
 
 /// Vtable for a Zig implementation of the `OcrBackend` trait.
@@ -6555,14 +8553,13 @@ pub const IOcrBackend = extern struct {
     ///     let text = if fast_mode {
     ///         "Fast OCR result".to_string()
     ///     } else {
-    ///         format!("Extracted text in language: {}", config.language)
+    ///         format!("Extracted text in language: {:?}", config.language)
     ///     };
     ///
-    ///     Ok(ExtractedDocument {
-    ///         content: text,
-    ///         mime_type: Cow::Borrowed("text/plain"),
-    ///         ..Default::default()
-    ///     })
+    ///     let mut document = ExtractedDocument::default();
+    ///     document.content = text;
+    ///     document.mime_type = Cow::Borrowed("text/plain");
+    ///     Ok(document)
     /// }
     /// ```
     process_image: ?*const fn (user_data: ?*anyopaque, image_bytes_ptr: [*c]const u8, image_bytes_len: usize, config: [*c]const u8, out_result: ?*?[*c]u8, out_error: ?*?[*c]u8) callconv(.c) i32 = null,
@@ -6744,23 +8741,30 @@ pub fn make_ocr_backend_vtable(comptime T: type, instance: *T) IOcrBackend {
                 const self: *T = @ptrCast(@alignCast(ud));
                 _ = image_bytes_len;
                 if (self.process_image(image_bytes_ptr, config)) |value| {
-                    // Complex return type: serialize the host value to JSON and hand back a
-                    // NUL-terminated C string. The caller owns the returned pointer and must
-                    // free it via the C API.
-                    const _json_slice = std.fmt.allocPrint(std.heap.c_allocator, "{f}", .{ std.json.fmt(value, .{}) }) catch {
+                    if (value == null) {
+                        if (out_result) |ptr| ptr.* = null;
+                        return 0;
+                    }
+                    const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
                         if (out_error) |ptr| ptr.* = null;
                         return 1;
                     };
-                    defer std.heap.c_allocator.free(_json_slice);
-                    const _json_cstr = std.heap.c_allocator.dupeZ(u8, _json_slice) catch {
-                        if (out_error) |ptr| ptr.* = null;
-                        return 1;
-                    };
-                    if (out_result) |ptr| ptr.* = @ptrCast(_json_cstr.ptr);
+                    if (out_result) |ptr| {
+                        ptr.* = @ptrCast(_owned_result.ptr);
+                    } else {
+                        std.heap.c_allocator.free(_owned_result);
+                    }
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -6770,23 +8774,30 @@ pub fn make_ocr_backend_vtable(comptime T: type, instance: *T) IOcrBackend {
             fn thunk(ud: ?*anyopaque, path: [*c]const u8, config: [*c]const u8, out_result: ?*?[*c]u8, out_error: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 if (self.process_image_file(path, config)) |value| {
-                    // Complex return type: serialize the host value to JSON and hand back a
-                    // NUL-terminated C string. The caller owns the returned pointer and must
-                    // free it via the C API.
-                    const _json_slice = std.fmt.allocPrint(std.heap.c_allocator, "{f}", .{ std.json.fmt(value, .{}) }) catch {
+                    if (value == null) {
+                        if (out_result) |ptr| ptr.* = null;
+                        return 0;
+                    }
+                    const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
                         if (out_error) |ptr| ptr.* = null;
                         return 1;
                     };
-                    defer std.heap.c_allocator.free(_json_slice);
-                    const _json_cstr = std.heap.c_allocator.dupeZ(u8, _json_slice) catch {
-                        if (out_error) |ptr| ptr.* = null;
-                        return 1;
-                    };
-                    if (out_result) |ptr| ptr.* = @ptrCast(_json_cstr.ptr);
+                    if (out_result) |ptr| {
+                        ptr.* = @ptrCast(_owned_result.ptr);
+                    } else {
+                        std.heap.c_allocator.free(_owned_result);
+                    }
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -6803,8 +8814,17 @@ pub fn make_ocr_backend_vtable(comptime T: type, instance: *T) IOcrBackend {
             fn thunk(ud: ?*anyopaque, out_result: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 const value = self.backend_type();
+                if (value == null) {
+                    if (out_result) |ptr| ptr.* = null;
+                    return 0;
+                }
+                const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
+                    return 1;
+                };
                 if (out_result) |ptr| {
-                    ptr.* = @constCast(value);
+                    ptr.* = @ptrCast(_owned_result.ptr);
+                } else {
+                    std.heap.c_allocator.free(_owned_result);
                 }
                 return 0;
             }
@@ -6814,8 +8834,17 @@ pub fn make_ocr_backend_vtable(comptime T: type, instance: *T) IOcrBackend {
             fn thunk(ud: ?*anyopaque, out_result: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 const value = self.supported_languages();
+                if (value == null) {
+                    if (out_result) |ptr| ptr.* = null;
+                    return 0;
+                }
+                const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
+                    return 1;
+                };
                 if (out_result) |ptr| {
-                    ptr.* = @constCast(value);
+                    ptr.* = @ptrCast(_owned_result.ptr);
+                } else {
+                    std.heap.c_allocator.free(_owned_result);
                 }
                 return 0;
             }
@@ -6846,23 +8875,30 @@ pub fn make_ocr_backend_vtable(comptime T: type, instance: *T) IOcrBackend {
             fn thunk(ud: ?*anyopaque, _path: [*c]const u8, _config: [*c]const u8, out_result: ?*?[*c]u8, out_error: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 if (self.process_document(_path, _config)) |value| {
-                    // Complex return type: serialize the host value to JSON and hand back a
-                    // NUL-terminated C string. The caller owns the returned pointer and must
-                    // free it via the C API.
-                    const _json_slice = std.fmt.allocPrint(std.heap.c_allocator, "{f}", .{ std.json.fmt(value, .{}) }) catch {
+                    if (value == null) {
+                        if (out_result) |ptr| ptr.* = null;
+                        return 0;
+                    }
+                    const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
                         if (out_error) |ptr| ptr.* = null;
                         return 1;
                     };
-                    defer std.heap.c_allocator.free(_json_slice);
-                    const _json_cstr = std.heap.c_allocator.dupeZ(u8, _json_slice) catch {
-                        if (out_error) |ptr| ptr.* = null;
-                        return 1;
-                    };
-                    if (out_result) |ptr| ptr.* = @ptrCast(_json_cstr.ptr);
+                    if (out_result) |ptr| {
+                        ptr.* = @ptrCast(_owned_result.ptr);
+                    } else {
+                        std.heap.c_allocator.free(_owned_result);
+                    }
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -6870,7 +8906,7 @@ pub fn make_ocr_backend_vtable(comptime T: type, instance: *T) IOcrBackend {
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -7118,8 +9154,15 @@ pub fn make_post_processor_vtable(comptime T: type, instance: *T) IPostProcessor
                     _ = value;
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -7129,8 +9172,17 @@ pub fn make_post_processor_vtable(comptime T: type, instance: *T) IPostProcessor
             fn thunk(ud: ?*anyopaque, out_result: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 const value = self.processing_stage();
+                if (value == null) {
+                    if (out_result) |ptr| ptr.* = null;
+                    return 0;
+                }
+                const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
+                    return 1;
+                };
                 if (out_result) |ptr| {
-                    ptr.* = @constCast(value);
+                    ptr.* = @ptrCast(_owned_result.ptr);
+                } else {
+                    std.heap.c_allocator.free(_owned_result);
                 }
                 return 0;
             }
@@ -7159,7 +9211,7 @@ pub fn make_post_processor_vtable(comptime T: type, instance: *T) IPostProcessor
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -7422,8 +9474,15 @@ pub fn make_validator_vtable(comptime T: type, instance: *T) IValidator {
                     _ = value;
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -7445,7 +9504,7 @@ pub fn make_validator_vtable(comptime T: type, instance: *T) IValidator {
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -7621,23 +9680,30 @@ pub fn make_document_extractor_vtable(comptime T: type, instance: *T) IDocumentE
             fn thunk(ud: ?*anyopaque, input: [*c]const u8, config: [*c]const u8, out_result: ?*?[*c]u8, out_error: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 if (self.extract(input, config)) |value| {
-                    // Complex return type: serialize the host value to JSON and hand back a
-                    // NUL-terminated C string. The caller owns the returned pointer and must
-                    // free it via the C API.
-                    const _json_slice = std.fmt.allocPrint(std.heap.c_allocator, "{f}", .{ std.json.fmt(value, .{}) }) catch {
+                    if (value == null) {
+                        if (out_result) |ptr| ptr.* = null;
+                        return 0;
+                    }
+                    const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
                         if (out_error) |ptr| ptr.* = null;
                         return 1;
                     };
-                    defer std.heap.c_allocator.free(_json_slice);
-                    const _json_cstr = std.heap.c_allocator.dupeZ(u8, _json_slice) catch {
-                        if (out_error) |ptr| ptr.* = null;
-                        return 1;
-                    };
-                    if (out_result) |ptr| ptr.* = @ptrCast(_json_cstr.ptr);
+                    if (out_result) |ptr| {
+                        ptr.* = @ptrCast(_owned_result.ptr);
+                    } else {
+                        std.heap.c_allocator.free(_owned_result);
+                    }
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -7647,8 +9713,17 @@ pub fn make_document_extractor_vtable(comptime T: type, instance: *T) IDocumentE
             fn thunk(ud: ?*anyopaque, out_result: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 const value = self.supported_mime_types();
+                if (value == null) {
+                    if (out_result) |ptr| ptr.* = null;
+                    return 0;
+                }
+                const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
+                    return 1;
+                };
                 if (out_result) |ptr| {
-                    ptr.* = @constCast(value);
+                    ptr.* = @ptrCast(_owned_result.ptr);
+                } else {
+                    std.heap.c_allocator.free(_owned_result);
                 }
                 return 0;
             }
@@ -7670,7 +9745,7 @@ pub fn make_document_extractor_vtable(comptime T: type, instance: *T) IDocumentE
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -7818,23 +9893,30 @@ pub fn make_embedding_backend_vtable(comptime T: type, instance: *T) IEmbeddingB
             fn thunk(ud: ?*anyopaque, texts: [*c]const u8, out_result: ?*?[*c]u8, out_error: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 if (self.embed(texts)) |value| {
-                    // Complex return type: serialize the host value to JSON and hand back a
-                    // NUL-terminated C string. The caller owns the returned pointer and must
-                    // free it via the C API.
-                    const _json_slice = std.fmt.allocPrint(std.heap.c_allocator, "{f}", .{ std.json.fmt(value, .{}) }) catch {
+                    if (value == null) {
+                        if (out_result) |ptr| ptr.* = null;
+                        return 0;
+                    }
+                    const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
                         if (out_error) |ptr| ptr.* = null;
                         return 1;
                     };
-                    defer std.heap.c_allocator.free(_json_slice);
-                    const _json_cstr = std.heap.c_allocator.dupeZ(u8, _json_slice) catch {
-                        if (out_error) |ptr| ptr.* = null;
-                        return 1;
-                    };
-                    if (out_result) |ptr| ptr.* = @ptrCast(_json_cstr.ptr);
+                    if (out_result) |ptr| {
+                        ptr.* = @ptrCast(_owned_result.ptr);
+                    } else {
+                        std.heap.c_allocator.free(_owned_result);
+                    }
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -7842,7 +9924,7 @@ pub fn make_embedding_backend_vtable(comptime T: type, instance: *T) IEmbeddingB
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -7976,23 +10058,30 @@ pub fn make_renderer_vtable(comptime T: type, instance: *T) IRenderer {
             fn thunk(ud: ?*anyopaque, result: [*c]const u8, out_result: ?*?[*c]u8, out_error: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 if (self.render_result(result)) |value| {
-                    // Complex return type: serialize the host value to JSON and hand back a
-                    // NUL-terminated C string. The caller owns the returned pointer and must
-                    // free it via the C API.
-                    const _json_slice = std.fmt.allocPrint(std.heap.c_allocator, "{f}", .{ std.json.fmt(value, .{}) }) catch {
+                    if (value == null) {
+                        if (out_result) |ptr| ptr.* = null;
+                        return 0;
+                    }
+                    const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
                         if (out_error) |ptr| ptr.* = null;
                         return 1;
                     };
-                    defer std.heap.c_allocator.free(_json_slice);
-                    const _json_cstr = std.heap.c_allocator.dupeZ(u8, _json_slice) catch {
-                        if (out_error) |ptr| ptr.* = null;
-                        return 1;
-                    };
-                    if (out_result) |ptr| ptr.* = @ptrCast(_json_cstr.ptr);
+                    if (out_result) |ptr| {
+                        ptr.* = @ptrCast(_owned_result.ptr);
+                    } else {
+                        std.heap.c_allocator.free(_owned_result);
+                    }
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -8000,7 +10089,7 @@ pub fn make_renderer_vtable(comptime T: type, instance: *T) IRenderer {
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -8141,23 +10230,30 @@ pub fn make_reranker_backend_vtable(comptime T: type, instance: *T) IRerankerBac
             fn thunk(ud: ?*anyopaque, query: [*c]const u8, documents: [*c]const u8, out_result: ?*?[*c]u8, out_error: ?*?[*c]u8) callconv(.c) i32 {
                 const self: *T = @ptrCast(@alignCast(ud));
                 if (self.rerank(query, documents)) |value| {
-                    // Complex return type: serialize the host value to JSON and hand back a
-                    // NUL-terminated C string. The caller owns the returned pointer and must
-                    // free it via the C API.
-                    const _json_slice = std.fmt.allocPrint(std.heap.c_allocator, "{f}", .{ std.json.fmt(value, .{}) }) catch {
+                    if (value == null) {
+                        if (out_result) |ptr| ptr.* = null;
+                        return 0;
+                    }
+                    const _owned_result = std.heap.c_allocator.dupeZ(u8, std.mem.span(value)) catch {
                         if (out_error) |ptr| ptr.* = null;
                         return 1;
                     };
-                    defer std.heap.c_allocator.free(_json_slice);
-                    const _json_cstr = std.heap.c_allocator.dupeZ(u8, _json_slice) catch {
-                        if (out_error) |ptr| ptr.* = null;
-                        return 1;
-                    };
-                    if (out_result) |ptr| ptr.* = @ptrCast(_json_cstr.ptr);
+                    if (out_result) |ptr| {
+                        ptr.* = @ptrCast(_owned_result.ptr);
+                    } else {
+                        std.heap.c_allocator.free(_owned_result);
+                    }
                     return 0;
                 } else |err| {
-                    _ = err;
-                    if (out_error) |ptr| ptr.* = null; // caller checks error code
+                    if (out_error) |ptr| {
+                        const _error = std.fmt.allocPrintSentinel(
+                            std.heap.c_allocator,
+                            "{s}",
+                            .{@errorName(err)},
+                            0,
+                        ) catch null;
+                        ptr.* = if (_error) |value| @ptrCast(value.ptr) else null;
+                    }
                     return 1;
                 }
             }
@@ -8165,7 +10261,7 @@ pub fn make_reranker_backend_vtable(comptime T: type, instance: *T) IRerankerBac
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -8302,7 +10398,7 @@ pub fn make_tokenizer_backend_vtable(comptime T: type, instance: *T) ITokenizerB
 
         .free_string = struct {
             fn thunk(ptr: [*c]u8) callconv(.c) void {
-                _ = ptr;
+                if (ptr != null) std.heap.c_allocator.free(std.mem.span(ptr));
             }
         }.thunk,
         .free_user_data = struct {
@@ -8322,11 +10418,13 @@ pub fn new_token_counter() TokenCounter {
 
 /// Per-category running counter for `RedactionStrategy.TokenReplace`.
 pub const TokenCounter = struct {
-    _handle: *anyopaque,
+    _handle: ?*anyopaque,
 
-    /// Release the underlying FFI handle. Safe to call once per instance.
+    /// Release the underlying FFI handle. Safe to call more than once.
     pub fn free(self: *TokenCounter) void {
-    c.xberg_token_counter_free(@as(*c.XBERGTokenCounter, @ptrCast(self._handle)));
+    const handle = self._handle orelse return;
+        self._handle = null;
+        c.xberg_token_counter_free(@as(*c.XBERGTokenCounter, @ptrCast(handle)));
     }
 };
 
@@ -8341,14 +10439,15 @@ pub fn compile_meta_schema(meta_schema_json: []const u8) error{OutOfMemory}!Meta
 
 /// Compiled meta-schema validator over `preset.schema.json`.
 pub const MetaSchema = struct {
-    _handle: *anyopaque,
+    _handle: ?*anyopaque,
 
     /// Validate `raw` against the meta-schema and deserialize into a `Preset`,
     /// stamping the fingerprint over the canonical file bytes.
-    pub fn parse_preset(self: *MetaSchema, path: []const u8, raw: []const u8) (LoadError||error{OutOfMemory})![]u8 {
-    const path_z = try std.heap.c_allocator.dupeZ(u8, path);
+    pub fn parse_preset(self: *MetaSchema, path: []const u8, raw: []const u8) (LoadError||error{OutOfMemory,HandleClosed})![]u8 {
+    const handle = self._handle orelse return error.HandleClosed;
+        const path_z = try std.heap.c_allocator.dupeZ(u8, path);
         defer std.heap.c_allocator.free(path_z);
-        const _result = c.xberg_meta_schema_parse_preset(@as(*c.XBERGMetaSchema, @ptrCast(self._handle)), path_z, raw.ptr, raw.len);
+        const _result = c.xberg_meta_schema_parse_preset(@as(*c.XBERGMetaSchema, @ptrCast(handle)), path_z, raw.ptr, raw.len);
         if (_result == null) {
             return _first_error(LoadError);
         }
@@ -8362,9 +10461,11 @@ pub const MetaSchema = struct {
         };
     }
 
-    /// Release the underlying FFI handle. Safe to call once per instance.
+    /// Release the underlying FFI handle. Safe to call more than once.
     pub fn free(self: *MetaSchema) void {
-    c.xberg_meta_schema_free(@as(*c.XBERGMetaSchema, @ptrCast(self._handle)));
+    const handle = self._handle orelse return;
+        self._handle = null;
+        c.xberg_meta_schema_free(@as(*c.XBERGMetaSchema, @ptrCast(handle)));
     }
 };
 
@@ -8378,19 +10479,21 @@ pub fn load_embedded_registry() Registry {
 
 /// Sorted map of preset id → `Preset`.
 pub const Registry = struct {
-    _handle: *anyopaque,
+    _handle: ?*anyopaque,
 
     /// Look up a preset by its identifier.
-    pub fn get(self: *Registry, id: []const u8) error{OutOfMemory}!?[]u8 {
-    const id_z = try std.heap.c_allocator.dupeZ(u8, id);
+    pub fn get(self: *Registry, id: []const u8) error{OutOfMemory,HandleClosed}!?[]u8 {
+    const handle = self._handle orelse return error.HandleClosed;
+        const id_z = try std.heap.c_allocator.dupeZ(u8, id);
         defer std.heap.c_allocator.free(id_z);
-        const _result = c.xberg_registry_get(@as(*c.XBERGRegistry, @ptrCast(self._handle)), id_z);
+        const _result = c.xberg_registry_get(@as(*c.XBERGRegistry, @ptrCast(handle)), id_z);
         return _result;
     }
 
     /// Materialize a `PresetSummary` list for the public registry endpoint.
-    pub fn summaries(self: *Registry) error{OutOfMemory}![]u8 {
-    const _result = c.xberg_registry_summaries(@as(*c.XBERGRegistry, @ptrCast(self._handle)));
+    pub fn summaries(self: *Registry) error{OutOfMemory,HandleClosed}![]u8 {
+    const handle = self._handle orelse return error.HandleClosed;
+        const _result = c.xberg_registry_summaries(@as(*c.XBERGRegistry, @ptrCast(handle)));
         return blk: {
             const slice = std.mem.span(_result);
             const owned = try std.heap.c_allocator.dupe(u8, slice);
@@ -8400,25 +10503,28 @@ pub const Registry = struct {
     }
 
     /// Number of presets currently loaded.
-    pub fn len(self: *Registry) u64 {
-    const _result = c.xberg_registry_len(@as(*c.XBERGRegistry, @ptrCast(self._handle)));
+    pub fn len(self: *Registry) error{HandleClosed}!u64 {
+    const handle = self._handle orelse return error.HandleClosed;
+        const _result = c.xberg_registry_len(@as(*c.XBERGRegistry, @ptrCast(handle)));
         return _result;
     }
 
     /// Whether the registry contains zero presets.
-    pub fn is_empty(self: *Registry) bool {
-    const _result = c.xberg_registry_is_empty(@as(*c.XBERGRegistry, @ptrCast(self._handle)));
+    pub fn is_empty(self: *Registry) error{HandleClosed}!bool {
+    const handle = self._handle orelse return error.HandleClosed;
+        const _result = c.xberg_registry_is_empty(@as(*c.XBERGRegistry, @ptrCast(handle)));
         return _result;
     }
 
     /// Read raw sample bytes for `<preset_id>` from
     /// `library/<id>/samples/<name>`. Returns `null` when the file is absent.
-    pub fn sample_bytes(self: *Registry, preset_id: []const u8, name: []const u8) error{OutOfMemory}!?[]const u8 {
-    const preset_id_z = try std.heap.c_allocator.dupeZ(u8, preset_id);
+    pub fn sample_bytes(self: *Registry, preset_id: []const u8, name: []const u8) error{OutOfMemory,HandleClosed}!?[]const u8 {
+    const handle = self._handle orelse return error.HandleClosed;
+        const preset_id_z = try std.heap.c_allocator.dupeZ(u8, preset_id);
         defer std.heap.c_allocator.free(preset_id_z);
         const name_z = try std.heap.c_allocator.dupeZ(u8, name);
         defer std.heap.c_allocator.free(name_z);
-        const _result = c.xberg_registry_sample_bytes(@as(*c.XBERGRegistry, @ptrCast(self._handle)), preset_id_z, name_z);
+        const _result = c.xberg_registry_sample_bytes(@as(*c.XBERGRegistry, @ptrCast(handle)), preset_id_z, name_z);
         return _result;
     }
 
@@ -8437,18 +10543,37 @@ pub const Registry = struct {
     ///
     /// This is the injection point for downstream catalogs that add curated
     /// presets on top of the single embedded OSS preset.
-    pub fn extend_from_dir(self: *Registry, dir: []const u8) (LoadError||error{OutOfMemory})!u64 {
-    const dir_z = try std.heap.c_allocator.dupeZ(u8, dir);
+    pub fn extend_from_dir(self: *Registry, dir: []const u8) (LoadError||error{OutOfMemory,HandleClosed})!u64 {
+    const handle = self._handle orelse return error.HandleClosed;
+        const dir_z = try std.heap.c_allocator.dupeZ(u8, dir);
         defer std.heap.c_allocator.free(dir_z);
-        const _result = c.xberg_registry_extend_from_dir(@as(*c.XBERGRegistry, @ptrCast(self._handle)), dir_z);
+        const _result = c.xberg_registry_extend_from_dir(@as(*c.XBERGRegistry, @ptrCast(handle)), dir_z);
         if (_result == null) {
             return _first_error(LoadError);
         }
         return _result;
     }
 
-    /// Release the underlying FFI handle. Safe to call once per instance.
+    /// Release the underlying FFI handle. Safe to call more than once.
     pub fn free(self: *Registry) void {
-    c.xberg_registry_free(@as(*c.XBERGRegistry, @ptrCast(self._handle)));
+    const handle = self._handle orelse return;
+        self._handle = null;
+        c.xberg_registry_free(@as(*c.XBERGRegistry, @ptrCast(handle)));
+    }
+};
+
+/// Chunk-classification enrichment knob: how to multi-label individual chunks.
+///
+/// Operates on `ExtractedDocument.chunks` in place — the caller must have
+/// already produced chunks (e.g. via `ExtractionConfig.chunking`) for this
+/// stage to have any effect; a document with no chunks is a no-op.
+pub const ChunkClassificationEnrichmentConfig = struct {
+    _handle: ?*anyopaque,
+
+    /// Release the underlying FFI handle. Safe to call more than once.
+    pub fn free(self: *ChunkClassificationEnrichmentConfig) void {
+    const handle = self._handle orelse return;
+        self._handle = null;
+        c.xberg_chunk_classification_enrichment_config_free(@as(*c.XBERGChunkClassificationEnrichmentConfig, @ptrCast(handle)));
     }
 };

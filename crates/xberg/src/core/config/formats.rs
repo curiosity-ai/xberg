@@ -12,8 +12,11 @@ use std::str::FromStr;
 /// Controls the format of the `content` field in `ExtractedDocument`.
 /// When set to `Markdown`, `Djot`, or `Html`, the output uses that format.
 /// `Plain` returns the raw extracted text.
-/// `Structured` returns JSON with full OCR element data including bounding
-/// boxes and confidence scores.
+/// `Structured` is currently a metadata-only label: `derive_extraction_result`
+/// returns `None` for it (see `extraction/derive.rs`), so no renderer runs and
+/// the content is left exactly as `Plain` would leave it. Only
+/// `metadata.output_format` differs. It does NOT attach OCR element data,
+/// bounding boxes or confidence scores.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
@@ -28,8 +31,12 @@ pub enum OutputFormat {
     Html,
     /// JSON tree format with heading-driven sections.
     Json,
-    /// Structured JSON format with full OCR element metadata.
+    /// Metadata-only label; content is identical to [`OutputFormat::Plain`].
+    /// No dedicated renderer exists yet, so this attaches no OCR element
+    /// metadata. See the enum-level docs above.
     Structured,
+    /// Docling DocTags format (tables rendered as OTSL).
+    DocTags,
     /// Custom renderer registered via the RendererRegistry.
     /// The string is the renderer name (e.g., "docx", "latex").
     #[serde(untagged)]
@@ -40,13 +47,14 @@ pub enum OutputFormat {
 impl OutputFormat {
     /// Get the renderer name for this format.
     /// Returns `None` for formats that don't use the renderer registry
-    /// (Plain, Structured, Toon — these are handled differently).
+    /// (Plain, Json, Structured — these are handled differently).
     pub(crate) fn renderer_name(&self) -> Option<&str> {
         match self {
             OutputFormat::Plain | OutputFormat::Json | OutputFormat::Structured => None,
             OutputFormat::Markdown => Some("markdown"),
             OutputFormat::Djot => Some("djot"),
             OutputFormat::Html => Some("html"),
+            OutputFormat::DocTags => Some("doctags"),
             OutputFormat::Custom(name) => Some(name.as_str()),
         }
     }
@@ -61,6 +69,7 @@ impl std::fmt::Display for OutputFormat {
             OutputFormat::Html => write!(f, "html"),
             OutputFormat::Json => write!(f, "json"),
             OutputFormat::Structured => write!(f, "structured"),
+            OutputFormat::DocTags => write!(f, "doctags"),
             OutputFormat::Custom(name) => write!(f, "{}", name),
         }
     }
@@ -77,7 +86,67 @@ impl FromStr for OutputFormat {
             "html" => Ok(OutputFormat::Html),
             "json" => Ok(OutputFormat::Json),
             "structured" | "structured-ocr" => Ok(OutputFormat::Structured),
+            "doctags" => Ok(OutputFormat::DocTags),
             other => Ok(OutputFormat::Custom(other.to_string())),
+        }
+    }
+}
+
+/// Controls how Jupyter notebook code cells are rendered during extraction.
+///
+/// A code cell carries both its **source** and any **outputs** that were saved in
+/// the notebook. Callers ingesting notebooks for AI agents want different slices of
+/// this depending on the task. Xberg never executes cells — `Outputs` and `Both`
+/// only surface outputs already stored in the `.ipynb`.
+///
+/// This toggle governs a code cell's **source body** and its **saved outputs**.
+/// Markdown (prose) cells and structural markers (kernel language, cell id, tags,
+/// execution count) are unaffected — prose always renders and markers orient the
+/// reader regardless of mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JupyterCellRendering {
+    /// Render the code source as a fenced code block; omit saved outputs.
+    Source,
+    /// Omit the code source; render only the saved cell outputs.
+    Outputs,
+    /// Render both the code source and the saved outputs (default; preserves the
+    /// historical behavior).
+    #[default]
+    Both,
+}
+
+impl JupyterCellRendering {
+    /// Whether the code cell's source should be rendered.
+    pub fn includes_source(self) -> bool {
+        matches!(self, Self::Source | Self::Both)
+    }
+
+    /// Whether the code cell's saved outputs should be rendered.
+    pub fn includes_outputs(self) -> bool {
+        matches!(self, Self::Outputs | Self::Both)
+    }
+}
+
+impl std::fmt::Display for JupyterCellRendering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JupyterCellRendering::Source => write!(f, "source"),
+            JupyterCellRendering::Outputs => write!(f, "outputs"),
+            JupyterCellRendering::Both => write!(f, "both"),
+        }
+    }
+}
+
+impl FromStr for JupyterCellRendering {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "source" | "code" => Ok(JupyterCellRendering::Source),
+            "outputs" | "output" => Ok(JupyterCellRendering::Outputs),
+            "both" => Ok(JupyterCellRendering::Both),
+            other => Err(format!("unknown Jupyter cell rendering: {other}")),
         }
     }
 }
@@ -85,6 +154,46 @@ impl FromStr for OutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_jupyter_cell_rendering_default_is_both() {
+        assert_eq!(JupyterCellRendering::default(), JupyterCellRendering::Both);
+        assert!(JupyterCellRendering::Both.includes_source());
+        assert!(JupyterCellRendering::Both.includes_outputs());
+        assert!(JupyterCellRendering::Source.includes_source());
+        assert!(!JupyterCellRendering::Source.includes_outputs());
+        assert!(!JupyterCellRendering::Outputs.includes_source());
+        assert!(JupyterCellRendering::Outputs.includes_outputs());
+    }
+
+    #[test]
+    fn test_jupyter_cell_rendering_from_str_and_serde() {
+        assert_eq!(
+            "source".parse::<JupyterCellRendering>().unwrap(),
+            JupyterCellRendering::Source
+        );
+        assert_eq!(
+            "code".parse::<JupyterCellRendering>().unwrap(),
+            JupyterCellRendering::Source
+        );
+        assert_eq!(
+            "OUTPUTS".parse::<JupyterCellRendering>().unwrap(),
+            JupyterCellRendering::Outputs
+        );
+        assert_eq!(
+            "both".parse::<JupyterCellRendering>().unwrap(),
+            JupyterCellRendering::Both
+        );
+        assert!("nope".parse::<JupyterCellRendering>().is_err());
+        assert_eq!(
+            serde_json::to_string(&JupyterCellRendering::Outputs).unwrap(),
+            "\"outputs\""
+        );
+        assert_eq!(
+            serde_json::from_str::<JupyterCellRendering>("\"source\"").unwrap(),
+            JupyterCellRendering::Source
+        );
+    }
 
     #[test]
     fn test_output_format_from_str_plain() {
@@ -142,6 +251,39 @@ mod tests {
         assert_eq!(result, OutputFormat::Custom("docx".to_string()));
     }
 
+    /// `"doctags"` must resolve to the first-class `DocTags` variant, not fall
+    /// through the `Custom` catch-all — `Custom` is unvalidated (any unknown
+    /// string parses successfully), so a first-class variant is the only way
+    /// callers can distinguish "the real DocTags format" from a typo.
+    #[test]
+    fn should_parse_doctags_to_the_doctags_variant_not_custom() {
+        assert_eq!("doctags".parse::<OutputFormat>().unwrap(), OutputFormat::DocTags);
+        assert_eq!("DOCTAGS".parse::<OutputFormat>().unwrap(), OutputFormat::DocTags);
+        assert_eq!("DocTags".parse::<OutputFormat>().unwrap(), OutputFormat::DocTags);
+        assert_ne!(
+            "doctags".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Custom("doctags".to_string())
+        );
+    }
+
+    /// A typo close to a recognized keyword must still fall back to `Custom`,
+    /// not be silently coerced into a real variant.
+    #[test]
+    fn should_treat_typo_of_a_keyword_as_custom_not_a_real_variant() {
+        let result = "markdwon".parse::<OutputFormat>().unwrap();
+        assert_eq!(result, OutputFormat::Custom("markdwon".to_string()));
+    }
+
+    /// `Display`/`FromStr` must round-trip for `DocTags`, matching the pattern
+    /// already established for the other built-in formats.
+    #[test]
+    fn should_roundtrip_doctags_through_display_and_from_str() {
+        let format = OutputFormat::DocTags;
+        let rendered = format.to_string();
+        assert_eq!(rendered, "doctags");
+        assert_eq!(rendered.parse::<OutputFormat>().unwrap(), OutputFormat::DocTags);
+    }
+
     #[test]
     fn test_output_format_to_string() {
         assert_eq!(OutputFormat::Plain.to_string(), "plain");
@@ -150,6 +292,7 @@ mod tests {
         assert_eq!(OutputFormat::Html.to_string(), "html");
         assert_eq!(OutputFormat::Json.to_string(), "json");
         assert_eq!(OutputFormat::Structured.to_string(), "structured");
+        assert_eq!(OutputFormat::DocTags.to_string(), "doctags");
         assert_eq!(OutputFormat::Custom("docx".to_string()).to_string(), "docx");
     }
 
@@ -168,6 +311,7 @@ mod tests {
             OutputFormat::Html,
             OutputFormat::Json,
             OutputFormat::Structured,
+            OutputFormat::DocTags,
         ] {
             let json = serde_json::to_string(&format).unwrap();
             let deserialized: OutputFormat = serde_json::from_str(&json).unwrap();
@@ -186,6 +330,7 @@ mod tests {
             serde_json::to_string(&OutputFormat::Structured).unwrap(),
             "\"structured\""
         );
+        assert_eq!(serde_json::to_string(&OutputFormat::DocTags).unwrap(), "\"doctags\"");
     }
 
     #[test]
@@ -196,6 +341,7 @@ mod tests {
         assert_eq!(OutputFormat::Djot.renderer_name(), Some("djot"));
         assert_eq!(OutputFormat::Json.renderer_name(), None);
         assert_eq!(OutputFormat::Structured.renderer_name(), None);
+        assert_eq!(OutputFormat::DocTags.renderer_name(), Some("doctags"));
         assert_eq!(OutputFormat::Custom("docx".to_string()).renderer_name(), Some("docx"));
     }
 }

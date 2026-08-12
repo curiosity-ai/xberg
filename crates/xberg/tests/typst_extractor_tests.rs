@@ -12,18 +12,50 @@
 //!
 //! Each test document is extracted and validated for correct content extraction.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "office")]
 
 mod helpers;
 use helpers::extract_bytes_document;
 
 use std::{fs, path::PathBuf};
+use xberg::ExtractedDocument;
 use xberg::core::config::ExtractionConfig;
+use xberg::types::document_structure::NodeContent;
 
 fn typst_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test_documents/typst")
         .join(name)
+}
+
+/// Extraction config that also returns the structured document tree.
+///
+/// Heading levels live on `NodeContent::Heading`, never in the extracted text: the
+/// extractor records headings as structural elements and no renderer re-emits the
+/// Typst `=` markers. Asserting on the structure is the only honest way to check a
+/// level, and stricter than string matching — `"= Features"` is also a substring of
+/// `"== Features"`.
+fn structure_config() -> ExtractionConfig {
+    ExtractionConfig {
+        include_document_structure: true,
+        ..Default::default()
+    }
+}
+
+/// Every heading as a `(level, text)` pair, in document order.
+fn headings(result: &ExtractedDocument) -> Vec<(u8, &str)> {
+    result
+        .document
+        .as_ref()
+        .expect("include_document_structure should populate `document`")
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.content {
+            NodeContent::Heading { level, text } => Some((*level, text.as_str())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Test simple.typ - Basic Typst document with fundamental formatting
@@ -41,7 +73,7 @@ fn typst_fixture(name: &str) -> PathBuf {
 /// Expected: Document should extract text, preserve headings, metadata, and formatting markers
 #[tokio::test]
 async fn test_simple_typst_document_extraction() {
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let doc_path = typst_fixture("simple.typ");
     let content = match fs::read(doc_path) {
@@ -87,23 +119,20 @@ async fn test_simple_typst_document_extraction() {
         "Should extract 'Conclusion' heading"
     );
 
-    let intro_count = extraction.content.matches("= Introduction").count();
-    let subsection_count = extraction.content.matches("== Subsection").count();
-    let features_count = extraction.content.matches("= Features").count();
-    let lists_count = extraction.content.matches("== Lists").count();
-    let code_count = extraction.content.matches("== Code").count();
-    let tables_count = extraction.content.matches("== Tables").count();
-    let links_count = extraction.content.matches("== Links").count();
-    let conclusion_count = extraction.content.matches("= Conclusion").count();
-
-    assert_eq!(intro_count, 1, "Should extract 'Introduction' (level 1)");
-    assert_eq!(subsection_count, 1, "Should extract 'Subsection' (level 2)");
-    assert_eq!(features_count, 1, "Should extract 'Features' (level 1)");
-    assert_eq!(lists_count, 1, "Should extract 'Lists' (level 2)");
-    assert_eq!(code_count, 1, "Should extract 'Code' (level 2)");
-    assert_eq!(tables_count, 1, "Should extract 'Tables' (level 2)");
-    assert_eq!(links_count, 1, "Should extract 'Links' (level 2)");
-    assert_eq!(conclusion_count, 1, "Should extract 'Conclusion' (level 1)");
+    assert_eq!(
+        headings(&extraction),
+        vec![
+            (1, "Introduction"),
+            (2, "Subsection"),
+            (1, "Features"),
+            (2, "Lists"),
+            (2, "Code"),
+            (2, "Tables"),
+            (2, "Links"),
+            (1, "Conclusion"),
+        ],
+        "All 8 headings should be extracted once each, at their source level, in document order"
+    );
 
     assert!(
         extraction.content.contains("*") || extraction.content.contains("bold"),
@@ -174,7 +203,7 @@ async fn test_minimal_typst_document_extraction() {
 /// Expected: Heading structure should be preserved with level information
 #[tokio::test]
 async fn test_heading_hierarchy_extraction() {
-    let config = ExtractionConfig::default();
+    let config = structure_config();
 
     let doc_path = typst_fixture("headings.typ");
     let content = match fs::read(doc_path) {
@@ -195,49 +224,27 @@ async fn test_heading_hierarchy_extraction() {
 
     assert!(!extraction.content.is_empty(), "Document should extract content");
 
-    assert!(
-        extraction.content.contains("= Level 1") || extraction.content.contains("Level 1 Heading"),
-        "Should extract level 1 heading"
+    for level in 1..=6 {
+        let expected = format!("Level {} Heading", level);
+        assert!(
+            extraction.content.contains(&expected),
+            "Heading text '{}' should reach the extracted text",
+            expected
+        );
+    }
+
+    assert_eq!(
+        headings(&extraction),
+        vec![
+            (1, "Level 1 Heading"),
+            (2, "Level 2 Heading"),
+            (3, "Level 3 Heading"),
+            (4, "Level 4 Heading"),
+            (5, "Level 5 Heading"),
+            (6, "Level 6 Heading"),
+        ],
+        "Each level 1-6 should be extracted exactly once, at its source level, in document order"
     );
-
-    assert!(
-        extraction.content.contains("== Level 2") || extraction.content.contains("Level 2 Heading"),
-        "Should extract level 2 heading"
-    );
-
-    assert!(
-        extraction.content.contains("=== Level 3") || extraction.content.contains("Level 3 Heading"),
-        "Should extract level 3 heading"
-    );
-
-    assert!(
-        extraction.content.contains("==== Level 4") || extraction.content.contains("Level 4 Heading"),
-        "Should extract level 4 heading"
-    );
-
-    assert!(
-        extraction.content.contains("===== Level 5") || extraction.content.contains("Level 5 Heading"),
-        "Should extract level 5 heading"
-    );
-
-    assert!(
-        extraction.content.contains("====== Level 6") || extraction.content.contains("Level 6 Heading"),
-        "Should extract level 6 heading"
-    );
-
-    let level_1_count = extraction.content.matches("= Level 1").count();
-    let level_2_count = extraction.content.matches("== Level 2").count();
-    let level_3_count = extraction.content.matches("=== Level 3").count();
-    let level_4_count = extraction.content.matches("==== Level 4").count();
-    let level_5_count = extraction.content.matches("===== Level 5").count();
-    let level_6_count = extraction.content.matches("====== Level 6").count();
-
-    assert_eq!(level_1_count, 1, "Should extract exactly one level 1 heading");
-    assert_eq!(level_2_count, 1, "Should extract exactly one level 2 heading");
-    assert_eq!(level_3_count, 1, "Should extract exactly one level 3 heading");
-    assert_eq!(level_4_count, 1, "Should extract exactly one level 4 heading");
-    assert_eq!(level_5_count, 1, "Should extract exactly one level 5 heading");
-    assert_eq!(level_6_count, 1, "Should extract exactly one level 6 heading");
 
     println!(
         "✓ headings.typ: Successfully extracted {} characters with heading structure",

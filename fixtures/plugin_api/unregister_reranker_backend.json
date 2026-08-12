@@ -2,6 +2,12 @@
 	"id": "unregister_reranker_backend",
 	"category": "plugin_api",
 	"description": "unregister_reranker_backend",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "unregister_reranker_backend",
+		"description": "unregister_reranker_backend",
+		"side_effects": "safe"
+	},
 	"call": "unregister_reranker_backend",
 	"input": {
 		"name": "test-reranker-backend"

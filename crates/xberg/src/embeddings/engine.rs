@@ -23,6 +23,10 @@ pub enum Pooling {
     Cls,
     /// Mean of all token embeddings, weighted by attention mask.
     Mean,
+    /// Use the last non-padding token embedding. Decoder-style embedding models
+    /// (e.g. Qwen3-Embedding) place the pooled representation on the final
+    /// content token rather than a prepended `[CLS]`.
+    Last,
 }
 #[cfg_attr(alef, alef(skip))]
 /// Text embedding model with thread-safe inference.
@@ -65,10 +69,6 @@ impl EmbeddingEngine {
             return Ok(Vec::new());
         }
 
-        // Defensive: callers from polyglot bindings may pass batch_size=0 when the
-        // host-side `EmbeddingConfig` mirror omits the serde default. `chunks(0)`
-        // would panic — fall back to the documented default rather than aborting
-        // the entire interpreter.
         let batch_size = if batch_size == 0 { 32 } else { batch_size };
 
         let mut all_embeddings = Vec::with_capacity(texts.len());
@@ -83,7 +83,6 @@ impl EmbeddingEngine {
 
     /// Embed a single batch of texts.
     fn embed_batch<S: AsRef<str>>(&self, batch: &[S]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        // Tokenize
         let inputs: Vec<&str> = batch.iter().map(|t| t.as_ref()).collect();
         let encodings = self
             .tokenizer
@@ -97,7 +96,6 @@ impl EmbeddingEngine {
         let batch_size = batch.len();
         let max_size = encoding_length * batch_size;
 
-        // Build input tensors
         let mut ids_array = Vec::with_capacity(max_size);
         let mut mask_array = Vec::with_capacity(max_size);
         let mut type_ids_array = Vec::with_capacity(max_size);
@@ -115,8 +113,7 @@ impl EmbeddingEngine {
 
         let mask_nd = ndarray::Array::from_shape_vec((batch_size, encoding_length), mask_array)
             .map_err(|e| EmbedError::Shape(e.to_string()))?;
-        // Clone mask only when mean pooling needs it for post-processing.
-        let attention_mask_for_pooling = if self.pooling == Pooling::Mean {
+        let attention_mask_for_pooling = if matches!(self.pooling, Pooling::Mean | Pooling::Last) {
             Some(mask_nd.clone())
         } else {
             None
@@ -132,11 +129,6 @@ impl EmbeddingEngine {
             session_inputs.push(("token_type_ids".into(), Value::from_array(type_ids_tensor)?.into()));
         }
 
-        // Run inference — thread-safe despite &mut self signature on Session::run()
-        //
-        // SAFETY: ort::Session::run() takes &mut self but delegates to run_inner(&self)
-        // with zero actual mutation. The ONNX Runtime C API (OrtApi::Run) is documented
-        // as thread-safe for concurrent Run() calls on the same session.
         #[allow(unsafe_code)]
         let outputs = unsafe {
             let session_ptr = &self.session as *const Session as *mut Session;
@@ -144,15 +136,22 @@ impl EmbeddingEngine {
         }
         .map_err(EmbedError::Ort)?;
 
-        // Find the embedding output tensor
         let (_, output_value) = outputs.iter().next().ok_or(EmbedError::NoOutput)?;
 
         let tensor: ArrayView<f32, Dim<IxDynImpl>> = output_value.try_extract_array().map_err(EmbedError::Ort)?;
 
-        // Pool (without normalization — caller controls normalization)
-        let pooled = match attention_mask_for_pooling {
-            Some(mask) => mean_pool(&tensor, mask)?,
-            None => cls_pool(&tensor)?,
+        let pooled = match self.pooling {
+            Pooling::Cls => cls_pool(&tensor)?,
+            Pooling::Mean => {
+                let mask = attention_mask_for_pooling
+                    .ok_or_else(|| EmbedError::Shape("mean pooling requires the attention mask".to_string()))?;
+                mean_pool(&tensor, mask)?
+            }
+            Pooling::Last => {
+                let mask = attention_mask_for_pooling
+                    .ok_or_else(|| EmbedError::Shape("last-token pooling requires the attention mask".to_string()))?;
+                last_pool(&tensor, mask)?
+            }
         };
 
         let embeddings: Vec<Vec<f32>> = pooled
@@ -165,10 +164,6 @@ impl EmbeddingEngine {
     }
 }
 
-// SAFETY: EmbeddingEngine is Send + Sync because:
-// 1. Tokenizer is Send + Sync (confirmed in tokenizers crate)
-// 2. Session: we only call run() which is internally thread-safe
-// 3. All other fields are immutable after construction
 #[allow(unsafe_code)]
 unsafe impl Send for EmbeddingEngine {}
 #[allow(unsafe_code)]
@@ -218,6 +213,43 @@ fn mean_pool(tensor: &ArrayView<f32, Dim<IxDynImpl>>, attention_mask: Array2<i64
     let mask_sum = mask_sum.mapv(|x| if x == 0.0 { 1.0 } else { x });
 
     Ok(&sum / &mask_sum)
+}
+
+/// Last-token pooling — extract the final non-padding token's embedding per row.
+///
+/// Decoder-style embedding models (Qwen3-Embedding) carry the pooled
+/// representation on the last content token. The last real token is located via
+/// the attention mask (scanning from the end for the last `1`), so this is
+/// robust to either left- or right-padding. A row whose mask is entirely zero
+/// falls back to the final position.
+fn last_pool(tensor: &ArrayView<f32, Dim<IxDynImpl>>, attention_mask: Array2<i64>) -> Result<Array2<f32>, EmbedError> {
+    if tensor.dim().ndim() == 2 {
+        return Ok(tensor.slice(s![.., ..]).to_owned());
+    }
+    if tensor.dim().ndim() != 3 {
+        return Err(EmbedError::Shape(format!(
+            "Expected 2D or 3D tensor, got {:?}",
+            tensor.dim()
+        )));
+    }
+
+    let tensor3 = tensor.slice(s![.., .., ..]);
+    let (batch, seq_len, hidden) = tensor3.dim();
+    let mut pooled = Array2::<f32>::zeros((batch, hidden));
+    for b in 0..batch {
+        let last_index = (0..seq_len)
+            .rev()
+            .find(|&t| attention_mask[[b, t]] != 0)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    batch_row = b,
+                    "last-token pooling saw an all-zero attention mask; falling back to the final position"
+                );
+                seq_len - 1
+            });
+        pooled.row_mut(b).assign(&tensor3.slice(s![b, last_index, ..]));
+    }
+    Ok(pooled)
 }
 
 /// L2-normalize a vector.
@@ -271,7 +303,7 @@ mod tests {
     /// Test normalization of a known vector produces unit vector (L2 norm ≈ 1.0).
     #[test]
     fn test_normalize_unit_vector() {
-        let v = vec![3.0, 4.0]; // 3-4-5 triangle
+        let v = vec![3.0, 4.0];
         let normalized = normalize(&v);
 
         assert_eq!(normalized.len(), 2);
@@ -286,7 +318,6 @@ mod tests {
             normalized[1]
         );
 
-        // Verify L2 norm is approximately 1.0
         let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6, "L2 norm should be ~1.0, got {}", norm);
     }
@@ -325,17 +356,14 @@ mod tests {
     /// Test that all EmbedError variants have Display impl without panicking.
     #[test]
     fn test_embed_error_display() {
-        // Test Tokenizer variant
         let tokenizer_err = EmbedError::Tokenizer("test error".to_string());
         let display = format!("{}", tokenizer_err);
         assert!(display.contains("Tokenizer error"), "Tokenizer display: {}", display);
 
-        // Test Shape variant
         let shape_err = EmbedError::Shape("invalid shape".to_string());
         let display = format!("{}", shape_err);
         assert!(display.contains("Tensor shape error"), "Shape display: {}", display);
 
-        // Test NoOutput variant
         let no_output_err = EmbedError::NoOutput;
         let display = format!("{}", no_output_err);
         assert!(display.contains("no output"), "NoOutput display: {}", display);
@@ -347,18 +375,14 @@ mod tests {
         let cls = Pooling::Cls;
         let mean = Pooling::Mean;
 
-        // Different variants should not be equal
         assert_ne!(cls, mean, "Pooling::Cls and Pooling::Mean should be different");
 
-        // Same variants should be equal
         assert_eq!(cls, Pooling::Cls);
         assert_eq!(mean, Pooling::Mean);
 
-        // Pooling should be cloneable
         let cls_clone = cls.clone();
         assert_eq!(cls, cls_clone);
 
-        // Pooling should be debuggable
         let debug_output = format!("{:?}", cls);
         assert!(debug_output.contains("Cls"), "Debug output: {}", debug_output);
     }
@@ -382,13 +406,12 @@ mod tests {
     /// Test normalization handles negative values.
     #[test]
     fn test_normalize_negative_values() {
-        let v = vec![-3.0, -4.0]; // Same magnitude as [3.0, 4.0]
+        let v = vec![-3.0, -4.0];
         let normalized = normalize(&v);
 
         assert!((normalized[0] - (-0.6)).abs() < 1e-6, "Expected ~-0.6");
         assert!((normalized[1] - (-0.8)).abs() < 1e-6, "Expected ~-0.8");
 
-        // Verify L2 norm is still 1.0
         let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
     }
@@ -399,7 +422,6 @@ mod tests {
         let v = vec![f32::EPSILON / 2.0, f32::EPSILON / 2.0];
         let normalized = normalize(&v);
 
-        // Values below epsilon threshold should be returned as-is
         assert_eq!(normalized, v, "Very small vectors (< epsilon) returned unchanged");
     }
 
@@ -408,7 +430,6 @@ mod tests {
     fn test_embed_error_is_error_type() {
         let err = EmbedError::Shape("test".to_string());
         let _: &dyn std::error::Error = &err;
-        // If this compiles, the trait is properly implemented
     }
 
     /// Test Pooling enum Clone and Debug traits.
@@ -417,19 +438,16 @@ mod tests {
         let cls = Pooling::Cls;
         let mean = Pooling::Mean;
 
-        // Test Clone
         let cls_clone = cls.clone();
         let mean_clone = mean.clone();
         assert_eq!(cls, cls_clone);
         assert_eq!(mean, mean_clone);
 
-        // Test Debug produces valid output
         let cls_debug = format!("{:?}", cls);
         let mean_debug = format!("{:?}", mean);
         assert!(!cls_debug.is_empty());
         assert!(!mean_debug.is_empty());
 
-        // Test PartialEq and Eq
         assert_eq!(cls, cls);
         assert_eq!(mean, mean);
         assert_ne!(cls, mean);
@@ -441,7 +459,6 @@ mod tests {
         let v = vec![1e6, 1e6];
         let normalized = normalize(&v);
 
-        // Should normalize without overflow
         assert!(!normalized.iter().any(|x| x.is_infinite()), "No overflow");
         let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "L2 norm should be ~1.0");
@@ -456,5 +473,60 @@ mod tests {
         assert_eq!(normalized.len(), 3);
         let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6, "L2 norm should be ~1.0");
+    }
+
+    /// last_pool picks the final non-pad token per row, robust to right- and
+    /// left-padding (mask scans from the end), and degrades to the last
+    /// position for an all-zero mask.
+    #[test]
+    fn last_pool_selects_last_non_pad_token_per_row() {
+        let tensor = ndarray::Array3::from_shape_vec(
+            (3, 3, 2),
+            vec![
+                10.0, 11.0, 20.0, 21.0, 99.0, 99.0, 77.0, 77.0, 30.0, 31.0, 40.0, 41.0, 50.0, 51.0, 60.0, 61.0, 70.0,
+                71.0,
+            ],
+        )
+        .unwrap();
+        let mask = Array2::from_shape_vec((3, 3), vec![1, 1, 0, 0, 1, 1, 1, 1, 1]).unwrap();
+        let view = tensor.view().into_dyn();
+        let pooled = last_pool(&view, mask).unwrap();
+
+        assert_eq!(pooled.dim(), (3, 2));
+        assert_eq!(
+            pooled.row(0).to_vec(),
+            vec![20.0, 21.0],
+            "right-pad: last real token is index 1, not the pad at 2"
+        );
+        assert_eq!(
+            pooled.row(1).to_vec(),
+            vec![40.0, 41.0],
+            "left-pad: last real token is index 2"
+        );
+        assert_eq!(
+            pooled.row(2).to_vec(),
+            vec![70.0, 71.0],
+            "no pad: last token is index 2"
+        );
+    }
+
+    /// last_pool passes a 2D (already-pooled) tensor through unchanged.
+    #[test]
+    fn last_pool_passes_through_2d_tensor() {
+        let tensor = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let view = tensor.view().into_dyn();
+        let mask = Array2::from_shape_vec((2, 1), vec![1, 1]).unwrap();
+        let pooled = last_pool(&view, mask).unwrap();
+        assert_eq!(pooled, tensor);
+    }
+
+    /// mean_pool averages only the unmasked tokens.
+    #[test]
+    fn mean_pool_averages_unmasked_tokens() {
+        let tensor = ndarray::Array3::from_shape_vec((1, 3, 2), vec![2.0, 4.0, 4.0, 8.0, 100.0, 100.0]).unwrap();
+        let mask = Array2::from_shape_vec((1, 3), vec![1, 1, 0]).unwrap();
+        let view = tensor.view().into_dyn();
+        let pooled = mean_pool(&view, mask).unwrap();
+        assert_eq!(pooled.row(0).to_vec(), vec![3.0, 6.0]);
     }
 }

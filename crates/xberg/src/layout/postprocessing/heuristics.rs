@@ -28,11 +28,8 @@ pub(crate) fn apply_heuristics(
     page_width: f32,
     page_height: f32,
 ) -> Vec<LayoutDetection> {
-    // 1. Apply per-class confidence thresholds.
     detections.retain(|d| d.confidence >= class_threshold(d.class_name));
 
-    // 2. Remove full-page pictures (>90% of page area). Chart is a refinement
-    //    of Picture and is treated identically throughout this pass.
     detections.retain(|d| {
         if matches!(d.class_name, LayoutClass::Picture | LayoutClass::Chart) {
             d.bbox.page_coverage(page_width, page_height) < 0.9
@@ -41,9 +38,6 @@ pub(crate) fn apply_heuristics(
         }
     });
 
-    // 2b. Demote tiny Table/Picture false positives to Text.
-    //     If a Table or Picture covers <3% of page area AND has confidence <0.7,
-    //     it is likely a false positive that would suppress body text.
     for d in detections.iter_mut() {
         if matches!(
             d.class_name,
@@ -55,7 +49,6 @@ pub(crate) fn apply_heuristics(
         }
     }
 
-    // 3. Overlap resolution — iterative (up to 3 passes).
     for _ in 0..3 {
         let prev_len = detections.len();
         resolve_overlaps(&mut detections);
@@ -64,7 +57,6 @@ pub(crate) fn apply_heuristics(
         }
     }
 
-    // 4. Cross-type overlap: remove KVR if 90%+ overlapping with Table and conf_diff < 0.1.
     resolve_kvr_table_overlap(&mut detections);
     detections
 }
@@ -90,12 +82,10 @@ fn resolve_overlaps(detections: &mut Vec<LayoutDetection>) {
             let containment_i_of_j = detections[i].bbox.containment_of(&detections[j].bbox);
             let containment_j_of_i = detections[j].bbox.containment_of(&detections[i].bbox);
 
-            // Skip if no significant overlap.
             if iou < 0.8 && containment_i_of_j < 0.8 && containment_j_of_i < 0.8 {
                 continue;
             }
 
-            // Determine which to remove using label-specific preference rules.
             let remove_idx = pick_removal(&detections[i], &detections[j], containment_i_of_j);
             if remove_idx == 0 {
                 remove[i] = true;
@@ -116,33 +106,29 @@ fn resolve_overlaps(detections: &mut Vec<LayoutDetection>) {
 /// Determine which of two overlapping detections to remove.
 /// Returns 0 to remove `a`, 1 to remove `b`.
 fn pick_removal(a: &LayoutDetection, b: &LayoutDetection, containment_a_of_b: f32) -> usize {
-    // ListItem preferred over Text when similar area (±20%).
     if a.class_name == LayoutClass::ListItem && b.class_name == LayoutClass::Text {
         let area_ratio = a.bbox.area() / b.bbox.area().max(1e-6);
         if (0.8..=1.2).contains(&area_ratio) {
-            return 1; // remove Text
+            return 1;
         }
     }
     if b.class_name == LayoutClass::ListItem && a.class_name == LayoutClass::Text {
         let area_ratio = b.bbox.area() / a.bbox.area().max(1e-6);
         if (0.8..=1.2).contains(&area_ratio) {
-            return 0; // remove Text
+            return 0;
         }
     }
 
-    // Code preferred when other is 80%+ contained.
     if a.class_name == LayoutClass::Code && containment_a_of_b > 0.8 {
-        return 1; // remove b
+        return 1;
     }
     if b.class_name == LayoutClass::Code {
         let containment_b_of_a = b.bbox.containment_of(&a.bbox);
         if containment_b_of_a > 0.8 {
-            return 0; // remove a
+            return 0;
         }
     }
 
-    // Text preferred over Table/Picture when Text has equal or higher confidence.
-    // This prevents low-confidence Table/Picture detections from suppressing body text.
     if a.class_name == LayoutClass::Text
         && matches!(
             b.class_name,
@@ -150,7 +136,7 @@ fn pick_removal(a: &LayoutDetection, b: &LayoutDetection, containment_a_of_b: f3
         )
         && a.confidence >= b.confidence
     {
-        return 1; // remove Table/Picture/Chart, keep Text
+        return 1;
     }
     if b.class_name == LayoutClass::Text
         && matches!(
@@ -159,10 +145,9 @@ fn pick_removal(a: &LayoutDetection, b: &LayoutDetection, containment_a_of_b: f3
         )
         && b.confidence >= a.confidence
     {
-        return 0; // remove Table/Picture/Chart, keep Text
+        return 0;
     }
 
-    // Default: keep higher confidence.
     if a.confidence >= b.confidence { 1 } else { 0 }
 }
 

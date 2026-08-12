@@ -1,11 +1,4 @@
 # =============================================================================
-# Alpine-based builder for musl-linked Elixir Rustler NIF.
-#
-# Usage:
-#   docker build -f docker/Dockerfile.musl-rustler \
-#     --output type=local,dest=./dist .
-#
-# Produces libxberg_nif.so at dist/libxberg_nif.so
 # =============================================================================
 FROM alpine:3.21 AS builder
 
@@ -13,8 +6,12 @@ ARG RUST_TOOLCHAIN=nightly-2026-03-10
 
 WORKDIR /build
 
-# Install build dependencies — Alpine's g++ and libstdc++ are musl-native,
-# so tesseract C++ compilation works without glibc conflicts.
+# Alpine's /bin/sh is busybox ash, which supports `-o pipefail`. Without it the
+# `curl ... | sh` rustup bootstrap below reports only sh's status, so a failed or
+# truncated download silently installs nothing, and the `readelf ... | grep`
+# linkage diagnostic reports success on an empty pipe. (hadolint DL4006)
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+
 RUN apk add --no-cache \
     curl musl-dev cmake make pkgconf \
     perl linux-headers git file && \
@@ -24,50 +21,39 @@ RUN apk add --no-cache \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
 
-# Install Rust via rustup (Alpine's packaged Rust may be too old / not nightly)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --component rust-src && \
     echo "Rust host: $(~/.cargo/bin/rustc -vV | grep host)" && \
     echo "Default target: $(~/.cargo/bin/rustc --print cfg | grep target)"
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Point ort-sys to Alpine's system ORT library instead of downloading prebuilt binaries.
 ENV ORT_LIB_LOCATION=/usr/lib
 ENV ORT_PREFER_DYNAMIC_LINK=1
 ENV ORT_SKIP_DOWNLOAD=1
 ENV ORT_STRATEGY=system
-# Allow cdylib output on musl targets (default is +crt-static which blocks shared libs)
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Copy workspace manifests and crates
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
+COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
+COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 COPY packages/elixir/native/xberg_nif/ packages/elixir/native/xberg_nif/
 
-# Remove workspace members that aren't included
 RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-cli/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
 
-# Build the Rustler NIF shared library (the crate is excluded from the workspace,
-# so we build it directly from its package directory).
-# See Dockerfile.musl-build for the --offline / --locked rationale (sed mutates
-# parent manifest; registry cache is empty so --offline fails to resolve deps).
 RUN cd packages/elixir/native/xberg_nif && \
     cargo build --release && \
     cp target/release/libxberg_nif.so /build/libxberg_nif.so && \
     strip /build/libxberg_nif.so
 
-# Verify the library
 RUN file /build/libxberg_nif.so && \
     echo "=== Dynamic dependencies ===" && \
     readelf -d /build/libxberg_nif.so 2>/dev/null | grep NEEDED || echo "No dynamic dependencies (fully static)"
 
-# =============================================================================
-# Output stage — just the shared library
-# =============================================================================
 FROM scratch
 COPY --from=builder /build/libxberg_nif.so /libxberg_nif.so

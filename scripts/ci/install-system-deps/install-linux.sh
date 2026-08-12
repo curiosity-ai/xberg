@@ -18,12 +18,19 @@ packages=(
   tesseract-ocr-eng
   tesseract-ocr-tur
   tesseract-ocr-deu
+  # Korean and vertical-Japanese packs back the multilingual PNG (eng+kor) and
+  # vertical JPEG (jpn_vert) OCR benchmark fixtures. The harness OCR preflight
+  # fails fast unless these resolve on disk, so they must be installed here
+  # rather than downloaded inside the timed extraction. ~keep
+  tesseract-ocr-kor
+  tesseract-ocr-jpn-vert
   fonts-liberation
   fonts-dejavu-core
   fonts-noto-core
   libssl-dev
   pkg-config
   build-essential
+  patchelf
   cmake
   libmagic-dev
   libuv1-dev
@@ -32,8 +39,20 @@ packages=(
   libx265-dev
   libdav1d-dev
   libnuma-dev
-  php-cli
-  php-dev
+  # boost (header-only spirit) and zlib headers are build-time deps of
+  # librevenge + libwpd, compiled from source by the xberg-libwpd crate. ~keep
+  libboost-dev
+  zlib1g-dev
+  # liblzma-dev provides the liblzma.so linker symlink. The swift package
+  # statically links libxberg_ffi.a, whose lzma-sys transitive dep surfaces
+  # `-llzma` at the swift link step; the runner ships liblzma5 (runtime) but
+  # not the dev symlink, so ld.gold fails with "cannot find -llzma". ~keep
+  liblzma-dev
+  # libbz2-dev provides the libbz2.so linker symlink. Same reasoning as
+  # liblzma-dev: the swift package's bzip2 crates (archive/zip/unhwp paths)
+  # emit `-lbz2`; the runner ships libbz2 runtime but not the dev symlink, so
+  # ld.gold fails with "cannot find -lbz2". ~keep
+  libbz2-dev
 )
 
 echo "Installing dependencies..."
@@ -56,6 +75,19 @@ else
   fi
 fi
 
+# Install PHP dev headers only when no PHP is already active. The php-extension
+# build matrix runs shivammathur/setup-php first (matrix.php), putting phpX.Y and
+# its -dev headers on PATH; apt's unversioned php-cli/php-dev pull Ubuntu Noble's
+# default (8.3) and reset php-config, so ext-php-rs builds against the wrong PHP
+# version. Guard on `command -v php`, mirroring the Windows/macOS scripts. ~keep
+if command -v php >/dev/null 2>&1; then
+  echo "✓ PHP already active: $(php --version | head -1)"
+else
+  echo "Installing PHP (php-cli, php-dev)..."
+  retry_with_backoff_timeout 300 sudo apt-get install -y php-cli php-dev ||
+    echo "::warning::Failed to install php-cli/php-dev"
+fi
+
 echo "::endgroup::"
 
 echo "::group::Building libheif from source (Noble ships 1.17.6, libheif-sys needs >=1.21)"
@@ -63,9 +95,6 @@ echo "::group::Building libheif from source (Noble ships 1.17.6, libheif-sys nee
 LIBHEIF_VERSION="${LIBHEIF_VERSION:-1.23.0}"
 LIBHEIF_PREFIX="${LIBHEIF_PREFIX:-/usr/local}"
 
-# Remove apt's older libheif to prevent shadowing our source build.
-# On aarch64, apt's libheif (1.17.6) installs to /usr/lib/aarch64-linux-gnu/,
-# and on x86_64 to /usr/lib/x86_64-linux-gnu/. This ensures we use the 1.23.0 build.
 echo "Removing apt's libheif to prevent shadowing..."
 if dpkg -l | grep -q "^ii.*libheif"; then
   sudo apt-get remove -y libheif* || echo "::warning::Failed to remove apt libheif, continuing..."
@@ -107,11 +136,8 @@ else
   rm -rf "$build_dir"
 fi
 
-# Always run ldconfig to update the dynamic linker cache, even if libheif was cached
 sudo ldconfig
 
-# If cache save is enabled (e.g., actions/cache post-run), prepare cache directory
-# Actions/cache will restore from /tmp/libheif-cache in the next workflow run
 if [ -n "${GITHUB_ACTION:-}" ]; then
   mkdir -p /tmp/libheif-cache/usr/local/lib/pkgconfig
   mkdir -p /tmp/libheif-cache/usr/local/include
@@ -122,8 +148,6 @@ if [ -n "${GITHUB_ACTION:-}" ]; then
   [ -d /usr/local/share/libheif ] && cp -a /usr/local/share/libheif /tmp/libheif-cache/usr/local/share/
 fi
 
-# Diagnostic: verify the correct libheif is in the cache and has the required symbol.
-# This helps debug future ARM linker issues.
 echo ""
 echo "libheif symbol verification:"
 if [ -f "$LIBHEIF_PREFIX/lib/libheif.so.1" ]; then
@@ -141,8 +165,6 @@ ldconfig -p | grep libheif || echo "(no libheif in ldconfig cache)"
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   echo "PKG_CONFIG_PATH=$LIBHEIF_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >>"$GITHUB_ENV"
-  # Ensure /usr/local/lib comes FIRST in LD_LIBRARY_PATH so source-built libheif 1.23.0 wins
-  # over any system (apt) libheif. This is critical on ARM where apt's old libheif may be present.
   echo "LD_LIBRARY_PATH=$LIBHEIF_PREFIX/lib:${LD_LIBRARY_PATH:-}" >>"$GITHUB_ENV"
 fi
 
@@ -154,13 +176,11 @@ echo "CMake:"
 if command -v cmake >/dev/null 2>&1; then
   cmake --version | head -1
   echo "✓ CMake available"
-  # Export CMAKE environment variable for immediate availability in build scripts
   CMAKE_FULL_PATH="$(command -v cmake)"
   if [[ -n "$GITHUB_ENV" ]]; then
     echo "CMAKE=$CMAKE_FULL_PATH" >>"$GITHUB_ENV"
     echo "✓ Set CMAKE=$CMAKE_FULL_PATH in GITHUB_ENV"
   fi
-  # Also add cmake binary directory to GITHUB_PATH for subsequent steps
   CMAKE_BIN="$(dirname "$CMAKE_FULL_PATH")"
   if [[ -n "$GITHUB_PATH" && -d "$CMAKE_BIN" ]]; then
     echo "$CMAKE_BIN" >>"$GITHUB_PATH"

@@ -1,13 +1,9 @@
 # =============================================================================
-# Builder Stage - Build Rust binary with all dependencies
 # =============================================================================
 FROM rust:1.95-trixie AS builder
 
 WORKDIR /build
 
-# Install build dependencies
-# Debian Trixie ships libheif 1.20.x but libheif-sys 5.3 requires >= 1.21,
-# so we source-build libheif 1.23.0 after the apt step.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         cmake \
@@ -28,7 +24,6 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Source-build libheif 1.23.0 (Trixie ships 1.20.x, libheif-sys 5.3 needs >= 1.21)
 RUN cd /tmp && \
     curl -fsSL -o libheif.tar.gz https://github.com/strukturag/libheif/releases/download/v1.23.0/libheif-1.23.0.tar.gz && \
     tar -xzf libheif.tar.gz && \
@@ -39,12 +34,10 @@ RUN cd /tmp && \
     ldconfig && \
     cd / && rm -rf /tmp/libheif*
 
-# Set onnxruntime version (can be overridden via build-arg)
 ARG ONNXRUNTIME_VERSION=1.24.2
 ARG TARGETARCH
 ENV ONNXRUNTIME_VERSION=${ONNXRUNTIME_VERSION}
 
-# Download and extract ONNX Runtime
 RUN mkdir -p /build/onnxruntime && \
     if [ "$TARGETARCH" = "arm64" ]; then \
         ORT_ARCH="aarch64"; \
@@ -56,20 +49,19 @@ RUN mkdir -p /build/onnxruntime && \
     tar -xzf /build/onnxruntime.tgz -C /build/onnxruntime --strip-components=1 && \
     rm /build/onnxruntime.tgz
 
-# Copy workspace manifests and crates
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
+COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-cli/ crates/xberg-cli/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
+COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
 
-# Remove workspace members that aren't included (Ruby, Node, Python, PHP, Elixir, tools, e2e)
 RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
 
-# Build release binary with server features (api + full format support)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
@@ -77,19 +69,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/xberg /build/xberg && \
     strip /build/xberg
 
-# =============================================================================
-# Runtime Stage - Minimal runtime environment
-# =============================================================================
 FROM debian:trixie-slim
 
-# OCI labels for container metadata
 LABEL org.opencontainers.image.source="https://github.com/xberg-io/xberg"
 LABEL org.opencontainers.image.description="Xberg document intelligence - full variant"
 LABEL org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 
-# Install runtime dependencies and init process for signal handling
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -119,42 +106,32 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Copy source-built libheif 1.23.0 from builder
 COPY --from=builder /usr/local/lib/libheif* /usr/local/lib/
 COPY --from=builder /usr/local/lib/pkgconfig/libheif.pc /usr/local/lib/pkgconfig/libheif.pc
 RUN ldconfig
 
-# Copy ONNX Runtime libraries from builder
 COPY --from=builder /build/onnxruntime/lib/libonnxruntime.so* /usr/local/lib/
 RUN ldconfig
 
-# Copy binary from builder
 COPY --from=builder /build/xberg /usr/local/bin/xberg
 RUN chmod +x /usr/local/bin/xberg
 
-# Create non-root user
 RUN groupadd -r xberg && \
     useradd -r -g xberg -d /app -s /sbin/nologin xberg && \
     mkdir -p /app/.xberg && \
     chown -R xberg:xberg /app
 
-# Create config directories for volume mounts
 RUN mkdir -p /etc/xberg /app/.config/xberg && \
     chown -R xberg:xberg /etc/xberg /app/.config/xberg
 
-# Create Hugging Face cache directory for embeddings models
 RUN mkdir -p /app/.xberg/huggingface && \
     chown -R xberg:xberg /app/.xberg/huggingface
 
-# Pre-download all models (PaddleOCR + layout detection) using xberg cache warm
 RUN XBERG_CACHE_DIR=/app/.xberg \
     /usr/local/bin/xberg cache warm --cache-dir /app/.xberg --format json && \
     chown -R xberg:xberg /app/.xberg && \
     echo "All models ready (PaddleOCR + layout detection)"
 
-# Ensure read permissions on tessdata files for non-root user
-# Tessdata is installed in version-specific directory (e.g., tesseract-ocr/5 or tesseract-ocr/4)
-# Make all tessdata directories readable by the non-root xberg user
 RUN set -eux; \
     echo "Setting up tessdata permissions..."; \
     for dir in /usr/share/tesseract-ocr/*/tessdata /usr/share/tesseract-ocr/tessdata /usr/share/tessdata; do \
@@ -167,13 +144,7 @@ RUN set -eux; \
     done; \
     echo "✓ Tessdata permissions configured"
 
-# Environment configuration.
-# RUST_LOG=info is the right default here. Third-party transport crates
-# (ureq, rustls, hyper_util, tower_http, hf_hub) are pre-suppressed by the
 # xberg-cli subscriber defaults in logging.rs, so they won't emit DEBUG
-# even at the "info" root level. HuggingFace model downloads happen once at
-# image build time via `cache warm`; runtime /extract requests hit the HF
-# disk cache under HF_HOME and generate no network traffic.
 ENV XBERG_CACHE_DIR=/app/.xberg \
     HF_HOME=/app/.xberg/huggingface \
     RUST_LOG=info \
@@ -183,13 +154,8 @@ USER xberg
 
 EXPOSE 8000
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/xberg", "--version"]
 
-# Use tini as PID 1 to properly forward SIGTERM/SIGINT signals
-# This enables graceful shutdown: docker stop → SIGTERM → clean shutdown
-# xberg is part of the entrypoint so CLI subcommand overrides (docker run img detect …)
-# still resolve to the binary; CMD only supplies the default serve args.
 ENTRYPOINT ["/usr/bin/tini", "--", "xberg"]
 CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]

@@ -26,8 +26,6 @@ pub mod multidoc;
 pub mod structured;
 pub mod thresholds;
 
-// Convenience re-exports so callers can `use xberg::heuristics::*` for the
-// most common types.
 pub use analyzer::{DocumentMetadata, UserChunkConfig, analyze_document, analyze_with_user_chunks};
 pub use confidence::{ConfidenceSignals, ConfidenceWeights, ExtractionConfidence, SchemaCompliance, score_confidence};
 pub use config::HeuristicsConfig;

@@ -1,17 +1,17 @@
 {
   "name": "xberg-root",
-  "version": "1.0.0-rc.9",
+  "version": "1.1.0",
   "private": true,
   "scripts": {
     "typecheck": "pnpm -r --if-present run typecheck"
   },
   "devDependencies": {
-    "@emnapi/core": "^1.11.1",
-    "@emnapi/runtime": "1.11.1",
-    "@vitest/coverage-v8": "^4.1.9",
-    "tsx": "^4.22.4",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.9"
+    "@emnapi/core": "^1.11.3",
+    "@emnapi/runtime": "1.11.3",
+    "@vitest/coverage-v8": "^4.1.10",
+    "tsx": "^4.23.11",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   },
-  "packageManager": "pnpm@11.9.0+sha512.bd682d5d03fe525ef7c9fd6780c6884d1e756ac4c9c9fe00c538782824310dcf90e3ddc4f53835f06dfaebd5085e41855e0bcbb3b60de2ac5bbab89e5036f03b"
+  "packageManager": "pnpm@11.20.0+sha512.9a6f330a95b66446ea088faf1521405a8a01f07fde7124cc9958dfed52d4bb436737e65b08f85f37b46fcba375092558ac51262b816844b22f63406ed166bfee"
 }

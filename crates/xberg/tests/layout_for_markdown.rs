@@ -16,7 +16,34 @@ mod helpers;
 use helpers::extract_uri_document_blocking;
 
 use helpers::{get_test_file_path, test_documents_available};
+#[cfg(target_os = "macos")]
+use xberg::core::config::{AccelerationConfig, ExecutionProviderType};
 use xberg::core::config::{ExtractionConfig, OutputFormat, layout::LayoutDetectionConfig};
+
+#[cfg(target_os = "macos")]
+fn accelerated_layout(provider: ExecutionProviderType) -> LayoutDetectionConfig {
+    LayoutDetectionConfig {
+        acceleration: Some(AccelerationConfig {
+            provider,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// True when any warning came from the layout stage.
+#[cfg(target_os = "macos")]
+fn has_any_layout_warning(warnings: &[xberg::types::ProcessingWarning]) -> bool {
+    warnings.iter().any(|warning| warning.source == "layout")
+}
+
+/// True when a warning reports that layout detection failed entirely.
+#[cfg(target_os = "macos")]
+fn has_layout_failure_warning(warnings: &[xberg::types::ProcessingWarning]) -> bool {
+    warnings
+        .iter()
+        .any(|warning| warning.source == "layout" && warning.message.contains("layout detection failed"))
+}
 
 /// Extract `relative_path` (from `test_documents/`) with the given config.
 fn extract_md(relative_path: &str, config: &ExtractionConfig) -> String {
@@ -56,8 +83,6 @@ fn layout_for_markdown_config() -> ExtractionConfig {
     }
 }
 
-// ── Default: no behavior change ─────────────────────────────────────────────
-
 /// With `use_layout_for_markdown = false` (the default), the pipeline must
 /// produce output that is indistinguishable from the baseline (no layout).
 /// This guards against accidental regressions introduced by the new field.
@@ -76,8 +101,6 @@ fn test_use_layout_for_markdown_false_matches_baseline() {
         "use_layout_for_markdown=false must not change extraction output compared to no-layout config"
     );
 }
-
-// ── Layout injection: structural improvement ─────────────────────────────────
 
 /// With `use_layout_for_markdown = true` and a PDF that has headings, the
 /// markdown output must contain at least one ATX heading line (`# ...`).
@@ -105,19 +128,14 @@ fn test_use_layout_for_markdown_produces_headings() {
     );
 }
 
-/// **Strict regression guard** — `use_layout_for_markdown=true` must produce
-/// strictly more ATX headings than the baseline (font-clustering only).
+/// Layout geometry must not rewrite native heading semantics.
 ///
-/// This is the test that catches the catastrophic bug where RT-DETR runs but
-/// its detections never reach `apply_layout_overrides`, making the layout
-/// pipeline a 70× slower no-op (identical SF1 to baseline). Presence-only
-/// tests (see `test_use_layout_for_markdown_produces_headings`) pass even
-/// when the layout path is broken, because font-clustering finds some
-/// headings on its own. Only an *inequality* against the baseline reveals
-/// whether layout hints actually changed classification.
+/// The native PDF path uses layout regions for reading order, grouping, and
+/// tables. Font/tag-derived heading roles remain authoritative; OCR keeps its
+/// separate layout-semantic classification path.
 #[test]
 #[ignore = "requires layout model files (ORT inference)"]
-fn test_use_layout_for_markdown_adds_headings_vs_baseline() {
+fn test_use_layout_for_markdown_preserves_native_headings() {
     if !test_documents_available() {
         return;
     }
@@ -126,34 +144,105 @@ fn test_use_layout_for_markdown_adds_headings_vs_baseline() {
     let baseline = extract_md(pdf, &baseline_config());
     let layout = extract_md(pdf, &layout_for_markdown_config());
 
-    fn count_atx_headings(content: &str) -> usize {
-        content
+    fn atx_headings(content: &str) -> Vec<(String, usize)> {
+        let mut headings = content
             .lines()
-            .filter(|line| {
+            .filter_map(|line| {
                 let trimmed = line.trim_start();
-                trimmed.starts_with("# ")
-                    || trimmed.starts_with("## ")
-                    || trimmed.starts_with("### ")
-                    || trimmed.starts_with("#### ")
-                    || trimmed.starts_with("##### ")
-                    || trimmed.starts_with("###### ")
+                let level = trimmed.chars().take_while(|character| *character == '#').count();
+                (1..=6)
+                    .contains(&level)
+                    .then(|| trimmed.get(level..))
+                    .flatten()
+                    .filter(|remainder| remainder.starts_with(' '))
+                    .map(|remainder| (remainder.trim().to_owned(), level))
             })
-            .count()
+            .collect::<Vec<_>>();
+        headings.sort();
+        headings
     }
 
-    let baseline_h = count_atx_headings(&baseline);
-    let layout_h = count_atx_headings(&layout);
+    let baseline_headings = atx_headings(&baseline);
+    let layout_headings = atx_headings(&layout);
+
+    assert_eq!(
+        baseline_headings, layout_headings,
+        "layout geometry must preserve native heading texts and levels"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires layout model files and CoreML"]
+fn test_auto_layout_avoids_coreml_failure() {
+    if !test_documents_available() {
+        return;
+    }
+
+    let config = ExtractionConfig {
+        output_format: OutputFormat::Markdown,
+        disable_ocr: true,
+        layout: Some(accelerated_layout(ExecutionProviderType::Auto)),
+        use_layout_for_markdown: true,
+        ..Default::default()
+    };
+    let path = get_test_file_path("pdf/tiny.pdf");
+    let result = extract_uri_document_blocking(&path, None, &config).expect("auto layout extraction should succeed");
+
+    assert!(!result.content.trim().is_empty());
+    assert!(
+        !has_any_layout_warning(&result.processing_warnings),
+        "auto layout unexpectedly degraded: {:?}",
+        result.processing_warnings
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires layout model files and CoreML"]
+fn test_explicit_coreml_layout_failure_emits_processing_warning() {
+    if !test_documents_available() {
+        return;
+    }
+
+    let config = ExtractionConfig {
+        output_format: OutputFormat::Markdown,
+        disable_ocr: true,
+        layout: Some(accelerated_layout(ExecutionProviderType::CoreMl)),
+        use_layout_for_markdown: true,
+        ..Default::default()
+    };
+    let path = get_test_file_path("pdf/tiny.pdf");
+    let result =
+        extract_uri_document_blocking(&path, None, &config).expect("extraction should soft-fail to native text");
 
     assert!(
-        layout_h > baseline_h,
-        "use_layout_for_markdown=true must add at least one heading vs baseline.\n\
-         baseline_headings = {}, layout_headings = {}\n\
-         If these are equal, layout detections are not flowing into \
-         apply_layout_overrides. Check pdf/mod.rs:169 (`layout_hints` should \
-         not be hardcoded `None`) and the pixel→PDF coord-space conversion in \
-         extractors/pdf/layout_hints.rs.",
-        baseline_h,
-        layout_h
+        has_layout_failure_warning(&result.processing_warnings),
+        "expected a caller-visible layout warning, got {:?}",
+        result.processing_warnings
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "ocr"))]
+#[test]
+#[ignore = "requires layout model files, CoreML, and Tesseract"]
+fn test_explicit_coreml_ocr_layout_failure_emits_processing_warning() {
+    if !test_documents_available() {
+        return;
+    }
+
+    let config = ExtractionConfig {
+        force_ocr: true,
+        layout: Some(accelerated_layout(ExecutionProviderType::CoreMl)),
+        ..Default::default()
+    };
+    let path = get_test_file_path("pdf/tiny.pdf");
+    let result = extract_uri_document_blocking(&path, None, &config).expect("OCR should continue without layout");
+
+    assert!(
+        has_layout_failure_warning(&result.processing_warnings),
+        "expected a caller-visible OCR layout warning, got {:?}",
+        result.processing_warnings
     );
 }
 
@@ -168,7 +257,6 @@ fn test_use_layout_for_markdown_without_layout_config_is_noop() {
     let pdf = "pdf/google_doc_document.pdf";
     let baseline = extract_md(pdf, &baseline_config());
 
-    // use_layout_for_markdown=true but layout=None → runner must skip silently.
     let noop_config = ExtractionConfig {
         output_format: OutputFormat::Markdown,
         layout: None,
@@ -187,9 +275,6 @@ fn test_use_layout_for_markdown_without_layout_config_is_noop() {
 /// The field must be a no-op when the entire document is OCR'd.
 #[test]
 fn test_use_layout_for_markdown_skipped_when_force_ocr() {
-    // We can't easily run OCR in unit tests without a backend registered,
-    // but we CAN verify the config combination doesn't panic or error.
-    // The actual gate is tested via the `maybe_run_layout_for_markdown` guard.
     let config = ExtractionConfig {
         output_format: OutputFormat::Markdown,
         layout: Some(LayoutDetectionConfig::default()),
@@ -197,7 +282,6 @@ fn test_use_layout_for_markdown_skipped_when_force_ocr() {
         force_ocr: true,
         ..Default::default()
     };
-    // Config construction must succeed and the field values must be set correctly.
     assert!(config.use_layout_for_markdown);
     assert!(config.force_ocr);
     assert!(config.layout.is_some());

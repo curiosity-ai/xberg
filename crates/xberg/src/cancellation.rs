@@ -50,7 +50,13 @@ impl CancellationToken {
     ///
     /// All clones of this token will observe [`is_cancelled`] returning `true`
     /// on their next check. This operation is idempotent.
-    #[cfg(any(feature = "tokio-runtime", test))]
+    ///
+    /// Gated `not(target_arch = "wasm32")` to match the only call sites
+    /// (`run_timed_extraction` in `batch.rs`, the timeout block in `bytes.rs`):
+    /// `tokio-runtime` is enabled transitively on wasm32 via `layout-tract`
+    /// inside `wasm-target`, so gating on the feature alone leaves this method
+    /// compiled-but-uncalled (dead code) on that target.
+    #[cfg(any(all(feature = "tokio-runtime", not(target_arch = "wasm32")), test))]
     #[inline]
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
@@ -68,9 +74,6 @@ impl Serialize for CancellationToken {
     where
         S: Serializer,
     {
-        // Serialize the current cancellation state.
-        // Note: This is a snapshot at serialization time; deserialized tokens
-        // are independent of the original token's future state.
         let state = self.is_cancelled();
         state.serialize(serializer)
     }
@@ -81,7 +84,6 @@ impl<'de> Deserialize<'de> for CancellationToken {
     where
         D: Deserializer<'de>,
     {
-        // Deserialize the cancellation state into a new token.
         let cancelled = bool::deserialize(deserializer)?;
         Ok(CancellationToken {
             cancelled: Arc::new(AtomicBool::new(cancelled)),

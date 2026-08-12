@@ -139,7 +139,6 @@ pub fn field_precision_recall_f1(predicted: &Value, ground_truth: &Value) -> Met
     let mut fp = 0usize;
     let mut fn_count = 0usize;
 
-    // True positives and false positives
     for (path, pred_val) in &pred_leaves {
         if let Some(gt_val) = gt_leaves.get(path) {
             if pred_val == gt_val {
@@ -152,11 +151,18 @@ pub fn field_precision_recall_f1(predicted: &Value, ground_truth: &Value) -> Met
         }
     }
 
-    // False negatives
     for path in gt_leaves.keys() {
         if !pred_leaves.contains_key(path) {
             fn_count += 1;
         }
+    }
+
+    if tp + fp == 0 && tp + fn_count == 0 {
+        return Metrics {
+            precision: 1.0,
+            recall: 1.0,
+            f1: 1.0,
+        };
     }
 
     let precision = if tp + fp == 0 {
@@ -249,11 +255,10 @@ pub fn numeric_match(predicted: &Value, ground_truth: &Value, tolerance: &Numeri
 
     match (pred_num, gt_num) {
         (Some(p), Some(g)) => {
+            if g == 0.0 {
+                return p == 0.0;
+            }
             let percent_diff = ((p - g).abs() / g.abs()).min(1.0);
-            // Values >= 1.0 are treated as currency-scale (prices, totals, counts),
-            // letting the looser currency_percent govern. Sub-unit decimals stick
-            // with the tighter decimal_percent budget. When the two tolerances are
-            // identical (Default::default), the choice is a no-op.
             let effective = if g.abs() >= 1.0 {
                 tolerance.currency_percent.max(tolerance.decimal_percent)
             } else {
@@ -269,8 +274,6 @@ pub fn numeric_match(predicted: &Value, ground_truth: &Value, tolerance: &Numeri
 pub fn exact_match(predicted: &Value, ground_truth: &Value) -> bool {
     predicted == ground_truth
 }
-
-// ── Normalized helpers ────────────────────────────────────────────────────────
 
 /// Normalize a string for comparison: trim whitespace, lowercase, collapse runs of
 /// internal whitespace to a single space.
@@ -293,7 +296,6 @@ fn values_match_normalized(pred: &Value, gt: &Value, tol: &NumericTolerance) -> 
             if pn == gn {
                 return true;
             }
-            // Both parse as f64? Fall back to numeric tolerance.
             if let (Ok(pf), Ok(gf)) = (pn.parse::<f64>(), gn.parse::<f64>()) {
                 let pred_num =
                     Value::Number(serde_json::Number::from_f64(pf).unwrap_or_else(|| serde_json::Number::from(0)));
@@ -303,7 +305,6 @@ fn values_match_normalized(pred: &Value, gt: &Value, tol: &NumericTolerance) -> 
             }
             false
         }
-        // One is a number, the other is a string representation of a number.
         (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
             let sn = normalize_string(s);
             if let (Some(nf), Ok(sf)) = (n.as_f64(), sn.parse::<f64>()) {
@@ -348,7 +349,6 @@ pub fn field_precision_recall_f1_normalized(
     let mut fp = 0usize;
     let mut fn_count = 0usize;
 
-    // True positives and false positives
     for (path, pred_val) in &pred_leaves {
         if let Some(gt_val) = gt_leaves.get(path) {
             if values_match_normalized(pred_val, gt_val, tol) {
@@ -361,11 +361,18 @@ pub fn field_precision_recall_f1_normalized(
         }
     }
 
-    // False negatives (paths only in GT)
     for path in gt_leaves.keys() {
         if !pred_leaves.contains_key(path) {
             fn_count += 1;
         }
+    }
+
+    if tp + fp == 0 && tp + fn_count == 0 {
+        return Metrics {
+            precision: 1.0,
+            recall: 1.0,
+            f1: 1.0,
+        };
     }
 
     let precision = if tp + fp == 0 {
@@ -415,13 +422,10 @@ pub fn flatten_form_fields(fields: &[xberg::PdfFormField]) -> Value {
     Value::Object(map)
 }
 
-// ── LaTeX token F1 ───────────────────────────────────────────────────────────
-
 /// Normalize a single LaTeX string for token-level comparison:
 /// strip surrounding `$` / `$$` delimiters, collapse whitespace.
 fn normalize_latex(s: &str) -> String {
     let s = s.trim();
-    // Strip `$$...$$` then `$...$`
     let s = s.strip_prefix("$$").and_then(|s| s.strip_suffix("$$")).unwrap_or(s);
     let s = s.strip_prefix('$').and_then(|s| s.strip_suffix('$')).unwrap_or(s);
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -462,7 +466,6 @@ pub fn latex_token_f1(extracted: &[String], gt: &[String]) -> Metrics {
         };
     }
 
-    // Build multiset counts
     let mut pred_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut gt_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for t in &pred_tokens {
@@ -472,7 +475,6 @@ pub fn latex_token_f1(extracted: &[String], gt: &[String]) -> Metrics {
         *gt_counts.entry(t.as_str()).or_insert(0) += 1;
     }
 
-    // Multiset intersection: min(pred_count, gt_count) for each token
     let intersection: usize = gt_counts
         .iter()
         .map(|(tok, &gc)| {
@@ -525,10 +527,7 @@ mod tests {
             "required": ["name"]
         });
 
-        let predictions = vec![
-            json!({"name": "Alice"}),
-            json!({"age": 30}), // missing required field
-        ];
+        let predictions = vec![json!({"name": "Alice"}), json!({"age": 30})];
 
         let rate = schema_validity_rate(&predictions, &schema);
         assert!(rate > 0.0 && rate < 1.0);
@@ -630,7 +629,7 @@ mod tests {
     fn test_type_correctness_rate_mixed() {
         let pred = json!({
             "name": "Alice",
-            "age": "30" // wrong type: string instead of number
+            "age": "30"
         });
 
         let gt = json!({
@@ -650,7 +649,7 @@ mod tests {
         let gt = json!(100.0);
 
         let result = numeric_match(&pred, &gt, &tol);
-        assert!(result); // 1% difference is within default tolerance
+        assert!(result);
     }
 
     #[test]
@@ -661,13 +660,13 @@ mod tests {
         let gt = json!(100.0);
 
         let result = numeric_match(&pred, &gt, &tol);
-        assert!(!result); // 50% difference exceeds tolerance
+        assert!(!result);
     }
 
     #[test]
     fn test_numeric_match_currency() {
         let tol = NumericTolerance {
-            currency_percent: 0.02, // 2% tolerance for currency
+            currency_percent: 0.02,
             decimal_percent: 0.01,
         };
 
@@ -706,11 +705,8 @@ mod tests {
         assert!(!exact_match(&a, &b));
     }
 
-    // ── Normalized field P/R/F1 tests ─────────────────────────────────────────
-
     #[test]
     fn test_normalized_string_case_fold() {
-        // "ALICE" vs "alice" — should match after normalization
         let pred = json!({ "name": "ALICE" });
         let gt = json!({ "name": "alice" });
         let tol = NumericTolerance::default();
@@ -729,7 +725,6 @@ mod tests {
 
     #[test]
     fn test_normalized_numeric_as_string() {
-        // GT stores number as quoted string "60.000", pred has JSON number 60.0
         let pred = json!({ "amount": 60.0 });
         let gt = json!({ "amount": "60.000" });
         let tol = NumericTolerance::default();
@@ -739,7 +734,6 @@ mod tests {
 
     #[test]
     fn test_normalized_strict_fallback_for_non_numeric_strings() {
-        // "foo" vs "bar" — no numeric parse possible, must not match
         let pred = json!({ "label": "foo" });
         let gt = json!({ "label": "bar" });
         let tol = NumericTolerance::default();
@@ -755,8 +749,6 @@ mod tests {
         let m = field_precision_recall_f1_normalized(&pred, &gt, &tol);
         assert_eq!(m.f1, 1.0);
     }
-
-    // ── flatten_form_fields tests ─────────────────────────────────────────────
 
     #[test]
     fn test_flatten_form_fields_uses_full_name_and_value() {
@@ -834,8 +826,6 @@ mod tests {
         assert_eq!(flat["solo"], Value::String("v".to_string()));
     }
 
-    // ── latex_token_f1 tests ──────────────────────────────────────────────────
-
     #[test]
     fn test_latex_token_f1_perfect_match() {
         let extracted = vec!["E = mc^2".to_string()];
@@ -846,7 +836,6 @@ mod tests {
 
     #[test]
     fn test_latex_token_f1_strips_dollar_delimiters() {
-        // Both have `$$` wrappers — tokens should be the same after stripping
         let extracted = vec!["$$E = mc^2$$".to_string()];
         let gt = vec!["E = mc^2".to_string()];
         let m = latex_token_f1(&extracted, &gt);
@@ -858,8 +847,6 @@ mod tests {
         let extracted = vec!["a b c".to_string()];
         let gt = vec!["a b d".to_string()];
         let m = latex_token_f1(&extracted, &gt);
-        // intersection = {a, b}, pred_len = 3, gt_len = 3
-        // precision = 2/3, recall = 2/3, f1 = 2/3
         let expected_f1 = 2.0 / 3.0;
         assert!(
             (m.f1 - expected_f1).abs() < 1e-9,
@@ -880,5 +867,133 @@ mod tests {
         let gt = vec!["x^2".to_string()];
         let m = latex_token_f1(&[], &gt);
         assert_eq!(m.f1, 0.0);
+    }
+
+    #[test]
+    fn test_numeric_match_zero_vs_zero_is_a_match() {
+        let tol = NumericTolerance::default();
+        let pred = json!(0.0);
+        let gt = json!(0.0);
+        let result = numeric_match(&pred, &gt, &tol);
+        assert!(result, "0.0 vs 0.0 must be a match, not a NaN-driven mismatch");
+    }
+
+    #[test]
+    fn test_numeric_match_zero_vs_nonzero_is_a_mismatch() {
+        let tol = NumericTolerance::default();
+        let pred = json!(0.0);
+        let gt = json!(0.5);
+        let result = numeric_match(&pred, &gt, &tol);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_numeric_match_equal_hundreds() {
+        let tol = NumericTolerance::default();
+        let pred = json!(100.0);
+        let gt = json!(100.0);
+        let result = numeric_match(&pred, &gt, &tol);
+        assert!(result);
+    }
+
+    #[test]
+    fn test_numeric_match_beyond_tolerance_is_a_mismatch() {
+        let tol = NumericTolerance::default();
+        let pred = json!(106.0);
+        let gt = json!(100.0);
+        let result = numeric_match(&pred, &gt, &tol);
+        assert!(!result, "6% diff exceeds default 1% tolerance");
+    }
+
+    #[test]
+    fn test_numeric_match_no_nan_across_boundary_cases() {
+        let tol = NumericTolerance::default();
+        let cases: [(f64, f64, bool); 4] = [
+            (0.0, 0.0, true),
+            (0.0, 0.5, false),
+            (100.0, 100.0, true),
+            (100.0, 106.0, false),
+        ];
+        for (p, g, expected) in cases {
+            let result = numeric_match(&json!(p), &json!(g), &tol);
+            assert_eq!(result, expected, "numeric_match({p}, {g}) mismatch");
+        }
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_both_empty_is_vacuous_match() {
+        let pred = json!({});
+        let gt = json!({});
+        let m = field_precision_recall_f1(&pred, &gt);
+        assert_eq!(m.precision, 1.0);
+        assert_eq!(m.recall, 1.0);
+        assert_eq!(m.f1, 1.0, "both-empty JSON must be a vacuous match, not F1=0.0");
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_empty_pred_vs_nonempty_gt_is_zero() {
+        let pred = json!({});
+        let gt = json!({ "name": "Alice" });
+        let m = field_precision_recall_f1(&pred, &gt);
+        assert_eq!(m.f1, 0.0);
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_nonempty_pred_vs_empty_gt_is_zero() {
+        let pred = json!({ "name": "Alice" });
+        let gt = json!({});
+        let m = field_precision_recall_f1(&pred, &gt);
+        assert_eq!(m.f1, 0.0);
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_partial_overlap_exact_value() {
+        let pred = json!({ "a": 1, "b": 2, "c": 3 });
+        let gt = json!({ "a": 1, "b": 99, "d": 4 });
+        // tp=1 (a), fp=2 (b mismatched, c extra), fn=1 (d missing)
+        let m = field_precision_recall_f1(&pred, &gt);
+        assert_eq!(m.precision, 1.0 / 3.0);
+        assert_eq!(m.recall, 0.5);
+        assert!((m.f1 - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_normalized_both_empty_is_vacuous_match() {
+        let pred = json!({});
+        let gt = json!({});
+        let tol = NumericTolerance::default();
+        let m = field_precision_recall_f1_normalized(&pred, &gt, &tol);
+        assert_eq!(m.precision, 1.0);
+        assert_eq!(m.recall, 1.0);
+        assert_eq!(m.f1, 1.0, "both-empty JSON must be a vacuous match, not F1=0.0");
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_normalized_empty_pred_vs_nonempty_gt_is_zero() {
+        let pred = json!({});
+        let gt = json!({ "name": "Alice" });
+        let tol = NumericTolerance::default();
+        let m = field_precision_recall_f1_normalized(&pred, &gt, &tol);
+        assert_eq!(m.f1, 0.0);
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_normalized_nonempty_pred_vs_empty_gt_is_zero() {
+        let pred = json!({ "name": "Alice" });
+        let gt = json!({});
+        let tol = NumericTolerance::default();
+        let m = field_precision_recall_f1_normalized(&pred, &gt, &tol);
+        assert_eq!(m.f1, 0.0);
+    }
+
+    #[test]
+    fn test_field_precision_recall_f1_normalized_partial_overlap_exact_value() {
+        let pred = json!({ "a": 1, "b": 2, "c": 3 });
+        let gt = json!({ "a": 1, "b": 99, "d": 4 });
+        let tol = NumericTolerance::default();
+        let m = field_precision_recall_f1_normalized(&pred, &gt, &tol);
+        assert_eq!(m.precision, 1.0 / 3.0);
+        assert_eq!(m.recall, 0.5);
+        assert!((m.f1 - 0.4).abs() < 1e-12);
     }
 }

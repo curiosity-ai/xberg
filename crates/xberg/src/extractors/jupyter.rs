@@ -7,39 +7,55 @@
 //! - Cell outputs (text, HTML, images)
 //! - Cell metadata (execution_count, tags)
 //!
-//! Requires the `office` feature.
+//! Requires the `notebook` feature.
 
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use crate::Result;
-#[cfg(feature = "office")]
-use crate::core::config::ExtractionConfig;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
+use crate::core::config::{ExtractionConfig, JupyterCellRendering};
+#[cfg(feature = "notebook")]
 use crate::extractors::security::SecurityBudget;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use crate::plugins::{InternalDocumentExtractor, Plugin};
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
+use crate::types::ProcessingWarning;
+#[cfg(feature = "notebook")]
 use crate::types::internal::InternalDocument;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use crate::types::internal_builder::InternalDocumentBuilder;
-#[cfg(feature = "office")]
-use crate::types::uri::ExtractedUri;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use crate::types::{ExtractedImage, Metadata};
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use ahash::AHashMap;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use async_trait::async_trait;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use base64::Engine;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use bytes::Bytes;
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use serde_json::{Value, json};
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 use std::borrow::Cow;
 
-#[cfg(feature = "office")]
-type NotebookContent = (String, AHashMap<Cow<'static, str>, Value>, Vec<ExtractedImage>, Value);
+#[cfg(feature = "notebook")]
+type NotebookContent = (
+    String,
+    AHashMap<Cow<'static, str>, Value>,
+    Vec<ExtractedImage>,
+    Value,
+    Vec<ProcessingWarning>,
+    Vec<ExtractedImage>,
+);
+
+/// Image MIME types recognized in output `data` bundles and cell
+/// `attachments`, in the order they are checked. Raster formats are listed
+/// first (matching the pre-#160 behavior for outputs), with `image/svg+xml`
+/// appended last since it requires different handling (raw markup rather
+/// than base64-decoded raster bytes) for outputs, though attachments always
+/// decode base64 regardless of mimetype.
+#[cfg(feature = "notebook")]
+const SUPPORTED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"];
 
 /// Jupyter Notebook extractor.
 ///
@@ -49,10 +65,23 @@ type NotebookContent = (String, AHashMap<Cow<'static, str>, Value>, Vec<Extracte
 /// - Cell outputs (text, HTML, etc.)
 /// - Cell-level metadata (tags, execution counts)
 #[cfg_attr(alef, alef(skip))]
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 pub struct JupyterExtractor;
 
-#[cfg(feature = "office")]
+/// One output's richest text-bearing representation, tagged with how it
+/// must be rendered.
+#[cfg(feature = "notebook")]
+enum OutputRepresentation {
+    /// Raw HTML markup. Must be emitted verbatim (not as a normal
+    /// paragraph) because backslash-escaping markdown special characters
+    /// (as paragraph rendering does) would corrupt the tags.
+    RawHtml(String),
+    /// Plain prose, from `text/markdown` or `text/plain`. Rendered as an
+    /// ordinary paragraph, subject to the document's usual escaping.
+    Text(String),
+}
+
+#[cfg(feature = "notebook")]
 impl JupyterExtractor {
     /// Create a new Jupyter extractor.
     pub(crate) fn new() -> Self {
@@ -67,6 +96,8 @@ impl JupyterExtractor {
         let mut extracted_content = String::new();
         let mut metadata = AHashMap::new();
         let mut images = Vec::new();
+        let mut attachment_images = Vec::new();
+        let mut warnings = Vec::new();
 
         if let Some(notebook_metadata) = notebook.get("metadata").and_then(|m| m.as_object()) {
             if let Some(kernelspec) = notebook_metadata.get("kernelspec") {
@@ -74,10 +105,8 @@ impl JupyterExtractor {
             }
 
             if let Some(language_info) = notebook_metadata.get("language_info") {
-                // Store the full language_info object
                 metadata.insert(Cow::Borrowed("language_info"), language_info.clone());
 
-                // Extract individual fields for convenience
                 if let Some(obj) = language_info.as_object() {
                     if let Some(name) = obj.get("name") {
                         metadata.insert(Cow::Borrowed("language_name"), name.clone());
@@ -99,7 +128,6 @@ impl JupyterExtractor {
             metadata.insert(Cow::Borrowed("nbformat_minor"), nbformat_minor.clone());
         }
 
-        // Count cells by type
         if let Some(cells) = notebook.get("cells").and_then(|c| c.as_array()) {
             metadata.insert(Cow::Borrowed("cell_count"), json!(cells.len()));
         }
@@ -107,32 +135,155 @@ impl JupyterExtractor {
         if let Some(cells) = notebook.get("cells").and_then(|c| c.as_array()) {
             let mut cells_meta: Vec<Value> = Vec::with_capacity(cells.len());
             for (cell_idx, cell) in cells.iter().enumerate() {
-                let cell_type = cell.get("cell_type").and_then(|t| t.as_str()).unwrap_or("unknown");
-                let mut cell_entry = serde_json::Map::new();
-                cell_entry.insert("index".into(), json!(cell_idx));
-                cell_entry.insert("cell_type".into(), json!(cell_type));
-
-                if cell_type == "code"
-                    && let Some(exec_count) = cell.get("execution_count")
-                {
-                    cell_entry.insert("execution_count".into(), exec_count.clone());
-                }
-                if let Some(tags) = cell
-                    .get("metadata")
-                    .and_then(|m| m.get("tags"))
-                    .and_then(|t| t.as_array())
-                    && !tags.is_empty()
-                {
-                    cell_entry.insert("tags".into(), Value::Array(tags.clone()));
-                }
-                cells_meta.push(Value::Object(cell_entry));
+                cells_meta.push(Self::cell_metadata(cell, cell_idx));
 
                 Self::extract_cell(cell, cell_idx, &mut extracted_content, &mut images, plain)?;
+                Self::extract_cell_attachments(cell, cell_idx, &mut attachment_images, &mut warnings);
             }
             metadata.insert(Cow::Borrowed("cells"), json!(cells_meta));
         }
 
-        Ok((extracted_content, metadata, images, notebook))
+        Ok((
+            extracted_content,
+            metadata,
+            images,
+            notebook,
+            warnings,
+            attachment_images,
+        ))
+    }
+
+    /// Extract a markdown/raw cell's `attachments` map into `images`.
+    ///
+    /// Per nbformat, `attachments` is a map of filename -> {mimetype: base64
+    /// data}, referenced from cell source via `attachment:<filename>` URIs.
+    /// Only markdown and raw cells carry this field. Each attachment is
+    /// expected to carry exactly one mimetype; if none of the mimetypes on
+    /// an attachment are a supported image type, a `ProcessingWarning`
+    /// naming the attachment file is recorded instead of silently dropping
+    /// it.
+    fn extract_cell_attachments(
+        cell: &Value,
+        cell_idx: usize,
+        images: &mut Vec<ExtractedImage>,
+        warnings: &mut Vec<ProcessingWarning>,
+    ) {
+        let Some(attachments) = cell.get("attachments").and_then(|a| a.as_object()) else {
+            return;
+        };
+
+        for (filename, mime_map) in attachments {
+            let Some(mime_map) = mime_map.as_object() else {
+                continue;
+            };
+
+            let supported = SUPPORTED_IMAGE_MIME_TYPES
+                .iter()
+                .find_map(|mime_type| mime_map.get(*mime_type).map(|value| (*mime_type, value)));
+
+            let Some((mime_type, value)) = supported else {
+                warnings.push(ProcessingWarning {
+                    source: Cow::Borrowed("jupyter"),
+                    message: Cow::Owned(format!(
+                        "Cell {} attachment '{}' has no supported image MIME type; skipped",
+                        cell_idx, filename
+                    )),
+                });
+                continue;
+            };
+
+            let base64_str = Self::extract_source(value);
+            let cleaned = base64_str.replace(['\n', '\r'], "");
+            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&cleaned) else {
+                warnings.push(ProcessingWarning {
+                    source: Cow::Borrowed("jupyter"),
+                    message: Cow::Owned(format!(
+                        "Cell {} attachment '{}' could not be base64-decoded; skipped",
+                        cell_idx, filename
+                    )),
+                });
+                continue;
+            };
+
+            let format = mime_type.trim_start_matches("image/").replace("svg+xml", "svg");
+            let (image_kind, kind_confidence) =
+                crate::extraction::image_kind::classify(&decoded, &format, None, None, None, None, false);
+
+            images.push(ExtractedImage {
+                data: Bytes::from(decoded),
+                format: Cow::Owned(format),
+                image_index: images.len() as u32,
+                page_number: Some((cell_idx + 1) as u32),
+                width: None,
+                height: None,
+                colorspace: None,
+                bits_per_component: None,
+                is_mask: false,
+                description: Some(format!("Notebook cell {} attachment: {}", cell_idx, filename)),
+                ocr_result: None,
+                bounding_box: None,
+                source_path: None,
+                image_kind: Some(image_kind),
+                kind_confidence: Some(kind_confidence),
+                cluster_id: None,
+                caption: None,
+                qr_codes: None,
+                data_base64: None,
+            });
+        }
+    }
+
+    fn cell_metadata(cell: &Value, cell_idx: usize) -> Value {
+        let cell_type = cell
+            .get("cell_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("index".into(), json!(cell_idx));
+        metadata.insert("cell_type".into(), json!(cell_type));
+
+        for key in ["id", "execution_count"] {
+            if let Some(value) = cell.get(key) {
+                metadata.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(tags) = cell
+            .get("metadata")
+            .and_then(|value| value.get("tags"))
+            .and_then(|value| value.as_array())
+            && !tags.is_empty()
+        {
+            metadata.insert("tags".into(), Value::Array(tags.clone()));
+        }
+        if let Some(outputs) = cell.get("outputs").and_then(|value| value.as_array())
+            && !outputs.is_empty()
+        {
+            metadata.insert(
+                "outputs".into(),
+                Value::Array(outputs.iter().enumerate().map(Self::output_metadata).collect()),
+            );
+        }
+
+        Value::Object(metadata)
+    }
+
+    fn output_metadata((output_idx, output): (usize, &Value)) -> Value {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("index".into(), json!(output_idx));
+        if let Some(output_type) = output.get("output_type") {
+            metadata.insert("output_type".into(), output_type.clone());
+        }
+        for key in ["name", "execution_count", "ename", "evalue"] {
+            if let Some(value) = output.get(key) {
+                metadata.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(data) = output.get("data").and_then(|value| value.as_object()) {
+            let mut mime_types: Vec<&str> = data.keys().map(String::as_str).collect();
+            mime_types.sort_unstable();
+            metadata.insert("mime_types".into(), json!(mime_types));
+        }
+        Value::Object(metadata)
     }
 
     /// Extract content from a single cell.
@@ -152,7 +303,6 @@ impl JupyterExtractor {
             _ => {}
         }
 
-        // Separate cells with a blank line
         if !content.ends_with('\n') {
             content.push('\n');
         }
@@ -226,7 +376,7 @@ impl JupyterExtractor {
 
         match output_type {
             "stream" => Self::extract_stream_output(output, content)?,
-            "execute_result" | "display_data" => {
+            "execute_result" | "display_data" | "update_display_data" => {
                 Self::extract_data_output(output, cell_idx, content, images, plain)?;
             }
             "error" => Self::extract_error_output(output, content)?,
@@ -258,7 +408,6 @@ impl JupyterExtractor {
         plain_mode: bool,
     ) -> Result<()> {
         if let Some(data) = output.get("data").and_then(|d| d.as_object()) {
-            // Prefer text/plain first - it has the most readable tokens for quality scoring
             if let Some(plain) = data.get("text/plain") {
                 let text = Self::extract_source(plain);
                 if !text.is_empty() {
@@ -269,9 +418,6 @@ impl JupyterExtractor {
                 }
             }
 
-            // Also include markdown/HTML content — these often contain richer
-            // semantic information than text/plain (e.g. descriptive fallback text).
-            // Skip these for plain text output mode.
             if !plain_mode {
                 for mime_type in &["text/markdown", "text/html"] {
                     if let Some(mime_content) = data.get(*mime_type) {
@@ -286,7 +432,6 @@ impl JupyterExtractor {
                 }
             }
 
-            // For raster image types, extract actual base64-encoded image data
             for mime_type in &["image/png", "image/jpeg", "image/gif", "image/webp"] {
                 if let Some(image_value) = data.get(*mime_type) {
                     let base64_str = Self::extract_source(image_value);
@@ -300,7 +445,6 @@ impl JupyterExtractor {
                             _ => "unknown",
                         };
 
-                        // Classify image based on metadata and visual properties
                         let (image_kind, kind_confidence) =
                             crate::extraction::image_kind::classify(&decoded, format, None, None, None, None, false);
 
@@ -330,12 +474,38 @@ impl JupyterExtractor {
                 }
             }
 
-            // Handle SVG as text (not a raster image for OCR)
-            if data.contains_key("image/svg+xml") {
-                content.push_str("[Image: image/svg+xml]\n");
+            if let Some(svg_value) = data.get("image/svg+xml") {
+                let svg_markup = Self::extract_source(svg_value);
+                if !svg_markup.is_empty() {
+                    let svg_bytes = svg_markup.into_bytes();
+                    let (image_kind, kind_confidence) =
+                        crate::extraction::image_kind::classify(&svg_bytes, "svg", None, None, None, None, false);
+
+                    images.push(ExtractedImage {
+                        data: Bytes::from(svg_bytes),
+                        format: Cow::Borrowed("svg"),
+                        image_index: images.len() as u32,
+                        page_number: Some((cell_idx + 1) as u32),
+                        width: None,
+                        height: None,
+                        colorspace: None,
+                        bits_per_component: None,
+                        is_mask: false,
+                        description: Some(format!("Notebook cell {} output", cell_idx)),
+                        ocr_result: None,
+                        bounding_box: None,
+                        source_path: None,
+                        image_kind: Some(image_kind),
+                        kind_confidence: Some(kind_confidence),
+                        cluster_id: None,
+                        caption: None,
+                        qr_codes: None,
+                        data_base64: None,
+                    });
+                    content.push_str("[Image: image/svg+xml]\n");
+                }
             }
 
-            // Include JSON output as structured data
             if let Some(json_content) = data.get("application/json")
                 && let Ok(formatted) = serde_json::to_string_pretty(json_content)
             {
@@ -347,215 +517,113 @@ impl JupyterExtractor {
         Ok(())
     }
 
-    /// Scan markdown text for inline formatting patterns and produce
-    /// stripped text with annotations.
+    /// Push the richest text-bearing representation of a single output onto
+    /// `builder` as one element, or push nothing if the output carries none.
     ///
-    /// Recognizes: `**bold**`, `*italic*`, `` `code` ``
-    fn scan_markdown_inline(text: &str) -> (String, Vec<crate::types::TextAnnotation>) {
-        use crate::types::TextAnnotation;
-        use crate::types::document_structure::AnnotationKind;
-
-        let mut out = String::with_capacity(text.len());
-        let mut annotations = Vec::new();
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-
-        while i < len {
-            if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-                // Bold: **...**
-                if let Some(end) = Self::find_closing(bytes, i + 2, b"**") {
-                    let inner = &text[i + 2..end];
-                    let start = out.len() as u32;
-                    out.push_str(inner);
-                    let ann_end = out.len() as u32;
-                    annotations.push(TextAnnotation {
-                        start,
-                        end: ann_end,
-                        kind: AnnotationKind::Bold,
-                    });
-                    i = end + 2;
-                    continue;
-                }
-            }
-
-            if bytes[i] == b'*' && (i == 0 || bytes[i - 1] != b'*') {
-                // Italic: *...*  (but not **)
-                if i + 1 < len
-                    && bytes[i + 1] != b'*'
-                    && let Some(end) = Self::find_closing_single_star(bytes, i + 1)
-                {
-                    let inner = &text[i + 1..end];
-                    let start = out.len() as u32;
-                    out.push_str(inner);
-                    let ann_end = out.len() as u32;
-                    annotations.push(TextAnnotation {
-                        start,
-                        end: ann_end,
-                        kind: AnnotationKind::Italic,
-                    });
-                    i = end + 1;
-                    continue;
-                }
-            }
-
-            if bytes[i] == b'`' && (i + 1 >= len || bytes[i + 1] != b'`') {
-                // Inline code: `...`
-                if let Some(end) = Self::find_closing_byte(bytes, i + 1, b'`') {
-                    let inner = &text[i + 1..end];
-                    let start = out.len() as u32;
-                    out.push_str(inner);
-                    let ann_end = out.len() as u32;
-                    annotations.push(TextAnnotation {
-                        start,
-                        end: ann_end,
-                        kind: AnnotationKind::Code,
-                    });
-                    i = end + 1;
-                    continue;
-                }
-            }
-
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-
-        (out, annotations)
-    }
-
-    /// Find position of a two-byte closing delimiter (e.g. `**`).
-    fn find_closing(bytes: &[u8], start: usize, delim: &[u8; 2]) -> Option<usize> {
-        let mut i = start;
-        while i + 1 < bytes.len() {
-            if bytes[i] == delim[0] && bytes[i + 1] == delim[1] {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
-    }
-
-    /// Find position of a closing single `*` that is not followed by another `*`.
-    fn find_closing_single_star(bytes: &[u8], start: usize) -> Option<usize> {
-        let mut i = start;
-        while i < bytes.len() {
-            if bytes[i] == b'*' && (i + 1 >= bytes.len() || bytes[i + 1] != b'*') {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
-    }
-
-    /// Find position of a closing single byte delimiter.
-    fn find_closing_byte(bytes: &[u8], start: usize, delim: u8) -> Option<usize> {
-        bytes[start..].iter().position(|&b| b == delim).map(|p| start + p)
-    }
-
-    /// Extract markdown-style links from text and return as URIs.
+    /// Precedence for `execute_result`/`display_data`/`update_display_data`,
+    /// most to least rich (unless `plain` restricts output to plain text, in
+    /// which case only `text/plain` is considered):
+    /// 1. `text/html` — carries the most structure/semantics; some outputs
+    ///    (e.g. a bare `display(HTML(...))` call) have *only* this
+    ///    representation, so it must not be skipped in favor of a
+    ///    less-structured one that happens to also be present.
+    /// 2. `text/markdown` — less structure than HTML but more than plain text.
+    /// 3. `text/plain` — always available as a fallback for reprs that only
+    ///    implement `__repr__`.
     ///
-    /// Uses pulldown-cmark for robust parsing instead of hand-rolled byte scanning.
-    /// Recognizes both `[text](url)` hyperlinks and `![alt](url)` image links.
-    fn extract_markdown_links(text: &str) -> Vec<ExtractedUri> {
-        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-
-        let parser = Parser::new(text);
-        let mut uris = Vec::new();
-        let mut current_text = String::new();
-        let mut current_url: Option<String> = None;
-        let mut in_link = false;
-        let mut in_image = false;
-
-        for event in parser {
-            match event {
-                Event::Start(Tag::Link { dest_url, .. }) => {
-                    in_link = true;
-                    current_text.clear();
-                    current_url = Some(dest_url.into_string());
-                }
-                Event::Start(Tag::Image { dest_url, .. }) => {
-                    in_image = true;
-                    current_text.clear();
-                    current_url = Some(dest_url.into_string());
-                }
-                Event::Text(text) if in_link || in_image => {
-                    current_text.push_str(&text);
-                }
-                Event::End(TagEnd::Link) => {
-                    if let Some(url) = current_url.take()
-                        && !url.is_empty()
-                    {
-                        let label_opt = if current_text.is_empty() {
-                            None
-                        } else {
-                            Some(current_text.clone())
-                        };
-                        uris.push(ExtractedUri::hyperlink(&url, label_opt));
-                    }
-                    in_link = false;
-                    current_text.clear();
-                }
-                Event::End(TagEnd::Image) => {
-                    if let Some(url) = current_url.take()
-                        && !url.is_empty()
-                    {
-                        let label_opt = if current_text.is_empty() {
-                            None
-                        } else {
-                            Some(current_text.clone())
-                        };
-                        uris.push(ExtractedUri::image(&url, label_opt));
-                    }
-                    in_image = false;
-                    current_text.clear();
-                }
-                _ => {}
-            }
-        }
-
-        uris
-    }
-
-    /// Detect an ATX heading line (`# …`, `## …`, etc.) and return level + text.
-    fn parse_heading_line(line: &str) -> Option<(u8, &str)> {
-        let trimmed = line.trim_start();
-        let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-        if hashes == 0 || hashes > 6 {
-            return None;
-        }
-        let rest = &trimmed[hashes..];
-        // ATX heading requires a space (or end-of-line) after the hashes
-        if !rest.is_empty() && !rest.starts_with(' ') {
-            return None;
-        }
-        Some((hashes as u8, rest.trim()))
-    }
-
-    /// Collect `text/plain` content from a single notebook output object.
-    fn collect_output_text(output: &Value) -> String {
-        let mut text = String::new();
-
+    /// `stream` outputs use their `text` field directly. `error` outputs
+    /// render the exception name/value plus the *full* traceback (not just
+    /// the name/value), since the traceback is often the only actionable
+    /// diagnostic for a failed cell.
+    fn push_output_element(builder: &mut InternalDocumentBuilder, output: &Value, plain: bool) {
         let output_type = output.get("output_type").and_then(|t| t.as_str()).unwrap_or("");
 
         match output_type {
             "stream" => {
                 if let Some(t) = output.get("text") {
-                    text.push_str(&Self::extract_source(t));
+                    let text = Self::extract_source(t);
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        builder.push_paragraph(trimmed, vec![], None, None);
+                    }
                 }
             }
-            "execute_result" | "display_data" => {
-                if let Some(data) = output.get("data").and_then(|d| d.as_object())
-                    && let Some(plain) = data.get("text/plain")
-                {
-                    text.push_str(&Self::extract_source(plain));
+            "execute_result" | "display_data" | "update_display_data" => {
+                let Some(data) = output.get("data").and_then(|d| d.as_object()) else {
+                    return;
+                };
+                match Self::richest_output_representation(data, plain) {
+                    Some(OutputRepresentation::RawHtml(html)) => {
+                        let trimmed = html.trim();
+                        if !trimmed.is_empty() {
+                            builder.push_raw_block("html", trimmed, None);
+                        }
+                    }
+                    Some(OutputRepresentation::Text(text)) => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            builder.push_paragraph(trimmed, vec![], None, None);
+                        }
+                    }
+                    None => {}
                 }
             }
             "error" => {
-                let ename = output.get("ename").and_then(|e| e.as_str()).unwrap_or("Unknown");
-                let evalue = output.get("evalue").and_then(|e| e.as_str()).unwrap_or("");
-                text.push_str(&format!("Error ({}): {}", ename, evalue));
+                let text = Self::collect_error_text(output);
+                if !text.is_empty() {
+                    builder.push_paragraph(&text, vec![], None, None);
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Select the single richest text-bearing representation from an
+    /// output's `data` bundle. See `push_output_element` for the precedence.
+    fn richest_output_representation(
+        data: &serde_json::Map<String, Value>,
+        plain: bool,
+    ) -> Option<OutputRepresentation> {
+        if !plain {
+            if let Some(html) = data.get("text/html") {
+                let text = Self::extract_source(html);
+                if !text.is_empty() {
+                    return Some(OutputRepresentation::RawHtml(text));
+                }
+            }
+            if let Some(markdown) = data.get("text/markdown") {
+                let text = Self::extract_source(markdown);
+                if !text.is_empty() {
+                    return Some(OutputRepresentation::Text(text));
+                }
+            }
+        }
+
+        let plain_value = data.get("text/plain")?;
+        let text = Self::extract_source(plain_value);
+        if text.is_empty() {
+            None
+        } else {
+            Some(OutputRepresentation::Text(text))
+        }
+    }
+
+    /// Render an `error` output's exception name/value and full traceback as
+    /// a single text block.
+    fn collect_error_text(output: &Value) -> String {
+        let ename = output.get("ename").and_then(|e| e.as_str()).unwrap_or("Unknown");
+        let evalue = output.get("evalue").and_then(|e| e.as_str()).unwrap_or("");
+        let mut text = format!("Error ({}): {}", ename, evalue);
+
+        if let Some(traceback) = output.get("traceback").and_then(|t| t.as_array()) {
+            text.push('\n');
+            text.push_str("Traceback:");
+            for line in traceback {
+                if let Some(line_str) = line.as_str() {
+                    text.push('\n');
+                    text.push_str(line_str);
+                }
+            }
         }
 
         text
@@ -564,8 +632,15 @@ impl JupyterExtractor {
     /// Build an `InternalDocument` from the already-parsed notebook JSON.
     ///
     /// Markdown cells are split into headings and paragraphs. Code cells
-    /// become code blocks followed by any output paragraphs.
-    fn build_internal_document(notebook: &Value) -> Option<InternalDocument> {
+    /// become code blocks followed by any output paragraphs. `plain`
+    /// mirrors `ExtractionConfig::output_format` being `Plain`/`Structured`
+    /// and suppresses richer (markdown/html) output representations in
+    /// favor of `text/plain` only.
+    fn build_internal_document(
+        notebook: &Value,
+        rendering: JupyterCellRendering,
+        plain: bool,
+    ) -> Option<InternalDocument> {
         let cells = notebook.get("cells")?.as_array()?;
 
         let kernel_lang = notebook
@@ -583,142 +658,81 @@ impl JupyterExtractor {
 
         let mut builder = InternalDocumentBuilder::new("jupyter");
 
-        // Emit kernel language at start of document
-        if let Some(lang) = kernel_lang {
-            builder.push_paragraph(&format!("[kernel_language: {}]", lang), vec![], None, None);
-        }
-
         for cell in cells {
             let cell_type = cell.get("cell_type").and_then(|t| t.as_str()).unwrap_or("unknown");
             let source_text = Self::extract_source(cell.get("source").unwrap_or(&Value::Null));
             let trimmed = source_text.trim();
 
-            // Emit cell ID and type markers at start of cell
-            if let Some(cell_id) = cell.get("id").and_then(|id| id.as_str()) {
-                builder.push_paragraph(&format!("[cell_id: {}]", cell_id), vec![], None, None);
-            }
+            // A cell is only genuinely empty (and therefore droppable) if it
+            // also has nothing else to contribute: a code cell's `source`
+            // may be legitimately cleared (privacy/size stripping) while its
+            // saved `outputs` still carry real content (#159), and a
+            // markdown/raw cell's `source` may be empty while it still
+            // references image `attachments` (#160).
+            let has_code_outputs = cell_type == "code"
+                && cell
+                    .get("outputs")
+                    .and_then(|o| o.as_array())
+                    .is_some_and(|arr| !arr.is_empty());
+            let has_attachments = cell
+                .get("attachments")
+                .and_then(|a| a.as_object())
+                .is_some_and(|m| !m.is_empty());
 
-            // Emit tags if present
-            if let Some(tags) = cell
-                .get("metadata")
-                .and_then(|m| m.get("tags"))
-                .and_then(|t| t.as_array())
-                && !tags.is_empty()
-            {
-                let tag_strs: Vec<String> = tags.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                if !tag_strs.is_empty() {
-                    builder.push_paragraph(&format!("[tags: {}]", tag_strs.join(",")), vec![], None, None);
-                }
-            }
-
-            if trimmed.is_empty() {
+            if trimmed.is_empty() && !has_code_outputs && !has_attachments {
                 continue;
             }
 
             match cell_type {
                 "markdown" => {
-                    // Extract markdown links as URIs
-                    let link_uris = Self::extract_markdown_links(trimmed);
-                    for uri in link_uris {
-                        builder.push_uri(uri);
-                    }
-
-                    // Parse line-by-line: headings become push_heading, other
-                    // lines are accumulated and flushed as paragraphs.
-                    let mut para_buf = String::new();
-                    for line in trimmed.lines() {
-                        if let Some((level, heading_text)) = Self::parse_heading_line(line) {
-                            // Flush accumulated paragraph text first
-                            let flushed = para_buf.trim();
-                            if !flushed.is_empty() {
-                                let (stripped, annotations) = Self::scan_markdown_inline(flushed);
-                                builder.push_paragraph(&stripped, annotations, None, None);
-                            }
-                            para_buf.clear();
-
-                            if !heading_text.is_empty() {
-                                builder.push_heading(level, heading_text, None, None);
-                            }
-                        } else {
-                            if !para_buf.is_empty() {
-                                para_buf.push('\n');
-                            }
-                            para_buf.push_str(line);
-                        }
-                    }
-                    // Flush remaining paragraph text
-                    let flushed = para_buf.trim();
-                    if !flushed.is_empty() {
-                        let (stripped, annotations) = Self::scan_markdown_inline(flushed);
-                        builder.push_paragraph(&stripped, annotations, None, None);
-                    }
+                    let events: Vec<pulldown_cmark::Event> =
+                        pulldown_cmark::Parser::new_ext(trimmed, crate::extractors::markdown::markdown_options())
+                            .collect();
+                    let cell_doc =
+                        crate::extractors::markdown::MarkdownExtractor::build_internal_document(&events, &None);
+                    builder.append_document(cell_doc);
                 }
                 "code" => {
-                    let idx = builder.push_code(trimmed, kernel_lang, None, None);
-                    // Store execution_count and tags as element attributes
-                    let mut attrs = AHashMap::new();
-                    if let Some(exec_count) = cell.get("execution_count") {
-                        match exec_count {
-                            Value::Number(n) => {
-                                attrs.insert("execution_count".to_string(), n.to_string());
-                            }
-                            Value::Null => {
-                                attrs.insert("execution_count".to_string(), "null".to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Some(tags) = cell
-                        .get("metadata")
-                        .and_then(|m| m.get("tags"))
-                        .and_then(|t| t.as_array())
-                        && !tags.is_empty()
-                    {
-                        let tag_strs: Vec<&str> = tags.iter().filter_map(|v| v.as_str()).collect();
-                        attrs.insert("tags".to_string(), tag_strs.join(","));
-                    }
-                    if !attrs.is_empty() {
-                        builder.set_attributes(idx, attrs);
-                    }
-
-                    // Emit execution_count metadata as paragraph
-                    if let Some(exec_count) = cell.get("execution_count") {
-                        match exec_count {
-                            Value::Number(n) => {
-                                builder.push_paragraph(&format!("execution_count: {}", n), vec![], None, None);
-                            }
-                            Value::Null => {
-                                builder.push_paragraph("execution_count: null", vec![], None, None);
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Emit cell outputs as paragraphs with type markers
-                    if let Some(outputs) = cell.get("outputs").and_then(|o| o.as_array()) {
-                        for output in outputs {
-                            let output_type = output.get("output_type").and_then(|t| t.as_str()).unwrap_or("unknown");
-
-                            // Emit output type marker
-                            builder.push_paragraph(&format!("[output_type: {}]", output_type), vec![], None, None);
-
-                            // Emit MIME type markers if present
-                            if let Some(data) = output.get("data").and_then(|d| d.as_object()) {
-                                for mime_type in data.keys() {
-                                    builder.push_paragraph(&format!("[mime: {}]", mime_type), vec![], None, None);
+                    if rendering.includes_source() && !trimmed.is_empty() {
+                        let idx = builder.push_code(trimmed, kernel_lang, None, None);
+                        let mut attrs = AHashMap::new();
+                        if let Some(exec_count) = cell.get("execution_count") {
+                            match exec_count {
+                                Value::Number(n) => {
+                                    attrs.insert("execution_count".to_string(), n.to_string());
                                 }
+                                Value::Null => {
+                                    attrs.insert("execution_count".to_string(), "null".to_string());
+                                }
+                                _ => {}
                             }
+                        }
+                        if let Some(tags) = cell
+                            .get("metadata")
+                            .and_then(|m| m.get("tags"))
+                            .and_then(|t| t.as_array())
+                            && !tags.is_empty()
+                        {
+                            let tag_strs: Vec<&str> = tags.iter().filter_map(|v| v.as_str()).collect();
+                            attrs.insert("tags".to_string(), tag_strs.join(","));
+                        }
+                        if !attrs.is_empty() {
+                            builder.set_attributes(idx, attrs);
+                        }
+                    }
 
-                            let output_text = Self::collect_output_text(output);
-                            let output_trimmed = output_text.trim();
-                            if !output_trimmed.is_empty() {
-                                builder.push_paragraph(output_trimmed, vec![], None, None);
-                            }
+                    if rendering.includes_outputs()
+                        && let Some(outputs) = cell.get("outputs").and_then(|o| o.as_array())
+                    {
+                        for output in outputs {
+                            Self::push_output_element(&mut builder, output, plain);
                         }
                     }
                 }
                 _ => {
-                    builder.push_paragraph(trimmed, vec![], None, None);
+                    if !trimmed.is_empty() {
+                        builder.push_paragraph(trimmed, vec![], None, None);
+                    }
                 }
             }
         }
@@ -747,14 +761,14 @@ impl JupyterExtractor {
     }
 }
 
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 impl Default for JupyterExtractor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 impl Plugin for JupyterExtractor {
     fn name(&self) -> &str {
         "jupyter-extractor"
@@ -781,7 +795,7 @@ impl Plugin for JupyterExtractor {
     }
 }
 
-#[cfg(feature = "office")]
+#[cfg(feature = "notebook")]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl InternalDocumentExtractor for JupyterExtractor {
@@ -807,11 +821,10 @@ impl InternalDocumentExtractor for JupyterExtractor {
             config.output_format,
             crate::core::config::OutputFormat::Plain | crate::core::config::OutputFormat::Structured
         );
-        let (_extracted_content, additional_metadata, extracted_images, notebook_json) =
+        let (_extracted_content, additional_metadata, extracted_images, notebook_json, warnings, attachment_images) =
             Self::extract_notebook(content, plain)?;
 
         let mut metadata_additional = AHashMap::new();
-        // Extract language name for the standard Metadata.language field
         let meta_language = additional_metadata
             .get(&Cow::Borrowed("language_name"))
             .and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -819,10 +832,20 @@ impl InternalDocumentExtractor for JupyterExtractor {
             metadata_additional.insert(key, json!(value));
         }
 
-        let images = extracted_images;
+        // `JupyterCellRendering` governs a code cell's saved *outputs*; cell
+        // `attachments` are part of markdown/raw cell *source* and are kept
+        // regardless of that setting (see `JupyterCellRendering`'s docs).
+        let mut images = if config.jupyter_cell_rendering.includes_outputs() {
+            extracted_images
+        } else {
+            Vec::new()
+        };
+        images.extend(attachment_images);
+        for (index, image) in images.iter_mut().enumerate() {
+            image.image_index = index as u32;
+        }
 
-        // Build InternalDocument from already-parsed notebook (no re-parse)
-        let mut doc = Self::build_internal_document(&notebook_json)
+        let mut doc = Self::build_internal_document(&notebook_json, config.jupyter_cell_rendering, plain)
             .unwrap_or_else(|| InternalDocumentBuilder::new("jupyter").build());
         doc.mime_type = mime_type.to_string();
 
@@ -832,6 +855,7 @@ impl InternalDocumentExtractor for JupyterExtractor {
             ..Default::default()
         };
         doc.images = images;
+        doc.processing_warnings.extend(warnings);
 
         Ok(doc)
     }
@@ -848,6 +872,7 @@ impl InternalDocumentExtractor for JupyterExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::internal::ElementKind;
 
     #[test]
     fn test_jupyter_extractor_plugin_interface() {
@@ -864,9 +889,15 @@ mod tests {
             "cells": [
                 {
                     "cell_type": "code",
+                    "id": "code-cell",
                     "source": ["print('hello')"],
                     "execution_count": 5,
-                    "outputs": [],
+                    "outputs": [{
+                        "output_type": "execute_result",
+                        "execution_count": 5,
+                        "data": {"text/plain": ["hello"]},
+                        "metadata": {}
+                    }],
                     "metadata": {"tags": ["test-tag", "important"]}
                 }
             ],
@@ -878,9 +909,8 @@ mod tests {
             "nbformat_minor": 5
         }"#;
 
-        let (_, metadata, _, _) = JupyterExtractor::extract_notebook(notebook_json.as_bytes(), false).unwrap();
+        let (_, metadata, _, _, _, _) = JupyterExtractor::extract_notebook(notebook_json.as_bytes(), false).unwrap();
 
-        // Check cells array metadata
         let cells = metadata.get(&Cow::Borrowed("cells"));
         assert!(cells.is_some(), "Should have cells metadata array");
         let cells_arr = cells.unwrap().as_array().expect("cells should be an array");
@@ -888,13 +918,15 @@ mod tests {
         let cell0 = &cells_arr[0];
         assert_eq!(cell0["index"], json!(0));
         assert_eq!(cell0["cell_type"], json!("code"));
+        assert_eq!(cell0["id"], json!("code-cell"));
         assert_eq!(cell0["execution_count"], json!(5));
         assert_eq!(cell0["tags"], json!(["test-tag", "important"]));
+        assert_eq!(cell0["outputs"][0]["output_type"], json!("execute_result"));
+        assert_eq!(cell0["outputs"][0]["execution_count"], json!(5));
+        assert_eq!(cell0["outputs"][0]["mime_types"], json!(["text/plain"]));
 
-        // Check cell_count
         assert_eq!(metadata.get(&Cow::Borrowed("cell_count")), Some(&json!(1)));
 
-        // Check language_info fields
         assert_eq!(metadata.get(&Cow::Borrowed("language_name")), Some(&json!("python")));
         assert_eq!(metadata.get(&Cow::Borrowed("language_version")), Some(&json!("3.10.0")));
         assert_eq!(
@@ -902,7 +934,6 @@ mod tests {
             Some(&json!("text/x-python"))
         );
 
-        // Check nbformat_minor
         assert_eq!(metadata.get(&Cow::Borrowed("nbformat_minor")), Some(&json!(5)));
     }
 
@@ -930,7 +961,7 @@ mod tests {
             "nbformat_minor": 0
         }"#;
 
-        let (content, _, _, _) = JupyterExtractor::extract_notebook(notebook_json.as_bytes(), false).unwrap();
+        let (content, _, _, _, _, _) = JupyterExtractor::extract_notebook(notebook_json.as_bytes(), false).unwrap();
 
         assert!(
             content.contains("Error (ZeroDivisionError): division by zero"),
@@ -938,5 +969,95 @@ mod tests {
         );
         assert!(content.contains("Traceback:"), "Should contain traceback header");
         assert!(content.contains("Traceback line 1"), "Should contain traceback lines");
+    }
+
+    fn rendering_sample() -> Value {
+        serde_json::from_str(
+            r#"{
+            "cells": [
+                {
+                    "cell_type": "code",
+                    "source": ["print('hello world')"],
+                    "execution_count": 1,
+                    "outputs": [
+                        {"output_type": "stream", "name": "stdout", "text": ["hello world\n"]}
+                    ],
+                    "metadata": {}
+                }
+            ],
+            "metadata": {"kernelspec": {"name": "python3", "language": "python"}},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_rendering_source_emits_code_without_outputs() {
+        let doc = JupyterExtractor::build_internal_document(&rendering_sample(), JupyterCellRendering::Source, false)
+            .unwrap();
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| matches!(e.kind, ElementKind::Code) && e.text.contains("print('hello world')")),
+            "source rendering keeps the code cell"
+        );
+        assert!(
+            !doc.elements.iter().any(|e| e.text.contains("[output_type:")),
+            "source rendering suppresses saved outputs"
+        );
+    }
+
+    #[test]
+    fn test_rendering_outputs_emits_outputs_without_code() {
+        let doc = JupyterExtractor::build_internal_document(&rendering_sample(), JupyterCellRendering::Outputs, false)
+            .unwrap();
+        assert!(
+            !doc.elements.iter().any(|e| matches!(e.kind, ElementKind::Code)),
+            "outputs rendering suppresses the code source"
+        );
+        assert!(
+            doc.elements.iter().any(|e| e.text.contains("hello world")),
+            "outputs rendering keeps the saved output text"
+        );
+        assert!(
+            !doc.elements.iter().any(|e| e.text.contains("[output_type:")),
+            "outputs rendering does not expose diagnostic markers"
+        );
+    }
+
+    #[test]
+    fn test_rendering_both_emits_code_and_outputs() {
+        let doc =
+            JupyterExtractor::build_internal_document(&rendering_sample(), JupyterCellRendering::Both, false).unwrap();
+        assert!(
+            doc.elements.iter().any(|e| matches!(e.kind, ElementKind::Code)),
+            "both rendering keeps the code source"
+        );
+        assert!(doc.elements.iter().any(|e| e.text.contains("hello world")));
+        assert!(!doc.elements.iter().any(|e| e.text.contains("[output_type:")));
+    }
+
+    #[test]
+    fn test_markdown_cell_reuses_shared_parser() {
+        let notebook: Value = serde_json::from_str(
+            r##"{
+            "cells": [
+                {"cell_type": "markdown", "source": ["# Heading\n\nSome **bold** prose."], "metadata": {}}
+            ],
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        }"##,
+        )
+        .unwrap();
+        let doc = JupyterExtractor::build_internal_document(&notebook, JupyterCellRendering::Both, false).unwrap();
+        assert!(
+            doc.elements
+                .iter()
+                .any(|e| matches!(e.kind, ElementKind::Heading { .. }) && e.text.contains("Heading")),
+            "markdown cells render through the shared MarkdownExtractor (heading element present)"
+        );
     }
 }

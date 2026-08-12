@@ -8,7 +8,12 @@ use async_trait::async_trait;
 ///
 /// The redaction engine and the NER post-processor both consume backends through
 /// this trait so they can be swapped without rewriting consumer code.
-#[async_trait]
+/// On wasm32 the `async_trait` futures are `?Send`: a JS-bridge backend's
+/// futures hold `JsValue`s driven by `wasm_bindgen_futures`, which are not
+/// `Send`, and the target is single-threaded so `Send` futures buy nothing.
+/// Every other target keeps the plain `Send` contract unchanged.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(alef, alef(skip))]
 pub trait NerBackend: Send + Sync {
     /// Identify entities in `text` belonging to any of the `categories`.

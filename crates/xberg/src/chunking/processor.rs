@@ -248,7 +248,6 @@ mod tests {
 
         processor.process(&mut result, &config).await.unwrap();
         let chunks = result.chunks.unwrap();
-        // Yaml chunker produces section-prefixed chunks
         assert!(chunks[0].content.contains("# server > host"));
     }
 
@@ -276,7 +275,6 @@ mod tests {
 
         processor.process(&mut result, &config).await.unwrap();
         let chunks = result.chunks.unwrap();
-        // JSON chunker produces section-prefixed chunks
         assert!(chunks[0].content.contains("# name"));
     }
 
@@ -304,7 +302,6 @@ mod tests {
 
         processor.process(&mut result, &config).await.unwrap();
         let chunks = result.chunks.unwrap();
-        // Markdown chunker does NOT produce "# server > host" section headers
         assert!(!chunks[0].content.contains("# server > host"));
     }
 
@@ -331,7 +328,6 @@ mod tests {
 
         processor.process(&mut result, &config).await.unwrap();
         let chunks = result.chunks.unwrap();
-        // Without data_format metadata, should NOT auto-infer yaml chunking
         assert!(!chunks[0].content.contains("# server > host"));
     }
 }

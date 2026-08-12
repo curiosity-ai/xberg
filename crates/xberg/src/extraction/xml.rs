@@ -31,8 +31,8 @@
 use crate::error::{Result, XbergError};
 use crate::extractors::security::{SecurityBudget, SecurityLimits};
 use crate::types::XmlExtractionResult;
+use crate::utils::xml_utils::EntityReader;
 use ahash::AHashSet;
-use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::borrow::Cow;
 
@@ -69,15 +69,12 @@ fn parse_xml_inner(
     svg_mode: bool,
     limits: &SecurityLimits,
 ) -> Result<XmlExtractionResult> {
-    // Handle UTF-16 encoded XML by detecting BOM and transcoding to UTF-8
     let decoded_bytes;
     let effective_bytes = if xml_bytes.len() >= 2 {
         if xml_bytes[0] == 0xFF && xml_bytes[1] == 0xFE {
-            // UTF-16 LE BOM
             decoded_bytes = decode_utf16_to_utf8(xml_bytes, false)?;
             &decoded_bytes
         } else if xml_bytes[0] == 0xFE && xml_bytes[1] == 0xFF {
-            // UTF-16 BE BOM
             decoded_bytes = decode_utf16_to_utf8(xml_bytes, true)?;
             &decoded_bytes
         } else {
@@ -87,21 +84,22 @@ fn parse_xml_inner(
         xml_bytes
     };
 
-    let mut reader = Reader::from_reader(effective_bytes);
-    reader.config_mut().trim_text(!preserve_whitespace);
+    // No reader-level trim_text: EntityReader coalesces text fragments around
+    // entity references, and trimming fragments first would corrupt spacing.
+    // Text is trimmed below (when `preserve_whitespace` is off), after coalescing. ~keep
+    let mut reader = EntityReader::from_bytes(effective_bytes);
     reader.config_mut().check_end_names = false;
 
     let mut budget = SecurityBudget::from_limits(limits);
     let mut content = String::new();
     let mut element_count = 0usize;
     let mut unique_elements_set = AHashSet::new();
-    let mut buf = Vec::new();
     let mut element_stack: Vec<String> = Vec::new();
     let mut had_depth1_element = false;
 
     loop {
         budget.step()?;
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(e)) => {
                 budget.enter()?;
                 let name_bytes = (e.name().as_ref() as &[u8]).to_vec();
@@ -110,7 +108,6 @@ fn parse_xml_inner(
                 element_count += 1;
                 unique_elements_set.insert(name_owned.clone());
 
-                // In SVG mode, skip attribute extraction entirely
                 if !svg_mode {
                     for attr in e.attributes().flatten() {
                         let key: Cow<str> = String::from_utf8_lossy(attr.key.as_ref());
@@ -131,7 +128,6 @@ fn parse_xml_inner(
                 element_count += 1;
                 unique_elements_set.insert(name_owned.clone());
 
-                // In SVG mode, skip self-closing tag output entirely
                 if !svg_mode {
                     for attr in e.attributes().flatten() {
                         let key: Cow<str> = String::from_utf8_lossy(attr.key.as_ref());
@@ -145,7 +141,6 @@ fn parse_xml_inner(
             }
             Ok(Event::End(_e)) => {
                 budget.leave();
-                // Pop matching element from stack
                 element_stack.pop();
             }
             Ok(Event::Text(e)) => {
@@ -159,7 +154,6 @@ fn parse_xml_inner(
                 if !trimmed.is_empty() {
                     budget.check_entity(&trimmed)?;
                     budget.account_text(trimmed.len())?;
-                    // In SVG mode, only extract text from SVG text-bearing elements
                     if svg_mode {
                         let in_text_element = element_stack
                             .iter()
@@ -176,7 +170,6 @@ fn parse_xml_inner(
                 }
             }
             Ok(Event::CData(e)) => {
-                // In SVG mode, only extract CData from SVG text-bearing elements
                 if svg_mode {
                     let in_text_element = element_stack
                         .iter()
@@ -201,7 +194,6 @@ fn parse_xml_inner(
             }
             _ => {}
         }
-        buf.clear();
     }
 
     let content = content.trim().to_string();
@@ -217,7 +209,6 @@ fn parse_xml_inner(
 
 /// Decode UTF-16 bytes (with BOM) to UTF-8 bytes.
 fn decode_utf16_to_utf8(data: &[u8], big_endian: bool) -> Result<Vec<u8>> {
-    // Skip BOM (first 2 bytes) and truncate to even length
     let data = &data[2..];
     let even_len = data.len() & !1;
     let data = &data[..even_len];
@@ -313,7 +304,6 @@ mod tests {
     fn test_simple_xml() {
         let xml = b"<root><item>Hello</item><item>World</item></root>";
         let result = parse_xml(xml, false, &default_limits()).unwrap();
-        // Element names with text indented beneath
         assert!(result.content.contains("item\n  Hello"));
         assert!(result.content.contains("item\n  World"));
         assert_eq!(result.element_count, 3);
@@ -549,8 +539,7 @@ mod tests {
 
     #[test]
     fn test_utf16_le_xml() {
-        // UTF-16 LE BOM + "<r>A</r>" encoded as UTF-16 LE
-        let mut xml = vec![0xFF, 0xFE]; // BOM
+        let mut xml = vec![0xFF, 0xFE];
         for c in "<r>A</r>".encode_utf16() {
             xml.extend_from_slice(&c.to_le_bytes());
         }
@@ -560,8 +549,7 @@ mod tests {
 
     #[test]
     fn test_utf16_be_xml() {
-        // UTF-16 BE BOM + "<r>B</r>" encoded as UTF-16 BE
-        let mut xml = vec![0xFE, 0xFF]; // BOM
+        let mut xml = vec![0xFE, 0xFF];
         for c in "<r>B</r>".encode_utf16() {
             xml.extend_from_slice(&c.to_be_bytes());
         }
@@ -571,12 +559,11 @@ mod tests {
 
     #[test]
     fn test_utf16_odd_byte_count_truncates_gracefully() {
-        // UTF-16 LE BOM + "<r>X</r>" + trailing odd byte
-        let mut xml = vec![0xFF, 0xFE]; // BOM
+        let mut xml = vec![0xFF, 0xFE];
         for c in "<r>X</r>".encode_utf16() {
             xml.extend_from_slice(&c.to_le_bytes());
         }
-        xml.push(0x0A); // trailing odd byte
+        xml.push(0x0A);
         let result = parse_xml(&xml, false, &default_limits()).unwrap();
         assert!(result.content.contains("X"));
     }
