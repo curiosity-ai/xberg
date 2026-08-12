@@ -105,8 +105,11 @@ public static class DocxReader
         var mainXml = pkg.ReadXml("word/document.xml");
         var body = mainXml?.Root?.Elements().FirstOrDefault(e => e.Name.LocalName == "body");
         if (body is not null)
+        {
+            var pageBreaks = new PageBreakState();
             foreach (var child in body.Elements())
-                ParseBodyChild(child, doc, rels);
+                ParseBodyChild(child, doc, rels, pageBreaks);
+        }
 
         _styles = styles; // used by ResolveHeadingLevel
 
@@ -125,26 +128,53 @@ public static class DocxReader
     [ThreadStatic] private static Dictionary<string, StyleDef>? _styles;
 
     // ── body walk ──────────────────────────────────────────────────────────────
-    private static void ParseBodyChild(XElement el, DocxDocument doc, Dictionary<string, string> rels)
+    /// <summary>
+    /// Page-break bookkeeping shared by <c>w:br</c> and <c>w:lastRenderedPageBreak</c>
+    /// (Rust GH#1416, GH#1419).
+    /// </summary>
+    private sealed class PageBreakState
+    {
+        /// <summary>Whether rendered content has been emitted since the previous break.
+        /// Starts <c>true</c> so a break with nothing before it — including the very first one in
+        /// the document — is never treated as a spurious duplicate.</summary>
+        public bool TextSinceBreak = true;
+
+        /// <summary>Breaks seen inside a table, flushed once the table element is pushed.</summary>
+        public uint PendingTableBreaks;
+    }
+
+    private static void ParseBodyChild(XElement el, DocxDocument doc, Dictionary<string, string> rels, PageBreakState pb)
     {
         switch (el.Name.LocalName)
         {
             case "p":
                 // Drawings + page breaks open (and are recorded) before the enclosing paragraph closes.
-                EmitPreElements(el, doc, rels, pageBreaks: true);
+                EmitPreElements(el, doc, rels, pb, inTable: false);
                 doc.Elements.Add(new DocElement { Kind = DocElementKind.Paragraph, Paragraph = ParseParagraph(el, rels) });
                 break;
             case "tbl":
                 // Drawings inside cells open before the table closes → emitted before the Table.
-                // Page breaks inside tables are ignored (matches Rust `table_stack.is_empty()`).
-                EmitPreElements(el, doc, rels, pageBreaks: false);
+                // A page break inside a table is deferred rather than dropped: a form feed cannot
+                // be written into the middle of a table that renders as one markdown block, so it
+                // is flushed once the table element has been pushed (GH#1419).
+                EmitPreElements(el, doc, rels, pb, inTable: true);
                 doc.Elements.Add(new DocElement { Kind = DocElementKind.Table, Table = ParseTable(el, rels) });
+                for (; pb.PendingTableBreaks > 0; pb.PendingTableBreaks--)
+                    doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
                 break;
         }
     }
 
-    private static void EmitPreElements(XElement container, DocxDocument doc, Dictionary<string, string> rels, bool pageBreaks)
+    private static void EmitPreElements(
+        XElement container, DocxDocument doc, Dictionary<string, string> rels, PageBreakState pb, bool inTable)
     {
+        void RecordBreak()
+        {
+            if (inTable) pb.PendingTableBreaks++;
+            else doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
+            pb.TextSinceBreak = false;
+        }
+
         foreach (var e in container.Descendants())
         {
             switch (e.Name.LocalName)
@@ -153,6 +183,20 @@ public static class DocxReader
                     var draw = ParseDrawing(e, rels);
                     doc.Drawings.Add(draw);
                     doc.Elements.Add(new DocElement { Kind = DocElementKind.Drawing, Drawing = draw });
+                    pb.TextSinceBreak = true;
+                    break;
+
+                // Rendered content: anything that puts glyphs on the page counts as text emitted
+                // since the last break, which is what makes a following render hint non-redundant.
+                case "t" when e.Value.Length > 0:
+                case "tab":
+                case "noBreakHyphen":
+                case "sym":
+                case "oMath":
+                case "oMathPara":
+                case "footnoteReference":
+                case "endnoteReference":
+                    pb.TextSinceBreak = true;
                     break;
                 case "txbxContent":
                     // Text-box content. Rust's flat event reader keeps the VML (`<w:pict>`) copy but
@@ -163,12 +207,19 @@ public static class DocxReader
                         foreach (var tp in e.Elements().Where(x => x.Name.LocalName == "p"))
                             doc.Elements.Add(new DocElement { Kind = DocElementKind.Paragraph, Paragraph = ParseParagraph(tp, rels) });
                     break;
-                case "lastRenderedPageBreak" when pageBreaks:
-                    doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
+                // Word writes this hint at the start of the first run on a page *it* rendered —
+                // including, redundantly, right after an authored `<w:br w:type="page"/>` that
+                // already recorded the same transition (GH#1416). It is the only page-break signal
+                // in documents Word paginated itself, so it cannot be dropped outright; it is
+                // recorded only when real content has been emitted since the previous break, which
+                // is exactly when it is not a redundant echo.
+                case "lastRenderedPageBreak":
+                    if (pb.TextSinceBreak) RecordBreak();
                     break;
-                case "br" when pageBreaks &&
-                    e.Attributes().FirstOrDefault(a => a.Name.LocalName == "type")?.Value == "page":
-                    doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
+
+                // The author's own explicit break — always recorded, never suppressed.
+                case "br" when e.Attributes().FirstOrDefault(a => a.Name.LocalName == "type")?.Value == "page":
+                    RecordBreak();
                     break;
             }
         }
@@ -270,7 +321,7 @@ public static class DocxReader
         {
             switch (child.Name.LocalName)
             {
-                case "t": run.Text += DropXmlEntities(child.Value); break;
+                case "t": run.Text += child.Value; break;
                 // An in-run <w:tab/> separates words; a <w:pPr><w:tabs> tab-stop definition lives
                 // under the paragraph, not the run, so it stays invisible here (Rust GH#1377).
                 case "tab": run.Text += "\t"; break;
@@ -518,21 +569,4 @@ public static class DocxReader
 
     private static long? ParseLong(string? s) => long.TryParse(s, out var v) ? v : null;
 
-    /// <summary>
-    /// Drop XML entity references from decoded text. Rust's quick_xml surfaces character/entity
-    /// references (<c>&amp;lt;</c>, <c>&amp;amp;</c>, numeric refs) as separate events that the
-    /// DOCX parser ignores, so entity-encoded characters are absent from the extracted text.
-    /// In well-formed XML text content the characters <c>&lt;</c>, <c>&gt;</c>, and <c>&amp;</c>
-    /// can only originate from such references, so removing them reproduces Rust's output.
-    /// </summary>
-    internal static string DropXmlEntities(string s)
-    {
-        if (s.IndexOfAny(EntitySourceChars) < 0) return s;
-        var sb = new StringBuilder(s.Length);
-        foreach (char c in s)
-            if (c is not ('<' or '>' or '&')) sb.Append(c);
-        return sb.ToString();
-    }
-
-    private static readonly char[] EntitySourceChars = { '<', '>', '&' };
 }

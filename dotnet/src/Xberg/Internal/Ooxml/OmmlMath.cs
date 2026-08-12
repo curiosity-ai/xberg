@@ -104,7 +104,7 @@ internal static class OmmlMath
     {
         var text = new StringBuilder();
         foreach (var t in r.Elements().Where(e => e.Name.LocalName == "t"))
-            text.Append(DocxReader.DropXmlEntities(t.Value));
+            text.Append(t.Value);
         return new Run(text.ToString());
     }
 
