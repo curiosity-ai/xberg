@@ -1,0 +1,802 @@
+// Ported from Rust `crates/xberg/src/extractors/odt.rs`.
+// Walks content.xml / styles.xml and populates an InternalDocumentBuilder.
+// Tracked-changes/revisions are intentionally omitted (InternalDocument.Revisions is
+// [JsonIgnore] in the C# port) and image_kind classification is skipped.
+
+using System.IO.Compression;
+using System.Text;
+using System.Xml.Linq;
+using Xberg.Types;
+
+namespace Xberg.Internal.Odf;
+
+/// <summary>Pre-extracted image binary: raw bytes plus a normalized format string.</summary>
+internal readonly record struct OdfImage(byte[] Data, string Format);
+
+/// <summary>Native ODF (OpenDocument Text) content parser. Ports the walking logic in odt.rs.</summary>
+internal static class OdfContentParser
+{
+    // ── entry point ────────────────────────────────────────────────────────
+
+    /// <summary>Build an <see cref="InternalDocument"/> from an ODT archive. Ports `build_internal_document`.</summary>
+    public static InternalDocument BuildInternalDocument(ZipArchive archive)
+    {
+        var imageData = PreExtractImages(archive);
+        var formulaData = PreExtractFormulas(archive);
+
+        var contentXml = ReadEntry(archive, "content.xml");
+        if (contentXml is null)
+            return new InternalDocumentBuilder("odt").Build();
+
+        var doc = XDocument.Parse(contentXml, LoadOptions.PreserveWhitespace);
+        var root = doc.Root!;
+        var styleMap = OdfStyles.BuildStyleMap(root);
+        var builder = new InternalDocumentBuilder("odt");
+
+        foreach (var bodyChild in root.Elements())
+        {
+            if (bodyChild.Name.LocalName != "body")
+                continue;
+            foreach (var textElem in bodyChild.Elements())
+            {
+                if (textElem.Name.LocalName != "text")
+                    continue;
+                BuildInternalElements(textElem, builder, styleMap, imageData, formulaData);
+            }
+        }
+
+        ExtractHeadersFooters(archive, builder);
+        return builder.Build();
+    }
+
+    // ── recursive body walk ────────────────────────────────────────────────
+
+    /// <summary>Ports `build_internal_elements` (revision handling dropped).</summary>
+    private static void BuildInternalElements(
+        XElement parent,
+        InternalDocumentBuilder builder,
+        Dictionary<string, OdtStyleProps> styleMap,
+        Dictionary<string, OdfImage> imageData,
+        Dictionary<string, string> formulaData)
+    {
+        uint footnoteCounter = 0;
+
+        foreach (var node in parent.Elements())
+        {
+            switch (node.Name.LocalName)
+            {
+                case "h":
+                {
+                    var (text, _, uris) = CollectAnnotations(node, styleMap);
+                    foreach (var uri in uris)
+                        builder.PushUri(uri);
+                    var trimmed = text.Trim();
+                    if (trimmed.Length > 0)
+                    {
+                        byte level = 1;
+                        var lv = OdfStyles.Attr(node, "outline-level");
+                        if (lv is not null && byte.TryParse(lv, out var parsed))
+                            level = parsed;
+                        builder.PushHeading(level, trimmed, null, null);
+                    }
+                    break;
+                }
+                case "p":
+                    HandleParagraph(node, builder, styleMap, imageData, formulaData, ref footnoteCounter);
+                    break;
+                case "table":
+                {
+                    var cells = ExtractTableCells(node);
+                    if (cells.Count > 0)
+                        builder.PushTableFromCells(cells, null, null);
+                    break;
+                }
+                case "list":
+                    BuildList(node, builder);
+                    break;
+                case "section":
+                    BuildInternalElements(node, builder, styleMap, imageData, formulaData);
+                    break;
+            }
+        }
+    }
+
+    private static void HandleParagraph(
+        XElement node,
+        InternalDocumentBuilder builder,
+        Dictionary<string, OdtStyleProps> styleMap,
+        Dictionary<string, OdfImage> imageData,
+        Dictionary<string, string> formulaData,
+        ref uint footnoteCounter)
+    {
+        var footnoteMarkers = new List<string>();
+
+        // draw:frame descendants — images or embedded formulas.
+        foreach (var desc in DescendantsAndSelf(node))
+        {
+            if (desc.Name.LocalName != "frame")
+                continue;
+
+            bool isFormula = false;
+            foreach (var frameChild in desc.Elements())
+            {
+                if (frameChild.Name.LocalName != "object")
+                    continue;
+                var objHref = OdfStyles.Attr(frameChild, "href");
+                if (objHref is null)
+                    continue;
+                var normalized = TrimStartStr(objHref, "./");
+                if (formulaData.TryGetValue(normalized, out var formulaText))
+                {
+                    builder.PushFormula(formulaText, null, null);
+                    isFormula = true;
+                    break;
+                }
+            }
+
+            if (isFormula)
+                continue;
+
+            foreach (var frameChild in DescendantsAndSelf(desc))
+            {
+                if (frameChild.Name.LocalName != "image")
+                    continue;
+                var href = OdfStyles.Attr(frameChild, "href");
+
+                // Richer alt text: svg:title/svg:desc/text:p, else frame's svg:title attribute.
+                var description = ExtractFrameDescription(desc) ?? OdfStyles.Attr(desc, "title");
+
+                if (href is not null && imageData.TryGetValue(href, out var img))
+                {
+                    var image = new ExtractedImage
+                    {
+                        Data = img.Data,
+                        Format = img.Format,
+                        ImageIndex = 0,
+                        IsMask = false,
+                        Description = description,
+                        // image_kind::classify is intentionally skipped (ImageKind/KindConfidence null).
+                    };
+                    uint idx = builder.PushImage(description, image, null, null);
+                    builder.SetAttributes(idx, new Dictionary<string, string> { ["src"] = href });
+                }
+                else
+                {
+                    var textVal = description ?? href ?? "";
+                    var elem = InternalElement.TextElement(ElementKind.Image(0), textVal, 0);
+                    uint idx = builder.PushElement(elem);
+                    if (href is not null)
+                        builder.SetAttributes(idx, new Dictionary<string, string> { ["src"] = href });
+                }
+            }
+        }
+
+        // Footnotes: collect citation markers + push definitions on the Footnote layer.
+        foreach (var child in DescendantsAndSelf(node))
+        {
+            if (child.Name.LocalName != "note")
+                continue;
+            var noteId = OdfStyles.Attr(child, "id");
+
+            foreach (var noteChild in child.Elements())
+            {
+                if (noteChild.Name.LocalName == "note-citation")
+                {
+                    var citationText = ExtractNodeText(noteChild) ?? "";
+                    var citationTrimmed = citationText.Trim();
+                    if (citationTrimmed.Length > 0)
+                    {
+                        footnoteCounter += 1;
+                        var key = noteId ?? $"fn{footnoteCounter}";
+                        footnoteMarkers.Add(citationTrimmed);
+                        builder.PushFootnoteRef(citationTrimmed, key, null);
+                    }
+                }
+                if (noteChild.Name.LocalName == "note-body")
+                {
+                    var noteText = ExtractNodeText(noteChild);
+                    if (noteText is not null)
+                    {
+                        var trimmed = noteText.Trim();
+                        if (trimmed.Length > 0)
+                        {
+                            string key;
+                            if (noteId is not null)
+                            {
+                                key = noteId;
+                            }
+                            else
+                            {
+                                if (footnoteCounter == 0)
+                                    footnoteCounter += 1;
+                                key = $"fn{footnoteCounter}";
+                            }
+                            uint defIdx = builder.PushFootnoteDefinition(trimmed, key, null);
+                            builder.SetLayer(defIdx, ContentLayer.Footnote);
+                        }
+                    }
+                }
+            }
+        }
+
+        var (paraText, annotations, paraUris) = CollectAnnotations(node, styleMap);
+        var text = new StringBuilder(paraText);
+        foreach (var uri in paraUris)
+            builder.PushUri(uri);
+
+        // Caption paragraphs nested in draw:frame > draw:text-box, missed by CollectAnnotations.
+        foreach (var frame in node.Elements())
+        {
+            if (frame.Name.LocalName != "frame")
+                continue;
+            foreach (var textBox in frame.Elements())
+            {
+                if (textBox.Name.LocalName != "text-box")
+                    continue;
+                foreach (var nestedP in textBox.Elements())
+                {
+                    if (nestedP.Name.LocalName != "p")
+                        continue;
+                    var (caption, _, captionUris) = CollectAnnotations(nestedP, styleMap);
+                    foreach (var uri in captionUris)
+                        builder.PushUri(uri);
+                    var captionTrimmed = caption.Trim();
+                    if (captionTrimmed.Length > 0)
+                    {
+                        if (text.Length > 0)
+                            text.Append('\n');
+                        text.Append(captionTrimmed);
+                    }
+                }
+            }
+        }
+
+        // Inject inline footnote markers [^N].
+        foreach (var citation in footnoteMarkers)
+        {
+            var marker = $"[^{citation}]";
+            if (text.ToString().IndexOf(marker, StringComparison.Ordinal) < 0)
+                text.Append(marker);
+        }
+
+        var finalTrimmed = text.ToString().Trim();
+        if (finalTrimmed.Length > 0)
+            builder.PushParagraph(finalTrimmed, annotations, null, null);
+    }
+
+    /// <summary>Ports `build_internal_list`. Lists are always emitted unordered (matches Rust).</summary>
+    private static void BuildList(XElement listNode, InternalDocumentBuilder builder)
+    {
+        builder.PushList(false);
+        foreach (var item in listNode.Elements())
+        {
+            if (item.Name.LocalName != "list-item")
+                continue;
+            foreach (var child in item.Elements())
+            {
+                switch (child.Name.LocalName)
+                {
+                    case "p":
+                    case "h":
+                    {
+                        var text = ExtractNodeText(child);
+                        if (text is not null)
+                        {
+                            var trimmed = text.Trim();
+                            if (trimmed.Length > 0)
+                                builder.PushListItem(trimmed, false, new List<TextAnnotation>(), null, null);
+                        }
+                        break;
+                    }
+                    case "list":
+                        BuildList(child, builder);
+                        break;
+                }
+            }
+        }
+        builder.EndList();
+    }
+
+    /// <summary>Ports `extract_odt_internal_headers_footers`. Reads styles.xml header/footer paragraphs.</summary>
+    private static void ExtractHeadersFooters(ZipArchive archive, InternalDocumentBuilder builder)
+    {
+        var stylesXml = ReadEntry(archive, "styles.xml");
+        if (stylesXml is null)
+            return;
+
+        XDocument doc;
+        try
+        {
+            doc = XDocument.Parse(stylesXml, LoadOptions.PreserveWhitespace);
+        }
+        catch
+        {
+            return;
+        }
+
+        var root = doc.Root;
+        if (root is null)
+            return;
+
+        foreach (var node in DescendantsAndSelf(root))
+        {
+            if (node.Name.LocalName == "header")
+            {
+                var text = ExtractNodeText(node);
+                var trimmed = text?.Trim();
+                if (!string.IsNullOrEmpty(trimmed))
+                {
+                    uint idx = builder.PushParagraph(trimmed, new List<TextAnnotation>(), null, null);
+                    builder.SetLayer(idx, ContentLayer.Header);
+                }
+            }
+            else if (node.Name.LocalName == "footer")
+            {
+                var text = ExtractNodeText(node);
+                var trimmed = text?.Trim();
+                if (!string.IsNullOrEmpty(trimmed))
+                {
+                    uint idx = builder.PushParagraph(trimmed, new List<TextAnnotation>(), null, null);
+                    builder.SetLayer(idx, ContentLayer.Footer);
+                }
+            }
+        }
+    }
+
+    // ── text / annotation collection ───────────────────────────────────────
+
+    /// <summary>Ports `collect_odt_annotations`. Byte offsets are UTF-8 byte lengths (Rust `str::len`).</summary>
+    private static (string Text, List<TextAnnotation> Annotations, List<ExtractedUri> Uris) CollectAnnotations(
+        XElement node,
+        Dictionary<string, OdtStyleProps> styleMap)
+    {
+        var text = new StringBuilder();
+        int byteLen = 0;
+        var annotations = new List<TextAnnotation>();
+        var uris = new List<ExtractedUri>();
+
+        foreach (var child in node.Nodes())
+        {
+            if (child is XElement el)
+            {
+                switch (el.Name.LocalName)
+                {
+                    case "span":
+                    {
+                        var spanText = NodeText(el) ?? "";
+                        if (spanText.Length == 0)
+                            continue;
+                        uint start = (uint)byteLen;
+                        text.Append(spanText);
+                        byteLen += Encoding.UTF8.GetByteCount(spanText);
+                        uint end = (uint)byteLen;
+
+                        var styleName = OdfStyles.Attr(el, "style-name");
+                        if (styleName is not null && styleMap.TryGetValue(styleName, out var props))
+                        {
+                            if (props.Bold)
+                                annotations.Add(Ann(start, end, AnnotationKind.Tag.Bold));
+                            if (props.Italic)
+                                annotations.Add(Ann(start, end, AnnotationKind.Tag.Italic));
+                            if (props.Underline)
+                                annotations.Add(Ann(start, end, AnnotationKind.Tag.Underline));
+                            if (props.Strikethrough)
+                                annotations.Add(Ann(start, end, AnnotationKind.Tag.Strikethrough));
+                            if (props.Color is not null)
+                                annotations.Add(new TextAnnotation
+                                {
+                                    Start = start,
+                                    End = end,
+                                    Kind = new AnnotationKind { Which = AnnotationKind.Tag.Color, Value = props.Color },
+                                });
+                            if (props.FontSize is not null)
+                                annotations.Add(new TextAnnotation
+                                {
+                                    Start = start,
+                                    End = end,
+                                    Kind = new AnnotationKind { Which = AnnotationKind.Tag.FontSize, Value = props.FontSize },
+                                });
+                        }
+                        break;
+                    }
+                    case "tab":
+                        text.Append('\t');
+                        byteLen += 1;
+                        break;
+                    case "line-break":
+                        text.Append('\n');
+                        byteLen += 1;
+                        break;
+                    case "note":
+                        // Footnotes/endnotes handled separately.
+                        break;
+                    case "a":
+                    {
+                        var linkText = NodeText(el) ?? "";
+                        if (linkText.Length == 0)
+                            continue;
+                        uint start = (uint)byteLen;
+                        text.Append(linkText);
+                        byteLen += Encoding.UTF8.GetByteCount(linkText);
+                        uint end = (uint)byteLen;
+                        var url = OdfStyles.Attr(el, "href") ?? "";
+                        if (url.Length > 0)
+                        {
+                            annotations.Add(new TextAnnotation
+                            {
+                                Start = start,
+                                End = end,
+                                Kind = new AnnotationKind { Which = AnnotationKind.Tag.Link, Url = url, Title = null },
+                            });
+                            var kind = url.StartsWith('#') ? UriKind.Anchor
+                                : url.StartsWith("mailto:", StringComparison.Ordinal) ? UriKind.Email
+                                : UriKind.Hyperlink;
+                            uris.Add(new ExtractedUri { Url = url, Label = linkText, Page = null, Kind = kind });
+                        }
+                        break;
+                    }
+                    default:
+                    {
+                        var t = NodeText(el);
+                        if (t is not null)
+                        {
+                            text.Append(t);
+                            byteLen += Encoding.UTF8.GetByteCount(t);
+                        }
+                        break;
+                    }
+                }
+            }
+            else if (child is XText xt)
+            {
+                text.Append(xt.Value);
+                byteLen += Encoding.UTF8.GetByteCount(xt.Value);
+            }
+        }
+
+        // Fallback: no children produced text → use the node's own direct text.
+        if (text.Length == 0)
+        {
+            var t = NodeText(node);
+            if (t is not null)
+                text.Append(t);
+        }
+
+        return (text.ToString(), annotations, uris);
+    }
+
+    /// <summary>Ports `extract_node_text`: concatenates span/tab/line-break/direct-text of the node's children.</summary>
+    internal static string? ExtractNodeText(XElement node)
+    {
+        var parts = new List<string>();
+        foreach (var child in node.Nodes())
+        {
+            if (child is XElement el)
+            {
+                switch (el.Name.LocalName)
+                {
+                    case "span":
+                    {
+                        var t = NodeText(el);
+                        if (t is not null)
+                            parts.Add(t);
+                        break;
+                    }
+                    case "tab":
+                        parts.Add("\t");
+                        break;
+                    case "line-break":
+                        parts.Add("\n");
+                        break;
+                    default:
+                    {
+                        var t = NodeText(el);
+                        if (t is not null)
+                            parts.Add(t);
+                        break;
+                    }
+                }
+            }
+            else if (child is XText xt)
+            {
+                parts.Add(xt.Value);
+            }
+        }
+
+        if (parts.Count == 0)
+            return NodeText(node);
+        return string.Concat(parts);
+    }
+
+    /// <summary>Ports `extract_frame_description`: svg:title, then svg:desc, then text:p children.</summary>
+    private static string? ExtractFrameDescription(XElement frame)
+    {
+        foreach (var child in frame.Elements())
+        {
+            if (child.Name.LocalName == "title")
+            {
+                var t = NodeText(child)?.Trim();
+                if (!string.IsNullOrEmpty(t))
+                    return t;
+            }
+        }
+        foreach (var child in frame.Elements())
+        {
+            if (child.Name.LocalName == "desc")
+            {
+                var t = NodeText(child)?.Trim();
+                if (!string.IsNullOrEmpty(t))
+                    return t;
+            }
+        }
+        foreach (var child in frame.Elements())
+        {
+            if (child.Name.LocalName == "p")
+            {
+                var t = ExtractNodeText(child)?.Trim();
+                if (!string.IsNullOrEmpty(t))
+                    return t;
+            }
+        }
+        return null;
+    }
+
+    // ── tables ─────────────────────────────────────────────────────────────
+
+    /// <summary>Ports `extract_table_cells`. Handles direct rows and table-header-rows containers.</summary>
+    private static List<List<string>> ExtractTableCells(XElement tableNode)
+    {
+        var rows = new List<List<string>>();
+        foreach (var child in tableNode.Elements())
+        {
+            switch (child.Name.LocalName)
+            {
+                case "table-row":
+                {
+                    var row = ExtractRowCells(child);
+                    if (row is not null)
+                        rows.Add(row);
+                    break;
+                }
+                case "table-header-rows":
+                {
+                    foreach (var rowNode in child.Elements())
+                    {
+                        if (rowNode.Name.LocalName != "table-row")
+                            continue;
+                        var row = ExtractRowCells(rowNode);
+                        if (row is not null)
+                            rows.Add(row);
+                    }
+                    break;
+                }
+            }
+        }
+        return rows;
+    }
+
+    private static List<string>? ExtractRowCells(XElement rowNode)
+    {
+        var rowCells = new List<string>();
+        foreach (var cellNode in rowNode.Elements())
+        {
+            if (cellNode.Name.LocalName != "table-cell")
+                continue;
+            var cellText = ExtractNodeText(cellNode) ?? "";
+            rowCells.Add(cellText.Trim());
+        }
+        return rowCells.Count == 0 ? null : rowCells;
+    }
+
+    // ── image / formula pre-extraction ─────────────────────────────────────
+
+    /// <summary>Ports `pre_extract_images`. Maps <c>Pictures/*</c> href → (bytes, format).</summary>
+    private static Dictionary<string, OdfImage> PreExtractImages(ZipArchive archive)
+    {
+        var images = new Dictionary<string, OdfImage>();
+        foreach (var entry in archive.Entries)
+        {
+            var name = entry.FullName;
+            if (!name.StartsWith("Pictures/", StringComparison.Ordinal))
+                continue;
+
+            int dot = name.LastIndexOf('.');
+            var ext = dot >= 0 ? name[(dot + 1)..].ToLowerInvariant() : "";
+            var format = ext switch
+            {
+                "jpg" or "jpeg" => "jpeg",
+                "png" => "png",
+                "gif" => "gif",
+                "webp" => "webp",
+                "svg" => "svg",
+                "bmp" => "bmp",
+                "tiff" or "tif" => "tiff",
+                _ => "png",
+            };
+
+            var buf = ReadEntryBytes(entry);
+            if (buf.Length > 0)
+                images[name] = new OdfImage(buf, format);
+        }
+        return images;
+    }
+
+    /// <summary>Ports `pre_extract_formulas`. Maps embedded object dirs → MathML text.</summary>
+    private static Dictionary<string, string> PreExtractFormulas(ZipArchive archive)
+    {
+        var formulas = new Dictionary<string, string>();
+        foreach (var entry in archive.Entries)
+        {
+            var name = entry.FullName;
+            if (!name.EndsWith("/content.xml", StringComparison.Ordinal) || name == "content.xml")
+                continue;
+
+            string xml;
+            using (var stream = entry.Open())
+            using (var reader = new StreamReader(stream))
+                xml = reader.ReadToEnd();
+
+            if (!xml.Contains("math", StringComparison.Ordinal))
+                continue;
+
+            var text = ExtractMathmlText(xml);
+            if (text.Length == 0)
+                continue;
+
+            var dir = name[..^"/content.xml".Length];
+            formulas[dir] = text;
+            formulas[dir + "/"] = text;
+        }
+        return formulas;
+    }
+
+    /// <summary>Ports `extract_mathml_text`.</summary>
+    private static string ExtractMathmlText(string xml)
+    {
+        XDocument doc;
+        try
+        {
+            doc = XDocument.Parse(xml, LoadOptions.PreserveWhitespace);
+        }
+        catch
+        {
+            return "";
+        }
+        var root = doc.Root;
+        if (root is null)
+            return "";
+        var tokens = new List<string>();
+        CollectMathmlTokens(root, tokens);
+        return string.Join(" ", tokens);
+    }
+
+    /// <summary>Ports `collect_mathml_tokens`.</summary>
+    private static void CollectMathmlTokens(XElement node, List<string> tokens)
+    {
+        switch (node.Name.LocalName)
+        {
+            case "mi":
+            case "mn":
+            case "mo":
+            case "ms":
+            case "mtext":
+            {
+                var t = NodeText(node)?.Trim();
+                if (!string.IsNullOrEmpty(t))
+                    tokens.Add(t);
+                break;
+            }
+            case "mfrac":
+            {
+                var children = node.Elements().ToList();
+                if (children.Count == 2)
+                {
+                    var num = new List<string>();
+                    CollectMathmlTokens(children[0], num);
+                    var den = new List<string>();
+                    CollectMathmlTokens(children[1], den);
+                    if (num.Count > 0 || den.Count > 0)
+                    {
+                        tokens.Add($"({string.Join(" ", num)})/({string.Join(" ", den)})");
+                        return;
+                    }
+                }
+                foreach (var child in node.Elements())
+                    CollectMathmlTokens(child, tokens);
+                break;
+            }
+            case "msup":
+            {
+                var children = node.Elements().ToList();
+                if (children.Count == 2)
+                {
+                    var baseToks = new List<string>();
+                    CollectMathmlTokens(children[0], baseToks);
+                    var exp = new List<string>();
+                    CollectMathmlTokens(children[1], exp);
+                    tokens.Add($"{string.Join(" ", baseToks)}^{string.Join(" ", exp)}");
+                    return;
+                }
+                foreach (var child in node.Elements())
+                    CollectMathmlTokens(child, tokens);
+                break;
+            }
+            case "msub":
+            {
+                var children = node.Elements().ToList();
+                if (children.Count == 2)
+                {
+                    var baseToks = new List<string>();
+                    CollectMathmlTokens(children[0], baseToks);
+                    var sub = new List<string>();
+                    CollectMathmlTokens(children[1], sub);
+                    tokens.Add($"{string.Join(" ", baseToks)}_{string.Join(" ", sub)}");
+                    return;
+                }
+                foreach (var child in node.Elements())
+                    CollectMathmlTokens(child, tokens);
+                break;
+            }
+            case "msqrt":
+            {
+                var inner = new List<string>();
+                foreach (var child in node.Elements())
+                    CollectMathmlTokens(child, inner);
+                tokens.Add($"sqrt({string.Join(" ", inner)})");
+                break;
+            }
+            default:
+                foreach (var child in node.Elements())
+                    CollectMathmlTokens(child, tokens);
+                break;
+        }
+    }
+
+    // ── small helpers ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Mirrors roxmltree <c>Node::text()</c> for an element: the value of the first child node
+    /// when that child is a text (or CDATA) node, otherwise null.
+    /// </summary>
+    internal static string? NodeText(XElement el)
+    {
+        var first = el.FirstNode;
+        return first is XText t ? t.Value : null;
+    }
+
+    private static IEnumerable<XElement> DescendantsAndSelf(XElement el)
+    {
+        yield return el;
+        foreach (var d in el.Descendants())
+            yield return d;
+    }
+
+    private static TextAnnotation Ann(uint start, uint end, AnnotationKind.Tag tag) =>
+        new() { Start = start, End = end, Kind = new AnnotationKind { Which = tag } };
+
+    // Mirrors Rust `str::trim_start_matches`: strips every leading occurrence of the prefix.
+    private static string TrimStartStr(string s, string prefix)
+    {
+        while (prefix.Length > 0 && s.StartsWith(prefix, StringComparison.Ordinal))
+            s = s[prefix.Length..];
+        return s;
+    }
+
+    private static string? ReadEntry(ZipArchive archive, string name)
+    {
+        var entry = archive.GetEntry(name);
+        if (entry is null)
+            return null;
+        using var stream = entry.Open();
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
+    }
+
+    private static byte[] ReadEntryBytes(ZipArchiveEntry entry)
+    {
+        using var stream = entry.Open();
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        return ms.ToArray();
+    }
+}

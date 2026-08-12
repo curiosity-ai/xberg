@@ -1,0 +1,328 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
+
+namespace Xberg.Types;
+
+/// <summary>Document-level metadata. Field order matches Rust `Metadata`.</summary>
+public sealed class Metadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Title { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Subject { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? Authors { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? Keywords { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Language { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CreatedAt { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? ModifiedAt { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CreatedBy { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? ModifiedBy { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public PageStructure? Pages { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public FormatMetadata? Format { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public object? ImagePreprocessing { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public JsonElement? JsonSchema { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public ErrorMetadata? Error { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public ulong? ExtractionDurationMs { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Category { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? Tags { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? DocumentVersion { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? AbstractText { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? OutputFormat { get; set; }
+    public bool OcrUsed { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public Dictionary<string, JsonElement> Additional { get; set; } = new();
+}
+
+public sealed class ErrorMetadata
+{
+    public string ErrorType { get; set; } = "";
+    public string Message { get; set; } = "";
+}
+
+/// <summary>
+/// Format-specific metadata. Internally-tagged on "format_type"; the converter writes the tag
+/// followed by the payload struct's fields (flattened), matching Rust's serde output.
+/// </summary>
+[JsonConverter(typeof(FormatMetadataConverter))]
+public sealed class FormatMetadata
+{
+    public string FormatType { get; set; } = "text";
+    public object? Payload { get; set; }
+
+    public static FormatMetadata Text(TextMetadata m) => new() { FormatType = "text", Payload = m };
+    public static FormatMetadata Excel(ExcelMetadata m) => new() { FormatType = "excel", Payload = m };
+    public static FormatMetadata Csv(CsvMetadata m) => new() { FormatType = "csv", Payload = m };
+    public static FormatMetadata Html(HtmlMetadata m) => new() { FormatType = "html", Payload = m };
+    public static FormatMetadata Xml(XmlMetadata m) => new() { FormatType = "xml", Payload = m };
+    public static FormatMetadata Image(ImageMetadata m) => new() { FormatType = "image", Payload = m };
+
+    private static readonly Dictionary<string, Type> PayloadTypes = new()
+    {
+        ["text"] = typeof(TextMetadata),
+        ["excel"] = typeof(ExcelMetadata),
+        ["csv"] = typeof(CsvMetadata),
+        ["html"] = typeof(HtmlMetadata),
+        ["xml"] = typeof(XmlMetadata),
+        ["image"] = typeof(ImageMetadata),
+        ["email"] = typeof(EmailMetadata),
+        ["pptx"] = typeof(PptxMetadata),
+        ["docx"] = typeof(DocxMetadata),
+        ["archive"] = typeof(ArchiveMetadata),
+        ["pdf"] = typeof(PdfMetadata),
+        ["bibtex"] = typeof(BibtexMetadata),
+        ["citation"] = typeof(CitationMetadata),
+        ["fiction_book"] = typeof(FictionBookMetadata),
+        ["dbf"] = typeof(DbfMetadata),
+        ["jats"] = typeof(JatsMetadata),
+        ["epub"] = typeof(EpubMetadata),
+        ["pst"] = typeof(PstMetadata),
+    };
+
+    public static Type? TypeForTag(string tag) => PayloadTypes.TryGetValue(tag, out var t) ? t : null;
+}
+
+public sealed class FormatMetadataConverter : JsonConverter<FormatMetadata>
+{
+    public override FormatMetadata Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        using var doc = JsonDocument.ParseValue(ref reader);
+        var root = doc.RootElement;
+        string tag = root.GetProperty("format_type").GetString()!;
+        var payloadType = FormatMetadata.TypeForTag(tag);
+        object? payload = null;
+        if (payloadType is not null)
+            payload = root.Deserialize(payloadType, options);
+        return new FormatMetadata { FormatType = tag, Payload = payload };
+    }
+
+    public override void Write(Utf8JsonWriter writer, FormatMetadata value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("format_type", value.FormatType);
+        if (value.Payload is not null)
+        {
+            var node = JsonSerializer.SerializeToNode(value.Payload, value.Payload.GetType(), options);
+            if (node is JsonObject obj)
+            {
+                foreach (var kvp in obj)
+                {
+                    writer.WritePropertyName(kvp.Key);
+                    (kvp.Value ?? JsonValue.Create((string?)null)).WriteTo(writer, options);
+                }
+            }
+        }
+        writer.WriteEndObject();
+    }
+}
+
+// ============================================================================
+// Format metadata payload structs
+// ============================================================================
+
+public sealed class TextMetadata
+{
+    public uint LineCount { get; set; }
+    public uint WordCount { get; set; }
+    public uint CharacterCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? Headers { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string[]>? Links { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string[]>? CodeBlocks { get; set; }
+}
+
+public sealed class ExcelMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? SheetCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? SheetNames { get; set; }
+}
+
+public sealed class CsvMetadata
+{
+    public uint RowCount { get; set; }
+    public uint ColumnCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Delimiter { get; set; }
+    public bool HasHeader { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? ColumnTypes { get; set; }
+}
+
+public sealed class XmlMetadata
+{
+    public uint ElementCount { get; set; }
+    public List<string> UniqueElements { get; set; } = new();
+}
+
+public sealed class ImageMetadata
+{
+    public uint Width { get; set; }
+    public uint Height { get; set; }
+    public string Format { get; set; } = "";
+    public Dictionary<string, string> Exif { get; set; } = new();
+}
+
+public enum TextDirection
+{
+    [JsonStringEnumMemberName("ltr")] LeftToRight,
+    [JsonStringEnumMemberName("rtl")] RightToLeft,
+    [JsonStringEnumMemberName("auto")] Auto,
+}
+
+public enum LinkType
+{
+    [JsonStringEnumMemberName("anchor")] Anchor,
+    [JsonStringEnumMemberName("internal")] Internal,
+    [JsonStringEnumMemberName("external")] External,
+    [JsonStringEnumMemberName("email")] Email,
+    [JsonStringEnumMemberName("phone")] Phone,
+    [JsonStringEnumMemberName("other")] Other,
+}
+
+public enum ImageTypeKind
+{
+    [JsonStringEnumMemberName("data-uri")] DataUri,
+    [JsonStringEnumMemberName("inline-svg")] InlineSvg,
+    [JsonStringEnumMemberName("external")] External,
+    [JsonStringEnumMemberName("relative")] Relative,
+}
+
+public enum StructuredDataType
+{
+    [JsonStringEnumMemberName("json-ld")] JsonLd,
+    [JsonStringEnumMemberName("microdata")] Microdata,
+    [JsonStringEnumMemberName("rdfa")] RDFa,
+}
+
+public sealed class HtmlMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Title { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Description { get; set; }
+    public List<string> Keywords { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Author { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CanonicalUrl { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? BaseHref { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Language { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public TextDirection? TextDirection { get; set; }
+    public Dictionary<string, string> OpenGraph { get; set; } = new();
+    public Dictionary<string, string> TwitterCard { get; set; } = new();
+    public Dictionary<string, string> MetaTags { get; set; } = new();
+    public List<object> Headers { get; set; } = new();
+    public List<object> Links { get; set; } = new();
+    public List<object> Images { get; set; } = new();
+    public List<object> StructuredData { get; set; } = new();
+}
+
+// --- Stub payloads for the less-common format variants ---
+
+public sealed class EmailMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? FromEmail { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? FromName { get; set; }
+    public List<string> ToEmails { get; set; } = new();
+    public List<string> CcEmails { get; set; } = new();
+    public List<string> BccEmails { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? MessageId { get; set; }
+    public List<string> Attachments { get; set; } = new();
+}
+
+public sealed class PptxMetadata
+{
+    public uint SlideCount { get; set; }
+    public List<string> SlideNames { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? ImageCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? TableCount { get; set; }
+}
+
+public sealed class DocxMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public JsonElement? CoreProperties { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public JsonElement? AppProperties { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public Dictionary<string, JsonElement>? CustomProperties { get; set; }
+}
+
+public sealed class ArchiveMetadata
+{
+    public string Format { get; set; } = "";
+    public uint FileCount { get; set; }
+    public List<string> FileList { get; set; } = new();
+    public ulong TotalSize { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public ulong? CompressedSize { get; set; }
+}
+
+public sealed class PdfMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? PdfVersion { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Producer { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? IsEncrypted { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public long? Width { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public long? Height { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? PageCount { get; set; }
+}
+
+/// <summary>Year range for bibliographic metadata (Rust `YearRange`).</summary>
+public sealed class YearRange
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? Min { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? Max { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<uint> Years { get; set; } = new();
+}
+
+public sealed class BibtexMetadata
+{
+    public long EntryCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> CitationKeys { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Authors { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public YearRange? YearRange { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public SortedDictionary<string, long>? EntryTypes { get; set; }
+}
+
+public sealed class CitationMetadata
+{
+    public long CitationCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Format { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Authors { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public YearRange? YearRange { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Dois { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Keywords { get; set; } = new();
+}
+
+public sealed class FictionBookMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Genres { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<string> Sequences { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Annotation { get; set; }
+}
+
+public sealed class DbfFieldInfo
+{
+    public string Name { get; set; } = "";
+    public string FieldType { get; set; } = "";
+}
+
+public sealed class DbfMetadata
+{
+    public long RecordCount { get; set; }
+    public long FieldCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<DbfFieldInfo> Fields { get; set; } = new();
+}
+
+public sealed class ContributorRole
+{
+    public string Name { get; set; } = "";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Role { get; set; }
+}
+
+public sealed class JatsMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Copyright { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? License { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public SortedDictionary<string, string> HistoryDates { get; set; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public List<ContributorRole> ContributorRoles { get; set; } = new();
+}
+public sealed class EpubMetadata
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Coverage { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? DcFormat { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Relation { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Source { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? DcType { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CoverImage { get; set; }
+}
+public sealed class PstMetadata { public long MessageCount { get; set; } }

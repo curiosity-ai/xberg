@@ -1,0 +1,154 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Xberg.Types;
+
+namespace Xberg.Core;
+
+/// <summary>
+/// Output format. Known variants serialize as lowercase strings ("plain", "markdown", "djot",
+/// "html", "json", "structured"); <see cref="Custom"/> serializes as its bare renderer name.
+/// Default = Plain. Mirrors Rust `OutputFormat` (FromStr / Display).
+/// </summary>
+[JsonConverter(typeof(OutputFormatConverter))]
+public readonly struct OutputFormat : IEquatable<OutputFormat>
+{
+    public enum Kind { Plain, Markdown, Djot, Html, Json, Structured, Custom }
+
+    public Kind Which { get; }
+    public string? CustomName { get; }
+
+    private OutputFormat(Kind which, string? customName = null)
+    {
+        Which = which;
+        CustomName = customName;
+    }
+
+    public static readonly OutputFormat Plain = new(Kind.Plain);
+    public static readonly OutputFormat Markdown = new(Kind.Markdown);
+    public static readonly OutputFormat Djot = new(Kind.Djot);
+    public static readonly OutputFormat Html = new(Kind.Html);
+    public static readonly OutputFormat Json = new(Kind.Json);
+    public static readonly OutputFormat Structured = new(Kind.Structured);
+    public static OutputFormat Custom(string name) => new(Kind.Custom, name);
+
+    /// <summary>Parse from a string (never fails; unknown → Custom of the lowercased string).</summary>
+    public static OutputFormat FromString(string s)
+    {
+        string lower = s.ToLowerInvariant();
+        return lower switch
+        {
+            "plain" or "text" => Plain,
+            "markdown" or "md" => Markdown,
+            "djot" => Djot,
+            "html" => Html,
+            "json" => Json,
+            "structured" or "structured-ocr" => Structured,
+            _ => Custom(lower),
+        };
+    }
+
+    public override string ToString() => Which switch
+    {
+        Kind.Plain => "plain",
+        Kind.Markdown => "markdown",
+        Kind.Djot => "djot",
+        Kind.Html => "html",
+        Kind.Json => "json",
+        Kind.Structured => "structured",
+        Kind.Custom => CustomName ?? "",
+        _ => "plain",
+    };
+
+    public bool Equals(OutputFormat other) => Which == other.Which && CustomName == other.CustomName;
+    public override bool Equals(object? obj) => obj is OutputFormat o && Equals(o);
+    public override int GetHashCode() => HashCode.Combine(Which, CustomName);
+    public static bool operator ==(OutputFormat a, OutputFormat b) => a.Equals(b);
+    public static bool operator !=(OutputFormat a, OutputFormat b) => !a.Equals(b);
+}
+
+public sealed class OutputFormatConverter : JsonConverter<OutputFormat>
+{
+    public override OutputFormat Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+        OutputFormat.FromString(reader.GetString() ?? "plain");
+
+    public override void Write(Utf8JsonWriter writer, OutputFormat value, JsonSerializerOptions options) =>
+        writer.WriteStringValue(value.ToString());
+}
+
+/// <summary>Trimmed, native-only extraction configuration.</summary>
+public sealed class ExtractionConfig
+{
+    public ResultFormat ResultFormat { get; set; } = ResultFormat.Unified;
+    public OutputFormat OutputFormat { get; set; } = OutputFormat.Plain;
+    public bool IncludeDocumentStructure { get; set; }
+
+    // Content-relevant option stubs (defaults; extractors read these later).
+    public bool ExtractImages { get; set; } = true;
+    public bool ExtractTables { get; set; } = true;
+}
+
+/// <summary>Kind of extraction input. Serialized as bare snake_case string.</summary>
+public enum ExtractInputKind
+{
+    Bytes,
+    Uri,
+}
+
+/// <summary>An extraction input: raw bytes with a MIME type, or a URI/path.</summary>
+public sealed class ExtractInput
+{
+    public ExtractInputKind Kind { get; set; } = ExtractInputKind.Uri;
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public byte[]? Bytes { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Uri { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? MimeType { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Filename { get; set; }
+
+    public static ExtractInput FromBytes(byte[] bytes, string mimeType, string? filename = null) => new()
+    {
+        Kind = ExtractInputKind.Bytes,
+        Bytes = bytes,
+        MimeType = mimeType,
+        Filename = filename,
+    };
+
+    public static ExtractInput FromUri(string uri) => new()
+    {
+        Kind = ExtractInputKind.Uri,
+        Uri = uri,
+    };
+}
+
+public sealed class ExtractionErrorItem
+{
+    public long Index { get; set; }
+    public uint Code { get; set; }
+    public string ErrorType { get; set; } = "";
+    public string Source { get; set; } = "";
+    public string Message { get; set; } = "";
+}
+
+public sealed class ExtractionSummary
+{
+    public long Inputs { get; set; }
+    public long Results { get; set; }
+    public long Errors { get; set; }
+}
+
+/// <summary>Batch envelope of extraction results plus per-input errors.</summary>
+public sealed class ExtractionResult
+{
+    public List<ExtractedDocument> Results { get; set; } = new();
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public List<ExtractionErrorItem> Errors { get; set; } = new();
+
+    public ExtractionSummary Summary { get; set; } = new();
+}

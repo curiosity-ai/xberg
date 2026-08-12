@@ -1,0 +1,299 @@
+// PDF font model for text extraction: simple fonts (Type1/TrueType/Type3) and
+// composite Type0/CID fonts. Provides code iteration, code→Unicode, and glyph widths.
+// Ports the text-relevant behaviour of pdf_oxide's FontInfo (crates/pdf/oxide).
+
+namespace Xberg.Internal.Pdf;
+
+public sealed class PdfFont
+{
+    public bool IsType0;
+    public string BaseFont = "";
+    public string Subtype = "";
+
+    // Simple font: code (0-255) -> unicode string (from encoding + Differences).
+    private string[]? _encoding;
+    // Simple font widths.
+    private Dictionary<int, double>? _widths;
+    public int FirstChar;
+    public double MissingWidth;
+    // pdf_oxide default_width (fonts/font_dict.rs): 600 fixed-pitch / 500
+    // proportional / 550 when the descriptor carries no /Flags. Used as the final
+    // width fallback for simple fonts (after /Widths and Standard-14 AFM metrics).
+    private double _simpleDefaultWidth = 550.0;
+    // Standard-14 AFM metrics, resolved once from BaseFont (null if not a Standard-14).
+    private Fonts.StandardFonts.Metrics? _afm;
+
+    // ToUnicode (both simple and Type0).
+    private PdfCMap? _toUnicode;
+
+    // Type0: encoding CMap (bytes->code, code->CID), CID widths.
+    private PdfCMap? _cmap;
+    private Dictionary<int, double>? _cidWidths;
+    public double DefaultWidth = 1000.0;
+
+    public bool IsBold;
+    public bool IsItalic;
+    public bool IsMonospace;
+    public double FontMatrixA = 0.001;
+    public double Ascent = 0.95;
+    public double Descent = -0.35;
+
+    public static PdfFont Load(PdfDict fontDict, PdfDocument doc)
+    {
+        var f = new PdfFont();
+        f.Subtype = doc.Resolve(fontDict.Get("Subtype")).AsName() ?? "";
+        f.BaseFont = doc.Resolve(fontDict.Get("BaseFont")).AsName() ?? "";
+
+        // ToUnicode
+        if (doc.Resolve(fontDict.Get("ToUnicode")) is PdfStream tuStream)
+        {
+            try { f._toUnicode = PdfCMap.ParseToUnicode(doc.DecodeStream(tuStream)); }
+            catch { f._toUnicode = null; }
+        }
+
+        if (f.Subtype == "Type0")
+        {
+            f.IsType0 = true;
+            LoadType0(f, fontDict, doc);
+        }
+        else
+        {
+            LoadSimple(f, fontDict, doc);
+        }
+        // Bold/italic hint from base font name.
+        string bf = f.BaseFont.ToLowerInvariant();
+        if (bf.Contains("bold")) f.IsBold = true;
+        if (bf.Contains("italic") || bf.Contains("oblique")) f.IsItalic = true;
+        if (bf.Contains("mono") || bf.Contains("courier") || bf.Contains("consol")) f.IsMonospace = true;
+        return f;
+    }
+
+    private static void LoadSimple(PdfFont f, PdfDict fontDict, PdfDocument doc)
+    {
+        // Base encoding.
+        string[] baseEnc;
+        bool symbolic = false;
+        var descriptor = doc.Resolve(fontDict.Get("FontDescriptor")).AsDict();
+        if (descriptor != null)
+        {
+            var flagsObj = doc.Resolve(descriptor.Get("Flags"));
+            int flags = (int)(flagsObj.AsLong() ?? 0);
+            symbolic = (flags & 4) != 0 && (flags & 32) == 0;
+            if ((flags & (1 << 18)) != 0) f.IsBold = true;
+            if ((flags & (1 << 6)) != 0) f.IsItalic = true;
+            if ((flags & 1) != 0) f.IsMonospace = true;
+            // pdf_oxide default_width from FixedPitch flag (bit 1).
+            if (flagsObj is PdfNumber) f._simpleDefaultWidth = (flags & 1) != 0 ? 600.0 : 500.0;
+            f.MissingWidth = doc.Resolve(descriptor.Get("MissingWidth")).AsNumber() ?? 0;
+            var asc = doc.Resolve(descriptor.Get("Ascent")).AsNumber();
+            var desc = doc.Resolve(descriptor.Get("Descent")).AsNumber();
+            if (asc.HasValue && asc.Value != 0) f.Ascent = asc.Value / 1000.0;
+            if (desc.HasValue && desc.Value != 0) f.Descent = desc.Value / 1000.0;
+        }
+
+        var encObj = doc.Resolve(fontDict.Get("Encoding"));
+        string? baseName = null;
+        PdfArray? diffs = null;
+        if (encObj is PdfName en) baseName = en.Value;
+        else if (encObj.AsDict() is PdfDict ed)
+        {
+            baseName = doc.Resolve(ed.Get("BaseEncoding")).AsName();
+            diffs = doc.Resolve(ed.Get("Differences")).AsArray();
+        }
+
+        baseEnc = PdfEncodings.ByName(baseName)
+            ?? (f.Subtype == "TrueType" && !symbolic ? PdfEncodings.WinAnsi : PdfEncodings.Standard);
+        // Type3 FontMatrix
+        if (f.Subtype == "Type3" && doc.Resolve(fontDict.Get("FontMatrix")).AsArray() is PdfArray fm && fm.Items.Count >= 1)
+        {
+            f.FontMatrixA = doc.Resolve(fm.Items[0]).AsNumber() ?? 0.001;
+            // pdf_oxide rescales default_width so callers multiplying by font_matrix_a
+            // still yield the intended em fraction when the matrix isn't 1/1000.
+            if (f.FontMatrixA != 0.001 && f.FontMatrixA != 0.0)
+                f._simpleDefaultWidth = f._simpleDefaultWidth * 0.001 / f.FontMatrixA;
+        }
+
+        var enc = new string[256];
+        Array.Copy(baseEnc, enc, 256);
+        if (diffs != null)
+        {
+            int cur = 0;
+            foreach (var it in diffs.Items)
+            {
+                var r = doc.Resolve(it);
+                if (r is PdfNumber n) cur = (int)n.Value;
+                else if (r is PdfName gn)
+                {
+                    if (cur >= 0 && cur < 256) enc[cur] = PdfEncodings.GlyphNameToUnicode(gn.Value);
+                    cur++;
+                }
+            }
+        }
+
+        // Symbolic standard fonts: per spec 9.6.6.1 (and pdf_oxide's priority order) a
+        // symbolic font named *Symbol* / *Zapf* / *Dingbat* maps through its BUILT-IN
+        // encoding, overriding /Encoding and /Differences. Symbolic = descriptor flag
+        // bit 3 when present, else inferred from the base font name (standard-14
+        // Symbol/ZapfDingbats often carry no descriptor).
+        string bfLower = f.BaseFont.ToLowerInvariant();
+        bool symbolicFont = descriptor != null
+            ? (doc.Resolve(descriptor.Get("Flags")).AsLong() is long fl && (fl & 4) != 0)
+            : bfLower.Contains("symbol") || bfLower.Contains("zapf") || bfLower.Contains("dingbat");
+        string?[]? builtIn = null;
+        if (symbolicFont && bfLower.Contains("symbol")) builtIn = PdfEncodings.Symbol;
+        else if (symbolicFont && (bfLower.Contains("zapf") || bfLower.Contains("dingbat"))) builtIn = PdfEncodings.ZapfDingbats;
+        if (builtIn != null)
+            for (int c = 0; c < 256; c++)
+                if (builtIn[c] is string s) enc[c] = s;
+
+        f._encoding = enc;
+
+        // Standard-14 AFM metrics (resolved once; used when /Widths lacks a code).
+        f._afm = Fonts.StandardFonts.Resolve(f.BaseFont);
+
+        // Widths
+        f.FirstChar = (int)(doc.Resolve(fontDict.Get("FirstChar")).AsLong() ?? 0);
+        var wArr = doc.Resolve(fontDict.Get("Widths")).AsArray();
+        if (wArr != null)
+        {
+            f._widths = new Dictionary<int, double>();
+            for (int i = 0; i < wArr.Items.Count; i++)
+            {
+                double w = doc.Resolve(wArr.Items[i]).AsNumber() ?? 0;
+                f._widths[f.FirstChar + i] = w;
+            }
+        }
+    }
+
+    private static void LoadType0(PdfFont f, PdfDict fontDict, PdfDocument doc)
+    {
+        var encObj = doc.Resolve(fontDict.Get("Encoding"));
+        if (encObj is PdfName en)
+        {
+            if (en.Value.StartsWith("Identity")) f._cmap = PdfCMap.Identity(2);
+            else f._cmap = PdfCMap.Identity(2); // predefined CJK CMaps approximated as 2-byte identity
+        }
+        else if (encObj is PdfStream cmapStream)
+        {
+            try { f._cmap = PdfCMap.ParseCid(doc.DecodeStream(cmapStream)); }
+            catch { f._cmap = PdfCMap.Identity(2); }
+        }
+        else f._cmap = PdfCMap.Identity(2);
+
+        var descFonts = doc.Resolve(fontDict.Get("DescendantFonts")).AsArray();
+        PdfDict? cidFont = null;
+        if (descFonts != null && descFonts.Items.Count > 0) cidFont = doc.Resolve(descFonts.Items[0]).AsDict();
+        if (cidFont != null)
+        {
+            f.DefaultWidth = doc.Resolve(cidFont.Get("DW")).AsNumber() ?? 1000.0;
+            var wArr = doc.Resolve(cidFont.Get("W")).AsArray();
+            if (wArr != null) f._cidWidths = ParseCidWidths(wArr, doc);
+            var descriptor = doc.Resolve(cidFont.Get("FontDescriptor")).AsDict();
+            if (descriptor != null)
+            {
+                int flags = (int)(doc.Resolve(descriptor.Get("Flags")).AsLong() ?? 0);
+                if ((flags & (1 << 18)) != 0) f.IsBold = true;
+                if ((flags & (1 << 6)) != 0) f.IsItalic = true;
+                var asc = doc.Resolve(descriptor.Get("Ascent")).AsNumber();
+                var desc = doc.Resolve(descriptor.Get("Descent")).AsNumber();
+                if (asc.HasValue && asc.Value != 0) f.Ascent = asc.Value / 1000.0;
+                if (desc.HasValue && desc.Value != 0) f.Descent = desc.Value / 1000.0;
+            }
+        }
+    }
+
+    private static Dictionary<int, double> ParseCidWidths(PdfArray w, PdfDocument doc)
+    {
+        var map = new Dictionary<int, double>();
+        int i = 0;
+        while (i < w.Items.Count)
+        {
+            var first = doc.Resolve(w.Items[i]);
+            if (first is not PdfNumber c) { i++; continue; }
+            if (i + 1 >= w.Items.Count) break;
+            var second = doc.Resolve(w.Items[i + 1]);
+            if (second is PdfArray arr)
+            {
+                int cid = (int)c.Value;
+                foreach (var it in arr.Items)
+                    map[cid++] = doc.Resolve(it).AsNumber() ?? 0;
+                i += 2;
+            }
+            else if (second is PdfNumber c2 && i + 2 < w.Items.Count)
+            {
+                double wv = doc.Resolve(w.Items[i + 2]).AsNumber() ?? 0;
+                for (int cid = (int)c.Value; cid <= (int)c2.Value; cid++) map[cid] = wv;
+                i += 3;
+            }
+            else i++;
+        }
+        return map;
+    }
+
+    /// <summary>Split a show-text byte string into character codes.</summary>
+    public IEnumerable<int> DecodeCodes(byte[] bytes)
+    {
+        if (!IsType0)
+        {
+            foreach (var b in bytes) yield return b;
+            yield break;
+        }
+        var cmap = _cmap ?? PdfCMap.Identity(2);
+        int pos = 0;
+        while (pos < bytes.Length)
+        {
+            int len = cmap.MatchCodeLength(bytes, pos);
+            if (len <= 0) len = 1;
+            if (pos + len > bytes.Length) len = bytes.Length - pos;
+            int code = 0;
+            for (int i = 0; i < len; i++) code = (code << 8) | bytes[pos + i];
+            pos += len;
+            yield return code;
+        }
+    }
+
+    // Note: pdf_oxide only expands ligature chars (U+FB00–06 → "fi"/"fl"…) when the
+    // mapping comes from a parsed embedded font-program encoding — NOT from ToUnicode.
+    // Since this port doesn't parse embedded CFF/TrueType programs, we return the raw
+    // Unicode (matching pdf_oxide's ToUnicode path, which is the common case).
+    public string CharToUnicode(int code)
+    {
+        if (_toUnicode != null)
+        {
+            var s = _toUnicode.LookupUnicode(code);
+            if (s != null) return s;
+        }
+        if (!IsType0)
+        {
+            if (_encoding != null && code >= 0 && code < 256)
+            {
+                var s = _encoding[code];
+                if (!string.IsNullOrEmpty(s)) return s;
+            }
+            if (code >= 32 && code < 127) return ((char)code).ToString();
+            return "";
+        }
+        // Type0 without ToUnicode: last resort, treat CID as unicode if plausible.
+        int? cid = _cmap?.LookupCid(code);
+        if (cid.HasValue && cid.Value >= 32 && cid.Value < 0xFFFE) return ((char)cid.Value).ToString();
+        return "";
+    }
+
+    /// <summary>Glyph advance width in glyph-space units (1/1000 em typically).</summary>
+    public double GlyphWidth(int code)
+    {
+        if (!IsType0)
+        {
+            // pdf_oxide get_glyph_width order: /Widths (covered code) → Standard-14
+            // AFM metrics → default_width. MissingWidth is intentionally NOT consulted
+            // here (pdf_oxide uses the flags-derived default_width instead).
+            if (_widths != null && _widths.TryGetValue(code, out var w)) return w;
+            var afm = _afm?.Width(code);
+            if (afm.HasValue) return afm.Value;
+            return _simpleDefaultWidth;
+        }
+        int cid = _cmap?.LookupCid(code) ?? code;
+        if (_cidWidths != null && _cidWidths.TryGetValue(cid, out var cw)) return cw;
+        return DefaultWidth;
+    }
+}

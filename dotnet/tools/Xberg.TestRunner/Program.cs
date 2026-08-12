@@ -1,0 +1,466 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Xberg.Core;
+using Xberg.Types;
+
+// Xberg C# port — golden parity harness.
+//
+// Walks a test_documents tree for `{filename}-results-rust.json` golden files (produced by
+// tools/xberg-reference-gen against the original Rust library), runs the C# extractor over the
+// same source file in each output format, and diffs the result against the golden.
+//
+// Usage:
+//   xberg-testrunner <root-dir> [options]
+//     --filter <substr>   only fixtures whose relative path contains <substr> (e.g. "docx")
+//     --ext <ext>         only fixtures with this source extension (e.g. "docx")
+//     --show <N>          print up to N example mismatches per dimension (default 5)
+//     --diff              print a short unified-ish diff for mismatches
+//     --strict-md         count markdown/html mismatches as failures (default: soft/reported)
+//     --list-ok           also list fixtures that fully match
+
+// Single-file extract mode: `--extract <file> [--format plain|markdown|html|json]`
+// Prints the C# extractor's output for one file (used to build the quality gallery).
+if (args.Length >= 2 && args[0] == "--extract")
+{
+    var fmt = OutputFormat.Plain;
+    for (int i = 2; i < args.Length - 1; i++)
+        if (args[i] == "--format") fmt = OutputFormat.FromString(args[i + 1]);
+    var res = new Extractor().Extract(ExtractInput.FromUri(args[1]), new ExtractionConfig { OutputFormat = fmt });
+    Console.Out.Write(res.Results.FirstOrDefault()?.Content ?? "");
+    return 0;
+}
+
+var opts = ParseArgs(args);
+if (opts is null) return 2;
+
+var goldenFiles = Directory
+    .EnumerateFiles(opts.Root, "*-results-rust.json", SearchOption.AllDirectories)
+    .OrderBy(p => p, StringComparer.Ordinal)
+    .ToList();
+
+if (goldenFiles.Count == 0)
+{
+    Console.Error.WriteLine($"No *-results-rust.json golden files under {opts.Root}");
+    return 2;
+}
+
+var extractor = new Extractor();
+var stats = new Stats();
+var examples = new Dictionary<string, List<string>>();
+
+foreach (var goldenPath in goldenFiles)
+{
+    var sourcePath = goldenPath[..^"-results-rust.json".Length];
+    var rel = Path.GetRelativePath(opts.Root, sourcePath).Replace('\\', '/');
+    var ext = Path.GetExtension(sourcePath).TrimStart('.').ToLowerInvariant();
+
+    if (opts.Filter is not null && !rel.Contains(opts.Filter, StringComparison.OrdinalIgnoreCase)) continue;
+    if (opts.Ext is not null && !ext.Equals(opts.Ext, StringComparison.OrdinalIgnoreCase)) continue;
+    if (!File.Exists(sourcePath)) { stats.NoSource++; continue; }
+
+    JsonNode golden;
+    try { golden = JsonNode.Parse(File.ReadAllText(goldenPath))!; }
+    catch { stats.BadGolden++; continue; }
+
+    stats.Total++;
+    stats.ByExt.TryAdd(ext, new ExtStat());
+    var es = stats.ByExt[ext];
+    es.Total++;
+
+    bool rustSuccess = golden["success"]?.GetValue<bool>() ?? true;
+
+    // Run the C# extractor for each output format.
+    var got = new Dictionary<string, string>();
+    ExtractedDocument? plainDoc = null;
+    bool csharpFailed = false;
+    foreach (var (name, fmt) in Formats())
+    {
+        try
+        {
+            // Per-file guard: a pathological fixture must not stall the whole sweep.
+            var capturedPath = sourcePath;
+            var task = System.Threading.Tasks.Task.Run(() =>
+                extractor.Extract(ExtractInput.FromUri(capturedPath), new ExtractionConfig { OutputFormat = fmt }));
+            if (!task.Wait(TimeSpan.FromSeconds(20)))
+            {
+                csharpFailed = true;
+                got[name] = "";
+                Console.Error.WriteLine($"TIMEOUT {name} {rel}");
+                continue;
+            }
+            var doc = task.Result.Results.FirstOrDefault();
+            got[name] = doc?.Content ?? "";
+            if (name == "plain") plainDoc = doc;
+        }
+        catch
+        {
+            csharpFailed = true;
+            got[name] = "";
+        }
+    }
+
+    // Both sides couldn't handle it → not a regression; count separately.
+    bool csharpEmpty = string.IsNullOrEmpty(got["plain"]) && (plainDoc is null || plainDoc.Metadata.Format is null);
+    if (!rustSuccess)
+    {
+        if (csharpFailed || csharpEmpty) { es.BothUnsupported++; stats.BothUnsupported++; }
+        else { es.Extra++; stats.Extra++; }
+        continue;
+    }
+
+    // Rust succeeded — measure each dimension.
+    bool allHard = true;
+    foreach (var (name, _) in Formats())
+    {
+        string want = golden["content"]?[name]?.GetValue<string>() ?? "";
+        string have = got[name];
+        bool soft = name is "markdown" or "html" && !opts.StrictMd;
+        bool match = name is "plain" or "json"
+            ? want == have
+            : NormalizeText(want) == NormalizeText(have);
+
+        var dim = es.Dim(name);
+        if (match) dim.Match++;
+        else
+        {
+            dim.Mismatch++;
+            if (!soft) allHard = false;
+            AddExample(examples, $"{name}", rel, want, have, opts);
+            if (opts.Dump is not null)
+            {
+                var safe = rel.Replace('/', '_');
+                Directory.CreateDirectory(opts.Dump);
+                File.WriteAllText(Path.Combine(opts.Dump, $"{safe}.{name}.rust.txt"), want);
+                File.WriteAllText(Path.Combine(opts.Dump, $"{safe}.{name}.cs.txt"), have);
+            }
+        }
+    }
+
+    // Metadata + tables (structural).
+    bool metaMatch = JsonEquivalent(golden["metadata"], SerializeToNode(plainDoc?.Metadata), MetadataNormalizer);
+    if (metaMatch) es.MetaMatch++; else { es.MetaMismatch++; allHard = false; AddExample(examples, "metadata", rel, Compact(golden["metadata"]), Compact(SerializeToNode(plainDoc?.Metadata)), opts); }
+
+    bool tablesMatch = JsonEquivalent(golden["tables"], SerializeToNode(plainDoc?.Tables), TablesNormalizer);
+    if (tablesMatch) es.TablesMatch++; else { es.TablesMismatch++; allHard = false; AddExample(examples, "tables", rel, Compact(golden["tables"]), Compact(SerializeToNode(plainDoc?.Tables)), opts); }
+
+    if (allHard) { es.Ok++; stats.Ok++; if (opts.ListOk) Console.WriteLine($"  ok  {rel}"); }
+
+    // ── Content-parity (separate from byte-parity) ──────────────────────────
+    // Byte-parity penalises us for cosmetic and even for being-more-correct-than-Rust
+    // differences. Content-parity asks the honest question: is the extracted TEXT the
+    // same, ignoring whitespace/spacing and reading-order? Measured on the plain text.
+    {
+        string rustPlain = golden["content"]?["plain"]?.GetValue<string>() ?? "";
+        string csPlain = got["plain"];
+        if (rustPlain == csPlain) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
+        else if (NormalizeText(rustPlain) == NormalizeText(csPlain)) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
+        else if (NormalizeSorted(rustPlain) == NormalizeSorted(csPlain)) { stats.ContentOrder++; stats.ContentClose++; }
+        else
+        {
+            double r = Similarity(rustPlain, csPlain);
+            if (r >= 0.95) stats.ContentClose++;
+            else if (r >= 0.80) stats.ContentPartial++;
+            else stats.ContentLow++;
+
+            // Record real content losses: Rust extracted clean, substantial text and we
+            // produced meaningfully less of it (not just reformatted / reordered).
+            bool rClean = GarbageRatio(rustPlain) < 0.02 && NormalizeText(rustPlain).Length >= 40;
+            if (r < 0.80 && rClean && NormalizeText(csPlain).Length < NormalizeText(rustPlain).Length * 0.9)
+                stats.Misses.Add(new MissRow(ext, rel, rustPlain.Length, csPlain.Length, r));
+        }
+
+        // ── Catastrophe audit (judges OUR output on its own merits) ──────────
+        // A catastrophe = output a human would call broken, independent of Rust parity:
+        //   crash, timeout, empty-when-there-is-content, mojibake, severe under-extraction.
+        // Only flag output WE broke relative to Rust — if the Rust reference is itself
+        // garbage/binary/empty on a fixture, matching it is correct, not a catastrophe.
+        string? cat = null;
+        double csGarbage = GarbageRatio(csPlain);
+        double rustGarbage = GarbageRatio(rustPlain);
+        bool rustClean = rustGarbage < 0.02;
+        bool rustHadContent = NormalizeText(rustPlain).Length >= 40 && rustClean;
+        if (csharpFailed && csPlain.Length == 0) cat = "CRASH/TIMEOUT (threw or hung; Rust succeeded)";
+        else if (csGarbage > 0.02 && csGarbage > rustGarbage + 0.02) cat = $"MOJIBAKE ({csGarbage:P0} vs Rust {rustGarbage:P0})";
+        else if (rustHadContent && NormalizeText(csPlain).Length == 0) cat = "EMPTY (Rust extracted text, we got nothing)";
+        else if (rustHadContent && csPlain.Length < rustPlain.Length * 0.25) cat = $"SEVERE UNDER-EXTRACTION ({csPlain.Length}/{rustPlain.Length} chars)";
+        if (cat is not null)
+        {
+            stats.Catastrophes++;
+            if (stats.CatastropheList.Count < 60) stats.CatastropheList.Add($"  [{ext}] {rel}  →  {cat}");
+        }
+    }
+}
+
+PrintReport(stats, examples, opts);
+Console.WriteLine();
+Console.WriteLine("─── Content parity (plain text; whitespace/order-normalized) ───");
+int cTotal = stats.Total;
+Console.WriteLine($"  content-identical (ws/order-normalized): {stats.ContentExact + stats.ContentOrder}  ({Pct(stats.ContentExact + stats.ContentOrder, cTotal)})");
+Console.WriteLine($"  ≥95% similar (near-identical):           {stats.ContentClose}  ({Pct(stats.ContentClose, cTotal)})");
+Console.WriteLine($"  80–95% similar (minor content drift):    {stats.ContentPartial}");
+Console.WriteLine($"  <80% similar (real content miss):        {stats.ContentLow}");
+Console.WriteLine();
+Console.WriteLine($"─── Catastrophe audit (broken output, judged on its own merits) ───");
+Console.WriteLine($"  catastrophes: {stats.Catastrophes}  ({Pct(stats.Catastrophes, cTotal)} of fixtures)");
+foreach (var line in stats.CatastropheList) Console.WriteLine(line);
+
+Console.WriteLine();
+Console.WriteLine($"─── Content losses (Rust caught clean text we under-extract) — {stats.Misses.Count} fixtures ───");
+// Group by extension: count + total chars lost, worst formats first.
+foreach (var g in stats.Misses.GroupBy(m => m.Ext)
+                              .Select(g => new { Ext = g.Key, N = g.Count(), Lost = g.Sum(m => (long)(m.RustLen - m.CsLen)) })
+                              .OrderByDescending(g => g.Lost))
+    Console.WriteLine($"  {g.Ext,-8} {g.N,4} fixtures   {g.Lost,10:N0} chars lost");
+Console.WriteLine("  ── worst 40 individual fixtures (by chars lost) ──");
+foreach (var m in stats.Misses.OrderByDescending(m => m.RustLen - m.CsLen).Take(40))
+    Console.WriteLine($"  [{m.Ext,-6}] rust={m.RustLen,8:N0}  cs={m.CsLen,8:N0}  sim={m.Sim:F2}  {m.Rel}");
+return 0;
+
+static string Pct(int n, int d) => d == 0 ? "—" : $"{100.0 * n / d:F1}%";
+
+// Fraction of chars that are U+FFFD (mojibake) or C0/C1 control (excluding \t\n\r).
+static double GarbageRatio(string s)
+{
+    if (s.Length == 0) return 0;
+    int bad = 0;
+    foreach (char c in s)
+        if (c == '�' || (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || (c >= 0x7F && c <= 0x9F))
+            bad++;
+    return (double)bad / s.Length;
+}
+
+// Whitespace + line-order insensitive (catches pure reading-order differences).
+static string NormalizeSorted(string s)
+{
+    var lines = s.Split('\n').Select(l => NormalizeText(l)).Where(l => l.Length > 0).ToList();
+    lines.Sort(StringComparer.Ordinal);
+    return string.Join("\n", lines);
+}
+
+static double Similarity(string a, string b)
+{
+    // Bounded LCS-ratio on capped inputs (cheap, good enough for bucketing).
+    const int cap = 2500;  // LCS is O(n*m); a small cap keeps similarity bucketing cheap
+    if (a.Length > cap) a = a[..cap];
+    if (b.Length > cap) b = b[..cap];
+    if (a.Length == 0 && b.Length == 0) return 1.0;
+    int lcs = Lcs(a, b);
+    return 2.0 * lcs / (a.Length + b.Length);
+}
+
+static int Lcs(string a, string b)
+{
+    var prev = new int[b.Length + 1];
+    var cur = new int[b.Length + 1];
+    for (int i = 1; i <= a.Length; i++)
+    {
+        for (int j = 1; j <= b.Length; j++)
+            cur[j] = a[i - 1] == b[j - 1] ? prev[j - 1] + 1 : Math.Max(prev[j], cur[j - 1]);
+        (prev, cur) = (cur, prev);
+    }
+    return prev[b.Length];
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+static (string name, OutputFormat fmt)[] Formats() =>
+    [("plain", OutputFormat.Plain), ("markdown", OutputFormat.Markdown), ("html", OutputFormat.Html), ("json", OutputFormat.Json)];
+
+static JsonNode? SerializeToNode(object? value)
+{
+    if (value is null) return null;
+    var json = JsonSerializer.Serialize(value, value.GetType(), Xberg.Types.Json.Options);
+    return JsonNode.Parse(json);
+}
+
+// Whitespace-insensitive text comparison for the not-yet-byte-exact markdown/html renderers.
+static string NormalizeText(string s)
+{
+    var sb = new StringBuilder(s.Length);
+    bool prevWs = false;
+    foreach (char c in s)
+    {
+        if (char.IsWhiteSpace(c)) { if (!prevWs) sb.Append(' '); prevWs = true; }
+        else { sb.Append(c); prevWs = false; }
+    }
+    return sb.ToString().Trim();
+}
+
+// Structural JSON comparison treating null == absent == empty([]/{}) as equal, after an
+// optional per-domain normalization pass (drops volatile / not-yet-ported keys).
+static bool JsonEquivalent(JsonNode? a, JsonNode? b, Action<JsonObject>? normalizeObj)
+{
+    a = Canonicalize(a?.DeepClone(), normalizeObj);
+    b = Canonicalize(b?.DeepClone(), normalizeObj);
+    return JsonNodeDeepEquals(a, b);
+}
+
+static JsonNode? Canonicalize(JsonNode? n, Action<JsonObject>? normalizeObj)
+{
+    switch (n)
+    {
+        case null: return null;
+        case JsonObject obj:
+            normalizeObj?.Invoke(obj);
+            var keys = obj.Select(kv => kv.Key).ToList();
+            foreach (var k in keys)
+            {
+                var child = Canonicalize(obj[k]?.DeepClone(), normalizeObj);
+                if (IsEmpty(child)) obj.Remove(k);
+                else obj[k] = child;
+            }
+            return obj.Count == 0 ? null : obj;
+        case JsonArray arr:
+            for (int i = 0; i < arr.Count; i++) arr[i] = Canonicalize(arr[i]?.DeepClone(), normalizeObj);
+            return arr.Count == 0 ? null : arr;
+        default: return n;
+    }
+}
+
+static bool IsEmpty(JsonNode? n) => n is null || (n is JsonArray a && a.Count == 0) || (n is JsonObject o && o.Count == 0);
+
+static bool JsonNodeDeepEquals(JsonNode? a, JsonNode? b)
+{
+    if (a is null && b is null) return true;
+    if (a is null || b is null) return false;
+    if (a is JsonObject oa && b is JsonObject ob)
+    {
+        if (oa.Count != ob.Count) return false;
+        foreach (var kv in oa)
+        {
+            if (!ob.TryGetPropertyValue(kv.Key, out var bv)) return false;
+            if (!JsonNodeDeepEquals(kv.Value, bv)) return false;
+        }
+        return true;
+    }
+    if (a is JsonArray aa && b is JsonArray ab)
+    {
+        if (aa.Count != ab.Count) return false;
+        for (int i = 0; i < aa.Count; i++) if (!JsonNodeDeepEquals(aa[i], ab[i])) return false;
+        return true;
+    }
+    return a.ToJsonString() == b.ToJsonString();
+}
+
+// Drop machine/runtime-volatile metadata bookkeeping before comparison.
+static void MetadataNormalizer(JsonObject obj)
+{
+    if (obj.TryGetPropertyValue("additional", out var add) && add is JsonObject ao)
+        foreach (var k in new[] { "source_uri", "final_uri", "source_index", "source_kind", "extraction_method" })
+            ao.Remove(k);
+    obj.Remove("extraction_duration_ms");
+    obj.Remove("output_format");
+}
+
+// The per-table `markdown` string tracks the (not-yet-exact) markdown renderer; compare cells only.
+static void TablesNormalizer(JsonObject obj) => obj.Remove("markdown");
+
+static string Compact(JsonNode? n) => n?.ToJsonString() ?? "null";
+
+static void AddExample(Dictionary<string, List<string>> ex, string dim, string rel, string want, string have, Options o)
+{
+    if (!ex.TryGetValue(dim, out var list)) ex[dim] = list = new();
+    if (list.Count >= o.Show) return;
+    var sb = new StringBuilder();
+    sb.Append("    • ").Append(rel);
+    if (o.Diff)
+    {
+        sb.Append("\n      rust: ").Append(Trunc(want, 200));
+        sb.Append("\n      c#  : ").Append(Trunc(have, 200));
+    }
+    list.Add(sb.ToString());
+}
+
+static string Trunc(string s, int n) => s.Length <= n ? s.Replace("\n", "\\n") : s[..n].Replace("\n", "\\n") + "…";
+
+static void PrintReport(Stats s, Dictionary<string, List<string>> ex, Options o)
+{
+    Console.WriteLine();
+    Console.WriteLine("═══ Xberg C# parity report ═══");
+    Console.WriteLine($"Fixtures compared (rust succeeded): {s.Total}");
+    Console.WriteLine($"  fully matching (hard dims):      {s.Ok}");
+    Console.WriteLine($"  both-unsupported (rust failed):  {s.BothUnsupported}");
+    Console.WriteLine($"  C# produced output, rust failed: {s.Extra}");
+    Console.WriteLine($"  source file missing:             {s.NoSource}");
+    Console.WriteLine();
+    Console.WriteLine($"{"ext",-10}{"n",5}{"ok",6}{"plain",8}{"md",8}{"html",8}{"json",8}{"meta",8}{"tables",8}");
+    foreach (var (ext, es) in s.ByExt.OrderByDescending(k => k.Value.Total))
+    {
+        Console.WriteLine($"{ext,-10}{es.Total,5}{es.Ok,6}" +
+            $"{Frac(es.Plain),8}{Frac(es.Markdown),8}{Frac(es.Html),8}{Frac(es.Json),8}" +
+            $"{es.MetaMatch + "/" + (es.MetaMatch + es.MetaMismatch),8}{es.TablesMatch + "/" + (es.TablesMatch + es.TablesMismatch),8}");
+    }
+    if (ex.Count > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine("Example mismatches:");
+        foreach (var (dim, list) in ex)
+        {
+            Console.WriteLine($"  [{dim}]");
+            foreach (var line in list) Console.WriteLine(line);
+        }
+    }
+}
+
+static string Frac(DimStat d) => d.Match + d.Mismatch == 0 ? "-" : $"{d.Match}/{d.Match + d.Mismatch}";
+
+static Options? ParseArgs(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.Error.WriteLine("Usage: xberg-testrunner <root-dir> [--filter s] [--ext e] [--show N] [--diff] [--strict-md] [--list-ok]");
+        return null;
+    }
+    var o = new Options { Root = args[0] };
+    for (int i = 1; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--filter": o.Filter = args[++i]; break;
+            case "--ext": o.Ext = args[++i]; break;
+            case "--show": o.Show = int.Parse(args[++i]); break;
+            case "--diff": o.Diff = true; break;
+            case "--strict-md": o.StrictMd = true; break;
+            case "--list-ok": o.ListOk = true; break;
+            case "--dump": o.Dump = args[++i]; break;
+        }
+    }
+    if (!Directory.Exists(o.Root)) { Console.Error.WriteLine($"not a directory: {o.Root}"); return null; }
+    return o;
+}
+
+sealed class Options
+{
+    public string Root = "";
+    public string? Filter;
+    public string? Ext;
+    public int Show = 5;
+    public bool Diff;
+    public bool StrictMd;
+    public bool ListOk;
+    public string? Dump;
+}
+
+sealed class DimStat { public int Match; public int Mismatch; }
+
+sealed class ExtStat
+{
+    public int Total, Ok, BothUnsupported, Extra, MetaMatch, MetaMismatch, TablesMatch, TablesMismatch;
+    public int ContentExact;
+    public readonly DimStat Plain = new(), Markdown = new(), Html = new(), Json = new();
+    public DimStat Dim(string n) => n switch { "plain" => Plain, "markdown" => Markdown, "html" => Html, _ => Json };
+}
+
+sealed class Stats
+{
+    public int Total, Ok, BothUnsupported, Extra, NoSource, BadGolden;
+    // Content-parity buckets (plain text, whitespace/order-normalized).
+    public int ContentExact, ContentOrder, ContentClose, ContentPartial, ContentLow;
+    public int Catastrophes;
+    public readonly List<string> CatastropheList = new();
+    // Fixtures where Rust extracted clean content that we under-extract (content loss).
+    public readonly List<MissRow> Misses = new();
+    public readonly Dictionary<string, ExtStat> ByExt = new();
+}
+
+readonly record struct MissRow(string Ext, string Rel, int RustLen, int CsLen, double Sim);
