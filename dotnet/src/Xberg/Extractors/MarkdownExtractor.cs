@@ -394,9 +394,20 @@ public sealed class MarkdownExtractor : IExtractor
                 case MdEventKind.FootnoteReference:
                     b.PushFootnoteRef(e.Text, e.Text, null);
                     break;
+                // Raw HTML goes into whichever block is currently open. Block-level HTML (e.g. a
+                // bare `<div>…</div>` or an `<!-- image -->` comment between blank lines) arrives
+                // with no block open at all; record it as a raw block instead of dropping it.
                 case MdEventKind.Html:
-                    if (footnoteDefLabel is not null) footnoteDefText.Append(e.Text);
+                    if (inHeading) headingText.Append(e.Text);
+                    else if (inTableCell) currentCell.Append(e.Text);
+                    else if (inListItem) listItemText.Append(e.Text);
+                    else if (footnoteDefLabel is not null) footnoteDefText.Append(e.Text);
                     else if (inParagraph) paragraphText.Append(e.Text);
+                    else
+                    {
+                        string trimmedHtml = e.Text.Trim();
+                        if (trimmedHtml.Length > 0) b.PushRawBlock("html", trimmedHtml, null);
+                    }
                     break;
                 case MdEventKind.TaskListMarker:
                     if (inListItem) listItemText.Append(e.Checked ? "[x] " : "[ ] ");

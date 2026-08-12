@@ -310,11 +310,16 @@ public static class MarkdownParser
                 continue;
             }
 
-            // HTML block (dropped by the extractor, like pulldown-cmark block HTML).
+            // Block-level raw HTML. pulldown-cmark emits it as an Html event with no enclosing
+            // block open; the extractor records it as a raw block rather than dropping it.
             if (indent <= 3 && trimmedStart.StartsWith("<"))
             {
                 int newI = TryHtmlBlock(lines, i, hi);
-                if (newI > i) { i = newI; continue; }
+                if (newI > i)
+                {
+                    ev.Add(MdEvent.WithText(MdEventKind.Html, string.Join("\n", lines.GetRange(i, newI - i))));
+                    i = newI; continue;
+                }
             }
 
             // Blockquote
