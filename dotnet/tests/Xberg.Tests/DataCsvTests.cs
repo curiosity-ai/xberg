@@ -35,10 +35,29 @@ public class DataCsvTests
     }
 
     [Fact]
-    public void HeaderCsv_RendersEmbeddingText()
+    public void HeaderCsv_RendersCanonicalTablePlaintext()
     {
         string plain = Xberg.Rendering.PlainRenderer.Render(Extract("Name,Age\nAlice,30\n"));
-        Assert.Equal("Row 1:\nName: Alice\nAge: 30", plain);
+        Assert.Equal("Name Age\nAlice 30", plain);
+    }
+
+    [Fact]
+    public void BlankAfterTrimRow_OmittedFromPlaintextButKeptInTable()
+    {
+        // Whitespace-only cells survive parsing (they are not empty), but a row that is blank
+        // after trimming must not reach the plain text as a line of bare separators.
+        var doc = Extract("Name,Age\nAlice,30\n  ,  \nBob,40\n");
+        string plain = Xberg.Rendering.PlainRenderer.Render(doc);
+        Assert.Equal("Name Age\nAlice 30\nBob 40", plain);
+        // The row still conveys structure, so `tables` keeps it.
+        Assert.Contains(doc.Tables[0].Cells, row => row.Count > 0 && row.All(c => c.Trim().Length == 0));
+    }
+
+    [Fact]
+    public void HeaderCsv_PopulatesTableColumns()
+    {
+        var doc = Extract("Name,Age\nAlice,30\n");
+        Assert.Equal(new[] { "Name", "Age" }, doc.Tables[0].Columns);
     }
 
     [Fact]

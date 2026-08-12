@@ -312,6 +312,15 @@ public static class XlsxReader
         if (app.Company is not null) wb.Metadata["organization"] = app.Company;
         if (app.Application is not null) wb.Metadata["application"] = app.Application;
         if (app.AppVersion is not null) wb.Metadata["application_version"] = app.AppVersion;
+        // #230: surface the raw DocSecurity integer plus its decoded ECMA-376 flags —
+        // XlsxAppProperties never reaches the format metadata, so without this the workbook's
+        // protection state is discarded entirely.
+        if (app.DocSecurity is { } docSecurity)
+        {
+            wb.Metadata[OfficeMetadata.DocSecurityKey] = docSecurity.ToString(CultureInfo.InvariantCulture);
+            foreach (var (key, value) in OfficeMetadata.DecodeDocSecurityFlags(docSecurity))
+                wb.Metadata[key] = value ? "true" : "false";
+        }
 
         foreach (var (k, v) in OfficeMetadata.ExtractCustom(pkg))
             wb.Metadata["custom_" + k] = v.ValueKind == System.Text.Json.JsonValueKind.String ? v.GetString() ?? "" : v.GetRawText();

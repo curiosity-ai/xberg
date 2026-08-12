@@ -265,12 +265,15 @@ public static class DocxReader
                 }
             }
         }
-        // Text content: w:t (preserve), w:br (line break → \n), w:tab ignored, footnote/endnote refs.
+        // Text content: w:t (preserve), w:br (line break → \n), w:tab (→ \t), footnote/endnote refs.
         foreach (var child in r.Elements())
         {
             switch (child.Name.LocalName)
             {
                 case "t": run.Text += DropXmlEntities(child.Value); break;
+                // An in-run <w:tab/> separates words; a <w:pPr><w:tabs> tab-stop definition lives
+                // under the paragraph, not the run, so it stays invisible here (Rust GH#1377).
+                case "tab": run.Text += "\t"; break;
                 case "br":
                     var brType = child.Attributes().FirstOrDefault(a => a.Name.LocalName == "type")?.Value;
                     if (brType != "page") run.Text += "\n";

@@ -11,6 +11,17 @@ public sealed class Table
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public BoundingBox? BoundingBox { get; set; }
+
+    /// <summary>Header cells for this fragment, i.e. the first row of <see cref="Cells"/>.
+    /// <c>null</c> when no header row could be determined.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? Columns { get; set; }
+
+    /// <summary>Stable identifier shared by every <c>tables[]</c> entry representing a fragment
+    /// of the same physical table. Assigned deterministically in document order; <c>null</c>
+    /// when the extractor did not assign one.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TableId { get; set; }
 }
 
 /// <summary>Future/unused per-cell table extension point (mirrors Rust `TableCell`).</summary>

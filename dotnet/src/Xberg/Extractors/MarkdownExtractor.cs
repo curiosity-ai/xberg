@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using Xberg.Core;
 using Xberg.Internal.Commonmark;
+using Xberg.Internal.Markup;
 using Xberg.Internal.Yaml;
 using Xberg.Types;
 
@@ -99,6 +100,7 @@ public sealed class MarkdownExtractor : IExtractor
         bool inImage = false;
         var imageAlt = new StringBuilder();
         string? imageUrl = null;
+        uint imageCounter = 0;
         string? footnoteDefLabel = null;
         var footnoteDefText = new StringBuilder();
 
@@ -308,22 +310,40 @@ public sealed class MarkdownExtractor : IExtractor
                 {
                     inImage = false;
                     string trimmed = imageAlt.ToString().Trim();
-                    string desc = trimmed;
-                    var kind = ElementKind.Image(uint.MaxValue);
-                    var elem = new InternalElement
+                    string? desc = trimmed.Length == 0 ? null : trimmed;
+                    string? url = imageUrl is { Length: > 0 } ? imageUrl : null;
+
+                    // Data-URI images are decoded so the emitted `Image` element's index actually
+                    // resolves in `doc.Images`. Plain-URL images have no bytes to attach, and an
+                    // element with an unresolvable index is silently dropped by every renderer, so
+                    // their reference is preserved as visible text instead (Rust `markdown.rs`).
+                    var decodedImage = url is not null && url.StartsWith("data:image/", StringComparison.Ordinal)
+                        ? MarkdownUtils.DecodeDataUriImage(url, imageCounter)
+                        : null;
+
+                    if (decodedImage is not null)
                     {
-                        Id = InternalElementId.Generate(kind.Discriminant(), desc, null, 0),
-                        Kind = kind,
-                        Text = desc,
-                        Depth = 0,
-                        Layer = ContentLayer.Body,
-                    };
-                    b.PushElement(elem);
-                    if (imageUrl is not null && imageUrl.Length > 0)
+                        imageCounter++;
+                        decodedImage.Description = desc;
+                        b.PushImage(desc, decodedImage, null, null);
+                    }
+                    else
+                    {
+                        string display = (url, desc) switch
+                        {
+                            (not null, not null) => $"[Image: {desc} ({url})]",
+                            (not null, null) => $"[Image: {url}]",
+                            (null, not null) => $"[Image: {desc}]",
+                            _ => "",
+                        };
+                        if (display.Length > 0) b.PushParagraph(display, new(), null, null);
+                    }
+
+                    if (url is not null)
                         b.PushUri(new ExtractedUri
                         {
-                            Url = imageUrl,
-                            Label = desc.Length == 0 ? null : desc,
+                            Url = url,
+                            Label = desc,
                             Kind = UriKind.Image,
                         });
                     imageUrl = null;

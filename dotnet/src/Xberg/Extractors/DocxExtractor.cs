@@ -442,6 +442,15 @@ public sealed class DocxExtractor : IExtractor
         AddStr("category", core.Category);
         AddStr("content_status", core.ContentStatus);
         AddStr("description", core.Description);
+        // #230: surface both the raw DocSecurity value and the decoded ECMA-376 flags so a
+        // consumer can tell a read-only-recommended or password-protected document apart
+        // without knowing the bit layout.
+        if (app.DocSecurity is { } docSecurity)
+        {
+            additional[OfficeMetadata.DocSecurityKey] = JsonNumber(docSecurity);
+            foreach (var (key, value) in OfficeMetadata.DecodeDocSecurityFlags(docSecurity))
+                additional[key] = JsonBool(value);
+        }
         // Custom properties also surface as `custom_<name>` entries in `additional`.
         foreach (var (k, v) in custom) additional["custom_" + k] = v;
 
@@ -520,4 +529,7 @@ public sealed class DocxExtractor : IExtractor
 
     private static JsonElement JsonNumber(int n) =>
         JsonDocument.Parse(n.ToString(System.Globalization.CultureInfo.InvariantCulture)).RootElement.Clone();
+
+    private static JsonElement JsonBool(bool b) =>
+        JsonDocument.Parse(b ? "true" : "false").RootElement.Clone();
 }

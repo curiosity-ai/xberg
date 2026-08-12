@@ -32,7 +32,7 @@ public sealed partial class CsvExtractor : IExtractor
         bool hasHeader = DetectHeader(rows);
         var columnTypes = InferColumnTypes(rows, hasHeader);
 
-        string markdown = BuildMarkdownTable(rows);
+        string markdown = BuildMarkdownTable(rows, hasHeader);
 
         var csvMeta = new CsvMetadata
         {
@@ -44,17 +44,22 @@ public sealed partial class CsvExtractor : IExtractor
         };
 
         var builder = new InternalDocumentBuilder("csv");
-        string contentText = hasHeader ? RenderCsvEmbeddingText(rows) : RenderTablePlainCsv(rows);
-        builder.PushParagraph(contentText, new(), null, null);
-
-        var doc = builder.Build();
-        doc.Tables.Add(new Table
+        var table = new Table
         {
             Cells = rows.Select(r => new List<string>(r)).ToList(),
             Markdown = markdown,
             PageNumber = 1,
             BoundingBox = null,
-        });
+            Columns = hasHeader && rows.Count > 0 ? new List<string>(rows[0]) : null,
+        };
+
+        // The table is pushed as a real element (so every renderer sees a table, not a
+        // paragraph) and carries the canonical plain text the plain renderer prefers.
+        string contentText = RenderTablePlainCsv(rows);
+        uint tableElement = builder.PushTable(table, null, null);
+        builder.SetText(tableElement, contentText);
+
+        var doc = builder.Build();
         doc.MimeType = mimeType;
         doc.Metadata = new Metadata { Format = FormatMetadata.Csv(csvMeta) };
         return doc;
@@ -244,51 +249,42 @@ public sealed partial class CsvExtractor : IExtractor
         return result;
     }
 
-    private static string RenderCsvEmbeddingText(List<List<string>> cells)
+    /// <summary>
+    /// Render rows as canonical space-separated plain text for <c>result.Content</c>.
+    /// Matches <see cref="Rendering.RenderCommon.RenderTablePlain"/> except that rows where every
+    /// cell is empty after trimming are omitted entirely, rather than surviving as a blank-looking
+    /// line of bare separators. The Markdown table and <c>result.Tables</c> keep such rows, since
+    /// they still convey real structure there. (Rust `extractors/csv.rs::render_plain_text`.)
+    /// </summary>
+    private static string RenderTablePlainCsv(List<List<string>> cells)
     {
-        if (cells.Count < 2)
-        {
-            if (cells.Count == 1)
-                return string.Join(" ", cells[0].Where(h => h.Trim().Length > 0));
-            return "";
-        }
-
-        var headers = cells[0];
         var sb = new StringBuilder();
-        int rowNumber = 0;
-
-        for (int r = 1; r < cells.Count; r++)
+        foreach (var row in cells)
         {
-            var row = cells[r];
             if (row.All(c => c.Trim().Length == 0)) continue;
-            rowNumber++;
-            if (rowNumber > 1) sb.Append("\n\n");
-            sb.Append("Row ").Append(rowNumber).Append(':');
-
-            for (int col = 0; col < headers.Count; col++)
-            {
-                string header = headers[col].Trim();
-                if (header.Length == 0) continue;
-                string value = col < row.Count ? row[col].Trim() : "";
-                if (value.Length == 0) continue;
-                sb.Append('\n').Append(header).Append(": ").Append(value);
-            }
+            sb.Append(string.Join(" ", row));
+            sb.Append('\n');
         }
         return sb.ToString();
     }
 
-    private static string RenderTablePlainCsv(List<List<string>> cells) =>
-        string.Join("\n", cells
-            .Select(row => string.Join(" ", row.Select(c => c.Trim()).Where(c => c.Length > 0)))
-            .Where(line => line.Length > 0));
-
-    private static string BuildMarkdownTable(List<List<string>> rows)
+    private static string BuildMarkdownTable(List<List<string>> rows, bool hasHeader)
     {
         if (rows.Count == 0) return "";
         int colCount = rows.Max(r => r.Count);
         if (colCount == 0) return "";
 
         var md = new StringBuilder();
+        if (!hasHeader)
+        {
+            md.Append('|');
+            for (int j = 0; j < colCount; j++) md.Append("  |");
+            md.Append('\n');
+            md.Append('|');
+            for (int j = 0; j < colCount; j++) md.Append(" --- |");
+            md.Append('\n');
+        }
+
         for (int i = 0; i < rows.Count; i++)
         {
             md.Append('|');
@@ -298,7 +294,7 @@ public sealed partial class CsvExtractor : IExtractor
                 md.Append(' ').Append(cell).Append(" |");
             }
             md.Append('\n');
-            if (i == 0)
+            if (hasHeader && i == 0)
             {
                 md.Append('|');
                 for (int j = 0; j < colCount; j++) md.Append(" --- |");
