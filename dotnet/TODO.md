@@ -38,12 +38,15 @@ not a cosmetic difference.
       systematic fixes — measured, not assumed:
       - Plain-text divergence spreads across **223 distinct first-divergence clusters** for
         274 failing fixtures, i.e. mostly reading-order and whitespace, one document at a time.
-      - Markdown is pinned far below plain (32 vs 114) by **heading level** assignment, not
-        heading detection: the largest cluster is 8 fixtures where Rust emits `##` and the port
-        emits `#`. Rust's rules live in `pdf/structure/classify.rs` + `adapters.rs` (~2000
-        lines of interacting promote/demote/merge passes, e.g. the first-paragraph H1 rescue
-        is gated on `MIN_BLOCKS_FOR_FONT_HEADING = 5`, which the port's fallback lacks).
-        Porting a rule at a time is how this closes; guessing at it is not.
+      - Markdown/html were pinned far below plain by **heading level** assignment rather than
+        heading detection. Porting the sparsity gate, the H1-rescue gates and the level
+        inference took markdown 32 → 49 and html 27 → 41 of 388, but moved **no fixture into
+        `ok`**: every one of them still fails plain or json, so the heading work only pays off
+        once reading order does. Rust's remaining rules are in `pdf/structure/classify.rs` +
+        `adapters.rs` — still unported there: `sparse_multi_page_heading_map` (a repeated font
+        tier across pages), `has_repeated_sparse_peer_heading_tier`, the changelog
+        hierarchy passes, and `promote_title_heading`'s guard. Port a rule at a time and
+        measure; guessing costs more than it gains.
       - Tables: of 234 mismatches only **30** are "we found no table at all" (the missing
         ruling-line/bordered-grid tier). The other 204 are cell-segmentation differences.
       A caution learned the hard way: `pdf/structure/text_repair.rs` looks like a free win but
