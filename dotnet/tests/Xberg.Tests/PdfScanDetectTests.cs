@@ -198,3 +198,158 @@ public class PdfHeadingLevelTests
         Assert.Equal((byte)3, PdfStructure.InferBoldHeadingLevel(30f, 10f, "1.1 Details"));
     }
 }
+
+/// <summary>
+/// Rotated-page reassembly from Rust <c>extractors/pdf/rotation.rs</c>. Word gaps in a rotated
+/// run live on that run's own baseline, not on page-x, so page-order concatenation both glues
+/// words and reads them out of order.
+/// </summary>
+public class PdfRotationRepairTests
+{
+    private static TextSpan RotatedWord(string text, double y, double width) =>
+        new() { Text = text, X = 100, Y = y, Width = width, Height = 10, FontSize = 10, RotationDegrees = 90 };
+
+    private static TextSpan UprightWord(string text, double x, double y, double width) =>
+        new() { Text = text, X = x, Y = y, Width = width, Height = 10, FontSize = 10 };
+
+    /// <summary>Six words whose correct reading order runs along ascending advance axis
+    /// (page-y for a 90° run), with real 3pt word gaps between them.</summary>
+    private static List<TextSpan> ScrambledRotatedSentence() => new()
+    {
+        RotatedWord("Engine", 0, 36), RotatedWord("oil", 39, 18), RotatedWord("need", 60, 24),
+        RotatedWord("only", 87, 24), RotatedWord("meet", 114, 24), RotatedWord("the", 141, 18),
+    };
+
+    [Fact]
+    public void RotatedRun_ReadsAlongItsAdvanceAxisAndSpacesWordGaps()
+    {
+        var spans = ScrambledRotatedSentence();
+        // Fed back-to-front, exactly the garbled order the real fixture produces.
+        var order = new List<int> { 5, 4, 3, 2, 1, 0 };
+        Assert.Equal("Engine oil need only meet the",
+            PdfRotationRepair.AssembleReadingOrderText(spans, order));
+    }
+
+    [Fact]
+    public void KerningTightRotatedFragments_GlueRatherThanSpace()
+    {
+        // Two fragments of one word 0.5pt apart on a 10pt run — well under the 1.5pt cutoff.
+        var spans = new List<TextSpan> { RotatedWord("Eng", 0, 18), RotatedWord("ine", 18.5, 18) };
+        Assert.Equal("Engine", PdfRotationRepair.AssembleReadingOrderText(spans, new List<int> { 0, 1 }));
+    }
+
+    [Fact]
+    public void AnUprightPage_IsNeverRewritten()
+    {
+        // The safety property the whole repair rests on: no rotation, no repair, no drift.
+        var spans = new List<TextSpan> { UprightWord("Hello", 10, 700, 30), UprightWord("world", 45, 700, 30) };
+        Assert.Null(PdfRotationRepair.RepairRotatedPageText(spans));
+    }
+
+    [Fact]
+    public void ASingleRotatedLabelOnAnUprightPage_DoesNotTriggerTheWholePageRewrite()
+    {
+        // Rotation below the dominance share: repairing a three-character tab would cost the
+        // upright majority its paragraph structure, which is the worse trade.
+        var spans = new List<TextSpan>
+        {
+            UprightWord("Plenty of ordinary upright prose across the page", 10, 700, 200),
+            UprightWord("and a second full line of upright body text too", 10, 686, 200),
+            RotatedWord("2.1", 500, 12),
+        };
+        Assert.Null(PdfRotationRepair.RepairRotatedPageText(spans));
+    }
+
+    [Fact]
+    public void ADominantlyRotatedPage_IsRepaired()
+    {
+        var spans = ScrambledRotatedSentence();
+        Assert.Equal("Engine oil need only meet the", PdfRotationRepair.RepairRotatedPageText(spans));
+    }
+}
+
+/// <summary>
+/// Two-column repair from Rust <c>pdf/oxide/text.rs</c> and the region classifier gating it.
+/// </summary>
+public class PdfColumnReorderTests
+{
+    /// <summary>A prose line: one wide span of <paramref name="chars"/> characters.</summary>
+    private static TextSpan Line(string text, double x, double y, double width) =>
+        new() { Text = text, X = x, Y = y, Width = width, Height = 10, FontSize = 10 };
+
+    private static List<TextSpan> TwoColumnPage(int rows)
+    {
+        // A 612pt page: left column at x=40 (240 wide), right at x=330, gutter 50pt.
+        var spans = new List<TextSpan>();
+        for (int r = 0; r < rows; r++)
+        {
+            double y = 700 - r * 14;
+            spans.Add(Line($"left row {r} carrying a substantial amount of prose text", 40, y, 240));
+            spans.Add(Line($"right row {r} carrying a substantial amount of prose text", 330, y, 240));
+        }
+        return spans;
+    }
+
+    [Fact]
+    public void ADenseTwoColumnPage_IsReadColumnMajor()
+    {
+        var spans = TwoColumnPage(rows: 8);
+        Assert.True(PdfColumnReorder.ReorderDenseTwoColumnPage(spans, 612));
+
+        // Every left-column span must now precede every right-column span.
+        int lastLeft = spans.FindLastIndex(s => s.X < 300);
+        int firstRight = spans.FindIndex(s => s.X >= 300);
+        Assert.True(lastLeft < firstRight, "columns must not interleave after the repair");
+    }
+
+    [Fact]
+    public void ASingleColumnPage_IsLeftAlone()
+    {
+        var spans = new List<TextSpan>();
+        for (int r = 0; r < 10; r++)
+            spans.Add(Line($"full width row {r} of ordinary prose running right across the page",
+                40, 700 - r * 14, 530));
+        Assert.False(PdfColumnReorder.ReorderDenseTwoColumnPage(spans, 612));
+    }
+
+    [Fact]
+    public void ATooNarrowPage_IsLeftAlone()
+    {
+        // Below the content-width floor there is no room for two columns at all.
+        var spans = TwoColumnPage(rows: 8).Where(s => s.X < 300).ToList();
+        foreach (var s in spans) s.Width = 80;
+        Assert.False(PdfColumnReorder.ReorderDenseTwoColumnPage(spans, 612));
+    }
+
+    [Fact]
+    public void ShortCellGrid_ClassifiesAsTableNotProse()
+    {
+        // Digit-only cells: mean characters per line falls below the prose floor, so the
+        // reorder gate must reject it rather than corrupt cell ordering.
+        var spans = new List<TextSpan>();
+        for (int r = 0; r < 8; r++)
+            spans.Add(Line($"{r}", 40, 700 - r * 14, 20));
+        var indices = Enumerable.Range(0, spans.Count).ToList();
+        Assert.Equal(RegionClass.Table, PdfRegionClassifier.Classify(spans, indices));
+        Assert.False(PdfRegionClassifier.Classify(spans, indices).IsReorderableColumn());
+    }
+
+    [Fact]
+    public void NumberedEntries_ClassifyAsReferenceAndAreReorderable()
+    {
+        var spans = new List<TextSpan>();
+        for (int r = 0; r < 8; r++)
+            spans.Add(Line($"[{r + 1}] A cited work with a reasonably long title and authors",
+                40, 700 - r * 14, 240));
+        var cls = PdfRegionClassifier.Classify(spans, Enumerable.Range(0, spans.Count).ToList());
+        Assert.Equal(RegionClass.Reference, cls);
+        Assert.True(cls.IsReorderableColumn());
+    }
+
+    [Fact]
+    public void TooFewLines_StayMixedSoCallersKeepPriorBehaviour()
+    {
+        var spans = new List<TextSpan> { Line("A heading", 40, 700, 100), Line("A caption", 40, 686, 100) };
+        Assert.Equal(RegionClass.Mixed, PdfRegionClassifier.Classify(spans, new List<int> { 0, 1 }));
+    }
+}

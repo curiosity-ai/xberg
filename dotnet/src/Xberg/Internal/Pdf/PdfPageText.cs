@@ -53,6 +53,11 @@ public static class PdfPageText
         var (ordered, orderedRuns) = t;
         if (ordered.Count == 0) return "";
 
+        // A page whose text is drawn sideways is reassembled in its own reading frame; an
+        // upright page returns null here and is never rewritten. Ahead of the fragmentation
+        // check, matching Rust `extract_page_text_column_aware`.
+        if (PdfRotationRepair.RepairRotatedPageText(ordered) is { } rotated) return rotated;
+
         // Issue #962: glyph-fragmented span lists are rebuilt from positions.
         // Detected on the MERGED runs (word-level), matching pdf_oxide which runs
         // this on merged spans — running it on raw per-glyph spans false-positives.

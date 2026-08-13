@@ -32,6 +32,9 @@ public sealed class TextSpan
     public bool IsItalic;
     public bool IsMonospace;
 
+    /// <summary>Text-matrix rotation in degrees; 0 for upright text.</summary>
+    public double RotationDegrees;
+
     // Geometry accessors mirroring pdf_oxide Rect (PDF coords: Y grows up).
     public double Left => X;
     public double Right => X + Width;
@@ -76,6 +79,7 @@ public sealed class PdfContentExtractor
         public double EffFontSize;             // font_size * sqrt(b²+d²)
         public bool IsBold, IsItalic, IsMonospace;
         public bool HasRtl;
+        public double RotationDegrees;         // atan2(b, a) of the combined matrix
     }
 
     private TjBuffer? _buf;
@@ -261,6 +265,16 @@ public sealed class PdfContentExtractor
         }
     }
 
+    /// <summary>Text-matrix rotation in degrees. Zero for the overwhelming majority of spans;
+    /// a sideways table or caption carries 90/180/270.</summary>
+    private static double RotationOf(in Matrix m)
+    {
+        double deg = Math.Atan2(m.B, m.A) * (180.0 / Math.PI);
+        // Snap float noise around an upright matrix to exactly zero so the "is this page
+        // rotated at all" gate is not tripped by rounding.
+        return Math.Abs(deg) < 1e-6 ? 0.0 : deg;
+    }
+
     // Synthetic space span for a large TJ offset (pdf_oxide insert_space_as_span).
     private void InsertSpaceSpan()
     {
@@ -278,6 +292,7 @@ public sealed class PdfContentExtractor
             IsBold = false,
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = false,
+            RotationDegrees = RotationOf(combined),
         });
     }
 
@@ -290,6 +305,7 @@ public sealed class PdfContentExtractor
             StartY = combined.F,
             EffFontSize = _gs.FontSize * Math.Sqrt(combined.D * combined.D + combined.B * combined.B),
             UserHScale = Math.Sqrt(combined.A * combined.A + combined.C * combined.C),
+            RotationDegrees = RotationOf(combined),
             IsBold = _gs.Font?.IsBold ?? false,
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = _gs.Font?.IsMonospace ?? false,
@@ -318,6 +334,7 @@ public sealed class PdfContentExtractor
             IsBold = b.IsBold,
             IsItalic = b.IsItalic,
             IsMonospace = b.IsMonospace,
+            RotationDegrees = b.RotationDegrees,
         });
     }
 
