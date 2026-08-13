@@ -2,6 +2,15 @@
 	"id": "extract_bytes_input_empty_mime",
 	"category": "extract",
 	"description": "extract bytes input with empty MIME type",
+	"docs": {
+		"topic": "extract",
+		"title": "extract bytes input with empty MIME type",
+		"description": "extract bytes input with empty MIME type",
+		"presentation": {
+			"files": [{ "field": "/bytes", "path": "test_documents/text/plain.txt" }]
+		},
+		"side_effects": "safe"
+	},
 	"tags": ["extract", "bytes", "error"],
 	"call": "extract",
 	"input": {

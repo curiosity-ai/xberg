@@ -2,6 +2,12 @@
 	"id": "url_remote_text_document",
 	"category": "url",
 	"description": "extract: remote text document URL",
+	"docs": {
+		"topic": "url",
+		"title": "extract: remote text document URL",
+		"description": "extract: remote text document URL",
+		"side_effects": "server"
+	},
 	"tags": ["url", "document"],
 	"call": "extract",
 	"args": [
@@ -56,9 +62,5 @@
 			"field": "summary.remote_urls",
 			"value": 1
 		}
-	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM e2e does not enable URL ingestion"
-	}
+	]
 }

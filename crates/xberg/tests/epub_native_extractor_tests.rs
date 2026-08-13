@@ -6,11 +6,12 @@
 //! This test suite verifies the fix for the two-pass OPF parsing bug that
 //! caused 99.84% content loss due to single-pass manifest/spine resolution.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "office")]
 
 use std::path::PathBuf;
 use xberg::ExtractInput;
-use xberg::core::config::ExtractionConfig;
+use xberg::core::config::{ExtractionConfig, OutputFormat};
 use xberg::extractors::EpubExtractor;
 use xberg::plugins::DocumentExtractor;
 
@@ -121,8 +122,11 @@ async fn test_native_epub_features_extraction() {
 
     let bytes = std::fs::read(&test_file).expect("Failed to read features.epub");
     let extractor = EpubExtractor;
-    let config = ExtractionConfig::default();
-    let input = ExtractInput::from_bytes(bytes, "application/epub+zip", None);
+    let config = ExtractionConfig {
+        output_format: OutputFormat::Markdown,
+        ..Default::default()
+    };
+    let input = ExtractInput::from_bytes(bytes.clone(), "application/epub+zip", None);
     let result = extractor
         .extract(input, &config)
         .await
@@ -133,6 +137,49 @@ async fn test_native_epub_features_extraction() {
         "CRITICAL: Should extract from ALL chapters, got only {} bytes. \
          This indicates the two-pass bug is not fixed!",
         result.content.len()
+    );
+    assert_eq!(
+        result.content.lines().filter(|line| line.trim() == "PASS").count(),
+        1,
+        "epub:switch should select its default branch"
+    );
+    assert_eq!(
+        result.content.lines().filter(|line| line.trim() == "FAIL").count(),
+        0,
+        "epub:switch should omit unsupported and fallback branches"
+    );
+    assert!(
+        result.content.lines().any(|line| line.trim() == "2 \u{2061} x + y - z"),
+        "Markdown output should retain the selected MathML equation, got:\n{}",
+        result.content
+    );
+
+    let plain_config = ExtractionConfig {
+        output_format: OutputFormat::Plain,
+        ..Default::default()
+    };
+    let plain_input = ExtractInput::from_bytes(bytes, "application/epub+zip", None);
+    let plain_result = extractor
+        .extract(plain_input, &plain_config)
+        .await
+        .expect("Should extract plain features.epub successfully");
+    assert_eq!(
+        plain_result
+            .content
+            .lines()
+            .filter(|line| line.trim() == "PASS")
+            .count(),
+        1,
+        "Plain output should retain the default for an unsupported namespace"
+    );
+    assert_eq!(
+        plain_result
+            .content
+            .lines()
+            .filter(|line| line.trim() == "FAIL")
+            .count(),
+        1,
+        "Plain output should retain the readable fallback when MathML is unsupported"
     );
 
     println!(
@@ -231,7 +278,6 @@ async fn test_native_epub_deterministic_extraction() {
 async fn test_native_epub_no_content_loss() {
     let epub_files = vec![
         ("epub2_cover.epub", 10),
-        // This fixture contains a single title line in one XHTML body document.
         ("epub2_no_cover.epub", 10),
         ("img.epub", 50),
         ("features.epub", 1000),
@@ -267,4 +313,43 @@ async fn test_native_epub_no_content_loss() {
     }
 
     println!("✅ All EPUBs extracted successfully - no content loss!");
+}
+
+/// Tests that real embedded MathML (from the EPUB 3 accessibility/conformance
+/// test suite fixture) is converted to genuine LaTeX rather than being
+/// mangled into raw concatenated symbol text or leaking tag names.
+#[tokio::test]
+async fn test_native_epub_features_mathml_converts_to_latex() {
+    let test_file = get_test_epub_path("features.epub");
+    if !test_file.exists() {
+        println!("Skipping test: Test file not found at {:?}", test_file);
+        return;
+    }
+
+    let bytes = std::fs::read(&test_file).expect("Failed to read features.epub");
+    let extractor = EpubExtractor;
+    let config = ExtractionConfig::default();
+    let input = ExtractInput::from_bytes(bytes, "application/epub+zip", None);
+    let result = extractor
+        .extract(input, &config)
+        .await
+        .expect("Should extract features.epub successfully");
+
+    assert!(
+        result.content.contains("x=\\frac{"),
+        "Expected the quadratic-formula MathML to convert to a LaTeX \\frac, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("\\sum "),
+        "Expected the summation MathML to convert to \\sum, got: {}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("mfrac") && !result.content.contains("munderover"),
+        "Raw MathML tag names must not leak into extracted content, got: {}",
+        result.content
+    );
+
+    println!("✅ EPUB MathML-to-LaTeX conversion test passed!");
 }

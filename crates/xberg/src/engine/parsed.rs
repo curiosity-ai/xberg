@@ -143,13 +143,11 @@ mod tests {
 
         assert_eq!(first.len(), 1, "one page rendered");
         assert_eq!(first[0].page_number, 1, "1-based page numbering");
-        // Memoized: the second call returns byte-identical pages without re-rendering.
         assert_eq!(
             first[0].png_bytes, second[0].png_bytes,
             "second call returns the memoized PNG"
         );
 
-        // The memo's render equals a direct render of the same bytes.
         let direct = render_all_pages(&png, "image/png", DPI).expect("direct rasterize succeeds");
         assert_eq!(direct.len(), 1, "direct render yields one page");
         assert_eq!(

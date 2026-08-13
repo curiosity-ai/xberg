@@ -6,10 +6,8 @@ pub mod builtin;
 mod registry;
 mod r#trait;
 
-// Re-export trait and enum for backward compatibility
 pub use r#trait::{PostProcessor, ProcessingStage};
 
-// Re-export registry functions for backward compatibility
 pub use registry::list_post_processors;
 
 use std::sync::Arc;
@@ -337,6 +335,7 @@ mod tests {
             markdown: "| A | B |".to_string(),
             page_number: 0,
             bounding_box: None,
+            ..Default::default()
         };
 
         let mut result = ExtractedDocument {

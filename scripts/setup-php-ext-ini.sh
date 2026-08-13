@@ -1,13 +1,9 @@
 #!/bin/bash
 set -e
 
-# Setup temporary php.ini for e2e/php that loads the xberg extension from target/release
-# Called from alef.toml before hook for PHP e2e tests
-# Must be run from e2e/php directory
 
 EXT_DIR=$(php -r 'echo ini_get("extension_dir");')
 
-# Look for built extension (relative to e2e/php/)
 for path in ../../target/release/libxberg_php.dylib ../../target/release/libxberg_php.so ../../target/release/xberg_php.dll; do
   if [ -f "$path" ]; then
     BUILT_EXT="$path"
@@ -20,19 +16,13 @@ if [ -z "$BUILT_EXT" ]; then
   exit 1
 fi
 
-# Resolve to absolute path
 BUILT_EXT=$(cd "$(dirname "$BUILT_EXT")" && pwd)/$(basename "$BUILT_EXT")
 
-# Copy extension to extension directory
 BASENAME=$(basename "$BUILT_EXT")
 TARGET="$EXT_DIR/$BASENAME"
-cp "$BUILT_EXT" "$TARGET" 2>/dev/null || true # May fail if already exists, that's OK
+cp "$BUILT_EXT" "$TARGET" 2>/dev/null || true
 echo "Extension copied/verified: $TARGET"
 
-# Create php.ini in current directory (e2e/php) that loads the extension.
-# extension_dir is set explicitly so the ini works even when invoked with
-# PHP_INI_SCAN_DIR= (which is recommended in the e2e runner to skip stale
-# conf.d/*.ini entries left behind by sibling projects).
 cat >php.ini <<EOF
 ; Temporary PHP INI for e2e tests — loads xberg PHP extension from system extension directory
 [PHP]

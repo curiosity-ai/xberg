@@ -1,8 +1,4 @@
 #!/usr/bin/env -S uv run --no-project --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["google-genai>=1.0"]
-# ///
 """Generate proper markdown ground truth from PDF documents using Gemini.
 
 Reads benchmark fixture JSON files to locate PDFs, sends each to Gemini 2.5 Flash
@@ -139,7 +135,6 @@ def generate_markdown(
 
     text = response.text or ""
 
-    # Strip markdown code fence wrapper if Gemini added one
     if text.startswith("```markdown\n"):
         text = text[len("```markdown\n") :]
         text = text.removesuffix("\n```")
@@ -221,7 +216,6 @@ def main() -> int:
             gt_dir.mkdir(parents=True, exist_ok=True)
             md_path.write_text(markdown, encoding="utf-8")
 
-            # Quick quality check
             lines = markdown.strip().split("\n")
             headings = sum(1 for l in lines if l.startswith("#"))
             tables = sum(1 for l in lines if "|" in l and "---" not in l)

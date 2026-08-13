@@ -6,18 +6,24 @@ use crate::extractors::SyncExtractor;
 use crate::extractors::security::SecurityBudget;
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 use crate::text::utf8_validation;
+#[cfg(test)]
+use crate::types::Table;
 use crate::types::document_structure::TextAnnotation;
 use crate::types::extraction::ExtractedImage;
 use crate::types::internal::InternalDocument;
 use crate::types::internal_builder::InternalDocumentBuilder;
 use crate::types::uri::{ExtractedUri, classify_uri};
-use crate::types::{HtmlMetadata, Metadata, Table};
+use crate::types::{HtmlMetadata, Metadata};
 use async_trait::async_trait;
 use bytes::Bytes;
 use html_to_markdown_rs::InlineImageFormat;
 use std::borrow::Cow;
 #[cfg(feature = "tokio-runtime")]
 use std::path::Path;
+
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+const HTML_WARNING_SOURCE: &str = "html";
+
 #[cfg_attr(alef, alef(skip))]
 /// HTML document extractor using html-to-markdown.
 pub struct HtmlExtractor;
@@ -50,11 +56,6 @@ impl HtmlExtractor {
         budget: &mut SecurityBudget,
     ) -> crate::Result<InternalDocument> {
         let mut b = InternalDocumentBuilder::new("html");
-
-        // Track which nodes are list containers so we can manage open/close
-        // We need to walk top-level nodes and handle children via the tree structure.
-        // html-to-markdown uses a flat array with parent/children indices.
-        // We do a depth-first walk using the children structure.
 
         let root_indices: Vec<usize> = doc_structure
             .nodes
@@ -114,7 +115,6 @@ impl HtmlExtractor {
                 }
                 HC::ListItem { text } => {
                     budget.enter()?;
-                    // Determine if parent is ordered
                     let ordered = node
                         .parent
                         .and_then(|p| doc.nodes.get(p as usize))
@@ -125,7 +125,6 @@ impl HtmlExtractor {
                     budget.account_text(text.len())?;
                     b.push_list_item(text, ordered, annotations, None, None);
 
-                    // Recurse into children (e.g. nested lists inside this item)
                     if !node.children.is_empty() {
                         let child_indices: Vec<usize> = node.children.iter().map(|&i| i as usize).collect();
                         Self::walk_nodes(doc, &child_indices, b, inject_placeholders, budget)?;
@@ -135,13 +134,12 @@ impl HtmlExtractor {
                 HC::Table { grid } => {
                     let cell_count = grid.cells.len();
                     budget.add_cells(cell_count)?;
-                    // Convert grid to 2D cells for the builder
-                    let mut cells = vec![vec![String::new(); grid.cols as usize]; grid.rows as usize];
-                    for cell in &grid.cells {
-                        if (cell.row as usize) < cells.len() && (cell.col as usize) < cells[0].len() {
-                            cells[cell.row as usize][cell.col as usize] = cell.content.clone();
-                        }
-                    }
+                    let cells = crate::extraction::grid_flatten::flatten_positioned_cells(
+                        grid.rows as usize,
+                        grid.cells
+                            .iter()
+                            .map(|c| (c.row, c.row_span, c.col_span, c.content.clone())),
+                    );
                     b.push_table_from_cells(&cells, None, None);
                 }
                 HC::Image { description, src, .. } => {
@@ -159,7 +157,6 @@ impl HtmlExtractor {
                         budget.account_text(display.len())?;
                         b.push_paragraph(&display, vec![], None, None);
                     }
-                    // Always collect image URI reference regardless of inject_placeholders
                     if let Some(img_src) = src.as_ref().filter(|s| !s.is_empty()) {
                         b.push_uri(ExtractedUri::image(img_src.as_str(), description.clone()));
                     }
@@ -178,7 +175,6 @@ impl HtmlExtractor {
                 }
                 HC::DefinitionList => {
                     budget.enter()?;
-                    // Walk children (DefinitionItem nodes)
                     let child_indices: Vec<usize> = node.children.iter().map(|&i| i as usize).collect();
                     Self::walk_nodes(doc, &child_indices, b, inject_placeholders, budget)?;
                     budget.leave();
@@ -197,7 +193,6 @@ impl HtmlExtractor {
                     b.push_group_end();
                     budget.leave();
                 }
-                // Skip RawBlock (script/style content) and MetadataBlock (handled by metadata extraction)
                 HC::RawBlock { .. } | HC::MetadataBlock { .. } => {}
             }
         }
@@ -242,12 +237,29 @@ fn push_link_uris_from_annotations(annotations: &[TextAnnotation], text: &str, b
             if url.is_empty() {
                 continue;
             }
-            let label = if ann.start < ann.end && (ann.end as usize) <= text.len() {
-                let slice = &text[ann.start as usize..ann.end as usize];
-                if slice.is_empty() {
-                    None
+            let start = ann.start as usize;
+            let end = ann.end as usize;
+            let label = if ann.start < ann.end && end <= text.len() {
+                if text.is_char_boundary(start) && text.is_char_boundary(end) {
+                    let slice = &text[start..end];
+                    if slice.is_empty() {
+                        None
+                    } else {
+                        Some(slice.to_string())
+                    }
                 } else {
-                    Some(slice.to_string())
+                    // A non-ASCII document can have an annotation span whose byte
+                    // offsets land mid-codepoint; slicing on that would panic.
+                    // Degrade gracefully instead: drop the label but keep the URI.
+                    b.add_warning(crate::core::diagnostics::warning(
+                        HTML_WARNING_SOURCE,
+                        format!(
+                            "A link annotation ({start}..{end}) did not align with a character \
+                             boundary in the source text; its label text was dropped, though the \
+                             link URL was preserved"
+                        ),
+                    ));
+                    None
                 }
             } else {
                 None
@@ -271,42 +283,146 @@ fn push_link_uris_from_annotations(annotations: &[TextAnnotation], text: &str, b
 ///
 /// This function normalizes all three issues. Only called when `pre_rendered_content`
 /// is about to be stored as the Markdown output of an HTML extraction.
+/// Matches a `<math>...</math>` subtree (case-insensitive, spanning newlines) anywhere in
+/// raw HTML, mirroring the allowlist already used by `extraction::html::structure` for
+/// EPUB/email content.
+#[cfg(feature = "office")]
+static MATH_TAG_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<math\b[^>]*>.*?</math>").unwrap());
+
+/// Matches the `<!-- MathML: ... -->` comment that `html-to-markdown-rs` emits inline for
+/// every `<math>` element it converts (see `handle_math` in that crate). The comment
+/// serializes the raw MathML XML and leaks straight into `pre_rendered_content`/plain text
+/// output; it carries no value once the equation has been recovered as LaTeX below, so it
+/// is stripped.
+static MATHML_COMMENT_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<!--\s*MathML:.*?-->\s*").unwrap());
+
+/// Recover MathML equations as LaTeX `Formula` elements (issue #129).
+///
+/// `html-to-markdown-rs`'s `DocumentStructure` has no dedicated node kind for `<math>`
+/// content: a `<math>` outside a paragraph is dropped entirely by its structure walker, and
+/// one nested inside a paragraph is flattened into concatenated token text (`mn`/`mo`/`mi`
+/// text with no operators). The library's markdown/plain-text conversion pass additionally
+/// leaks a raw `<!-- MathML: ... -->` comment into the rendered output. Neither problem can
+/// be fixed inside the extractor's mapped `DocumentStructure`, since the information is
+/// already lost by the time it gets there — so this re-scans the original HTML directly,
+/// using the same MathML-to-LaTeX converter the EPUB/email HTML structure builder already
+/// calls (`crate::extraction::mathml::convert_mathml_str_to_latex`), and appends one
+/// `ElementKind::Formula` element per recovered equation.
+fn recover_mathml_formulas(html: &str, doc: &mut InternalDocument) {
+    doc.pre_rendered_content = doc
+        .pre_rendered_content
+        .take()
+        .map(|content| MATHML_COMMENT_RE.replace_all(&content, "").into_owned());
+
+    #[cfg(feature = "office")]
+    {
+        let mut budget = crate::extractors::security::SecurityBudget::from_limits(
+            &crate::extractors::security::SecurityLimits::default(),
+        );
+        for m in MATH_TAG_RE.find_iter(html) {
+            if let Ok(latex) = crate::extraction::mathml::convert_mathml_str_to_latex(m.as_str(), &mut budget)
+                && !latex.trim().is_empty()
+            {
+                doc.push_element(crate::types::internal::InternalElement::text(
+                    crate::types::internal::ElementKind::Formula,
+                    latex,
+                    0,
+                ));
+            }
+        }
+    }
+
+    // MathML-to-LaTeX conversion needs `roxmltree`, gated behind the `office` feature (see
+    // `crate::extraction::mathml`). Without it, equations are dropped rather than mangled.
+    #[cfg(not(feature = "office"))]
+    let _ = html;
+}
+
+/// Matches a `<caption>...</caption>` element's inner content (case-insensitive, spanning
+/// newlines), wherever it appears in the raw HTML.
+static TABLE_CAPTION_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<caption\b[^>]*>(.*?)</caption>").unwrap());
+
+/// Matches any HTML tag, used to strip inline markup out of a captured `<caption>` body.
+static ANY_TAG_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<[^>]+>").unwrap());
+
+/// Recover `<table><caption>` text as a paragraph immediately preceding its table (issue
+/// #146).
+///
+/// `html-to-markdown-rs`'s `TableGrid` (the structure the extractor's `HC::Table { grid }`
+/// arm consumes) has no caption field at all, so a table's caption text never reaches
+/// `map_document_structure` through the normal walk — it is dropped before the extractor
+/// ever sees it. This re-scans the original HTML for `<caption>` elements (in document
+/// order) and inserts one immediately before its corresponding `Table` element, so the
+/// caption text at least reaches the element stream rather than vanishing outright.
+///
+/// This is a best-effort, order-based correlation (Nth caption -> Nth table): it has no way
+/// to know a `<table>` had no `<caption>` at all when a *later* table does, since that
+/// association is exactly the information the upstream library discards. For the common
+/// case (each table has at most one caption, in document order) this is correct.
+fn recover_table_captions(html: &str, doc: &mut InternalDocument) {
+    let captions: Vec<String> = TABLE_CAPTION_RE
+        .captures_iter(html)
+        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+        .map(|inner| ANY_TAG_RE.replace_all(inner, "").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if captions.is_empty() {
+        return;
+    }
+
+    let table_positions: Vec<usize> = doc
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, crate::types::internal::ElementKind::Table { .. }))
+        .map(|(i, _)| i)
+        .collect();
+
+    for (pos, caption) in table_positions
+        .iter()
+        .zip(captions.iter())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        doc.elements.insert(
+            *pos,
+            crate::types::internal::InternalElement::text(crate::types::internal::ElementKind::Paragraph, caption, 0),
+        );
+    }
+}
+
 pub(crate) fn normalize_html_markdown(raw: String) -> String {
     let lines: Vec<&str> = raw.lines().collect();
-    // First pass: convert setext headings → ATX headings, strip trailing whitespace.
-    // This produces a flat Vec<String> where setext pairs are collapsed to a single line.
     let mut pass1: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
-        let line_trimmed = line.trim_end(); // strip trailing whitespace
+        let line_trimmed = line.trim_end();
 
-        // Check whether the *next* line is a setext heading underline.
-        // setext H1: next line is all `=` with length >= 1
-        // setext H2: next line is all `-` with length >= 1 (but not a table separator
-        //            which starts after a `|`-prefixed line)
         if i + 1 < lines.len() {
             let next = lines[i + 1].trim();
             let is_setext_h1 = !next.is_empty() && next.chars().all(|c| c == '=');
-            // Only treat as setext H2 if the current line is non-empty (to avoid
-            // converting horizontal rules or list separators).
             let is_setext_h2 = !next.is_empty()
                 && next.chars().all(|c| c == '-')
                 && !line_trimmed.trim().is_empty()
                 && !line_trimmed.trim().starts_with('|');
 
             if is_setext_h1 {
-                // Emit as ATX H1 and skip the underline
                 let heading_text = line_trimmed.trim();
                 pass1.push(format!("# {heading_text}"));
-                i += 2; // skip current line + underline
+                i += 2;
                 continue;
             }
             if is_setext_h2 {
-                // Emit as ATX H2 and skip the underline
                 let heading_text = line_trimmed.trim();
                 pass1.push(format!("## {heading_text}"));
-                i += 2; // skip current line + underline
+                i += 2;
                 continue;
             }
         }
@@ -315,22 +431,19 @@ pub(crate) fn normalize_html_markdown(raw: String) -> String {
         i += 1;
     }
 
-    // Second pass: ensure a blank line before every ATX heading that is not at
-    // the start of the file and not already preceded by a blank line.
     let mut result = String::with_capacity(raw.len());
     for (idx, line) in pass1.iter().enumerate() {
         let is_atx_heading = line.starts_with('#');
         if is_atx_heading && idx > 0 {
             let prev = &pass1[idx - 1];
             if !prev.is_empty() {
-                result.push('\n'); // inject blank line separator
+                result.push('\n');
             }
         }
         result.push_str(line);
         result.push('\n');
     }
 
-    // Ensure single trailing newline (GFM rule)
     let trimmed_len = result.trim_end().len();
     if trimmed_len == 0 {
         return String::new();
@@ -367,7 +480,6 @@ pub(crate) fn apply_content_filter_to_html_options(
     }
 
     let mut opts = options.unwrap_or_default();
-    // Merge with any existing strip_tags rather than replacing them.
     for tag in tags_to_strip {
         if !opts.strip_tags.contains(&tag) {
             opts.strip_tags.push(tag);
@@ -398,16 +510,23 @@ impl SyncExtractor for HtmlExtractor {
     fn extract_sync(&self, content: &[u8], mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
         let _span = tracing::debug_span!("extract_html", element_count = tracing::field::Empty,).entered();
 
-        let html = utf8_validation::from_utf8(content)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(content).into_owned());
+        // A non-UTF-8 page still extracts, but every undecodable byte has already become
+        // U+FFFD by the time anything downstream sees it. Remember that here so the caller
+        // is told the text was mangled instead of being handed silent mojibake (#171).
+        let (html, decoded_lossily) = match utf8_validation::from_utf8(content) {
+            Ok(valid) => (valid.to_string(), false),
+            Err(_) => (String::from_utf8_lossy(content).into_owned(), true),
+        };
 
-        // Apply content filter to HTML conversion options: strip <header>/<footer>
-        // elements when the corresponding flags are false.
         let html_options =
             apply_content_filter_to_html_options(config.html_options.clone(), config.content_filter.as_ref());
 
-        let (content_text, html_metadata, table_data, doc_structure) =
+        // `_table_data` is intentionally unused: it comes from the same conversion pass as
+        // `doc_structure`, whose `map_document_structure` already creates the table elements and
+        // their `doc.tables` entries. Converting it a second time only added duplicate,
+        // unreferenced entries to `doc.tables` (and double-counted cells against the security
+        // budget) without adding anything to rendered output.
+        let (content_text, html_metadata, _table_data, doc_structure) =
             crate::extraction::html::convert_html_to_markdown_with_tables(
                 &html,
                 html_options,
@@ -416,25 +535,6 @@ impl SyncExtractor for HtmlExtractor {
 
         let mut budget = SecurityBudget::from_config(config);
 
-        let mut tables: Vec<Table> = Vec::with_capacity(table_data.len());
-        for (i, t) in table_data.into_iter().enumerate() {
-            let grid = &t.grid;
-            budget.add_cells(grid.cells.len())?;
-            let mut cells = vec![vec![String::new(); grid.cols as usize]; grid.rows as usize];
-            for cell in &grid.cells {
-                if (cell.row as usize) < cells.len() && (cell.col as usize) < cells[0].len() {
-                    cells[cell.row as usize][cell.col as usize] = cell.content.clone();
-                }
-            }
-            tables.push(Table {
-                cells,
-                markdown: t.markdown,
-                page_number: (i + 1) as u32,
-                bounding_box: None,
-            });
-        }
-
-        // Extract standard metadata fields from HtmlMetadata before consuming into FormatMetadata
         let meta_title = html_metadata.as_ref().and_then(|m| m.title.clone());
         let meta_authors = html_metadata
             .as_ref()
@@ -451,10 +551,6 @@ impl SyncExtractor for HtmlExtractor {
 
         let format_metadata = html_metadata.map(|m: HtmlMetadata| crate::types::FormatMetadata::Html(Box::new(m)));
 
-        // Signal that the extractor already formatted the output so the pipeline
-        // does not double-convert.
-        // Markdown content is normalized to GFM: setext headings → ATX, trailing
-        // whitespace removed. Djot is passed through as-is (different lint rules apply).
         let (pre_formatted, pre_rendered) = match config.output_format {
             OutputFormat::Markdown => {
                 let normalized = normalize_html_markdown(content_text.clone());
@@ -464,9 +560,6 @@ impl SyncExtractor for HtmlExtractor {
             _ => (None, None),
         };
 
-        // Build InternalDocument from html-to-markdown's DocumentStructure.
-        // If the structure has nodes, map them to InternalDocument elements.
-        // Otherwise, fall back to a single paragraph with the converter's text output.
         let inject_placeholders = config
             .images
             .as_ref()
@@ -476,8 +569,6 @@ impl SyncExtractor for HtmlExtractor {
         let mut doc = if let Some(ref structure) = doc_structure {
             let mapped = Self::map_document_structure(structure, inject_placeholders, &mut budget)?;
             if mapped.elements.is_empty() && !content_text.is_empty() {
-                // Structure collector didn't produce nodes (e.g. only images/lists which
-                // aren't collected yet). Use the converter's text as a paragraph.
                 let mut b = InternalDocumentBuilder::new("html");
                 b.push_paragraph(&content_text, vec![], None, None);
                 b.build()
@@ -492,6 +583,14 @@ impl SyncExtractor for HtmlExtractor {
             InternalDocumentBuilder::new("html").build()
         };
 
+        if decoded_lossily {
+            crate::core::diagnostics::push_lossy_decode_warning(
+                &mut doc.processing_warnings,
+                HTML_WARNING_SOURCE,
+                "HTML source",
+            );
+        }
+
         doc.metadata = Metadata {
             title: meta_title,
             authors: meta_authors,
@@ -504,15 +603,18 @@ impl SyncExtractor for HtmlExtractor {
         };
         doc.mime_type = mime_type.to_string();
         doc.pre_rendered_content = pre_rendered;
+        recover_mathml_formulas(&html, &mut doc);
+        recover_table_captions(&html, &mut doc);
 
-        // Add tables to InternalDocument
-        for table in tables {
-            doc.push_table(table);
-        }
-
-        // Extract inline images when image extraction is configured
         let should_extract_images = config.needs_image_data();
 
+        // Images extracted here (with binary data and OCR eligibility) each need a matching
+        // `ElementKind::Image` element: every renderer resolves images by walking elements, not
+        // by reading `doc.images` directly, so a raw `push_image` alone silently drops them.
+        // The HTML conversion pass above emits only inline `![alt](src)` markdown and a URI
+        // record — it never stores bytes — and correlating those back to the extracted images
+        // would require threading image identity through that pass, so the elements are appended
+        // here instead of being placed in-flow. ~keep
         if should_extract_images {
             let image_html_options =
                 apply_content_filter_to_html_options(config.html_options.clone(), config.content_filter.as_ref());
@@ -530,7 +632,6 @@ impl SyncExtractor for HtmlExtractor {
                     InlineImageFormat::Other(ref s) => Cow::Owned(s.clone()),
                 };
 
-                // Classify image based on metadata and visual properties
                 let (image_kind, kind_confidence) = crate::extraction::image_kind::classify(
                     &img.data,
                     format.as_ref(),
@@ -562,7 +663,14 @@ impl SyncExtractor for HtmlExtractor {
                     qr_codes: None,
                     data_base64: None,
                 };
-                doc.push_image(extracted);
+                let description = extracted.description.clone();
+                let image_index = doc.push_image(extracted);
+                let text = description.unwrap_or_default();
+                doc.push_element(crate::types::internal::InternalElement::text(
+                    crate::types::internal::ElementKind::Image { image_index },
+                    text,
+                    0,
+                ));
             }
         }
 
@@ -592,7 +700,7 @@ impl InternalDocumentExtractor for HtmlExtractor {
         )
     ))]
     async fn extract_path(&self, path: &Path, mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
-        let bytes = tokio::fs::read(path).await?;
+        let bytes = crate::core::io::read_file_async(path).await?;
         self.extract_content(&bytes, mime_type, config).await
     }
 
@@ -619,17 +727,18 @@ mod tests {
             .enumerate()
             .map(|(i, t)| {
                 let grid = &t.grid;
-                let mut cells = vec![vec![String::new(); grid.cols as usize]; grid.rows as usize];
-                for cell in &grid.cells {
-                    if (cell.row as usize) < cells.len() && (cell.col as usize) < cells[0].len() {
-                        cells[cell.row as usize][cell.col as usize] = cell.content.clone();
-                    }
-                }
+                let cells = crate::extraction::grid_flatten::flatten_positioned_cells(
+                    grid.rows as usize,
+                    grid.cells
+                        .iter()
+                        .map(|c| (c.row, c.row_span, c.col_span, c.content.clone())),
+                );
                 Table {
                     cells,
                     markdown: t.markdown,
                     page_number: (i + 1) as u32,
                     bounding_box: None,
+                    ..Default::default()
                 }
             })
             .collect()
@@ -673,6 +782,52 @@ mod tests {
         assert_eq!(table.page_number, 1);
         assert!(table.markdown.contains("Header1"));
         assert!(table.markdown.contains("Row1Col1"));
+    }
+
+    /// A non-ASCII document whose link annotation lands mid-codepoint must not panic
+    /// `push_link_uris_from_annotations`. `text` is "café" (5 bytes: c, a, f, then the
+    /// 2-byte UTF-8 encoding of 'é'); an annotation ending at byte 4 splits that 'é' and
+    /// is not a valid `&str` slice boundary. The link's label must be dropped (not sliced)
+    /// while the URI itself is still recorded, and a `ProcessingWarning` must name the drop.
+    #[test]
+    fn should_not_panic_and_should_warn_when_link_annotation_splits_a_codepoint() {
+        use crate::types::document_structure::AnnotationKind;
+
+        let text = "caf\u{00e9}";
+        assert_eq!(
+            text.len(),
+            5,
+            "'café' must be 5 UTF-8 bytes for this test to be meaningful"
+        );
+        assert!(!text.is_char_boundary(4), "byte 4 must split the 2-byte 'é' encoding");
+
+        let annotations = vec![TextAnnotation {
+            start: 0,
+            end: 4,
+            kind: AnnotationKind::Link {
+                url: "https://example.com".to_string(),
+                title: None,
+            },
+        }];
+
+        let mut builder = InternalDocumentBuilder::new("html");
+        push_link_uris_from_annotations(&annotations, text, &mut builder);
+        let doc = builder.build();
+
+        assert_eq!(doc.uris.len(), 1, "the URI must still be recorded");
+        assert_eq!(doc.uris[0].url, "https://example.com");
+        assert_eq!(
+            doc.uris[0].label, None,
+            "label must be dropped, not sliced mid-codepoint"
+        );
+
+        assert_eq!(doc.processing_warnings.len(), 1);
+        assert_eq!(doc.processing_warnings[0].source, HTML_WARNING_SOURCE);
+        assert!(
+            doc.processing_warnings[0].message.contains("character boundary"),
+            "warning message was: {}",
+            doc.processing_warnings[0].message
+        );
     }
 
     #[test]
@@ -766,14 +921,12 @@ mod tests {
 
         let tables = extract_tables(html);
 
-        // Should find at least 2 tables: outer + nested
         assert!(
             tables.len() >= 2,
             "Expected at least 2 tables (outer + nested), found {}",
             tables.len()
         );
 
-        // Find the nested table (has Task ID header)
         let nested = tables
             .iter()
             .find(|t| {
@@ -822,14 +975,84 @@ mod tests {
         let result =
             crate::extraction::derive::derive_extraction_result(result, true, crate::core::config::OutputFormat::Plain);
 
-        // Tables come from document structure extraction (single source now)
         assert!(!result.tables.is_empty(), "Should have at least one table");
-        // Verify table content
         let table = &result.tables[0];
         assert_eq!(table.cells.len(), 3);
         assert_eq!(table.cells[0], vec!["Name", "Age"]);
         assert_eq!(table.cells[1], vec!["Alice", "30"]);
         assert_eq!(table.cells[2], vec!["Bob", "25"]);
+    }
+
+    /// Regression test: `extract_sync` used to additionally re-push every table via the raw,
+    /// element-less `InternalDocument::push_table`, on top of the correctly-created table
+    /// element from `map_document_structure`. That created a duplicate, unreferenced entry in
+    /// `doc.tables` for every table (and double-counted cells against the security budget)
+    /// without changing rendered output. Assert there is exactly one table, not two.
+    #[tokio::test]
+    async fn test_html_extractor_table_is_not_duplicated_in_structured_output() {
+        let html = r#"
+            <html>
+                <body>
+                    <table>
+                        <tr><th>Name</th><th>Age</th></tr>
+                        <tr><td>Alice</td><td>30</td></tr>
+                    </table>
+                </body>
+            </html>
+        "#;
+
+        let extractor = HtmlExtractor::new();
+        let config = ExtractionConfig::default();
+        let result = extractor
+            .extract_content(html.as_bytes(), "text/html", &config)
+            .await
+            .unwrap();
+        let result =
+            crate::extraction::derive::derive_extraction_result(result, true, crate::core::config::OutputFormat::Plain);
+
+        assert_eq!(
+            result.tables.len(),
+            1,
+            "table should not be duplicated: {:?}",
+            result.tables
+        );
+    }
+
+    /// Regression test: extracted inline image bytes must be reachable from a matching
+    /// `ElementKind::Image` element, otherwise renderers silently drop the image (and any OCR
+    /// content attached to it) since they look images up by walking elements, not `doc.images`
+    /// directly.
+    #[tokio::test]
+    async fn test_html_extractor_inline_image_produces_image_element() {
+        let png_b64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let html = format!(r#"<html><body><img src="data:image/png;base64,{png_b64}" alt="a photo"></body></html>"#);
+
+        let config = ExtractionConfig {
+            images: Some(crate::core::config::ImageExtractionConfig {
+                extract_images: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let extractor = HtmlExtractor::new();
+        let doc = extractor
+            .extract_content(html.as_bytes(), "text/html", &config)
+            .await
+            .expect("extraction should succeed");
+
+        assert_eq!(doc.images.len(), 1, "expected one extracted image in {:?}", doc.images);
+        let image_element_count = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Image { .. }))
+            .count();
+        assert_eq!(
+            image_element_count, 1,
+            "expected one Image element in {:?}",
+            doc.elements
+        );
     }
 
     #[tokio::test]
@@ -893,14 +1116,11 @@ mod tests {
         let result =
             crate::extraction::derive::derive_extraction_result(result, true, crate::core::config::OutputFormat::Plain);
 
-        // Content should already be in djot format
         assert_eq!(result.mime_type, "text/html");
         let original_content = result.content.clone();
 
-        // Simulate pipeline format application
         let pipeline_result = crate::core::pipeline::apply_output_format(result.clone(), OutputFormat::Djot);
 
-        // Content should be identical - no re-conversion should occur
         assert_eq!(pipeline_result.content, original_content);
         assert_eq!(pipeline_result.mime_type, "text/html");
     }
@@ -920,12 +1140,11 @@ mod tests {
     async fn test_extract_sync_plain_text_has_content() {
         let html = r#"<h1>Title</h1><p>Hello world</p>"#;
         let extractor = HtmlExtractor::new();
-        let config = ExtractionConfig::default(); // Plain text
+        let config = ExtractionConfig::default();
         let result = extractor
             .extract_content(html.as_bytes(), "text/html", &config)
             .await
             .unwrap();
-        // Check that InternalDocument has elements
         assert!(
             !result.elements.is_empty(),
             "InternalDocument should have elements, got: {:?}",
@@ -963,7 +1182,6 @@ mod tests {
         let mut budget = SecurityBudget::from_limits(&SecurityLimits::default());
         let doc = HtmlExtractor::map_document_structure(&doc_structure, true, &mut budget).unwrap();
 
-        // Check that no element contains CSS or script content
         for elem in &doc.elements {
             let text = elem.text.as_str();
             assert!(
@@ -1014,7 +1232,6 @@ mod tests {
             "inject_placeholders=false should not produce image markdown placeholder, got: '{}'",
             content
         );
-        // URI should still be collected
         assert!(
             !doc.uris.is_empty(),
             "Image URI should still be collected when inject_placeholders=false"
@@ -1024,10 +1241,6 @@ mod tests {
             "Should have URI for test.png"
         );
     }
-
-    // =========================================================================
-    // normalize_html_markdown tests
-    // =========================================================================
 
     #[test]
     fn test_normalize_converts_setext_h1_to_atx() {
@@ -1065,7 +1278,6 @@ mod tests {
         let input = "Some text\n# Heading\n".to_string();
         let output = normalize_html_markdown(input);
         let lines: Vec<&str> = output.lines().collect();
-        // Find the heading line and assert the line before it is blank
         let heading_idx = lines.iter().position(|l| l.starts_with("# Heading")).unwrap();
         assert!(heading_idx > 0, "heading should not be at line 0");
         assert!(
@@ -1079,7 +1291,6 @@ mod tests {
     fn test_normalize_atx_heading_at_file_start_no_blank_line_needed() {
         let input = "# Top Heading\n\nSome text.\n".to_string();
         let output = normalize_html_markdown(input.clone());
-        // When heading is the very first line, no blank line should be prepended
         assert!(
             output.starts_with("# Top Heading"),
             "heading at file start should not have leading blank line, got: {output:?}"
@@ -1140,10 +1351,8 @@ mod tests {
         let (content, metadata, _, _) =
             crate::extraction::html::convert_html_to_markdown_with_tables(html, Some(options), None).unwrap();
 
-        // Content should still be extracted
         assert!(content.contains("Content Heading"));
 
-        // But metadata should be None when extract_metadata=false
         assert!(
             metadata.is_none() || metadata.as_ref().unwrap().is_empty(),
             "Metadata should be None or empty when extract_metadata=false, but got: {:?}",
@@ -1175,10 +1384,8 @@ mod tests {
         let (content, metadata, _, _) =
             crate::extraction::html::convert_html_to_markdown_with_tables(html, Some(options), None).unwrap();
 
-        // Content should be extracted
         assert!(content.contains("Content Heading"));
 
-        // Metadata should be present when extract_metadata=true
         assert!(metadata.is_some(), "Metadata should be Some when extract_metadata=true");
         let meta = metadata.unwrap();
         assert_eq!(

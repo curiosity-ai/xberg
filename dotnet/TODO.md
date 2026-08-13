@@ -2,17 +2,58 @@
 
 Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` out of scope (dropped)
 
-Each format is "done" when the `Xberg.TestRunner` output matches the committed
+Each format is "done" when the `Xberg.TestRunner` output matches the locally generated
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
+See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
-> **Status:** **content-parity 86.6% identical, 92.8% ≥95%-similar; 35 fixtures (<80%) are
-> genuine content misses; ZERO catastrophes.** 232 unit tests. Every format in the corpus now
-> extracts. Recent fixes for cases Rust caught and we didn't: epub nav-detection (roxmltree
-> text() semantics), docx VML text-box content, PDF AcroForm field values, legacy .xla (CFB
-> sniff), .xlsb (new BIFF12 reader), 7z (new managed LZMA/LZMA2 decoder + container parser),
-> tgz format label. The remaining real misses are iWork (unported), a stale SVG golden (we
-> match current Rust, which excludes `<script>`), two html-to-markdown ordering quirks, and
-> deep PDF reading-order / math-glyph spacing (a limitation Rust shares on the worst fixtures).
+> **Status (after the August upstream merge, 1821 Rust commits):** measured against goldens
+> regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
+> **2043 fixtures (69.4%) match on every hard dimension**; content-parity **76.7% identical,
+> 87.1% ≥95%-similar**; 138 fixtures (<80%) are genuine content misses; **22 catastrophes
+> (0.7%)**. 234 unit tests.
+>
+> The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
+> they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
+> markdown smart punctuation and block-level raw HTML, structural rendering for
+> YAML/TOML/JSONL plus `flattened_fields`, a JSON node for every element kind, docx entity
+> refs / inline annotations / page-break accounting, `.msg` PR_HTML binary bodies, the full
+> email header set with CRLF normalization, csv table elements, DocSecurity flags, and
+> character counts as Unicode scalars rather than UTF-8 bytes.
+
+## Known gaps after the merge
+
+Ordered by corpus impact. Each is a real upstream behaviour the port does not yet reproduce —
+not a cosmetic difference.
+
+- [ ] **PDF (389 fixtures, 0 fully matching; plain 114/388, markdown 32/388).** The single
+      largest area, and upstream landed 127 PDF commits in this window. Divergence is deep:
+      reading order, heading detection, chart/figure text, and bold runs. Metadata is 0/388
+      purely because `PdfMetadata` lacks the two scanned-detection fields
+      (`scanned_confidence`, `scanned_pages`) — port `pdf/scan_detect.rs`: a page scores 0.5
+      for ≥80% raster coverage, +0.35 when the text layer is absent or ≥50% invisible, +0.10
+      for a CCITT/JBIG2 codec, +0.05 for a scanner producer; document confidence is the page
+      maximum, and `scanned_pages` lists 1-based pages at or above the configured threshold.
+- [ ] **DocTags ingestion (12 of the 22 catastrophes).** Upstream added DocTags as an input
+      format, so `*.doctags.txt` fixtures parse into a structured tree; we read them as plain
+      text and emit the raw `<doctag><loc_60>…` markup. New format, not a bug fix.
+- [ ] **TOML key ordering (toml 1/5).** Rust's `toml::Value::Table` is a `BTreeMap`, so keys
+      are emitted in sorted order; the C# parser preserves file order. Datetimes also need the
+      `$__toml_private_datetime` wrapper that toml→serde_json produces, while the flattened
+      view keeps them plain.
+- [ ] **pptx slide numbering (metadata 0/11).** Upstream GH#1413 reworked the extractor to
+      parse each archive-derived slide independently and carry its true slide number; we still
+      rebuild from the rendered string and only advance the number on a titled slide.
+- [ ] **Reviewer comments (`CommentRef` / `CommentDefinition`).** Upstream gave docx comments
+      their own element kinds (GH#300). The C# `ElementKindTag` has no such variants, so the
+      JSON renderer's comment arms could not be ported with the rest.
+- [ ] **Email attachment text (3 eml + 2 msg catastrophes).** Rust extracts each attachment
+      through the pipeline and appends its text under a level-2 heading; we list attachment
+      names and sizes only.
+- [ ] **Markdown math.** `$…$` / `$$…$$` should surface as content with the delimiters
+      stripped (pulldown-cmark `ENABLE_MATH`); we pass the delimiters through as literal text.
+- [ ] **Citation formats (nbib, ris).** Severe under-extraction — both are catastrophes.
+- [ ] **html 10/41, typ 0/8, odp, ipynb, mdx.** Not yet triaged; use `--cluster`.
+
 ---
 
 ## Phase 0 — Setup & reference data
@@ -81,7 +122,8 @@ Each format is "done" when the `Xberg.TestRunner` output matches the committed
 
 ## Phase 4 — Email & archives
 
-- [x] **eml** (msg deferred) (`extractors/email.rs`, `extraction/email.rs`) — MIME + CFB msg.
+- [x] **eml** + **msg** (`extractors/email.rs`, `extraction/email.rs`) — MIME + CFB msg.
+      Attachment-text inlining still missing; see "Known gaps".
 - [ ] **pst** (`extractors/pst.rs`) — Outlook PST (port `outlook-pst`; large — evaluate).
 - [x] **archives** (`extractors/archive.rs`) — zip / tar / 7z / gzip, recursive extraction
       of children through the pipeline.
@@ -110,7 +152,12 @@ Each format is "done" when the `Xberg.TestRunner` output matches the committed
 - [ ] Per-page content splitting.
 - [ ] Document-structure tree derivation (for the structured object output).
 - [ ] Security limits (max size, zip-bomb guards — `extractors/security.rs`).
-- [ ] CI: build + run `Xberg.TestRunner` on the fixtures; publish NuGet on tag.
+- [ ] CI: build + run `Xberg.TestRunner` on the fixtures; publish NuGet on tag. Note the
+      corpus is no longer self-contained: CI must run `test_documents/scripts/fetch_corpus.py`
+      and regenerate goldens, since neither the binaries nor the goldens are in git.
+- [ ] Performance: the 55 MB `parsebench/text_content.jsonl` fixture takes ~29s to render
+      markdown now that structured formats build an element tree. Not wrong, but far off
+      Rust; the harness timeout was raised to 120s to keep it measured rather than skipped.
 
 ## Excluded (dropped per requirements)
 

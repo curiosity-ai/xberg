@@ -44,7 +44,6 @@ impl SnippetValidator for CValidator {
                 c
             }
             ValidationLevel::Run => {
-                // Compile first
                 let mut compile = std::process::Command::new(cc);
                 compile.args(["-o", &out_str, &src_str]);
                 let (ok, output) = run_command(&mut compile, timeout_secs)?;
@@ -79,9 +78,6 @@ impl SnippetValidator for CValidator {
             return false;
         }
 
-        // Use any() instead of all(): if ANY error is a dependency error, treat the
-        // entire snippet as dependency-limited. Cascading errors from missing headers
-        // produce unpredictable secondary messages that can't all be enumerated.
         error_lines.iter().any(|line| {
             line.contains("file not found")
                 || line.contains("unknown type name")
@@ -89,31 +85,31 @@ impl SnippetValidator for CValidator {
                 || line.contains("implicit declaration of function")
                 || line.contains("incompatible pointer")
                 || line.contains("No such file or directory")
-                || line.contains("undeclared") // general undeclared
-                || line.contains("incomplete type") // from missing header types
-                || line.contains("has no member named") // struct member from dep
-                || line.contains("called object type") // function pointer from dep
-                || line.contains("use of undeclared") // any undeclared usage
-                || line.contains("implicit conversion") // type conversion from missing types
-                || line.contains("expected expression") // incomplete code fragments
-                || line.contains("expected identifier") // cascading from unknown types
-                || line.contains("errors generated") // summary line (N errors generated)
-                || line.contains("call to undeclared") // undeclared function
-                || line.contains("conflicting types") // cascading type issues
-                || line.contains("too few arguments") // cascading
-                || line.contains("too many arguments") // cascading
-                || line.contains("type specifier missing") // cascading from missing headers
-                || line.contains("parameter list without types") // cascading
-                || line.contains("call to undeclared library") // undeclared library function
-                || line.contains("warnings and") // "N warnings and M errors generated"
-                || line.contains("too many errors") // fatal: too many errors emitted
-                || line.contains("incompatible integer") // cascading from unknown types
-                || line.contains("initializer element") // cascading from undeclared
-                || line.contains("expected parameter declarator") // fragment without includes
-                || line.contains("expected ')'") // cascading from unknown types
-                || line.contains("expected '}'") // cascading from incomplete code
-                || line.contains("data definition has no type or storage class") // code fragments without function wrapper
-                || line.contains("type defaults to") // cascading from missing types/includes
+                || line.contains("undeclared")
+                || line.contains("incomplete type")
+                || line.contains("has no member named")
+                || line.contains("called object type")
+                || line.contains("use of undeclared")
+                || line.contains("implicit conversion")
+                || line.contains("expected expression")
+                || line.contains("expected identifier")
+                || line.contains("errors generated")
+                || line.contains("call to undeclared")
+                || line.contains("conflicting types")
+                || line.contains("too few arguments")
+                || line.contains("too many arguments")
+                || line.contains("type specifier missing")
+                || line.contains("parameter list without types")
+                || line.contains("call to undeclared library")
+                || line.contains("warnings and")
+                || line.contains("too many errors")
+                || line.contains("incompatible integer")
+                || line.contains("initializer element")
+                || line.contains("expected parameter declarator")
+                || line.contains("expected ')'")
+                || line.contains("expected '}'")
+                || line.contains("data definition has no type or storage class")
+                || line.contains("type defaults to")
         })
     }
 }

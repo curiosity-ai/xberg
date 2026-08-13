@@ -125,13 +125,11 @@ def replace_workspace_deps_in_toml(toml_path: Path, workspace_deps: dict[str, ob
             other_fields_str = match.group(1).strip()
             base_spec = format_dependency(name, dep_spec)
             if " = { " not in base_spec:
-                # Simple string dep like `ctor = "0.6"` - wrap it
                 version_val = base_spec.split(" = ", 1)[1].strip('"')
                 spec_part = f'version = "{version_val}"'
             else:
                 spec_part = base_spec.split(" = { ", 1)[1].rstrip("} ").rstrip("}")
 
-            # Extract existing keys and values from workspace spec, handling nested brackets
             workspace_fields: dict[str, str] = {}
             bracket_depth = 0
             current_field = ""
@@ -143,7 +141,6 @@ def replace_workspace_deps_in_toml(toml_path: Path, workspace_deps: dict[str, ob
                     bracket_depth -= 1
                     current_field += char
                 elif char == "," and bracket_depth == 0:
-                    # End of field
                     field = current_field.strip()
                     if field and "=" in field:
                         key, val = field.split("=", 1)
@@ -152,14 +149,12 @@ def replace_workspace_deps_in_toml(toml_path: Path, workspace_deps: dict[str, ob
                 else:
                     current_field += char
 
-            # Don't forget the last field
             if current_field.strip():
                 field = current_field.strip()
                 if field and "=" in field:
                     key, val = field.split("=", 1)
                     workspace_fields[key.strip()] = val.strip()
 
-            # Extract crate-specific keys using bracket-aware parsing
             crate_fields: dict[str, str] = {}
             bracket_depth = 0
             current_field = ""
@@ -171,7 +166,6 @@ def replace_workspace_deps_in_toml(toml_path: Path, workspace_deps: dict[str, ob
                     bracket_depth -= 1
                     current_field += char
                 elif char == "," and bracket_depth == 0:
-                    # End of field
                     field = current_field.strip()
                     if field and "=" in field:
                         key, val = field.split("=", 1)
@@ -180,17 +174,14 @@ def replace_workspace_deps_in_toml(toml_path: Path, workspace_deps: dict[str, ob
                 else:
                     current_field += char
 
-            # Don't forget the last field
             if current_field.strip():
                 field = current_field.strip()
                 if field and "=" in field:
                     key, val = field.split("=", 1)
                     crate_fields[key.strip()] = val.strip()
 
-            # Merge: crate-specific fields override workspace fields
             merged_fields = {**workspace_fields, **crate_fields}
 
-            # Build result from merged fields
             merged_parts = [f"{k} = {v}" for k, v in merged_fields.items()]
             merged_spec = ", ".join(merged_parts)
 
@@ -220,7 +211,6 @@ def generate_vendor_cargo_toml(
 
     deps_str = "\n".join(deps_lines)
 
-    # Build members list based on actually copied crates
     members = [
         name
         for name in ["xberg", "xberg-ffi", "xberg-tesseract", "xberg-paddle-ocr", "rb-sys"]
@@ -266,13 +256,11 @@ def main() -> None:
 
     vendor_base: Path = repo_root / "packages" / "ruby" / "vendor"
 
-    # Clean only crate directories, preserving vendor/bundle/ (Bundler gems)
     crate_names = ["xberg", "xberg-ffi", "xberg-tesseract", "xberg-paddle-ocr", "rb-sys"]
     for name in crate_names:
         crate_path = vendor_base / name
         if crate_path.exists():
             shutil.rmtree(crate_path)
-    # Also clean the vendor Cargo.toml (will be regenerated)
     vendor_cargo = vendor_base / "Cargo.toml"
     if vendor_cargo.exists():
         vendor_cargo.unlink()
@@ -319,7 +307,6 @@ def main() -> None:
 
     print("Cleaned build artifacts")
 
-    # Update workspace inheritance in Cargo.toml files
     for crate_dir in copied_crates:
         crate_toml = vendor_base / crate_dir / "Cargo.toml"
         if crate_toml.exists():
@@ -343,35 +330,29 @@ def main() -> None:
             replace_workspace_deps_in_toml(crate_toml, workspace_deps)
             print(f"Updated {crate_dir}/Cargo.toml")
 
-    # Update path dependencies in xberg-ffi crate
     if "xberg-ffi" in copied_crates and "xberg" in copied_crates:
         ffi_toml = vendor_base / "xberg-ffi" / "Cargo.toml"
         if ffi_toml.exists():
             with open(ffi_toml) as f:
                 content = f.read()
 
-            # Replace xberg workspace references with path dependency
-            # Handle cases with path, version, or neither
             content = re.sub(r'(xberg = \{) (?:(?:path|version) = "[^"]*", )?', r'\1 path = "../xberg", ', content)
 
             with open(ffi_toml, "w") as f:
                 f.write(content)
 
-    # Update path dependencies in xberg crate if tesseract was copied
     if "xberg" in copied_crates:
         xberg_toml = vendor_base / "xberg" / "Cargo.toml"
         if xberg_toml.exists():
             with open(xberg_toml) as f:
                 content = f.read()
 
-            # Only update tesseract path if it was actually copied
             if "xberg-tesseract" in copied_crates:
                 content = re.sub(
                     r'xberg-tesseract = \{ (?:path = "[^"]*", )?version = "[^"]*", optional = true \}',
                     'xberg-tesseract = { path = "../xberg-tesseract", optional = true }',
                     content,
                 )
-            # Only update paddle-ocr path if it was actually copied
             if "xberg-paddle-ocr" in copied_crates:
                 content = re.sub(
                     r'xberg-paddle-ocr = \{ (?:path = "[^"]*", )?version = "[^"]*", optional = true \}',
@@ -385,15 +366,11 @@ def main() -> None:
     generate_vendor_cargo_toml(repo_root, workspace_deps, core_version, copied_crates)
     print("Generated vendor/Cargo.toml")
 
-    # Update native extension Cargo.toml to use vendored crates
     native_toml = repo_root / "packages" / "ruby" / "ext" / "xberg_rb" / "native" / "Cargo.toml"
     if native_toml.exists():
         with open(native_toml) as f:
             content = f.read()
 
-        # Replace path dependencies to point to vendored crates
-        # From: path = "../../../../../crates/xberg"
-        # To: path = "../../../vendor/xberg"
         content = re.sub(r'path = "\.\./\.\./\.\./\.\./\.\./crates/xberg"', 'path = "../../../vendor/xberg"', content)
         content = re.sub(
             r'path = "\.\./\.\./\.\./\.\./\.\./crates/xberg-ffi"', 'path = "../../../vendor/xberg-ffi"', content

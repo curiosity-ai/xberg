@@ -22,12 +22,6 @@ if [ "$use_cross" = "true" ]; then
 fi
 if [ "$use_zigbuild" = "true" ]; then
   args+=(--cross-compile)
-  # openssl-sys's build script emits a single `-I/usr/include` for the expando
-  # probe. Ubuntu's multilib layout splits the arch-independent openssl headers
-  # at /usr/include/openssl/ from the arch-specific ones at
-  # /usr/include/<triplet>/openssl/. Under zig's sysroot, the second path isn't
-  # picked up automatically, so the probe fails to find opensslconf.h. Symlink
-  # the arch-specific headers into /usr/include/openssl/ so -I/usr/include works.
   case "$target" in
   x86_64-unknown-linux-gnu) triplet=x86_64-linux-gnu ;;
   aarch64-unknown-linux-gnu) triplet=aarch64-linux-gnu ;;
@@ -56,7 +50,6 @@ ls -lah "$artifacts_dir" 2>/dev/null || echo "Artifacts directory not found!"
 echo "=== Checking for .node files ==="
 find "$artifacts_dir" -name "*.node" -print 2>/dev/null || echo "No .node files found!"
 
-# Verify that at least one .node file was created
 node_files=$(find "$artifacts_dir" -name "*.node" 2>/dev/null | wc -l)
 if [ "$node_files" -eq 0 ]; then
   echo "ERROR: Native module build succeeded but no .node file was generated" >&2

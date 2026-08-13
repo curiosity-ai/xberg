@@ -70,7 +70,6 @@ async fn custom_labels_route_through_backend() {
     let backend = match GlineBackend::new(None) {
         Ok(b) => b,
         Err(xberg::XbergError::MissingDependency(_)) | Err(xberg::XbergError::Plugin { .. }) => {
-            // Model download blocked offline — acceptable in this test.
             return;
         }
         Err(other) => panic!("unexpected backend construction error: {other:?}"),

@@ -18,6 +18,7 @@ const QUIET_DIRECTIVES: &[&str] = &[
     "rustls=warn",
     "hyper_util=warn",
     "hf_hub=info",
+    "pdf_oxide=warn",
     "tower_http=info",
 ];
 
@@ -46,15 +47,11 @@ fn directive_target(directive: &str) -> Option<&str> {
 /// * `level_override` — explicit root-level string from a CLI flag (e.g. `"debug"`).
 ///   When `Some`, it replaces `RUST_LOG` entirely for the root level.
 pub fn build_env_filter(level_override: Option<&str>) -> EnvFilter {
-    // Use try_new on user input so a malformed --log-level falls back to info
-    // instead of panicking the CLI.
     let base = level_override
         .and_then(|level| EnvFilter::try_new(level).ok())
         .or_else(|| EnvFilter::try_from_default_env().ok())
         .unwrap_or_else(|| EnvFilter::new("info"));
 
-    // Snapshot the existing directive set so we can skip quiet directives
-    // whose target the user has already configured explicitly.
     let existing_targets: std::collections::HashSet<String> = base
         .to_string()
         .split(',')
@@ -64,9 +61,6 @@ pub fn build_env_filter(level_override: Option<&str>) -> EnvFilter {
     QUIET_DIRECTIVES
         .iter()
         .filter(|directive| {
-            // Only add the quiet directive when no per-target rule for this
-            // exact crate already exists. Word-boundary match via tokenized
-            // target set avoids `hf_hub` colliding with `hf_hub_server`.
             directive_target(directive)
                 .map(|target| !existing_targets.contains(target))
                 .unwrap_or(true)
@@ -90,7 +84,6 @@ mod tests {
 
     #[test]
     fn default_filter_suppresses_ureq() {
-        // No env, no override → ureq and ureq_proto must be suppressed.
         let filter = build_env_filter(None);
         let directives = filter_directives(&filter);
         assert!(
@@ -109,7 +102,6 @@ mod tests {
 
     #[test]
     fn default_filter_keeps_xberg_info() {
-        // Root level info → xberg has no suppression applied.
         let filter = build_env_filter(None);
         let directives = filter_directives(&filter);
         assert!(
@@ -120,9 +112,6 @@ mod tests {
 
     #[test]
     fn env_override_wins_for_third_party() {
-        // Simulate RUST_LOG=ureq=debug by passing it as the level_override.
-        // build_env_filter must detect the existing ureq= directive and skip the
-        // ureq=warn suppression, so ureq=debug survives in the final filter.
         let filter = build_env_filter(Some("info,ureq=debug"));
         let directives = filter.to_string();
         assert!(
@@ -137,14 +126,12 @@ mod tests {
 
     #[test]
     fn level_override_wins() {
-        // CLI flag "debug" → root must be debug; suppression directives still present.
         let filter = build_env_filter(Some("debug"));
         let directives = filter_directives(&filter);
         assert!(
             directives.contains("debug"),
             "root debug level must appear in filter with --log-level debug; got: {directives}"
         );
-        // Suppression for ureq must still be layered on top.
         assert!(
             directives.contains("ureq=warn"),
             "ureq=warn suppression must still be present even under --log-level debug; got: {directives}"
@@ -153,7 +140,6 @@ mod tests {
 
     #[test]
     fn tower_http_suppressed_at_default() {
-        // No override → tower_http must be suppressed.
         let filter = build_env_filter(None);
         let directives = filter_directives(&filter);
         assert!(
@@ -164,7 +150,6 @@ mod tests {
 
     #[test]
     fn all_quiet_directives_are_valid() {
-        // Ensure every built-in directive parses without panic.
         for directive in super::QUIET_DIRECTIVES {
             directive
                 .parse::<tracing_subscriber::filter::Directive>()
@@ -174,11 +159,8 @@ mod tests {
 
     #[test]
     fn no_level_override_uses_info_root() {
-        // Without RUST_LOG set and no override, root should default to info.
-        // The directive string must not open with debug or trace as the root level.
         let filter = build_env_filter(None);
         let directives = filter_directives(&filter);
-        // Root "debug" or "trace" as the first token would mean root is debug/trace.
         let root_is_noisier_than_info = directives.starts_with("debug") || directives.starts_with("trace");
         assert!(
             !root_is_noisier_than_info,
@@ -207,12 +189,31 @@ mod tests {
     }
 
     #[test]
+    fn pdf_oxide_suppressed_at_default() {
+        let directives = filter_directives(&build_env_filter(None));
+        assert!(
+            directives.contains("pdf_oxide=warn"),
+            "pdf_oxide must be suppressed to warn by default; got: {directives}"
+        );
+    }
+
+    #[test]
+    fn pdf_oxide_user_override_wins() {
+        let directives = filter_directives(&build_env_filter(Some("info,pdf_oxide=debug")));
+        assert!(
+            directives.contains("pdf_oxide=debug"),
+            "user-supplied pdf_oxide=debug must be preserved; got: {directives}"
+        );
+        assert!(
+            !directives.contains("pdf_oxide=warn"),
+            "default pdf_oxide suppression must not replace a user override; got: {directives}"
+        );
+    }
+
+    #[test]
     fn malformed_level_override_falls_back_to_info() {
-        // Garbage CLI flag must NOT panic — try_new returns Err and we fall back
-        // to RUST_LOG / info default.
         let filter = build_env_filter(Some(":::garbage"));
         let directives = filter_directives(&filter);
-        // Quiet directives should still be layered, proving we recovered.
         assert!(
             directives.contains("ureq=warn"),
             "ureq=warn must still be present after malformed override; got: {directives}"
@@ -221,9 +222,6 @@ mod tests {
 
     #[test]
     fn similar_target_name_does_not_block_suppression() {
-        // A user-supplied directive for `hf_hub_server` must NOT cause the
-        // `hf_hub=info` suppression to be skipped (regression test for the
-        // earlier substring-containment bug).
         let filter = build_env_filter(Some("info,hf_hub_server=debug"));
         let directives = filter.to_string();
         assert!(

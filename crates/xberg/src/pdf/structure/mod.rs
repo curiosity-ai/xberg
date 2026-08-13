@@ -9,13 +9,16 @@ mod classify;
 pub(crate) mod constants;
 pub(crate) mod geometry;
 pub(crate) mod layout_classify;
+pub(crate) mod layout_debug;
 mod lines;
+mod list_marker;
+pub(crate) mod page_number;
 mod paragraphs;
 mod pipeline;
 pub(crate) mod regions;
 mod text_repair;
 pub(crate) mod types;
 
-#[allow(unused_imports)] // Used by extractors/pdf/ocr.rs for building InternalDocument from OCR paragraphs
+#[allow(unused_imports)]
 pub(crate) use assembly::assemble_internal_document;
 pub(crate) use pipeline::{SegmentStructureConfig, extract_document_structure_from_segments};

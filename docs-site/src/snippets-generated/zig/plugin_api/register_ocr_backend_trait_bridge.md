@@ -1,0 +1,34 @@
+---
+id: fixture_zig_register_ocr_backend_trait_bridge
+language: zig
+target: zig
+level: typecheck
+requires: []
+side_effect: safe
+---
+
+register_ocr_backend: trait bridge
+
+```zig title="Zig"
+const std = @import("std");
+const xberg = @import("xberg");
+
+pub fn main() !void {
+    const TestStub_register_ocr_backend_trait_bridge = struct {
+        pub fn process_image(_: *@This(), _: [*c]const u8, _: [*c]const u8) ![*c]const u8 { return ""; }
+        pub fn process_image_file(_: *@This(), _: [*c]const u8, _: [*c]const u8) ![*c]const u8 { return ""; }
+        pub fn supports_language(_: *@This(), _: [*c]const u8) i32 { return 0; }
+        pub fn backend_type(_: *@This()) [*c]const u8 { return "{}"; }
+        pub fn supported_languages(_: *@This()) [*c]const u8 { return "[]"; }
+        pub fn supports_table_detection(_: *@This()) i32 { return 0; }
+        pub fn supports_document_processing(_: *@This()) i32 { return 0; }
+        pub fn emits_structured_markdown(_: *@This()) i32 { return 0; }
+        pub fn process_document(_: *@This(), _: [*c]const u8, _: [*c]const u8) ![*c]const u8 { return ""; }
+    };
+    var stub_register_ocr_backend_trait_bridge = TestStub_register_ocr_backend_trait_bridge{};
+    const vtable_register_ocr_backend_trait_bridge = xberg.make_ocr_backend_vtable(TestStub_register_ocr_backend_trait_bridge, &stub_register_ocr_backend_trait_bridge);
+    var out_err_register_ocr_backend_trait_bridge: ?[*c]u8 = null;
+    _ = xberg.register_ocr_backend("test", vtable_register_ocr_backend_trait_bridge, &stub_register_ocr_backend_trait_bridge, @ptrCast(&out_err_register_ocr_backend_trait_bridge));
+}
+
+```

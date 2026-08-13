@@ -2,6 +2,12 @@
 	"id": "extract_batch_uri_not_found",
 	"category": "batch",
 	"description": "extract_batch with missing URI input",
+	"docs": {
+		"topic": "batch",
+		"title": "extract_batch with missing URI input",
+		"description": "extract_batch with missing URI input",
+		"side_effects": "safe"
+	},
 	"tags": ["batch", "uri", "error"],
 	"call": "extract_batch",
 	"input": {
@@ -16,9 +22,5 @@
 		{
 			"type": "not_error"
 		}
-	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM cannot access filesystem; use bytes input with file content instead"
-	}
+	]
 }

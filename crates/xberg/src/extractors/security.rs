@@ -8,7 +8,7 @@
 //! - Entity length validation
 //! - Path traversal detection
 
-#[cfg(any(feature = "archives", feature = "hwpx"))]
+#[cfg(any(feature = "archives", feature = "hwpx", feature = "iwork"))]
 use std::io::{Read, Seek};
 
 /// Configuration for security limits across extractors.
@@ -57,15 +57,7 @@ impl Default for SecurityLimits {
             max_archive_size: 500 * 1024 * 1024,
             max_compression_ratio: 100,
             max_files_in_archive: 10_000,
-            // 1024 levels — generous headroom for legitimate DOCX/PPTX/EPUB
-            // documents (deeply nested tables-in-cells, OMath expressions,
-            // formatting wrappers) while still catching depth-bomb attacks
-            // (those typically have 5 000+ levels).
             max_nesting_depth: 1024,
-            // 1 MiB — per-token cap that catches billion-laughs entity
-            // expansion (single entities ballooning to hundreds of MB) without
-            // false-positiving on legitimate long attributes / CDATA blocks.
-            // Cumulative content size is bounded separately by max_content_size.
             max_entity_length: 1024 * 1024,
             max_content_size: 100 * 1024 * 1024,
             max_iterations: 10_000_000,
@@ -152,6 +144,16 @@ pub enum SecurityError {
         /// Configured maximum cell count.
         max: usize,
     },
+
+    /// An archive entry could not be read, so its declared sizes could not be
+    /// counted towards the archive limits. Reported rather than skipped: an
+    /// unaccounted entry makes every aggregate total untrustworthy.
+    UnreadableEntry {
+        /// Zero-based index of the entry in the archive's central directory.
+        index: usize,
+        /// Why the entry header could not be read.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SecurityError {
@@ -192,6 +194,13 @@ impl std::fmt::Display for SecurityError {
             SecurityError::TooManyCells { cells, max } => {
                 write!(f, "Too many table cells: {} (max: {})", cells, max)
             }
+            SecurityError::UnreadableEntry { index, reason } => {
+                write!(
+                    f,
+                    "Archive entry {} could not be read for security accounting: {}",
+                    index, reason
+                )
+            }
         }
     }
 }
@@ -199,13 +208,13 @@ impl std::fmt::Display for SecurityError {
 impl std::error::Error for SecurityError {}
 
 /// Helper struct for validating ZIP archives for security issues.
-#[cfg(any(feature = "archives", feature = "hwpx"))]
+#[cfg(any(feature = "archives", feature = "hwpx", feature = "iwork"))]
 #[cfg_attr(alef, alef(skip))]
 pub struct ZipBombValidator {
     limits: SecurityLimits,
 }
 
-#[cfg(any(feature = "archives", feature = "hwpx"))]
+#[cfg(any(feature = "archives", feature = "hwpx", feature = "iwork"))]
 impl ZipBombValidator {
     /// Create a new ZIP bomb validator.
     pub(crate) fn new(limits: SecurityLimits) -> Self {
@@ -213,6 +222,19 @@ impl ZipBombValidator {
     }
 
     /// Validate a ZIP archive for security issues.
+    ///
+    /// Every entry listed in the central directory is accounted for. Sizes are read via
+    /// `zip::ZipArchive::by_index_raw`, which parses the entry header without building a
+    /// decompressor, so entries using an unsupported compression method or requiring a
+    /// password still contribute to the totals instead of dropping out of them. An entry
+    /// whose header cannot be read at all is reported as `SecurityError::UnreadableEntry`
+    /// rather than skipped: an unaccounted entry means the aggregate totals below no longer
+    /// bound what extraction will do.
+    ///
+    /// Accumulation uses saturating arithmetic and the running total is compared against
+    /// `max_archive_size` after *every* entry. Declared sizes come straight from attacker
+    /// controlled ZIP64 headers and can each be close to `u64::MAX`, so an unchecked `+=`
+    /// would wrap the total back down to a small value and let the archive through.
     ///
     /// # Arguments
     /// * `archive` - Mutable ZIP archive to validate
@@ -230,40 +252,54 @@ impl ZipBombValidator {
             });
         }
 
+        let max_archive_size = self.limits.max_archive_size as u64;
+        let max_compression_ratio = self.limits.max_compression_ratio as f64;
         let mut total_uncompressed: u64 = 0;
         let mut total_compressed: u64 = 0;
 
-        for i in 0..file_count {
-            if let Ok(file) = archive.by_index(i) {
-                let compressed_size = file.compressed_size();
-                let uncompressed_size = file.size();
+        for index in 0..file_count {
+            let (compressed_size, uncompressed_size) = match archive.by_index_raw(index) {
+                Ok(file) => (file.compressed_size(), file.size()),
+                Err(error) => {
+                    return Err(SecurityError::UnreadableEntry {
+                        index,
+                        reason: error.to_string(),
+                    });
+                }
+            };
 
-                total_uncompressed += uncompressed_size;
-                total_compressed += compressed_size;
+            total_uncompressed = total_uncompressed.saturating_add(uncompressed_size);
+            total_compressed = total_compressed.saturating_add(compressed_size);
 
-                if compressed_size > 0 && uncompressed_size > 0 {
-                    let ratio = uncompressed_size as f64 / compressed_size as f64;
-                    if ratio > self.limits.max_compression_ratio as f64 {
-                        return Err(SecurityError::ZipBombDetected {
-                            compressed_size,
-                            uncompressed_size,
-                            ratio,
-                        });
-                    }
+            if uncompressed_size > 0 {
+                // A zero compressed size paired with a non-zero uncompressed size cannot be
+                // produced by any compressor; treating it as an unbounded ratio stops the
+                // entry from slipping past this check on a division it never performs. ~keep
+                let ratio = if compressed_size == 0 {
+                    f64::INFINITY
+                } else {
+                    uncompressed_size as f64 / compressed_size as f64
+                };
+                if ratio > max_compression_ratio {
+                    return Err(SecurityError::ZipBombDetected {
+                        compressed_size,
+                        uncompressed_size,
+                        ratio,
+                    });
                 }
             }
-        }
 
-        if total_uncompressed > self.limits.max_archive_size as u64 {
-            return Err(SecurityError::ArchiveTooLarge {
-                size: total_uncompressed,
-                max: self.limits.max_archive_size,
-            });
+            if total_uncompressed > max_archive_size {
+                return Err(SecurityError::ArchiveTooLarge {
+                    size: total_uncompressed,
+                    max: self.limits.max_archive_size,
+                });
+            }
         }
 
         if total_compressed > 0 {
             let ratio = total_uncompressed as f64 / total_compressed as f64;
-            if ratio > self.limits.max_compression_ratio as f64 {
+            if ratio > max_compression_ratio {
                 return Err(SecurityError::ZipBombDetected {
                     compressed_size: total_compressed,
                     uncompressed_size: total_uncompressed,
@@ -493,12 +529,27 @@ impl SecurityBudget {
     /// Build a budget from a borrowed `SecurityLimits`.
     pub(crate) fn from_limits(limits: &SecurityLimits) -> Self {
         Self {
-            depth: DepthValidator::new(limits.max_xml_depth.max(limits.max_nesting_depth)),
+            // Both limits apply to the same parse, so the budget must honour the tighter
+            // of the two. Taking the looser value silently discards a caller's attempt to
+            // clamp nesting via either knob. ~keep
+            depth: DepthValidator::new(limits.max_xml_depth.min(limits.max_nesting_depth)),
             iteration: IterationValidator::new(limits.max_iterations),
             entity: EntityValidator::new(limits.max_entity_length),
             growth: StringGrowthValidator::new(limits.max_content_size),
             table: TableValidator::new(limits.max_table_cells),
         }
+    }
+
+    /// Build a protobuf/iWork budget using the format-agnostic nesting limit.
+    // All callers live in the `iwork`-gated extractor module, so gate the
+    // constructor to match — otherwise it is dead code under feature combos
+    // that omit `iwork` (e.g. the no-ORT tract clippy leg). ~keep
+    #[cfg(feature = "iwork")]
+    pub(crate) fn for_iwork(limits: &SecurityLimits) -> Self {
+        let mut budget = Self::from_limits(limits);
+        // iWork parses protobuf messages, so XML depth is not applicable here. ~keep
+        budget.depth = DepthValidator::new(limits.max_nesting_depth);
+        budget
     }
 
     /// Convenience: build from `ExtractionConfig.security_limits` falling back to defaults.
@@ -515,7 +566,10 @@ impl SecurityBudget {
     }
 
     /// Build with explicit defaults (no config available, e.g. internal call sites).
-    #[cfg(any(feature = "xml", all(test, feature = "office")))]
+    // `office` is here for the PPTX OMML sub-parse (#47): the roxmltree-based slide parser
+    // threads no budget of its own, so the nested quick-xml math reader has nothing to
+    // inherit and falls back to the default limits. ~keep
+    #[cfg(any(feature = "xml", feature = "office"))]
     pub(crate) fn with_defaults() -> Self {
         Self::from_limits(&SecurityLimits::default())
     }
@@ -568,7 +622,11 @@ impl SecurityBudget {
 ///
 /// # Examples
 ///
-/// ```
+/// Not run as a doctest: this predicate is `pub(crate)`, used by the archive and
+/// container extractors. The public entry point for archive safety is
+/// [`crate::SecurityLimits`].
+///
+/// ```ignore
 /// # use xberg::extractors::security::has_path_traversal;
 /// assert!(has_path_traversal("word/../../etc/passwd"));
 /// assert!(!has_path_traversal("word/images/photo.png"));
@@ -674,7 +732,36 @@ mod tests {
         ));
     }
 
-    // ---- has_path_traversal tests ------------------------------------------
+    #[test]
+    fn test_security_budget_depth_uses_the_tighter_of_the_two_configured_limits() {
+        let nesting_is_tighter = SecurityLimits {
+            max_xml_depth: 1024,
+            max_nesting_depth: 5,
+            ..SecurityLimits::default()
+        };
+        assert_eq!(
+            SecurityBudget::from_limits(&nesting_is_tighter).depth.max_depth,
+            5,
+            "a tightened max_nesting_depth must not be discarded in favour of max_xml_depth"
+        );
+
+        let xml_is_tighter = SecurityLimits {
+            max_xml_depth: 3,
+            max_nesting_depth: 1024,
+            ..SecurityLimits::default()
+        };
+        assert_eq!(
+            SecurityBudget::from_limits(&xml_is_tighter).depth.max_depth,
+            3,
+            "a tightened max_xml_depth must not be discarded in favour of max_nesting_depth"
+        );
+
+        assert_eq!(
+            SecurityBudget::from_limits(&SecurityLimits::default()).depth.max_depth,
+            1024,
+            "both defaults are 1024, so the default budget is unchanged"
+        );
+    }
 
     #[test]
     fn test_path_traversal_detected_in_simple_dotdot() {
@@ -703,7 +790,6 @@ mod tests {
 
     #[test]
     fn test_dotdot_in_filename_not_flagged() {
-        // A filename like "1..2.png" has no ParentDir component.
         assert!(!has_path_traversal("images/1..2.png"));
     }
 

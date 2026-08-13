@@ -10,6 +10,7 @@
 //! cargo test -p xberg --features "summarization-llm,quality" --test llm_summarization_smoke -- --nocapture
 //! ```
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(all(feature = "summarization-llm", not(target_os = "windows")))]
 
 use std::borrow::Cow;

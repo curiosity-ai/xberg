@@ -6,7 +6,7 @@
 use crate::types::{BoundingBox, Element, ElementMetadata, ElementType};
 use std::collections::HashMap;
 
-use super::elements::{add_paragraphs, detect_list_items, generate_element_id};
+use super::elements::{add_paragraphs, detect_list_items, generate_element_id, normalize_line_endings};
 
 /// Detect a markdown ATX heading and return its level (1-6) when matched.
 fn detect_markdown_heading(line: &str) -> Option<u8> {
@@ -55,7 +55,6 @@ fn detect_isolated_numbered_heading(para_text: &str) -> bool {
     if !after_dot.starts_with(' ') {
         return false;
     }
-    // Require exactly one space (not double-space) followed by an uppercase letter.
     after_dot.chars().nth(1).is_some_and(|c| c.is_uppercase())
 }
 
@@ -81,24 +80,22 @@ fn add_paragraphs_with_classification(
         return;
     }
 
+    let normalized = normalize_line_endings(text);
     let mut leftover = String::new();
-    for paragraph in text.split("\n\n").filter(|p| !p.trim().is_empty()) {
+    for paragraph in normalized.split("\n\n").filter(|p| !p.trim().is_empty()) {
         let para_text = paragraph.trim();
         if para_text.is_empty() {
             continue;
         }
 
-        // Single-line paragraphs are the only candidates for headings/placeholders.
         let is_single_line = !para_text.contains('\n');
 
         if is_single_line && let Some(level) = detect_markdown_heading(para_text) {
-            // Drain any leftover narrative paragraphs first.
             if !leftover.is_empty() {
                 add_paragraphs(elements, leftover.trim(), page_number, title);
                 leftover.clear();
             }
             let element_type = heading_level_to_element_type(level);
-            // Strip leading `#`s + whitespace for the heading text.
             let heading_text = para_text.trim_start_matches('#').trim();
             let element_id = generate_element_id(heading_text, element_type, Some(page_number));
             elements.push(Element {
@@ -184,7 +181,6 @@ fn add_paragraphs_with_classification(
 /// Adjust a byte offset to the nearest valid UTF-8 char boundary, searching forward.
 fn snap_to_char_boundary(s: &str, offset: usize) -> usize {
     let clamped = offset.min(s.len());
-    // Search forward for the next valid char boundary
     let mut pos = clamped;
     while pos < s.len() && !s.is_char_boundary(pos) {
         pos += 1;
@@ -198,18 +194,15 @@ pub(super) fn process_content(elements: &mut Vec<Element>, content: &str, page_n
     let mut current_byte_offset = 0;
 
     for list_item in list_items {
-        // Snap offsets to valid char boundaries to prevent panics on multi-byte UTF-8
         let safe_start = snap_to_char_boundary(content, list_item.byte_start);
         let safe_end = snap_to_char_boundary(content, list_item.byte_end);
         let safe_current = snap_to_char_boundary(content, current_byte_offset);
 
-        // Add narrative text/paragraphs before this list item
         if safe_current < safe_start {
             let text_slice = content[safe_current..safe_start].trim();
             add_paragraphs_with_classification(elements, text_slice, page_number, title);
         }
 
-        // Add the list item itself
         let item_text = content[safe_start..safe_end].trim();
         if !item_text.is_empty() {
             let element_id = generate_element_id(item_text, ElementType::ListItem, Some(page_number));
@@ -235,7 +228,6 @@ pub(super) fn process_content(elements: &mut Vec<Element>, content: &str, page_n
         current_byte_offset = safe_end;
     }
 
-    // Add any remaining narrative text/paragraphs
     if current_byte_offset < content.len() {
         let safe_current = snap_to_char_boundary(content, current_byte_offset);
         let text_slice = content[safe_current..].trim();
@@ -247,7 +239,6 @@ pub(super) fn process_content(elements: &mut Vec<Element>, content: &str, page_n
 pub(super) fn format_table_as_text(table: &crate::types::Table) -> String {
     let mut output = String::new();
 
-    // Simple text representation: rows separated by newlines, cells by tabs
     for row in &table.cells {
         for (i, cell) in row.iter().enumerate() {
             if i > 0 {
@@ -287,7 +278,6 @@ pub(super) fn process_hierarchy(
             "h1" => ElementType::Title,
             "h2" | "h3" | "h4" | "h5" | "h6" => ElementType::Heading,
             _ => {
-                // Body text: emit as NarrativeText with coordinates when available.
                 if block.text.trim().is_empty() {
                     continue;
                 }
@@ -358,7 +348,7 @@ pub(super) fn process_tables(
             metadata: ElementMetadata {
                 page_number: Some(page_number),
                 filename: title.clone(),
-                coordinates: None, // Tables don't have bbox in current structure
+                coordinates: None,
                 element_index: Some(elements.len()),
                 additional: HashMap::new(),
             },
@@ -393,7 +383,7 @@ pub(super) fn process_images(
             metadata: ElementMetadata {
                 page_number: Some(page_number),
                 filename: title.clone(),
-                coordinates: None, // Images don't have bbox in current structure
+                coordinates: None,
                 element_index: Some(elements.len()),
                 additional: {
                     let mut m = HashMap::new();
@@ -555,7 +545,6 @@ mod tests_issue_961 {
     #[test]
     fn isolated_numbered_heading_becomes_heading_not_list_item() {
         let mut elements = Vec::new();
-        // Simulate one PDF page: single chapter heading followed by body text.
         let content = "1. Managementsamenvatting\n\nDit rapport geeft een overzicht van de prestaties.";
         process_content(&mut elements, content, 1, &None);
 
@@ -634,7 +623,6 @@ mod tests_issue_961 {
             .iter()
             .filter(|e| e.element_type == ElementType::ListItem)
             .collect();
-        // Both the bullet and the numbered item share a block — numbered stays a list item.
         assert!(
             list_items.iter().any(|e| e.text.contains("Numbered item")),
             "numbered item with a bullet sibling must remain a ListItem"
@@ -745,11 +733,8 @@ mod tests_issue_961 {
     #[test]
     fn detect_isolated_numbered_heading_rejects_edge_cases() {
         assert!(!detect_isolated_numbered_heading("1.  No capital after space"));
-        // Single digit + dot but no space after
         assert!(!detect_isolated_numbered_heading("1.Introduction"));
-        // Too many digits (>2)
         assert!(!detect_isolated_numbered_heading("100. Too many digits"));
-        // Empty string
         assert!(!detect_isolated_numbered_heading(""));
     }
 }

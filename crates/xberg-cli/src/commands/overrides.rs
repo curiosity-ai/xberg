@@ -4,20 +4,52 @@
 //! optional CLI flags for extraction configuration. Call `validate()` then
 //! `apply()` to layer these overrides onto an `ExtractionConfig`.
 
-use anyhow::{Context as _, Result, bail};
-use xberg::{ChunkingConfig, ExecutionProviderType, ExtractionConfig, LanguageDetectionConfig, LlmConfig, OcrConfig};
+#[cfg(feature = "ocr-surface")]
+use anyhow::Context as _;
+use anyhow::{Result, bail};
+#[cfg(feature = "analysis")]
+use xberg::LanguageDetectionConfig;
+#[cfg(feature = "ocr-surface")]
+use xberg::OcrConfig;
+#[cfg(any(feature = "core-cli", feature = "analysis"))]
+use xberg::{BreadcrumbTarget, ChunkingConfig};
+use xberg::{ExecutionProviderType, ExtractionConfig, LlmConfig};
+
+use xberg::JupyterCellRendering;
 
 use crate::ContentOutputFormatArg;
 
+/// Which parts of a Jupyter code cell to render during extraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum JupyterCellRenderingArg {
+    /// Render only the code source; omit saved outputs.
+    Source,
+    /// Render only the saved cell outputs; omit the code source.
+    Outputs,
+    /// Render both the code source and the saved outputs (default).
+    Both,
+}
+
+impl From<JupyterCellRenderingArg> for JupyterCellRendering {
+    fn from(arg: JupyterCellRenderingArg) -> Self {
+        match arg {
+            JupyterCellRenderingArg::Source => JupyterCellRendering::Source,
+            JupyterCellRenderingArg::Outputs => JupyterCellRendering::Outputs,
+            JupyterCellRenderingArg::Both => JupyterCellRendering::Both,
+        }
+    }
+}
+
 /// Accepted values for `--ocr-backend`.
+#[cfg(feature = "ocr-surface")]
 const VALID_OCR_BACKENDS: &[&str] = &[
     "tesseract",
     "paddle-ocr",
+    "sceptre",
     "vlm",
     "candle-trocr",
     "candle-paddleocr-vl",
     "candle-glm-ocr",
-    "candle-hunyuan-ocr",
     "candle-deepseek-ocr",
 ];
 
@@ -50,7 +82,30 @@ impl From<AccelerationArg> for ExecutionProviderType {
     }
 }
 
+/// Where the heading-path breadcrumb is written when Markdown chunking prepends
+/// heading context. See [`xberg::BreadcrumbTarget`] for the dense-vs-lexical
+/// retrieval trade-off.
+#[cfg(any(feature = "core-cli", feature = "analysis"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BreadcrumbTargetArg {
+    /// Prepend the breadcrumb into chunk content (default).
+    Content,
+    /// Keep content clean; rely on `ChunkMetadata::heading_path` only.
+    Metadata,
+}
+
+#[cfg(any(feature = "core-cli", feature = "analysis"))]
+impl From<BreadcrumbTargetArg> for BreadcrumbTarget {
+    fn from(arg: BreadcrumbTargetArg) -> Self {
+        match arg {
+            BreadcrumbTargetArg::Content => BreadcrumbTarget::Content,
+            BreadcrumbTargetArg::Metadata => BreadcrumbTarget::Metadata,
+        }
+    }
+}
+
 /// Token reduction intensity level.
+#[cfg(feature = "analysis")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ReductionLevelArg {
     /// Disable token reduction.
@@ -65,6 +120,7 @@ pub enum ReductionLevelArg {
     Maximum,
 }
 
+#[cfg(feature = "analysis")]
 impl ReductionLevelArg {
     /// Convert to the string mode expected by `TokenReductionConfig`.
     fn as_mode_str(self) -> &'static str {
@@ -85,26 +141,46 @@ impl ReductionLevelArg {
 /// clap command with `#[command(flatten)]`.
 #[derive(Debug, Default, clap::Args)]
 pub struct ExtractionOverrides {
-    // ── OCR ───────────────────────────────────────────────────────────
     /// Enable or disable OCR. When true, configures an OCR backend
     /// (default: tesseract). When false, removes any OCR configuration.
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub ocr: Option<bool>,
 
-    /// OCR backend to use when --ocr is enabled (tesseract, paddle-ocr, vlm, or candle-*).
+    /// OCR backend to use when --ocr is enabled (tesseract, paddle-ocr, sceptre, vlm, or candle-*).
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub ocr_backend: Option<String>,
 
     /// OCR language code. Tesseract uses ISO 639-3 (eng, fra, deu).
     /// PaddleOCR uses short codes (en, ch, french, korean).
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub ocr_language: Option<String>,
 
     /// Force OCR even if text extraction succeeds.
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub force_ocr: Option<bool>,
 
+    /// OCR pages that look like scans, keeping native text elsewhere.
+    ///
+    /// Detects pages that are full-page images, including scans whose hidden
+    /// text layer would otherwise pass the default quality check.
+    #[cfg(feature = "ocr-surface")]
+    #[arg(long)]
+    pub ocr_scanned_pages: bool,
+
+    /// Minimum scan confidence (0.0-1.0) for --ocr-scanned-pages. Default: 0.7.
+    ///
+    /// A threshold of 0.50 or lower also OCRs born-digital slides that use a
+    /// full-bleed background image.
+    #[cfg(feature = "ocr-surface")]
+    #[arg(long, requires = "ocr_scanned_pages")]
+    pub scanned_min_confidence: Option<f64>,
+
     /// Disable OCR entirely (even for images)
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub disable_ocr: Option<bool>,
 
@@ -113,19 +189,23 @@ pub struct ExtractionOverrides {
     pub no_cache: Option<bool>,
 
     /// Enable automatic image rotation before OCR based on detected orientation.
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub ocr_auto_rotate: Option<bool>,
 
     /// JSON object of per-backend OCR options (e.g. `{"layout_mode":"whole_page"}`).
+    #[cfg(feature = "ocr-surface")]
     #[arg(long, value_name = "JSON")]
     pub ocr_backend_options: Option<String>,
 
     /// VLM model for OCR (implies --ocr-backend vlm). Uses liter-llm routing format
     /// (e.g., "openai/gpt-4o", "anthropic/claude-sonnet-4-20250514").
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub vlm_model: Option<String>,
 
     /// VLM API key for OCR
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub vlm_api_key: Option<String>,
 
@@ -138,28 +218,37 @@ pub struct ExtractionOverrides {
     pub api_key: Option<String>,
 
     /// Custom VLM OCR prompt template (Jinja2)
+    #[cfg(feature = "ocr-surface")]
     #[arg(long)]
     pub vlm_prompt: Option<String>,
 
-    // ── Chunking ─────────────────────────────────────────────────────
     /// Enable or disable text chunking.
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[arg(long)]
     pub chunk: Option<bool>,
 
     /// Maximum chunk size in characters.
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[arg(long)]
     pub chunk_size: Option<usize>,
 
     /// Overlap between consecutive chunks in characters.
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[arg(long)]
     pub chunk_overlap: Option<usize>,
 
     /// Tokenizer model for token-based chunk sizing (e.g. "Xenova/gpt-4o").
     /// Implicitly enables chunking. Requires the chunking-tokenizers feature.
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[arg(long)]
     pub chunking_tokenizer: Option<String>,
 
-    // ── Output ────────────────────────────────────────────────────────
+    /// Where the heading-path breadcrumb is written when Markdown chunking prepends
+    /// heading context (content, metadata, or both). Default: content.
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
+    #[arg(long, value_enum)]
+    pub chunk_breadcrumb_target: Option<BreadcrumbTargetArg>,
+
     /// Content rendering format (plain, markdown, djot, html).
     /// Controls the format of extracted content.
     #[arg(long, value_enum)]
@@ -173,16 +262,21 @@ pub struct ExtractionOverrides {
     #[arg(long)]
     pub include_structure: Option<bool>,
 
-    // ── Quality & detection ──────────────────────────────────────────
+    /// For Jupyter notebooks: render code cells as source, outputs, or both (default: both).
+    /// Cells are never executed — outputs come only from those saved in the notebook.
+    #[arg(long, value_enum)]
+    pub jupyter_cell_rendering: Option<JupyterCellRenderingArg>,
+
     /// Enable quality post-processing.
+    #[cfg(feature = "analysis")]
     #[arg(long)]
     pub quality: Option<bool>,
 
     /// Enable language detection on extracted text.
+    #[cfg(feature = "analysis")]
     #[arg(long)]
     pub detect_language: Option<bool>,
 
-    // ── Layout detection ─────────────────────────────────────────────
     /// Enable layout detection with default model settings (RT-DETR v2).
     /// Use `--layout` to enable or `--layout false` to explicitly disable.
     #[cfg(feature = "layout-detection")]
@@ -193,6 +287,15 @@ pub struct ExtractionOverrides {
     #[cfg(feature = "layout-detection")]
     #[arg(long)]
     pub layout_confidence: Option<f32>,
+
+    /// Which pages the layout model runs on: always (default, every page) or
+    /// auto (pre-screen each page and skip the model where it cannot help).
+    #[cfg(feature = "layout-detection")]
+    #[arg(
+        long,
+        help = "Layout page selection: always (default, every page) or auto (pre-screen pages)"
+    )]
+    pub layout_strategy: Option<String>,
 
     /// Table structure model: tatr (default), slanet_wired, slanet_wireless, slanet_plus, slanet_auto, disabled.
     #[cfg(feature = "layout-detection")]
@@ -209,7 +312,6 @@ pub struct ExtractionOverrides {
     #[arg(long)]
     pub use_layout_for_markdown: bool,
 
-    // ── Acceleration & concurrency ───────────────────────────────────
     /// ONNX Runtime execution provider for model inference.
     #[arg(long, value_enum)]
     pub acceleration: Option<AccelerationArg>,
@@ -222,7 +324,6 @@ pub struct ExtractionOverrides {
     #[arg(long, help = "Limit total threads for constrained environments")]
     pub max_threads: Option<usize>,
 
-    // ── Pages ─────────────────────────────────────────────────────────
     /// Extract pages as a separate array in results.
     #[arg(long)]
     pub extract_pages: Option<bool>,
@@ -231,7 +332,6 @@ pub struct ExtractionOverrides {
     #[arg(long)]
     pub page_markers: Option<bool>,
 
-    // ── Images ────────────────────────────────────────────────────────
     /// Enable image extraction from documents.
     #[arg(long)]
     pub extract_images: Option<bool>,
@@ -240,25 +340,29 @@ pub struct ExtractionOverrides {
     #[arg(long)]
     pub target_dpi: Option<i32>,
 
-    // ── PDF ───────────────────────────────────────────────────────────
     /// Password(s) for encrypted PDFs. Can be specified multiple times.
+    #[cfg(feature = "pdf-surface")]
     #[arg(long)]
     pub pdf_password: Vec<String>,
 
     /// Extract images embedded in PDF pages.
+    #[cfg(feature = "pdf-surface")]
     #[arg(long)]
     pub pdf_extract_images: Option<bool>,
 
     /// Extract tables from PDF (pdf_oxide native grid + heuristic text-layer fallback).
     /// Default: true.
+    #[cfg(feature = "pdf-surface")]
     #[arg(long)]
     pub pdf_extract_tables: Option<bool>,
 
     /// OCR extracted inline images and inject results into the document.
+    #[cfg(all(feature = "pdf-surface", feature = "ocr-surface"))]
     #[arg(long)]
     pub pdf_ocr_inline_images: Option<bool>,
 
     /// Extract PDF metadata (title, author, etc.).
+    #[cfg(feature = "pdf-surface")]
     #[arg(long)]
     pub pdf_extract_metadata: Option<bool>,
 
@@ -267,21 +371,20 @@ pub struct ExtractionOverrides {
     /// This flag is accepted for forward-compatibility with future backends.
     /// At present, any value other than "pdf-oxide" is rejected with an error.
     // NOTE: no effect on ExtractionConfig today; reserved for future backend selection.
+    #[cfg(feature = "pdf-surface")]
     #[arg(long, value_name = "BACKEND")]
     pub pdf_backend: Option<String>,
 
-    // ── Token reduction ──────────────────────────────────────────────
     /// Token reduction level (off, light, moderate, aggressive, maximum).
+    #[cfg(feature = "analysis")]
     #[arg(long, value_enum)]
     pub token_reduction: Option<ReductionLevelArg>,
 
-    // ── Email ─────────────────────────────────────────────────────────
     /// Windows codepage fallback for MSG files without codepage metadata.
     /// Common values: 1250 (Central European), 1251 (Cyrillic), 1252 (Western).
     #[arg(long)]
     pub msg_codepage: Option<u32>,
 
-    // ── Cache ─────────────────────────────────────────────────────────
     /// Cache namespace for tenant isolation.
     #[arg(long)]
     pub cache_namespace: Option<String>,
@@ -290,7 +393,6 @@ pub struct ExtractionOverrides {
     #[arg(long)]
     pub cache_ttl_secs: Option<u64>,
 
-    // ── HTML styled output ────────────────────────────────────────────
     /// Built-in colour theme for styled HTML output (default, github, dark, light, unstyled).
     /// Implies --content-format html and enables the styled HTML renderer.
     #[cfg(feature = "html")]
@@ -316,6 +418,16 @@ pub struct ExtractionOverrides {
     #[cfg(feature = "html")]
     #[arg(long)]
     pub html_no_embed_css: bool,
+
+    /// CSV/TSV field delimiter (single ASCII character, e.g. ";", "|", "\t").
+    /// When unset, the delimiter is auto-detected from the file.
+    #[arg(long, value_name = "CHAR")]
+    pub csv_delimiter: Option<String>,
+
+    /// Line prefix marking a CSV/TSV comment line to skip entirely (e.g. "#").
+    /// Can be specified multiple times. Default: no comment filtering.
+    #[arg(long, value_name = "PREFIX")]
+    pub csv_comment_prefix: Vec<String>,
 }
 
 impl ExtractionOverrides {
@@ -324,7 +436,7 @@ impl ExtractionOverrides {
     /// Call this before `apply()` to surface user-friendly errors for
     /// invalid or contradictory options.
     pub fn validate(&self) -> Result<()> {
-        // Chunking validation
+        #[cfg(any(feature = "core-cli", feature = "analysis"))]
         if let Some(size) = self.chunk_size {
             if size == 0 {
                 bail!("Invalid chunk size: {size}. Chunk size must be greater than 0.");
@@ -336,6 +448,7 @@ impl ExtractionOverrides {
             }
         }
 
+        #[cfg(any(feature = "core-cli", feature = "analysis"))]
         if let Some(overlap) = self.chunk_overlap
             && let Some(size) = self.chunk_size
             && overlap >= size
@@ -343,14 +456,12 @@ impl ExtractionOverrides {
             bail!("Invalid chunk overlap: {overlap}. Overlap ({overlap}) must be less than chunk size ({size}).");
         }
 
-        // Target DPI validation
         if let Some(dpi) = self.target_dpi
             && (!(36..=2400).contains(&dpi))
         {
             bail!("Invalid target DPI: {dpi}. Value must be between 36 and 2400.");
         }
 
-        // Layout validation
         #[cfg(feature = "layout-detection")]
         {
             if let Some(conf) = self.layout_confidence
@@ -361,10 +472,57 @@ impl ExtractionOverrides {
             if self.layout == Some(false) && (self.layout_confidence.is_some() || self.layout_table_model.is_some()) {
                 bail!("--layout false cannot be combined with --layout-confidence or --layout-table-model");
             }
+            if self.layout == Some(false) && self.layout_strategy.is_some() {
+                bail!("--layout false cannot be combined with --layout-strategy");
+            }
+            if let Some(ref strategy) = self.layout_strategy
+                && strategy.parse::<xberg::LayoutStrategy>().is_err()
+            {
+                bail!("Invalid layout strategy: '{strategy}'. Valid: always, auto.");
+            }
         }
 
-        // Chunking tokenizer feature validation
-        #[cfg(not(feature = "chunking-tokenizers"))]
+        #[cfg(feature = "ocr-surface")]
+        {
+            if self.ocr_scanned_pages && self.disable_ocr == Some(true) {
+                bail!("--ocr-scanned-pages cannot be combined with --disable-ocr");
+            }
+            if let Some(confidence) = self.scanned_min_confidence
+                && !(0.0..=1.0).contains(&confidence)
+            {
+                bail!("Invalid scan confidence: {confidence}. Value must be between 0.0 and 1.0.");
+            }
+            if self.force_ocr == Some(true) && self.disable_ocr == Some(true) {
+                bail!("--force-ocr and --disable-ocr cannot both be true");
+            }
+
+            if let Some(ref backend) = self.ocr_backend
+                && !VALID_OCR_BACKENDS.contains(&backend.as_str())
+            {
+                bail!(
+                    "Invalid OCR backend '{}'. Valid backends: {}",
+                    backend,
+                    VALID_OCR_BACKENDS.join(", ")
+                );
+            }
+
+            self.parsed_backend_options()?;
+
+            if self.vlm_api_key.is_some() && self.vlm_model.is_none() {
+                bail!("--vlm-api-key requires --vlm-model to be specified");
+            }
+            if self.vlm_prompt.is_some() && self.vlm_model.is_none() {
+                bail!("--vlm-prompt requires --vlm-model to be specified");
+            }
+            if self.ocr_backend.as_deref() == Some("vlm") && self.vlm_model.is_none() {
+                bail!("--ocr-backend vlm requires --vlm-model to be specified");
+            }
+        }
+
+        #[cfg(all(
+            any(feature = "core-cli", feature = "analysis"),
+            not(feature = "chunking-tokenizers")
+        ))]
         if self.chunking_tokenizer.is_some() {
             bail!(
                 "--chunking-tokenizer requires the chunking-tokenizers feature. \
@@ -372,34 +530,6 @@ impl ExtractionOverrides {
             );
         }
 
-        // force_ocr + disable_ocr conflict
-        if self.force_ocr == Some(true) && self.disable_ocr == Some(true) {
-            bail!("--force-ocr and --disable-ocr cannot both be true");
-        }
-
-        // OCR backend validation
-        if let Some(ref backend) = self.ocr_backend
-            && !VALID_OCR_BACKENDS.contains(&backend.as_str())
-        {
-            bail!(
-                "Invalid OCR backend '{}'. Valid backends: {}",
-                backend,
-                VALID_OCR_BACKENDS.join(", ")
-            );
-        }
-
-        // OCR backend options validation — parse here to surface errors early
-        self.parsed_backend_options()?;
-
-        // VLM OCR validation
-        if self.vlm_api_key.is_some() && self.vlm_model.is_none() {
-            bail!("--vlm-api-key requires --vlm-model to be specified");
-        }
-        if self.vlm_prompt.is_some() && self.vlm_model.is_none() {
-            bail!("--vlm-prompt requires --vlm-model to be specified");
-        }
-
-        // Concurrency validation
         if let Some(0) = self.max_concurrent {
             bail!("--max-concurrent must be at least 1");
         }
@@ -407,13 +537,22 @@ impl ExtractionOverrides {
             bail!("--max-threads must be at least 1");
         }
 
-        // PDF backend validation (forward-compat flag; only pdf-oxide is supported today)
+        #[cfg(feature = "pdf-surface")]
         if let Some(ref backend) = self.pdf_backend
             && backend.as_str() != "pdf-oxide"
         {
             bail!(
                 "Invalid PDF backend '{}'. Only 'pdf-oxide' is currently supported.",
                 backend
+            );
+        }
+
+        if let Some(ref delimiter) = self.csv_delimiter
+            && !(delimiter.len() == 1 && delimiter.is_ascii())
+        {
+            bail!(
+                "Invalid CSV delimiter '{}'. Must be exactly one ASCII character (e.g. ',', ';', '\\t', '|').",
+                delimiter
             );
         }
 
@@ -425,44 +564,41 @@ impl ExtractionOverrides {
     /// Only fields that were explicitly provided on the command line take
     /// effect; everything else is left untouched.
     pub fn apply(self, config: &mut ExtractionConfig) {
-        // Resolve the shared LLM API key once at startup so every downstream
-        // `create_client` call sees a populated value. Precedence (highest
-        // first): `--api-key`, `XBERG_LLM_API_KEY`, existing config value,
-        // liter-llm's per-provider env-var fallback (i.e. leave `None`).
         let resolved_api_key = resolve_llm_api_key(self.api_key.as_deref());
+        #[cfg(feature = "ocr-surface")]
         self.apply_ocr(config);
+        #[cfg(feature = "ocr-surface")]
         self.apply_vlm_ocr(config);
+        #[cfg(any(feature = "core-cli", feature = "analysis"))]
         self.apply_chunking(config);
+        #[cfg(feature = "analysis")]
         self.apply_quality_and_detection(config);
         self.apply_output_format(config);
         self.apply_include_structure(config);
+        self.apply_jupyter_cell_rendering(config);
         self.apply_layout(config);
         self.apply_acceleration(config);
         self.apply_concurrency(config);
         self.apply_pages(config);
         self.apply_images(config);
+        #[cfg(feature = "pdf-surface")]
         self.apply_pdf(config);
+        #[cfg(feature = "analysis")]
         self.apply_token_reduction(config);
         self.apply_email(config);
         self.apply_cache(config);
         self.apply_html_styled(config);
+        self.apply_csv(config);
         if let Some(key) = resolved_api_key {
             apply_llm_api_key(config, &key);
         }
     }
 
-    // ── Private helpers ──────────────────────────────────────────────
-
+    #[cfg(feature = "ocr-surface")]
     fn apply_ocr(&self, config: &mut ExtractionConfig) {
         if let Some(ocr_flag) = self.ocr {
             if ocr_flag {
-                let backend = match self.ocr_backend.as_deref() {
-                    Some("paddle-ocr") => "paddle-ocr",
-                    Some("candle-trocr") => "candle-trocr",
-                    Some("candle-paddleocr-vl") => "candle-paddleocr-vl",
-                    Some("candle-glm-ocr") => "candle-glm-ocr",
-                    _ => "tesseract",
-                };
+                let backend = self.ocr_backend.as_deref().unwrap_or("tesseract");
                 let language = match &self.ocr_language {
                     Some(lang) => vec![lang.clone()],
                     None => match backend {
@@ -470,11 +606,9 @@ impl ExtractionOverrides {
                         _ => vec!["eng".to_string()],
                     },
                 };
-                // Preserve existing paddle_ocr_config and element_config from config file/inline JSON
                 let existing_paddle_config = config.ocr.as_ref().and_then(|o| o.paddle_ocr_config.clone());
                 let existing_element_config = config.ocr.as_ref().and_then(|o| o.element_config.clone());
                 let auto_rotate = self.ocr_auto_rotate.unwrap_or(false);
-                // validated in validate(); unwrap is safe here
                 let backend_options = self.parsed_backend_options().ok().flatten();
                 config.ocr = Some(OcrConfig {
                     enabled: true,
@@ -500,15 +634,28 @@ impl ExtractionOverrides {
             }
         }
 
-        // Override language on existing OCR config when --ocr-language is used without --ocr
         if self.ocr.is_none()
             && let Some(ref lang) = self.ocr_language
             && let Some(ref mut existing_ocr) = config.ocr
         {
-            existing_ocr.language = vec![lang.clone()];
+            let language = vec![lang.clone()];
+            existing_ocr.language = language.clone();
+            if let Some(tesseract_config) = existing_ocr.tesseract_config.as_mut() {
+                tesseract_config.language = language.clone();
+            }
+            if let Some(pipeline) = existing_ocr.pipeline.as_mut() {
+                for stage in &mut pipeline.stages {
+                    if stage.backend != "tesseract" {
+                        continue;
+                    }
+                    stage.language = Some(language.clone());
+                    if let Some(tesseract_config) = stage.tesseract_config.as_mut() {
+                        tesseract_config.language = language.clone();
+                    }
+                }
+            }
         }
 
-        // Override auto_rotate on existing OCR config when used without --ocr
         if self.ocr.is_none()
             && let Some(rotate) = self.ocr_auto_rotate
             && let Some(ref mut existing_ocr) = config.ocr
@@ -522,25 +669,24 @@ impl ExtractionOverrides {
         if let Some(disable_ocr_flag) = self.disable_ocr {
             config.disable_ocr = disable_ocr_flag;
         }
-        if let Some(no_cache_flag) = self.no_cache {
-            config.use_cache = !no_cache_flag;
+        if self.ocr_scanned_pages {
+            config.ocr_strategy = xberg::OcrStrategy::ScannedPages {
+                min_confidence: self
+                    .scanned_min_confidence
+                    .unwrap_or(xberg::core::config::DEFAULT_SCANNED_MIN_CONFIDENCE),
+            };
         }
     }
 
+    #[cfg(feature = "ocr-surface")]
     fn apply_vlm_ocr(&self, config: &mut ExtractionConfig) {
         if let Some(ref vlm_model) = self.vlm_model {
             let vlm_llm_config = LlmConfig {
                 model: vlm_model.clone(),
                 api_key: self.vlm_api_key.clone(),
-                base_url: None,
-                timeout_secs: None,
-                max_retries: None,
-                temperature: None,
-                max_tokens: None,
+                ..Default::default()
             };
 
-            // If OCR config already exists, update it; otherwise create a new one
-            // validated in validate(); unwrap is safe here
             let backend_options = self.parsed_backend_options().ok().flatten();
             let ocr = config.ocr.get_or_insert_with(|| OcrConfig {
                 enabled: true,
@@ -572,6 +718,7 @@ impl ExtractionOverrides {
     }
 
     /// Parse `--ocr-backend-options` into a `serde_json::Value`, enforcing that it is a JSON object.
+    #[cfg(feature = "ocr-surface")]
     fn parsed_backend_options(&self) -> Result<Option<serde_json::Value>> {
         let Some(ref s) = self.ocr_backend_options else {
             return Ok(None);
@@ -584,8 +731,8 @@ impl ExtractionOverrides {
         Ok(Some(value))
     }
 
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     fn apply_chunking(&self, config: &mut ExtractionConfig) {
-        // --chunking-tokenizer implicitly enables chunking
         let chunk = if self.chunking_tokenizer.is_some() && self.chunk.is_none() {
             Some(true)
         } else {
@@ -596,7 +743,7 @@ impl ExtractionOverrides {
             if chunk_flag {
                 let max_characters = self.chunk_size.unwrap_or(1000);
                 let overlap = self.chunk_overlap.unwrap_or(200);
-                let mut chunking_config = ChunkingConfig {
+                let chunking_config = ChunkingConfig {
                     max_characters,
                     overlap,
                     trim: true,
@@ -605,12 +752,26 @@ impl ExtractionOverrides {
                 };
 
                 #[cfg(feature = "chunking-tokenizers")]
-                if let Some(ref model) = self.chunking_tokenizer {
-                    chunking_config.sizing = xberg::ChunkSizing::Tokenizer {
-                        model: model.clone(),
-                        cache_dir: None,
-                    };
-                }
+                let chunking_config = if let Some(ref model) = self.chunking_tokenizer {
+                    ChunkingConfig {
+                        sizing: xberg::ChunkSizing::Tokenizer {
+                            model: model.clone(),
+                            cache_dir: None,
+                        },
+                        ..chunking_config
+                    }
+                } else {
+                    chunking_config
+                };
+
+                let chunking_config = if let Some(target) = self.chunk_breadcrumb_target {
+                    ChunkingConfig {
+                        breadcrumb_target: target.into(),
+                        ..chunking_config
+                    }
+                } else {
+                    chunking_config
+                };
 
                 config.chunking = Some(chunking_config);
             } else {
@@ -624,8 +785,6 @@ impl ExtractionOverrides {
                 chunking.overlap = overlap;
             }
 
-            // Clamp overlap when it exceeds max_characters (can happen when
-            // only --chunk-overlap is provided against an existing config).
             if chunking.overlap >= chunking.max_characters {
                 chunking.overlap = chunking.max_characters / 4;
             }
@@ -637,9 +796,14 @@ impl ExtractionOverrides {
                     cache_dir: None,
                 };
             }
+
+            if let Some(target) = self.chunk_breadcrumb_target {
+                chunking.breadcrumb_target = target.into();
+            }
         }
     }
 
+    #[cfg(feature = "analysis")]
     fn apply_quality_and_detection(&self, config: &mut ExtractionConfig) {
         if let Some(quality_flag) = self.quality {
             config.enable_quality_processing = quality_flag;
@@ -660,7 +824,7 @@ impl ExtractionOverrides {
     fn apply_output_format(&self, config: &mut ExtractionConfig) {
         let final_format = self.content_format.or_else(|| {
             if self.output_format.is_some() {
-                eprintln!("warning: '--output-format' is deprecated, use '--content-format' instead");
+                tracing::warn!("'--output-format' is deprecated, use '--content-format' instead");
             }
             self.output_format
         });
@@ -676,11 +840,16 @@ impl ExtractionOverrides {
         }
     }
 
+    fn apply_jupyter_cell_rendering(&self, config: &mut ExtractionConfig) {
+        if let Some(rendering) = self.jupyter_cell_rendering {
+            config.jupyter_cell_rendering = rendering.into();
+        }
+    }
+
     #[allow(unused_variables)]
     fn apply_layout(&self, config: &mut ExtractionConfig) {
         #[cfg(feature = "layout-detection")]
         {
-            // --layout false explicitly disables layout detection
             if self.layout == Some(false) {
                 config.layout = None;
                 return;
@@ -689,6 +858,7 @@ impl ExtractionOverrides {
             let has_layout_flag = self.layout == Some(true)
                 || self.layout_confidence.is_some()
                 || self.layout_table_model.is_some()
+                || self.layout_strategy.is_some()
                 || self.use_layout_for_markdown;
             if has_layout_flag {
                 let mut layout = config.layout.clone().unwrap_or_default();
@@ -697,6 +867,9 @@ impl ExtractionOverrides {
                 }
                 if let Some(ref table_model) = self.layout_table_model {
                     layout.table_model = table_model.parse().unwrap_or_default();
+                }
+                if let Some(ref strategy) = self.layout_strategy {
+                    layout.strategy = strategy.parse().unwrap_or_default();
                 }
                 config.layout = Some(layout);
             }
@@ -752,12 +925,14 @@ impl ExtractionOverrides {
         }
     }
 
+    #[cfg(feature = "pdf-surface")]
     fn apply_pdf(&self, config: &mut ExtractionConfig) {
         let has_pdf_flag = self.pdf_extract_images.is_some()
             || self.pdf_extract_tables.is_some()
-            || self.pdf_ocr_inline_images.is_some()
             || self.pdf_extract_metadata.is_some()
             || !self.pdf_password.is_empty();
+        #[cfg(feature = "ocr-surface")]
+        let has_pdf_flag = has_pdf_flag || self.pdf_ocr_inline_images.is_some();
         if has_pdf_flag {
             let pdf_opts = config.pdf_options.get_or_insert_with(Default::default);
             if let Some(extract_img) = self.pdf_extract_images {
@@ -766,6 +941,7 @@ impl ExtractionOverrides {
             if let Some(extract_tables) = self.pdf_extract_tables {
                 pdf_opts.extract_tables = extract_tables;
             }
+            #[cfg(feature = "ocr-surface")]
             if let Some(ocr_img) = self.pdf_ocr_inline_images {
                 pdf_opts.ocr_inline_images = ocr_img;
             }
@@ -778,6 +954,7 @@ impl ExtractionOverrides {
         }
     }
 
+    #[cfg(feature = "analysis")]
     fn apply_token_reduction(&self, config: &mut ExtractionConfig) {
         if let Some(level) = self.token_reduction {
             config.token_reduction = Some(xberg::TokenReductionOptions {
@@ -795,6 +972,9 @@ impl ExtractionOverrides {
     }
 
     fn apply_cache(&self, config: &mut ExtractionConfig) {
+        if let Some(no_cache_flag) = self.no_cache {
+            config.use_cache = !no_cache_flag;
+        }
         if let Some(ns) = &self.cache_namespace {
             config.cache_namespace = Some(ns.clone());
         }
@@ -814,7 +994,6 @@ impl ExtractionOverrides {
                 || self.html_no_embed_css;
 
             if has_flag {
-                // Force content format to HTML when any styled HTML flag is used.
                 config.output_format = xberg::OutputFormat::Html;
 
                 let mut html_cfg = config.html_output.clone().unwrap_or_default();
@@ -849,6 +1028,20 @@ impl ExtractionOverrides {
             }
         }
     }
+
+    fn apply_csv(&self, config: &mut ExtractionConfig) {
+        let has_flag = self.csv_delimiter.is_some() || !self.csv_comment_prefix.is_empty();
+        if has_flag {
+            let mut csv_cfg = config.csv.clone().unwrap_or_default();
+            if let Some(ref delimiter) = self.csv_delimiter {
+                csv_cfg.delimiter = Some(delimiter.clone());
+            }
+            if !self.csv_comment_prefix.is_empty() {
+                csv_cfg.comment_prefixes = self.csv_comment_prefix.clone();
+            }
+            config.csv = Some(csv_cfg);
+        }
+    }
 }
 
 /// Resolve the LLM API key the CLI should propagate to every `LlmConfig` slot.
@@ -875,10 +1068,6 @@ pub(crate) fn resolve_llm_api_key(cli_api_key: Option<&str>) -> Option<String> {
         tracing::info!(source = "xberg_env", "Resolved LLM API key from XBERG_LLM_API_KEY");
         return Some(value);
     }
-    // Source is either "config" (when a slot already had a key — handled by
-    // `apply_llm_api_key` not overwriting it) or "provider_env" (liter-llm
-    // reads e.g. OPENAI_API_KEY at request time). Both cases are observable
-    // downstream, so we don't log here.
     None
 }
 
@@ -903,8 +1092,6 @@ pub(crate) fn apply_llm_api_key(config: &mut ExtractionConfig, key: &str) {
         fill(&mut ext.llm, key);
     }
 
-    // Embedding via LLM provider — the model lives behind the
-    // `EmbeddingModelType::Llm { llm }` variant in chunking config.
     if let Some(chunking) = config.chunking.as_mut()
         && let Some(embedding) = chunking.embedding.as_mut()
         && let xberg::EmbeddingModelType::Llm { llm } = &mut embedding.model
@@ -946,8 +1133,7 @@ mod tests {
         ExtractionOverrides::default()
     }
 
-    // ── OCR tests ────────────────────────────────────────────────────
-
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_default_language_tesseract() {
         let mut config = ExtractionConfig::default();
@@ -961,6 +1147,7 @@ mod tests {
         assert_eq!(ocr.language, vec!["eng".to_string()]);
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_default_language_paddleocr() {
         let mut config = ExtractionConfig::default();
@@ -975,6 +1162,22 @@ mod tests {
         assert_eq!(ocr.language, vec!["en".to_string()]);
     }
 
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn test_ocr_default_language_sceptre() {
+        let mut config = ExtractionConfig::default();
+        let overrides = ExtractionOverrides {
+            ocr: Some(true),
+            ocr_backend: Some("sceptre".to_string()),
+            ..default_overrides()
+        };
+        overrides.apply(&mut config);
+        let ocr = config.ocr.expect("OCR config should be set");
+        assert_eq!(ocr.backend, "sceptre");
+        assert_eq!(ocr.language, vec!["eng".to_string()]);
+    }
+
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_validate_unknown_ocr_backend_rejected() {
         let overrides = ExtractionOverrides {
@@ -985,6 +1188,7 @@ mod tests {
         assert!(err.to_string().contains("Invalid OCR backend"));
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_language_override_tesseract() {
         let mut config = ExtractionConfig::default();
@@ -999,6 +1203,7 @@ mod tests {
         assert_eq!(ocr.language, vec!["fra".to_string()]);
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_language_override_paddleocr() {
         let mut config = ExtractionConfig::default();
@@ -1014,6 +1219,7 @@ mod tests {
         assert_eq!(ocr.language, vec!["ch".to_string()]);
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_language_without_ocr_flag_no_existing_config() {
         let mut config = ExtractionConfig::default();
@@ -1022,10 +1228,10 @@ mod tests {
             ..default_overrides()
         };
         overrides.apply(&mut config);
-        // No OCR config exists, so --ocr-language alone doesn't create one
         assert!(config.ocr.is_none());
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_language_without_ocr_flag_existing_config() {
         let mut config = ExtractionConfig {
@@ -1060,6 +1266,109 @@ mod tests {
         assert_eq!(ocr.language, vec!["deu".to_string()]);
     }
 
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn test_ocr_language_updates_existing_nested_tesseract_config() {
+        let mut config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                enabled: true,
+                backend: "tesseract".to_string(),
+                language: vec!["eng".to_string()],
+                tesseract_config: Some(xberg::TesseractConfig {
+                    language: vec!["eng".to_string()],
+                    use_cache: false,
+                    ..Default::default()
+                }),
+                output_format: None,
+                paddle_ocr_config: None,
+                element_config: None,
+                quality_thresholds: None,
+                pipeline: None,
+                auto_rotate: false,
+                vlm_config: None,
+                vlm_fallback: Default::default(),
+                vlm_prompt: None,
+                acceleration: None,
+                tessdata_bytes: None,
+                tessdata_path: None,
+                backend_options: None,
+            }),
+            ..Default::default()
+        };
+        let overrides = ExtractionOverrides {
+            ocr_language: Some("deu".to_string()),
+            ..default_overrides()
+        };
+
+        overrides.apply(&mut config);
+
+        let ocr = config.ocr.unwrap();
+        assert_eq!(ocr.language, vec!["deu".to_string()]);
+        let tesseract = ocr.tesseract_config.unwrap();
+        assert_eq!(tesseract.language, vec!["deu".to_string()]);
+        assert!(!tesseract.use_cache);
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn test_ocr_language_updates_tesseract_pipeline_stages() {
+        let tesseract_config = xberg::TesseractConfig {
+            language: vec!["eng".to_string()],
+            use_cache: false,
+            ..Default::default()
+        };
+        let mut config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                pipeline: Some(xberg::OcrPipelineConfig {
+                    stages: vec![
+                        xberg::OcrPipelineStage {
+                            backend: "tesseract".to_string(),
+                            priority: 100,
+                            language: Some(vec!["eng".to_string()]),
+                            tesseract_config: Some(tesseract_config),
+                            paddle_ocr_config: None,
+                            vlm_config: None,
+                            backend_options: None,
+                        },
+                        xberg::OcrPipelineStage {
+                            backend: "paddle-ocr".to_string(),
+                            priority: 90,
+                            language: Some(vec!["en".to_string()]),
+                            tesseract_config: None,
+                            paddle_ocr_config: None,
+                            vlm_config: None,
+                            backend_options: None,
+                        },
+                    ],
+                    quality_thresholds: Default::default(),
+                }),
+                ..OcrConfig::default()
+            }),
+            ..Default::default()
+        };
+        let overrides = ExtractionOverrides {
+            ocr_language: Some("deu".to_string()),
+            ..default_overrides()
+        };
+
+        overrides.apply(&mut config);
+
+        let stages = &config.ocr.unwrap().pipeline.unwrap().stages;
+        assert_eq!(stages[0].language, Some(vec!["deu".to_string()]));
+        assert_eq!(
+            stages[0].tesseract_config.as_ref().unwrap().language,
+            vec!["deu".to_string()]
+        );
+        assert_eq!(stages[1].backend, "paddle-ocr");
+        assert_eq!(stages[1].priority, 90);
+        assert_eq!(stages[1].language, Some(vec!["en".to_string()]));
+        assert!(stages[1].tesseract_config.is_none());
+        assert!(stages[1].paddle_ocr_config.is_none());
+        assert!(stages[1].vlm_config.is_none());
+        assert!(stages[1].backend_options.is_none());
+    }
+
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_disabled_ignores_language() {
         let mut config = ExtractionConfig::default();
@@ -1072,6 +1381,7 @@ mod tests {
         assert!(config.ocr.is_none());
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_backend_options_parsed_and_applied() {
         let mut config = ExtractionConfig::default();
@@ -1082,13 +1392,11 @@ mod tests {
             ..default_overrides()
         };
 
-        // Validate should pass (parsed_backend_options is called during validate)
         assert!(overrides.validate().is_ok());
 
         overrides.apply(&mut config);
         let ocr = config.ocr.unwrap();
 
-        // Verify backend_options is present and contains the expected object
         assert!(ocr.backend_options.is_some());
         let opts = ocr.backend_options.unwrap();
         assert!(opts.is_object());
@@ -1096,6 +1404,7 @@ mod tests {
         assert_eq!(opts.get("layout_mode").and_then(|v| v.as_str()), Some("whole_page"));
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_backend_options_invalid_json_fails_validation() {
         let overrides = ExtractionOverrides {
@@ -1103,10 +1412,10 @@ mod tests {
             ocr_backend_options: Some("not-valid-json".to_string()),
             ..default_overrides()
         };
-        // Validation should fail because JSON is not valid
         assert!(overrides.validate().is_err());
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_backend_options_not_object_fails_validation() {
         let overrides = ExtractionOverrides {
@@ -1114,12 +1423,10 @@ mod tests {
             ocr_backend_options: Some(r#"["array", "not", "object"]"#.to_string()),
             ..default_overrides()
         };
-        // Validation should fail because JSON is not an object
         assert!(overrides.validate().is_err());
     }
 
-    // ── Chunking tests ───────────────────────────────────────────────
-
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_chunking_enabled_defaults() {
         let mut config = ExtractionConfig::default();
@@ -1133,6 +1440,7 @@ mod tests {
         assert_eq!(chunking.overlap, 200);
     }
 
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_chunking_custom_size() {
         let mut config = ExtractionConfig::default();
@@ -1148,6 +1456,50 @@ mod tests {
         assert_eq!(chunking.overlap, 50);
     }
 
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
+    #[test]
+    fn test_chunking_breadcrumb_target_applied_on_new_config() {
+        let mut config = ExtractionConfig::default();
+        let overrides = ExtractionOverrides {
+            chunk: Some(true),
+            chunk_breadcrumb_target: Some(BreadcrumbTargetArg::Metadata),
+            ..default_overrides()
+        };
+        overrides.apply(&mut config);
+        let chunking = config.chunking.unwrap();
+        assert_eq!(chunking.breadcrumb_target, BreadcrumbTarget::Metadata);
+    }
+
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
+    #[test]
+    fn test_chunking_breadcrumb_target_applied_on_existing_config() {
+        let mut config = ExtractionConfig {
+            chunking: Some(ChunkingConfig::default()),
+            ..Default::default()
+        };
+        let overrides = ExtractionOverrides {
+            chunk_breadcrumb_target: Some(BreadcrumbTargetArg::Metadata),
+            ..default_overrides()
+        };
+        overrides.apply(&mut config);
+        let chunking = config.chunking.unwrap();
+        assert_eq!(chunking.breadcrumb_target, BreadcrumbTarget::Metadata);
+    }
+
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
+    #[test]
+    fn test_chunking_breadcrumb_target_defaults_to_content() {
+        let mut config = ExtractionConfig::default();
+        let overrides = ExtractionOverrides {
+            chunk: Some(true),
+            ..default_overrides()
+        };
+        overrides.apply(&mut config);
+        let chunking = config.chunking.unwrap();
+        assert_eq!(chunking.breadcrumb_target, BreadcrumbTarget::Content);
+    }
+
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_chunking_disabled() {
         let mut config = ExtractionConfig {
@@ -1162,8 +1514,7 @@ mod tests {
         assert!(config.chunking.is_none());
     }
 
-    // ── Validation tests ─────────────────────────────────────────────
-
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_validate_chunk_size_zero() {
         let overrides = ExtractionOverrides {
@@ -1173,6 +1524,7 @@ mod tests {
         assert!(overrides.validate().is_err());
     }
 
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_validate_chunk_size_too_large() {
         let overrides = ExtractionOverrides {
@@ -1182,6 +1534,7 @@ mod tests {
         assert!(overrides.validate().is_err());
     }
 
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_validate_overlap_exceeds_size() {
         let overrides = ExtractionOverrides {
@@ -1216,6 +1569,63 @@ mod tests {
         assert!(overrides.validate().is_ok());
     }
 
+    #[test]
+    fn test_validate_csv_delimiter_valid() {
+        let overrides = ExtractionOverrides {
+            csv_delimiter: Some(";".to_string()),
+            ..default_overrides()
+        };
+        assert!(overrides.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_csv_delimiter_empty_rejected() {
+        let overrides = ExtractionOverrides {
+            csv_delimiter: Some(String::new()),
+            ..default_overrides()
+        };
+        let err = overrides.validate().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid CSV delimiter ''. Must be exactly one ASCII character (e.g. ',', ';', '\\t', '|')."
+        );
+    }
+
+    #[test]
+    fn test_validate_csv_delimiter_multi_byte_rejected() {
+        let overrides = ExtractionOverrides {
+            csv_delimiter: Some("::".to_string()),
+            ..default_overrides()
+        };
+        let err = overrides.validate().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid CSV delimiter '::'. Must be exactly one ASCII character (e.g. ',', ';', '\\t', '|')."
+        );
+    }
+
+    #[test]
+    fn test_apply_csv_delimiter_and_comment_prefixes() {
+        let mut config = ExtractionConfig::default();
+        let overrides = ExtractionOverrides {
+            csv_delimiter: Some(";".to_string()),
+            csv_comment_prefix: vec!["#".to_string(), "//".to_string()],
+            ..default_overrides()
+        };
+        overrides.apply(&mut config);
+        let csv = config.csv.expect("csv config should be set");
+        assert_eq!(csv.delimiter.as_deref(), Some(";"));
+        assert_eq!(csv.comment_prefixes, vec!["#".to_string(), "//".to_string()]);
+    }
+
+    #[test]
+    fn test_apply_csv_no_flags_leaves_config_untouched() {
+        let mut config = ExtractionConfig::default();
+        let overrides = default_overrides();
+        overrides.apply(&mut config);
+        assert!(config.csv.is_none());
+    }
+
     #[cfg(feature = "layout-detection")]
     #[test]
     fn test_validate_layout_confidence_out_of_range() {
@@ -1242,8 +1652,6 @@ mod tests {
         assert!(overrides.validate().is_ok());
     }
 
-    // ── Layout tests ─────────────────────────────────────────────────
-
     #[cfg(feature = "layout-detection")]
     #[test]
     fn test_layout_table_model_applied() {
@@ -1259,6 +1667,42 @@ mod tests {
 
     #[cfg(feature = "layout-detection")]
     #[test]
+    fn test_layout_strategy_applied() {
+        let mut config = ExtractionConfig::default();
+        let overrides = ExtractionOverrides {
+            layout_strategy: Some("auto".to_string()),
+            ..default_overrides()
+        };
+        overrides.apply(&mut config);
+        let layout = config.layout.unwrap();
+        assert_eq!(layout.strategy, xberg::LayoutStrategy::Auto);
+    }
+
+    #[cfg(feature = "layout-detection")]
+    #[test]
+    fn test_layout_strategy_rejects_unknown_value() {
+        let overrides = ExtractionOverrides {
+            layout_strategy: Some("adaptive".to_string()),
+            ..default_overrides()
+        };
+        let error = overrides.validate().expect_err("unknown strategy must fail");
+        assert!(error.to_string().contains("Invalid layout strategy"));
+    }
+
+    #[cfg(feature = "layout-detection")]
+    #[test]
+    fn test_layout_strategy_conflicts_with_layout_false() {
+        let overrides = ExtractionOverrides {
+            layout: Some(false),
+            layout_strategy: Some("auto".to_string()),
+            ..default_overrides()
+        };
+        let error = overrides.validate().expect_err("conflicting flags must fail");
+        assert!(error.to_string().contains("--layout-strategy"));
+    }
+
+    #[cfg(feature = "layout-detection")]
+    #[test]
     fn test_layout_confidence_applied() {
         let mut config = ExtractionConfig::default();
         let overrides = ExtractionOverrides {
@@ -1269,8 +1713,6 @@ mod tests {
         let layout = config.layout.unwrap();
         assert_eq!(layout.confidence_threshold, Some(0.7));
     }
-
-    // ── Acceleration tests ───────────────────────────────────────────
 
     #[test]
     fn test_acceleration_applied() {
@@ -1283,8 +1725,6 @@ mod tests {
         let accel = config.acceleration.unwrap();
         assert_eq!(accel.provider, ExecutionProviderType::Cpu);
     }
-
-    // ── Pages tests ──────────────────────────────────────────────────
 
     #[test]
     fn test_extract_pages_applied() {
@@ -1300,8 +1740,6 @@ mod tests {
         assert!(pages.insert_page_markers);
     }
 
-    // ── Images tests ─────────────────────────────────────────────────
-
     #[test]
     fn test_extract_images_applied() {
         let mut config = ExtractionConfig::default();
@@ -1316,8 +1754,7 @@ mod tests {
         assert_eq!(images.target_dpi, 150);
     }
 
-    // ── Token reduction tests ────────────────────────────────────────
-
+    #[cfg(feature = "analysis")]
     #[test]
     fn test_token_reduction_applied() {
         let mut config = ExtractionConfig::default();
@@ -1330,8 +1767,6 @@ mod tests {
         assert_eq!(reduction.mode, "aggressive");
     }
 
-    // ── Email tests ──────────────────────────────────────────────────
-
     #[test]
     fn test_msg_codepage_applied() {
         let mut config = ExtractionConfig::default();
@@ -1343,8 +1778,6 @@ mod tests {
         let email = config.email.unwrap();
         assert_eq!(email.msg_fallback_codepage, Some(1251));
     }
-
-    // ── Concurrency tests ────────────────────────────────────────────
 
     #[test]
     fn test_max_concurrent_applied() {
@@ -1369,8 +1802,6 @@ mod tests {
         assert_eq!(concurrency.max_threads, Some(2));
     }
 
-    // ── Include structure tests ──────────────────────────────────────
-
     #[test]
     fn test_include_structure_applied() {
         let mut config = ExtractionConfig::default();
@@ -1383,6 +1814,7 @@ mod tests {
         assert!(config.include_document_structure);
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_validate_invalid_ocr_backend() {
         let overrides = ExtractionOverrides {
@@ -1413,9 +1845,10 @@ mod tests {
         assert!(err.to_string().contains("--max-threads must be at least 1"));
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_validate_valid_ocr_backends() {
-        for backend in &["tesseract", "paddle-ocr"] {
+        for backend in &["tesseract", "paddle-ocr", "sceptre"] {
             let overrides = ExtractionOverrides {
                 ocr_backend: Some(backend.to_string()),
                 ..default_overrides()
@@ -1424,8 +1857,43 @@ mod tests {
         }
     }
 
-    // ── OCR backend options tests ────────────────────────────────────
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn test_apply_ocr_preserves_candle_deepseek_backend() {
+        let mut config = ExtractionConfig::default();
+        let overrides = ExtractionOverrides {
+            ocr: Some(true),
+            ocr_backend: Some("candle-deepseek-ocr".to_string()),
+            ..default_overrides()
+        };
 
+        overrides.apply(&mut config);
+
+        assert_eq!(
+            config.ocr.expect("OCR config should be set").backend,
+            "candle-deepseek-ocr"
+        );
+    }
+
+    #[cfg(feature = "ocr-surface")]
+    #[test]
+    fn test_validate_vlm_backend_requires_model() {
+        let overrides = ExtractionOverrides {
+            ocr_backend: Some("vlm".to_string()),
+            ..default_overrides()
+        };
+
+        let error = overrides
+            .validate()
+            .expect_err("VLM backend without a model should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "--ocr-backend vlm requires --vlm-model to be specified"
+        );
+    }
+
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_backend_options_threaded_into_config() {
         let mut config = ExtractionConfig::default();
@@ -1442,6 +1910,7 @@ mod tests {
         assert_eq!(opts, serde_json::json!({"layout_mode": "whole_page"}));
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_validate_rejects_non_object_backend_options() {
         let overrides = ExtractionOverrides {
@@ -1455,6 +1924,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_validate_rejects_invalid_json_backend_options() {
         let overrides = ExtractionOverrides {
@@ -1468,6 +1938,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_backend_options_none_when_absent() {
         let mut config = ExtractionConfig::default();
@@ -1481,10 +1952,7 @@ mod tests {
         assert!(ocr.backend_options.is_none());
     }
 
-    // ── No-op when no flags provided ─────────────────────────────────
-
-    // ── Overlap clamping tests ─────────────────────────────────────
-
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_chunk_overlap_clamped_on_existing_config() {
         let mut config = ExtractionConfig {
@@ -1495,18 +1963,17 @@ mod tests {
             }),
             ..Default::default()
         };
-        // Provide only --chunk-overlap with a value exceeding max_characters
         let overrides = ExtractionOverrides {
             chunk_overlap: Some(1500),
             ..default_overrides()
         };
         overrides.apply(&mut config);
         let chunking = config.chunking.unwrap();
-        // overlap should be clamped to max_characters / 4
         assert_eq!(chunking.overlap, 800 / 4);
         assert_eq!(chunking.max_characters, 800);
     }
 
+    #[cfg(any(feature = "core-cli", feature = "analysis"))]
     #[test]
     fn test_chunk_overlap_valid_on_existing_config() {
         let mut config = ExtractionConfig {
@@ -1517,7 +1984,6 @@ mod tests {
             }),
             ..Default::default()
         };
-        // Provide a valid overlap that is less than max_characters
         let overrides = ExtractionOverrides {
             chunk_overlap: Some(200),
             ..default_overrides()
@@ -1528,9 +1994,10 @@ mod tests {
         assert_eq!(chunking.max_characters, 800);
     }
 
-    // ── Chunking tokenizer feature validation ───────────────────────
-
-    #[cfg(not(feature = "chunking-tokenizers"))]
+    #[cfg(all(
+        any(feature = "core-cli", feature = "analysis"),
+        not(feature = "chunking-tokenizers")
+    ))]
     #[test]
     fn test_validate_chunking_tokenizer_requires_feature() {
         let overrides = ExtractionOverrides {
@@ -1544,8 +2011,6 @@ mod tests {
         );
     }
 
-    // ── LLM API key resolution tests ────────────────────────────────
-
     /// Lock around the `XBERG_LLM_API_KEY` env var to keep the resolution
     /// tests deterministic in the multi-threaded test runner. Tests that touch
     /// the environment must hold this guard for their full duration.
@@ -1555,8 +2020,6 @@ mod tests {
     fn with_env_var<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(key).ok();
-        // SAFETY: tests are serialized via ENV_LOCK; no other thread observes
-        // the mutation during the closure.
         unsafe {
             match value {
                 Some(v) => std::env::set_var(key, v),
@@ -1600,7 +2063,6 @@ mod tests {
     #[test]
     fn empty_cli_flag_does_not_count() {
         with_env_var("XBERG_LLM_API_KEY", Some("env-value"), || {
-            // Empty / whitespace-only flag values fall through to the env var.
             let resolved = resolve_llm_api_key(Some("   "));
             assert_eq!(resolved.as_deref(), Some("env-value"));
         });
@@ -1671,8 +2133,6 @@ mod tests {
         assert_eq!(pc.llm.api_key.as_deref(), Some("resolved"));
     }
 
-    // ── No-op when no flags provided ─────────────────────────────────
-
     #[test]
     fn test_no_overrides_leaves_config_unchanged() {
         let original = ExtractionConfig::default();
@@ -1680,7 +2140,6 @@ mod tests {
         let overrides = default_overrides();
         overrides.apply(&mut config);
 
-        // Spot-check critical fields remain at defaults
         assert!(config.ocr.is_none());
         assert!(config.chunking.is_none());
         assert!(config.use_cache);
@@ -1696,9 +2155,9 @@ mod tests {
         assert!(!config.include_document_structure);
     }
 
+    #[cfg(feature = "ocr-surface")]
     #[test]
     fn test_ocr_backend_options_vlm_flow() {
-        // Test that --ocr-backend-options integrates with --vlm-model
         let mut config = ExtractionConfig::default();
         let backend_options_json = r#"{"task":"chart","layout_mode":"whole_page"}"#;
         let overrides = ExtractionOverrides {
@@ -1707,22 +2166,18 @@ mod tests {
             ..default_overrides()
         };
 
-        // Validate should pass
         assert!(overrides.validate().is_ok());
 
         overrides.apply(&mut config);
 
-        // Verify OCR is configured with VLM backend and backend_options is set
         let ocr = config.ocr.expect("OCR should be configured");
         assert_eq!(ocr.backend, "vlm");
 
-        // Verify backend_options parsed and flowed into the config
         let opts = ocr.backend_options.expect("backend_options should be Some");
         assert!(opts.is_object());
         assert_eq!(opts.get("task").and_then(|v| v.as_str()), Some("chart"));
         assert_eq!(opts.get("layout_mode").and_then(|v| v.as_str()), Some("whole_page"));
 
-        // Verify VLM config is also set
         assert!(ocr.vlm_config.is_some());
         let vlm = ocr.vlm_config.unwrap();
         assert_eq!(vlm.model, "openai/gpt-4o");

@@ -1,16 +1,5 @@
 name: Publish Release
 
-# Action-first xberg release pipeline.
-#
-# Orchestrates 16 alef language targets:
-#   crates · python · node · wasm · ruby · php · cli · homebrew · go · c-ffi
-#   java · csharp · elixir · dart · swift · zig · kotlin
-#
-# Mirrors html-to-markdown's publish.yaml composition: every registry
-# interaction, every multi-platform build, and every release-asset upload
-# routes through a shared xberg-io/actions composite. Repo-quirky inline
-# bash is reserved for matrix expansion / artifact path stitching only.
-
 on:
   workflow_dispatch:
     inputs:
@@ -46,6 +35,20 @@ on:
     types: [published]
   repository_dispatch:
     types: [publish-release]
+
+env:
+  GLIBC_FLOOR: "2.28"
+  # jsDelivr (which serves the published @xberg-io/xberg-wasm package to the
+  # live browser demo) hard-caps a single file at 50 MB and rejects the whole
+  # package past 150 MB total -- either cap breached serves a 403 to every
+  # consumer, which has already happened once (commit 8ad6b2f4ccf dropped
+  # tree-sitter from wasm-target purely to get back under the per-file cap).
+  # Both budgets below sit at 80% of the real jsDelivr limit: candle (added to
+  # wasm-target after that incident) means the bundle is trending upward and
+  # untracked, so the margin exists to fail CI while there is still headroom
+  # to investigate, instead of finding out from a broken demo. ~keep
+  WASM_MAX_FILE_BYTES: "41943040" # 40 MiB; jsDelivr per-file hard cap is 50 MB
+  WASM_MAX_PACKAGE_BYTES: "125829120" # 120 MiB; jsDelivr per-package hard cap is 150 MB
 
 permissions:
   contents: read
@@ -122,6 +125,11 @@ jobs:
         id: meta
         uses: xberg-io/actions/prepare-release-metadata@v1
 
+      # Created NON-draft (published) so the `release: [created]` event fires
+      # immediately and publish-docker.yaml runs as an independent parallel
+      # workflow (App-token-created events do trigger workflows). Assets upload
+      # into the live release over the run; finalize-release is idempotent and
+      # just confirms the prerelease flag at the end. ~keep
       - name: Ensure GitHub Release exists for tag
         if: ${{ steps.meta.outputs.is_tag == 'true' && steps.meta.outputs.dry_run != 'true' }}
         uses: xberg-io/actions/publish-github-release@v1
@@ -129,7 +137,7 @@ jobs:
           tag: ${{ steps.meta.outputs.tag }}
           target: ${{ steps.meta.outputs.target_sha }}
           notes: "Release ${{ steps.meta.outputs.tag }}"
-          draft: "true"
+          draft: "false"
           prerelease: ${{ steps.meta.outputs.is_prerelease }}
           token: ${{ steps.app-token.outputs.token }}
 
@@ -149,8 +157,6 @@ jobs:
         uses: xberg-io/actions/validate-versions@v1
         with:
           version: ${{ needs.prepare.outputs.version }}
-
-  # ─── Registry existence checks ────────────────────────────────────────
 
   check-pypi:
     name: Check PyPI for existing version
@@ -260,6 +266,7 @@ jobs:
       candle_exists: ${{ steps.check.outputs.candle_exists }}
       libheif_exists: ${{ steps.check.outputs.libheif_exists }}
       gliner_exists: ${{ steps.check.outputs.gliner_exists }}
+      libwpd_exists: ${{ steps.check.outputs.libwpd_exists }}
       cli_exists: ${{ steps.check.outputs.cli_exists }}
       all_exist: ${{ steps.derive.outputs.all_exist }}
     steps:
@@ -275,11 +282,10 @@ jobs:
             candle_exists=xberg-candle-ocr
             libheif_exists=xberg-libheif
             gliner_exists=xberg-gliner
+            libwpd_exists=xberg-libwpd
             cli_exists=xberg-cli
 
       - id: derive
-        # Inline: aggregate the check-registry outputs into a single boolean
-        # the publish-crates job can guard on. No shared action equivalent.
         run: |
           if [[ "${{ steps.check.outputs.exists }}" == "true" \
             && "${{ steps.check.outputs.tesseract_exists }}" == "true" \
@@ -287,6 +293,7 @@ jobs:
             && "${{ steps.check.outputs.candle_exists }}" == "true" \
             && "${{ steps.check.outputs.libheif_exists }}" == "true" \
             && "${{ steps.check.outputs.gliner_exists }}" == "true" \
+            && "${{ steps.check.outputs.libwpd_exists }}" == "true" \
             && "${{ steps.check.outputs.cli_exists }}" == "true" ]]; then
             echo "all_exist=true" >> "$GITHUB_OUTPUT"
           else
@@ -332,11 +339,6 @@ jobs:
       exists: ${{ steps.check.outputs.exists }}
     steps:
       - id: check
-        # `registry: github-release` (not `registry: zig`) — alef check-registry's
-        # zig path only verifies the release tag exists. On a real release that's
-        # always true, so it short-circuits `publish-zig` to skipped (regression:
-        # v4.x shipped without the zig tarball asset because of this). Verify
-        # the actual asset is present instead.
         uses: xberg-io/actions/check-registry@v1
         with:
           registry: github-release
@@ -364,7 +366,11 @@ jobs:
   check-cli:
     name: Check GitHub Release for CLI assets
     needs: prepare
-    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.release_cli == 'true' }}
+    # Run in dry-run too (mirrors the zig check gate) so a `dry_run` dispatch does
+    # not skip check-cli — otherwise every CLI build job (which `needs` this) would
+    # cascade-skip, and the CLI lane (incl. the static binstall Docker build) could
+    # never be exercised without cutting a real tag.
+    if: ${{ (needs.prepare.outputs.is_tag == 'true' || needs.prepare.outputs.dry_run == 'true') && needs.prepare.outputs.release_cli == 'true' }}
     runs-on: ubuntu-latest
     outputs:
       exists: ${{ steps.check.outputs.exists }}
@@ -435,8 +441,6 @@ jobs:
           tag: ${{ needs.prepare.outputs.tag }}
           asset-prefix: libxberg_nif-
 
-  # ─── Build matrix jobs ────────────────────────────────────────────────
-
   python-wheels:
     name: Build Python wheels (${{ matrix.os }})
     needs: [prepare, check-pypi]
@@ -445,22 +449,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macОS is PINNED to macos-15 (Sequoia), NOT macos-latest: when
-        # macos-latest rolled forward to macOS 26 (Tahoe) its Homebrew HEIF/AV1
-        # bottles became 26.0-min, which exceeds the wheel's
-        # MACOSX_DEPLOYMENT_TARGET=15.0 (set below) and delocate refused to vendor
-        # them ("Library dependencies do not satisfy target MacOS version 15.0").
-        # Pinning the runner keeps the bottles' min-target aligned with the 15.0
-        # wheel tag; bump both together when intentionally raising the floor.
-        #
-        # macos-15-intel (x86_64): re-added. ort has no static x86_64-apple-darwin
-        # prebuilt, so this leg builds once xberg-py's Cargo.toml carries the
-        # alef macos-intel-target override (pending alef target_dep_overrides
-        # support for the pyo3 scaffold, then `alef generate`). The wheel does
-        # not yet bundle libonnxruntime.dylib (delocate cannot see the runtime
-        # dlopen dependency), so ML features on the Intel wheel need
-        # ORT_DYLIB_PATH pointing at an installed ONNX Runtime until explicit
-        # vendoring lands.
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15, macos-15-intel]
     steps:
       - uses: actions/checkout@v6
@@ -468,30 +456,20 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
 
       - name: Build wheels
-        # Pinned to v1 (currently → v1.8.66, includes the PKG=$(...) command
-        # substitution fix so the libheif source-build runs in the main shell
-        # scope, not a subshell where PKG silently expands to empty).
         uses: xberg-io/actions/build-python-wheels@v1
         with:
           python-version: "3.13"
           package-dir: packages/python
-          # PyO3 abi3-py310 → one wheel per platform covers Python 3.10+.
           cibw-build: "cp310-*"
           upload-artifact: "false"
-          # xberg links libheif-sys, so opt in to the in-container libheif build.
           build-libheif: "true"
-          # AlmaLinux 8 base ships OpenSSL 1.1.1 (CentOS 7 base of manylinux2014
-          # ships 1.0.2k which openssl-sys 0.9.115+ rejects).
           manylinux-x86_64-image: "manylinux_2_28"
           manylinux-aarch64-image: "manylinux_2_28"
-          # manylinux_2_28 (AlmaLinux 8) provides glibc 2.28 required for glibc floor.
-          # CARGO_TARGET_*_LINKER points cargo at the in-image gcc instead of looking
-          # for triple-prefixed binaries that aren't there.
           cibw-before-build-linux: |
             set -euo pipefail
             pip install maturin uv
@@ -506,24 +484,36 @@ jobs:
             export CMAKE_CXX_FLAGS="${CXXFLAGS}"
             export CC="gcc ${CFLAGS}"
             export CXX="g++ ${CXXFLAGS}"
-          cibw-environment: 'MATURIN_BUILD_ARGS="--compatibility manylinux_2_28" CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc CC_x86_64_unknown_linux_gnu=gcc CC_aarch64_unknown_linux_gnu=gcc CXX_x86_64_unknown_linux_gnu=g++ CXX_aarch64_unknown_linux_gnu=g++'
-          # The runner is pinned to macos-15 (Sequoia) above, and the Homebrew
-          # HEIF/AV1 dylibs libheif pulls in (libx265, libheif, libaom, libvmaf,
-          # libsharpyuv, libde265) are built with LC_BUILD_VERSION minos 15.0.
-          # Pin MACOSX_DEPLOYMENT_TARGET=15.0 so the arm64 wheel is tagged
-          # macosx_15_0_arm64 and delocate's min-version check passes (an 11.0
-          # tag fails: "Library dependencies do not satisfy target MacOS version
-          # 11.0"). Only arm64 macOS is built (Intel dropped in rc.20+).
-          cibw-environment-macos: 'MATURIN_BUILD_ARGS="" CARGO_BUILD_LOCKED=true MACOSX_DEPLOYMENT_TARGET=15.0'
-          # cibw's bundled rustup-init on Windows defaults host triple to gnu, and
-          # rust-toolchain.toml channel="1.95" resolves against that gnu host. Install
-          # 1.95-x86_64-pc-windows-msvc explicitly AND set RUSTUP_TOOLCHAIN env var so
-          # cargo bypasses the toolchain.toml override (env var > toml in rustup precedence).
+            # Link Microsoft's glibc-clean ONNX Runtime, not the pyke prebuilt; auditwheel bundles it (#1284).
+            ort_version=1.24.2
+            case "$(uname -m)" in aarch64 | arm64) ort_arch=aarch64 ;; *) ort_arch=x64 ;; esac
+            curl -fsSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-linux-${ort_arch}-${ort_version}.tgz"
+            mkdir -p /opt/msort && tar -xzf /tmp/ort.tgz -C /opt/msort --strip-components=1
+          cibw-environment: 'MATURIN_BUILD_ARGS="--compatibility manylinux_2_28" CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc CC_x86_64_unknown_linux_gnu=gcc CC_aarch64_unknown_linux_gnu=gcc CXX_x86_64_unknown_linux_gnu=g++ CXX_aarch64_unknown_linux_gnu=g++ ORT_STRATEGY=system ORT_LIB_LOCATION=/opt/msort/lib ORT_SKIP_DOWNLOAD=1 ORT_PREFER_DYNAMIC_LINK=1 LD_LIBRARY_PATH=/opt/msort/lib'
+          # The deployment target is the wheel's macOS floor: 15.0 left macOS 11-14
+          # with no installable wheel (#1243). delocate bundles the libheif closure,
+          # so the hook builds it from source at the target and PKG_CONFIG_PATH links
+          # the wheel against it instead of Homebrew's runner-OS bottles. ~keep
+          cibw-before-build-macos: bash {project}/scripts/ci/build-macos-heif-deps.sh
+          cibw-environment-macos: 'MATURIN_BUILD_ARGS="" CARGO_BUILD_LOCKED=true MACOSX_DEPLOYMENT_TARGET=11.0 PKG_CONFIG_PATH=/tmp/xberg-heif/lib/pkgconfig'
           cibw-before-build-windows: "rustup install 1.95-x86_64-pc-windows-msvc --profile minimal --component rust-src --component rustfmt --component clippy && rustup target add x86_64-pc-windows-msvc --toolchain 1.95-x86_64-pc-windows-msvc && pip install maturin uv && set PATH=%USERPROFILE%\\.cargo\\bin;%PATH%"
-          # RUSTC_WRAPPER= disables the Alef-scaffolded `.cargo/rustc-wrapper.sh`
-          # sccache shim on Windows, where cargo cannot exec a .sh wrapper
-          # ("%1 is not a valid Win32 application", os error 193).
           cibw-environment-windows: 'MATURIN_BUILD_ARGS="--target x86_64-pc-windows-msvc" RUSTUP_TOOLCHAIN="1.95-x86_64-pc-windows-msvc" RUSTC_WRAPPER='
+
+      - name: Vendor ONNX Runtime into wheel
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # auditwheel's default repair only bundles libs it can resolve via ldd
+          # at repair time; it has been observed to drop libonnxruntime.so here
+          # (#1284 follow-up). Vendor explicitly, same as every other native
+          # target in this workflow, instead of depending on auditwheel alone.
+          for w in wheelhouse/*.whl; do bash scripts/ci/vendor-native-closure.sh "$w"; done
+
+      - name: Verify wheel glibc floor + bundled ONNX Runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for w in wheelhouse/*.whl; do bash scripts/ci/verify-glibc-floor.sh "$w" "$GLIBC_FLOOR"; done
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7
@@ -532,15 +522,51 @@ jobs:
           path: wheelhouse/*.whl
           retention-days: 14
 
+  python-wheels-musl:
+    name: Build Python wheels (musl-${{ matrix.arch }})
+    needs: [prepare, check-pypi]
+    if: ${{ needs.prepare.outputs.release_python == 'true' && (needs.check-pypi.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, arch: x86_64, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, arch: aarch64, target: aarch64-unknown-linux-musl }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+          submodules: false
+
+      - name: Build Python wheel via Alpine Docker
+        run: |
+          docker build -f docker/Dockerfile.musl-python \
+            --build-arg TARGET=${{ matrix.target }} \
+            --output type=local,dest=./build-output .
+
+      - name: Verify musl wheel produced
+        run: |
+          test -n "$(find build-output -name '*.whl')" || {
+            echo "::error::no wheel produced by musl build for ${{ matrix.target }}"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-wheels-musl-${{ matrix.arch }}
+          path: build-output/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
   python-sdist:
     name: Build Python sdist
-    # The sdist compiles on the consumer's machine, so its Cargo.toml must carry
-    # registry version-deps, not workspace paths. build-python-sdist@v1 rewrites
-    # them (--require-registry) then runs maturin sdist, so the core crates must be
-    # on crates.io first. The status guard lets it run when publish-crates is
-    # skipped, blocking only on its actual failure.
     needs: [prepare, check-pypi, publish-crates]
-    if: ${{ !cancelled() && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_python == 'true' && (needs.check-pypi.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    # Skipped on dry runs. The sdist is built out of the workspace with internal `path = "..."` keys
+    # stripped, so `cargo generate-lockfile` must resolve `xberg = "^<version>"` from crates.io. A dry
+    # run's `publish-crates` succeeds without actually publishing, so that version is never on the
+    # registry and resolution fails by construction — the job can only ever be red here, whatever the
+    # code does. (`is_tag` is NOT the right predicate: dry runs synthesize a tag and set it true.)
+    if: ${{ !cancelled() && needs.prepare.outputs.dry_run != 'true' && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_python == 'true' && (needs.check-pypi.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -548,19 +574,12 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
-      # xberg uses a split layout: pyproject.toml lives in packages/python/
-      # while the PyO3 crate is at crates/xberg-py/. Passing manifest-path
-      # routes the action to its single-tree branch which cd's into the Rust crate
-      # dir and runs `maturin sdist`, then fails with "pyproject.toml not found".
-      # Default package-dir=packages/python triggers the split-layout fallback
-      # which cd's into the package dir; maturin resolves manifest-path from
-      # pyproject.toml's [tool.maturin] section itself.
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
 
@@ -584,13 +603,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: macos-15, target: aarch64-apple-darwin }
-          # Intel macOS: native x86_64 build; ONNX Runtime staged by
-          # setup-onnx-runtime (Homebrew on x86_64) and linked dynamically,
-          # same as the macos-arm64 leg.
-          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          # x86_64-apple-darwin (Intel macOS) intentionally omitted: pyke ships
+          # no static ORT for it and Microsoft's last dylib is 1.23.2. Kept in
+          # sync with alef's [crates.node].exclude_platforms=["darwin-x64"]. ~keep
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v6
@@ -598,7 +614,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: ${{ matrix.target }}
@@ -615,22 +631,78 @@ jobs:
         with:
           ort-version: "1.24.2"
 
-      - name: Setup Zig for glibc 2.28 floor
-        if: contains(matrix.target, '-linux-gnu')
-        uses: xberg-io/actions/setup-zig@v1
-
-      - name: Install cargo-zigbuild for glibc 2.28 floor
-        if: contains(matrix.target, '-linux-gnu')
+      # Build the libheif closure from source at the macOS floor (#1243) and
+      # make the .node link it instead of Homebrew's runner-OS bottles. ~keep
+      - name: Build libheif stack for the macOS floor
+        if: contains(matrix.target, 'apple-darwin')
         shell: bash
-        run: command -v cargo-zigbuild || cargo install --locked cargo-zigbuild
+        run: |
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          bash scripts/ci/build-macos-heif-deps.sh
+          {
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+            echo "PKG_CONFIG_PATH=/tmp/xberg-heif/lib/pkgconfig"
+          } >>"$GITHUB_ENV"
 
       - name: Build NAPI binding
         uses: xberg-io/actions/build-node-napi@v1
         with:
           crate-dir: crates/xberg-node
           target: ${{ matrix.target }}
-          use-napi-cross: ${{ contains(matrix.target, '-linux-gnu') }}
+          use-napi-cross: "false"
           pack-target-tarball: node-bindings-${{ matrix.target }}.tar.gz
+
+      - name: Ship the alef-generated index.d.ts, not napi's regenerated one
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `napi build` (run inside build-node-napi) regenerates
+          # crates/xberg-node/index.d.ts from the Rust napi idents, reintroducing
+          # dangling `Js*` type references that TypeScript resolves to `any`
+          # (#1351). The committed file is alef-generated and correct, so restore
+          # it and repack the per-target tarball so the clean declaration file is
+          # what ships. On macOS the vendor step below repacks again with the
+          # dylib closure, reusing this restored file; on the other targets this
+          # repack produces the final tarball (build-node-napi does not repack).
+          git checkout HEAD -- crates/xberg-node/index.d.ts
+          members=(npm)
+          [ -f crates/xberg-node/index.js ] && members+=(index.js)
+          [ -f crates/xberg-node/index.d.ts ] && members+=(index.d.ts)
+          tar -czf "node-bindings-${{ matrix.target }}.tar.gz" -C crates/xberg-node "${members[@]}"
+
+      - name: Vendor macOS dylib closure (libheif + codecs) into the .node package
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build-node-napi staged the .node (+ @rpath-relocatable ONNX Runtime)
+          # into crates/xberg-node/npm/<platform>/ and packed the tarball. The
+          # libheif closure is still absolute paths in the .node, so vendor it
+          # beside the .node (@loader_path) and repack.
+          node_file="$(find crates/xberg-node/npm -maxdepth 2 -name '*.node' -type f | head -1)"
+          [ -n "$node_file" ] || { echo "::error::no .node staged under crates/xberg-node/npm"; exit 1; }
+          platform_dir="$(dirname "$node_file")"
+          bash scripts/ci/vendor-macos-node-dylibs.sh "$platform_dir"
+          # Reconcile the platform package.json `files` with every binary now on
+          # disk so npm pack ships the whole closure.
+          node -e '
+            const fs = require("fs"), path = require("path");
+            const dir = process.argv[1];
+            const p = path.join(dir, "package.json");
+            const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
+            const ship = /\.(node|dylib|dll)$|\.so(\.[0-9]+)*$/;
+            const onDisk = fs.readdirSync(dir).filter((f) => ship.test(f));
+            pkg.files = [...new Set([...(pkg.files || []), ...onDisk])].sort();
+            fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
+            console.log("reconciled files:", JSON.stringify(pkg.files));
+          ' "$platform_dir"
+          # Repack the per-target tarball with the same layout build-node-napi
+          # uses (npm/ tree + root index.js/index.d.ts), overwriting the
+          # pre-vendor one.
+          members=(npm)
+          [ -f crates/xberg-node/index.js ] && members+=(index.js)
+          [ -f crates/xberg-node/index.d.ts ] && members+=(index.d.ts)
+          tar -czf "node-bindings-${{ matrix.target }}.tar.gz" -C crates/xberg-node "${members[@]}"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -639,39 +711,137 @@ jobs:
           retention-days: 14
 
   node-bindings-musl:
-    # Alpine container build via Dockerfile.musl-node (system onnxruntime-dev).
     name: Build Node bindings (linux-musl-${{ matrix.arch }})
     needs: [prepare, check-npm]
     if: ${{ needs.prepare.outputs.release_node == 'true' && (needs.check-npm.outputs.node_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
-    # aarch64 builds on a native arm64 runner so Docker pulls the arm64 Alpine
-    # base and cross-assembly of aarch64 asm (e.g. aws-lc-sys `aesimc`) by the
-    # x86_64 host assembler is avoided — mirrors the musl-ffi / musl-rustler jobs.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, arch: x86_64, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-24.04-arm, arch: aarch64, target: aarch64-unknown-linux-musl }
+          - { os: ubuntu-latest, arch: x86_64, napi_arch: x64, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, arch: aarch64, napi_arch: arm64, target: aarch64-unknown-linux-musl }
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
-          submodules: recursive
+          submodules: false
       - name: Build Node NAPI binding via Alpine Docker
         run: |
           docker build -f docker/Dockerfile.musl-node \
             --build-arg TARGET=${{ matrix.target }} \
             --output type=local,dest=./build-output .
-      - name: Stage .node file and package structure for npm
-        # Inline: package the .node file into npm/<platform>/ structure matching
-        # the main job's build-node-napi output format (pack-target-tarball).
-        # The publish-node script will create/inject package.json for each platform.
+      - name: Stage .node into napi platform dir for npm
         run: |
-          mkdir -p staging/npm/xberg-${{ matrix.target }}
-          find build-output -name "*.node" -exec cp {} staging/npm/xberg-${{ matrix.target }}/ \;
+          platform="linux-${{ matrix.napi_arch }}-musl"
+          mkdir -p "staging/npm/${platform}"
+          find build-output -name "*.node" -exec cp {} "staging/npm/${platform}/" \;
+          test -n "$(find "staging/npm/${platform}" -name '*.node')" || {
+            echo "::error::no .node produced by musl build for ${platform}"; exit 1; }
+          # Ship the .node's vendored shared-lib closure (libonnxruntime + codecs)
+          # beside it — the .node's RUNPATH is $ORIGIN, so co-located libs resolve
+          # at require() time. Without them consumers hit ERR_DLOPEN_FAILED.
+          # `*.so*` (not `*.so`) matches versioned sonames like libonnxruntime.so.1,
+          # which a plain `*.so` glob silently drops. ~keep
+          if ls build-output/*.so* >/dev/null 2>&1; then
+            cp -v build-output/*.so* "staging/npm/${platform}/"
+          else
+            echo "::error::no vendored shared libs produced by musl build for ${platform}"; exit 1
+          fi
+          cp "crates/xberg-node/npm/${platform}/package.json" "staging/npm/${platform}/package.json"
+          # Reconcile `files` with the binaries on disk — napi create-npm-dirs
+          # regenerates the committed package.json to list only *.node, so the
+          # vendored libs must be re-added here or npm publish drops them.
+          python3 -c '
+          import json, os, re, sys
+          d = sys.argv[1]; p = os.path.join(d, "package.json")
+          pkg = json.load(open(p))
+          ship = re.compile(r"\.(node|dylib|dll)$|\.so(\.[0-9]+)*$")
+          on_disk = sorted(f for f in os.listdir(d) if ship.search(f))
+          pkg["files"] = sorted(set(pkg.get("files", [])) | set(on_disk))
+          with open(p, "w") as fh:
+              json.dump(pkg, fh, indent=2); fh.write("\n")
+          print("reconciled files:", pkg["files"])
+          ' "staging/npm/${platform}"
           tar -czf node-bindings-${{ matrix.target }}.tar.gz -C staging npm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: node-bindings-${{ matrix.target }}
+          path: node-bindings-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  node-bindings-manylinux:
+    name: Build Node bindings (linux-gnu-${{ matrix.arch }})
+    needs: [prepare, check-npm]
+    if: ${{ needs.prepare.outputs.release_node == 'true' && (needs.check-npm.outputs.node_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              os: ubuntu-latest,
+              arch: x86_64,
+              napi_arch: x64,
+              target: x86_64-unknown-linux-gnu,
+              image: quay.io/pypa/manylinux_2_28_x86_64,
+            }
+          - {
+              os: ubuntu-24.04-arm,
+              arch: aarch64,
+              napi_arch: arm64,
+              target: aarch64-unknown-linux-gnu,
+              image: quay.io/pypa/manylinux_2_28_aarch64,
+            }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+          submodules: false
+      - name: Build Node NAPI binding via manylinux Docker
+        run: |
+          docker build -f docker/Dockerfile.manylinux-node \
+            --build-arg MANYLINUX_IMAGE=${{ matrix.image }} \
+            --build-arg TARGET=${{ matrix.target }} \
+            --output type=local,dest=./build-output .
+      - name: Stage .node into napi platform dir for npm
+        run: |
+          platform="linux-${{ matrix.napi_arch }}-gnu"
+          mkdir -p "staging/npm/${platform}"
+          find build-output -name "*.node" -exec cp {} "staging/npm/${platform}/" \;
+          test -n "$(find "staging/npm/${platform}" -name '*.node')" || {
+            echo "::error::no .node produced by manylinux build for ${platform}"; exit 1; }
+          # Ship the .node's vendored shared-lib closure (libonnxruntime + codecs)
+          # beside it — the .node's RUNPATH is $ORIGIN, so co-located libs resolve
+          # at require() time. Without them consumers hit ERR_DLOPEN_FAILED.
+          # `*.so*` (not `*.so`) matches versioned sonames like libonnxruntime.so.1,
+          # which a plain `*.so` glob silently drops. ~keep
+          if ls build-output/*.so* >/dev/null 2>&1; then
+            cp -v build-output/*.so* "staging/npm/${platform}/"
+          else
+            echo "::error::no vendored shared libs produced by manylinux build for ${platform}"; exit 1
+          fi
+          cp "crates/xberg-node/npm/${platform}/package.json" "staging/npm/${platform}/package.json"
+          # Reconcile `files` with the binaries on disk — napi create-npm-dirs
+          # regenerates the committed package.json to list only *.node, so the
+          # vendored libs must be re-added here or npm publish drops them.
+          python3 -c '
+          import json, os, re, sys
+          d = sys.argv[1]; p = os.path.join(d, "package.json")
+          pkg = json.load(open(p))
+          ship = re.compile(r"\.(node|dylib|dll)$|\.so(\.[0-9]+)*$")
+          on_disk = sorted(f for f in os.listdir(d) if ship.search(f))
+          pkg["files"] = sorted(set(pkg.get("files", [])) | set(on_disk))
+          with open(p, "w") as fh:
+              json.dump(pkg, fh, indent=2); fh.write("\n")
+          print("reconciled files:", pkg["files"])
+          ' "staging/npm/${platform}"
+          tar -czf node-bindings-${{ matrix.target }}.tar.gz -C staging npm
+      - name: Verify glibc floor
+        run: bash scripts/ci/verify-glibc-floor.sh "staging/npm/linux-${{ matrix.napi_arch }}-gnu" "$GLIBC_FLOOR"
       - uses: actions/upload-artifact@v7
         with:
           name: node-bindings-${{ matrix.target }}
@@ -684,19 +854,14 @@ jobs:
     needs: [prepare, check-npm]
     if: ${{ needs.prepare.outputs.release_wasm == 'true' && (needs.check-npm.outputs.wasm_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
-    # WASM cold-build of xberg-wasm compiles 100+ tree-sitter parsers for wasm32-unknown-unknown
-    # via clang. A SINGLE large parser (ABL/Java) peaks at ~13-14 GB clang RSS, so the standard
-    # ~16 GB GHA runner OOMs. CARGO_BUILD_JOBS=1 serializes compilation (cc-rs reads NUM_JOBS) so
-    # only one ~13-14 GB clang runs at a time — j>=2 would run two in parallel (~26 GB) and OOM
-    # harder. This is the diagnosed root cause (NOT the linker, as a prior comment claimed); even
-    # j=1 is tight, so the build stays `continue-on-error` until the real fix lands: a `wasm-lite`
-    # feature set with a curated parser list (markdown, javascript, python, rust, json, yaml, html,
-    # css, sql, c, …) that drops the heaviest grammars. See task #486.
     timeout-minutes: 120
-    # Best-effort until the wasm-lite fix: a WASM OOM must not block the rest of the publish.
+    # The WASM package is a best-effort publish gate, not part of the core release: a WASM
+    # build failure must not block publishing the crate/PyPI/npm/Maven/etc. artifacts that
+    # depend only on `prepare`. downstream `publish-wasm` requires
+    # needs.wasm-bindings.result == 'success', so a failure here still correctly skips
+    # publishing a broken WASM package -- it just doesn't fail the whole run. ~keep
     continue-on-error: true
     env:
-      # Serialize tree-sitter clang compilation so only one ~13-14 GB parser builds at a time.
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v6
@@ -704,7 +869,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: wasm32-unknown-unknown
@@ -723,14 +888,89 @@ jobs:
         with:
           crate-dir: crates/xberg-wasm
           pack-tarball: "true"
+          # The wasm-pack nodejs glue carries unresolvable require("env") /
+          # require("wasi_snapshot_preview1") calls (from the WASI-cross-compiled
+          # Tesseract in ocr-wasm) that throw on load. fix-wasi-imports.mjs stubs
+          # them post-build. This override is the durable hook: alef regenerates
+          # crates/xberg-wasm/package.json scripts and drops any hand-added
+          # suffix, so we invoke the patch here (publish.yaml is not generated)
+          # rather than relying on a package.json script surviving regen. ~keep
+          build-command: "pnpm run build:all && node scripts/fix-wasi-imports.mjs"
+
+      - name: Enforce WASM CDN size budget (jsDelivr limits)
+        working-directory: crates/xberg-wasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Early warning, deliberately NOT the blocking gate: this job carries a
+          # job-level `continue-on-error: true`, so a failure here does not
+          # reliably stop publish-wasm from running. The authoritative check is
+          # the npm-tarball measurement inside publish-wasm, which runs before
+          # the publish step in a job that is not continue-on-error. This step
+          # exists to surface the number early, against the build output rather
+          # than the packed tarball, so growth toward the jsDelivr caps is
+          # visible on every run instead of being discovered from a broken
+          # demo. Sizes print whether or not the budget is breached. ~keep
+          FAIL=0
+          {
+            echo "### WASM CDN size budget (crates/xberg-wasm)"
+            echo
+            echo "| artifact | size (bytes) | limit (bytes) | status |"
+            echo "|---|---|---|---|"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r -d '' file; do
+            size=$(stat -c%s "$file")
+            rel="crates/xberg-wasm/${file#./}"
+            status="ok"
+            if (( size > WASM_MAX_FILE_BYTES )); then
+              status="FAIL"
+              FAIL=1
+              echo "::error::${rel} is ${size} bytes, exceeding the per-file budget of ${WASM_MAX_FILE_BYTES} bytes (jsDelivr's hard per-file cap is 50 MB). Trim this artifact (or feature-gate the dependency that grew it) before it can publish."
+            fi
+            echo "size: ${rel} = ${size} bytes (limit ${WASM_MAX_FILE_BYTES})"
+            echo "| ${rel} | ${size} | ${WASM_MAX_FILE_BYTES} | ${status} |" >>"$GITHUB_STEP_SUMMARY"
+          done < <(find pkg -name '*.wasm' -print0)
+
+          total=$(du -sb pkg | cut -f1)
+          status="ok"
+          if (( total > WASM_MAX_PACKAGE_BYTES )); then
+            status="FAIL"
+            FAIL=1
+            echo "::error::crates/xberg-wasm/pkg is ${total} bytes, exceeding the package budget of ${WASM_MAX_PACKAGE_BYTES} bytes (jsDelivr's hard per-package cap is 150 MB). Trim the published bundle before it can publish."
+          fi
+          echo "size: crates/xberg-wasm/pkg (total) = ${total} bytes (limit ${WASM_MAX_PACKAGE_BYTES})"
+          echo "| crates/xberg-wasm/pkg (total) | ${total} | ${WASM_MAX_PACKAGE_BYTES} | ${status} |" >>"$GITHUB_STEP_SUMMARY"
+
+          if [[ "$FAIL" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Smoke test — Node can load the wasm web bundle
+        working-directory: crates/xberg-wasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Guards the rc.21/rc.22 regression: the wasm-pack glue carried
+          # unresolvable "env" / "wasi_snapshot_preview1" imports (from the
+          # WASI-cross-compiled Tesseract in ocr-wasm) that threw on load.
+          # scripts/fix-wasi-imports.mjs (run via the build-command override
+          # above) must have stripped and stubbed them; if not, importing the
+          # bundle throws here and fails the job before a broken package can
+          # publish. The package is web-only (single ESM target under pkg/web),
+          # so import it as an ES module — this exercises the same env/wasi ESM
+          # shim path. Load-only (no tessdata needed): fast and network-free.
+          node --input-type=module -e '
+            const wasm = await import("./pkg/web/xberg_wasm.js");
+            if (typeof wasm.extract !== "function" || typeof wasm.WasmExtractInput !== "function") {
+              console.error("wasm web glue loaded but expected exports are missing"); process.exit(1);
+            }
+            console.log("wasm web glue loaded; exports present:", Object.keys(wasm).length);
+          '
 
       - uses: actions/upload-artifact@v7
         with:
           name: wasm-bundle
-          # pkg/ holds the wasm-pack output that package.json's main/module/types
-          # point at (pkg/nodejs/…, pkg/web/…); it MUST ship in the artifact or the
-          # published @xberg-io/xberg-wasm tarball has missing entry points. package.json
-          # is included so the publish job uses the build-stamped manifest.
           path: |
             crates/xberg-wasm/dist/**
             crates/xberg-wasm/dist-node/**
@@ -741,11 +981,6 @@ jobs:
 
   ruby-gem:
     name: Build Ruby gem (${{ matrix.label }})
-    # build-ruby-gem@v1 rewrites workspace path-deps to registry version-deps
-    # (--require-registry) before compiling, so the core crates must be on
-    # crates.io first: order after publish-crates. The status guard lets the build
-    # still run when publish-crates is skipped (crates already published), blocking
-    # only on its actual failure.
     needs: [prepare, check-rubygems, publish-crates]
     if: ${{ !cancelled() && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_ruby == 'true' && (needs.check-rubygems.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ${{ matrix.os }}
@@ -758,19 +993,28 @@ jobs:
           - { os: ubuntu-latest, label: linux-x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64 }
           - { os: macos-15, label: macos-arm64 }
-          # Intel macOS: native x86_64 gem; dynamic ort (alef macos-intel-target).
-          - { os: macos-15-intel, label: macos-x86_64 }
-          # Ruby on Windows is MinGW (rb-sys → x86_64-pc-windows-gnu) but ort-sys
-          # only ships msvc prebuilts; the ABIs are incompatible. Skip until ORT
-          # publishes mingw binaries or xberg moves to ort-tract on Ruby/Win.
+          - { os: windows-latest, label: windows-x86_64 }
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
+      # RubyInstaller's Windows Ruby is built against the UCRT/MinGW ABI (gem
+      # platform `x64-mingw-ucrt`, already declared in packages/ruby/Rakefile's
+      # CROSS_PLATFORMS), not MSVC — unlike the Python/Node/PHP/C# Windows legs
+      # in this workflow, which all target genuine MSVC binaries. rb_sys's
+      # create_rust_makefile detects the host Ruby's platform and asks cargo to
+      # build for the matching Rust target, so the host Rust toolchain itself
+      # must be the GNU one; a MSVC-hosted rustc cross-building that target
+      # would need a mingw sysroot dance rb_sys does not set up. Selecting it
+      # through setup-rust's own `toolchain` input (rather than a later
+      # `rustup default`) keeps the action's verify-install step checking the
+      # toolchain we actually build with.
       - uses: xberg-io/actions/setup-rust@v1
+        with:
+          toolchain: ${{ runner.os == 'Windows' && 'stable-x86_64-pc-windows-gnu' || '' }}
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -786,11 +1030,6 @@ jobs:
           dry-run: ${{ needs.prepare.outputs.dry_run }}
 
       - name: Package platform gem
-        # `rake compile` builds the native extension for this runner's platform;
-        # rake-compiler then tags the `rake build` gem with the current platform
-        # (e.g. -x86_64-linux), alongside the fallback source gem. Without the
-        # compile, `rake build` emits a source-only gem that forces every consumer
-        # to compile from source on `gem install`.
         working-directory: packages/ruby
         run: |
           bundle exec rake compile
@@ -799,16 +1038,13 @@ jobs:
 
       - name: Drop source gem on non-canonical builders
         if: ${{ matrix.label != 'linux-x86_64' }}
-        # Only the canonical linux-x86_64 builder ships the fallback source gem;
-        # other runners emit byte-different source gems that collide under
-        # publish-rubygems' merge-multiple. Keep only platform-tagged gems here.
         shell: bash
         run: |
           shopt -s nullglob
           for f in packages/ruby/pkg/*.gem; do
             base="$(basename "$f")"
             case "$base" in
-              *-x86_64-linux.gem|*-aarch64-linux.gem|*-arm64-darwin.gem|*-x86_64-darwin.gem) ;;
+              *-x86_64-linux.gem|*-aarch64-linux.gem|*-arm64-darwin.gem|*-x86_64-darwin.gem|*-x64-mingw-ucrt.gem) ;;
               *) echo "Removing non-canonical source gem $base"; rm -f "$f" ;;
             esac
           done
@@ -821,28 +1057,21 @@ jobs:
 
   php-extension:
     name: Build PHP extension (php${{ matrix.php }} ${{ matrix.platform.label }})
-    # build-php-extension@v1 rewrites path-deps to registry versions before
-    # building; the core crates must be published first. The status guard lets the
-    # build run when publish-crates is skipped, blocking only on its actual failure.
     needs: [prepare, check-packagist, publish-crates]
-    if: ${{ !cancelled() && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_php == 'true' && (needs.check-packagist.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    # Skipped on dry runs for the same reason as `python-sdist`: the extension is packaged out of the
+    # workspace with internal `path = "..."` keys stripped, so it resolves `xberg = "^<version>"` from
+    # crates.io, which only exists after a real (non-dry-run) `publish-crates`.
+    if: ${{ !cancelled() && needs.prepare.outputs.dry_run != 'true' && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_php == 'true' && (needs.check-packagist.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ${{ matrix.platform.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      # 4 PHP versions x 5 platforms = 20 jobs, 8 of them on the scarce macOS
-      # runner pool. Cap concurrency so this single matrix cannot monopolize the
-      # pool and starve the other languages' macOS legs (jobs queued 2h+ and
-      # never ran on rc.4). Coverage is unchanged — only the fan-out rate is.
-      max-parallel: 4
       matrix:
-        php: ["8.2", "8.3", "8.4", "8.5"]
+        php: ["8.3", "8.4", "8.5"]
         platform:
           - { os: ubuntu-latest, label: linux-x86_64, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, label: linux-arm64, target: aarch64-unknown-linux-gnu }
           - { os: macos-15, label: macos-arm64, target: aarch64-apple-darwin }
-          # Intel macOS: native x86_64; dynamic ort (alef macos-intel-target).
-          - { os: macos-15-intel, label: macos-x86_64, target: x86_64-apple-darwin }
           - { os: windows-latest, label: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v6
@@ -850,7 +1079,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-php@v1
         with:
           php-version: ${{ matrix.php }}
@@ -900,14 +1129,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # gnu CLI builds on native ubuntu-24.04 for glibc 2.39 (≥ 2.38 floor for ORT).
-          # The executable statically links C++ deps (tesseract/leptonica)
-          # that reference GNU libstdc++ `__cxx11` symbols. ubuntu-24.04's GCC emits C23
-          # glibc symbols (__isoc23_strtoll etc.) which require glibc ≥ 2.38;
-          # ubuntu-24.04 ships glibc 2.39, satisfying ORT's requirements. Older systems
-          # are served by the static musl CLI below.
-          # HEIF/HEIC is built in (the CLI's xberg `formats` feature includes `heic`);
-          # libheif is provisioned from source via install-system-deps.
           - {
               os: ubuntu-24.04,
               target: x86_64-unknown-linux-gnu,
@@ -917,15 +1138,10 @@ jobs:
               target: aarch64-unknown-linux-gnu,
             }
           - { os: macos-15, target: aarch64-apple-darwin }
-          # Native Intel macOS. ort has no static x86_64-apple-darwin prebuilt
-          # (dropped rc.11; Microsoft dropped onnxruntime-osx-x86_64 after 1.23),
-          # so this target keeps the default features but swaps ort-bundled for
-          # ort-dynamic and ships a bundled libonnxruntime.dylib. Full parity
-          # with the aarch64 CLI.
           - {
               os: macos-15-intel,
               target: x86_64-apple-darwin,
-              extra_cargo_args: "--features ort-dynamic,mcp,mcp-http,api",
+              extra_cargo_args: "--features ort-dynamic,mcp,mcp-http,api,heic",
             }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
@@ -934,11 +1150,12 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
 
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: ${{ matrix.target }}
+          cache-key-prefix: cli-native-v1
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
@@ -955,37 +1172,33 @@ jobs:
           package-name: xberg-cli
           binary-name: xberg
           target: ${{ matrix.target }}
-          # Ship the server surface in prebuilt binaries so `xberg mcp` /
-          # `xberg mcp --transport http` / `xberg api` work from
-          # install.sh + Homebrew (the CLI `default` features omit these). `heic`
-          # is already on via the CLI's xberg `formats` feature; libheif is
-          # provisioned by the system-deps steps (from source on Linux/macOS,
-          # vcpkg on Windows). Intel macOS overrides this (matrix.extra_cargo_args)
-          # to add ort-dynamic in place of the missing static prebuilt.
-          extra-cargo-args: ${{ matrix.extra_cargo_args || '--features mcp,mcp-http,api' }}
+          # `heic` re-adds HEIC/HEIF to the prebuilt binaries — the CLI default
+          # dropped it so `cargo install` works on stock Windows (#1361); CI has
+          # libheif so the official binaries keep HEIC. ~keep
+          extra-cargo-args: ${{ matrix.extra_cargo_args || '--features mcp,mcp-http,api,heic' }}
+
+      # Stage ONNX Runtime for Intel macOS after the build so the ort-dynamic
+      # compile is unaffected; this exports ORT_DYLIB_PATH for the vendor step.
+      # pyke ships no x86_64-apple-darwin build, so the macOS setup script pins
+      # Microsoft's last x86_64 release (1.23.2, self-contained). ~keep
+      - name: Setup ONNX Runtime (Intel macOS)
+        if: matrix.target == 'x86_64-apple-darwin'
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: "1.23.2"
+          arch-id: x64
+          dest-dir: crates/xberg-cli
 
       - name: Vendor ONNX Runtime dylib (Intel macOS)
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
         run: |
           set -euxo pipefail
-          # This target loads ONNX Runtime at runtime (ort-dynamic) rather than
-          # static-linking a prebuilt, because none exists for x86_64-apple-darwin
-          # at onnxruntime >= 1.24 (the version ort rc.12 requires). Homebrew's
-          # onnxruntime (1.27, x86_64 "sonoma" bottle) satisfies the >=1.24 check.
-          # The sequoia runner has no matching x86_64 bottle, so pour the sonoma
-          # one explicitly. Vendored next to the binary + rewritten to
-          # @loader_path so it resolves without Homebrew on the user's machine.
-          export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
-          brew install --bottle-tag=sonoma onnxruntime \
-            || brew install onnxruntime
-          ORT_LIB="$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib"
-          test -f "$ORT_LIB"
-          echo "ORT_VENDOR_LIB=$ORT_LIB" >> "$GITHUB_ENV"
+          # Bundle the dylib the setup step staged next to the binary.
+          test -f "$ORT_DYLIB_PATH"
+          echo "ORT_VENDOR_LIB=$ORT_DYLIB_PATH" >> "$GITHUB_ENV"
 
       - name: Package CLI artifact
-        # Inline: archive layout (.tar.gz on Unix, .zip on Windows) varies per
-        # OS in a way no shared action covers; tiny and self-contained.
         env:
           BINARY_PATH: ${{ steps.build.outputs.binary-path }}
           TARGET: ${{ matrix.target }}
@@ -993,51 +1206,44 @@ jobs:
         run: |
           STAGE="xberg-cli-${TARGET}"
           mkdir -p "$STAGE"
+          cp LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cp "$BINARY_PATH" "$STAGE/xberg.exe"
             7z a "${STAGE}.zip" "$STAGE" >/dev/null
           else
             cp "$BINARY_PATH" "$STAGE/xberg"
-            # Intel macOS: bundle libonnxruntime.dylib next to the binary. ort
-            # resolves the default dylib name relative to the executable, so no
-            # ORT_DYLIB_PATH is needed. Vendor the dylib's FULL non-system
-            # dependency closure — Homebrew's onnxruntime links abseil, onnx,
-            # protobuf and re2, which in turn link each other — and repoint
-            # every install name at @loader_path so the bundle is
-            # self-contained (no Homebrew required at runtime). Each staged
-            # copy gets its @loader_path ID set immediately so its own
-            # LC_ID_DYLIB line (which otool -L prints first) drops out of the
-            # Homebrew-path grep instead of being re-vendored under its
-            # versioned name.
+            # Intel macOS: bundle libonnxruntime.dylib next to the binary; ort
+            # resolves the default dylib name relative to the executable. The
+            # official build links only system frameworks, so the one file is
+            # the whole closure.
             if [[ "$TARGET" == "x86_64-apple-darwin" && -n "${ORT_VENDOR_LIB:-}" ]]; then
               cp "$ORT_VENDOR_LIB" "$STAGE/libonnxruntime.dylib"
               chmod u+w "$STAGE/libonnxruntime.dylib"
               install_name_tool -id "@loader_path/libonnxruntime.dylib" "$STAGE/libonnxruntime.dylib"
-              # Iterate to a fixpoint: each pass copies newly referenced
-              # dylibs and rewrites references in everything staged so far.
-              changed=1
-              while [[ "$changed" == 1 ]]; do
-                changed=0
-                for lib in "$STAGE"/*.dylib; do
-                  while IFS= read -r dep; do
-                    base="$(basename "$dep")"
-                    src="$dep"
-                    [[ "$dep" == @rpath/* ]] && src="$(brew --prefix onnxruntime)/lib/$base"
-                    if [[ ! -f "$STAGE/$base" ]]; then
-                      [[ -f "$src" ]] || continue
-                      cp "$src" "$STAGE/$base"
-                      chmod u+w "$STAGE/$base"
-                      install_name_tool -id "@loader_path/$base" "$STAGE/$base"
-                      changed=1
-                    fi
-                    install_name_tool -change "$dep" "@loader_path/$base" "$lib" || true
-                  done < <(otool -L "$lib" | tail -n +2 | awk '{print $1}' \
-                    | grep -E '^(/opt/homebrew|/usr/local|@rpath)/' || true)
-                done
-              done
-              for lib in "$STAGE"/*.dylib; do
-                codesign --force -s - "$lib" || true
-              done
+              deps="$(otool -L "$STAGE/libonnxruntime.dylib" | tail -n +3 | awk '{print $1}' \
+                | grep -E '^(/opt/homebrew|/usr/local)/' || true)"
+              if [[ -n "$deps" ]]; then
+                echo "::error::vendored ONNX Runtime links non-system libraries:"; echo "$deps"; exit 1
+              fi
+              codesign --force -s - "$STAGE/libonnxruntime.dylib" || true
+            fi
+            # macOS CLI builds enable the formats feature, which dynamically
+            # links libheif. Bundle its complete non-system dylib closure next to
+            # the binary and rewrite load commands to @loader_path so the tarball
+            # is self-contained rather than carrying an absolute Homebrew libheif
+            # path that is absent on users' machines (xberg-io/xberg#1357). The
+            # dlopen'd ONNX Runtime dylib (Intel, handled above) is not a link-time
+            # dependency, so this closure walk does not disturb it.
+            if [[ "$TARGET" == *-apple-darwin ]]; then
+              bash scripts/ci/vendor-native-closure-macos.sh "$STAGE/xberg"
+              "$STAGE/xberg" --version
+            fi
+            # Linux CLI builds enable the formats feature, which dynamically
+            # links libheif. Ship its complete non-system dependency closure.
+            if [[ "$TARGET" == *-unknown-linux-gnu ]]; then
+              bash scripts/ci/vendor-native-closure.sh "$STAGE/xberg"
+              compgen -G "$STAGE/libheif.so*" >/dev/null
+              env -u LD_LIBRARY_PATH "$STAGE/xberg" --version
             fi
             tar -czf "${STAGE}.tar.gz" "$STAGE"
           fi
@@ -1052,10 +1258,6 @@ jobs:
           retention-days: 14
 
   cli-binaries-musl:
-    # Alpine container build: ort-sys ships no musl prebuilts, so we use Alpine's
-    # system onnxruntime-dev (apk) plus -C target-feature=-crt-static for cdylib.
-    # Each Dockerfile is single-arch (FROM alpine:3.21); arch-matched runners
-    # produce arch-matched binaries without qemu emulation.
     name: Build CLI binary (${{ matrix.target }})
     needs: [prepare, check-cli]
     if: ${{ needs.prepare.outputs.release_cli == 'true' && (needs.check-cli.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
@@ -1072,7 +1274,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - name: Build CLI via Alpine Docker
         run: |
           docker build -f docker/Dockerfile.musl-build \
@@ -1085,6 +1287,7 @@ jobs:
         run: |
           STAGE="xberg-cli-${TARGET}"
           mkdir -p "$STAGE/lib"
+          cp LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"
           cp build-output/xberg "$STAGE/xberg"
           cp build-output/xberg.bin "$STAGE/xberg.bin"
           cp -a build-output/lib/. "$STAGE/lib/"
@@ -1095,6 +1298,57 @@ jobs:
         with:
           name: cli-${{ matrix.target }}
           path: xberg-cli-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Fully static musl CLI for `cargo binstall xberg-cli`. binstall extracts only
+  # the binary from the archive, so this ships ONE static ELF (no sibling dylibs,
+  # unlike the bundled cli-binaries-musl tarball). x86_64 gets Candle OCR
+  # (binstall-ocr); aarch64 is extraction-only (binstall) since candle's gemm-f16
+  # needs fullfp16, absent on the musl aarch64 baseline. Assets are named
+  # `xberg-cli-binstall-<target>` so upload-cli-release attaches them via its
+  # existing `xberg-cli-*` glob, and `[package.metadata.binstall]` points here.
+  cli-binaries-binstall:
+    name: Build static binstall CLI (${{ matrix.target }})
+    needs: [prepare, check-cli]
+    if: ${{ needs.prepare.outputs.release_cli == 'true' && (needs.check-cli.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, features: binstall-ocr }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, features: binstall }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+
+          submodules: false
+      - name: Build static CLI via Alpine Docker
+        run: |
+          docker build -f docker/Dockerfile.binstall-musl \
+            --build-arg FEATURES=${{ matrix.features }} \
+            --build-arg TARGET=${{ matrix.target }} \
+            --output type=local,dest=./build-output .
+
+      - name: Package binstall CLI artifact (single static binary)
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          STAGE="xberg-cli-binstall-${TARGET}"
+          mkdir -p "$STAGE"
+          cp LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"
+          cp build-output/xberg "$STAGE/xberg"
+          chmod +x "$STAGE/xberg"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-binstall-${{ matrix.target }}
+          path: xberg-cli-binstall-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -1110,8 +1364,6 @@ jobs:
           - { os: ubuntu-latest, platform: linux-x86_64, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, platform: linux-aarch64, target: aarch64-unknown-linux-gnu }
           - { os: macos-15, platform: macos-arm64, target: aarch64-apple-darwin }
-          # Intel macOS: native x86_64; dynamic ort (alef macos-intel-target).
-          - { os: macos-15-intel, platform: macos-x86_64, target: x86_64-apple-darwin }
           - { os: windows-latest, platform: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v6
@@ -1119,13 +1371,20 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: ${{ matrix.target }}
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
+
+      - name: Setup ONNX Runtime
+        if: contains(matrix.target, 'windows') || contains(matrix.target, '-linux-gnu')
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: "1.24.2"
+          dest-dir: crates/xberg-ffi
 
       - name: Setup Zig for glibc 2.28 floor
         if: contains(matrix.target, '-linux-gnu')
@@ -1144,7 +1403,20 @@ jobs:
           header-path: crates/xberg-ffi/include/xberg.h
           archive-name: xberg-go-${{ matrix.platform }}.tar.gz
           output-dir: dist/go-ffi
-          glibc-version: "2.28"
+          glibc-version: ${{ env.GLIBC_FLOOR }}
+      - name: Ship + verify ONNX Runtime (glibc Linux)
+        if: contains(matrix.target, '-linux-gnu')
+        shell: bash
+        run: |
+          shopt -s nullglob
+          shipped=0
+          for t in dist/go-ffi/*.tar.gz; do
+            shipped=1
+            bash scripts/ci/vendor-native-closure.sh "$t"
+            bash scripts/ci/verify-glibc-floor.sh "$t" "$GLIBC_FLOOR"
+          done
+          [ "$shipped" = 1 ] || echo "::notice::no artifact produced (dry-run stub); skipping ship+verify"
+
       - uses: actions/upload-artifact@v7
         with:
           name: go-ffi-${{ matrix.platform }}
@@ -1164,8 +1436,6 @@ jobs:
           - { os: ubuntu-latest, platform: linux-x86_64, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, platform: linux-aarch64, target: aarch64-unknown-linux-gnu }
           - { os: macos-15, platform: macos-arm64, target: aarch64-apple-darwin }
-          # Intel macOS: native x86_64; dynamic ort (alef macos-intel-target).
-          - { os: macos-15-intel, platform: macos-x86_64, target: x86_64-apple-darwin }
           - { os: windows-latest, platform: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v6
@@ -1173,13 +1443,20 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: ${{ matrix.target }}
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
+
+      - name: Setup ONNX Runtime
+        if: contains(matrix.target, 'windows') || contains(matrix.target, '-linux-gnu')
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: "1.24.2"
+          dest-dir: crates/xberg-ffi
 
       - name: Setup Zig for glibc 2.28 floor
         if: contains(matrix.target, '-linux-gnu')
@@ -1194,11 +1471,10 @@ jobs:
         with:
           crate-name: xberg-ffi
           target: ${{ matrix.target }}
-          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && '2.28' || '' }}
+          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && env.GLIBC_FLOOR || '' }}
 
       - name: Stage C FFI distribution
         # Inline: bundle library + header + LICENSE into a single tarball
-        # named to match upload-c-ffi-release's expected asset prefix.
         env:
           TARGET: ${{ matrix.target }}
           PLATFORM: ${{ matrix.platform }}
@@ -1213,6 +1489,19 @@ jobs:
           cp LICENSE "$STAGE/" 2>/dev/null || true
           mkdir -p dist/c-ffi
           tar -czf "dist/c-ffi/${STAGE}.tar.gz" "$STAGE"
+
+      - name: Ship + verify ONNX Runtime (glibc Linux)
+        if: contains(matrix.target, '-linux-gnu')
+        shell: bash
+        run: |
+          shopt -s nullglob
+          shipped=0
+          for t in dist/c-ffi/*.tar.gz; do
+            shipped=1
+            bash scripts/ci/vendor-native-closure.sh "$t"
+            bash scripts/ci/verify-glibc-floor.sh "$t" "$GLIBC_FLOOR"
+          done
+          [ "$shipped" = 1 ] || echo "::notice::no artifact produced (dry-run stub); skipping ship+verify"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1233,8 +1522,6 @@ jobs:
           - { os: ubuntu-latest, classifier: linux-x86_64, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, classifier: linux-aarch64, target: aarch64-unknown-linux-gnu }
           - { os: macos-15, classifier: macos-arm64, target: aarch64-apple-darwin }
-          # Intel macOS: native x86_64; dynamic ort (alef macos-intel-target).
-          - { os: macos-15-intel, classifier: macos-x86_64, target: x86_64-apple-darwin }
           - { os: windows-latest, classifier: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v6
@@ -1242,13 +1529,20 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: ${{ matrix.target }}
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
+
+      - name: Setup ONNX Runtime
+        if: contains(matrix.target, 'windows') || contains(matrix.target, '-linux-gnu')
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: "1.24.2"
+          dest-dir: crates/xberg-ffi
 
       - name: Setup Zig for glibc 2.28 floor
         if: contains(matrix.target, '-linux-gnu')
@@ -1265,7 +1559,18 @@ jobs:
           crate-name: xberg-ffi
           lib-name: xberg_ffi
           classifier: ${{ matrix.classifier }}
-          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && '2.28' || '' }}
+          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && env.GLIBC_FLOOR || '' }}
+
+      - name: Ship + verify ONNX Runtime (glibc Linux)
+        if: contains(matrix.target, '-linux-gnu')
+        shell: bash
+        run: |
+          if [ -d dist/java-natives ] && find dist/java-natives -name '*.so' -type f | grep -q .; then
+            bash scripts/ci/vendor-native-closure.sh dist/java-natives
+            bash scripts/ci/verify-glibc-floor.sh dist/java-natives "$GLIBC_FLOOR"
+          else
+            echo "::notice::no java natives produced (dry-run stub); skipping ship+verify"
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1275,7 +1580,6 @@ jobs:
           retention-days: 14
 
   java-natives-musl:
-    # Alpine container build via Dockerfile.musl-ffi (system onnxruntime-dev).
     name: Build Java natives (linux-musl-${{ matrix.arch }})
     needs: [prepare, check-maven]
     if: ${{ needs.prepare.outputs.release_java == 'true' && (needs.check-maven.outputs.java_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
@@ -1292,7 +1596,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - name: Build xberg-ffi via Alpine Docker
         run: |
           docker build -f docker/Dockerfile.musl-ffi \
@@ -1328,20 +1632,19 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
 
       - uses: xberg-io/actions/build-android-natives@v1
         with:
-          crate-name: xberg-ffi
+          # xberg-jni has no [features] table of its own; it pulls in
+          # xberg's android-target feature automatically via
+          # cfg(target_os = "android") dependency selection, so no
+          # --features/--no-default-features flags are passed here. ~keep
+          crate-name: xberg-jni
           abis: ${{ matrix.abi }}
-          # Android uses the no-ORT feature set: ort-sys has no prebuilt for
-          # x86_64-linux-android and the dep is android-target for all Android
-          # arches (see xberg-ffi Cargo.toml). Mirrors ci-mobile.yaml.
-          features: android-target
-          no-default-features: "true"
       - uses: actions/upload-artifact@v7
         with:
           name: kotlin-android-${{ matrix.abi }}
@@ -1361,8 +1664,6 @@ jobs:
           - { os: ubuntu-latest, rid: linux-x64, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, rid: linux-arm64, target: aarch64-unknown-linux-gnu }
           - { os: macos-15, rid: osx-arm64, target: aarch64-apple-darwin }
-          # Intel macOS: native x86_64; dynamic ort (alef macos-intel-target).
-          - { os: macos-15-intel, rid: osx-x64, target: x86_64-apple-darwin }
           - { os: windows-latest, rid: win-x64, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v6
@@ -1370,7 +1671,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: ${{ matrix.target }}
@@ -1382,6 +1683,20 @@ jobs:
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
+
+      # Build the libheif closure from source at the macOS floor (#1243) and make
+      # the FFI dylib link it instead of Homebrew's runner-OS bottles, so the
+      # osx-arm64 NuGet native bundles a floor-11 heif closure. ~keep
+      - name: Build libheif stack for the macOS floor
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          bash scripts/ci/build-macos-heif-deps.sh
+          {
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+            echo "PKG_CONFIG_PATH=/tmp/xberg-heif/lib/pkgconfig"
+          } >>"$GITHUB_ENV"
 
       - name: Setup Zig for glibc 2.28 floor
         if: contains(matrix.target, '-linux-gnu')
@@ -1398,7 +1713,7 @@ jobs:
           crate-name: xberg-ffi
           lib-name: xberg_ffi
           rid: ${{ matrix.rid }}
-          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && '2.28' || '' }}
+          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && env.GLIBC_FLOOR || '' }}
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1408,7 +1723,6 @@ jobs:
           retention-days: 14
 
   csharp-natives-musl:
-    # Alpine container build via Dockerfile.musl-ffi (system onnxruntime-dev).
     name: Build C# natives (linux-musl-${{ matrix.arch }})
     needs: [prepare, check-nuget]
     if: ${{ needs.prepare.outputs.release_csharp == 'true' && (needs.check-nuget.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
@@ -1425,7 +1739,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - name: Build xberg-ffi via Alpine Docker
         run: |
           docker build -f docker/Dockerfile.musl-ffi \
@@ -1436,7 +1750,12 @@ jobs:
           RID: ${{ matrix.rid }}
         run: |
           mkdir -p "dist/csharp-natives/runtimes/${RID}/native"
-          cp build-output/libxberg_ffi.so "dist/csharp-natives/runtimes/${RID}/native/libxberg_ffi.so"
+          # Dockerfile.musl-ffi bundles the FFI library plus its vendored shared-lib
+          # closure (libonnxruntime + codecs) with RUNPATH=$ORIGIN, so ship all of
+          # them — not just libxberg_ffi.so — or .NET fails to load ORT at runtime (#1280).
+          # `*.so*` (not `*.so`) matches versioned sonames like libonnxruntime.so.1,
+          # which a plain `*.so` glob silently drops. ~keep
+          cp build-output/*.so* "dist/csharp-natives/runtimes/${RID}/native/"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1446,11 +1765,7 @@ jobs:
           retention-days: 14
 
   elixir-natives:
-    name: Build Elixir NIF (${{ matrix.label }})
-    # build-elixir-natives@v1 rewrites path-deps to registry versions before
-    # building (so the hex source fallback resolves); needs published crates. The
-    # status guard lets the build run when publish-crates is skipped, blocking only
-    # on its actual failure.
+    name: Build Elixir NIF (${{ matrix.label }} nif-${{ matrix.nif }})
     needs: [prepare, check-elixir-release, publish-crates]
     if: ${{ !cancelled() && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_elixir == 'true' && (needs.check-elixir-release.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ${{ matrix.os }}
@@ -1458,8 +1773,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-latest]
-        nif: ["2.16", "2.17"]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
+        nif: ["2.16"]
         include:
           - os: ubuntu-latest
             label: linux-x86_64
@@ -1467,10 +1782,6 @@ jobs:
           - os: ubuntu-24.04-arm
             label: linux-aarch64
             target: aarch64-unknown-linux-gnu
-          # Intel macOS: native x86_64; dynamic ort (alef macos-intel-target).
-          - os: macos-15-intel
-            label: macos-x86_64
-            target: x86_64-apple-darwin
           - os: macos-15
             label: macos-arm64
             target: aarch64-apple-darwin
@@ -1483,21 +1794,13 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - name: Override ImageOS on ARM Linux runners
-        # erlef/setup-beam@v1 maps ImageOS env to its package index. On
-        # `ubuntu-24.04-arm` the runner reports `ImageOS=ubuntu24-arm64`,
-        # which setup-beam does not recognize. Force it to `ubuntu24` —
-        # the OTP packages are arch-aware via setup-beam's separate logic.
         if: matrix.os == 'ubuntu-24.04-arm'
         shell: bash
         run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
 
       - name: Override ImageOS on Windows runners
-        # erlef/setup-beam@v1 maps ImageOS env to its package index. On
-        # `windows-latest` the runner reports `ImageOS=win25-vs2026`,
-        # which setup-beam does not recognize. Force it to `win25` —
-        # the OTP package selection only varies by major Windows release.
         if: runner.os == 'Windows'
         shell: bash
         run: echo "ImageOS=win25" >> "$GITHUB_ENV"
@@ -1524,12 +1827,16 @@ jobs:
         run: command -v cargo-zigbuild || cargo install --locked cargo-zigbuild
 
       - name: Disable sccache wrapper on Windows
-        # cargo cannot exec the Alef-scaffolded `.cargo/rustc-wrapper.sh` on
-        # Windows ("%1 is not a valid Win32 application"). Empty RUSTC_WRAPPER
-        # disables the shim for this build only.
         if: contains(matrix.target, 'windows')
         shell: bash
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
+      - name: Setup ONNX Runtime
+        if: contains(matrix.target, '-linux-gnu')
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: "1.24.2"
+          dest-dir: crates/xberg-ffi
 
       - uses: xberg-io/actions/build-elixir-natives@v1
         with:
@@ -1539,10 +1846,31 @@ jobs:
           package-dir: packages/elixir
           nif-version: ${{ needs.prepare.outputs.version }}
           nif-api-version: ${{ matrix.nif }}
-          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && '2.28' || '' }}
+          glibc-version: ${{ contains(matrix.target, '-linux-gnu') && env.GLIBC_FLOOR || '' }}
           dry-run: ${{ needs.prepare.outputs.dry_run }}
 
+      - name: Ship + verify ONNX Runtime (glibc Linux)
+        if: contains(matrix.target, '-linux-gnu')
+        shell: bash
+        run: |
+          shopt -s nullglob
+          shipped=0
+          for t in dist/elixir-natives/*.tar.gz; do
+            shipped=1
+            bash scripts/ci/vendor-native-closure.sh "$t"
+            bash scripts/ci/verify-glibc-floor.sh "$t" "$GLIBC_FLOOR"
+          done
+          [ "$shipped" = 1 ] || echo "::notice::no artifact produced (dry-run stub); skipping ship+verify"
+
+      # `build-elixir-natives` returns before creating the tarball on a dry run
+      # (scripts/build.py writes its outputs and skips the cargo build), so the
+      # glob below matches nothing and `if-no-files-found: error` fails the job
+      # -- on exactly the case the ship+verify step above deliberately tolerates
+      # as a "dry-run stub". Sibling actions emit a stub and so do not hit this.
+      # Gate on dry_run, NOT on is_tag: publish.yaml synthesizes a dry-run tag,
+      # so `is_tag` is true on a dry run and would not skip anything. ~keep
       - uses: actions/upload-artifact@v7
+        if: ${{ needs.prepare.outputs.dry_run != 'true' }}
         with:
           name: elixir-${{ matrix.label }}-nif-${{ matrix.nif }}
           path: dist/elixir-natives/*.tar.gz
@@ -1550,10 +1878,6 @@ jobs:
           retention-days: 14
 
   elixir-natives-musl:
-    # Alpine container build via Dockerfile.musl-rustler (system onnxruntime-dev).
-    # Replicates RustlerPrecompiled tarball naming the build-elixir-natives action
-    # uses for non-musl variants: lib{nif}-v{ver}-nif-{api}-{target}.so.tar.gz + sha256.
-    # Like elixir-natives, needs published crates for the hex source fallback.
     name: Build Elixir NIF (linux-musl-${{ matrix.arch }} nif-${{ matrix.nif }})
     needs: [prepare, check-elixir-release, publish-crates]
     if: ${{ !cancelled() && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_elixir == 'true' && (needs.check-elixir-release.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
@@ -1563,7 +1887,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
-        nif: ["2.16", "2.17"]
+        nif: ["2.16"]
         include:
           - os: ubuntu-latest
             arch: x86_64
@@ -1577,7 +1901,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - name: Build xberg_nif via Alpine Docker
         run: |
           docker build -f docker/Dockerfile.musl-rustler \
@@ -1601,68 +1925,6 @@ jobs:
         with:
           name: elixir-musl-${{ matrix.arch }}-nif-${{ matrix.nif }}
           path: dist/elixir-natives/*.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-
-  dart-android-natives:
-    name: Build Dart Android natives (${{ matrix.abi }})
-    needs: [prepare, check-pub]
-    if: ${{ needs.prepare.outputs.release_dart == 'true' && (needs.check-pub.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { abi: arm64-v8a }
-          - { abi: x86_64 }
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.checkout_ref }}
-          fetch-depth: 0
-          submodules: recursive
-      - uses: xberg-io/actions/setup-rust@v1
-      - name: Install system dependencies
-        uses: ./.github/actions/install-system-deps
-
-      - uses: xberg-io/actions/build-android-natives@v1
-        with:
-          crate-name: xberg-dart
-          abis: ${{ matrix.abi }}
-          # Android uses the no-ORT feature set: ort-sys has no prebuilt for
-          # x86_64-linux-android and the dep is android-target for all Android
-          # arches (see xberg-dart Cargo.toml). Mirrors ci-mobile.yaml.
-          features: android-target
-          no-default-features: "true"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dart-android-${{ matrix.abi }}
-          path: dist/android-natives
-          if-no-files-found: error
-          retention-days: 14
-
-  dart-ios-xcframework:
-    name: Build Dart iOS XCFramework
-    needs: [prepare, check-pub]
-    if: ${{ needs.prepare.outputs.release_dart == 'true' && (needs.check-pub.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.checkout_ref }}
-          fetch-depth: 0
-          submodules: recursive
-      - uses: xberg-io/actions/setup-rust@v1
-      - name: Install system dependencies
-        uses: ./.github/actions/install-system-deps
-
-      - uses: xberg-io/actions/build-ios-xcframework@v1
-        with:
-          crate-name: xberg-dart
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dart-ios-xcframework
-          path: dist/ios-xcframework
           if-no-files-found: error
           retention-days: 14
 
@@ -1690,14 +1952,10 @@ jobs:
           - {
               os: macos-15,
               target: aarch64-apple-darwin,
-              blob: macos-arm64,
-              lib: libxberg_dart.dylib,
-            }
-          # Intel macOS: native x86_64; dynamic ort (alef macos-intel-target).
-          - {
-              os: macos-15-intel,
-              target: x86_64-apple-darwin,
-              blob: macos-x86_64,
+              # Asset blob uses the aarch64 spelling to match native_loader.dart's
+              # nativeAssetBlob() (and the linux-aarch64 asset); the cache RID stays
+              # macos-arm64. A macos-arm64 asset name here 404s on Apple Silicon. ~keep
+              blob: macos-aarch64,
               lib: libxberg_dart.dylib,
             }
           - {
@@ -1711,7 +1969,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
         with:
           target: ${{ matrix.target }}
@@ -1729,9 +1987,6 @@ jobs:
         shell: bash
         run: command -v cargo-zigbuild || cargo install --locked cargo-zigbuild
       - name: Disable sccache wrapper on Windows
-        # cargo cannot exec the Alef-scaffolded `.cargo/rustc-wrapper.sh` on
-        # Windows ("%1 is not a valid Win32 application"). Empty RUSTC_WRAPPER
-        # disables the shim for this build only.
         if: contains(matrix.target, 'windows')
         shell: bash
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -1748,18 +2003,54 @@ jobs:
           # Use zigbuild for linux-gnu targets to set glibc floor to 2.28
           if [[ "$TARGET" == *"-linux-gnu" ]]; then
             BUILD_CMD="cargo zigbuild"
-            TARGET_ARG="${TARGET}.2.28"
-            echo "[publish] glibc floor: 2.28 (target: ${TARGET_ARG})"
+            TARGET_ARG="${TARGET}.${GLIBC_FLOOR}"
+            echo "[publish] glibc floor: ${GLIBC_FLOOR} (target: ${TARGET_ARG})"
           fi
           ${BUILD_CMD} --locked -p xberg-dart --release --target "${TARGET_ARG}"
-      - name: Stage native library
+      - name: Stage native library and vendor its ONNX Runtime closure
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           LIB: ${{ matrix.lib }}
         run: |
-          mkdir -p dist/server-natives
-          cp "target/${TARGET}/release/${LIB}" "dist/server-natives/${LIB}"
+          set -euxo pipefail
+          STAGE=dist/server-natives
+          mkdir -p "$STAGE"
+          cp "target/${TARGET}/release/${LIB}" "$STAGE/${LIB}"
+          # The Dart native dynamically links ONNX Runtime; the download-based
+          # pub package ships only these staged files, so the ORT runtime must be
+          # bundled beside the native or `RustLib.init()` fails to dlopen it.
+          case "$TARGET" in
+            *-apple-darwin)
+              # Native loads `@rpath/libonnxruntime.<ver>.dylib` with rpath
+              # `@loader_path`, so ship that exact basename next to it.
+              base="$(otool -L "$STAGE/${LIB}" | awk '/onnxruntime/{print $1; exit}' | xargs -r basename)"
+              [ -n "$base" ] || { echo "::error::dart native does not link onnxruntime"; exit 1; }
+              src="${ORT_LIB_LOCATION:?}/$base"
+              [ -f "$src" ] || src="${ORT_DYLIB_PATH:?}"
+              cp "$src" "$STAGE/$base"
+              chmod u+w "$STAGE/$base"
+              install_name_tool -id "@loader_path/$base" "$STAGE/$base"
+              codesign --force -s - "$STAGE/$base" || true
+              # The native and the ORT dylib must not resolve non-system libs.
+              bad="$(otool -L "$STAGE/${LIB}" "$STAGE/$base" | tail -n +2 \
+                | awk '{print $1}' | grep -E '^(/opt/homebrew|/usr/local)/' || true)"
+              [ -z "$bad" ] || { echo "::error::dart native links non-system libs:"; echo "$bad"; exit 1; }
+              ;;
+            *-unknown-linux-gnu)
+              # patchelf the $ORIGIN rpath and copy the .so closure (libonnxruntime + codecs).
+              bash scripts/ci/vendor-native-closure.sh "$STAGE/${LIB}"
+              compgen -G "$STAGE/libonnxruntime.so*" >/dev/null \
+                || { echo "::error::libonnxruntime not vendored beside dart native"; exit 1; }
+              ;;
+            *-pc-windows-msvc)
+              # Windows resolves imports from the loader's own directory, so ship
+              # every ORT DLL beside the native.
+              cp "${ORT_LIB_LOCATION:?}"/*.dll "$STAGE/"
+              [ -f "$STAGE/onnxruntime.dll" ] || { echo "::error::onnxruntime.dll not staged"; exit 1; }
+              ;;
+          esac
+          ls -l "$STAGE"
       - uses: actions/upload-artifact@v7
         with:
           name: dart-server-${{ matrix.blob }}
@@ -1767,34 +2058,56 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  dart-package:
-    name: Build Dart package
-    needs: [prepare, check-pub]
-    if: ${{ needs.prepare.outputs.release_dart == 'true' && (needs.check-pub.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+  upload-dart-release:
+    name: Upload Dart server natives to GitHub Release
+    needs: [prepare, dart-server-natives]
+    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.release_dart == 'true' && needs.dart-server-natives.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/create-github-app-token@v2
+        id: app-token
         with:
-          ref: ${{ needs.prepare.outputs.checkout_ref }}
-          fetch-depth: 0
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: xberg-io
 
-          submodules: recursive
-      - uses: xberg-io/actions/setup-rust@v1
-
-      - name: Install system dependencies
-        uses: ./.github/actions/install-system-deps
-
-      - uses: xberg-io/actions/build-dart-package@v1
+      - uses: actions/download-artifact@v8
         with:
-          # flutter_rust_bridge.yaml lives in packages/dart/rust/, where rust_root: .
-          package-dir: packages/dart/rust
-          crate-name: xberg-dart
+          pattern: dart-server-*
+          path: dart-server-artifacts
 
-      - uses: actions/upload-artifact@v7
+      - name: Package server natives as tarballs
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/dart-release
+          for dir in dart-server-artifacts/dart-server-*; do
+            [[ -d "$dir" ]] || continue
+            blob="$(basename "$dir" | sed 's/^dart-server-//')"
+            [[ -n "$(ls -A "$dir")" ]] || continue
+            # Ship the whole vendored native closure (native + libonnxruntime +
+            # codecs), flattened to the tarball root so native_loader.dart extracts
+            # them side by side in the versioned cache dir — the native then
+            # resolves ORT via @loader_path (macOS) / $ORIGIN (Linux) / the load
+            # directory (Windows).
+            tarball="xberg-dart-v${VERSION}-${blob}.tar.gz"
+            tar -czf "dist/dart-release/${tarball}" -C "$dir" .
+            ( cd dist/dart-release && sha256sum "${tarball}" >"${tarball}.sha256" )
+          done
+
+      - uses: xberg-io/actions/upload-release-assets@v1
         with:
-          name: dart-package
-          path: packages/dart
-          retention-days: 14
+          tag: ${{ needs.prepare.outputs.tag }}
+          working-directory: dist/dart-release
+          dry-run: ${{ needs.prepare.outputs.dry_run }}
+          token: ${{ steps.app-token.outputs.token }}
+          # Include the .sha256 sidecars: native_loader.dart verifies the
+          # downloaded tarball against them before extracting, so a bare
+          # xberg-dart-*.tar.gz pattern (no trailing *) would ship natives the
+          # loader then refuses to install. ~keep
+          assets: xberg-dart-*.tar.gz*
 
   swift-artifactbundle:
     name: Build Swift artifact bundle
@@ -1806,7 +2119,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
@@ -1815,12 +2128,11 @@ jobs:
         id: bundle
         with:
           crate-name: xberg-swift
-          artifact-name: XbergSwift
-          # Intel macOS slice deferred alongside the Homebrew bottle: the crate
-          # builds for x86_64-apple-darwin via the alef macos-intel-target
-          # override, but build-swift-artifactbundle does not yet vendor
-          # libonnxruntime.dylib into the slice, so it would ship unable to load
-          # ONNX Runtime at runtime. Flip to "true" once the action vendors it.
+          # Must match the asset filename the alef-generated root Package.swift
+          # binaryTarget resolves: `<name>.artifactbundle.zip`. The manifest
+          # references Xberg-rs.artifactbundle.zip, so the uploaded asset (named
+          # after artifact-name) must be Xberg-rs, not XbergSwift, or SwiftPM 404s. ~keep
+          artifact-name: Xberg-rs
           include-macos-x86_64: "false"
           include-ios-x86_64: "false"
       - uses: actions/upload-artifact@v7
@@ -1847,7 +2159,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
 
       - name: Install system dependencies
@@ -1866,8 +2178,13 @@ jobs:
 
   update-swift-package-manifest:
     name: Update Swift Package.swift manifest with version and checksum
-    needs: [prepare, swift-artifactbundle]
-    if: ${{ needs.prepare.outputs.release_swift == 'true' }}
+    # Depends on the UPLOAD (not just the build) so the checksum is computed from
+    # the exact bytes on the release — the same asset SwiftPM downloads. This
+    # eliminates the class of failure where a rebuilt/re-uploaded bundle (checksum
+    # non-determinism) or a flaky `download-artifact` digest check left Package.swift
+    # pinning a checksum that no longer matched the released bundle. ~keep
+    needs: [prepare, upload-swift-bundle]
+    if: ${{ needs.prepare.outputs.release_swift == 'true' && needs.upload-swift-bundle.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2
@@ -1884,21 +2201,33 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: true
 
-      - uses: actions/download-artifact@v8
-        with:
-          name: swift-checksum
-          path: swift-checksums
+      - name: Compute checksum from the released artifact bundle
+        id: checksum
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          # Compute the checksum from the EXACT bytes on the release (the asset
+          # SwiftPM downloads), not from a separate run-artifact. SwiftPM's
+          # binaryTarget checksum is the plain SHA-256 of the zip, which equals
+          # `swift package compute-checksum`. Using the released asset guarantees
+          # Package.swift matches what consumers fetch, regardless of rebuild
+          # non-determinism, and avoids the flaky download-artifact digest check.
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern 'Xberg-rs.artifactbundle.zip' --dir bundle-dl --clobber
+          CHECKSUM=$(sha256sum bundle-dl/Xberg-rs.artifactbundle.zip | cut -d' ' -f1)
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
 
       - name: Update Package.swift with version and checksum
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          CHECKSUM=$(cat swift-checksums/*.checksum | tr -d '[:space:]')
+          CHECKSUM="${{ steps.checksum.outputs.checksum }}"
 
-          # Replace placeholders in Package.swift. The version placeholder is normally already
-          # substituted by `alef sync-versions` at bump time; the checksum is only known here,
-          # after the artifactbundle is built.
+          # Substitute version + checksum. Match the current value (placeholder OR a
+          # real prior checksum), so a re-run re-pins the freshly-computed checksum
+          # instead of no-op'ing on an already-substituted manifest.
           sed -i "s/__ALEF_SWIFT_VERSION__/${VERSION}/g" Package.swift
-          sed -i "s/__ALEF_SWIFT_CHECKSUM__/${CHECKSUM}/g" Package.swift
+          sed -i -E "s|(checksum:[[:space:]]*\")[^\"]*(\")|\1${CHECKSUM}\2|" Package.swift
 
           echo "Updated Package.swift:"
           head -40 Package.swift
@@ -1928,7 +2257,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
 
       - name: Install system dependencies
@@ -1938,8 +2267,6 @@ jobs:
         with:
           ffi-crate: xberg-ffi
           package-dir: packages/zig
-
-  # ─── CLI proxy wheels (platform-specific, with bundled binary) ──────────
 
   cli-proxy-wheels:
     name: Build CLI proxy wheel (${{ matrix.target }})
@@ -1999,8 +2326,6 @@ jobs:
         shell: bash
         working-directory: cli-proxy/pypi
         env:
-          # The build host is always ubuntu/amd64; the hook cannot infer the triple
-          # from platform.*, so pass the matrix target explicitly.
           XBERG_CLI_TARGET: ${{ matrix.target }}
         run: |
           pip install hatchling build
@@ -2013,12 +2338,10 @@ jobs:
           path: cli-proxy/pypi/dist/*.whl
           retention-days: 14
 
-  # ─── GitHub Release asset uploads ─────────────────────────────────────
-
   upload-cli-release:
     name: Upload CLI binaries to GitHub Release
-    needs: [prepare, cli-binaries, cli-binaries-musl]
-    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.cli-binaries.result == 'success' && needs.cli-binaries-musl.result == 'success' }}
+    needs: [prepare, cli-binaries, cli-binaries-musl, cli-binaries-binstall]
+    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.cli-binaries.result == 'success' && needs.cli-binaries-musl.result == 'success' && needs.cli-binaries-binstall.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2
@@ -2034,6 +2357,9 @@ jobs:
           path: dist/cli
           merge-multiple: true
 
+      # `cli-*` also matches the `cli-binstall-*` artifacts, and the
+      # `xberg-cli-*` globs below attach the `xberg-cli-binstall-<target>`
+      # archives alongside the bundled tarballs in one shot.
       - uses: xberg-io/actions/upload-release-assets@v1
         with:
           tag: ${{ needs.prepare.outputs.tag }}
@@ -2043,6 +2369,28 @@ jobs:
           assets: |
             xberg-cli-*.tar.gz
             xberg-cli-*.zip
+
+  # Prove a consumer can actually `cargo binstall xberg-cli` the freshly uploaded
+  # (--manifest-path) so it verifies the exact metadata against the release assets
+  # without waiting on the crates.io publish. Only the musl targets have binstall
+  # archives, so the matrix is overridden to those triples.
+  verify-binstall:
+    name: Verify cargo-binstall
+    needs: [prepare, upload-cli-release]
+    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.upload-cli-release.result == 'success' && needs.prepare.outputs.dry_run != 'true' }}
+    permissions:
+      contents: read
+    uses: xberg-io/actions/.github/workflows/reusable-binstall-verify.yml@v1
+    with:
+      package-name: xberg-cli
+      binary-name: xberg
+      manifest-path: crates/xberg-cli
+      checkout-ref: ${{ needs.prepare.outputs.checkout_ref }}
+      targets: >-
+        [
+          {"os": "ubuntu-latest", "target": "x86_64-unknown-linux-musl"},
+          {"os": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-musl"}
+        ]
 
   upload-go-release:
     name: Upload Go FFI archives to GitHub Release
@@ -2063,13 +2411,72 @@ jobs:
           path: dist/go-ffi
           merge-multiple: true
 
+      # The generated Go cmd/setup tool verifies each downloaded archive against
+      # its .sha256 sidecar before extracting (dart download_libs parity), so the
+      # sidecars must ship as release assets alongside the tarballs. ~keep
+      - name: Generate SHA-256 sidecars for cmd/setup verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist/go-ffi
+          for t in xberg-go-*.tar.gz; do
+            sha256sum "$t" > "$t.sha256"
+          done
+          ls -la
+
       - uses: xberg-io/actions/upload-release-assets@v1
         with:
           tag: ${{ needs.prepare.outputs.tag }}
           working-directory: dist/go-ffi
           dry-run: ${{ needs.prepare.outputs.dry_run }}
           token: ${{ steps.app-token.outputs.token }}
-          assets: xberg-go-*.tar.gz
+          # Trailing * includes the .sha256 sidecars (same pattern as dart). ~keep
+          assets: xberg-go-*.tar.gz*
+
+  tag-go-module:
+    name: Tag Go module for pkg.go.dev resolution
+    # Must run AFTER update-swift-package-manifest force-moves the release tag onto
+    # the Package.swift-checksum commit. Otherwise this job races the tag-mover and
+    # its checkout asserts the original triggering SHA, failing with "ref does not
+    # point to expected commit". Ordering also removes a concurrent tag-push race.
+    # `skipped` is accepted so a non-Swift release still tags the Go module. ~keep
+    needs: [prepare, upload-go-release, update-swift-package-manifest]
+    # dry-run releases must NEVER mint real remote tags; the tag script has no
+    # dry-run awareness of its own, so this job is skipped entirely when dry_run
+    # is true instead of trying to thread a flag through the script. ~keep
+    if: ${{ !cancelled() && needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.dry_run != 'true' && needs.upload-go-release.result == 'success' && (needs.update-swift-package-manifest.result == 'success' || needs.update-swift-package-manifest.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: xberg-io
+
+      - uses: actions/checkout@v6
+        with:
+          # Pin to the tag by name so checkout takes its CURRENT commit rather
+          # than asserting the triggering `github.sha`. update-swift-package-manifest
+          # force-moves this tag onto the Package.swift-checksum commit before this
+          # job runs; without an explicit ref, checkout fails "ref does not point to
+          # the expected commit". Tagging the Go module at the moved (released) tip
+          # is correct for pkg.go.dev. ~keep
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "xberg-bot[bot]"
+          git config user.email "xberg-bot[bot]@users.noreply.github.com"
+
+      - name: Create and push packages/go tags
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: scripts/publish/go/tag-and-push-go-module.sh "${{ needs.prepare.outputs.tag }}"
 
   upload-c-ffi-release:
     name: Upload C FFI archives to GitHub Release
@@ -2101,7 +2508,12 @@ jobs:
   upload-elixir-release:
     name: Upload Elixir NIF archives to GitHub Release
     needs: [prepare, elixir-natives, elixir-natives-musl]
-    if: ${{ needs.prepare.outputs.is_tag == 'true' && (needs.elixir-natives.result == 'success' || needs.elixir-natives-musl.result == 'success') }}
+    # `is_tag` alone does NOT exclude a dry run -- prepare synthesizes
+    # `v<version>-dryrun-<sha>`, so `is_tag` is true there too. Without the
+    # dry_run test this job would start uploading release assets as soon as the
+    # native builds stopped failing, and its download-artifact would find
+    # nothing because the dry-run upload above is skipped. ~keep
+    if: ${{ needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.elixir-natives.result == 'success' || needs.elixir-natives-musl.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2
@@ -2182,8 +2594,6 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           assets: "*.zip"
 
-  # Verifies every expected release asset is present on the GitHub release
-  # before the publish-* fan-out depends on those URLs.
   verify-assets:
     name: Verify release assets
     needs:
@@ -2196,9 +2606,21 @@ jobs:
     if: ${{ always() && needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.dry_run != 'true' && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     steps:
+      # Mint the App token for release asset lookups (push access), consistent
+      # with finalize and the other release-writing jobs. Without it the lookup
+      # failed every retry with "release not found", skipping finalize and
+      # cascading into a skipped Homebrew bottle build (issue #1247). ~keep
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: xberg-io
+
       - uses: xberg-io/actions/verify-release-assets@v1
         with:
           tag: ${{ needs.prepare.outputs.tag }}
+          token: ${{ steps.app-token.outputs.token }}
           expected-assets: |
             # CLI
             xberg-cli-*.tar.gz
@@ -2209,8 +2631,6 @@ jobs:
             xberg-ffi-*.tar.gz
             # Elixir NIF
             libxberg_nif-*.tar.gz
-
-  # ─── Publish jobs ─────────────────────────────────────────────────────
 
   publish-crates:
     name: Publish crates.io packages
@@ -2225,7 +2645,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
 
       - name: Install system dependencies
@@ -2233,14 +2653,14 @@ jobs:
 
       - uses: xberg-io/actions/publish-crates@v1
         with:
-          crates: xberg-libheif xberg-tesseract xberg-paddle-ocr xberg-candle-ocr xberg-gliner xberg xberg-cli
+          crates: xberg-libheif xberg-tesseract xberg-paddle-ocr xberg-candle-ocr xberg-gliner xberg-libwpd xberg xberg-cli
           version: ${{ needs.prepare.outputs.version }}
           dry-run: ${{ needs.prepare.outputs.dry_run }}
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [prepare, python-wheels, python-sdist, check-pypi]
-    if: ${{ needs.prepare.outputs.release_python == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-pypi.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, python-wheels, python-wheels-musl, python-sdist, check-pypi, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_python == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-pypi.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -2263,10 +2683,6 @@ jobs:
           language: python
           artifact-path: dist
           package-name: xberg
-          # Per-archive patterns don't apply uniformly: wheels carry the
-          # native .so/.dylib/.dll but sdist doesn't; sdist carries the
-          # source tree the wheels strip. The basic `python` allowlist also
-          # only matches wheels. strict=false reports diffs without blocking.
           strict: "false"
 
       - uses: xberg-io/actions/publish-pypi@v1
@@ -2276,8 +2692,8 @@ jobs:
 
   publish-cli-proxy:
     name: Publish CLI proxy to PyPI (wheels + sdist)
-    needs: [prepare, check-cli, cli-proxy-wheels]
-    if: ${{ needs.prepare.outputs.release_cli == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-cli.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, check-cli, cli-proxy-wheels, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_cli == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-cli.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -2322,8 +2738,8 @@ jobs:
 
   publish-rubygems:
     name: Publish Ruby gems
-    needs: [prepare, ruby-gem, check-rubygems]
-    if: ${{ needs.prepare.outputs.release_ruby == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-rubygems.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, ruby-gem, check-rubygems, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_ruby == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-rubygems.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -2333,20 +2749,12 @@ jobs:
         with:
           pattern: rubygems-*
           path: dist
-          # Keep each artifact in its own `dist/rubygems-<label>/` subdir (no
-          # merge-multiple): the canonical linux-x86_64 builder also ships the
-          # fallback source gem `xberg-<version>.gem`, whose basename would
-          # collide across runners under merge-multiple. publish-rubygems globs
-          # recursively and dedupes via its already-published guard, so the
-          # per-platform gems and the single source gem all publish.
 
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
           bundler-cache: false
 
-      # Trusted publishing (OIDC) needs a recent RubyGems; the runner's bundled
-      # version can be too old for `configure-rubygems-credentials`.
       - name: Update RubyGems for OIDC trusted publishing
         run: gem update --system
 
@@ -2366,8 +2774,8 @@ jobs:
 
   publish-node:
     name: Publish Node packages
-    needs: [prepare, node-bindings, node-bindings-musl, check-npm]
-    if: ${{ needs.prepare.outputs.release_node == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-npm.outputs.node_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, node-bindings, node-bindings-musl, node-bindings-manylinux, check-npm, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_node == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-npm.outputs.node_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -2377,7 +2785,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
-          submodules: recursive
+          submodules: false
       - uses: actions/download-artifact@v8
         with:
           pattern: node-bindings-*
@@ -2390,50 +2798,61 @@ jobs:
           registry-url: "https://registry.npmjs.org/"
 
       - name: Stage platform packages and main package
-        # Inline: xberg's per-platform Node artifact layout is bespoke
-        # (one tarball per target containing pre-staged npm/<platform>/) and the
-        # main package needs an injected optionalDependencies map listing every
-        # platform sub-package. Tightly coupled to napi-rs + repo conventions;
-        # the generic publish-npm action operates on a single package dir.
-        working-directory: crates/xberg-node
         shell: bash
         run: |
-          rm -rf npm
-          mkdir -p npm
-
-          # Extract all platform tarballs into npm/<platform>/
-          cd ../..
+          # Every node-bindings artifact ships the canonical napi layout
+          # (npm/<napi-platform>/{package.json,*.node}); the macOS/Windows legs
+          # also carry index.js + index.d.ts at the tarball root. Extract them,
+          # pack each platform sub-package that has both a package.json and a
+          # built .node, and stamp the main package's optionalDependencies from
+          # exactly those sub-packages. Platform dirs that napi created but no
+          # job built (e.g. win32-arm64-msvc) have a package.json but no .node —
+          # skip them so we never publish an empty package or reference it.
+          # Extract each artifact in ISOLATION and copy only the platform dirs
+          # that actually contain a built .node. `napi create-npm-dirs` stamps a
+          # package.json stub for EVERY platform into EVERY artifact, so a blind
+          # `tar -xzf` of all artifacts onto one shared tree lets a later
+          # artifact's empty stub clobber the dylib-aware package.json a
+          # platform's own artifact produced — resetting `files` to just the
+          # .node, which makes `npm pack` silently drop the vendored ORT dylib
+          # (rc.21 shipped darwin-arm64/-x64 + linux-arm64-gnu broken this way).
+          # Copying only dirs-that-have-a-.node makes the merge a union of
+          # populated dirs, immune to extraction order.
+          rm -rf crates/xberg-node/npm
+          mkdir -p crates/xberg-node/npm
           for pkg in node-artifacts/*.tar.gz; do
-            tar -xzf "${pkg}" -C crates/xberg-node
+            scratch="$(mktemp -d)"
+            tar -xzf "${pkg}" -C "${scratch}"
+            for dir in "${scratch}"/npm/*/; do
+              if ls "${dir}"*.node >/dev/null 2>&1; then
+                # strip trailing slash so `cp -R src dest/` copies the dir
+                # itself, not its contents (BSD/macOS cp semantics; harmless
+                # on the GNU cp used in CI).
+                cp -R "${dir%/}" crates/xberg-node/npm/
+              fi
+            done
+            # index.js / index.d.ts ride at the tarball root on the macOS and
+            # Windows legs and are identical across targets; copy when present.
+            [ -f "${scratch}/index.js" ] && cp -f "${scratch}/index.js" crates/xberg-node/index.js
+            [ -f "${scratch}/index.d.ts" ] && cp -f "${scratch}/index.d.ts" crates/xberg-node/index.d.ts
+            rm -rf "${scratch}"
           done
-          cd crates/xberg-node
 
-          # Ensure each platform subdir has a package.json (create if missing)
-          for dir in npm/*/; do
-            [ -d "$dir" ] || continue
-            if [ ! -f "$dir/package.json" ]; then
-              # Create minimal platform package.json if not present
-              platform=$(basename "$dir")
-              jq -n --arg name "@xberg-io/xberg-${platform}" \
-                    --arg version "$([[ -f package.json ]] && jq -r '.version' package.json || echo '0.0.0')" \
-                    '{name: $name, version: $version, files: ["./*.node"]}' > "$dir/package.json"
-            fi
-          done
-
-          # Pack each platform sub-package as a tarball
-          cd npm
+          # Pack each platform sub-package (only those that shipped a binary).
+          cd crates/xberg-node/npm
           for dir in */; do
-            if [ -f "$dir/package.json" ]; then
+            if [ -f "$dir/package.json" ] && ls "$dir"*.node >/dev/null 2>&1; then
               (cd "$dir" && npm pack && mv ./*.tgz ..)
             fi
           done
-          cd ../..
+          cd ../../..
 
-          # Stamp main package's optionalDependencies with all platform packages
+          # Stamp main package's optionalDependencies with the packed platforms.
           tmp_pkg_json="$(mktemp)"
           optional_deps_json='{}'
           for platform_pkg_json in crates/xberg-node/npm/*/package.json; do
-            [ -f "$platform_pkg_json" ] || continue
+            dir="$(dirname "$platform_pkg_json")"
+            ls "$dir"/*.node >/dev/null 2>&1 || continue
             name="$(jq -r '.name // empty' "$platform_pkg_json")"
             version="$(jq -r '.version // empty' "$platform_pkg_json")"
             [[ -z "$name" || -z "$version" ]] && { echo "Invalid: $platform_pkg_json" >&2; exit 1; }
@@ -2443,14 +2862,18 @@ jobs:
             crates/xberg-node/package.json > "$tmp_pkg_json"
           mv "$tmp_pkg_json" crates/xberg-node/package.json
 
+      # ~keep This job is gated only on the MAIN package being absent from npm
+      # (check-npm.outputs.node_exists), so a re-run after a partial failure re-publishes
+      # every platform sub-package and the ones that already landed answer 403
+      # EPUBLISHCONFLICT. Failing the step on that would make a partially-published
+      # release unrecoverable, which is why the tolerance exists. What it must NOT be
+      # allowed to do is let the main package ship while a sub-package is genuinely
+      # absent: the main package's optionalDependencies are stamped from the tarballs
+      # this job packed, not from the registry, so a silently-skipped sub-package would
+      # publish @xberg-io/xberg pointing at a version nobody can install. The
+      # "Assert every optionalDependency is installable" step below is the real gate for
+      # that -- it queries the registry instead of trusting this step's exit code.
       - name: Publish platform sub-packages
-        # Tolerate per-platform publish failures so the main package and
-        # other platforms still ship. RC.45–RC.48 each hit ENEEDAUTH on
-        # `@xberg-io/xberg-linux-x64-musl` (npm Trusted Publisher
-        # not configured for that specific sub-package — see task #93);
-        # without continue-on-error the failure aborted the whole job and
-        # blocked the main `@xberg-io/xberg` publish too, leaving
-        # consumers unable to install on any platform.
         continue-on-error: true
         uses: xberg-io/actions/publish-npm@v1
         with:
@@ -2460,10 +2883,6 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # Wait for the platform sub-packages to be resolvable on npm before
-      # publishing the main package, whose optionalDependencies reference them.
-      # Without this the main package can land before its platform deps index,
-      # leaving a window where `npm install @xberg-io/xberg` fails.
       - name: Wait for npm indexing (node-linux-x64-gnu)
         if: ${{ needs.prepare.outputs.dry_run != 'true' }}
         uses: xberg-io/actions/wait-for-package@v1
@@ -2482,6 +2901,44 @@ jobs:
           version: ${{ needs.prepare.outputs.version }}
           max-attempts: "60"
 
+      # The two waits above only cover the two glibc Linux platforms; darwin, win32 and
+      # the musl targets had no check at all. Assert that EVERY name in the main
+      # package's optionalDependencies actually resolves on the registry at the exact
+      # stamped version before publishing it -- otherwise `npm install @xberg-io/xberg`
+      # resolves an optionalDependency that 404s. Optional deps are installed
+      # best-effort by npm, so a missing one does not fail the consumer's install; it
+      # fails later at import time with "Failed to load native binding", which is the
+      # failure mode this gate exists to prevent.
+      - name: Assert every optionalDependency is installable
+        if: ${{ needs.prepare.outputs.dry_run != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          entries="$(jq -r '.optionalDependencies // {} | to_entries[] | "\(.key)\t\(.value)"' \
+            crates/xberg-node/package.json)"
+          if [[ -z "$entries" ]]; then
+            echo "FATAL: crates/xberg-node/package.json has no optionalDependencies -- the staging step stamped nothing, so the main package would ship with no platform binaries at all." >&2
+            exit 1
+          fi
+          missing=0
+          while IFS=$'\t' read -r name version; do
+            [[ -n "$name" ]] || continue
+            for _ in $(seq 1 30); do
+              if npm view "${name}@${version}" version >/dev/null 2>&1; then
+                echo "OK: ${name}@${version}"
+                continue 2
+              fi
+              sleep 10
+            done
+            echo "FATAL: ${name}@${version} is not on the npm registry" >&2
+            missing=1
+          done <<<"$entries"
+          if [[ "$missing" -ne 0 ]]; then
+            echo "FATAL: refusing to publish @xberg-io/xberg -- it would reference platform sub-packages that were never published (the 'Publish platform sub-packages' step is continue-on-error, so check its log)." >&2
+            exit 1
+          fi
+          echo "OK: every optionalDependency resolves on the npm registry"
+
       - name: Publish main @xberg-io/xberg package
         uses: xberg-io/actions/publish-npm@v1
         with:
@@ -2492,13 +2949,24 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # NOTE (#1246 follow-up): the npm `latest` dist-tag for @xberg-io/xberg-wasm
+  # currently still points at a `0.0.1` placeholder published before this
+  # workflow's dist-tag logic existed (`npm view @xberg-io/xberg-wasm
+  # dist-tags` -> { latest: "0.0.1", next: "1.0.0-rc.29" }). This job always
+  # passes npm-tag: ${{ needs.prepare.outputs.npm_tag }}, which is "next" for
+  # every prerelease (see determine_npm_tag in
+  # scripts/publish/validate-and-compute-release-metadata.sh) and would only
+  # become "latest" on a genuine non-prerelease (1.0.0) publish -- so this
+  # workflow cannot safely repoint `latest` today without prematurely
+  # promoting an rc build. Fixing the stale pointer requires a one-time,
+  # out-of-band `npm dist-tag add @xberg-io/xberg-wasm@<version> latest` (or
+  # unpublish/deprecate of the 0.0.1 stub) run manually by someone with
+  # publish rights on the package; do not automate it here until a real
+  # 1.0.0 release exists. ~keep
   publish-wasm:
     name: Publish WASM package
-    needs: [prepare, wasm-bindings, check-npm]
-    # wasm-bindings is continue-on-error (best-effort until the wasm-lite fix), so a failed
-    # WASM build uploads no wasm-bundle artifact. Gate on its success — otherwise this job
-    # runs and hard-fails at download-artifact with "Artifact not found: wasm-bundle".
-    if: ${{ needs.wasm-bindings.result == 'success' && needs.prepare.outputs.release_wasm == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-npm.outputs.wasm_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, wasm-bindings, check-npm, publish-crates]
+    if: ${{ needs.wasm-bindings.result == 'success' && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_wasm == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-npm.outputs.wasm_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -2508,7 +2976,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
-          submodules: recursive
+          submodules: false
       - uses: actions/download-artifact@v8
         with:
           name: wasm-bundle
@@ -2518,6 +2986,62 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org/"
+
+      - name: Assert npm tarball contains the wasm web bundle and fits the CDN size budget
+        working-directory: crates/xberg-wasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Regression guard for #1246: crates/xberg-wasm/pkg/web/.gitignore = "*"
+          # can silently drop pkg/web from the published tarball unless
+          # build:all's `find pkg -name .gitignore -delete` step ran. A missing
+          # pkg/web/xberg_wasm.js or pkg/web/xberg_wasm_bg.wasm ships a package
+          # that 404s at import time (the live-demo failure this bug reports).
+          TARBALL=$(npm pack --silent)
+          # List the tarball once, then match against the captured text. Piping
+          # `tar -tzf` into `grep -qx` lets grep exit on first match and SIGPIPE
+          # `tar` while it is still inflating the ~40 MB gzip; under `pipefail`
+          # that makes the pipeline report non-zero and `if !` misreads it as a
+          # false "missing" (the bundle is actually present). ~keep
+          listing=$(tar -tzf "$TARBALL")
+          MISSING=0
+          for f in "package/pkg/web/xberg_wasm.js" "package/pkg/web/xberg_wasm_bg.wasm"; do
+            if ! grep -qxF "$f" <<<"$listing"; then
+              echo "FATAL: npm tarball is missing $f" >&2
+              MISSING=1
+            fi
+          done
+          if [[ "$MISSING" -ne 0 ]]; then
+            rm -f "$TARBALL"
+            echo "FATAL: wasm npm package is missing required web bundle files; aborting publish." >&2
+            exit 1
+          fi
+          echo "OK: npm tarball contains the wasm web bundle (xberg_wasm.js + xberg_wasm_bg.wasm)"
+
+          # Authoritative package-size gate: wasm-bindings already checked the
+          # unpacked pkg/ directory, but this is the actual gzip tarball
+          # npm/jsDelivr will serve, measured immediately before publish-npm
+          # runs so a regression introduced between jobs (or a stale
+          # wasm-bundle artifact) still can't reach the registry. Always
+          # printed, pass or fail, per #435. ~keep
+          tarball_size=$(stat -c%s "$TARBALL")
+          rm -f "$TARBALL"
+          status="ok"
+          if (( tarball_size > WASM_MAX_PACKAGE_BYTES )); then
+            status="FAIL"
+          fi
+          echo "size: npm tarball ($TARBALL) = ${tarball_size} bytes (limit ${WASM_MAX_PACKAGE_BYTES})"
+          {
+            echo "### WASM npm tarball size budget"
+            echo
+            echo "| artifact | size (bytes) | limit (bytes) | status |"
+            echo "|---|---|---|---|"
+            echo "| npm tarball | ${tarball_size} | ${WASM_MAX_PACKAGE_BYTES} | ${status} |"
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [[ "$status" == "FAIL" ]]; then
+            echo "::error::npm tarball is ${tarball_size} bytes, exceeding the package budget of ${WASM_MAX_PACKAGE_BYTES} bytes (jsDelivr's hard per-package cap is 150 MB). Aborting before publish-npm runs."
+            exit 1
+          fi
 
       - uses: xberg-io/actions/publish-npm@v1
         with:
@@ -2530,8 +3054,8 @@ jobs:
 
   publish-packagist:
     name: Trigger Packagist update
-    needs: [prepare, upload-php-pie-release, check-packagist]
-    if: ${{ needs.prepare.outputs.release_php == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-packagist.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, upload-php-pie-release, check-packagist, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_php == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-packagist.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: xberg-io/actions/publish-packagist@v1
@@ -2546,15 +3070,15 @@ jobs:
 
   publish-maven:
     name: Publish Maven (Java) package
-    needs: [prepare, java-natives, java-natives-musl, check-maven]
-    if: ${{ needs.prepare.outputs.release_java == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-maven.outputs.java_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, java-natives, java-natives-musl, check-maven, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_java == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-maven.outputs.java_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
-          submodules: recursive
+          submodules: false
       - uses: actions/download-artifact@v8
         with:
           pattern: java-natives-*
@@ -2565,7 +3089,7 @@ jobs:
         with:
           resources-dir: packages/java/src/main/resources/natives
           required-classifiers: >-
-            linux-x86_64 linux-aarch64 macos-arm64 macos-x86_64 windows-x86_64
+            linux-x86_64 linux-aarch64 macos-arm64 windows-x86_64
             linux-musl-x86_64 linux-musl-aarch64
           lib-name: xberg_ffi
 
@@ -2581,6 +3105,8 @@ jobs:
           gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
       - uses: xberg-io/actions/setup-maven@v1
+        with:
+          version: "3.9.16"
 
       - uses: xberg-io/actions/publish-maven@v1
         with:
@@ -2595,15 +3121,15 @@ jobs:
 
   publish-kotlin-android:
     name: Publish Kotlin Android (Maven Central via Gradle)
-    needs: [prepare, kotlin-android-natives, check-maven]
-    if: ${{ needs.prepare.outputs.release_kotlin == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-maven.outputs.kotlin_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, kotlin-android-natives, check-maven, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_kotlin == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-maven.outputs.kotlin_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
-          submodules: recursive
+          submodules: false
       - uses: actions/download-artifact@v8
         with:
           pattern: kotlin-android-*
@@ -2616,7 +3142,7 @@ jobs:
           for abi in arm64-v8a x86_64; do
             dest="packages/kotlin-android/src/main/jniLibs/${abi}"
             mkdir -p "$dest"
-            src="kotlin-android-artifacts/${abi}/libxberg_ffi.so"
+            src="kotlin-android-artifacts/${abi}/libxberg_jni.so"
             if [[ -f "$src" ]]; then
               cp -v "$src" "$dest/"
             fi
@@ -2639,8 +3165,8 @@ jobs:
 
   publish-nuget:
     name: Publish NuGet package
-    needs: [prepare, csharp-natives, csharp-natives-musl, check-nuget]
-    if: ${{ needs.prepare.outputs.release_csharp == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-nuget.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, csharp-natives, csharp-natives-musl, check-nuget, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_csharp == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-nuget.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -2650,7 +3176,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
-          submodules: recursive
+          submodules: false
       - uses: actions/download-artifact@v8
         with:
           pattern: csharp-natives-*
@@ -2658,8 +3184,6 @@ jobs:
           merge-multiple: true
 
       - name: Stage runtimes/<rid>/native into NuGet project
-        # Inline: NuGet expects native libs in runtimes/<rid>/native/ adjacent
-        # to the .csproj. Copy from artifact tree into project.
         run: |
           mkdir -p packages/csharp/Xberg/runtimes
           for dir in csharp-natives/runtimes/*/; do
@@ -2673,13 +3197,37 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Pack NuGet package
-        # Inline: dotnet pack with the version override; one-liner.
+      - name: Render runtime.json for the meta-package's RID fallback graph
+        # rc.35 still shipped every RID's native closure inside the meta package
+        # itself (Xberg.csproj packed `runtimes/**` directly) and nuget.org
+        # rejected the push with 413, even though the per-RID runtime.<rid>
+        # packages below were already lean and published fine. The meta package
+        # must instead carry only the managed assembly + this rendered
+        # runtime.json, which tells NuGet's RID-fallback graph which
+        # XbergIo.Xberg.runtime.<rid> package to pull in for the consumer's RID
+        # — the standard runtime-package split, same shape as e.g. SQLitePCLRaw.
+        # The RID list here must match packages/csharp/Xberg/runtime.json.template. ~keep
         run: |
+          sed "s/{{VERSION}}/${{ needs.prepare.outputs.version }}/g" \
+            packages/csharp/Xberg/runtime.json.template > packages/csharp/Xberg/runtime.json
+        shell: bash
+
+      - name: Pack NuGet packages (meta + one per-RID runtime package)
+        run: |
+          set -euo pipefail
           dotnet pack packages/csharp/Xberg/Xberg.csproj \
             -c Release \
             -p:Version=${{ needs.prepare.outputs.version }} \
             -o dist/nuget
+
+          for dir in packages/csharp/Xberg/runtimes/*/; do
+            rid="$(basename "$dir")"
+            dotnet pack packages/csharp/Xberg.Runtime/Xberg.Runtime.csproj \
+              -c Release \
+              -p:Version=${{ needs.prepare.outputs.version }} \
+              -p:PublishedRID="${rid}" \
+              -o dist/nuget
+          done
         shell: bash
 
       - uses: xberg-io/actions/publish-nuget@v1
@@ -2700,7 +3248,20 @@ jobs:
       - upload-elixir-release
       - upload-php-pie-release
       - upload-swift-bundle
-    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.dry_run != 'true' }}
+    # Decoupled gating: un-draft the release unless a required upload genuinely
+    # FAILED. `!= 'failure'` (not `== 'success'`) tolerates idempotently-SKIPPED
+    # uploads on same-tag retries — a skipped upload means the asset is already on
+    # the release, so finalize must still run. `== 'success'` here previously
+    # stuck every retry in draft, cascading into skipped hex/zig/homebrew. ~keep
+    if: >-
+      ${{ always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.prepare.outputs.dry_run != 'true'
+      && needs.verify-assets.result != 'failure'
+      && needs.upload-cli-release.result != 'failure'
+      && needs.upload-go-release.result != 'failure'
+      && needs.upload-c-ffi-release.result != 'failure'
+      && needs.upload-elixir-release.result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2
@@ -2718,15 +3279,24 @@ jobs:
 
   publish-hex:
     name: Publish Elixir Hex package
-    needs: [prepare, finalize-github-release-after-uploads, check-hex]
-    if: ${{ needs.prepare.outputs.release_elixir == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-hex.outputs.elixir_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, finalize-github-release-after-uploads, check-hex, publish-crates]
+    # Runs whenever the release is finalized, independent of any sibling channel's
+    # result. Fetches its NIFs from the finalized release (not run-artifacts), so it
+    # only needs finalize to have succeeded. ~keep
+    if: >-
+      ${{ always()
+      && needs.finalize-github-release-after-uploads.result == 'success'
+      && needs.publish-crates.result != 'failure'
+      && needs.prepare.outputs.release_elixir == 'true'
+      && needs.prepare.outputs.is_tag == 'true'
+      && (needs.check-hex.outputs.elixir_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
-          submodules: recursive
+          submodules: false
       - uses: xberg-io/actions/setup-rust@v1
       - uses: erlef/setup-beam@v1.24.0
         with:
@@ -2740,10 +3310,13 @@ jobs:
           tag: ${{ needs.prepare.outputs.tag }}
           version: ${{ needs.prepare.outputs.version }}
           lib-name: xberg_nif
-          # elixir-natives builds NIF API 2.16 AND 2.17; include both so the
-          # checksum file covers every uploaded artifact.
-          nif-versions: "2.16,2.17"
-          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,aarch64-apple-darwin,x86_64-apple-darwin,x86_64-pc-windows-msvc
+          # Must match the NIF versions actually built (elixir-natives matrix) and
+          # declared in packages/elixir/lib/xberg/native.ex (`nif_versions: ["2.16"]`).
+          # NIF 2.16 loads fine on OTP 27 (NIF minor versions are backward compatible),
+          # so a single 2.16 artifact covers every supported runtime. Requesting 2.17
+          # here made the checksum step hunt for assets that were never built. ~keep
+          nif-versions: "2.16"
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,aarch64-apple-darwin,x86_64-pc-windows-msvc
           output-path: packages/elixir/checksum-Elixir.Xberg.Native.exs
 
       - name: Build Elixir Hex tarball with dependency rewrite
@@ -2763,113 +3336,11 @@ jobs:
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
-  assemble-dart-bundle:
-    name: Assemble Dart package with native artifacts
-    needs:
-      [
-        prepare,
-        dart-package,
-        dart-android-natives,
-        dart-ios-xcframework,
-        dart-server-natives,
-        check-pub,
-      ]
-    if: ${{ needs.prepare.outputs.release_dart == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-pub.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: dart-package
-          path: packages/dart
-
-      - name: Download Android natives
-        uses: actions/download-artifact@v8
-        with:
-          pattern: dart-android-*
-          path: dart-android-artifacts
-          merge-multiple: true
-
-      - name: Download iOS XCFramework
-        uses: actions/download-artifact@v8
-        with:
-          name: dart-ios-xcframework
-          path: dart-ios-xcframework
-
-      - name: Download server natives (linux-x86_64)
-        uses: actions/download-artifact@v8
-        with:
-          name: dart-server-linux-x86_64
-          path: dart-server-artifacts/linux-x86_64
-
-      - name: Download server natives (linux-aarch64)
-        uses: actions/download-artifact@v8
-        with:
-          name: dart-server-linux-aarch64
-          path: dart-server-artifacts/linux-aarch64
-
-      - name: Download server natives (macos-arm64)
-        uses: actions/download-artifact@v8
-        with:
-          name: dart-server-macos-arm64
-          path: dart-server-artifacts/macos-arm64
-
-      - name: Download server natives (macos-x86_64)
-        uses: actions/download-artifact@v8
-        with:
-          name: dart-server-macos-x86_64
-          path: dart-server-artifacts/macos-x86_64
-
-      - name: Download server natives (windows-x86_64)
-        uses: actions/download-artifact@v8
-        with:
-          name: dart-server-windows-x86_64
-          path: dart-server-artifacts/windows-x86_64
-
-      - name: Stage native libraries into Dart package
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Android JNI libs
-          for abi in arm64-v8a x86_64; do
-            dest="packages/dart/android/src/main/jniLibs/${abi}"
-            mkdir -p "$dest"
-            src="dart-android-artifacts/${abi}/libxberg_dart.so"
-            [[ -f "$src" ]] && cp -v "$src" "$dest/"
-          done
-          # iOS XCFramework
-          mkdir -p packages/dart/ios/Frameworks
-          for xcf in dart-ios-xcframework/*.xcframework; do
-            [[ -d "$xcf" ]] && cp -r "$xcf" packages/dart/ios/Frameworks/
-          done
-          # Server blobs
-          for entry in "linux-x86_64:libxberg_dart.so" "linux-aarch64:libxberg_dart.so" "macos-arm64:libxberg_dart.dylib" "macos-x86_64:libxberg_dart.dylib" "windows-x86_64:xberg_dart.dll"; do
-            blob="${entry%%:*}"
-            lib="${entry##*:}"
-            dest="packages/dart/blobs/${blob}"
-            mkdir -p "$dest"
-            src="dart-server-artifacts/${blob}/${lib}"
-            [[ -f "$src" ]] && cp -v "$src" "$dest/"
-          done
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dart-package-assembled
-          path: packages/dart
-          retention-days: 7
-
   trigger-pubdev:
     name: Trigger pub.dev publish workflow
-    needs: [prepare, check-pub, assemble-dart-bundle]
-    # pub.dev OIDC rejects tokens from `release` events. We dispatch a separate
-    # workflow whose `workflow_dispatch` event produces an accepted token, then
-    # have it download the assembled Dart package artifact from this run.
-    if: ${{ needs.prepare.outputs.release_dart == 'true' && needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.dry_run != 'true' && (needs.check-pub.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, check-pub, upload-dart-release, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_dart == 'true' && needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.dry_run != 'true' && (needs.check-pub.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') && needs.upload-dart-release.result == 'success' }}
     runs-on: ubuntu-latest
-    # `gh workflow run` requires `actions: write` on whichever token it uses.
-    # The job below mints a xberg-dev-publisher App token, but that path
-    # 403'd on rc.10. Adding explicit job-level permissions covers the fallback
-    # when GITHUB_TOKEN is used; the App also needs `actions: write` configured
-    # on github.com/organizations/xberg-io/settings/apps.
     permissions:
       actions: write
       contents: read
@@ -2888,33 +3359,29 @@ jobs:
         run: |
           gh workflow run publish-pubdev.yaml \
             --ref ${{ github.ref_name }} \
-            -f run_id=${{ github.run_id }}
+            -f ref=${{ needs.prepare.outputs.checkout_ref }}
 
   publish-zig:
     name: Publish Zig package metadata
-    # Depend on c-ffi-libraries so the per-target FFI artifacts are available
-    # for `multi-platform-ffi-dir` bundling into the published Zig tarball.
-    needs: [prepare, finalize-github-release-after-uploads, check-zig, c-ffi-libraries]
-    if: ${{ needs.prepare.outputs.release_zig == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-zig.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    needs: [prepare, finalize-github-release-after-uploads, check-zig, c-ffi-libraries, publish-crates]
+    # Consumes c-ffi RUN-artifacts, so c-ffi-libraries must have SUCCEEDED this run
+    # (a skip means there are no artifacts to download). Otherwise runs independent
+    # of any sibling channel's result, once the release is finalized. ~keep
+    if: >-
+      ${{ always()
+      && needs.finalize-github-release-after-uploads.result == 'success'
+      && needs.c-ffi-libraries.result == 'success'
+      && needs.publish-crates.result != 'failure'
+      && needs.prepare.outputs.release_zig == 'true'
+      && needs.prepare.outputs.is_tag == 'true'
+      && (needs.check-zig.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          owner: xberg-io
-
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.ref }}
-          submodules: recursive
+          submodules: false
 
-      # Download the per-target C FFI artifacts produced by c-ffi-libraries and
-      # lay them out as ffi-artifacts/<zig-rid>/<libfile> + a shared
-      # ffi-artifacts/include/ for publish-zig multi-platform bundling. Without
-      # this the published tarball ships no libs, yet packages/zig/build.zig is
-      # rewritten to link bundled lib/+include/ — so `zig fetch` consumers fail.
       - uses: actions/download-artifact@v8
         with:
           pattern: c-ffi-*
@@ -2932,7 +3399,6 @@ jobs:
             ["linux-x86_64"]="linux-x64"
             ["linux-aarch64"]="linux-arm64"
             ["macos-arm64"]="osx-arm64"
-            ["macos-x86_64"]="osx-x64"
             ["windows-x86_64"]="win-x64"
           )
           out="ffi-artifacts"
@@ -2950,27 +3416,54 @@ jobs:
             tar -xzf "$art" -C "$tmp"
             stage_root="$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -1)"
             mkdir -p "$out/$rid"
-            cp "$stage_root"/lib/* "$out/$rid/"
+            # Ship shared libraries only. packages/zig/build.zig links xberg_ffi
+            # dynamically (linkSystemLibrary), so the per-platform static archives
+            # (libxberg_ffi.a, 500-760MB each) are dead weight. Bundling all five
+            # platforms' .a produced a 1.15GB release tarball whose upload to
+            # uploads.github.com failed; shared libs alone are ~70-105MB/platform.
+            shopt -s nullglob
+            copied=0
+            for lib in "$stage_root"/lib/*.so "$stage_root"/lib/*.so.* \
+                       "$stage_root"/lib/*.dylib "$stage_root"/lib/*.dll; do
+              cp "$lib" "$out/$rid/"
+              copied=1
+            done
+            shopt -u nullglob
+            if [ "$copied" -eq 0 ]; then
+              echo "::warning::no shared library found for $rid under $stage_root/lib — skipping"
+            fi
             cp "$stage_root"/include/*.h "$out/include/" 2>/dev/null || true
             rm -rf "$tmp"
           done
           ls -la "$out"
           for d in "$out"/*/; do echo "--- $d ---"; ls -la "$d"; done
 
+      # Mint the app token immediately before the upload. GitHub App installation
+      # tokens have a hard 1h TTL; laying out the multi-platform FFI bundle (>1GB)
+      # can outlast a token minted at job start, causing the release upload to 401. ~keep
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: xberg-io
+
       - uses: xberg-io/actions/publish-zig@v1
         with:
           working-directory: packages/zig
           tag: ${{ needs.prepare.outputs.tag }}
-          # Override the auto-detected package-name (`.xberg` from
-          # build.zig.zon) to match the alef-emitted test_app URL pattern
-          # `{crate-name}-zig-v{version}.tar.gz`. Without this, the asset
-          # uploads as `xberg-v{version}.tar.gz` while test_apps/zig
-          # fetches `xberg-zig-v{version}.tar.gz` → 404 + consumer
-          # build.zig.zon TODO hash.
+          # ~keep The action's internal steps use `GH_TOKEN: ${{ inputs.token }}`, which
+          # ~keep defaults to the read-only github.token (workflow permissions are
+          # ~keep contents:read) — without forwarding the app token here the release
+          # ~keep asset upload fails 403 "Resource not accessible by integration".
+          token: ${{ steps.app-token.outputs.token }}
+          # ~keep Override the auto-detected package-name (`.xberg` from
+          # ~keep build.zig.zon) to match the alef-emitted test_app URL pattern
+          # ~keep `{crate-name}-zig-v{version}.tar.gz`. Without this, the asset
+          # ~keep uploads as `xberg-v{version}.tar.gz` while test_apps/zig
+          # ~keep fetches `xberg-zig-v{version}.tar.gz` → 404 + consumer
+          # ~keep build.zig.zon placeholder hash.
           package-name: xberg-zig
-          # Bundle the per-target FFI libraries + header into the published
-          # tarball so consumers can `zig fetch --save` and link without
-          # downloading anything else.
           multi-platform-ffi-dir: ffi-artifacts
           module-name: xberg
           ffi-lib-name: xberg_ffi
@@ -2980,17 +3473,19 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
 
-  # ─── Homebrew (formula update + bottles) ──────────────────────────────
-  #
-  # Topology mirrors html-to-markdown:
-  #   1. publish-homebrew-formula — update formula source URL/sha (no bottles)
-  #   2. homebrew-bottles         — build bottle tarballs + JSON manifests
-  #   3. publish-homebrew-bottles — merge bottle DSL into formula and push
-
   publish-homebrew-formula:
     name: Update Homebrew formula
-    needs: [prepare, upload-cli-release, check-homebrew]
-    if: ${{ needs.prepare.outputs.release_homebrew == 'true' && needs.prepare.outputs.is_tag == 'true' && needs.check-homebrew.outputs.exists != 'true' }}
+    needs: [prepare, upload-cli-release, check-homebrew, publish-crates]
+    # Pins release-asset URLs that persist on the release, so a SKIPPED upload-cli
+    # on a same-tag retry (asset already uploaded) must not skip the formula bump;
+    # only a genuine upload failure should. Independent of all other channels. ~keep
+    if: >-
+      ${{ always()
+      && needs.upload-cli-release.result != 'failure'
+      && needs.publish-crates.result != 'failure'
+      && needs.prepare.outputs.release_homebrew == 'true'
+      && needs.prepare.outputs.is_tag == 'true'
+      && (needs.check-homebrew.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2
@@ -3024,8 +3519,6 @@ jobs:
           persist-credentials: true
 
       - name: Update formula files
-        # Inline: bumps url/sha256/version in Formula/xberg.rb. Equivalent
-        # of html-to-markdown's scripts/publish/update-homebrew-formula.sh.
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
@@ -3054,38 +3547,43 @@ jobs:
 
   homebrew-bottles:
     name: Build Homebrew bottle (${{ matrix.bottle_tag }})
-    needs: [prepare, publish-homebrew-formula]
-    if: ${{ needs.prepare.outputs.release_homebrew == 'true' && needs.prepare.outputs.is_tag == 'true' }}
+    # Depends on finalize so the GitHub Release is out of draft before the bottle
+    # build's `brew install` fetches the source tarball: the formula now pins a
+    # release-asset URL (stable bytes, uploaded by publish-homebrew-formula), and
+    # draft-release assets are not publicly downloadable. In dry-run finalize is
+    # skipped, so this job is skipped too (no asset is uploaded to point at). ~keep
+    needs: [prepare, publish-homebrew-formula, finalize-github-release-after-uploads]
+    # Runs once the formula is bumped and the release is finalized (out of draft so
+    # `brew install` can fetch the pinned release asset), independent of any sibling
+    # channel's result. Builds from source — consumes no cross-job run-artifacts. ~keep
+    if: >-
+      ${{ always()
+      && needs.publish-homebrew-formula.result == 'success'
+      && needs.finalize-github-release-after-uploads.result == 'success'
+      && needs.prepare.outputs.release_homebrew == 'true'
+      && needs.prepare.outputs.is_tag == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: macos-latest, bottle_tag: arm64_sonoma, install_brew: false }
-          # Intel macOS (sequoia): the tap formula builds x86_64 with ort-dynamic
-          # and depends on the `onnxruntime` formula for the runtime dylib (no
-          # static x86_64-apple-darwin prebuilt exists). Requires the paired tap
-          # change xberg-io/homebrew-tap#6 to be merged before this bottle builds.
           - { os: macos-15-intel, bottle_tag: sequoia, install_brew: false }
           - { os: ubuntu-latest, bottle_tag: x86_64_linux, install_brew: true }
           - { os: ubuntu-24.04-arm, bottle_tag: arm64_linux, install_brew: true }
     steps:
-      - uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          owner: xberg-io
-
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
 
-          submodules: recursive
+          submodules: false
       - name: Install Homebrew (Linux)
         if: ${{ matrix.install_brew }}
         uses: xberg-io/actions/install-homebrew-linux@v1
 
+      # Build (from source) and STAGE the bottle without uploading. A from-source build on
+      # the slow macOS runners can outlast a GitHub App token's hard 1h TTL, so uploading
+      # inside this step with a token minted before the build 401s (rc.36 sequoia). ~keep
       - name: Build bottles
         uses: xberg-io/actions/homebrew-build-bottles@v1
         with:
@@ -3096,7 +3594,39 @@ jobs:
             xberg
           out-dir: ${{ github.workspace }}/bottle-json
           github-repo: xberg-io/xberg
-          token: ${{ steps.app-token.outputs.token }}
+          upload: false
+
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: xberg-io
+
+      - name: Upload bottle to release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bottles=("${{ github.workspace }}/bottle-json/"*.bottle.tar.gz)
+          if [[ ${#bottles[@]} -eq 0 ]]; then
+            echo "::error::no bottle tarball staged in bottle-json/" >&2
+            exit 1
+          fi
+          for b in "${bottles[@]}"; do
+            echo "Uploading $(basename "$b") to ${TAG}"
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$b" --clobber --repo xberg-io/xberg; then break; fi
+              if [ "$attempt" = 5 ]; then
+                echo "::error::failed to upload $(basename "$b") after 5 attempts" >&2
+                exit 1
+              fi
+              echo "attempt ${attempt}/5 failed; retrying in $((attempt * 5))s" >&2
+              sleep $((attempt * 5))
+            done
+          done
 
       - uses: actions/upload-artifact@v7
         with:
@@ -3108,7 +3638,18 @@ jobs:
   publish-homebrew-bottles:
     name: Merge Homebrew bottle DSL
     needs: [prepare, publish-homebrew-formula, homebrew-bottles]
-    if: ${{ needs.prepare.outputs.release_homebrew == 'true' && needs.prepare.outputs.is_tag == 'true' }}
+    # Consumes the bottle-json RUN-artifacts. Runs on a PARTIAL bottle set too: with
+    # fail-fast:false the matrix legs upload independently, and merge-bottles renders a
+    # bottle block from whatever JSON manifests are present (missing platforms fall back
+    # to source-build). So a single failed leg (e.g. the slow sequoia runner) must NOT
+    # drop the bottle DSL for every platform — hence success OR failure, not just success.
+    # (download-artifact only pulls the legs that succeeded.) ~keep
+    if: >-
+      ${{ always()
+      && needs.publish-homebrew-formula.result == 'success'
+      && (needs.homebrew-bottles.result == 'success' || needs.homebrew-bottles.result == 'failure')
+      && needs.prepare.outputs.release_homebrew == 'true'
+      && needs.prepare.outputs.is_tag == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2
@@ -3123,7 +3664,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
 
-          submodules: recursive
+          submodules: false
       - name: Checkout homebrew-tap
         uses: actions/checkout@v6
         with:
@@ -3150,8 +3691,6 @@ jobs:
 
       - name: Commit and push bottle DSL
         if: ${{ needs.prepare.outputs.dry_run != 'true' }}
-        # Inline: tap-side commit/push of the regenerated formula. No shared
-        # action covers tap commits — each repo's bot identity is unique.
         working-directory: homebrew-tap
         env:
           GH_TOKEN: ${{ steps.tap-token.outputs.token }}
@@ -3166,8 +3705,6 @@ jobs:
           git commit -m "xberg ${{ needs.prepare.outputs.version }}: add bottle DSL"
           git push origin HEAD
         shell: bash
-
-  # ─── Finalization ─────────────────────────────────────────────────────
 
   release-finalize:
     name: Finalize GitHub Release (post-publish validation)
@@ -3194,7 +3731,18 @@ jobs:
       !cancelled() &&
       needs.prepare.outputs.is_tag == 'true' &&
       needs.prepare.outputs.dry_run != 'true' &&
-      !contains(needs.*.result, 'failure')
+      needs.finalize-github-release-after-uploads.result != 'failure' &&
+      needs.publish-crates.result != 'failure' &&
+      needs.publish-pypi.result != 'failure' &&
+      needs.publish-rubygems.result != 'failure' &&
+      needs.publish-node.result != 'failure' &&
+      needs.publish-wasm.result != 'failure' &&
+      needs.publish-packagist.result != 'failure' &&
+      needs.publish-maven.result != 'failure' &&
+      needs.publish-kotlin-android.result != 'failure' &&
+      needs.publish-nuget.result != 'failure' &&
+      needs.publish-hex.result != 'failure' &&
+      needs.publish-zig.result != 'failure'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v2
@@ -3209,10 +3757,6 @@ jobs:
           tag: ${{ needs.prepare.outputs.tag }}
           is-prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' && 'true' || 'false' }}
           go-module-path: packages/go
-          # Our go.mod lives at `packages/go/go.mod`, not at the stripped
-          # parent. Disabling the default `/vN` strip yields a Go module tag of
-          # `packages/go/{tag}`, which Go's module proxy resolves against
-          # that subtree. Fixes `missing go.mod at revision v5.0.0-rc.7`.
           go-strip-major-version: "false"
           token: ${{ steps.app-token.outputs.token }}
 
@@ -3266,53 +3810,260 @@ jobs:
 
   cli-proxy:
     name: Publish CLI proxy package (npm)
-    # The npm trusted publisher is bound to this workflow file (publish.yaml). The publish
-    # runs inline here via the publish-npm composite action (which executes in this job's
-    # context) rather than delegating to a reusable workflow — otherwise npm's OIDC
-    # trusted-publishing check sees the reusable workflow's filename, not publish.yaml.
-    # Decoupled from the main release: fires only on its own `cli-proxy-v*` release tag.
-    if: ${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'cli-proxy-v') }}
+    needs: [prepare, check-cli, publish-crates]
+    if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_cli == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-cli.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - uses: xberg-io/actions/setup-node-workspace@v1
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org/"
       - uses: xberg-io/actions/publish-npm@v1
         with:
           package-dir: cli-proxy/npm
           access: public
           provenance: "true"
 
-  trigger-docker-publish:
-    name: Trigger Docker image publish
-    # publish-docker.yaml normally fires on `release: published`, but the release
-    # is created as a draft and only un-drafted by finalize-github-release, which
-    # needs every binding upload to succeed — so a single binding failure means
-    # the release never publishes and Docker never builds. Fire the docker
-    # pipeline explicitly via repository_dispatch, decoupled from the scripting
-    # bindings: images build from source and only need a sane core. GITHUB_TOKEN
-    # cannot trigger a workflow from a workflow, so use the BOT app token.
-    needs: [prepare, publish-crates]
-    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.release_any == 'true' && !cancelled() && needs.publish-crates.result != 'failure' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          owner: xberg-io
+  # --- First-party integrations (lockstep with core; see integrations/README.md) ---
+  # These are additive best-effort stages: they publish the integrations that ship
+  # with this core version, but are intentionally NOT part of release-finalize /
+  # announce-discord `needs`, so an integration hiccup never blocks the core release.
+  # Each depends on the matching core publish job so the core artifact lands first. ~keep
 
-      - name: Dispatch publish-docker
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-          REF: ${{ needs.prepare.outputs.checkout_ref }}
+  publish-integrations-pypi:
+    name: Publish integrations to PyPI
+    needs: [prepare, publish-pypi, publish-crates]
+    if: >-
+      ${{ !cancelled() && needs.publish-pypi.result != 'failure'
+      && needs.publish-crates.result != 'failure'
+      && needs.prepare.outputs.release_python == 'true'
+      && needs.prepare.outputs.is_tag == 'true' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Build integration distributions
         run: |
           set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
-            -f event_type=publish-docker \
-            -f "client_payload[tag]=${TAG}" \
-            -f "client_payload[ref]=${REF}"
-          echo "Dispatched publish-docker for ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p integrations-dist
+          pkgs=(
+            integrations/python/crewai
+            integrations/python/txtai
+            integrations/python/surrealdb
+            integrations/python/langchain
+            integrations/python/llama-index/readers/llama-index-readers-xberg
+            integrations/python/llama-index/node_parsers/llama-index-node-parser-xberg
+          )
+          for p in "${pkgs[@]}"; do
+            echo "::group::build $p"
+            uv build --sdist --wheel --out-dir integrations-dist "$p"
+            echo "::endgroup::"
+          done
+          ls -la integrations-dist
+      # Every integration PyPI project trusts (xberg-io/xberg, publish.yaml, env pypi),
+      # so a single OIDC upload publishes all of them. ~keep
+      - uses: xberg-io/actions/publish-pypi@v1
+        with:
+          packages-dir: integrations-dist
+          dry-run: ${{ needs.prepare.outputs.dry_run }}
+
+  publish-integrations-maven:
+    name: Publish spring-ai integration to Maven Central
+    needs: [prepare, publish-maven, publish-crates]
+    if: >-
+      ${{ !cancelled() && needs.publish-maven.result != 'failure'
+      && needs.publish-crates.result != 'failure'
+      && needs.prepare.outputs.release_java == 'true'
+      && needs.prepare.outputs.is_tag == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - uses: xberg-io/actions/setup-maven@v1
+        with:
+          version: "3.9.16"
+      - name: Wait for core artifact on Maven Central
+        if: needs.prepare.outputs.dry_run != 'true'
+        env:
+          XBERG_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # spring-ai depends on io.xberg:xberg:$XBERG_VERSION, published by the core
+          # `publish-maven` job. `needs: publish-maven` guarantees that job finished but NOT
+          # that the Central Portal has synced the artifact to repo1.maven.org, where mvn
+          # resolves it — that indexing lag (minutes to tens of minutes) is what failed the
+          # rc.36 spring-ai deploy ("Could not find artifact io.xberg:xberg:jar in central").
+          url="https://repo1.maven.org/maven2/io/xberg/xberg/${XBERG_VERSION}/xberg-${XBERG_VERSION}.pom"
+          for attempt in $(seq 1 60); do
+            if curl -fsSL -o /dev/null "$url"; then
+              echo "core artifact available after attempt ${attempt}: ${url}"
+              exit 0
+            fi
+            echo "attempt ${attempt}/60: not yet on Central; sleeping 30s (${url})"
+            sleep 30
+          done
+          echo "::error::io.xberg:xberg:${XBERG_VERSION} did not appear on Maven Central within ~30m; re-run this job once it syncs" >&2
+          exit 1
+      - uses: xberg-io/actions/publish-maven@v1
+        with:
+          pom-file: integrations/java/spring-ai/pom.xml
+          maven-profile: publish
+          extra-args: -DskipTests
+          dry-run: ${{ needs.prepare.outputs.dry_run }}
+        env:
+          MAVEN_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+  publish-integrations-npm:
+    name: Publish ${{ matrix.package }} to npm
+    needs: [prepare, publish-node, publish-crates]
+    # Also skipped on dry runs: each integration package pins `@xberg-io/xberg` to the exact release
+    # version, and a dry-run `publish-node` never puts that version on npm, so `npm install` dies with
+    # ETARGET "No matching version found for @xberg-io/xberg@<version>" before anything is published.
+    if: >-
+      ${{ !cancelled() && needs.publish-node.result != 'failure'
+      && needs.publish-crates.result != 'failure'
+      && needs.prepare.outputs.release_node == 'true'
+      && needs.prepare.outputs.dry_run != 'true'
+      && needs.prepare.outputs.is_tag == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - n8n-nodes-xberg
+          - langchain-xberg
+          - llamaindex-xberg
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - uses: xberg-io/actions/setup-node-workspace@v1
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org/"
+      - name: Build
+        working-directory: integrations/node/${{ matrix.package }}
+        # `npm install` (not `npm ci`): the integration pins `@xberg-io/xberg` to the exact rc,
+        # which is published to npm only by the preceding `publish-node` job of THIS run — so a
+        # committed lockfile can never pre-match it (the stale rc.32 lockfile broke rc.36's npm
+        # publish). install reconciles the core entry against the just-published version while
+        # preserving the third-party pins already recorded in package-lock.json. ~keep
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+      - uses: xberg-io/actions/publish-npm@v1
+        with:
+          package-dir: integrations/node/${{ matrix.package }}
+          access: public
+          npm-tag: ${{ needs.prepare.outputs.npm_tag }}
+          provenance: "true"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # --- Coding-agent plugin (lives in plugin/, generated by ai-rulez; see plugin/README.md) ---
+  # Additive best-effort like the integrations above: intentionally NOT part of
+  # release-finalize / announce-discord `needs`, so a plugin hiccup never blocks the core
+  # release. Both publish the same content every tagged release (version tracks core), so
+  # each guards against an already-published version. `needs: [prepare]` only — the plugin
+  # has no build- or runtime-dependency on the core packages (mcp-launch.sh resolves the CLI
+  # at runtime), so it publishes in parallel with the core jobs. ~keep
+
+  publish-plugin-opencode:
+    name: Publish OpenCode plugin to npm
+    needs: [prepare]
+    if: >-
+      ${{ !cancelled() && needs.prepare.outputs.release_any == 'true'
+      && needs.prepare.outputs.is_tag == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - uses: xberg-io/actions/setup-node-workspace@v1
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org/"
+      # Plain ESM adapter — no build step. Skip if this version is already on npm so a
+      # release re-run is idempotent (publish-npm has no built-in skip-existing). ~keep
+      - name: Skip if already on npm
+        id: guard
+        run: |
+          name="$(node -p "require('./plugin/package.json').name")"
+          ver="$(node -p "require('./plugin/package.json').version")"
+          if npm view "${name}@${ver}" version >/dev/null 2>&1; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::${name}@${ver} already on npm; skipping"
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+          fi
+      - uses: xberg-io/actions/publish-npm@v1
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          package-dir: plugin
+          access: public
+          npm-tag: ${{ needs.prepare.outputs.npm_tag }}
+          provenance: "true"
+          dry-run: ${{ needs.prepare.outputs.dry_run }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-plugin-hermes:
+    name: Publish Hermes plugin to PyPI
+    needs: [prepare]
+    if: >-
+      ${{ !cancelled() && needs.prepare.outputs.release_any == 'true'
+      && needs.prepare.outputs.is_tag == 'true' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Build Hermes wheel
+        run: uv build --wheel --out-dir dist-hermes plugin/.hermes/package
+      # publish-pypi is idempotent (skips a version already on PyPI). ~keep
+      - uses: xberg-io/actions/publish-pypi@v1
+        with:
+          packages-dir: dist-hermes
+          dry-run: ${{ needs.prepare.outputs.dry_run }}

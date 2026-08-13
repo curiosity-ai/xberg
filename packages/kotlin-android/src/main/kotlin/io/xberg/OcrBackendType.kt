@@ -34,7 +34,7 @@ enum class OcrBackendType {
     @com.fasterxml.jackson.annotation.JsonProperty("PaddleOCR") PADDLE_O_C_R,
     /** Candle-based VLM OCR (TrOCR, PaddleOCR-VL). */
     @com.fasterxml.jackson.annotation.JsonProperty("Candle") CANDLE,
-    /** Custom/third-party OCR backend */
+    /** Name-selected built-in or third-party OCR backend. */
     @com.fasterxml.jackson.annotation.JsonProperty("Custom") CUSTOM;
 
     @com.fasterxml.jackson.annotation.JsonValue

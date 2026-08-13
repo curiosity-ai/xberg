@@ -23,9 +23,15 @@
 //! Reports are generated as self-contained HTML documents with inline CSS, requiring
 //! no external dependencies. The HTML is viewable in any modern web browser.
 
-#[cfg(feature = "profiling")]
+#[cfg(all(feature = "profiling", not(target_os = "windows")))]
 use crate::profiling::ProfilingResult;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
+
+/// Number of hotspots retained in a report, highest self-sample-count first.
+const TOP_HOTSPOT_COUNT: usize = 10;
+
+/// Multiplier converting a sample-count ratio into a percentage.
+const PERCENT_SCALE: f64 = 100.0;
 
 /// Comprehensive profiling report with hotspot analysis
 ///
@@ -59,6 +65,17 @@ pub struct Hotspot {
     /// Percentage of total samples (0.0-100.0)
     pub percentage: f64,
     /// File location if available (filename:line)
+    pub file_location: Option<String>,
+}
+
+/// The source site a CPU sample was attributed to
+///
+/// Used as the aggregation key when folding raw stack samples into per-function hotspots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HotspotSite {
+    /// Demangled function name of the leaf frame
+    pub function_name: String,
+    /// Source location as `file:line`, when the binary carries debug info
     pub file_location: Option<String>,
 }
 
@@ -107,7 +124,11 @@ impl ProfileReport {
     /// # Note
     ///
     /// This function is only available when the `profiling` feature is enabled.
-    #[cfg(feature = "profiling")]
+    ///
+    /// `sample_count` is the estimate carried by [`ProfilingResult`] (sampling frequency times
+    /// elapsed time), whereas hotspot percentages are computed against the sample total actually
+    /// present in the pprof report. The two can differ when the profiler drops samples under load.
+    #[cfg(all(feature = "profiling", not(target_os = "windows")))]
     pub fn from_profiling_result(result: &ProfilingResult, framework_name: &str) -> Self {
         let duration = result.duration;
         let sample_count = result.sample_count;
@@ -118,7 +139,7 @@ impl ProfileReport {
             0.0
         };
 
-        let top_hotspots = Self::extract_top_hotspots(&result.report, sample_count);
+        let top_hotspots = Self::extract_top_hotspots(&result.report);
 
         let recommendations = Self::generate_recommendations(sample_count, framework_name);
 
@@ -132,37 +153,79 @@ impl ProfileReport {
         }
     }
 
-    /// Extract top 10 hotspots from the pprof Report
+    /// Extract the top hotspots from a pprof Report
+    ///
+    /// Walks `pprof::Report::data`, which maps each captured stack to the number of samples in
+    /// which it was observed, and attributes every sample to its leaf frame. The result is
+    /// therefore *self* time: the cost of a function excluding its callees.
     ///
     /// # Arguments
     ///
-    /// * `_report` - pprof Report containing collected profile data
-    /// * `total_samples` - Total sample count for percentage calculation
+    /// * `report` - pprof Report containing collected profile data
     ///
     /// # Returns
     ///
-    /// Vector of up to 10 hotspots sorted by sample count descending
+    /// Up to [`TOP_HOTSPOT_COUNT`] hotspots sorted by sample count descending. Empty when the
+    /// report holds no samples.
+    #[cfg(all(feature = "profiling", not(target_os = "windows")))]
+    fn extract_top_hotspots(report: &pprof::Report) -> Vec<Hotspot> {
+        let mut leaf_samples: HashMap<HotspotSite, usize> = HashMap::new();
+        let mut total_samples: usize = 0;
+
+        for (frames, sample_count) in &report.data {
+            let Ok(samples) = usize::try_from(*sample_count) else {
+                continue;
+            };
+            total_samples += samples;
+
+            let Some(leaf) = frames.frames.first().and_then(|inlined| inlined.first()) else {
+                continue;
+            };
+            let site = HotspotSite {
+                function_name: leaf.name(),
+                file_location: symbol_file_location(leaf),
+            };
+            *leaf_samples.entry(site).or_default() += samples;
+        }
+
+        Self::rank_hotspots(leaf_samples, total_samples)
+    }
+
+    /// Rank aggregated per-site sample counts into the top [`TOP_HOTSPOT_COUNT`] hotspots
     ///
-    /// Note: This is a stub implementation. The pprof Report API doesn't expose
-    /// sample-level data directly in public API. A future enhancement would require
-    /// either:
-    /// 1. Creating custom serialization from pprof protobuf output
-    /// 2. Writing reports to intermediate format and parsing
-    /// 3. Enhancing pprof with additional API methods
+    /// # Arguments
     ///
-    /// For now, we generate recommendations based on sample count which is meaningful.
-    #[cfg(feature = "profiling")]
-    fn extract_top_hotspots(_report: &pprof::Report, total_samples: usize) -> Vec<Hotspot> {
+    /// * `leaf_samples` - Sample counts keyed by the site the samples were attributed to
+    /// * `total_samples` - Denominator for percentages: every sample in the profile, including
+    ///   those whose site could not be resolved
+    ///
+    /// # Returns
+    ///
+    /// Hotspots ordered by sample count descending, ties broken by function name so the ordering
+    /// is deterministic despite the unordered input map. Empty when `total_samples` is zero.
+    pub fn rank_hotspots(leaf_samples: HashMap<HotspotSite, usize>, total_samples: usize) -> Vec<Hotspot> {
         if total_samples == 0 {
             return Vec::new();
         }
 
-        vec![Hotspot {
-            function_name: "[profile data collected - hotspot extraction requires pprof API enhancement]".to_string(),
-            samples: total_samples,
-            percentage: 100.0,
-            file_location: None,
-        }]
+        let mut hotspots: Vec<Hotspot> = leaf_samples
+            .into_iter()
+            .map(|(site, samples)| Hotspot {
+                function_name: site.function_name,
+                samples,
+                percentage: samples as f64 * PERCENT_SCALE / total_samples as f64,
+                file_location: site.file_location,
+            })
+            .collect();
+
+        hotspots.sort_by(|left, right| {
+            right
+                .samples
+                .cmp(&left.samples)
+                .then_with(|| left.function_name.cmp(&right.function_name))
+        });
+        hotspots.truncate(TOP_HOTSPOT_COUNT);
+        hotspots
     }
 
     /// Generate recommendations based on profile quality metrics
@@ -417,7 +480,10 @@ impl ProfileReport {
         format!("<ul class=\"recommendations-list\">{}</ul>", items)
     }
 
-    /// Render memory trajectory chart (stub for future expansion)
+    /// Render the memory trajectory section
+    ///
+    /// Nothing in the harness populates `memory_trajectory` yet, so this renders only for callers
+    /// that build a `ProfileReport` with snapshots of their own.
     fn render_memory_chart(&self) -> String {
         if self.memory_trajectory.is_empty() {
             return String::new();
@@ -762,6 +828,16 @@ impl ProfileReport {
     }
 }
 
+/// Format a resolved symbol's source position as `file:line`
+///
+/// Returns `None` when the binary was built without the debug info pprof needs to resolve a
+/// filename, in which case the hotspot is reported by function name alone.
+#[cfg(all(feature = "profiling", not(target_os = "windows")))]
+fn symbol_file_location(symbol: &pprof::Symbol) -> Option<String> {
+    let filename = symbol.filename.as_ref()?;
+    Some(format!("{}:{}", filename.display(), symbol.lineno()))
+}
+
 /// Escape HTML special characters
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -950,6 +1026,80 @@ mod tests {
         assert!(html.contains("func_two"));
         assert!(html.contains("50"));
         assert!(html.contains("25.0%"));
+    }
+
+    fn site(function_name: &str, file_location: Option<&str>) -> HotspotSite {
+        HotspotSite {
+            function_name: function_name.to_string(),
+            file_location: file_location.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn rank_hotspots_returns_empty_when_no_samples_were_collected() {
+        let hotspots = ProfileReport::rank_hotspots(HashMap::new(), 0);
+        assert!(hotspots.is_empty(), "a profile with zero samples has no hotspots");
+    }
+
+    #[test]
+    fn rank_hotspots_orders_by_samples_and_computes_percentages_against_the_total() {
+        let leaf_samples = HashMap::from([
+            (site("parse_pdf", Some("pdf.rs:10")), 60),
+            (site("extract_text", None), 30),
+            (site("normalize", None), 10),
+        ]);
+
+        let hotspots = ProfileReport::rank_hotspots(leaf_samples, 200);
+
+        assert_eq!(hotspots.len(), 3, "every distinct site must be reported");
+        assert_eq!(hotspots[0].function_name, "parse_pdf");
+        assert_eq!(hotspots[0].samples, 60);
+        assert_eq!(hotspots[0].percentage, 30.0, "60 of 200 samples is 30%, not 100%");
+        assert_eq!(hotspots[0].file_location.as_deref(), Some("pdf.rs:10"));
+        assert_eq!(hotspots[1].function_name, "extract_text");
+        assert_eq!(hotspots[2].function_name, "normalize");
+        assert_eq!(hotspots[2].percentage, 5.0);
+    }
+
+    #[test]
+    fn rank_hotspots_breaks_ties_by_function_name_for_deterministic_output() {
+        let leaf_samples = HashMap::from([
+            (site("zeta", None), 5),
+            (site("alpha", None), 5),
+            (site("mid", None), 5),
+        ]);
+
+        let names: Vec<String> = ProfileReport::rank_hotspots(leaf_samples, 15)
+            .into_iter()
+            .map(|hotspot| hotspot.function_name)
+            .collect();
+
+        assert_eq!(names, vec!["alpha".to_string(), "mid".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn rank_hotspots_truncates_to_the_top_hotspot_count() {
+        let leaf_samples: HashMap<HotspotSite, usize> = (0..TOP_HOTSPOT_COUNT + 5)
+            .map(|index| (site(&format!("function_{index}"), None), index + 1))
+            .collect();
+
+        let hotspots = ProfileReport::rank_hotspots(leaf_samples, 1000);
+
+        assert_eq!(hotspots.len(), TOP_HOTSPOT_COUNT);
+        assert_eq!(hotspots[0].samples, TOP_HOTSPOT_COUNT + 5);
+        assert_eq!(hotspots[TOP_HOTSPOT_COUNT - 1].samples, 6);
+    }
+
+    #[test]
+    fn rank_hotspots_percentages_do_not_exceed_one_hundred_when_sites_are_unresolved() {
+        // Samples whose leaf frame could not be resolved still count toward the denominator, so
+        // the reported percentages must sum to less than 100 rather than being rescaled to it.
+        let leaf_samples = HashMap::from([(site("resolved", None), 25)]);
+
+        let hotspots = ProfileReport::rank_hotspots(leaf_samples, 100);
+
+        assert_eq!(hotspots.len(), 1);
+        assert_eq!(hotspots[0].percentage, 25.0);
     }
 
     #[test]

@@ -86,7 +86,6 @@ impl<'a> Encoder<'a> {
 #[allow(unsafe_code)]
 impl<'a> Drop for Encoder<'a> {
     fn drop(&mut self) {
-        // SAFETY: libheif C API; self.inner is non-null and valid.
         unsafe { lh::heif_encoder_release(self.inner) };
     }
 }
@@ -96,17 +95,13 @@ impl<'a> Encoder<'a> {
     /// Name of encoder.
     #[allow(unsafe_code)]
     pub fn name(&self) -> String {
-        // Name of encoder in `libheif` is mutable static array of chars.
-        // So we must use mutex to get access this array.
         let _lock = ENCODER_MUTEX.lock();
-        // SAFETY: libheif C API; self.inner is non-null; protected by mutex.
         let res = unsafe { lh::heif_encoder_get_name(self.inner) };
         cstr_to_str(res).unwrap_or("").to_owned()
     }
 
     #[allow(unsafe_code)]
     pub fn set_quality(&mut self, quality: EncoderQuality) -> Result<()> {
-        // SAFETY: libheif C API; self.inner is non-null.
         let err = match quality {
             EncoderQuality::LossLess => unsafe { lh::heif_encoder_set_lossless(self.inner, 1) },
             EncoderQuality::Lossy(value) => unsafe {
@@ -124,7 +119,6 @@ impl<'a> Encoder<'a> {
         let param_value = match parameter_type {
             EncoderParameterType::Int => {
                 let mut value = 0;
-                // SAFETY: libheif C API; self.inner is non-null, c_param_name is valid, value is valid mutable ptr.
                 let err = unsafe {
                     lh::heif_encoder_get_parameter_integer(self.inner, c_param_name.as_ptr(), &mut value as _)
                 };
@@ -133,7 +127,6 @@ impl<'a> Encoder<'a> {
             }
             EncoderParameterType::Bool => {
                 let mut value = 0;
-                // SAFETY: libheif C API; self.inner is non-null, c_param_name is valid, value is valid mutable ptr.
                 let err = unsafe {
                     lh::heif_encoder_get_parameter_boolean(self.inner, c_param_name.as_ptr(), &mut value as _)
                 };
@@ -142,7 +135,6 @@ impl<'a> Encoder<'a> {
             }
             EncoderParameterType::String => {
                 let value: Vec<u8> = vec![0; 51];
-                // SAFETY: libheif C API; self.inner is non-null, c_param_name is valid, value is valid buffer.
                 let err = unsafe {
                     lh::heif_encoder_get_parameter_string(self.inner, c_param_name.as_ptr(), value.as_ptr() as _, 50)
                 };
@@ -173,7 +165,6 @@ impl<'a> Encoder<'a> {
     #[allow(unsafe_code)]
     pub fn set_parameter_value(&self, name: &str, value: EncoderParameterValue) -> Result<()> {
         let c_param_name = CString::new(name).unwrap();
-        // SAFETY: libheif C API; self.inner is non-null, c_param_name is valid.
         let err = match value {
             EncoderParameterValue::Bool(v) => unsafe {
                 lh::heif_encoder_set_parameter_boolean(self.inner, c_param_name.as_ptr(), v.into())
@@ -194,11 +185,9 @@ impl<'a> Encoder<'a> {
 #[allow(unsafe_code)]
 fn parameters_types(c_encoder: &mut lh::heif_encoder) -> Result<EncoderParametersTypes> {
     let mut res = EncoderParametersTypes::new();
-    // SAFETY: libheif C API; c_encoder is non-null; param_pointers can be null or valid array.
     unsafe {
         let mut param_pointers = lh::heif_encoder_list_parameters(c_encoder);
         if !param_pointers.is_null() {
-            // SAFETY: param_pointers is non-null; we check for null before dereferencing in loop.
             while let Some(raw_param) = (*param_pointers).as_ref() {
                 let c_param_type = lh::heif_encoder_parameter_get_type(raw_param);
                 let param_type = match EncoderParameterType::n(c_param_type) {
@@ -229,7 +218,6 @@ pub struct EncodingOptions {
 #[allow(unsafe_code)]
 impl EncodingOptions {
     pub fn new() -> Result<Self> {
-        // SAFETY: libheif C API; returns a heap-allocated encoding options or null.
         let inner_ptr = unsafe { lh::heif_encoding_options_alloc() };
         match ptr::NonNull::new(inner_ptr) {
             Some(inner) => Ok(Self { inner }),
@@ -251,7 +239,6 @@ impl Default for EncodingOptions {
 #[allow(unsafe_code)]
 impl Drop for EncodingOptions {
     fn drop(&mut self) {
-        // SAFETY: self.inner is non-null and owned by this EncodingOptions; freeing it completes our ownership.
         unsafe {
             lh::heif_encoding_options_free(self.inner.as_ptr());
         }
@@ -263,14 +250,12 @@ impl EncodingOptions {
     #[inline(always)]
     #[allow(unsafe_code)]
     fn inner_ref(&self) -> &lh::heif_encoding_options {
-        // SAFETY: self.inner is a valid NonNull; we have shared access.
         unsafe { self.inner.as_ref() }
     }
 
     #[inline(always)]
     #[allow(unsafe_code)]
     fn inner_mut(&mut self) -> &mut lh::heif_encoding_options {
-        // SAFETY: self.inner is a valid NonNull; we have exclusive access.
         unsafe { self.inner.as_mut() }
     }
 
@@ -362,7 +347,6 @@ impl<'a> EncoderDescriptor<'a> {
     /// This name should stay constant over different encoder versions.
     #[allow(unsafe_code)]
     pub fn id(&self) -> &str {
-        // SAFETY: libheif C API; self.inner is non-null; returns a static c string or null.
         let name = unsafe { lh::heif_encoder_descriptor_get_id_name(self.inner) };
         cstr_to_str(name).unwrap_or_default()
     }
@@ -371,17 +355,13 @@ impl<'a> EncoderDescriptor<'a> {
     /// (including version information).
     #[allow(unsafe_code)]
     pub fn name(&self) -> String {
-        // Name of encoder in `libheif` is mutable static array of chars.
-        // So we must use mutex to get access this array.
         let _lock = ENCODER_MUTEX.lock();
-        // SAFETY: libheif C API; self.inner is non-null; protected by mutex.
         let name = unsafe { lh::heif_encoder_descriptor_get_name(self.inner) };
         cstr_to_str(name).unwrap_or_default().to_owned()
     }
 
     #[allow(unsafe_code)]
     pub fn compression_format(&self) -> CompressionFormat {
-        // SAFETY: libheif C API; self.inner is non-null.
         let c_format = unsafe { lh::heif_encoder_descriptor_get_compression_format(self.inner) };
         match CompressionFormat::n(c_format) {
             Some(res) => res,
@@ -391,13 +371,11 @@ impl<'a> EncoderDescriptor<'a> {
 
     #[allow(unsafe_code)]
     pub fn supports_lossy_compression(&self) -> bool {
-        // SAFETY: libheif C API; self.inner is non-null.
         unsafe { lh::heif_encoder_descriptor_supports_lossy_compression(self.inner) != 0 }
     }
 
     #[allow(unsafe_code)]
     pub fn supports_lossless_compression(&self) -> bool {
-        // SAFETY: libheif C API; self.inner is non-null.
         unsafe { lh::heif_encoder_descriptor_supports_lossless_compression(self.inner) != 0 }
     }
 }

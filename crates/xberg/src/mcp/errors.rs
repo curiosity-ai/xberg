@@ -104,7 +104,6 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
 
         XbergError::Other(msg) => McpError::internal_error(msg, None),
 
-        // MCP spec error code -32800: RequestCancelled
         XbergError::Cancelled => McpError {
             code: rmcp::model::ErrorCode(-32800),
             message: "Extraction cancelled".into(),
@@ -116,7 +115,6 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            // Hostile / malformed user input → invalid params per MCP spec.
             McpError::invalid_params(error_message, None)
         }
 

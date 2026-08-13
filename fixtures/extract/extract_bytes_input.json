@@ -2,12 +2,22 @@
 	"id": "extract_bytes_input",
 	"category": "extract",
 	"description": "extract bytes input from PDF document",
+	"docs": {
+		"topic": "extract",
+		"title": "extract bytes input from PDF document",
+		"description": "extract bytes input from PDF document",
+		"presentation": {
+			"files": [
+				{
+					"field": "/bytes",
+					"path": "test_documents/pdf/fake_memo.pdf"
+				}
+			]
+		},
+		"side_effects": "safe"
+	},
 	"tags": ["extract", "bytes", "api"],
 	"call": "extract",
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM e2e uses dedicated browser-safe fixtures for bytes input"
-	},
 	"input": {
 		"kind": "bytes",
 		"bytes": [

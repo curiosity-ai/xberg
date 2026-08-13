@@ -1,20 +1,6 @@
 version: "3"
 
 # ============================================================================
-# Test fixture generation
-#
-# Generates DOCX / ODT / XLSX / PPTX / PDF documents with track-changes,
-# revisions, comments, incremental updates, paired diff inputs, and
-# security edge cases — each paired with a *.gt.json ground-truth sidecar.
-#
-# Source: tools/generate_test_fixtures/
-# Output: test_documents/generated/<format>/
-#
-# Usage:
-#   task fixtures:generate            # produce every fixture
-#   task fixtures:generate -- docx    # produce a single category
-#   task fixtures:test                # run the toolkit's smoke test
-# ============================================================================
 
 tasks:
   generate:

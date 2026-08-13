@@ -1,6 +1,20 @@
 {
 	"id": "api_extract_batch_bytes_with_config",
 	"description": "Tests batch bytes extraction with per-input config (extract_batch)",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests batch bytes extraction with per-input config (extract_batch)",
+		"description": "Tests batch bytes extraction with per-input config (extract_batch)",
+		"presentation": {
+			"files": [
+				{
+					"field": "/inputs/0/bytes",
+					"path": "test_documents/pdf/fake_memo.pdf"
+				}
+			]
+		},
+		"side_effects": "safe"
+	},
 	"tags": ["contract", "api", "batch", "input_config"],
 	"call": "extract_batch",
 	"input": {

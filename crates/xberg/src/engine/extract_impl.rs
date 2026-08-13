@@ -8,13 +8,18 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+#[cfg(feature = "otel")]
+use tracing::Instrument;
 
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use std::future::Future;
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use std::sync::Arc;
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use std::time::Instant;
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+type PendingBatchItem = (usize, ExtractInput, String);
 
 #[cfg(feature = "url-ingestion")]
 use crawlberg::{CrawlConfig, CrawlEngine, CrawlPageResult, DownloadedDocument, ScrapeResult};
@@ -30,18 +35,143 @@ use crate::types::{ExtractedDocument, UriKind};
 use crate::{Result, XbergError};
 
 use crate::core::extractor::{extract_bytes, extract_file};
+use crate::engine::seams::ProgressEvent;
 
 const HTTP_SCHEME: &str = "http://";
 const HTTPS_SCHEME: &str = "https://";
 const FILE_SCHEME: &str = "file://";
 
+/// Stable progress-sink stage labels for the single-input [`extract`] entry point.
+///
+/// Chosen at coarse, stable lifecycle points only (session start, cache hit,
+/// completion, error) — never per-page or per-chunk — per the [`ProgressSink`]
+/// "coarse progress" contract (`crate::engine::seams::ProgressSink`).
+const PROGRESS_STAGE_START: &str = "extract_start";
+const PROGRESS_STAGE_CACHE_HIT: &str = "extract_cache_hit";
+const PROGRESS_STAGE_COMPLETE: &str = "extract_complete";
+const PROGRESS_STAGE_ERROR: &str = "extract_error";
+
+/// Namespace prefix mixed into the content-hash cache key so a future,
+/// incompatible key derivation can never collide with entries this version wrote.
+const CACHE_KEY_NAMESPACE: &[u8] = b"xberg-engine-extract-v1";
+
 /// Extract content from a single bytes or URI input.
-pub(crate) async fn extract(input: ExtractInput, config: &ExtractionConfig) -> Result<ExtractionResult> {
+///
+/// Honours the injected [`CacheBackend`](crate::engine::seams::CacheBackend) and
+/// [`ProgressSink`](crate::engine::seams::ProgressSink) seams: a content-hash cache
+/// hit (bytes inputs only, keyed on the raw bytes plus the resolved
+/// [`ExtractionConfig`]) returns the cached [`ExtractionResult`] and skips
+/// extraction entirely; a miss runs extraction as before and, on success,
+/// populates the cache for next time. Both seams default to no-ops
+/// ([`NoopCache`](crate::engine::seams::NoopCache),
+/// [`NoopProgressSink`](crate::engine::seams::NoopProgressSink)), so callers who
+/// inject nothing see byte-identical behavior.
+pub(crate) async fn extract(
+    inner: &super::EngineInner,
+    input: ExtractInput,
+    config: &ExtractionConfig,
+) -> Result<ExtractionResult> {
+    inner.progress.emit(ProgressEvent {
+        stage: PROGRESS_STAGE_START.to_string(),
+        message: None,
+        fraction: Some(0.0),
+    });
+
+    let cache_key = content_cache_key(&input, config);
+    if let Some(key) = cache_key.as_deref()
+        && let Some(cached_bytes) = inner.cache.get(key).await
+        && let Ok(cached_result) = serde_json::from_slice::<ExtractionResult>(&cached_bytes)
+    {
+        inner.progress.emit(ProgressEvent {
+            stage: PROGRESS_STAGE_CACHE_HIT.to_string(),
+            message: None,
+            fraction: Some(1.0),
+        });
+        return Ok(cached_result);
+    }
+
+    // Type-erased so `extract`'s future does not nest `extract_uncached`'s whole
+    // (already very deep) future type inside its own. Without this the compiler
+    // exceeds the recursion limit proving `Send` for the combined future, and any
+    // caller doing `tokio::spawn(xberg::extract(..))` — the canonical usage — fails
+    // to compile with E0275. ~keep
+    //
+    // No `+ Send` on wasm32: extractor futures are `!Send` there (`async_trait(?Send)`,
+    // see `plugins/extractor/trait.rs`), and the JS-backed futures pulled in through
+    // crawlberg/reqwest's wasm backend (`JsFuture`, wasm-bindgen closures) are never
+    // `Send` either. wasm32 has no OS threads and no `tokio::spawn`, so nothing needs
+    // the bound there — mirrors the `extract_batch` split below. ~keep
+    #[cfg(not(target_arch = "wasm32"))]
+    let uncached: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + Send>> =
+        Box::pin(extract_uncached(input, config));
+    #[cfg(target_arch = "wasm32")]
+    let uncached: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>>>> =
+        Box::pin(extract_uncached(input, config));
+    let result = uncached.await;
+
+    match &result {
+        Ok(output) => {
+            if let Some(key) = cache_key
+                && let Ok(serialized) = serde_json::to_vec(output)
+            {
+                inner.cache.put(&key, serialized, None).await;
+            }
+            inner.progress.emit(ProgressEvent {
+                stage: PROGRESS_STAGE_COMPLETE.to_string(),
+                message: None,
+                fraction: Some(1.0),
+            });
+        }
+        Err(error) => {
+            inner.progress.emit(ProgressEvent {
+                stage: PROGRESS_STAGE_ERROR.to_string(),
+                message: Some(error.to_string()),
+                fraction: None,
+            });
+        }
+    }
+
+    result
+}
+
+/// The extraction path proper, unwrapped from cache/progress bookkeeping so
+/// [`extract`] can wrap it uniformly for both the cache-hit and cache-miss cases.
+async fn extract_uncached(input: ExtractInput, config: &ExtractionConfig) -> Result<ExtractionResult> {
     let mut seen = initial_seen_urls(std::slice::from_ref(&input));
     let seed_hosts = initial_seed_hosts(std::slice::from_ref(&input));
     let mut output = Box::pin(extract_one(input, config, 0)).await?;
     follow_recursive_document_urls(&mut output, config, &mut seen, &seed_hosts).await?;
     Ok(output)
+}
+
+/// Derive a content-hash cache key for `input`, or `None` when the input is not
+/// eligible for caching.
+///
+/// Only `bytes` inputs are cached, per the cache-key contract (content-hash of
+/// file bytes + config, never path-based): a `uri` input's content is not yet
+/// known at this point without fetching it, which would defeat the purpose of a
+/// pre-extraction cache check. The key mixes the byte length and content, the
+/// MIME/filename hints, and the fully-resolved [`ExtractionConfig`] (base config
+/// merged with any per-input override), so a config or override change is a
+/// guaranteed cache miss.
+fn content_cache_key(input: &ExtractInput, base_config: &ExtractionConfig) -> Option<String> {
+    if input.kind != ExtractInputKind::Bytes {
+        return None;
+    }
+    let bytes = input.bytes.as_deref()?;
+    let resolved_config = resolve_input_config(input, base_config);
+    let config_json = serde_json::to_vec(&resolved_config).ok()?;
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CACHE_KEY_NAMESPACE);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    hasher.update(input.mime_type.as_deref().unwrap_or_default().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(input.filename.as_deref().unwrap_or_default().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&config_json);
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 /// Extract content from multiple bytes or URI inputs.
@@ -50,19 +180,63 @@ pub(crate) async fn extract_batch(
     inputs: Vec<ExtractInput>,
     config: &ExtractionConfig,
 ) -> Result<ExtractionResult> {
-    #[cfg(feature = "tokio-runtime")]
-    {
-        extract_batch_concurrent(inner, inputs, config).await
-    }
+    #[cfg(feature = "otel")]
+    let batch_span = crate::telemetry::spans::batch_span(inputs.len());
+    // `Instant::now()` panics on wasm32 (no usable timer there, see the wasm32 note on
+    // `extract_file_uncached`'s timeout handling), so the batch counter/histogram pair is
+    // skipped on that target rather than risking a panic for a metrics-only side effect. ~keep
+    #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
+    let batch_started = std::time::Instant::now();
 
-    #[cfg(not(feature = "tokio-runtime"))]
-    {
+    // `extract_batch_concurrent` spawns tasks on `tokio::task::JoinSet`, which requires `Send`
+    // futures; extractor futures are `!Send` on wasm32 (async_trait(?Send), see
+    // plugins/extractor/trait.rs) and wasm32 has no OS threads to run them on regardless. Use
+    // the sequential path there even though `tokio-runtime` is active (it's pulled in by
+    // `chunking-tokenizers`/`static-embeddings`, not concurrency support). ~keep
+    // Type-erased for the same reason as the single-extract path above: leaving the
+    // inner future's concrete type visible here makes callers that `tokio::spawn` a
+    // batch exceed the recursion limit proving `Send`. That bit the generated
+    // xberg-node binding (`run_bounded_batch_tasks`), which cannot carry a
+    // `#![recursion_limit]` of its own because it is regenerated from scratch. ~keep
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    let batch: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + Send>> =
+        Box::pin(extract_batch_concurrent(inner, inputs, config));
+
+    // No `+ Send` on wasm32: extractor futures are `!Send` there (async_trait(?Send)). ~keep
+    #[cfg(any(not(feature = "tokio-runtime"), target_arch = "wasm32"))]
+    let batch: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>>>> = {
         let _ = inner;
-        extract_batch_sequential(inputs, config).await
-    }
+        Box::pin(extract_batch_sequential(inputs, config))
+    };
+
+    #[cfg(feature = "otel")]
+    let result = batch.instrument(batch_span).await;
+    #[cfg(not(feature = "otel"))]
+    let result = batch.await;
+
+    #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
+    record_batch_metrics(batch_started.elapsed(), &result);
+
+    result
 }
 
-#[cfg(not(feature = "tokio-runtime"))]
+/// Emit the batch-level counter and duration histogram (#332).
+///
+/// Unlike the per-extraction metrics recorded in `plugins::extractor::instrumented`, there is
+/// exactly one batch span per call, so this carries no per-item attributes — only the
+/// overall `status` of the batch as a whole (an individual item's failure is captured in
+/// `ExtractionResult::errors`, not here).
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
+fn record_batch_metrics(elapsed: std::time::Duration, result: &Result<ExtractionResult>) {
+    let metrics = crate::telemetry::metrics::get_metrics();
+    let status = if result.is_ok() { "ok" } else { "error" };
+    let attrs = [opentelemetry::KeyValue::new("status", status)];
+
+    metrics.batch_total.add(1, &attrs);
+    metrics.batch_duration_ms.record(elapsed.as_secs_f64() * 1000.0, &[]);
+}
+
+#[cfg(any(not(feature = "tokio-runtime"), target_arch = "wasm32"))]
 async fn extract_batch_sequential(inputs: Vec<ExtractInput>, config: &ExtractionConfig) -> Result<ExtractionResult> {
     let mut seen = initial_seen_urls(&inputs);
     let seed_hosts = initial_seed_hosts(&inputs);
@@ -76,7 +250,14 @@ async fn extract_batch_sequential(inputs: Vec<ExtractInput>, config: &Extraction
 
     for (index, input) in inputs.into_iter().enumerate() {
         let source = input_source(&input);
-        match Box::pin(extract_one(input, config, index)).await {
+        let item = Box::pin(extract_one(input, config, index));
+
+        #[cfg(feature = "otel")]
+        let item_result = item.instrument(crate::telemetry::spans::batch_item_span(index)).await;
+        #[cfg(not(feature = "otel"))]
+        let item_result = item.await;
+
+        match item_result {
             Ok(item_output) => append_extraction_output(&mut output, item_output),
             Err(error) => output.errors.push(error_item(index, source, &error)),
         }
@@ -87,15 +268,12 @@ async fn extract_batch_sequential(inputs: Vec<ExtractInput>, config: &Extraction
     Ok(output)
 }
 
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 async fn extract_batch_concurrent(
     inner: &super::EngineInner,
     inputs: Vec<ExtractInput>,
     config: &ExtractionConfig,
 ) -> Result<ExtractionResult> {
-    use tokio::sync::Semaphore;
-    use tokio::task::JoinSet;
-
     let input_count = inputs.len();
     let mut seen = initial_seen_urls(&inputs);
     let seed_hosts = initial_seed_hosts(&inputs);
@@ -111,26 +289,13 @@ async fn extract_batch_concurrent(
         return Ok(output);
     }
 
-    let max_concurrent = config
-        .max_concurrent_extractions
-        .or_else(|| {
-            config
-                .concurrency
-                .as_ref()
-                .and_then(|concurrency| concurrency.max_threads)
-        })
-        .unwrap_or_else(|| crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref()))
-        .max(1);
-    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    crate::core::config::concurrency::init_batch_thread_pool(config.concurrency.as_ref());
     let base_config = Arc::new(config.clone());
-    let mut tasks = JoinSet::new();
+    let mut pending: VecDeque<PendingBatchItem> = VecDeque::with_capacity(input_count);
 
     let mut items: Vec<Option<BatchItemResult>> = Vec::with_capacity(input_count);
     items.resize_with(input_count, || None);
 
-    // Shared-URL group: http(s) URIs whose resolved crawl config + mode match
-    // the batch base config. These reuse ONE crawlberg engine via crawlberg's
-    // batch API instead of building a fresh engine per item.
     #[cfg(feature = "url-ingestion")]
     let mut shared_items: Vec<SharedUrlItem> = Vec::new();
     #[cfg(feature = "url-ingestion")]
@@ -139,9 +304,6 @@ async fn extract_batch_concurrent(
     for (index, input) in inputs.into_iter().enumerate() {
         let source = input_source(&input);
 
-        // Partition: route matching http(s) URIs into the shared group; every
-        // other input (bytes, file, file://, scheme-overriding URIs) keeps the
-        // existing per-item JoinSet + Semaphore + timeout path verbatim.
         #[cfg(feature = "url-ingestion")]
         {
             if let Some(uri) = shared_group_uri(&input) {
@@ -160,32 +322,54 @@ async fn extract_batch_concurrent(
             }
         }
 
-        let semaphore = Arc::clone(&semaphore);
-        let base_config = Arc::clone(&base_config);
-        tasks.spawn(async move {
-            let resolved_config = resolve_input_config_arc(&input, &base_config);
-            let timeout_secs = resolved_config.extraction_timeout_secs;
-            let cancel_token = resolved_config.cancel_token.clone();
-            run_batch_item(index, source, semaphore, timeout_secs, cancel_token, || async move {
-                Box::pin(extract_one_resolved(input, &resolved_config, index)).await
-            })
-            .await
-        });
+        pending.push_back((index, input, source));
     }
 
-    while let Some(task_result) = tasks.join_next().await {
-        match task_result {
-            Ok(item) => {
-                let index = item.index;
-                if index < items.len() {
-                    items[index] = Some(item);
-                } else {
-                    return Err(XbergError::Other(format!("batch task returned invalid index: {index}")));
-                }
+    let execution_plan = resolve_pending_batch_execution_plan(config, &pending);
+    let pending = if should_prioritize_pending_batch_items(pending.len(), execution_plan.workers) {
+        prioritize_pending_batch_items(pending, config).await
+    } else {
+        pending
+    };
+    let task_config = resolve_batch_base_config(&base_config, execution_plan.thread_budget);
+    let completed = run_bounded_batch_tasks(pending, execution_plan.workers, move |(index, input, source)| {
+        let base_config = Arc::clone(&task_config);
+        async move {
+            let resolved_config = resolve_batch_input_config(&input, &base_config, execution_plan.thread_budget);
+            let timeout_secs = resolved_config.extraction_timeout_secs;
+            let cancel_token = resolved_config.cancel_token.clone();
+            let item = run_batch_item(index, source, timeout_secs, cancel_token, || async move {
+                // Type-erased, not merely boxed. `run_bounded_batch_tasks` requires the
+                // enclosing async block to be `Send`, and proving that walks the whole
+                // nested future type -- which reaches h2/hyper/slab through reqwest and
+                // overflows rustc's 128 auto-trait recursion limit (E0275) in the
+                // alef-generated binding crates, which cannot carry `#![recursion_limit]`.
+                // A bare `Box::pin` does not help: it yields `Pin<Box<ConcreteFuture>>`,
+                // so the concrete type stays in the proof. Coercing to `dyn Future` cuts
+                // the chain here. ~keep
+                let extraction: std::pin::Pin<Box<dyn Future<Output = Result<ExtractionResult>> + Send + '_>> =
+                    Box::pin(extract_one_resolved(input, &resolved_config, index));
+                extraction.await
+            });
+
+            #[cfg(feature = "otel")]
+            {
+                item.instrument(crate::telemetry::spans::batch_item_span(index)).await
             }
-            Err(error) => {
-                return Err(XbergError::Other(format!("batch task failed to join: {error}")));
+            #[cfg(not(feature = "otel"))]
+            {
+                item.await
             }
+        }
+    })
+    .await?;
+
+    for item in completed {
+        let index = item.index;
+        if index < items.len() {
+            items[index] = Some(item);
+        } else {
+            return Err(XbergError::Other(format!("batch task returned invalid index: {index}")));
         }
     }
 
@@ -208,11 +392,297 @@ async fn extract_batch_concurrent(
     Ok(output)
 }
 
+#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn resolve_engine_batch_execution_plan(
+    config: &ExtractionConfig,
+    inputs: &[ExtractInput],
+) -> crate::core::config::concurrency::BatchExecutionPlan {
+    resolve_engine_batch_execution_plan_for(config, classify_layout_batch(config, inputs), inputs.len())
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn resolve_pending_batch_execution_plan(
+    config: &ExtractionConfig,
+    pending: &VecDeque<PendingBatchItem>,
+) -> crate::core::config::concurrency::BatchExecutionPlan {
+    resolve_engine_batch_execution_plan_for(
+        config,
+        classify_layout_batch(config, pending.iter().map(|(_, input, _)| input)),
+        pending.len(),
+    )
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn should_prioritize_pending_batch_items(pending_count: usize, workers: usize) -> bool {
+    workers > 1 && pending_count > workers
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+async fn prioritize_pending_batch_items(
+    pending: VecDeque<PendingBatchItem>,
+    base_config: &ExtractionConfig,
+) -> VecDeque<PendingBatchItem> {
+    const MAX_CONCURRENT_SIZE_HINTS: usize = 16;
+    const SIZE_HINT_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut costs = vec![None; pending.len()];
+    let mut local_paths = Vec::new();
+
+    for (position, (_, input, _)) in pending.iter().enumerate() {
+        match input.kind {
+            ExtractInputKind::Bytes => {
+                costs[position] = input.bytes.as_ref().map(|bytes| bytes.len() as u64);
+            }
+            ExtractInputKind::Uri => {
+                let effective_config = resolve_input_config(input, base_config);
+                let cancelled = effective_config
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(crate::cancellation::CancellationToken::is_cancelled);
+                if !cancelled && let Some(path) = local_batch_path(input, &effective_config) {
+                    local_paths.push((position, path));
+                }
+            }
+        }
+    }
+
+    let collect_costs = async {
+        let mut pending_paths: VecDeque<_> = local_paths.into();
+        let mut probes = tokio::task::JoinSet::new();
+        while probes.len() < MAX_CONCURRENT_SIZE_HINTS {
+            let Some((position, path)) = pending_paths.pop_front() else {
+                break;
+            };
+            probes.spawn(metadata_size_hint(position, path));
+        }
+
+        while let Some(result) = probes.join_next().await {
+            match result {
+                Ok((position, Some(cost))) => costs[position] = Some(cost),
+                Ok((position, None)) => {
+                    tracing::debug!(position, "batch input size hint unavailable; preserving FIFO slot");
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "batch input size hint task failed; preserving FIFO slot");
+                }
+            }
+
+            if let Some((position, path)) = pending_paths.pop_front() {
+                probes.spawn(metadata_size_hint(position, path));
+            }
+        }
+    };
+    if tokio::time::timeout(SIZE_HINT_BUDGET, collect_costs).await.is_err() {
+        tracing::debug!("batch input size hint budget exhausted; preserving unfinished FIFO slots");
+    }
+
+    reorder_pending_batch_items(pending, &costs)
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+async fn metadata_size_hint(position: usize, path: PathBuf) -> (usize, Option<u64>) {
+    let cost = tokio::fs::metadata(path).await.ok().map(|metadata| metadata.len());
+    (position, cost)
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn local_batch_path(input: &ExtractInput, config: &ExtractionConfig) -> Option<PathBuf> {
+    let uri = input.uri.as_deref()?;
+    if uri.starts_with(HTTP_SCHEME) || uri.starts_with(HTTPS_SCHEME) {
+        return None;
+    }
+    if uri.starts_with(FILE_SCHEME) {
+        return config.url.allow_file_uris.then(|| file_uri_to_path(uri).ok()).flatten();
+    }
+    if uri.contains("://") {
+        return None;
+    }
+    config.url.allow_local_file_inputs.then(|| PathBuf::from(uri))
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn reorder_pending_batch_items(
+    pending: VecDeque<PendingBatchItem>,
+    costs: &[Option<u64>],
+) -> VecDeque<PendingBatchItem> {
+    let mut prioritized = Vec::new();
+    let mut prioritized_positions = Vec::new();
+    let mut scheduled = Vec::with_capacity(pending.len());
+
+    for (position, item) in pending.into_iter().enumerate() {
+        if let Some(cost) = costs.get(position).copied().flatten() {
+            prioritized_positions.push(position);
+            prioritized.push((cost, position, item));
+            scheduled.push(None);
+        } else {
+            scheduled.push(Some(item));
+        }
+    }
+
+    prioritized.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    for (position, (_, _, item)) in prioritized_positions.into_iter().zip(prioritized) {
+        scheduled[position] = Some(item);
+    }
+
+    scheduled.into_iter().flatten().collect()
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn classify_layout_batch<'a>(
+    config: &ExtractionConfig,
+    inputs: impl IntoIterator<Item = &'a ExtractInput>,
+) -> crate::core::config::concurrency::LayoutBatchWorkload {
+    #[cfg(layout_detection)]
+    {
+        use crate::core::config::concurrency::LayoutBatchWorkload;
+
+        let mut any_layout_work = false;
+        let mut all_markdown_pdf = true;
+        let mut input_count = 0;
+        for input in inputs {
+            input_count += 1;
+            let effective = resolve_input_config(input, config);
+            let pdf_evidence = pdf_batch_evidence(input);
+            let markdown_pdf = effective.layout.is_some()
+                && effective.use_layout_for_markdown
+                && pdf_evidence == PdfBatchEvidence::Likely;
+            all_markdown_pdf &= markdown_pdf;
+
+            let ocr_layout_may_run = effective.layout.is_some() && !effective.disable_ocr;
+            let markdown_layout_may_run = effective.layout.is_some()
+                && effective.use_layout_for_markdown
+                && pdf_evidence != PdfBatchEvidence::Unlikely;
+            any_layout_work |= ocr_layout_may_run || markdown_layout_may_run;
+        }
+
+        if input_count > 0 && all_markdown_pdf {
+            LayoutBatchWorkload::All
+        } else if any_layout_work {
+            LayoutBatchWorkload::Mixed
+        } else {
+            LayoutBatchWorkload::None
+        }
+    }
+    #[cfg(not(layout_detection))]
+    {
+        let _ = (config, inputs);
+        crate::core::config::concurrency::LayoutBatchWorkload::None
+    }
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32"), layout_detection))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PdfBatchEvidence {
+    Likely,
+    Unlikely,
+    Unknown,
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32"), layout_detection))]
+fn pdf_batch_evidence(input: &ExtractInput) -> PdfBatchEvidence {
+    const PDF_HEADER_MAGIC: &[u8] = b"%PDF-";
+
+    if input.kind == ExtractInputKind::Bytes
+        && input
+            .bytes
+            .as_deref()
+            .is_some_and(|bytes| bytes.starts_with(PDF_HEADER_MAGIC))
+    {
+        return PdfBatchEvidence::Likely;
+    }
+    if input.mime_type.as_deref().is_some_and(is_pdf_mime) {
+        return PdfBatchEvidence::Likely;
+    }
+    if input.mime_type.is_some() {
+        return PdfBatchEvidence::Unlikely;
+    }
+
+    match input.kind {
+        ExtractInputKind::Bytes => match input.bytes.as_deref() {
+            Some(_) => PdfBatchEvidence::Unlikely,
+            None => PdfBatchEvidence::Unknown,
+        },
+        ExtractInputKind::Uri => input
+            .uri
+            .as_deref()
+            .map(uri_pdf_evidence)
+            .unwrap_or(PdfBatchEvidence::Unknown),
+    }
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32"), layout_detection))]
+fn is_pdf_mime(mime_type: &str) -> bool {
+    mime_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/pdf"))
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32"), layout_detection))]
+fn uri_pdf_evidence(uri: &str) -> PdfBatchEvidence {
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension) if extension.eq_ignore_ascii_case("pdf") => PdfBatchEvidence::Likely,
+        Some(_) => PdfBatchEvidence::Unlikely,
+        None => PdfBatchEvidence::Unknown,
+    }
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn resolve_engine_batch_execution_plan_for(
+    config: &ExtractionConfig,
+    layout_workload: crate::core::config::concurrency::LayoutBatchWorkload,
+    input_count: usize,
+) -> crate::core::config::concurrency::BatchExecutionPlan {
+    crate::core::config::concurrency::resolve_batch_execution_plan(
+        config.concurrency.as_ref(),
+        layout_workload,
+        input_count,
+        config.max_concurrent_extractions,
+    )
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+async fn run_bounded_batch_tasks<T, F, Fut>(
+    mut pending: VecDeque<T>,
+    max_concurrent: usize,
+    mut task: F,
+) -> Result<Vec<BatchItemResult>>
+where
+    T: Send + 'static,
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = BatchItemResult> + Send + 'static,
+{
+    use tokio::task::JoinSet;
+
+    let mut tasks = JoinSet::new();
+    let max_concurrent = max_concurrent.max(1);
+    while tasks.len() < max_concurrent {
+        let Some(item) = pending.pop_front() else {
+            break;
+        };
+        tasks.spawn(task(item));
+    }
+
+    let mut completed = Vec::with_capacity(tasks.len() + pending.len());
+    while let Some(task_result) = tasks.join_next().await {
+        let item = task_result.map_err(|error| XbergError::Other(format!("batch task failed to join: {error}")))?;
+        completed.push(item);
+        if let Some(next) = pending.pop_front() {
+            tasks.spawn(task(next));
+        }
+    }
+    Ok(completed)
+}
+
 /// Owned http(s) URI of an input eligible for the shared-URL batch group.
 ///
 /// Returns `None` for non-URI inputs and for URIs that are not http(s) (bytes,
 /// file paths, `file://`, and other schemes stay on the per-item path).
-#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion"))]
+#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion", not(target_arch = "wasm32")))]
 fn shared_group_uri(input: &ExtractInput) -> Option<String> {
     if !matches!(input.kind, ExtractInputKind::Uri) {
         return None;
@@ -227,7 +697,7 @@ fn shared_group_uri(input: &ExtractInput) -> Option<String> {
 
 /// One http(s) URL routed through the shared crawl engine, carrying everything
 /// needed to map the (completion-order) batch result back to its input slot.
-#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion"))]
+#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion", not(target_arch = "wasm32")))]
 struct SharedUrlItem {
     index: usize,
     source: String,
@@ -247,7 +717,7 @@ struct SharedUrlItem {
 /// `output_from_crawl`), which is what [`finalize_shared_item`] wraps. This is
 /// the precise nuance that differs from the per-item path, where the same
 /// timeout also bounds the fetch.
-#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion"))]
+#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion", not(target_arch = "wasm32")))]
 async fn run_shared_url_group(
     inner: &super::EngineInner,
     base_config: &ExtractionConfig,
@@ -256,12 +726,9 @@ async fn run_shared_url_group(
 ) {
     use std::collections::HashMap;
 
-    // Build the crawl engine ONCE for the shared batch config.
     let engine = match inner.crawl_engine_for(&base_config.url.crawl) {
         Ok(engine) => engine,
         Err(error) => {
-            // Construction/validation fails identically for every shared URL
-            // (they share one crawl config): isolate it into each error slot.
             for shared in &shared_items {
                 items[shared.index] = Some(BatchItemResult {
                     index: shared.index,
@@ -273,9 +740,6 @@ async fn run_shared_url_group(
         }
     };
 
-    // crawlberg returns results PAIRED WITH THE SEED URL IN COMPLETION ORDER,
-    // not input order. A per-URL queue of positions restores input order and
-    // maps duplicate URLs to the correct successive input slots.
     let mut positions_for_url: HashMap<&str, VecDeque<usize>> = HashMap::new();
     for (position, shared) in shared_items.iter().enumerate() {
         positions_for_url
@@ -285,12 +749,8 @@ async fn run_shared_url_group(
     }
     let urls: Vec<&str> = shared_items.iter().map(|shared| shared.uri.as_str()).collect();
 
-    // Crawl results whose URL key matches no queued input position (most
-    // commonly a panicked task, which crawlberg reports as an empty-URL
-    // `("", Err(..))` pair — see crawlberg `batch.rs`). Their errors are captured
-    // here and re-attached to dropped input slots in the sweep below, rather than
-    // silently discarded.
     let mut unmatched_errors: VecDeque<XbergError> = VecDeque::new();
+    let batch_started = Instant::now();
 
     match base_config.url.mode {
         UrlExtractionMode::Auto | UrlExtractionMode::Document => {
@@ -308,7 +768,7 @@ async fn run_shared_url_group(
                         Err(error) => Err(map_crawl_error(error)),
                     }
                 };
-                items[shared.index] = Some(finalize_shared_item(shared, conversion).await);
+                items[shared.index] = Some(finalize_shared_item(shared, batch_started, conversion).await);
             }
         }
         UrlExtractionMode::Crawl => {
@@ -326,7 +786,7 @@ async fn run_shared_url_group(
                         Err(error) => Err(map_crawl_error(error)),
                     }
                 };
-                items[shared.index] = Some(finalize_shared_item(shared, conversion).await);
+                items[shared.index] = Some(finalize_shared_item(shared, batch_started, conversion).await);
             }
         }
     }
@@ -342,7 +802,7 @@ async fn run_shared_url_group(
 /// input would vanish from BOTH `results` and `errors` while `summary.inputs`
 /// still counts it. Re-attach a captured unmatched error when one is available
 /// (FIFO), otherwise synthesize one carrying the input's URL.
-#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion"))]
+#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion", not(target_arch = "wasm32")))]
 fn fill_dropped_shared_slots(
     shared_items: &[SharedUrlItem],
     items: &mut [Option<BatchItemResult>],
@@ -364,12 +824,15 @@ fn fill_dropped_shared_slots(
 
 /// Apply batch-mode context, the per-item conversion timeout, and duration
 /// metadata to a shared-URL conversion future, mirroring `run_batch_item`.
-#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion"))]
-async fn finalize_shared_item<Fut>(shared: &SharedUrlItem, conversion: Fut) -> BatchItemResult
+///
+/// `batch_started` precedes the shared fetch, so reported duration covers both
+/// fetch and conversion. The timeout still starts immediately before conversion.
+#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion", not(target_arch = "wasm32")))]
+async fn finalize_shared_item<Fut>(shared: &SharedUrlItem, batch_started: Instant, conversion: Fut) -> BatchItemResult
 where
     Fut: Future<Output = Result<ExtractionResult>>,
 {
-    let start = Instant::now();
+    let conversion_started = Instant::now();
     let future = Box::pin(crate::core::batch_mode::with_batch_mode(conversion));
 
     let mut result = match shared.config.extraction_timeout_secs {
@@ -380,7 +843,7 @@ where
                     token.cancel();
                 }
                 Err(XbergError::Timeout {
-                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    elapsed_ms: conversion_started.elapsed().as_millis() as u64,
                     limit_ms: secs * 1000,
                 })
             }
@@ -389,7 +852,7 @@ where
     };
 
     if let Ok(ref mut item_output) = result {
-        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let elapsed_ms = batch_started.elapsed().as_millis() as u64;
         for extraction_result in &mut item_output.results {
             extraction_result.metadata.extraction_duration_ms = Some(elapsed_ms);
         }
@@ -404,7 +867,7 @@ where
 
 /// Rebuild a non-cloneable crawl-engine construction error so the identical
 /// failure can be isolated into every shared-URL error slot.
-#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion"))]
+#[cfg(all(feature = "tokio-runtime", feature = "url-ingestion", not(target_arch = "wasm32")))]
 fn duplicate_construction_error(error: &XbergError) -> XbergError {
     match error {
         XbergError::Validation { message, .. } => XbergError::validation(message.clone()),
@@ -413,18 +876,17 @@ fn duplicate_construction_error(error: &XbergError) -> XbergError {
     }
 }
 
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 struct BatchItemResult {
     index: usize,
     source: String,
     result: Result<ExtractionResult>,
 }
 
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 async fn run_batch_item<F, Fut>(
     index: usize,
     source: String,
-    semaphore: Arc<tokio::sync::Semaphore>,
     timeout_secs: Option<u64>,
     cancel_token: Option<crate::cancellation::CancellationToken>,
     extract_fn: F,
@@ -433,18 +895,6 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<ExtractionResult>>,
 {
-    let permit = match semaphore.acquire_owned().await {
-        Ok(permit) => permit,
-        Err(error) => {
-            return BatchItemResult {
-                index,
-                source,
-                result: Err(XbergError::Other(format!(
-                    "batch concurrency semaphore closed: {error}"
-                ))),
-            };
-        }
-    };
     let start = Instant::now();
     let extraction_future = Box::pin(crate::core::batch_mode::with_batch_mode(Box::pin(extract_fn())));
 
@@ -471,7 +921,6 @@ where
         }
     }
 
-    drop(permit);
     BatchItemResult { index, source, result }
 }
 
@@ -505,12 +954,43 @@ fn resolve_input_config(input: &ExtractInput, base_config: &ExtractionConfig) ->
 /// Resolve config for batch items, taking Arc<ExtractionConfig> to avoid unnecessary clones.
 /// When there are no per-item overrides, this returns Arc::clone (cheap reference increment)
 /// rather than cloning the inner ExtractionConfig.
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 fn resolve_input_config_arc(input: &ExtractInput, base_config: &Arc<ExtractionConfig>) -> Arc<ExtractionConfig> {
     match input.config.as_ref() {
         Some(overrides) => Arc::new(base_config.with_file_overrides(overrides)),
         None => Arc::clone(base_config),
     }
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn resolve_batch_input_config(
+    input: &ExtractInput,
+    base_config: &Arc<ExtractionConfig>,
+    thread_budget: usize,
+) -> Arc<ExtractionConfig> {
+    let resolved = resolve_input_config_arc(input, base_config);
+    if crate::core::config::concurrency::resolve_thread_budget(resolved.concurrency.as_ref()) == thread_budget {
+        return resolved;
+    }
+
+    let mut resolved = Arc::unwrap_or_clone(resolved);
+    resolved.concurrency = Some(crate::core::config::ConcurrencyConfig {
+        max_threads: Some(thread_budget),
+    });
+    Arc::new(resolved)
+}
+
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+fn resolve_batch_base_config(base_config: &Arc<ExtractionConfig>, thread_budget: usize) -> Arc<ExtractionConfig> {
+    if crate::core::config::concurrency::resolve_thread_budget(base_config.concurrency.as_ref()) == thread_budget {
+        return Arc::clone(base_config);
+    }
+
+    let mut resolved = (**base_config).clone();
+    resolved.concurrency = Some(crate::core::config::ConcurrencyConfig {
+        max_threads: Some(thread_budget),
+    });
+    Arc::new(resolved)
 }
 
 async fn extract_one_resolved(
@@ -529,8 +1009,6 @@ async fn extract_bytes_input(input: ExtractInput, config: &ExtractionConfig, ind
         .bytes
         .ok_or_else(|| XbergError::validation("extract input kind 'bytes' requires the 'bytes' field".to_string()))?;
     let mime_type = resolve_bytes_mime_type(input.mime_type.as_deref(), input.filename.as_deref(), &bytes)?;
-    // Thread the source filename so extractors can fall back to extension-based
-    // language detection (e.g. tree-sitter) when content sniffing is inconclusive.
     let mut cfg = config.clone();
     cfg.source_name = input.filename.as_deref().map(str::to_string);
     let mut result = Box::pin(extract_bytes(&bytes, &mime_type, &cfg)).await?;
@@ -727,7 +1205,23 @@ async fn output_from_crawl(
 ) -> Result<ExtractionResult> {
     let final_url = crawl.final_url.clone();
     let redirect_count = crawl.redirect_count;
-    let unique_normalized_urls = crawl.normalized_urls.clone();
+    // Derived from `pages`, not from the deprecated `CrawlResult::normalized_urls`.
+    // That field is no longer populated upstream — crawlberg 1.2.x keeps it only to
+    // avoid a breaking field removal and `CrawlResult::new` drops the value on the
+    // floor — so reading it yielded an always-empty `Vec` and silently lost every
+    // crawled URL from the summary. `CrawlResult::unique_normalized_urls()` is the
+    // documented replacement but returns a *count*; `merge_crawl_summary` needs the
+    // strings themselves, so mirror that method's own derivation instead. Dedup here
+    // matches its `AHashSet` semantics while preserving first-seen order. ~keep
+    let unique_normalized_urls = {
+        let mut seen = std::collections::HashSet::new();
+        crawl
+            .pages
+            .iter()
+            .filter(|page| seen.insert(page.normalized_url.as_str()))
+            .map(|page| page.normalized_url.clone())
+            .collect::<Vec<String>>()
+    };
     let crawl_error = crawl.error.clone();
     let mut output = ExtractionResult {
         summary: ExtractionSummary {
@@ -808,14 +1302,10 @@ fn merge_crawl_summary(
 /// `extract_bytes` handles it via content sniffing.
 #[cfg(feature = "url-ingestion")]
 fn refine_downloaded_mime_type(mime_type: &str, filename: Option<&str>, url: &str) -> String {
-    // Trust explicit, non-generic MIME types from the server.
     if mime_type != "application/octet-stream" {
         return mime_type.to_string();
     }
 
-    // Attempt extension-based detection from the filename (crawlberg derives this from
-    // the URL path or Content-Disposition header). This reaches the tree-sitter language
-    // detection path for source-code extensions (.py → text/x-source-code).
     if let Some(name) = filename
         && let Ok(detected) = crate::core::mime::detect_mime_type(name, false)
         && crate::core::mime::validate_mime_type(&detected).is_ok()
@@ -829,9 +1319,6 @@ fn refine_downloaded_mime_type(mime_type: &str, filename: Option<&str>, url: &st
         return detected;
     }
 
-    // No usable filename hint, or detected MIME is unsupported: fall through to the
-    // octet-stream handling in extract_bytes (content sniffing / tree-sitter content
-    // detection).
     mime_type.to_string()
 }
 

@@ -2,6 +2,15 @@
 	"id": "extract_batch_bytes_size_cap",
 	"category": "batch",
 	"description": "extract_batch: archive size cap triggers error",
+	"docs": {
+		"topic": "batch",
+		"title": "extract_batch: archive size cap triggers error",
+		"description": "extract_batch: archive size cap triggers error",
+		"presentation": {
+			"files": [{ "field": "/inputs/0/bytes", "path": "test_documents/text/fake_text.txt" }]
+		},
+		"side_effects": "safe"
+	},
 	"call": "extract_batch",
 	"skip": {
 		"languages": [
@@ -11,11 +20,9 @@
 			"php",
 			"wasm",
 			"go",
-			"r",
 			"ruby",
 			"csharp",
 			"elixir",
-			"kotlin",
 			"kotlin_android",
 			"swift",
 			"zig",

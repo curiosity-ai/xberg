@@ -1,0 +1,15 @@
+{
+  "name": "xberg",
+  "description": "Document intelligence for coding agents, by Kreuzberg, Inc.",
+  "owner": {
+    "name": "Kreuzberg, Inc.",
+    "email": "contact@xberg.io"
+  },
+  "plugins": [
+    {
+      "name": "xberg",
+      "description": "Local document extraction: text, tables, metadata, images from 101 formats with optional OCR.",
+      "source": "./plugin"
+    }
+  ]
+}

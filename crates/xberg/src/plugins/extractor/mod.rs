@@ -378,16 +378,6 @@ mod tests {
         assert_eq!(result.mime_type, "application/json");
     }
 
-    // ── Lifecycle free-function tests ────────────────────────────────────────
-
-    /// Unique MIME type per test to avoid collisions in the shared global registry.
-    fn unique_mime(suffix: &str) -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("application/x-test-{suffix}-{id}")
-    }
-
     struct LifecycleMock {
         mime: String,
     }
@@ -419,33 +409,48 @@ mod tests {
         }
 
         fn supported_mime_types(&self) -> &[&str] {
-            // Safety: self-referential slice kept alive for the duration of the call.
-            // Tests do not inspect MIME registration; this is only for Plugin::name uniqueness.
             &[]
         }
     }
 
+    /// Registers/unregisters a uniquely-named extractor against the *global* registry and
+    /// checks membership rather than the full list, so the assertions hold regardless of
+    /// whatever else is concurrently registered globally by other tests in this binary.
     #[test]
     fn register_list_unregister_roundtrip() {
-        let mime = unique_mime("rlu");
+        let mime = "application/x-mock-rlu".to_string();
         let extractor = Arc::new(LifecycleMock { mime: mime.clone() });
 
         register_document_extractor(Arc::clone(&extractor) as Arc<dyn DocumentExtractor>).unwrap();
-        assert!(list_document_extractors().unwrap().contains(&mime));
+        assert!(
+            list_document_extractors().unwrap().contains(&mime),
+            "the newly registered extractor must be listed"
+        );
 
         unregister_document_extractor(&mime).unwrap();
-        assert!(!list_document_extractors().unwrap().contains(&mime));
+        assert!(
+            !list_document_extractors().unwrap().contains(&mime),
+            "the unregistered extractor must no longer be listed"
+        );
     }
 
+    /// Exercises register/list/clear against a *local* registry instance instead of the
+    /// process-global one, since `clear_document_extractors()` empties the global registry
+    /// outright and would race any concurrently running extraction test that relies on it.
     #[test]
     fn register_list_clear_list_roundtrip() {
-        let mime = unique_mime("rlcl");
+        use crate::plugins::registry::DocumentExtractorRegistry;
+
+        let mime = "application/x-mock-rlcl".to_string();
         let extractor = Arc::new(LifecycleMock { mime: mime.clone() });
 
-        register_document_extractor(Arc::clone(&extractor) as Arc<dyn DocumentExtractor>).unwrap();
-        assert!(list_document_extractors().unwrap().contains(&mime));
+        let mut registry = DocumentExtractorRegistry::new();
+        registry
+            .register(Arc::clone(&extractor) as Arc<dyn DocumentExtractor>)
+            .unwrap();
+        assert_eq!(registry.list(), vec![mime]);
 
-        clear_document_extractors().unwrap();
-        assert!(!list_document_extractors().unwrap().contains(&mime));
+        registry.clear().unwrap();
+        assert!(registry.list().is_empty());
     }
 }

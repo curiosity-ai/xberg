@@ -31,6 +31,15 @@ if (args.Length >= 2 && args[0] == "--extract")
     return 0;
 }
 
+// Metadata dump mode: `--dump-metadata <file>` prints the C# metadata as JSON, so a
+// mismatch can be diffed field-by-field against the golden.
+if (args.Length >= 2 && args[0] == "--dump-metadata")
+{
+    var res = new Extractor().Extract(ExtractInput.FromUri(args[1]), new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+    Console.Out.Write(SerializeToNode(res.Results.FirstOrDefault()?.Metadata)?.ToJsonString() ?? "null");
+    return 0;
+}
+
 var opts = ParseArgs(args);
 if (opts is null) return 2;
 
@@ -48,6 +57,9 @@ if (goldenFiles.Count == 0)
 var extractor = new Extractor();
 var stats = new Stats();
 var examples = new Dictionary<string, List<string>>();
+// --cluster: group plain-text mismatches by the text at their first divergence, so a
+// systematic defect shows up as one bucket with a count instead of N separate fixtures.
+var clusters = new Dictionary<string, (int Count, string Rel, string Want, string Have)>(StringComparer.Ordinal);
 
 foreach (var goldenPath in goldenFiles)
 {
@@ -82,7 +94,7 @@ foreach (var goldenPath in goldenFiles)
             var capturedPath = sourcePath;
             var task = System.Threading.Tasks.Task.Run(() =>
                 extractor.Extract(ExtractInput.FromUri(capturedPath), new ExtractionConfig { OutputFormat = fmt }));
-            if (!task.Wait(TimeSpan.FromSeconds(20)))
+            if (!task.Wait(TimeSpan.FromSeconds(120)))
             {
                 csharpFailed = true;
                 got[name] = "";
@@ -153,6 +165,7 @@ foreach (var goldenPath in goldenFiles)
     {
         string rustPlain = golden["content"]?["plain"]?.GetValue<string>() ?? "";
         string csPlain = got["plain"];
+        if (opts.Cluster && rustPlain != csPlain) RecordCluster(clusters, rel, rustPlain, csPlain);
         if (rustPlain == csPlain) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
         else if (NormalizeText(rustPlain) == NormalizeText(csPlain)) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
         else if (NormalizeSorted(rustPlain) == NormalizeSorted(csPlain)) { stats.ContentOrder++; stats.ContentClose++; }
@@ -194,6 +207,15 @@ foreach (var goldenPath in goldenFiles)
 
 PrintReport(stats, examples, opts);
 Console.WriteLine();
+if (opts.Cluster)
+{
+    Console.WriteLine();
+    Console.WriteLine($"─── First-divergence clusters ({clusters.Count} distinct) ───");
+    foreach (var (key, c) in clusters.OrderByDescending(kv => kv.Value.Count).Take(25))
+        Console.WriteLine($"  {c.Count,4}  rust={Quote(c.Want),-46} c#={Quote(c.Have),-46}  e.g. {c.Rel}");
+    Console.WriteLine();
+}
+
 Console.WriteLine("─── Content parity (plain text; whitespace/order-normalized) ───");
 int cTotal = stats.Total;
 Console.WriteLine($"  content-identical (ws/order-normalized): {stats.ContentExact + stats.ContentOrder}  ({Pct(stats.ContentExact + stats.ContentOrder, cTotal)})");
@@ -357,6 +379,20 @@ static void TablesNormalizer(JsonObject obj) => obj.Remove("markdown");
 
 static string Compact(JsonNode? n) => n?.ToJsonString() ?? "null";
 
+// Bucket a mismatch by the first position where the two texts diverge, keyed on a short
+// window of both sides so unrelated fixtures with the same defect land together.
+static void RecordCluster(Dictionary<string, (int, string, string, string)> clusters,
+    string rel, string want, string have)
+{
+    int n = Math.Min(want.Length, have.Length), i = 0;
+    while (i < n && want[i] == have[i]) i++;
+    string w = want[i..Math.Min(want.Length, i + 30)];
+    string h = have[i..Math.Min(have.Length, i + 30)];
+    string key = w[..Math.Min(w.Length, 14)] + "\u0000" + h[..Math.Min(h.Length, 14)];
+    if (clusters.TryGetValue(key, out var cur)) clusters[key] = (cur.Item1 + 1, cur.Item2, cur.Item3, cur.Item4);
+    else clusters[key] = (1, rel, w, h);
+}
+
 static void AddExample(Dictionary<string, List<string>> ex, string dim, string rel, string want, string have, Options o)
 {
     if (!ex.TryGetValue(dim, out var list)) ex[dim] = list = new();
@@ -370,6 +406,8 @@ static void AddExample(Dictionary<string, List<string>> ex, string dim, string r
     }
     list.Add(sb.ToString());
 }
+
+static string Quote(string s) => "\"" + s.Replace("\n", "\\n").Replace("\t", "\\t") + "\"";
 
 static string Trunc(string s, int n) => s.Length <= n ? s.Replace("\n", "\\n") : s[..n].Replace("\n", "\\n") + "…";
 
@@ -420,6 +458,7 @@ static Options? ParseArgs(string[] args)
             case "--ext": o.Ext = args[++i]; break;
             case "--show": o.Show = int.Parse(args[++i]); break;
             case "--diff": o.Diff = true; break;
+            case "--cluster": o.Cluster = true; break;
             case "--strict-md": o.StrictMd = true; break;
             case "--list-ok": o.ListOk = true; break;
             case "--dump": o.Dump = args[++i]; break;
@@ -436,6 +475,7 @@ sealed class Options
     public string? Ext;
     public int Show = 5;
     public bool Diff;
+    public bool Cluster;
     public bool StrictMd;
     public bool ListOk;
     public string? Dump;

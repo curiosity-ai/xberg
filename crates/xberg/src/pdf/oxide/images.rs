@@ -29,139 +29,34 @@ fn detect_image_format_from_bytes(data: &[u8]) -> &'static str {
     } else if data.starts_with(b"BM") {
         "bmp"
     } else if data.len() >= 8 && data[0..4] == [0x00, 0x00, 0x00, 0x0C] && data[4..8] == [0x6A, 0x50, 0x20, 0x20] {
-        // JPEG 2000: 12-byte box starting with length 0x0000000C and type "jP  "
         "jpeg2000"
     } else {
         "raw"
     }
 }
 
-/// Extract at most `limit` images from a page by walking its XObject resource dictionary.
+/// Extract at most `limit` images in content-stream paint order.
 ///
-/// Unlike `doc.doc.extract_images(page_idx)` which decompresses every image on the page
-/// before returning, this function stops after `limit` successful decompressions, avoiding
-/// the eager-API cost for images beyond the cap.
-///
-/// **Trade-offs vs. `extract_images()`**:
-/// - Does not cover inline images (`BI`/`EI` content stream operators). Those are rare in
-///   practice for PDFs that embed large numbers of images.
-/// - Uses XObject resource dictionary order sorted alphabetically for determinism.
-///   Content stream `Do`-operator order may differ.
-///
-/// On any error accessing the resource dictionary the function returns an empty vec.
-/// The caller may then fall back to the full eager path.
-fn extract_n_images_from_xobject_resources(
+/// `page_image_handles` performs the cheap content-stream/CTM pass first, allowing
+/// the cap to be applied before image decompression while preserving bounding boxes,
+/// inline images, and images nested in Form XObjects.
+fn extract_n_images_from_page_handles(
     doc: &OxideDocument,
     page_idx: usize,
     limit: usize,
 ) -> Result<Vec<pdf_oxide::extractors::PdfImage>> {
-    let resources = match doc.doc.get_page_resources(page_idx) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(page = page_idx, "get_page_resources failed: {e}");
-            return Ok(Vec::new());
-        }
-    };
-
-    let res_dict = match resources.as_dict() {
-        Some(d) => d,
-        None => return Ok(Vec::new()),
-    };
-
-    let xobj_entry = match res_dict.get("XObject") {
-        Some(x) => x,
-        None => return Ok(Vec::new()),
-    };
-
-    // Resolve the XObject dictionary (it may be an indirect reference).
-    let xobj_owned;
-    let xobj_obj = if let Some(r) = xobj_entry.as_reference() {
-        match doc.doc.load_object(r) {
-            Ok(o) => {
-                xobj_owned = o;
-                &xobj_owned
-            }
-            Err(e) => {
-                tracing::debug!(page = page_idx, "load XObject dict ref failed: {e}");
-                return Ok(Vec::new());
-            }
-        }
-    } else {
-        xobj_entry
-    };
-
-    let xobj_dict = match xobj_obj.as_dict() {
-        Some(d) => d,
-        None => return Ok(Vec::new()),
-    };
-
-    // Collect and sort keys for deterministic ordering across calls.
-    let mut names: Vec<String> = xobj_dict.keys().cloned().collect();
-    names.sort();
-
+    let handles = doc.doc.page_image_handles(page_idx).map_err(|error| {
+        PdfError::ExtractionFailed(format!(
+            "enumerating image handles for PDF page {}: {error}",
+            page_idx + 1
+        ))
+    })?;
     let mut images = Vec::new();
-
-    for name in &names {
-        if images.len() >= limit {
-            break;
-        }
-
-        let val = match xobj_dict.get(name.as_str()) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let obj_ref = val.as_reference();
-
-        // Fast skip: is_form_xobject peeks at /Subtype without loading the stream.
-        // Returns true for Form XObjects (and conservatively for unknowns) so that
-        // we do not waste a load_object call on non-image XObjects.
-        if let Some(r) = obj_ref
-            && doc.doc.is_form_xobject(r)
-        {
-            continue;
-        }
-
-        // Load the XObject: fetches the stream dictionary + compressed bytes.
-        // Decompression (the expensive step) happens inside extract_image_from_xobject.
-        let loaded;
-        let xobj = if let Some(r) = obj_ref {
-            match doc.doc.load_object(r) {
-                Ok(o) => {
-                    loaded = o;
-                    &loaded
-                }
-                Err(e) => {
-                    tracing::debug!(page = page_idx, xobject = %name, "load XObject failed: {e}");
-                    continue;
-                }
-            }
-        } else {
-            val
-        };
-
-        // Guard: verify /Subtype = /Image before decompressing. is_form_xobject
-        // returns true (conservative) for some non-Image types, so this check
-        // filters those that slipped through.
-        if xobj.as_dict().and_then(|d| d.get("Subtype")).and_then(|s| s.as_name()) != Some("Image") {
-            continue;
-        }
-
-        // Decompress. This is the expensive step — it happens at most `limit` times
-        // per page, which is what this function is designed to guarantee.
-        match pdf_oxide::extractors::extract_image_from_xobject(
-            Some(&doc.doc),
-            xobj,
-            obj_ref,
-            None, // color_space_map: document-level resolution via doc
-        ) {
+    for handle in handles.into_iter().take(limit) {
+        match handle.decode() {
             Ok(img) => images.push(img),
-            Err(e) => {
-                tracing::debug!(
-                    page = page_idx,
-                    xobject = %name,
-                    "image decompression failed: {e}"
-                );
+            Err(error) => {
+                tracing::debug!(page = page_idx, "image decompression failed: {error}");
             }
         }
     }
@@ -224,9 +119,106 @@ fn raw_pixels_to_png(w: u32, h: u32, format: &pdf_oxide::extractors::PixelFormat
     Ok(Bytes::from(png_bytes))
 }
 
+/// Build the `ProcessingWarning` for an image that was dropped because its raw
+/// pixel buffer could not be re-encoded (issue #71). Previously this case only
+/// logged via `tracing::warn!`, so callers had no structured signal that the
+/// output `images` array is shorter than the document's actual image count.
+fn unencodable_image_warning(image_index: u32, page_number: u32, error: &PdfError) -> crate::types::ProcessingWarning {
+    crate::types::ProcessingWarning {
+        source: std::borrow::Cow::Borrowed("pdf_images"),
+        message: std::borrow::Cow::Owned(format!(
+            "skipped image {image_index} on page {page_number}: could not be re-encoded from raw \
+             pixel data ({error})"
+        )),
+    }
+}
+
+/// Collect OCR-ready image bytes for every image XObject on `page_idx`, for use as a
+/// `force_ocr` fallback when whole-page rasterization silently dropped an undecodable
+/// image (issue #1355).
+///
+/// `page_image_handles` is a cheap content-stream/CTM pass that succeeds even when the
+/// renderer could not paint an image (e.g. an unsupported codec that pdf_oxide's page
+/// renderer silently substitutes with a blank page). For each handle:
+/// - `decode()` success → re-encode raw pixels to PNG, or pass the embedded JPEG through
+///   as-is.
+/// - `decode()` failure on a DCTDecode/JPXDecode stream → hand back the raw compressed
+///   bytes, which are a valid standalone JPEG/JP2 file the OCR backend can decode itself.
+/// - Any other failure → skip the image; there is no way to recover pixel data from it.
+///
+/// Returned in content-stream paint order; empty when the page has no image XObjects or
+/// none of them yielded usable bytes.
+///
+// Available under `ocr-pipeline` too (not just `ocr`): `extract_with_ocr` — the sole
+// caller — is gated `any(ocr, ocr-pipeline)`, and the `binstall` CLI profile pulls
+// `ocr-pipeline` (via `liter-llm`) without `ocr`. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(crate) fn page_ocr_fallback_image_bytes(doc: &pdf_oxide::PdfDocument, page_idx: usize) -> Vec<Bytes> {
+    let handles = match doc.page_image_handles(page_idx) {
+        Ok(h) => h,
+        Err(error) => {
+            tracing::debug!(
+                page = page_idx,
+                "force_ocr fallback: enumerating image handles failed: {error}"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::with_capacity(handles.len());
+    for handle in &handles {
+        match handle.decode() {
+            Ok(img) => match img.data() {
+                pdf_oxide::extractors::ImageData::Jpeg(jpeg_bytes) => out.push(Bytes::copy_from_slice(jpeg_bytes)),
+                pdf_oxide::extractors::ImageData::Raw { pixels, format } => {
+                    match raw_pixels_to_png(img.width(), img.height(), format, pixels) {
+                        Ok(bytes) => out.push(bytes),
+                        Err(error) => {
+                            tracing::debug!(page = page_idx, "force_ocr fallback: raw re-encode failed: {error}");
+                        }
+                    }
+                }
+            },
+            Err(decode_err) => {
+                let passthrough = matches!(
+                    handle.filter_chain.last(),
+                    Some(pdf_oxide::PdfFilter::DCTDecode) | Some(pdf_oxide::PdfFilter::JPXDecode)
+                );
+                if passthrough {
+                    match handle.raw_compressed_bytes() {
+                        Ok(raw) if matches!(detect_image_format_from_bytes(&raw), "jpeg" | "jpeg2000") => {
+                            out.push(Bytes::from(raw));
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                page = page_idx,
+                                "force_ocr fallback: raw bytes not a recognizable JPEG/JP2"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                page = page_idx,
+                                "force_ocr fallback: raw_compressed_bytes failed: {error}"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        page = page_idx,
+                        "force_ocr fallback: undecodable image, non-JPEG codec: {decode_err}"
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Extract full image data from all pages of a PDF.
 ///
-/// Returns a `Vec<ExtractedImage>` with complete image data and metadata.
+/// Returns a `Vec<ExtractedImage>` with complete image data and metadata, plus any
+/// non-fatal `ProcessingWarning`s produced along the way (e.g. an image that could
+/// not be re-encoded and was skipped — see issue #71).
 /// When image extraction is disabled or no images are found, returns an empty vec.
 ///
 /// # Arguments
@@ -237,15 +229,15 @@ fn raw_pixels_to_png(w: u32, h: u32, format: &pdf_oxide::extractors::PixelFormat
 ///
 /// # Returns
 ///
-/// A `Vec<ExtractedImage>` containing all extracted images with their data.
+/// A `Vec<ExtractedImage>` containing all extracted images with their data, and a
+/// `Vec<ProcessingWarning>` describing any images that were skipped.
 pub(crate) fn extract_images_with_data(
     doc: &mut OxideDocument,
     max_images_per_page: Option<u32>,
     cancel_token: Option<&CancellationToken>,
-) -> Result<Vec<crate::types::ExtractedImage>> {
-    // When the cap is zero no image can ever pass through — skip decompression entirely.
+) -> Result<(Vec<crate::types::ExtractedImage>, Vec<crate::types::ProcessingWarning>)> {
     if max_images_per_page == Some(0) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     tracing::debug!(
@@ -260,26 +252,33 @@ pub(crate) fn extract_images_with_data(
         .map_err(|e| PdfError::MetadataExtractionFailed(format!("pdf_oxide: failed to get page count: {e}")))?;
 
     let mut all_images = Vec::new();
+    let mut warnings = Vec::new();
     let mut global_index = 0u32;
+
+    // Tagged-PDF `/Alt` text for `Figure` structure elements, keyed by 0-based page
+    // index (issue #62). Empty for the (common) untagged-PDF case.
+    let mut alt_text_by_page = super::hierarchy::extract_figure_alt_text_by_page(doc);
 
     for page_idx in 0..page_count {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             break;
         }
 
-        // For a positive cap use XObject resource enumeration to stop decompression
-        // after `limit` images. This avoids the eager cost of pdf_oxide::extract_images
-        // which decompresses every image on the page before returning.
-        // Fallback: if the XObject path returns nothing (e.g. page uses only inline
-        // images), retry with the full eager path and apply .take() manually.
-        // xberg#989 tracks getting inline-image support into the capped path.
         let oxide_images = match max_images_per_page.map(|n| n as usize) {
             Some(limit) => {
-                let xobj_images = extract_n_images_from_xobject_resources(doc, page_idx, limit).unwrap_or_default();
-                if !xobj_images.is_empty() {
-                    xobj_images
+                let handle_images = match extract_n_images_from_page_handles(doc, page_idx, limit) {
+                    Ok(images) => images,
+                    Err(error) => {
+                        tracing::debug!(
+                            page = page_idx,
+                            "capped image-handle extraction failed; falling back to eager extraction: {error}"
+                        );
+                        Vec::new()
+                    }
+                };
+                if !handle_images.is_empty() {
+                    handle_images
                 } else {
-                    // Fallback: page may use only inline images.
                     match doc.doc.extract_images(page_idx) {
                         Ok(imgs) => imgs.into_iter().take(limit).collect(),
                         Err(e) => {
@@ -298,14 +297,16 @@ pub(crate) fn extract_images_with_data(
             },
         };
 
-        let page_number = (page_idx + 1) as u32; // Xberg uses 1-indexed page numbers
-        for oxide_img in &oxide_images {
+        let page_number = (page_idx + 1) as u32;
+        let page_alt_texts = alt_text_by_page.remove(&(page_idx as u32));
+        for (page_image_position, oxide_img) in oxide_images.iter().enumerate() {
+            let alt_text = page_alt_texts
+                .as_ref()
+                .and_then(|alts| alts.get(page_image_position))
+                .and_then(|alt| alt.clone());
             let (data, format) = match oxide_img.data() {
                 pdf_oxide::extractors::ImageData::Jpeg(jpeg_bytes) => {
                     let data_bytes = Bytes::copy_from_slice(jpeg_bytes);
-                    // Validate that the data actually starts with JPEG magic bytes.
-                    // pdf_oxide may return JPEG format for data that lacks proper headers,
-                    // so detect the actual format from magic bytes.
                     let actual_format = detect_image_format_from_bytes(data_bytes.as_ref());
                     (data_bytes, Cow::Borrowed(actual_format))
                 }
@@ -318,6 +319,7 @@ pub(crate) fn extract_images_with_data(
                                 image_index = global_index,
                                 "skipping raw PDF image that could not be re-encoded: {e}"
                             );
+                            warnings.push(unencodable_image_warning(global_index, page_number, &e));
                             continue;
                         }
                     }
@@ -334,9 +336,14 @@ pub(crate) fn extract_images_with_data(
                 colorspace: Some(format!("{:?}", oxide_img.color_space())),
                 bits_per_component: Some(oxide_img.bits_per_component() as u32),
                 is_mask: false,
-                description: None,
+                description: alt_text,
                 ocr_result: None,
-                bounding_box: None,
+                bounding_box: oxide_img.bbox().map(|r| crate::types::BoundingBox {
+                    x0: r.x as f64,
+                    y0: r.y as f64,
+                    x1: (r.x + r.width) as f64,
+                    y1: (r.y + r.height) as f64,
+                }),
                 source_path: None,
                 image_kind: None,
                 kind_confidence: None,
@@ -351,7 +358,7 @@ pub(crate) fn extract_images_with_data(
         }
     }
 
-    Ok(all_images)
+    Ok((all_images, warnings))
 }
 
 #[cfg(test)]
@@ -364,7 +371,6 @@ mod tests {
 
     #[test]
     fn test_raw_pixels_to_png_grayscale() {
-        // 2×2 grayscale: 4 bytes, one per pixel.
         let pixels: Vec<u8> = vec![0x00, 0x80, 0xc0, 0xff];
         let result = raw_pixels_to_png(2, 2, &pdf_oxide::extractors::PixelFormat::Grayscale, &pixels);
         let bytes = result.expect("grayscale 2×2 must encode without error");
@@ -377,13 +383,7 @@ mod tests {
 
     #[test]
     fn test_raw_pixels_to_png_rgb() {
-        // 2×2 RGB: 12 bytes, 3 per pixel.
-        let pixels: Vec<u8> = vec![
-            0xff, 0x00, 0x00, // red
-            0x00, 0xff, 0x00, // green
-            0x00, 0x00, 0xff, // blue
-            0xff, 0xff, 0xff, // white
-        ];
+        let pixels: Vec<u8> = vec![0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff];
         let result = raw_pixels_to_png(2, 2, &pdf_oxide::extractors::PixelFormat::RGB, &pixels);
         let bytes = result.expect("RGB 2×2 must encode without error");
         assert!(
@@ -395,8 +395,6 @@ mod tests {
 
     #[test]
     fn test_raw_pixels_to_png_cmyk_converts_to_rgb_png() {
-        // 1×2 CMYK: 8 bytes, 4 per pixel.
-        // (0,0,0,255) = pure black; (0,0,0,0) = white.
         let pixels: Vec<u8> = vec![0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00];
         let result = raw_pixels_to_png(1, 2, &pdf_oxide::extractors::PixelFormat::CMYK, &pixels);
         let bytes = result.expect("CMYK 1×2 must encode without error");
@@ -405,7 +403,6 @@ mod tests {
             "output must be a PNG; got {:02x?}",
             &bytes[..4.min(bytes.len())]
         );
-        // Verify the PNG decodes to an RGB image (CMYK was converted to RGB before encoding).
         let decoded = image::load_from_memory(&bytes).expect("decoded PNG must be valid");
         assert_eq!(decoded.width(), 1);
         assert_eq!(decoded.height(), 2);
@@ -413,7 +410,6 @@ mod tests {
 
     #[test]
     fn test_raw_pixels_to_png_size_mismatch_returns_error() {
-        // 4×4 grayscale needs 16 bytes; supply only 4 — must be an error, not a panic.
         let pixels: Vec<u8> = vec![0x00, 0x80, 0xc0, 0xff];
         let result = raw_pixels_to_png(4, 4, &pdf_oxide::extractors::PixelFormat::Grayscale, &pixels);
         assert!(
@@ -424,7 +420,6 @@ mod tests {
 
     #[test]
     fn test_raw_pixels_to_png_rgb_size_mismatch_returns_error() {
-        // 2×2 RGB needs 12 bytes; supply 9 (divisible by 3 but wrong total).
         let pixels: Vec<u8> = vec![0xff; 9];
         let result = raw_pixels_to_png(2, 2, &pdf_oxide::extractors::PixelFormat::RGB, &pixels);
         assert!(result.is_err(), "mismatched RGB buffer must return Err");
@@ -432,13 +427,30 @@ mod tests {
 
     #[test]
     fn test_raw_pixels_to_png_cmyk_odd_length_returns_error() {
-        // 1×1 CMYK needs exactly 4 bytes; supply 3. chunks_exact(4) drops the remainder,
-        // producing an empty rgb vec. from_raw(1, 1, []) returns None → must be Err, not panic.
         let pixels: Vec<u8> = vec![0x00, 0x00, 0x00];
         let result = raw_pixels_to_png(1, 1, &pdf_oxide::extractors::PixelFormat::CMYK, &pixels);
         assert!(
             result.is_err(),
             "CMYK buffer whose length is not a multiple of 4 must return Err, not panic"
+        );
+    }
+
+    /// Issue #71: an image dropped for failing to re-encode must produce a
+    /// `ProcessingWarning` naming the image index and page, not just a
+    /// `tracing::warn!` log line the caller can never see.
+    #[test]
+    fn test_unencodable_image_warning_names_index_and_page() {
+        let pixels: Vec<u8> = vec![0x00, 0x80, 0xc0, 0xff];
+        let error = raw_pixels_to_png(4, 4, &pdf_oxide::extractors::PixelFormat::Grayscale, &pixels)
+            .expect_err("4x4 grayscale from a 4-byte buffer must fail to re-encode");
+
+        let warning = unencodable_image_warning(3, 2, &error);
+
+        assert_eq!(warning.source.as_ref(), "pdf_images");
+        assert_eq!(
+            warning.message.as_ref(),
+            format!("skipped image 3 on page 2: could not be re-encoded from raw pixel data ({error})"),
+            "warning message must name the exact image index (3) and page (2)"
         );
     }
 
@@ -466,7 +478,7 @@ mod tests {
         let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
         let mut doc = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
 
-        let result = extract_images_with_data(&mut doc, Some(0), None).expect("cap=0 must not error");
+        let (result, _warnings) = extract_images_with_data(&mut doc, Some(0), None).expect("cap=0 must not error");
 
         assert!(
             result.is_empty(),
@@ -500,9 +512,8 @@ mod tests {
 
         let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
 
-        // Full run (no cancel) — establishes the expected upper bound.
         let mut doc_full = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
-        let full_result =
+        let (full_result, _warnings) =
             extract_images_with_data(&mut doc_full, None, None).expect("uncancelled extraction must not error");
         let full_count = full_result.len();
         let page_count = doc_full
@@ -510,8 +521,6 @@ mod tests {
             .page_count()
             .expect("page_count must succeed on the fixture");
 
-        // Skip if the fixture has only one page or no images — mid-run cancellation
-        // between pages cannot be demonstrated.
         if page_count <= 1 || full_count == 0 {
             eprintln!(
                 "SKIP test_cancellation_fires_between_pages: nougat_039.pdf has {} page(s) \
@@ -521,9 +530,6 @@ mod tests {
             return;
         }
 
-        // Run with a token that a background thread cancels after 20ms.
-        // For a 67KB 2-page PDF on CI hardware this window typically lands between
-        // pages 0 and 1, but both earlier and later cancellations are correct.
         let mut doc_cancel = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
         let token = CancellationToken::new();
         let token_clone = token.clone();
@@ -533,18 +539,16 @@ mod tests {
             token_clone.cancel();
         });
 
-        let result =
+        let (result, _warnings) =
             extract_images_with_data(&mut doc_cancel, None, Some(&token)).expect("cancellation must not error");
 
         handle.join().expect("background thread must not panic");
 
-        // The token must have been set by the time the handle joins.
         assert!(
             token.is_cancelled(),
             "token must be cancelled after background thread fires"
         );
 
-        // Cancellation must never produce more images than an uncancelled run.
         assert!(
             result.len() <= full_count,
             "cancelled extraction returned {} image(s); uncancelled returned {}; \
@@ -572,7 +576,8 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let result = extract_images_with_data(&mut doc, None, Some(&token)).expect("extract must not error");
+        let (result, _warnings) =
+            extract_images_with_data(&mut doc, None, Some(&token)).expect("extract must not error");
 
         assert!(
             result.is_empty(),
@@ -582,48 +587,170 @@ mod tests {
         );
     }
 
+    /// The default (uncapped) extraction path routes through `PdfDocument::extract_images`,
+    /// which walks content streams tracking the CTM and calls `PdfImage::set_bbox` for every
+    /// image `Do` operator. Confirms `bounding_box` is populated end-to-end for a real fixture.
+    #[test]
+    fn test_extract_images_with_data_default_path_populates_bounding_box() {
+        let pdf_path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+        assert!(
+            pdf_path.exists(),
+            "missing fixture: test PDF not found at {}",
+            pdf_path.display()
+        );
+
+        let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
+        let mut doc = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
+
+        let (result, _warnings) = extract_images_with_data(&mut doc, None, None).expect("extraction must not error");
+
+        assert!(!result.is_empty(), "fixture must contain at least one image");
+        assert!(
+            result.iter().all(|img| img.bounding_box.is_some()),
+            "every image extracted via the default (uncapped) path must carry a bounding_box \
+             from pdf_oxide's CTM-tracked extract_images(); got: {:?}",
+            result.iter().map(|img| img.bounding_box).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_extract_images_with_data_capped_path_preserves_bounding_box() {
+        let pdf_path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+        assert!(
+            pdf_path.exists(),
+            "missing fixture: test PDF not found at {}",
+            pdf_path.display()
+        );
+
+        let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
+        let mut doc = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
+
+        let (result, _warnings) =
+            extract_images_with_data(&mut doc, Some(50), None).expect("extraction must not error");
+
+        assert!(!result.is_empty(), "fixture must contain at least one image");
+        assert!(
+            result.iter().all(|img| img.bounding_box.is_some()),
+            "the capped image-handle path must preserve CTM-derived bounding boxes; \
+             got: {:?}",
+            result.iter().map(|img| img.bounding_box).collect::<Vec<_>>()
+        );
+    }
+
     /// Verify that `detect_image_format_from_bytes` correctly identifies formats from magic bytes.
     /// This test ensures that even if pdf_oxide returns data labeled as JPEG but lacking proper
     /// headers, we can detect the actual format.
     #[test]
     fn test_detect_image_format_from_bytes() {
-        // JPEG magic bytes: FF D8 FF
         let jpeg_data = b"\xff\xd8\xff\xe0\x00\x10JFIF";
         assert_eq!(detect_image_format_from_bytes(jpeg_data), "jpeg");
 
-        // PNG magic bytes: 89 50 4E 47 0D 0A 1A 0A
         let png_data = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
         assert_eq!(detect_image_format_from_bytes(png_data), "png");
 
-        // GIF magic bytes: 47 49 46 38
         let gif_data = b"GIF89a";
         assert_eq!(detect_image_format_from_bytes(gif_data), "gif");
 
-        // TIFF (little-endian) magic: 49 49 (II)
         let tiff_le = b"II\x2a\x00";
         assert_eq!(detect_image_format_from_bytes(tiff_le), "tiff");
 
-        // TIFF (big-endian) magic: 4D 4D (MM)
         let tiff_be = b"MM\x00\x2a";
         assert_eq!(detect_image_format_from_bytes(tiff_be), "tiff");
 
-        // BMP magic: 42 4D (BM)
         let bmp_data = b"BM\x00\x00\x00";
         assert_eq!(detect_image_format_from_bytes(bmp_data), "bmp");
 
-        // JPEG 2000 magic: 00 00 00 0C 6A 50 20 20 (jP  box header)
         let jp2_data = b"\x00\x00\x00\x0cjP  ";
         assert_eq!(detect_image_format_from_bytes(jp2_data), "jpeg2000");
 
-        // Unknown format should return "raw"
         let raw_data = b"\x00\x01\x02\x03\x04\x05";
         assert_eq!(detect_image_format_from_bytes(raw_data), "raw");
 
-        // Empty data should return "raw"
         assert_eq!(detect_image_format_from_bytes(b""), "raw");
 
-        // Incomplete JPEG header should return "raw"
         let incomplete = b"\xff\xd8";
         assert_eq!(detect_image_format_from_bytes(incomplete), "raw");
+    }
+
+    /// `page_ocr_fallback_image_bytes` must recover usable image bytes for a page whose
+    /// content is real, decodable image XObjects — the fixture used elsewhere in this
+    /// file for image extraction (issue #1355 force_ocr fallback).
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn test_page_ocr_fallback_image_bytes_recovers_real_image() {
+        let pdf_path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+        assert!(
+            pdf_path.exists(),
+            "missing fixture: test PDF not found at {}",
+            pdf_path.display()
+        );
+
+        let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
+        let doc = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
+
+        let fallback_images = page_ocr_fallback_image_bytes(&doc.doc, 0);
+
+        assert!(
+            !fallback_images.is_empty(),
+            "fixture page 0 must contain at least one recoverable image XObject"
+        );
+        for image_bytes in &fallback_images {
+            let format = detect_image_format_from_bytes(image_bytes);
+            assert!(
+                matches!(format, "jpeg" | "png" | "jpeg2000"),
+                "fallback image bytes must carry a recognizable magic (jpeg/png/jpeg2000); got {:02x?}",
+                &image_bytes[..8.min(image_bytes.len())]
+            );
+        }
+    }
+
+    /// A page index past the end of the document must not panic; `page_image_handles`
+    /// returns an `Err` that the fallback helper degrades to an empty vec.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn test_page_ocr_fallback_image_bytes_out_of_range_page_returns_empty() {
+        let pdf_path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+        let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
+        let doc = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
+
+        let fallback_images = page_ocr_fallback_image_bytes(&doc.doc, 9999);
+
+        assert!(
+            fallback_images.is_empty(),
+            "out-of-range page must degrade to an empty vec, not panic or error"
+        );
+    }
+
+    /// Issue #62: a tagged PDF's `Figure` structure element carries `/Alt "officeArt
+    /// object"` on page 1 for the image XObject painted there. Before the fix,
+    /// `description` was hardcoded to `None` for every extracted image, so this
+    /// alt text was silently dropped and never reached `ExtractedImage::description`
+    /// (which markdown/plain-text rendering consume as the image's alt/caption text).
+    #[test]
+    fn test_extract_images_with_data_reads_tagged_pdf_alt_text() {
+        let pdf_path = test_documents_dir().join("pdf/nougat_049.pdf");
+        assert!(
+            pdf_path.exists(),
+            "missing fixture: test PDF not found at {}",
+            pdf_path.display()
+        );
+
+        let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
+        let mut doc = crate::pdf::oxide::OxideDocument::open_bytes(&bytes).expect("failed to open PDF");
+
+        let (result, _warnings) = extract_images_with_data(&mut doc, None, None).expect("extraction must not error");
+
+        let page_one_images: Vec<_> = result.iter().filter(|img| img.page_number == Some(1)).collect();
+        assert!(
+            !page_one_images.is_empty(),
+            "fixture page 1 must contain at least one extracted image"
+        );
+        assert_eq!(
+            page_one_images[0].description,
+            Some("officeArt object".to_string()),
+            "the first image on page 1 must carry the /Alt text from its Figure structure \
+             element instead of None; got {:?}",
+            page_one_images[0].description
+        );
     }
 }

@@ -5,9 +5,12 @@
 //! - `config` - Configuration hashing and Tesseract variables
 //! - `execution` - Core OCR execution logic
 
+mod api_pool;
 mod config;
 mod execution;
-mod validation;
+pub(crate) mod validation;
+
+pub(crate) use api_pool::MAX_TESSERACT_APIS;
 
 use crate::ocr::cache::OcrCache;
 use crate::ocr::error::OcrError;
@@ -22,12 +25,16 @@ use std::time::Instant;
 #[cfg_attr(alef, alef(skip))]
 pub struct OcrProcessor {
     cache: OcrCache,
+    api_pool: std::sync::Arc<api_pool::TesseractApiPool>,
 }
 
 impl OcrProcessor {
     pub(crate) fn new(cache_dir: Option<std::path::PathBuf>) -> Result<Self, OcrError> {
         let cache = OcrCache::new(cache_dir)?;
-        Ok(Self { cache })
+        Ok(Self {
+            cache,
+            api_pool: api_pool::TesseractApiPool::new(),
+        })
     }
 
     pub(crate) fn process_image(
@@ -42,7 +49,7 @@ impl OcrProcessor {
         #[cfg(feature = "otel")]
         let start = Instant::now();
 
-        let result = execution::process_image_with_cache(image_bytes, config, &self.cache, None);
+        let result = execution::process_image_with_cache(image_bytes, config, &self.cache, &self.api_pool, None);
 
         #[cfg(feature = "otel")]
         {
@@ -76,7 +83,8 @@ impl OcrProcessor {
         #[cfg(feature = "otel")]
         let start = Instant::now();
 
-        let result = execution::process_image_with_cache(image_bytes, config, &self.cache, Some(output_format));
+        let result =
+            execution::process_image_with_cache(image_bytes, config, &self.cache, &self.api_pool, Some(output_format));
 
         #[cfg(feature = "otel")]
         {
@@ -107,7 +115,7 @@ impl OcrProcessor {
         file_path: &str,
         config: &TesseractConfig,
     ) -> Result<OcrExtractionResult, OcrError> {
-        execution::process_image_file_with_cache(file_path, config, &self.cache, None)
+        execution::process_image_file_with_cache(file_path, config, &self.cache, &self.api_pool, None)
     }
 
     /// Process a file with OCR and respect the output format from ExtractionConfig.
@@ -120,7 +128,7 @@ impl OcrProcessor {
         config: &TesseractConfig,
         output_format: crate::core::config::OutputFormat,
     ) -> Result<OcrExtractionResult, OcrError> {
-        execution::process_image_file_with_cache(file_path, config, &self.cache, Some(output_format))
+        execution::process_image_file_with_cache(file_path, config, &self.cache, &self.api_pool, Some(output_format))
     }
 
     /// Process multiple image files in parallel using Rayon.
@@ -133,7 +141,7 @@ impl OcrProcessor {
         file_paths: Vec<String>,
         config: &TesseractConfig,
     ) -> Vec<BatchItemResult> {
-        execution::process_image_files_batch(file_paths, config, &self.cache)
+        execution::process_image_files_batch(file_paths, config, &self.cache, &self.api_pool)
     }
 }
 

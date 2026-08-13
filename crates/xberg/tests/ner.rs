@@ -1,3 +1,7 @@
+//! Unit tests for the `ner` feature's public types: `EntityCategory` string
+//! conversion (including the custom-label fallback and default) and `Entity`
+//! construction with optional confidence.
+
 #![cfg(feature = "ner")]
 
 use xberg::types::entity::EntityCategory;

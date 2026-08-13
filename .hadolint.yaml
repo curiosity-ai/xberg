@@ -1,17 +1,18 @@
-# hadolint configuration
 # DL3008/DL3018: version-pinning apt/apk packages is intentionally not done —
 #   the build images track distro security updates and pinned versions are
-#   routinely garbage-collected from upstream mirrors, breaking reproducible builds.
-# DL4006: the Alpine images run busybox `ash`, where `set -o pipefail` is the
-#   default-safe behaviour and the explicit SHELL directive is unnecessary.
-# DL3003: `cd` inside a single RUN is intentional for ephemeral source builds
-#   (libheif, the Elixir NIF) — WORKDIR would leak the directory into later layers.
-# SC2016: the `$ORIGIN` patchelf rpath must stay literal — single quotes are correct.
-# SC2012: `ls` of the musl loader glob runs over a controlled, single-match path.
+#   a build-time footgun once the pinned version ages out of the mirror.
+# DL3003: WORKDIR is preferred over `cd`, but several Dockerfiles chain a `cd`
+#   into a multi-command RUN for a one-off directory switch that WORKDIR would
+#   otherwise leak into every later layer.
+# SC2016: several RUN lines single-quote a literal `$ORIGIN` (RPATH/RUSTFLAGS
+#   values meant for the dynamic linker, e.g. `-rpath,$ORIGIN`) so this shell
+#   must NOT expand it -- that is the whole point of the single quotes.
+# SC2012: `ls` output is parsed against controlled build-output paths (e.g.
+#   counting/globbing `/build/lib/*.so*`), not arbitrary user-supplied
+#   filenames, so the usual "ls output isn't safe to parse" caveat doesn't hold.
 ignored:
   - DL3008
   - DL3018
-  - DL4006
   - DL3003
   - SC2016
   - SC2012

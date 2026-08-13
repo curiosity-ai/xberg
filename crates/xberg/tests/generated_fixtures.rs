@@ -127,11 +127,7 @@ fn generated_tree_present() -> bool {
             .unwrap_or(false)
 }
 
-// ── Example tests ─────────────────────────────────────────────────────────────
-//
 // One per feature stream. Each is `#[ignore]`d until the binary fixtures land
-// in `test_documents/`. They double as documentation of the intended
-// integration-test shape.
 
 #[test]
 #[ignore = "requires fixtures from `task fixtures:generate` to be checked into test_documents/"]
@@ -150,17 +146,8 @@ fn revisions_docx_track_changes_basic_matches_ground_truth() {
         "revisions fixture must declare at least one revision"
     );
 
-    // When the xberg extractor lands the revisions field on
-    // ExtractedDocument, replace the placeholder below with:
-    //
-    //   let input = ExtractInput::from_uri(fixture_path.display().to_string());
-    //   let output = xberg::extract(input, &cfg).await?;
-    //   let document = output
-    //       .results
-    //       .first()
     //       .expect("DOCX track-changes fixture must yield a result");
     //   let revisions = document.revisions.expect("DOCX track-changes fixture must yield revisions");
-    //   assert_eq!(revisions.len() as u64, expected_count);
     let _ = fixture_path;
 }
 
@@ -185,16 +172,6 @@ fn diff_xlsx_budget_pair_round_trips() {
     assert_eq!(change["col"].as_u64(), Some(1));
     assert_eq!(change["from"].as_str(), Some("100"));
     assert_eq!(change["to"].as_str(), Some("150"));
-
-    // When the integration lands:
-    //
-    //   let input_v1 = ExtractInput::from_uri(v1_path.display().to_string());
-    //   let input_v2 = ExtractInput::from_uri(v2_path.display().to_string());
-    //   let v1 = xberg::extract(input_v1, &cfg).await?;
-    //   let v2 = xberg::extract(input_v2, &cfg).await?;
-    //   let diff = xberg::diff::compare(&v1, &v2, &DiffOptions::default());
-    //   assert_eq!(diff.tables_changed.len(), 1);
-    //   assert_eq!(diff.tables_changed[0].cell_changes.len(), 1);
 }
 
 #[test]

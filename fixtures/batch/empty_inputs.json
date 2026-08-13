@@ -2,6 +2,12 @@
 	"id": "extract_batch_empty_inputs",
 	"category": "batch",
 	"description": "extract_batch: empty batch",
+	"docs": {
+		"topic": "batch",
+		"title": "extract_batch: empty batch",
+		"description": "extract_batch: empty batch",
+		"side_effects": "safe"
+	},
 	"call": "extract_batch",
 	"input": {
 		"inputs": []

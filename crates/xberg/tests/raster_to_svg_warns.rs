@@ -57,7 +57,6 @@ fn raster_png_to_svg_target_warns_and_preserves_bytes() {
     let result = extract_bytes_document_blocking(HTML_WITH_PNG_DATA_URI, "text/html", &config_svg_target())
         .expect("extraction must return Ok even when raster→SVG is unsupported");
 
-    // Must have emitted at least one image_encoder warning.
     let encoder_warnings: Vec<_> = result
         .processing_warnings
         .iter()
@@ -71,7 +70,6 @@ fn raster_png_to_svg_target_warns_and_preserves_bytes() {
         result.processing_warnings
     );
 
-    // The warning message must mention "svg" so callers can diagnose the issue.
     for warning in &encoder_warnings {
         assert!(
             warning.message.to_lowercase().contains("svg"),
@@ -80,7 +78,6 @@ fn raster_png_to_svg_target_warns_and_preserves_bytes() {
         );
     }
 
-    // The original image bytes must be untouched.
     if let Some(images) = result.images.as_ref() {
         for img in images {
             assert!(
@@ -88,8 +85,6 @@ fn raster_png_to_svg_target_warns_and_preserves_bytes() {
                 "image at index {} must retain non-empty data after skipped re-encode",
                 img.image_index
             );
-            // If the extractor returned the original PNG bytes they should
-            // still carry the PNG magic header.
             if img.format.as_ref() == "png" {
                 assert!(
                     img.data.starts_with(PNG_MAGIC),

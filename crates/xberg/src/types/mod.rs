@@ -1,9 +1,9 @@
 //! Core types for document extraction.
 
-// Module declarations
 pub mod annotations;
 pub mod builder;
 pub mod classification;
+pub mod diagram;
 pub mod djot;
 pub mod document_structure;
 pub mod entity;
@@ -25,7 +25,6 @@ pub mod tables;
 pub mod translation;
 pub mod uri;
 
-// Re-export all types for backward compatibility
 pub use annotations::*;
 pub use classification::{ClassificationLabel, PageClassification};
 pub use djot::*;
@@ -43,7 +42,9 @@ pub use ocr_elements::*;
 pub use page::*;
 pub use qr::{QrBoundingBox, QrCode};
 pub use redaction::{PiiCategory, RedactionFinding, RedactionReport, RedactionStrategy};
-pub use revisions::{CellChange, DiffLine, DocumentRevision, RevisionAnchor, RevisionDelta, RevisionKind};
+pub use revisions::{
+    CellChange, DiffLine, DocumentRevision, PropertyChange, RevisionAnchor, RevisionDelta, RevisionKind,
+};
 pub use summary::{DocumentSummary, SummaryStrategy};
 pub use tables::*;
 pub use translation::Translation;
@@ -94,6 +95,7 @@ mod tests {
             markdown: "| A | B |\n|---|---|\n".to_string(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_value(&table).unwrap();
@@ -113,6 +115,7 @@ mod tests {
             markdown: "| X | Y |\n|---|---|\n| 1 | 2 |\n".to_string(),
             page_number: 5,
             bounding_box: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -130,6 +133,7 @@ mod tests {
             markdown: "| shared |".to_string(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         });
 
         let tables_before = [Arc::clone(&shared_table), Arc::clone(&shared_table)].to_vec();
@@ -146,12 +150,14 @@ mod tests {
                 markdown: "| A |".to_string(),
                 page_number: 1,
                 bounding_box: None,
+                ..Default::default()
             },
             Table {
                 cells: vec![vec!["B".to_string()]],
                 markdown: "| B |".to_string(),
                 page_number: 2,
                 bounding_box: None,
+                ..Default::default()
             },
         ];
 
@@ -175,12 +181,14 @@ mod tests {
                     markdown: "| Table1 |".to_string(),
                     page_number: 3,
                     bounding_box: None,
+                    ..Default::default()
                 }),
                 Arc::new(Table {
                     cells: vec![vec!["Table2".to_string()]],
                     markdown: "| Table2 |".to_string(),
                     page_number: 3,
                     bounding_box: None,
+                    ..Default::default()
                 }),
             ],
             image_indices: Vec::new(),
@@ -222,7 +230,6 @@ mod tests {
 
         assert_eq!(deserialized.image_indices, vec![0, 1]);
 
-        // Verify JSON shape: image_indices is a plain array of integers.
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["image_indices"][0], 0);
         assert_eq!(v["image_indices"][1], 1);
@@ -235,6 +242,7 @@ mod tests {
             markdown: "| shared across pages |".to_string(),
             page_number: 0,
             bounding_box: None,
+            ..Default::default()
         });
 
         let page1 = PageContent {
@@ -304,6 +312,7 @@ mod tests {
             markdown: "| A |".to_string(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         };
 
         let table2 = Table {
@@ -311,6 +320,7 @@ mod tests {
             markdown: "| B |".to_string(),
             page_number: 2,
             bounding_box: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&vec![table1, table2]).unwrap();
@@ -354,7 +364,6 @@ mod tests {
         assert!(json.contains("\"x1\":540.0"));
         assert!(json.contains("\"y1\":600.0"));
 
-        // Round-trip
         let deserialized: ExtractedImage = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.image_index, 0);
         assert!(deserialized.bounding_box.is_some());
@@ -395,7 +404,6 @@ mod tests {
 
     #[test]
     fn test_extracted_image_bounding_box_backward_compatibility() {
-        // Old JSON without bounding_box field should deserialize
         let json = r#"{
             "data": "Rm9v",
             "format": "png",
@@ -496,7 +504,6 @@ mod tests {
         assert_eq!(cloned.image_index, image.image_index);
         assert_eq!(cloned.bounding_box, image.bounding_box);
 
-        // Debug should work
         let debug = format!("{:?}", image);
         assert!(debug.contains("bounding_box"));
     }

@@ -25,28 +25,30 @@
 //! assert!(validate_token_reduction_level("extreme").is_err());
 //! ```
 
+#[cfg(feature = "api-types")]
 mod dependencies;
 mod sections;
 
-// Re-export validation functions used in production code
+#[cfg(feature = "api-types")]
+pub(crate) use dependencies::{validate_cors_origin, validate_host, validate_port, validate_upload_size};
 pub(crate) use sections::{
-    validate_chunking_params, validate_language_code, validate_ocr_backend, validate_token_reduction_level,
+    validate_chunking_params, validate_confidence, validate_csv_delimiter, validate_dpi, validate_language_code,
+    validate_ocr_backend, validate_token_reduction_level, validate_vlm_backend_config,
 };
 
-// Re-export validation functions used only in tests
+pub(crate) use sections::{validate_binarization_method, validate_tesseract_oem, validate_tesseract_psm};
+
+// `validate_output_format` stays `#[cfg(test)]`-only, and correctly so: both
+// `ExtractionConfig::output_format` and `OcrConfig::output_format` are the strongly-typed
+// `OutputFormat` enum, which rejects invalid values at deserialization time. There is no
+// raw-string field left for this function to validate. ~keep
 #[cfg(test)]
-pub(crate) use dependencies::{validate_cors_origin, validate_host, validate_port, validate_upload_size};
-#[cfg(test)]
-pub(crate) use sections::{
-    validate_binarization_method, validate_confidence, validate_dpi, validate_output_format, validate_tesseract_oem,
-    validate_tesseract_psm, validate_vlm_backend_config,
-};
+pub(crate) use sections::validate_output_format;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Tests for section validation functions
     #[test]
     fn test_validate_binarization_method_valid() {
         assert!(validate_binarization_method("otsu").is_ok());
@@ -98,12 +100,14 @@ mod tests {
     fn test_validate_ocr_backend_valid() {
         assert!(validate_ocr_backend("tesseract").is_ok());
         assert!(validate_ocr_backend("paddleocr").is_ok());
+        assert!(validate_ocr_backend("sceptre").is_ok());
     }
 
     #[test]
     fn test_validate_ocr_backend_case_insensitive() {
         assert!(validate_ocr_backend("TESSERACT").is_ok());
         assert!(validate_ocr_backend("PADDLEOCR").is_ok());
+        assert!(validate_ocr_backend("SCEPTRE").is_ok());
     }
 
     #[test]
@@ -141,7 +145,21 @@ mod tests {
         assert!(validate_language_code("spa").is_ok());
         assert!(validate_language_code("zho").is_ok());
         assert!(validate_language_code("jpn").is_ok());
+        assert!(validate_language_code("jpn_vert").is_ok());
+        assert!(validate_language_code("JPN_VERT").is_ok());
         assert!(validate_language_code("kor").is_ok());
+        for language in ["afr", "aze", "bos", "bel", "kaz", "kir", "srp", "tgk"] {
+            assert!(
+                validate_language_code(language).is_ok(),
+                "Sceptre language {language} should pass shared validation"
+            );
+        }
+        for language in ["ch_sim", "rs_latin", "rs-cyrillic", "tel", "kan", "abq", "tjk"] {
+            assert!(
+                validate_language_code(language).is_ok(),
+                "EasyOCR Gen2 language {language} should pass shared validation"
+            );
+        }
     }
 
     #[test]
@@ -286,120 +304,5 @@ mod tests {
         let err = validate_language_code("bad").unwrap_err().to_string();
         assert!(err.contains("ISO 639"));
         assert!(err.contains("en"));
-    }
-
-    // Tests for dependency validation functions
-    #[test]
-    fn test_validate_port_valid() {
-        assert!(validate_port(1).is_ok());
-        assert!(validate_port(80).is_ok());
-        assert!(validate_port(443).is_ok());
-        assert!(validate_port(8000).is_ok());
-        assert!(validate_port(65535).is_ok());
-    }
-
-    #[test]
-    fn test_validate_port_invalid() {
-        let result = validate_port(0);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Port must be 1-65535"));
-        assert!(msg.contains("0"));
-    }
-
-    #[test]
-    fn test_validate_host_ipv4() {
-        assert!(validate_host("127.0.0.1").is_ok());
-        assert!(validate_host("0.0.0.0").is_ok());
-        assert!(validate_host("192.168.1.1").is_ok());
-        assert!(validate_host("10.0.0.1").is_ok());
-        assert!(validate_host("255.255.255.255").is_ok());
-    }
-
-    #[test]
-    fn test_validate_host_ipv6() {
-        assert!(validate_host("::1").is_ok());
-        assert!(validate_host("::").is_ok());
-        assert!(validate_host("2001:db8::1").is_ok());
-        assert!(validate_host("fe80::1").is_ok());
-    }
-
-    #[test]
-    fn test_validate_host_hostname() {
-        assert!(validate_host("localhost").is_ok());
-        assert!(validate_host("example.com").is_ok());
-        assert!(validate_host("sub.example.com").is_ok());
-        assert!(validate_host("api-server").is_ok());
-        assert!(validate_host("app123").is_ok());
-    }
-
-    #[test]
-    fn test_validate_host_invalid() {
-        let result = validate_host("");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Invalid host"));
-
-        let result = validate_host("not a valid host");
-        assert!(result.is_err());
-
-        let result = validate_host("256.256.256.256");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_cors_origin_https() {
-        assert!(validate_cors_origin("https://example.com").is_ok());
-        assert!(validate_cors_origin("https://localhost:3000").is_ok());
-        assert!(validate_cors_origin("https://sub.example.com").is_ok());
-        assert!(validate_cors_origin("https://192.168.1.1").is_ok());
-        assert!(validate_cors_origin("https://example.com/path").is_ok());
-    }
-
-    #[test]
-    fn test_validate_cors_origin_http() {
-        assert!(validate_cors_origin("http://example.com").is_ok());
-        assert!(validate_cors_origin("http://localhost:3000").is_ok());
-        assert!(validate_cors_origin("http://127.0.0.1:8000").is_ok());
-    }
-
-    #[test]
-    fn test_validate_cors_origin_wildcard() {
-        assert!(validate_cors_origin("*").is_ok());
-    }
-
-    #[test]
-    fn test_validate_cors_origin_invalid() {
-        let result = validate_cors_origin("not-a-url");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Invalid CORS origin"));
-
-        let result = validate_cors_origin("ftp://example.com");
-        assert!(result.is_err());
-
-        let result = validate_cors_origin("example.com");
-        assert!(result.is_err());
-
-        let result = validate_cors_origin("http://");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_upload_size_valid() {
-        assert!(validate_upload_size(1).is_ok());
-        assert!(validate_upload_size(1024).is_ok());
-        assert!(validate_upload_size(1_000_000).is_ok());
-        assert!(validate_upload_size(1_000_000_000).is_ok());
-        assert!(validate_upload_size(usize::MAX).is_ok());
-    }
-
-    #[test]
-    fn test_validate_upload_size_invalid() {
-        let result = validate_upload_size(0);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Upload size must be greater than 0"));
-        assert!(msg.contains("0"));
     }
 }

@@ -6,7 +6,6 @@ use xberg::types::{ExtractedImage, ImageKind};
 
 #[test]
 fn test_classify_simple() {
-    // Test basic classification works
     let (kind, conf) = classify(&[], "jpeg", Some(1000), Some(1000), None, None, false);
     assert_eq!(kind, ImageKind::Photograph);
     assert!(conf > 0.8, "confidence should be > 0.8 for large JPEG");
@@ -14,7 +13,6 @@ fn test_classify_simple() {
 
 #[test]
 fn test_cluster_tiles_basic() {
-    // Test clustering works
     let mut images = vec![
         ExtractedImage {
             data: Bytes::new(),
@@ -62,14 +60,12 @@ fn test_cluster_tiles_basic() {
 
     cluster_tiles(&mut images);
 
-    // Both should be in the same cluster (same page, same kind, adjacent indices)
     assert_eq!(images[0].cluster_id, Some(1));
     assert_eq!(images[1].cluster_id, Some(1));
 }
 
 #[test]
 fn test_image_kind_serde() {
-    // Test that ImageKind serializes/deserializes correctly
     let kind = ImageKind::Photograph;
     let json = serde_json::to_string(&kind).unwrap();
     assert_eq!(json, "\"photograph\"");
@@ -80,7 +76,6 @@ fn test_image_kind_serde() {
 
 #[test]
 fn test_extracted_image_with_classification() {
-    // Test that ExtractedImage with classification fields roundtrips
     let image = ExtractedImage {
         data: Bytes::new(),
         format: "png".into(),
@@ -116,7 +111,6 @@ fn test_extracted_image_with_classification() {
 
 #[test]
 fn test_extracted_image_with_classification_none() {
-    // Test that ExtractedImage without classification fields works
     let image = ExtractedImage {
         data: Bytes::new(),
         format: "png".into(),
@@ -140,7 +134,6 @@ fn test_extracted_image_with_classification_none() {
     };
 
     let json = serde_json::to_string(&image).unwrap();
-    // Optional fields should not appear when None
     assert!(!json.contains("image_kind"));
     assert!(!json.contains("kind_confidence"));
     assert!(!json.contains("cluster_id"));

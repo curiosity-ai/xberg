@@ -23,8 +23,8 @@
   <a href="https://github.com/xberg-io/xberg/tree/main/packages/go">
     <img src="https://img.shields.io/github/v/tag/xberg-io/xberg?label=Go&color=007ec6&filter=v1*" alt="Go">
   </a>
-  <a href="https://www.nuget.org/packages/Xberg/">
-    <img src="https://img.shields.io/nuget/v/Xberg?label=C%23&color=007ec6" alt="C#">
+  <a href="https://www.nuget.org/packages/XbergIo.Xberg/">
+    <img src="https://img.shields.io/nuget/v/XbergIo.Xberg?label=C%23&color=007ec6" alt="C#">
   </a>
   <a href="https://packagist.org/packages/xberg-io/xberg">
     <img src="https://img.shields.io/packagist/v/xberg-io/xberg?label=PHP&color=007ec6" alt="PHP">
@@ -53,6 +53,9 @@
   <a href="https://github.com/xberg-io/xberg/pkgs/container/xberg">
     <img src="https://img.shields.io/badge/Docker-ghcr.io-007ec6?logo=docker&logoColor=white" alt="Docker">
   </a>
+  <a href="https://docs.xberg.io/guides/kubernetes/">
+    <img src="https://img.shields.io/badge/Helm-chart-007ec6?logo=helm&logoColor=white" alt="Helm chart">
+  </a>
   <!-- Project Info -->
   <a href="https://github.com/xberg-io/xberg/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-007ec6" alt="License">
@@ -77,7 +80,7 @@
   </a>
 </div>
 
-Extract text, tables, images, metadata, and code intelligence from 96 file formats and 306 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Android library (AAR) with bundled jniLibs/arm64-v8a and jniLibs/x86_64 — Gradle automatically picks up the native cdylib for emulator and device builds. Server-side Kotlin/JVM consumers can use the Java binding directly via standard Kotlin/Java interop.
+Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Android library (AAR) with bundled jniLibs/arm64-v8a and jniLibs/x86_64 — Gradle automatically picks up the native cdylib for emulator and device builds. Server-side Kotlin/JVM consumers can use the Java binding directly via standard Kotlin/Java interop.
 
 ## What This Package Provides
 
@@ -94,13 +97,13 @@ Extract text, tables, images, metadata, and code intelligence from 96 file forma
 Kotlin DSL (`build.gradle.kts`):
 
 ```kotlin
-implementation("io.xberg:xberg-android:1.0.0-rc.9")
+implementation("io.xberg:xberg-android:1.1.0")
 ```
 
 Groovy DSL (`build.gradle`):
 
 ```groovy
-implementation 'io.xberg:xberg-android:1.0.0-rc.9'
+implementation 'io.xberg:xberg-android:1.1.0'
 ```
 
 Add to your `pom.xml`:
@@ -109,7 +112,7 @@ Add to your `pom.xml`:
 <dependency>
     <groupId>io.xberg</groupId>
     <artifactId>xberg-android</artifactId>
-    <version>1.0.0-rc.9</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
@@ -123,7 +126,19 @@ Add to your `pom.xml`:
 
 Extract text, metadata, and structure from any supported document format:
 
-<!-- snippet not found: api/extract.md -->
+```kotlin title="Kotlin"
+import io.xberg.ExtractInput
+import io.xberg.ExtractInputKind
+import io.xberg.ExtractionConfig
+import io.xberg.Xberg
+
+val output = Xberg.extract(
+    ExtractInput(kind = ExtractInputKind.URI, uri = "document.pdf"),
+    ExtractionConfig(),
+)
+
+println(output.results.first().content)
+```
 
 ### Common Use Cases
 
@@ -133,7 +148,28 @@ Most use cases benefit from configuration to control extraction behavior:
 
 **With OCR (for scanned documents):**
 
-<!-- snippet not found: ocr/ocr_extraction.md -->
+```kotlin title="Kotlin"
+import io.xberg.*
+import java.util.Optional
+
+fun main() {
+    val ocr = OcrConfig.builder()
+        .withBackend("tesseract")
+        .withLanguage("eng")
+        .build()
+
+    val config = ExtractionConfig.builder()
+        .withOcr(Optional.of(ocr))
+        .build()
+
+    val resultOutput = Xberg.extract(
+        ExtractInput(kind = ExtractInputKind.URI, uri = "scanned.pdf"),
+        config,
+    )
+    val result = resultOutput.results.first()
+    println(result.content)
+}
+```
 
 #### Table Extraction
 
@@ -141,34 +177,68 @@ See [Configuration Guide](https://docs.xberg.io/guides/configuration/) for table
 
 #### Processing Multiple Files
 
-<!-- snippet not found: api/extract_batch.md -->
+```kotlin title="Kotlin"
+import io.xberg.ExtractInput
+import io.xberg.ExtractInputKind
+import io.xberg.ExtractionConfig
+import io.xberg.Xberg
+
+val output = Xberg.extractBatch(
+    listOf(
+        ExtractInput(kind = ExtractInputKind.URI, uri = "document.pdf"),
+        ExtractInput(
+            kind = ExtractInputKind.BYTES,
+            bytes = "Hello from memory".toByteArray(),
+            mimeType = "text/plain",
+            filename = "note.txt",
+        ),
+    ),
+    ExtractionConfig(),
+)
+
+output.results.forEach { result ->
+    println(result.content)
+}
+```
 
 #### Async Processing
 
 For non-blocking document processing:
 
-<!-- snippet not found: api/extract.md -->
+```kotlin title="Kotlin"
+import io.xberg.ExtractInput
+import io.xberg.ExtractInputKind
+import io.xberg.ExtractionConfig
+import io.xberg.Xberg
+
+val output = Xberg.extract(
+    ExtractInput(kind = ExtractInputKind.URI, uri = "document.pdf"),
+    ExtractionConfig(),
+)
+
+println(output.results.first().content)
+```
 
 ### Next Steps
 
 - **[Installation Guide](https://docs.xberg.io/getting-started/installation/)** - Platform-specific setup
-- **[API Documentation](https://docs.xberg.io/reference/api-python/)** - Complete API reference
+- **[API Documentation](https://docs.xberg.io/reference/api-kotlin-android/)** - Complete API reference
 - **[Examples & Guides](https://docs.xberg.io/)** - Full code examples and usage guides
 - **[Configuration Guide](https://docs.xberg.io/guides/configuration/)** - Advanced configuration options
 
 ## Features
 
-### Supported File Formats (96)
+### Supported File Formats (100 formats · 120 file extensions)
 
-96 file formats across 8 major categories with intelligent format detection and comprehensive metadata extraction.
+100 formats across 120 file extensions in 8 major categories with intelligent format detection and comprehensive metadata extraction.
 
 #### Office Documents
 
 | Category | Formats | Capabilities |
 |----------|---------|--------------|
-| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages` | Full text, tables, images, metadata, styles |
+| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages`, `.wpd`, `.wp`, `.wp5`, `.wp6` | Full text, tables, images, metadata, styles |
 | **Spreadsheets** | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xla`, `.xlam`, `.xltm`, `.xltx`, `.xlt`, `.ods`, `.numbers` | Sheet data, formulas, cell metadata, charts |
-| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.key` | Slides, speaker notes, images, metadata |
+| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.odp`, `.key` | Slides, speaker notes, images, metadata |
 | **PDF** | `.pdf` | Text, tables, images, metadata, OCR support |
 | **eBooks** | `.epub`, `.fb2` | Chapters, metadata, embedded resources |
 | **Database** | `.dbf` | Table data extraction, field type support |
@@ -203,7 +273,7 @@ For non-blocking document processing:
 | Category | Formats | Features |
 |----------|---------|----------|
 | **Email** | `.eml`, `.msg`, `.pst` | Headers, body (HTML/plain), attachments, threading |
-| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | File listing, nested archives, metadata |
+| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | Recursive extraction of nested archives, file listing, metadata, zip-bomb protection |
 
 #### Academic & Scientific
 
@@ -214,7 +284,7 @@ For non-blocking document processing:
 | **Publishing** | `.fb2`, `.docbook`, `.dbk`, `.docbook4`, `.docbook5`, `.opml` | FictionBook, DocBook XML, OPML outlines |
 | **Documentation** | MIME-only POD, mdoc, troff | Technical documentation formats |
 
-#### Code Intelligence (306 Languages)
+#### Code Intelligence (371 Languages)
 
 | Feature | Description |
 |---------|-------------|
@@ -243,9 +313,9 @@ Powered by [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-l
 - **Batch Processing** - Efficiently process multiple documents in parallel
 - **Memory Efficient** - Stream large files without loading entirely into memory
 - **Language Detection** - Detect and support multiple languages in documents
-- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [306 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
+- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [371 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
 - **Configuration** - Fine-grained control over extraction behavior
-- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured JSON with OCR metadata
+- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured (same text as Plain with a `structured` metadata label)
 
 ## OCR Support
 
@@ -253,17 +323,50 @@ Xberg supports multiple OCR backends for extracting text from scanned documents 
 
 - **Tesseract**
 
-- **Paddleocr**
+- **Sceptre-Tract**
 
 ### OCR Configuration Example
 
-<!-- snippet not found: ocr/ocr_extraction.md -->
+```kotlin title="Kotlin"
+import io.xberg.*
+import java.util.Optional
+
+fun main() {
+    val ocr = OcrConfig.builder()
+        .withBackend("tesseract")
+        .withLanguage("eng")
+        .build()
+
+    val config = ExtractionConfig.builder()
+        .withOcr(Optional.of(ocr))
+        .build()
+
+    val resultOutput = Xberg.extract(
+        ExtractInput(kind = ExtractInputKind.URI, uri = "scanned.pdf"),
+        config,
+    )
+    val result = resultOutput.results.first()
+    println(result.content)
+}
+```
 
 ## Async Support
 
 This binding provides full async/await support for non-blocking document processing:
 
-<!-- snippet not found: api/extract.md -->
+```kotlin title="Kotlin"
+import io.xberg.ExtractInput
+import io.xberg.ExtractInputKind
+import io.xberg.ExtractionConfig
+import io.xberg.Xberg
+
+val output = Xberg.extract(
+    ExtractInput(kind = ExtractInputKind.URI, uri = "document.pdf"),
+    ExtractionConfig(),
+)
+
+println(output.results.first().content)
+```
 
 ## Plugin System
 
@@ -281,7 +384,29 @@ Generate vector embeddings for extracted text using the built-in ONNX Runtime su
 
 Process multiple documents efficiently:
 
-<!-- snippet not found: api/extract_batch.md -->
+```kotlin title="Kotlin"
+import io.xberg.ExtractInput
+import io.xberg.ExtractInputKind
+import io.xberg.ExtractionConfig
+import io.xberg.Xberg
+
+val output = Xberg.extractBatch(
+    listOf(
+        ExtractInput(kind = ExtractInputKind.URI, uri = "document.pdf"),
+        ExtractInput(
+            kind = ExtractInputKind.BYTES,
+            bytes = "Hello from memory".toByteArray(),
+            mimeType = "text/plain",
+            filename = "note.txt",
+        ),
+    ),
+    ExtractionConfig(),
+)
+
+output.results.forEach { result ->
+    println(result.content)
+}
+```
 
 ## Configuration
 
@@ -292,7 +417,7 @@ For advanced configuration options including language detection, table extractio
 ## Documentation
 
 - **[Official Documentation](https://docs.xberg.io/)**
-- **[API Reference](https://docs.xberg.io/reference/api-python/)**
+- **[API Reference](https://docs.xberg.io/reference/api-kotlin-android/)**
 - **[Examples & Guides](https://docs.xberg.io/)**
 
 ## Contributing
@@ -303,7 +428,7 @@ Contributions are welcome! See [Contributing Guide](https://github.com/xberg-io/
 
 - [crawlberg](https://github.com/xberg-io/crawlberg) — web crawling and scraping with HTML→Markdown and headless-Chrome fallback.
 - [html-to-markdown](https://github.com/xberg-io/html-to-markdown) — fast, lossless HTML→Markdown engine.
-- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 143 providers.
+- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 165 providers.
 - [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-language-pack) — tree-sitter grammars and code-intelligence primitives.
 - [alef](https://github.com/xberg-io/alef) — the polyglot binding generator that produces this README and all per-language bindings.
 - [Discord](https://discord.gg/xt9WY3GnKR) — community, roadmap, announcements.

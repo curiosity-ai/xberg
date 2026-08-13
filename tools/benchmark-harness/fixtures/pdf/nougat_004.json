@@ -4,13 +4,14 @@
 	"file_size": 63070,
 	"expected_frameworks": ["xberg"],
 	"metadata": {
-		"description": "Nougat benchmark PDF document",
-		"source": "nougat",
-		"size_category": "small"
+		"description": "Rotated chart-label PDF quality regression tracked by issue #1406",
+		"source": "docling-test-documents",
+		"issue": 1406,
+		"cohorts": ["pdf-regressions", "rotated-text", "chart"]
 	},
 	"ground_truth": {
 		"text_file": "../../../../test_documents/ground_truth/pdf/nougat_004.txt",
-		"source": "mistral-pixtral",
-		"markdown_file": "../../../../test_documents/ground_truth/pdf/nougat_004.md"
+		"markdown_file": "../../../../test_documents/ground_truth/pdf/nougat_004.md",
+		"source": "nougat"
 	}
 }

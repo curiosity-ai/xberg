@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "Git branch to benchmark"
+        description: "Optional branch or commit (defaults to the dispatched revision)"
         required: false
-        default: "main"
+        default: ""
         type: string
       timeout:
         description: "Timeout per document in seconds"
@@ -16,7 +16,7 @@ on:
 
 env:
   ITERATIONS: "3"
-  TIKA_VERSION: "3.2.3"
+  TIKA_VERSION: "3.3.1"
   ORT_VERSION: "1.24.2"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -44,18 +44,23 @@ defaults:
 jobs:
   setup:
     name: Build harness + native libs
-    runs-on: runner-medium-arm64
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
+      id-token: write
     outputs:
       artifact-name: benchmarks-target
+      source-sha: ${{ steps.source-revision.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ github.event.inputs.branch || github.sha }}
 
           submodules: recursive
+      - name: Pin benchmark source revision
+        id: source-revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Free disk space
         uses: xberg-io/actions/free-disk-space-linux@v1
 
@@ -69,7 +74,8 @@ jobs:
         uses: xberg-io/actions/setup-rust@v1
         with:
           cache-key-prefix: benchmarks-setup
-          use-sccache: "true"
+          use-sccache: "false"
+          disable-cache: "false"
           report-stats: "true"
 
       - name: Setup ONNX Runtime
@@ -83,16 +89,65 @@ jobs:
       - name: Install Task
         uses: xberg-io/actions/install-task@v1
 
+      - name: Validate benchmark scripts
+        run: task benchmark:validate:scripts
+
       - name: Cache benchmark harness
         uses: ./.github/actions/cache-benchmark-harness
         with:
           build-profile: release
 
-      - name: Build xberg-cli (release, all features)
-        run: cargo build --locked --release -p xberg-cli --features all
+      - name: Build xberg-cli (release, all features + Sceptre tract diagnostic)
+        run: cargo build --locked --release -p xberg-cli --features all,xberg/sceptre-ocr-tract
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_BENCHMARK_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install zstd (corpus cache decompression)
+        run: sudo apt-get install -y zstd
+
+      - name: Restore reference corpus cache
+        env:
+          GCP_BENCHMARK_BUCKET: ${{ secrets.GCP_BENCHMARK_BUCKET }}
+        run: scripts/benchmarks/restore-corpus-cache.sh
 
       - name: Validate ground truth
-        run: cargo run --locked --release -p benchmark-harness -- validate-gt --fixtures tools/benchmark-harness/fixtures/
+        run: >-
+          cargo run --locked --release -p benchmark-harness -- validate-gt
+          --fixtures tools/benchmark-harness/fixtures --strict
+
+      - name: Validate benchmark cohorts
+        run: cargo test --locked --release -p benchmark-harness 'cohort::tests::'
+
+      - name: Validate benchmark harness contracts
+        run: >-
+          cargo test --locked --release -p benchmark-harness
+          --test validate_artifacts --test lossless_aggregation
+          --test fixture_validation --test aggregate_schema
+
+      - name: Validate workflow matrix against harness contracts
+        run: scripts/ci/benchmarks/validate-workflow-matrix.py
+
+      - name: Package reference corpus cache
+        run: tar -C test_documents -cf corpus-cache.tar .corpus-cache/pdf .corpus-cache/ground_truth
+
+      - name: Upload reference corpus cache
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-corpus-cache
+          path: corpus-cache.tar
+          retention-days: 7
 
       - name: Log disk space before artifact upload
         run: scripts/ci/validate/show-disk-space.sh "Disk space before artifact upload"
@@ -119,25 +174,84 @@ jobs:
         run: scripts/ci/validate/show-disk-space.sh "Disk space after artifact upload"
 
   bench-rust:
-    name: bench-rust (${{ matrix.pipeline }}, ${{ matrix.output_format }}, ${{ matrix.mode }})
+    name: bench-rust (${{ matrix.pipeline }}, ${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
     needs: setup
-    # Layout pipeline loads RT-DETR (~50MB) + TATR (~235MB) ONNX models and exhausts
-    # runner-medium-arm64; the runner agent stopped responding at ~24min on every
-    # layout job. Route layout jobs to runner-large-arm64 (16-core, 64Gi).
-    runs-on: ${{ matrix.pipeline == 'layout' && 'runner-large-arm64' || 'runner-medium-arm64' }}
+    # Previously split heavy pipelines (layout/paddle/sceptre) onto runner-large-arm64 and
+    # the rest onto runner-medium-arm64. Both self-hosted arm64 pools were retired, so every
+    # leg now runs on the same hosted arm64 machine — figures need re-baselining before they
+    # are compared against numbers published from the old runners.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        pipeline: [baseline, layout]
+        pipeline:
+          - baseline
+          - layout
+          - baseline-paddle
+          - layout-paddle
+          - sceptre-ort
+          - sceptre-ort-layout
+          - sceptre-ort-autorotate
         output_format: [markdown, plaintext]
         mode: [single-file, batch]
+        cohort:
+          - native-pdf-fast-b8
+          - ocr-pdf-fast-b4
+          - native-office-fast
+          - native-markup-fast
+          - native-ebook-fast
+          - native-email-fast
+          - native-data-fast
+          - ocr-images-fast
+        # The layout pipeline only benefits rendered-page formats (PDF, images); for the other
+        # families a layout run would merely duplicate baseline, so drop those cells.
+        # The PaddleOCR-engine variants (baseline-paddle, layout-paddle) force OCR, so they run ONLY
+        # on the OCR cohorts (ocr-pdf-fast-b4, ocr-images-fast); drop them from every non-OCR cohort.
+        # NOTE: keep this block a clean list of `- {...}` entries — the validate-workflow-matrix.py
+        # exclude parser stops at the first non-entry line, so do not intersperse comments here.
+        exclude:
+          - { pipeline: layout, cohort: native-office-fast }
+          - { pipeline: layout, cohort: native-markup-fast }
+          - { pipeline: layout, cohort: native-ebook-fast }
+          - { pipeline: layout, cohort: native-email-fast }
+          - { pipeline: layout, cohort: native-data-fast }
+          - { pipeline: baseline-paddle, cohort: native-pdf-fast-b8 }
+          - { pipeline: baseline-paddle, cohort: native-office-fast }
+          - { pipeline: baseline-paddle, cohort: native-markup-fast }
+          - { pipeline: baseline-paddle, cohort: native-ebook-fast }
+          - { pipeline: baseline-paddle, cohort: native-email-fast }
+          - { pipeline: baseline-paddle, cohort: native-data-fast }
+          - { pipeline: layout-paddle, cohort: native-pdf-fast-b8 }
+          - { pipeline: layout-paddle, cohort: native-office-fast }
+          - { pipeline: layout-paddle, cohort: native-markup-fast }
+          - { pipeline: layout-paddle, cohort: native-ebook-fast }
+          - { pipeline: layout-paddle, cohort: native-email-fast }
+          - { pipeline: layout-paddle, cohort: native-data-fast }
+          - { pipeline: sceptre-ort, cohort: native-pdf-fast-b8 }
+          - { pipeline: sceptre-ort, cohort: native-office-fast }
+          - { pipeline: sceptre-ort, cohort: native-markup-fast }
+          - { pipeline: sceptre-ort, cohort: native-ebook-fast }
+          - { pipeline: sceptre-ort, cohort: native-email-fast }
+          - { pipeline: sceptre-ort, cohort: native-data-fast }
+          - { pipeline: sceptre-ort-layout, cohort: native-pdf-fast-b8 }
+          - { pipeline: sceptre-ort-layout, cohort: native-office-fast }
+          - { pipeline: sceptre-ort-layout, cohort: native-markup-fast }
+          - { pipeline: sceptre-ort-layout, cohort: native-ebook-fast }
+          - { pipeline: sceptre-ort-layout, cohort: native-email-fast }
+          - { pipeline: sceptre-ort-layout, cohort: native-data-fast }
+          - { pipeline: sceptre-ort-autorotate, cohort: native-pdf-fast-b8 }
+          - { pipeline: sceptre-ort-autorotate, cohort: native-office-fast }
+          - { pipeline: sceptre-ort-autorotate, cohort: native-markup-fast }
+          - { pipeline: sceptre-ort-autorotate, cohort: native-ebook-fast }
+          - { pipeline: sceptre-ort-autorotate, cohort: native-email-fast }
+          - { pipeline: sceptre-ort-autorotate, cohort: native-data-fast }
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -162,14 +276,67 @@ jobs:
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
 
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
+
       - name: Setup ONNX Runtime
         uses: ./.github/actions/setup-onnx-runtime
         with:
           ort-version: ${{ env.ORT_VERSION }}
 
       - name: Setup Layout Models
-        if: matrix.pipeline == 'layout'
+        if: contains(matrix.pipeline, 'layout')
         uses: ./.github/actions/setup-layout-models
+
+      # The bench-rust runner ships only `python3` (no `python` alias, and its system
+      # python3 is externally-managed without pip), so the PaddleOCR model action's
+      # `python -m pip install huggingface_hub` fails with exit 127. Provision a managed
+      # Python with pip (matching the competitor jobs) before the model download.
+      - name: Setup Python (PaddleOCR model download)
+        if: contains(matrix.pipeline, 'paddle')
+        uses: xberg-io/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-paddle-hf
+          install-command: "python -m pip install --disable-pip-version-check 'huggingface_hub>=0.34,<2'"
+
+      - name: Setup PaddleOCR Models
+        if: contains(matrix.pipeline, 'paddle')
+        uses: ./.github/actions/setup-paddle-ocr-models
+
+      - name: Pre-warm Sceptre ORT models
+        if: contains(matrix.pipeline, 'sceptre-ort')
+        env:
+          PIPELINE: ${{ matrix.pipeline }}
+        run: |
+          set -euo pipefail
+          for language in eng deu jpn; do
+            args=(
+              extract test_documents/images/test_hello_world.png
+              --ocr true
+              --force-ocr true
+              --ocr-backend sceptre
+              --ocr-backend-options '{"model":{"backend":"ort"}}'
+              --ocr-language "$language"
+              --no-cache true
+              --format json
+            )
+            if [[ "$PIPELINE" == "sceptre-ort-autorotate" ]]; then
+              args+=(--ocr-auto-rotate true)
+            fi
+            ./target/release/xberg "${args[@]}" >/dev/null
+          done
 
       - name: Run benchmark
         env:
@@ -178,34 +345,111 @@ jobs:
           OUTPUT_FORMAT: ${{ matrix.output_format }}
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
         run: scripts/benchmarks/run-benchmark.sh
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-rust-${{ matrix.pipeline }}-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          name: benchmarks-rust-${{ matrix.pipeline }}-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
-  bench-docling:
-    name: docling (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
-    needs: bench-rust
-    if: ${{ !cancelled() }}
-    runs-on: runner-medium-arm64
+  sceptre-tract-diagnostic:
+    name: sceptre-tract diagnostic (${{ matrix.mode }})
+    needs: setup
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        mode: [single-file]
-        shard: [1, 2, 3]
-        output_format: [markdown, plaintext]
+        mode: [single-file, batch]
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
+          submodules: recursive
+
+      - name: Free disk space
+        uses: xberg-io/actions/free-disk-space-linux@v1
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.setup.outputs.artifact-name }}
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Pre-warm Sceptre tract models
+        run: >-
+          ./target/release/xberg extract test_documents/images/test_hello_world.png
+          --ocr true --force-ocr true --ocr-backend sceptre
+          --ocr-backend-options '{"model":{"backend":"tract"}}'
+          --ocr-language eng --no-cache true --format json >/dev/null
+
+      - name: Run bounded diagnostic benchmark
+        env:
+          FRAMEWORK: xberg-markdown-sceptre-tract
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: markdown
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          COHORT: tools/benchmark-harness/cohorts/ocr-images-structured.json
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnostic-sceptre-tract-markdown-${{ matrix.mode }}-ocr-images-structured-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  bench-docling:
+    name: docling (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
+    needs: [setup, bench-rust]
+    if: ${{ needs.setup.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [single-file, batch]
+        output_format: [markdown, plaintext]
+        # Docling supports the multi-format families it has native readers for (office,
+        # markup, data) plus images; ebook/email are xberg-only. Cells for formats Docling
+        # cannot read are best-effort in the release contract, so partial coverage is fine.
+        cohort:
+          - native-pdf-fast-b8
+          - ocr-pdf-fast-b4
+          - native-office-fast
+          - native-markup-fast
+          - native-data-fast
+          - ocr-images-fast
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -219,6 +463,20 @@ jobs:
 
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
 
       - name: Install system dependencies (libheif + native libs for harness binary)
         uses: ./.github/actions/install-system-deps
@@ -233,12 +491,35 @@ jobs:
         with:
           python-version: "3.11"
           cache-prefix: benchmark-docling
-          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-docling"
+          install-command: "uv sync --frozen --no-install-project --no-install-workspace --group dev --group bench-docling"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-eng
+
+      - name: Restore EasyOCR model cache (docling OCR)
+        id: easyocr-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.EasyOCR
+          key: docling-easyocr-en-ko-ja-v1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Prefetch EasyOCR language models (en, ko, ja)
+        if: steps.easyocr-cache.outputs.cache-hit != 'true'
+        env:
+          UV_NO_SYNC: "1"
+        run: |
+          set -euo pipefail
+          # Docling's default OCR engine is EasyOCR; the image OCR cohort forwards
+          # Korean/Japanese, so prefetch those recognition models (plus the shared
+          # detection model) into ~/.EasyOCR to keep the download out of the timed run.
+          uv run --no-sync python - <<'PY'
+          import easyocr
+
+          for langs in (["en", "ko"], ["ja", "en"]):
+              easyocr.Reader(langs, gpu=False, verbose=False)
+          PY
 
       - name: Run benchmark
         env:
@@ -247,7 +528,7 @@ jobs:
           OUTPUT_FORMAT: ${{ matrix.output_format }}
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
-          SHARD: ${{ matrix.shard }}/3
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
           UV_NO_SYNC: "1"
         run: scripts/benchmarks/run-benchmark.sh
 
@@ -255,15 +536,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-docling-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          name: benchmarks-docling-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
   bench-markitdown:
-    name: markitdown (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
-    needs: bench-rust
-    if: ${{ !cancelled() }}
-    runs-on: runner-medium-arm64
+    name: markitdown (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
+    needs: [setup, bench-rust]
+    if: ${{ needs.setup.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
@@ -271,14 +552,15 @@ jobs:
       fail-fast: false
       matrix:
         mode: [single-file]
-        shard: [1, 2, 3]
         output_format: [markdown, plaintext]
+        # MarkItDown emits markdown; run it over PDF plus the office/markup/data families it supports.
+        cohort: [native-pdf-fast-b8, native-office-fast, native-markup-fast, native-data-fast]
         exclude:
           - output_format: plaintext
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -292,6 +574,20 @@ jobs:
 
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
 
       - name: Install system dependencies (libheif + native libs for harness binary)
         uses: ./.github/actions/install-system-deps
@@ -306,7 +602,7 @@ jobs:
         with:
           python-version: "3.11"
           cache-prefix: benchmark-markitdown
-          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-markitdown"
+          install-command: "uv sync --frozen --no-install-project --no-install-workspace --group dev --group bench-markitdown --prerelease=allow"
 
       - name: Run benchmark
         env:
@@ -315,8 +611,7 @@ jobs:
           OUTPUT_FORMAT: ${{ matrix.output_format }}
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
-          OCR_ENABLED: "false"
-          SHARD: ${{ matrix.shard }}/3
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
           UV_NO_SYNC: "1"
         run: scripts/benchmarks/run-benchmark.sh
 
@@ -324,15 +619,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-markitdown-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          name: benchmarks-markitdown-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
   bench-unstructured:
-    name: unstructured (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/4)
-    needs: bench-rust
-    if: ${{ !cancelled() }}
-    runs-on: runner-medium-arm64
+    name: unstructured (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
+    needs: [setup, bench-rust]
+    if: ${{ needs.setup.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
@@ -340,12 +635,21 @@ jobs:
       fail-fast: false
       matrix:
         mode: [single-file]
-        shard: [1, 2, 3, 4]
-        output_format: [markdown, plaintext]
+        output_format: [plaintext]
+        # Unstructured emits plaintext; run it over PDF plus the office/markup/email/data families.
+        cohort: [
+          native-pdf-fast-b8,
+          native-office-fast,
+          native-markup-fast,
+          native-email-fast,
+          native-data-fast,
+          ocr-pdf-fast-b4,
+          ocr-images-fast,
+        ]
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -359,6 +663,20 @@ jobs:
 
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
 
       - name: Install system dependencies (libheif + native libs for harness binary)
         uses: ./.github/actions/install-system-deps
@@ -378,7 +696,7 @@ jobs:
         with:
           python-version: "3.11"
           cache-prefix: benchmark-unstructured
-          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-unstructured"
+          install-command: "uv sync --frozen --no-install-project --no-install-workspace --group dev --group bench-unstructured"
 
       - name: Run benchmark
         env:
@@ -387,7 +705,7 @@ jobs:
           OUTPUT_FORMAT: ${{ matrix.output_format }}
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
-          SHARD: ${{ matrix.shard }}/4
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
           UV_NO_SYNC: "1"
         run: scripts/benchmarks/run-benchmark.sh
 
@@ -395,15 +713,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-unstructured-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          name: benchmarks-unstructured-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
   bench-tika:
-    name: tika (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
-    needs: bench-rust
-    if: ${{ !cancelled() }}
-    runs-on: runner-medium-arm64
+    name: tika (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
+    needs: [setup, bench-rust]
+    if: ${{ needs.setup.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
@@ -411,14 +729,23 @@ jobs:
       fail-fast: false
       matrix:
         mode: [single-file]
-        shard: [1, 2, 3]
         output_format: [markdown, plaintext]
+        # Tika is the broadest competitor: PDF plus office/markup/ebook/email/data families.
+        cohort:
+          - native-pdf-fast-b8
+          - native-office-fast
+          - native-markup-fast
+          - native-ebook-fast
+          - native-email-fast
+          - native-data-fast
+          - ocr-pdf-fast-b4
+          - ocr-images-fast
         exclude:
           - output_format: markdown
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -432,6 +759,20 @@ jobs:
 
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
 
       - name: Install system dependencies (libheif + native libs for harness binary)
         uses: ./.github/actions/install-system-deps
@@ -461,22 +802,22 @@ jobs:
           OUTPUT_FORMAT: ${{ matrix.output_format }}
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
-          SHARD: ${{ matrix.shard }}/3
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
         run: scripts/benchmarks/run-benchmark.sh
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-tika-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          name: benchmarks-tika-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
   bench-pymupdf4llm:
-    name: pymupdf4llm (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
-    needs: bench-rust
-    if: ${{ !cancelled() }}
-    runs-on: runner-medium-arm64
+    name: pymupdf4llm (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
+    needs: [setup, bench-rust]
+    if: ${{ needs.setup.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
@@ -484,14 +825,16 @@ jobs:
       fail-fast: false
       matrix:
         mode: [single-file]
-        shard: [1, 2, 3]
         output_format: [markdown, plaintext]
+        # PyMuPDF4LLM emits markdown and has no OCR path, so it runs the PDF and ebook families
+        # (which have text layers) but NOT the scanned-image cohort, where it would always be empty.
+        cohort: [native-pdf-fast-b8, native-ebook-fast]
         exclude:
           - output_format: plaintext
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -505,6 +848,20 @@ jobs:
 
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
 
       - name: Install system dependencies (libheif + native libs for harness binary)
         uses: ./.github/actions/install-system-deps
@@ -524,7 +881,7 @@ jobs:
         with:
           python-version: "3.11"
           cache-prefix: benchmark-pymupdf4llm
-          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-pymupdf4llm"
+          install-command: "uv sync --frozen --no-install-project --no-install-workspace --group dev --group bench-pymupdf4llm"
 
       - name: Run benchmark
         env:
@@ -534,7 +891,7 @@ jobs:
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
           TESSDATA_PREFIX: /usr/share/tesseract-ocr/5/tessdata
-          SHARD: ${{ matrix.shard }}/3
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
           UV_NO_SYNC: "1"
         run: scripts/benchmarks/run-benchmark.sh
 
@@ -542,15 +899,138 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-pymupdf4llm-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          name: benchmarks-pymupdf4llm-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
-  bench-mineru:
-    name: mineru (${{ matrix.output_format }}, ${{ matrix.mode }}, shard ${{ matrix.shard }}/3)
-    needs: bench-rust
+  prefetch-mineru-models:
+    name: Prefetch MinerU model weights
+    # Intentionally NOT `needs: setup`: prefetching MinerU weights only needs the
+    # repo (scripts + fixtures), not the built harness, so it runs concurrently
+    # with the FFI/harness build from the first stage instead of waiting for it.
+    # Checks out the same ref setup resolves (its later source-sha pin is only
+    # needed by jobs that must match the benchmarked binary's exact revision).
     if: ${{ !cancelled() }}
-    runs-on: runner-medium-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch || github.sha }}
+          submodules: recursive
+
+      - name: Free disk space
+        uses: xberg-io/actions/free-disk-space-linux@v1
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Setup Python
+        uses: xberg-io/actions/setup-python-env@v1
+        with:
+          python-version: "3.11"
+          cache-prefix: benchmark-mineru
+          install-command: "uv sync --frozen --no-install-project --no-install-workspace --group dev --group bench-mineru"
+
+      - name: Install system dependencies (libgl1 + libglib2.0-0 for mineru)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-eng
+
+      - name: Configure Hugging Face cache
+        run: |
+          mkdir -p "$HOME/.cache/huggingface/hub"
+          {
+            echo "HF_HOME=$HOME/.cache/huggingface"
+            echo "HF_HUB_CACHE=$HOME/.cache/huggingface/hub"
+            echo "MINERU_MODEL_SOURCE=huggingface"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore MinerU model cache
+        id: mineru-model-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/huggingface/hub
+            ~/mineru.json
+          key: mineru-models-3.4.4-cfg-v5-kor-jpn-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Warm MinerU model weights (native + OCR pipelines)
+        if: steps.mineru-model-cache.outputs.cache-hit != 'true'
+        env:
+          UV_NO_SYNC: "1"
+        run: |
+          set -euo pipefail
+          txt_fixture="test_documents/pdf/fake_memo.pdf"
+          ocr_fixture="test_documents/pdf/non_searchable.pdf"
+          echo "Warming MinerU pipeline weights (txt path) on ${txt_fixture}..."
+          uv run --no-sync python tools/benchmark-harness/scripts/mineru_extract.py \
+            --no-ocr --format=markdown sync "$txt_fixture" > /dev/null
+          echo "Warming MinerU OCR weights (ocr path) on ${ocr_fixture}..."
+          uv run --no-sync python tools/benchmark-harness/scripts/mineru_extract.py \
+            --ocr --format=markdown sync "$ocr_fixture" > /dev/null
+          echo "Warming MinerU Korean + Japanese PaddleOCR weights..."
+          # The image OCR cohort forwards non-English languages; PaddleOCR downloads the
+          # per-language model on first use, so warm korean/japan here (content is
+          # irrelevant to which model is fetched) to keep it out of the timed run.
+          uv run --no-sync python tools/benchmark-harness/scripts/mineru_extract.py \
+            --ocr --ocr-lang=eng+kor --format=markdown sync "$ocr_fixture" > /dev/null
+          uv run --no-sync python tools/benchmark-harness/scripts/mineru_extract.py \
+            --ocr --ocr-lang=jpn_vert --format=markdown sync "$ocr_fixture" > /dev/null
+          echo "MinerU model cache populated at $HF_HUB_CACHE"
+          du -sh "$HF_HUB_CACHE" || true
+
+      - name: Ensure MinerU config (mineru.json) present
+        env:
+          UV_NO_SYNC: "1"
+        run: |
+          set -euo pipefail
+          # MinerU's persist_downloaded_model_config fetches a config template from
+          # gcore.jsdelivr.net (bare requests.get, no timeout) on the first model
+          # resolution whenever ~/mineru.json is absent -- ungoverned by HF_HUB_OFFLINE,
+          # so on the egress-restricted bench runner it hangs the full timeout. Packaging
+          # a valid ~/mineru.json makes get_existing_configured_model_root short-circuit
+          # the download entirely. The warm step above writes it as a side effect; on a
+          # cache hit it is restored by actions/cache. Regenerate online if still missing.
+          if [ ! -f "$HOME/mineru.json" ]; then
+            echo "mineru.json missing after warm/cache-restore; generating online..."
+            uv run --no-sync python tools/benchmark-harness/scripts/mineru_extract.py \
+              --no-ocr --format=markdown sync test_documents/pdf/fake_memo.pdf > /dev/null
+          fi
+          uv run --no-sync python - <<'PY'
+          import json, os
+          cfg = os.path.expanduser("~/mineru.json")
+          data = json.load(open(cfg))
+          models_dir = data.get("models-dir") or {}
+          assert models_dir.get("pipeline"), f"mineru.json missing models-dir.pipeline: {data}"
+          print(f"mineru.json OK: config_version={data.get('config_version')} models-dir={models_dir}")
+          PY
+
+      - name: Package MinerU model cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mineru-model-cache"
+          tar -C "$HOME" -cf "$RUNNER_TEMP/mineru-model-cache/mineru-models.tar" \
+            .cache/huggingface/hub mineru.json
+          ls -lh "$RUNNER_TEMP/mineru-model-cache/mineru-models.tar"
+
+      - name: Upload MinerU model cache
+        uses: actions/upload-artifact@v7
+        with:
+          name: mineru-model-cache-${{ github.run_id }}
+          path: ${{ runner.temp }}/mineru-model-cache/mineru-models.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  bench-mineru:
+    name: mineru (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
+    needs: [setup, bench-rust, prefetch-mineru-models]
+    if: ${{ needs.setup.result == 'success' && needs.prefetch-mineru-models.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
@@ -558,18 +1038,15 @@ jobs:
       fail-fast: false
       matrix:
         mode: [single-file]
-        shard: [1, 2, 3]
         output_format: [markdown, plaintext]
-        # Skip the recurring framework-env failure on the plaintext shard 1/3.
-        # See project_benchmark_status.md for re-enable criteria.
+        # MinerU handles PDF (native + OCR) and document images.
+        cohort: [native-pdf-fast-b8, ocr-pdf-fast-b4, ocr-images-fast]
         exclude:
-          - mode: single-file
-            shard: 1
-            output_format: plaintext
+          - output_format: plaintext
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -583,6 +1060,20 @@ jobs:
 
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
 
       - name: Install system dependencies (libheif + native libs for harness binary)
         uses: ./.github/actions/install-system-deps
@@ -597,12 +1088,53 @@ jobs:
         with:
           python-version: "3.11"
           cache-prefix: benchmark-mineru
-          install-command: "uv sync --no-install-project --no-install-workspace --group dev --group bench-mineru"
+          install-command: "uv sync --frozen --no-install-project --no-install-workspace --group dev --group bench-mineru"
 
       - name: Install system dependencies (libgl1 + libglib2.0-0 for mineru)
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-eng
+
+      - name: Configure Hugging Face cache
+        run: |
+          mkdir -p "$HOME/.cache/huggingface/hub"
+          {
+            echo "HF_HOME=$HOME/.cache/huggingface"
+            echo "HF_HUB_CACHE=$HOME/.cache/huggingface/hub"
+            echo "MINERU_MODEL_SOURCE=huggingface"
+            echo "HF_HUB_OFFLINE=1"
+            echo "TRANSFORMERS_OFFLINE=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Download MinerU model cache
+        uses: actions/download-artifact@v8
+        with:
+          name: mineru-model-cache-${{ github.run_id }}
+          path: ${{ runner.temp }}/mineru-model-cache
+
+      - name: Unpack MinerU model cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/huggingface"
+          tar -C "$HOME" -xf "$RUNNER_TEMP/mineru-model-cache/mineru-models.tar"
+          test -f "$HOME/mineru.json" || { echo "mineru.json not restored from cache artifact"; exit 1; }
+          du -sh "$HOME/.cache/huggingface/hub" || true
+
+      - name: Log MinerU offline env and restored cache state
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "=== MinerU offline env ==="
+          echo "HF_HOME=${HF_HOME:-<unset>}"
+          echo "HF_HUB_CACHE=${HF_HUB_CACHE:-<unset>}"
+          echo "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-<unset>}"
+          echo "TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-<unset>}"
+          echo "MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-<unset>}"
+          echo "=== ~/mineru.json (drives the offline model short-circuit; absence => gcore fetch hang) ==="
+          cat "$HOME/mineru.json" || echo "!! mineru.json absent"
+          echo "=== HF hub cache contents ==="
+          ls -1 "$HOME/.cache/huggingface/hub" 2>/dev/null || echo "!! hub dir absent"
+          du -sh "$HOME/.cache/huggingface/hub" 2>/dev/null || true
 
       - name: Run benchmark
         env:
@@ -611,39 +1143,40 @@ jobs:
           OUTPUT_FORMAT: ${{ matrix.output_format }}
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
-          SHARD: ${{ matrix.shard }}/3
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
           UV_NO_SYNC: "1"
+          # Belt-and-suspenders: cap any stray unbounded network call (offline) so it
+          # fails fast and loud instead of hanging the full timeout. Bench-only, so the
+          # prefetch job's large online model downloads are unaffected.
+          MINERU_NET_TIMEOUT: "60"
         run: scripts/benchmarks/run-benchmark.sh
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-mineru-${{ matrix.output_format }}-${{ matrix.mode }}-shard${{ matrix.shard }}-${{ github.run_id }}
+          name: benchmarks-mineru-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
   bench-liteparse:
-    name: liteparse (${{ matrix.output_format }}, ${{ matrix.mode }})
-    needs: bench-rust
-    if: ${{ !cancelled() }}
-    runs-on: runner-medium-arm64
+    name: liteparse (${{ matrix.output_format }}, ${{ matrix.mode }}, ${{ matrix.cohort }})
+    needs: [setup, bench-rust]
+    if: ${{ needs.setup.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # liteparse is the primary head-to-head competitor: measured on the full
-        # grid (markdown/plaintext × single-file/batch), apples-to-apples with
-        # xberg. Batch uses liteparse's native `lit batch-parse` (see the harness
-        # liteparse adapter), mirroring xberg's native extract_batch.
         mode: [single-file, batch]
         output_format: [markdown, plaintext]
+        cohort: [native-pdf-fast-b8, ocr-pdf-fast-b4]
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ needs.setup.outputs.source-sha }}
 
           submodules: recursive
       - name: Free disk space
@@ -657,6 +1190,20 @@ jobs:
 
       - name: Restore benchmark binary permissions
         run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Bench cohorts span pdf/office/markup/ebook/email/data/images across the
+      # xberg + 6 competitor jobs -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
 
       - name: Install system dependencies (libheif + native libs for harness binary)
         uses: ./.github/actions/install-system-deps
@@ -679,7 +1226,7 @@ jobs:
 
       - name: Install liteparse CLI (lit)
         run: |
-          cargo install liteparse --locked
+          cargo install liteparse --version 2.9.0 --locked
           lit --version
 
       - name: Run benchmark
@@ -689,13 +1236,14 @@ jobs:
           OUTPUT_FORMAT: ${{ matrix.output_format }}
           ITERATIONS: ${{ env.ITERATIONS }}
           TIMEOUT: ${{ github.event.inputs.timeout }}
+          COHORT: tools/benchmark-harness/cohorts/${{ matrix.cohort }}.json
         run: scripts/benchmarks/run-benchmark.sh
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmarks-liteparse-${{ matrix.output_format }}-${{ matrix.mode }}-${{ github.run_id }}
+          name: benchmarks-liteparse-${{ matrix.output_format }}-${{ matrix.mode }}-${{ matrix.cohort }}-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
@@ -703,6 +1251,8 @@ jobs:
     name: Aggregate & Release Results
     needs:
       [
+        setup,
+        prefetch-mineru-models,
         bench-rust,
         bench-docling,
         bench-markitdown,
@@ -713,222 +1263,272 @@ jobs:
         bench-liteparse,
       ]
     runs-on: ubuntu-24.04-arm
-    # The App token (BOT_APP_*) is absent on workflow_dispatch, so GH_TOKEN falls
-    # back to the default GITHUB_TOKEN. Grant it contents: write so `gh release
-    # create` does not 403 ("Resource not accessible by integration").
     permissions:
       contents: write
-    if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
+    # MinerU prefetch is a HARD gate: if it fails, do not publish a partial
+    # baseline -- skip aggregation so the whole run fails. Other frameworks stay
+    # soft (always() tolerates their failures); only prefetch is mandatory.
+    if: ${{ always() && !cancelled() && needs.prefetch-mineru-models.result == 'success' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
     steps:
       - name: Create GitHub App token (if credentials available)
         id: app-token
+        # Optional: BOT_APP_ID/BOT_APP_PRIVATE_KEY may be unset (e.g. forked runs), and the
+        # token is only used to widen downstream write permissions, not required for the
+        # aggregation itself. Losing it degrades to default GITHUB_TOKEN, it does not mask a
+        # benchmark result. ~keep
         continue-on-error: true
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          owner: xberg-dev
 
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.setup.outputs.source-sha || github.sha }}
           submodules: recursive
 
-      - name: Setup Rust
-        uses: xberg-io/actions/setup-rust@v1
-        with:
-          cache-key-prefix: aggregate
+      # validate-artifacts/consolidate resolve each fixture's ground_truth_file, which
+      # points into the vendor test_documents corpus (quality scoring is on: MEASURE_QUALITY).
+      # Cohorts span nearly every format family, so no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
 
-      # The Consolidate step builds/runs the harness binary, which links libheif;
-      # without this the aggregate job fails on `libheif.pc not found` (PKG_CONFIG_PATH),
-      # blocking ALL result aggregation even when per-framework benchmarks succeeded.
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
+
+      # Reuse the harness binary + xberg-cli that `setup` already built and
+      # uploaded (benchmarks-target) instead of cold-rebuilding them here -- the
+      # xberg-cli is only needed so its on-disk size can be measured, and the
+      # harness binary runs validate-artifacts/consolidate. Same approach as
+      # bench-rust. The runtime still needs the native libs + ORT to execute the
+      # downloaded binary, but not a Rust toolchain or a compile.
+      - name: Download build artifacts (harness binary + xberg-cli)
+        if: needs.setup.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.setup.outputs.artifact-name }}
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        if: needs.setup.result == 'success'
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
       - name: Install system dependencies (libheif + native libs for harness binary)
+        if: needs.setup.result == 'success'
         uses: ./.github/actions/install-system-deps
 
       - name: Setup ONNX Runtime
+        if: needs.setup.result == 'success'
         uses: ./.github/actions/setup-onnx-runtime
         with:
           ort-version: ${{ env.ORT_VERSION }}
 
-      - name: Build xberg-cli (release, all features) for disk measurement
-        run: cargo build --locked --release -p xberg-cli --features all
-
       - name: Download all benchmark artifacts
+        # Some cohort jobs are allowed to fail independently (this job's own `if: always()`
+        # gate above tolerates that) and produce no benchmarks-*-<run_id> artifact, so the
+        # wildcard pattern can legitimately match nothing for a subset of cohorts.
+        # "Partition artifacts", "Log downloaded benchmark artifact inventory", and
+        # "Validate benchmark artifacts" below all explicitly handle missing per-cohort
+        # directories and fail the job if a cohort that should have produced results didn't. ~keep
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          pattern: "benchmarks-*"
-          path: benchmark-artifacts/
+          pattern: "benchmarks-*-${{ github.run_id }}"
+          path: benchmark-artifacts/_all/
           merge-multiple: false
 
-      - name: Validate artifacts before consolidation
-        id: validate-artifacts
+      - name: Partition artifacts into per-cohort directories
+        if: always()
         run: |
           set -euo pipefail
-
-          echo "=== Validating benchmark artifacts ==="
-
-          # Check if benchmark-artifacts directory exists and is not empty
-          if [[ ! -d "benchmark-artifacts" ]]; then
-            echo "WARNING: benchmark-artifacts directory does not exist"
-            echo "This may indicate that no benchmarks completed successfully (e.g., setup job was cancelled)"
-            echo "has-artifacts=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          ARTIFACT_COUNT=$(find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d | wc -l)
-          if [[ $ARTIFACT_COUNT -eq 0 ]]; then
-            echo "WARNING: No artifact directories found in benchmark-artifacts"
-            echo "This may indicate that no benchmarks completed successfully"
-            echo "has-artifacts=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Found $ARTIFACT_COUNT artifact directories"
-          find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d -exec basename {} \;
-          echo "has-artifacts=true" >> "$GITHUB_OUTPUT"
-
-      - name: Consolidate results
-        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
-        run: |
-          set -euo pipefail
-
-          # Check if we should skip (from validation step)
-          if [[ ! -d "benchmark-artifacts" ]]; then
-            echo "Skipping consolidation - no artifacts available"
-            exit 0
-          fi
-
-          ARTIFACT_COUNT=$(find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d | wc -l)
-          if [[ $ARTIFACT_COUNT -eq 0 ]]; then
-            echo "Skipping consolidation - no artifact directories found"
-            exit 0
-          fi
-
-          echo "=== Consolidating benchmark results ==="
-
-          # Find all artifact subdirectories
-          ARTIFACT_DIRS=$(find benchmark-artifacts -mindepth 1 -maxdepth 1 -type d | tr '\n' ',' | sed 's/,$//')
-
-          if [[ -z "$ARTIFACT_DIRS" ]]; then
-            echo "ERROR: ARTIFACT_DIRS is empty after globbing"
-            exit 1
-          fi
-
-          echo "Artifact directories: $ARTIFACT_DIRS"
-
-          # Run consolidation
-          cargo run --locked --release --package benchmark-harness --bin benchmark-harness -- consolidate \
-            --inputs "$ARTIFACT_DIRS" \
-            --output consolidated-output/
-
-          echo "Consolidation complete"
-          ls -lh consolidated-output/
-
-      - name: Validate aggregated data
-        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
-        run: |
-          set -euo pipefail
-
-          echo "=== Validating aggregated benchmark data ==="
-
-          AGGREGATED_FILE="consolidated-output/aggregated.json"
-
-          # Check if aggregated.json exists
-          if [[ ! -f "$AGGREGATED_FILE" ]]; then
-            echo "ERROR: aggregated.json not found at $AGGREGATED_FILE"
-            exit 1
-          fi
-
-          echo "Found aggregated.json ($(wc -c < "$AGGREGATED_FILE") bytes)"
-
-          # Validate JSON structure using jq
-          if ! jq empty "$AGGREGATED_FILE" 2>/dev/null; then
-            echo "ERROR: aggregated.json is not valid JSON"
-            exit 1
-          fi
-
-          echo "JSON validation passed"
-
-          # Check for required fields (by_framework_mode)
-          if ! jq -e '.by_framework_mode' "$AGGREGATED_FILE" > /dev/null 2>&1; then
-            echo "ERROR: Required field 'by_framework_mode' not found in aggregated.json"
-            exit 1
-          fi
-
-          echo "Required fields validated successfully"
-
-          # Display data structure summary
-          echo "Data structure summary:"
-          jq 'keys' "$AGGREGATED_FILE" | head -20
-
-      - name: Validate framework completeness
-        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
-        run: |
-          set -euo pipefail
-
-          AGGREGATED_FILE="consolidated-output/aggregated.json"
-
-          echo "=== Validating framework completeness (schema v2.4.0) ==="
-
-          # Keys follow the v2.4.0 aggregate-key convention:
-          #   xberg-*  →  "{framework_name}:{mode}"       (format is encoded in the name)
-          #   competitors  →  "{framework}:{output_format}:{mode}"
-          #
-          # xberg: 2 pipelines × 2 output formats × 2 modes = 8
-          # competitors: 13 entries (format varies per tool: docling/unstructured/mineru emit
-          #   both markdown+plaintext; markitdown/pymupdf4llm markdown-only; tika plaintext-only;
-          #   liteparse — the head-to-head competitor — emits both formats AND native batch)
-          # total expected: 21
-          EXPECTED_FRAMEWORKS=(
-            # xberg-* (slim keys — format encoded in name)
-            "xberg-markdown-baseline:single"   "xberg-markdown-baseline:batch"
-            "xberg-markdown-layout:single"     "xberg-markdown-layout:batch"
-            "xberg-plaintext-baseline:single"   "xberg-plaintext-baseline:batch"
-            "xberg-plaintext-layout:single"     "xberg-plaintext-layout:batch"
-            # competitors (format in key; single-file only unless noted)
-            "docling:markdown:single"    "docling:plaintext:single"
-            "markitdown:markdown:single"
-            "unstructured:markdown:single" "unstructured:plaintext:single"
-            "tika:plaintext:single"
-            "pymupdf4llm:markdown:single"
-            "mineru:markdown:single"     "mineru:plaintext:single"
-            # liteparse: full grid (markdown/plaintext × single/batch)
-            "liteparse:markdown:single"  "liteparse:plaintext:single"
-            "liteparse:markdown:batch"   "liteparse:plaintext:batch"
+          RUN_ID="${{ github.run_id }}"
+          # CliCohort -> cohort-manifest basename. No basename is a suffix of another, so a
+          # single trailing match assigns each artifact directory to exactly one cohort.
+          declare -A COHORT_BASENAME=(
+            [native]=native-pdf-fast-b8
+            [ocr]=ocr-pdf-fast-b4
+            [office]=native-office-fast
+            [markup]=native-markup-fast
+            [ebook]=native-ebook-fast
+            [email]=native-email-fast
+            [data]=native-data-fast
+            [images]=ocr-images-fast
           )
-
-          # Get actual frameworks from aggregated.json
-          ACTUAL_FRAMEWORKS=$(jq -r '.by_framework_mode | keys[]' "$AGGREGATED_FILE")
-
-          MISSING_COUNT=0
-          MISSING_LIST=""
-
-          for expected in "${EXPECTED_FRAMEWORKS[@]}"; do
-            if ! echo "$ACTUAL_FRAMEWORKS" | grep -qx "$expected"; then
-              MISSING_COUNT=$((MISSING_COUNT + 1))
-              MISSING_LIST="${MISSING_LIST}  - $expected"$'\n'
-            fi
+          shopt -s nullglob
+          for dir in benchmark-artifacts/_all/*/; do
+            name="$(basename "$dir")"
+            stem="${name%-"$RUN_ID"}"
+            for clicohort in "${!COHORT_BASENAME[@]}"; do
+              base="${COHORT_BASENAME[$clicohort]}"
+              if [[ "$stem" == *-"$base" ]]; then
+                mkdir -p "benchmark-artifacts/$clicohort"
+                mv "$dir" "benchmark-artifacts/$clicohort/$name"
+                break
+              fi
+            done
           done
 
-          echo "Present frameworks ($(echo "$ACTUAL_FRAMEWORKS" | wc -l | tr -d ' ')):"
-          while IFS= read -r framework; do
-            echo "  - $framework"
-          done <<< "$ACTUAL_FRAMEWORKS"
+      - name: Log downloaded benchmark artifact inventory
+        if: always()
+        run: |
+          set -uo pipefail
+          for cohort in native ocr office markup ebook email data images; do
+            root="benchmark-artifacts/${cohort}"
+            echo "=== ${cohort} artifacts (${root}) ==="
+            if [ ! -d "$root" ]; then
+              echo "!! no artifact directory (all ${cohort} jobs missing?)"
+              continue
+            fi
+            find "$root" -mindepth 1 -maxdepth 1 -type d | sort | while read -r dir; do
+              n_results=$(find "$dir" -name results.json | wc -l | tr -d ' ')
+              n_prov=$(find "$dir" -name provenance.json | wc -l | tr -d ' ')
+              echo "  $(basename "$dir"): results.json=${n_results} provenance.json=${n_prov}"
+            done
+          done
 
-          TOTAL_EXPECTED=${#EXPECTED_FRAMEWORKS[@]}
-          ACTUAL_COUNT=$(echo "$ACTUAL_FRAMEWORKS" | wc -l | tr -d ' ')
+      - name: Validate benchmark artifacts (all cohorts)
+        id: validate-artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          declare -A COHORT_BASENAME=(
+            [native]=native-pdf-fast-b8
+            [ocr]=ocr-pdf-fast-b4
+            [office]=native-office-fast
+            [markup]=native-markup-fast
+            [ebook]=native-ebook-fast
+            [email]=native-email-fast
+            [data]=native-data-fast
+            [images]=ocr-images-fast
+          )
+          for clicohort in native ocr office markup ebook email data images; do
+            base="${COHORT_BASENAME[$clicohort]}"
+            # mkdir so a cohort whose required producer emitted nothing yields the validator's
+            # "missing artifacts" contract error rather than an opaque read_dir failure.
+            mkdir -p "benchmark-artifacts/$clicohort"
+            echo "=== validate-artifacts: $clicohort ($base) ==="
+            ./target/release/benchmark-harness validate-artifacts \
+              --cohort "$clicohort" \
+              --artifacts-dir "benchmark-artifacts/$clicohort" \
+              --cohort-manifest "tools/benchmark-harness/cohorts/$base.json" \
+              --fixtures-root tools/benchmark-harness/fixtures \
+              --source-sha '${{ needs.setup.outputs.source-sha }}' \
+              --run-id '${{ github.run_id }}' \
+              --iterations '${{ env.ITERATIONS }}'
+          done
 
-          if [[ $MISSING_COUNT -gt 0 ]]; then
-            echo ""
-            echo "::warning::Missing $MISSING_COUNT of $TOTAL_EXPECTED expected framework:mode combinations (${ACTUAL_COUNT} present):"
-            echo "$MISSING_LIST"
-            echo "This is expected when some jobs fail — results will be published with available data."
-          else
-            echo ""
-            echo "All ${TOTAL_EXPECTED} expected framework:mode combinations present"
-          fi
+      - name: Consolidate results (all cohorts)
+        if: ${{ always() && steps.validate-artifacts.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          for clicohort in native ocr office markup ebook email data images; do
+            INPUTS=$(find "benchmark-artifacts/$clicohort" -mindepth 1 -maxdepth 1 -type d | sort | paste -sd, -)
+            ./target/release/benchmark-harness consolidate \
+              --inputs "$INPUTS" \
+              --output "consolidated-output/$clicohort/"
+          done
+
+      - name: Validate aggregates (all cohorts)
+        id: validate-aggregates
+        if: ${{ always() && steps.validate-artifacts.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          for clicohort in native ocr office markup ebook email data images; do
+            # Pass --fixtures-root explicitly (as the raw-artifact step above does): without it the
+            # binary falls back to a compile-time env!("CARGO_MANIFEST_DIR") path baked on the
+            # bench-rust build runner (/home/runner/_work/...), which does not exist on this runner.
+            ./target/release/benchmark-harness validate-artifacts \
+              --cohort "$clicohort" \
+              --fixtures-root tools/benchmark-harness/fixtures \
+              --aggregated-file "consolidated-output/$clicohort/aggregated.json"
+          done
+
+      - name: Prepare cohort release assets
+        id: prepare-release-assets
+        if: ${{ always() && steps.validate-aggregates.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          SOURCE_SHA="${{ needs.setup.outputs.source-sha }}"
+          UPDATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RUN_ID="${{ github.run_id }}"
+          # Per-cohort manifest name, BLAKE3, and required/optional matrix key counts come
+          # straight from the pinned bench_matrix contract via `cohort-contract`, so the release
+          # metadata can never drift from the validator (no hand-copied hashes/counts here).
+          index_cohorts='{}'
+          for clicohort in native ocr office markup ebook email data images; do
+            cp "consolidated-output/$clicohort/aggregated.json" "release-assets/benchmarks-$clicohort-aggregated.json"
+            contract="$(./target/release/benchmark-harness cohort-contract --cohort "$clicohort")"
+            jq -n \
+              --arg cohort "$(jq -r '.manifest_name' <<<"$contract")" \
+              --arg cohort_hash "$(jq -r '.manifest_blake3' <<<"$contract")" \
+              --argjson expected "$(jq -r '.expected_matrix_keys' <<<"$contract")" \
+              --argjson optional "$(jq -r '.optional_matrix_keys' <<<"$contract")" \
+              --arg commit "$SOURCE_SHA" \
+              --arg run_id "$RUN_ID" \
+              --arg run_url "$RUN_URL" \
+              --arg updated_at "$UPDATED_AT" \
+              '{cohort: $cohort, cohort_manifest_blake3: $cohort_hash, expected_matrix_keys: $expected, optional_matrix_keys: $optional, commit: $commit, run_id: $run_id, run_url: $run_url, updated_at: $updated_at}' \
+              > "release-assets/benchmarks-$clicohort-metadata.json"
+            index_cohorts="$(jq \
+              --arg k "$clicohort" \
+              --arg agg "benchmarks-$clicohort-aggregated.json" \
+              --arg meta "benchmarks-$clicohort-metadata.json" \
+              '.[$k] = {aggregated: $agg, metadata: $meta}' <<<"$index_cohorts")"
+          done
+          jq -n \
+            --arg commit "$SOURCE_SHA" \
+            --arg run_id "$RUN_ID" \
+            --arg run_url "$RUN_URL" \
+            --arg updated_at "$UPDATED_AT" \
+            --argjson cohorts "$index_cohorts" \
+            '{schema_version: 1, commit: $commit, run_id: $run_id, run_url: $run_url, updated_at: $updated_at, cohorts: $cohorts}' \
+            > release-assets/benchmarks-index.json
+
+      - name: Log aggregation gate status
+        if: always()
+        run: |
+          echo "=== Upstream job results ==="
+          echo "setup=${{ needs.setup.result }}"
+          echo "bench-rust=${{ needs.bench-rust.result }}"
+          echo "bench-docling=${{ needs.bench-docling.result }}"
+          echo "bench-markitdown=${{ needs.bench-markitdown.result }}"
+          echo "bench-unstructured=${{ needs.bench-unstructured.result }}"
+          echo "bench-tika=${{ needs.bench-tika.result }}"
+          echo "bench-pymupdf4llm=${{ needs.bench-pymupdf4llm.result }}"
+          echo "bench-mineru=${{ needs.bench-mineru.result }} (optional; NOT a release gate)"
+          echo "bench-liteparse=${{ needs.bench-liteparse.result }}"
+          echo "=== Aggregation step outcomes ==="
+          echo "validate-artifacts=${{ steps.validate-artifacts.outcome }}"
+          echo "validate-aggregates=${{ steps.validate-aggregates.outcome }}"
+          echo "prepare-release-assets=${{ steps.prepare-release-assets.outcome }}"
 
       - name: Create GitHub Release with benchmark results
-        if: steps.validate-artifacts.outputs.has-artifacts == 'true'
+        # Publication gates on the required producer jobs (setup + bench-rust; xberg is required in
+        # every cohort) AND on validate-artifacts, which enforces the full contract. The validator
+        # is the real gate for competitors: the PDF cohorts' competitor cells (docling, liteparse,
+        # tika, markitdown, unstructured, pymupdf4llm) are REQUIRED, so a missing one fails
+        # validate-artifacts and blocks the release even though we dropped the per-competitor
+        # `needs.*.result` gates. Only the competitor cells on the heterogeneous family cohorts are
+        # best-effort (optional in the contract): a framework that cannot read one member format of
+        # a family fails its own job without blocking the baseline, and its partial results still
+        # flow into the aggregate as non-gating data.
+        if: >-
+          ${{
+            always() &&
+            steps.validate-artifacts.outcome == 'success' &&
+            steps.validate-aggregates.outcome == 'success' &&
+            steps.prepare-release-assets.outcome == 'success' &&
+            needs.setup.result == 'success' &&
+            needs.bench-rust.result == 'success'
+          }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
         run: |
@@ -936,27 +1536,18 @@ jobs:
 
           echo "=== Creating GitHub Release with benchmark results ==="
 
-          SHORT_SHA="${{ github.sha }}"
+          SOURCE_SHA="${{ needs.setup.outputs.source-sha }}"
+          SHORT_SHA="${SOURCE_SHA}"
           SHORT_SHA="${SHORT_SHA:0:7}"
           TAG="benchmark-run-${{ github.run_id }}"
           DATE=$(date -u +"%Y-%m-%d")
 
-          # Create metadata file alongside aggregated data
-          cat > consolidated-output/metadata.json <<EOF
-          {
-            "updated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "commit": "${{ github.sha }}",
-            "run_id": "${{ github.run_id }}",
-            "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          }
-          EOF
-
           gh release create "$TAG" \
             --prerelease \
+            --target "${SOURCE_SHA}" \
             --title "Benchmark Results ${DATE} (${SHORT_SHA})" \
             --notes "Comparative benchmark results from workflow run [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
 
-          **Commit:** ${{ github.sha }}
+          **Commit:** ${SOURCE_SHA}
           **Date:** ${DATE}" \
-            consolidated-output/aggregated.json \
-            consolidated-output/metadata.json
+            release-assets/*.json

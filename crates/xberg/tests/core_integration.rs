@@ -300,7 +300,6 @@ fn test_mime_validation() {
     assert!(validate_mime_type("image/png").is_ok());
     assert!(validate_mime_type("image/custom-format").is_ok());
 
-    // video/mp4 (and other audio/video) are now declared formats; extraction requires transcription feature
     assert!(validate_mime_type("application/unknown").is_err());
 }
 
@@ -401,7 +400,6 @@ async fn test_nonexistent_file_error() {
     let result = extract(ExtractInput::from_uri("/nonexistent/file.txt"), &config).await;
 
     assert!(result.is_err());
-    // File validation returns Io error for missing files (NotFound)
     assert!(matches!(result.unwrap_err(), xberg::XbergError::Io(_)));
 }
 
@@ -409,8 +407,6 @@ async fn test_nonexistent_file_error() {
 #[tokio::test]
 async fn test_unsupported_mime_type_error() {
     let config = ExtractionConfig::default();
-    // video/mp4 is now a declared format (routes to transcription extractor when
-    // that feature is enabled). Use a genuinely unsupported type instead.
     let result = extract(
         ExtractInput::from_bytes(
             b"test".to_vec(),

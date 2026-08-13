@@ -9,6 +9,15 @@
 //!
 //! These tests ensure production workloads with high concurrency work correctly.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+// ~keep: test/bench binaries print by design; org logging policy exempts tests
+// `tokio::spawn`ing an extraction future requires proving it `Send`. Under `full`
+// features that proof walks into h2's `PollMessage` -> `slab::Entry` -> `PhantomData`
+// chain (reqwest/hyper, pulled in by api/mcp/liter-llm), which exceeds the default
+// 128 limit. The chain is entirely third-party — no xberg type appears in it — and
+// rustc's own diagnostic recommends exactly this. ~keep
+#![recursion_limit = "256"]
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use xberg::Result;
@@ -26,7 +35,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 mod helpers;
-use helpers::{BytesInput, extract_bytes_document, extract_bytes_documents, extract_uri_document_blocking};
+use helpers::{BytesInput, extract_bytes_document, extract_bytes_documents};
 
 fn trim_trailing_newlines(value: &str) -> &str {
     value.trim_end_matches(['\n', '\r'])
@@ -211,7 +220,7 @@ async fn test_concurrent_ocr_processing() {
         let config = config.clone();
 
         handles.push(tokio::task::spawn_blocking(move || {
-            extract_uri_document_blocking(&file_path, None, &config)
+            helpers::extract_uri_document_blocking(&file_path, None, &config)
         }));
     }
 
@@ -274,7 +283,7 @@ fn test_concurrent_ocr_cache_stress() {
 
     let file_path = get_test_file_path("images/ocr_image.jpg");
 
-    let first_result = extract_uri_document_blocking(&file_path, None, &config);
+    let first_result = helpers::extract_uri_document_blocking(&file_path, None, &config);
     assert!(first_result.is_ok(), "Initial OCR should succeed");
 
     let cache_hit_count = Arc::new(AtomicUsize::new(0));
@@ -287,7 +296,7 @@ fn test_concurrent_ocr_cache_stress() {
 
         handles.push(std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let result = extract_uri_document_blocking(&file_path, None, &config);
+            let result = helpers::extract_uri_document_blocking(&file_path, None, &config);
             let duration = start.elapsed();
 
             if duration < Duration::from_millis(500) {

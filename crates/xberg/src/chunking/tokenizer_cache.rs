@@ -3,7 +3,8 @@
 //! Tokenizers are cached in-memory for subsequent calls.  xberg ships no
 //! bundled tokenizer — callers supply the tokenizer via [`TokenizerSource`]:
 //!
-//! - [`TokenizerSource::Pretrained`] — resolved via HuggingFace Hub (network).
+//! - [`TokenizerSource::Pretrained`] — resolved via the standard Hugging Face
+//!   snapshot cache (network only on a cache miss).
 //! - [`TokenizerSource::File`]       — loaded from a local `tokenizer.json` path.
 //! - [`TokenizerSource::Bytes`]      — raw `tokenizer.json` bytes supplied by the
 //!   caller (e.g. `include_bytes!` in their binary).  This is the primary path for
@@ -27,19 +28,35 @@ use crate::XbergError;
 /// widely-available HuggingFace proxy for GPT-4o and Claude token counts.
 pub const DEFAULT_COUNT_TOKENS_MODEL: &str = "Xenova/gpt-4o";
 
+/// Immutable revision used by the default tokenizer preset. Only consumed by the
+/// native `Pretrained` HF-download path (gated below); wasm32 loads from bytes.
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_COUNT_TOKENS_REVISION: &str = "7956d98f2a83b2751a98ea7136fdf7fe6cf54e69";
+
 /// Source from which a tokenizer is loaded.
 ///
-/// Pass to [`try_count_tokens`] or [`preload_tokenizer`] to supply the tokenizer
-/// without relying on the HuggingFace Hub.
+/// Pass to [`try_count_tokens`] or [`preload_tokenizer`] to choose a Hub-backed
+/// or fully local tokenizer source.
 ///
 /// # FFI / bindings note
 ///
 /// This type is marked `#[cfg_attr(alef, alef(skip))]` on the functions that use
 /// it — it is a Rust-only abstraction and is not surfaced in language bindings.
 pub enum TokenizerSource<'a> {
-    /// HuggingFace model ID — resolved via [`tokenizers::Tokenizer::from_pretrained`]
-    /// (requires network access on the first call; result is disk-cached by `hf-hub`).
+    /// Hugging Face model ID resolved through hf-hub's snapshot cache.
+    ///
+    /// The default tokenizer preset is pinned to an immutable revision. Other
+    /// model IDs resolve the repository's `main`; use [`Self::PretrainedRevision`]
+    /// when reproducibility requires a caller-specified revision.
     Pretrained(&'a str),
+
+    /// Hugging Face model ID resolved at an immutable branch, tag, or commit.
+    PretrainedRevision {
+        /// Hugging Face model repository ID.
+        model: &'a str,
+        /// Branch, tag, or commit SHA to resolve.
+        revision: &'a str,
+    },
 
     /// Path to a local `tokenizer.json` file.
     File(&'a std::path::Path),
@@ -53,17 +70,17 @@ pub enum TokenizerSource<'a> {
 
 /// Cache key discriminator for [`TokenizerSource`] variants.
 ///
-/// We need a stable string key so all three source types can share one
+/// We need a stable string key so all source types can share one
 /// [`AHashMap`].  The discriminant prefix (`pretrained:`, `file:`, `bytes:`)
 /// prevents collisions across source kinds.
 fn cache_key(source: &TokenizerSource<'_>) -> String {
     match source {
         TokenizerSource::Pretrained(model) => format!("pretrained:{model}"),
+        TokenizerSource::PretrainedRevision { model, revision } => {
+            format!("pretrained:{model}@{revision}")
+        }
         TokenizerSource::File(path) => format!("file:{}", path.display()),
         TokenizerSource::Bytes(b) => {
-            // Hash the bytes with std's DefaultHasher.  We only need cache
-            // identity within a process lifetime — cryptographic strength is
-            // not required.
             let mut h = DefaultHasher::new();
             b.hash(&mut h);
             format!("bytes:{:016x}", h.finish())
@@ -81,14 +98,39 @@ static TOKENIZER_CACHE: LazyLock<RwLock<AHashMap<String, Arc<tokenizers::Tokeniz
 /// Load a tokenizer from `source` without consulting the cache.
 fn load_tokenizer(source: &TokenizerSource<'_>) -> crate::Result<tokenizers::Tokenizer> {
     match source {
-        // `from_pretrained` requires the tokenizers `http` feature (network fetch via hf-hub),
-        // which is unavailable on wasm32. File/Bytes sources remain supported.
         #[cfg(not(target_arch = "wasm32"))]
-        TokenizerSource::Pretrained(model) => tokenizers::Tokenizer::from_pretrained(model, None)
-            .map_err(|e| XbergError::validation(format!("Failed to load tokenizer '{model}': {e}"))),
+        TokenizerSource::Pretrained(model) => {
+            let revision = (*model == DEFAULT_COUNT_TOKENS_MODEL).then_some(DEFAULT_COUNT_TOKENS_REVISION);
+            let path = crate::model_download::hf_resolve_file(model, "tokenizer.json", revision, None, None)
+                .map_err(|e| XbergError::validation(format!("Failed to resolve tokenizer '{model}': {e}")))?;
+            tokenizers::Tokenizer::from_file(&path).map_err(|e| {
+                XbergError::validation(format!(
+                    "Failed to load tokenizer '{}' from '{}': {e}",
+                    model,
+                    path.display()
+                ))
+            })
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        TokenizerSource::PretrainedRevision { model, revision } => {
+            let path = crate::model_download::hf_resolve_file(model, "tokenizer.json", Some(revision), None, None)
+                .map_err(|e| {
+                    XbergError::validation(format!("Failed to resolve tokenizer '{model}@{revision}': {e}"))
+                })?;
+            tokenizers::Tokenizer::from_file(&path).map_err(|e| {
+                XbergError::validation(format!(
+                    "Failed to load tokenizer '{model}@{revision}' from '{}': {e}",
+                    path.display()
+                ))
+            })
+        }
         #[cfg(target_arch = "wasm32")]
         TokenizerSource::Pretrained(model) => Err(XbergError::validation(format!(
             "pretrained tokenizer '{model}' requires network access, unavailable on this platform"
+        ))),
+        #[cfg(target_arch = "wasm32")]
+        TokenizerSource::PretrainedRevision { model, revision } => Err(XbergError::validation(format!(
+            "pretrained tokenizer '{model}@{revision}' requires network access, unavailable on this platform"
         ))),
         TokenizerSource::File(path) => tokenizers::Tokenizer::from_file(path)
             .map_err(|e| XbergError::validation(format!("Failed to load tokenizer from '{}': {e}", path.display()))),
@@ -114,7 +156,6 @@ pub(crate) fn get_or_init_tokenizer_from_source(
 ) -> crate::Result<Arc<tokenizers::Tokenizer>> {
     let key = cache_key(source);
 
-    // Phase 1: try read lock (fast path for cache hits)
     {
         let cache = TOKENIZER_CACHE
             .read()
@@ -124,12 +165,10 @@ pub(crate) fn get_or_init_tokenizer_from_source(
         }
     }
 
-    // Phase 2: write lock, double-check, then load
     let mut cache = TOKENIZER_CACHE
         .write()
         .map_err(|e| XbergError::Other(format!("Tokenizer cache write lock poisoned: {e}")))?;
 
-    // Double-check after acquiring write lock (another thread may have loaded)
     if let Some(tok) = cache.get(&key) {
         return Ok(Arc::clone(tok));
     }
@@ -151,8 +190,9 @@ pub(crate) fn get_or_init_tokenizer(model: &str) -> crate::Result<Arc<tokenizers
 ///
 /// Reuses the global in-memory tokenizer cache — the tokenizer is downloaded and
 /// parsed only on the first call for each model, then served from memory for all
-/// subsequent calls.  File-level caching is handled by the `hf-hub` crate (defaults
-/// to `~/.cache/huggingface/`).
+/// subsequent calls. File-level caching is handled by `hf-hub`, including its
+/// standard `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, XDG, and platform
+/// cache conventions.
 ///
 /// # Arguments
 ///
@@ -276,8 +316,6 @@ mod tests {
 
     #[test]
     fn test_cache_returns_same_instance() {
-        // This test requires network access to download a tokenizer.
-        // Skip in CI by checking for a specific env var.
         if std::env::var("CI").is_ok() {
             return;
         }
@@ -286,7 +324,6 @@ mod tests {
         let tok1 = get_or_init_tokenizer(model).unwrap();
         let tok2 = get_or_init_tokenizer(model).unwrap();
 
-        // Same Arc instance (pointer equality)
         assert!(Arc::ptr_eq(&tok1, &tok2));
     }
 
@@ -303,14 +340,12 @@ mod tests {
 
         let text = "Hello, world! This is a test sentence for token counting.";
 
-        // None resolves to DEFAULT_COUNT_TOKENS_MODEL ("Xenova/gpt-4o")
         let count_via_none = count_tokens(text, None);
         assert!(
             count_via_none > 0,
             "count_tokens(text, None) must return a non-zero count"
         );
 
-        // Explicit model must return the same value (same model, same cache entry)
         let count_via_explicit = count_tokens(text, Some(DEFAULT_COUNT_TOKENS_MODEL));
         assert_eq!(
             count_via_none, count_via_explicit,
@@ -324,9 +359,7 @@ mod tests {
     #[test]
     fn test_count_tokens_falls_back_gracefully_on_invalid_model() {
         let text = "six distinct whitespace separated words here";
-        // An obviously invalid model ID — `get_or_init_tokenizer` will fail.
         let count = count_tokens(text, Some("__invalid_model_that_does_not_exist__"));
-        // Fallback: split_whitespace gives 6 tokens for the sentence above.
         assert_eq!(count, 6, "fallback whitespace estimator should count 6 words");
     }
 
@@ -338,13 +371,6 @@ mod tests {
         assert_eq!(whitespace_token_estimate("one"), 1);
         assert_eq!(whitespace_token_estimate("one two three"), 3);
     }
-
-    // ── Offline tests (no network required) ──────────────────────────────────
-    //
-    // These tests use the bert-base-uncased tokenizer.json bundled as a test
-    // fixture under testdata/.  The bert WordPiece tokenizer is much smaller
-    // than gpt-4o (~466 KB vs 2.9 MB) and was already present in the HuggingFace
-    // disk cache, making it suitable as a lightweight offline fixture.
 
     const BERT_TOKENIZER_BYTES: &[u8] = include_bytes!("testdata/bert-base-uncased.tokenizer.json");
 
@@ -370,7 +396,6 @@ mod tests {
     fn test_try_count_tokens_bytes_source_deterministic() {
         let n = try_count_tokens("Hello, world!", TokenizerSource::Bytes(BERT_TOKENIZER_BYTES))
             .expect("try_count_tokens with Bytes must not fail");
-        // bert WordPiece without special tokens: "hello", ",", "world", "!" = 4
         assert_eq!(n, 4, "expected 4 tokens for 'Hello, world!' via bert WordPiece");
     }
 
@@ -419,8 +444,6 @@ mod tests {
     /// fall back to whitespace when offline (no cached tokenizer for gpt-4o in unit tests).
     #[test]
     fn test_count_tokens_backcmpat_fallback_when_offline() {
-        // In a unit-test environment with no HF disk cache for Xenova/gpt-4o and CI=false,
-        // count_tokens falls back to whitespace.  We just assert it is non-zero and doesn't panic.
         let text = "hello world test";
         let n = count_tokens(text, None);
         assert!(
@@ -440,10 +463,19 @@ mod tests {
         assert_ne!(k_pretrained, k_bytes);
         assert_ne!(k_file, k_bytes);
 
-        // Same value, same source → same key
         assert_eq!(
             cache_key(&TokenizerSource::Pretrained("model-a")),
             cache_key(&TokenizerSource::Pretrained("model-a"))
+        );
+        assert_ne!(
+            cache_key(&TokenizerSource::PretrainedRevision {
+                model: "model-a",
+                revision: "revision-a",
+            }),
+            cache_key(&TokenizerSource::PretrainedRevision {
+                model: "model-a",
+                revision: "revision-b",
+            })
         );
         assert_eq!(
             cache_key(&TokenizerSource::Bytes(b"abc")),

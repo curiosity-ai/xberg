@@ -109,16 +109,68 @@ fn validate_workbook_budget(workbook: &crate::types::ExcelWorkbook, budget: &mut
     Ok(())
 }
 
+/// MIME types backed by an OOXML (or OOXML-derived binary) ZIP package, i.e.
+/// formats that may carry embedded objects under `xl/embeddings/`
+/// (xberg-io/xberg#78). `.xls`/`.xla` (legacy binary, not a ZIP) and `.ods`
+/// (OpenDocument, different embedding convention) are excluded.
+#[cfg(feature = "office")]
+fn is_ooxml_zip_mime(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.ms-excel.sheet.macroEnabled.12"
+            | "application/vnd.ms-excel.addin.macroEnabled.12"
+            | "application/vnd.ms-excel.template.macroEnabled.12"
+            | "application/vnd.ms-excel.sheet.binary.macroEnabled.12"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.template"
+    )
+}
+
+/// Name the embedded objects under `xl/embeddings/` in an OOXML zip package,
+/// for the [`SyncExtractor`] path (WASM), which cannot recurse into them the way
+/// `extract_content`/`extract_path` do via `ooxml_embedded` (that helper calls
+/// back into the async extraction pipeline). Naming them in a warning at least
+/// makes their presence and identity visible (xberg-io/xberg#78) rather than
+/// silently dropping them.
+///
+/// Returns `None` when `mime_type` is not an OOXML zip format, the content is
+/// not a readable zip, or the archive has no `xl/embeddings/` entries.
+#[cfg(feature = "office")]
+fn scan_for_embedded_objects(content: &[u8], mime_type: &str) -> Option<ProcessingWarning> {
+    if !is_ooxml_zip_mime(mime_type) {
+        return None;
+    }
+
+    let cursor = std::io::Cursor::new(content);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+
+    let mut names = Vec::new();
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).ok()?;
+        let name = entry.name().to_string();
+        if name.starts_with("xl/embeddings/") && !name.ends_with('/') {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+
+    Some(ProcessingWarning {
+        source: Cow::Borrowed("excel"),
+        message: Cow::Owned(format!(
+            "Workbook contains {} embedded object{} that were not extracted ({})",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            crate::core::diagnostics::format_entry_list(&names)
+        )),
+    })
+}
+
 /// Excel spreadsheet extractor using calamine.
 ///
 /// Supports: .xlsx, .xlsm, .xlam, .xltm, .xls, .xla, .xlsb, .ods
-///
-/// # Limitations
-///
-/// - **Hyperlinks**: calamine (v0.34) does not expose cell hyperlink data in its
-///   public API. Excel files may contain hyperlinks via the `HYPERLINK()` formula
-///   or via the relationships XML, but neither is accessible through the crate.
-///   This would require either a calamine upstream change or manual OOXML parsing.
 #[cfg_attr(alef, alef(skip))]
 pub struct ExcelExtractor;
 
@@ -160,11 +212,28 @@ impl ExcelExtractor {
         out
     }
 
+    /// Parse the `hidden_sheets` workbook-metadata entry (a comma-separated list of
+    /// sheet names populated by `extraction::excel::extract_metadata` from calamine's
+    /// `sheets_metadata()`) into the set of sheet names that are hidden or very-hidden
+    /// (xberg-io/xberg#119). A sheet's own content carries no visibility flag, so this
+    /// is the only way `build_internal_document` can tell a hidden sheet from a visible
+    /// one.
+    fn hidden_sheet_names(workbook: &crate::types::ExcelWorkbook) -> std::collections::HashSet<&str> {
+        workbook
+            .metadata
+            .get("hidden_sheets")
+            .map(|names| names.split(", ").collect())
+            .unwrap_or_default()
+    }
+
     /// Build an `InternalDocument` from the workbook.
     ///
     /// Each sheet becomes a table preceded by an H2 heading with the sheet name (when
-    /// non-empty). Additionally, `prebuilt_pages` is set to `Some(Vec<PageContent>)` with
-    /// one entry per sheet so that `ExtractedDocument.pages` is always `Some` for Excel.
+    /// non-empty). A sheet hidden in the workbook (`hidden_sheets` metadata) has
+    /// `" (hidden)"` appended to its heading so hidden content is distinguishable from
+    /// visible content (xberg-io/xberg#119). Additionally, `prebuilt_pages` is set to
+    /// `Some(Vec<PageContent>)` with one entry per sheet so that `ExtractedDocument.pages`
+    /// is always `Some` for Excel.
     ///
     /// Empty sheets still produce a `PageContent` entry so the page index aligns with the
     /// sheet index. The top-level `content` remains the concatenation of all per-sheet
@@ -172,6 +241,7 @@ impl ExcelExtractor {
     fn build_internal_document(workbook: &crate::types::ExcelWorkbook) -> InternalDocument {
         let mut builder = InternalDocumentBuilder::new("excel");
         let mut pages: Vec<PageContent> = Vec::with_capacity(workbook.sheets.len());
+        let hidden_sheets = Self::hidden_sheet_names(workbook);
 
         for (sheet_index, sheet) in workbook.sheets.iter().enumerate() {
             let page_number = (sheet_index + 1) as u32;
@@ -180,34 +250,33 @@ impl ExcelExtractor {
             } else {
                 Some(sheet.name.clone())
             };
+            let is_hidden = hidden_sheets.contains(sheet.name.as_str());
+            let hidden_suffix = if is_hidden { " (hidden)" } else { "" };
 
             if let Some(ref cells) = sheet.table_cells
                 && !cells.is_empty()
             {
                 if !sheet.name.is_empty() {
-                    builder.push_heading(2, &sheet.name, None, None);
+                    builder.push_heading(2, &format!("{}{hidden_suffix}", sheet.name), None, None);
                 }
                 builder.push_table_from_cells(cells, Some(page_number), None);
 
-                // Build per-sheet content: heading (when named) + markdown table.
-                // Sheet name is escaped so markdown-significant characters in the name
-                // don't produce double headings or broken inline elements.
                 let page_content = if sheet.name.is_empty() {
                     sheet.markdown.clone()
                 } else {
                     format!(
-                        "## {}\n\n{}",
+                        "## {}{hidden_suffix}\n\n{}",
                         Self::escape_sheet_name_for_heading(&sheet.name),
                         sheet.markdown
                     )
                 };
 
-                // Wrap the sheet table in Arc for zero-copy sharing.
                 let arc_table = Arc::new(Table {
                     cells: cells.clone(),
                     markdown: sheet.markdown.clone(),
                     page_number,
                     bounding_box: None,
+                    ..Default::default()
                 });
 
                 pages.push(PageContent {
@@ -223,11 +292,8 @@ impl ExcelExtractor {
                     sheet_name: name_opt,
                 });
             } else {
-                // Empty sheet: emit a PageContent so page index == sheet index.
-                // Content is always "## <name>\n\n" (or empty string) so that
-                // concatenating per-page content never mashes two headings together.
                 let content = match name_opt.as_deref() {
-                    Some(n) => format!("## {}\n\n", Self::escape_sheet_name_for_heading(n)),
+                    Some(n) => format!("## {}{hidden_suffix}\n\n", Self::escape_sheet_name_for_heading(n)),
                     None => String::new(),
                 };
 
@@ -285,7 +351,6 @@ impl ExcelExtractor {
         let mut additional = AHashMap::new();
         let wb_meta = &workbook.metadata;
 
-        // Map office metadata to standard Metadata fields
         let title = wb_meta.get("title").cloned();
         let subject = wb_meta.get("subject").cloned();
         let created_by = wb_meta.get("created_by").or_else(|| wb_meta.get("creator")).cloned();
@@ -301,7 +366,6 @@ impl ExcelExtractor {
         });
         let language = wb_meta.get("language").cloned();
 
-        // Put remaining metadata into additional map (excluding standard fields)
         for (key, value) in &workbook.metadata {
             match key.as_str() {
                 "title" | "subject" | "created_by" | "creator" | "modified_by" | "created_at" | "modified_at"
@@ -327,10 +391,8 @@ impl ExcelExtractor {
             ..Default::default()
         };
 
-        // Transfer revision headers extracted from xl/revisions/revisionHeaders.xml.
         doc.revisions = workbook.revisions.clone();
 
-        // Scan for DDE / external-call formulas and attach any warnings found.
         for warning in scan_for_dde_warnings(workbook) {
             doc.processing_warnings.push(warning);
         }
@@ -355,11 +417,24 @@ impl SyncExtractor for ExcelExtractor {
             _ => ".xlsx",
         };
 
-        let workbook = crate::extraction::excel::read_excel_bytes(content, extension)?;
+        let (workbook, read_warnings) = crate::extraction::excel::read_excel_bytes(content, extension)?;
         let mut budget = SecurityBudget::from_config(config);
         validate_workbook_budget(&workbook, &mut budget)?;
         let mut doc = Self::workbook_to_internal_document(&workbook);
+        doc.processing_warnings.extend(read_warnings);
         doc.mime_type = mime_type.to_string();
+
+        // The sync path (WASM) cannot recurse into embedded objects the way
+        // `extract_content`/`extract_path` do via `ooxml_embedded`, which requires
+        // async pipeline extraction. Name them in a warning instead so a workbook
+        // with embedded files doesn't look fully extracted (xberg-io/xberg#78). ~keep
+        #[cfg(feature = "office")]
+        if config.max_archive_depth > 0
+            && let Some(warning) = scan_for_embedded_objects(content, mime_type)
+        {
+            doc.processing_warnings.push(warning);
+        }
+
         Ok(doc)
     }
 }
@@ -392,7 +467,7 @@ impl InternalDocumentExtractor for ExcelExtractor {
             _ => ".xlsx",
         };
 
-        let workbook = {
+        let (workbook, read_warnings) = {
             #[cfg(feature = "tokio-runtime")]
             {
                 if crate::core::batch_mode::is_batch_mode() {
@@ -424,24 +499,62 @@ impl InternalDocumentExtractor for ExcelExtractor {
         let mut budget = SecurityBudget::from_config(config);
         validate_workbook_budget(&workbook, &mut budget)?;
         let mut doc = Self::workbook_to_internal_document(&workbook);
+        doc.processing_warnings.extend(read_warnings);
         doc.mime_type = mime_type.to_string();
+
+        #[cfg(feature = "office")]
+        if config.max_archive_depth > 0 && is_ooxml_zip_mime(mime_type) {
+            let (children, embed_warnings) = crate::extraction::ooxml_embedded::extract_ooxml_embedded_objects(
+                content,
+                "xl/embeddings/",
+                "excel",
+                config,
+            )
+            .await;
+            if !children.is_empty() {
+                doc.children = Some(children);
+            }
+            doc.processing_warnings.extend(embed_warnings);
+        }
+
         Ok(doc)
     }
 
     #[cfg_attr(feature = "otel", tracing::instrument(
-        skip(self, path, _config),
+        skip(self, path, config),
         fields(
             extractor.name = self.name(),
         )
     ))]
-    async fn extract_path(&self, path: &Path, mime_type: &str, _config: &ExtractionConfig) -> Result<InternalDocument> {
+    async fn extract_path(&self, path: &Path, mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
         let path_str = path
             .to_str()
             .ok_or_else(|| crate::XbergError::validation("Invalid file path".to_string()))?;
 
-        let workbook = crate::extraction::excel::read_excel_file(path_str)?;
+        let (workbook, read_warnings) = crate::extraction::excel::read_excel_file(path_str)?;
         let mut doc = Self::workbook_to_internal_document(&workbook);
+        doc.processing_warnings.extend(read_warnings);
         doc.mime_type = mime_type.to_string();
+
+        #[cfg(not(feature = "office"))]
+        let _ = config;
+
+        #[cfg(feature = "office")]
+        if config.max_archive_depth > 0 && is_ooxml_zip_mime(mime_type) {
+            let file_bytes = crate::core::io::open_file_bytes(path)?;
+            let (children, embed_warnings) = crate::extraction::ooxml_embedded::extract_ooxml_embedded_objects(
+                &file_bytes,
+                "xl/embeddings/",
+                "excel",
+                config,
+            )
+            .await;
+            if !children.is_empty() {
+                doc.children = Some(children);
+            }
+            doc.processing_warnings.extend(embed_warnings);
+        }
+
         Ok(doc)
     }
 
@@ -476,7 +589,6 @@ mod tests {
                 let rows = c.len();
                 let cols = c.iter().map(|r| r.len()).max().unwrap_or(0);
                 let count = c.iter().flat_map(|r| r.iter()).filter(|s| !s.is_empty()).count();
-                // Build a minimal markdown table for test assertions
                 let mut md = String::new();
                 for (i, row) in c.iter().enumerate() {
                     md.push('|');
@@ -535,8 +647,6 @@ mod tests {
 
     #[test]
     fn test_prebuilt_pages_always_some() {
-        // Even an empty workbook sets prebuilt_pages to Some(vec![]) so callers
-        // can rely on .is_some() to detect that this format supports paging.
         let workbook = make_workbook(vec![]);
         let doc = ExcelExtractor::build_internal_document(&workbook);
         assert!(doc.prebuilt_pages.is_some());
@@ -555,7 +665,6 @@ mod tests {
         let pages = doc.prebuilt_pages.as_ref().unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].page_number, 1);
-        // sheet_name carries the raw sheet name; section_name is PPTX-only
         assert_eq!(pages[0].sheet_name.as_deref(), Some("Sheet1"));
         assert_eq!(pages[0].section_name, None);
         assert!(pages[0].content.contains("Sheet1"));
@@ -565,8 +674,6 @@ mod tests {
 
     #[test]
     fn test_single_sheet_content_matches_flat_content() {
-        // The concatenation of per-sheet page content should equal what the flat
-        // extraction produces (heading text + table rows visible in elements).
         let cells = vec![
             vec!["Col1".to_string(), "Col2".to_string()],
             vec!["r1".to_string(), "r2".to_string()],
@@ -576,9 +683,7 @@ mod tests {
 
         let pages = doc.prebuilt_pages.as_ref().unwrap();
         assert_eq!(pages.len(), 1);
-        // Page content must start with the heading
         assert!(pages[0].content.starts_with("## Data"));
-        // Page content must include the table markdown
         assert!(pages[0].content.contains("Col1"));
         assert!(pages[0].content.contains("r1"));
     }
@@ -601,12 +706,10 @@ mod tests {
         let pages = doc.prebuilt_pages.as_ref().unwrap();
         assert_eq!(pages.len(), 3);
 
-        // Page numbers are 1-indexed and match sheet order
         assert_eq!(pages[0].page_number, 1);
         assert_eq!(pages[1].page_number, 2);
         assert_eq!(pages[2].page_number, 3);
 
-        // sheet_name carries the raw sheet name; section_name is PPTX-only and must be None
         assert_eq!(pages[0].sheet_name.as_deref(), Some("First"));
         assert_eq!(pages[1].sheet_name.as_deref(), Some("Second"));
         assert_eq!(pages[2].sheet_name.as_deref(), Some("Third"));
@@ -614,19 +717,16 @@ mod tests {
         assert_eq!(pages[1].section_name, None);
         assert_eq!(pages[2].section_name, None);
 
-        // Each page's content is only that sheet's markdown (not other sheets)
         assert!(pages[0].content.contains("First"));
         assert!(!pages[0].content.contains("Second"));
         assert!(pages[1].content.contains("Second"));
         assert!(!pages[1].content.contains("First"));
         assert!(pages[2].content.contains("Third"));
 
-        // Each page has exactly one table
         assert_eq!(pages[0].tables.len(), 1);
         assert_eq!(pages[1].tables.len(), 1);
         assert_eq!(pages[2].tables.len(), 1);
 
-        // Tables carry the right cells
         assert_eq!(pages[0].tables[0].cells[0][0], "A");
         assert_eq!(pages[1].tables[0].cells[0][0], "X");
         assert_eq!(pages[2].tables[0].cells[0][0], "P");
@@ -634,9 +734,6 @@ mod tests {
 
     #[test]
     fn test_top_level_tables_populated_for_multi_sheet_workbook() {
-        // ExtractedDocument.tables (top-level) must be populated after XLSX extraction
-        // and the count must equal the number of sheets with data. This is the primary
-        // backward-compat surface for callers that do not read .pages.
         let sheet1_cells = vec![
             vec!["H1".to_string(), "H2".to_string()],
             vec!["r1c1".to_string(), "r1c2".to_string()],
@@ -650,19 +747,16 @@ mod tests {
         ]);
         let doc = ExcelExtractor::build_internal_document(&workbook);
 
-        // Top-level tables come from the builder's push_table_from_cells calls
         assert_eq!(
             doc.tables.len(),
             3,
             "top-level tables count must equal number of sheets with data"
         );
 
-        // Table page numbers must align with sheet order (1-indexed)
         assert_eq!(doc.tables[0].page_number, 1);
         assert_eq!(doc.tables[1].page_number, 2);
         assert_eq!(doc.tables[2].page_number, 3);
 
-        // Spot-check cell content to confirm identity
         assert_eq!(doc.tables[0].cells[0][0], "H1");
         assert_eq!(doc.tables[1].cells[0][0], "X");
         assert_eq!(doc.tables[2].cells[0][0], "P");
@@ -670,12 +764,11 @@ mod tests {
 
     #[test]
     fn test_empty_sheet_in_middle_produces_page_at_correct_index() {
-        // An empty sheet must still emit a PageContent so page index == sheet index.
         let sheet1_cells = vec![vec!["A".to_string()]];
         let sheet3_cells = vec![vec!["C".to_string()]];
         let workbook = make_workbook(vec![
             make_sheet("First", Some(sheet1_cells)),
-            make_sheet("Empty", None), // empty — no table_cells
+            make_sheet("Empty", None),
             make_sheet("Third", Some(sheet3_cells)),
         ]);
         let doc = ExcelExtractor::build_internal_document(&workbook);
@@ -687,28 +780,22 @@ mod tests {
         assert_eq!(pages[1].page_number, 2);
         assert_eq!(pages[2].page_number, 3);
 
-        // Empty sheet has no tables and is marked blank
         assert_eq!(pages[1].tables.len(), 0);
         assert_eq!(pages[1].is_blank, Some(true));
-        // sheet_name is still set; section_name is PPTX-only
         assert_eq!(pages[1].sheet_name.as_deref(), Some("Empty"));
         assert_eq!(pages[1].section_name, None);
-        // Empty-sheet content must end with "\n\n" so per-page concatenation
-        // produces a blank line between two adjacent headings.
         assert!(
             pages[1].content.ends_with("\n\n"),
             "empty-sheet content must end with two newlines, got: {:?}",
             pages[1].content
         );
 
-        // Non-empty sheets are not blank
         assert_eq!(pages[0].is_blank, Some(false));
         assert_eq!(pages[2].is_blank, Some(false));
     }
 
     #[test]
     fn test_empty_sheet_cells_vec_produces_page_at_correct_index() {
-        // table_cells = Some(vec![]) (present but empty) is treated the same as None.
         let workbook = make_workbook(vec![
             make_sheet("HasData", Some(vec![vec!["x".to_string()]])),
             make_sheet("EmptyCells", Some(vec![])),
@@ -725,7 +812,6 @@ mod tests {
 
     #[test]
     fn test_sheet_order_preserved() {
-        // Natural workbook sheet order must be reflected in page order.
         let workbook = make_workbook(vec![
             make_sheet("Z", Some(vec![vec!["z".to_string()]])),
             make_sheet("A", Some(vec![vec!["a".to_string()]])),
@@ -739,10 +825,7 @@ mod tests {
         assert_eq!(pages[2].sheet_name.as_deref(), Some("M"));
     }
 
-    // ---- DDE / external-call formula scanning tests --------------------------
-
     fn make_dde_workbook(cell_value: &str) -> ExcelWorkbook {
-        // Single sheet "Sheet1" with the given cell at R1C1.
         make_workbook(vec![make_sheet("Sheet1", Some(vec![vec![cell_value.to_string()]]))])
     }
 
@@ -782,7 +865,6 @@ mod tests {
 
     #[test]
     fn test_cmd_pipe_formula_emits_warning() {
-        // Classic CSV injection via DDE cmd shell gadget.
         let workbook = make_dde_workbook("=cmd|' /c calc'!A0");
         let warnings = scan_for_dde_warnings(&workbook);
         assert_eq!(warnings.len(), 1);
@@ -791,8 +873,6 @@ mod tests {
 
     #[test]
     fn test_benign_formula_string_no_warning() {
-        // Calamine sometimes emits bare formula text for SUM/AVERAGE etc.
-        // These must not produce warnings.
         for safe in &["=SUM(A1:A2)", "=AVERAGE(B:B)", "hello world", "42", ""] {
             let workbook = make_dde_workbook(safe);
             let warnings = scan_for_dde_warnings(&workbook);
@@ -807,7 +887,6 @@ mod tests {
 
     #[test]
     fn test_dde_warning_cap_at_100() {
-        // Build a single sheet with 200 DDE cells and verify warnings are capped.
         let cells: Vec<Vec<String>> = (0..200)
             .map(|i| vec![format!("=DDE(\"app\",\"topic\",\"item{}\")", i)])
             .collect();
@@ -823,7 +902,6 @@ mod tests {
 
     #[test]
     fn test_dde_formula_case_insensitive() {
-        // Pattern must fire regardless of case.
         for variant in &[
             "=dde(\"app\",\"t\",\"i\")",
             "=DdE(\"a\",\"b\",\"c\")",
@@ -837,7 +915,6 @@ mod tests {
 
     #[test]
     fn test_workbook_to_internal_document_includes_dde_warnings() {
-        // Verify the integration: workbook_to_internal_document must attach DDE warnings.
         let workbook = make_workbook(vec![make_sheet(
             "Injection",
             Some(vec![
@@ -857,8 +934,6 @@ mod tests {
 
     #[test]
     fn test_sheet_name_markdown_escape_in_heading() {
-        // A sheet named "## Profit (2025) [Q1]" must not produce a double heading
-        // ("## ## Profit...") and must not render as a markdown link.
         let cells = vec![
             vec!["Revenue".to_string(), "Cost".to_string()],
             vec!["100".to_string(), "80".to_string()],
@@ -869,26 +944,103 @@ mod tests {
         let pages = doc.prebuilt_pages.as_ref().unwrap();
         assert_eq!(pages.len(), 1);
 
-        // The raw sheet name is stored unescaped in sheet_name
         assert_eq!(pages[0].sheet_name.as_deref(), Some("## Profit (2025) [Q1]"));
 
-        // The heading in content must not start with "## ##" (double heading)
         assert!(
             !pages[0].content.starts_with("## ##"),
             "double heading detected: {:?}",
             &pages[0].content[..pages[0].content.find('\n').unwrap_or(pages[0].content.len())]
         );
-        // The heading line must not contain an unescaped "[Q1]" that renders as a link
         let first_line = pages[0].content.lines().next().unwrap_or("");
-        // Unescaped "[Q1]" followed by "(..." is what creates a link; after escaping
-        // the "[" is preceded by a backslash so the pattern "[Q1]" → "\[Q1\]"
         assert!(
             !first_line.contains("[Q1]") || first_line.contains("\\["),
             "unescaped markdown link syntax in heading: {:?}",
             first_line
         );
-        // Content must still contain the heading marker and the word "Profit"
         assert!(pages[0].content.starts_with("## "), "content must start with H2 marker");
         assert!(pages[0].content.contains("Profit"));
+    }
+
+    /// xberg-io/xberg#119: a sheet named in the `hidden_sheets` workbook-metadata
+    /// entry gets `" (hidden)"` appended to its heading, while a visible sheet's
+    /// heading is untouched; its content is still fully present either way.
+    #[test]
+    fn should_mark_hidden_sheet_heading_but_keep_its_content() {
+        let mut workbook = make_workbook(vec![
+            make_sheet("Visible", Some(vec![vec!["A".to_string()]])),
+            make_sheet("Hidden", Some(vec![vec!["Secret".to_string()]])),
+        ]);
+        workbook
+            .metadata
+            .insert("hidden_sheets".to_string(), "Hidden".to_string());
+
+        let doc = ExcelExtractor::build_internal_document(&workbook);
+        let pages = doc.prebuilt_pages.as_ref().unwrap();
+
+        assert!(pages[0].content.starts_with("## Visible\n"), "{:?}", pages[0].content);
+        assert!(
+            pages[1].content.starts_with("## Hidden (hidden)\n"),
+            "{:?}",
+            pages[1].content
+        );
+        assert!(pages[1].content.contains("Secret"), "hidden sheet content must survive");
+    }
+
+    #[test]
+    fn should_treat_no_sheets_as_hidden_when_metadata_key_is_absent() {
+        let workbook = make_workbook(vec![make_sheet("Sheet1", Some(vec![vec!["A".to_string()]]))]);
+        let doc = ExcelExtractor::build_internal_document(&workbook);
+        let pages = doc.prebuilt_pages.as_ref().unwrap();
+        assert!(pages[0].content.starts_with("## Sheet1\n"), "{:?}", pages[0].content);
+    }
+
+    #[cfg(feature = "office")]
+    fn make_zip_with_entry(entry_path: &str, entry_data: &[u8]) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let buf = Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(buf);
+        let options = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(entry_path, options).unwrap();
+        zip.write_all(entry_data).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// xberg-io/xberg#78: an OOXML zip carrying files under `xl/embeddings/`
+    /// must be flagged, naming the embedded file, on the sync (WASM) path that
+    /// cannot recurse into them.
+    #[cfg(feature = "office")]
+    #[test]
+    fn should_warn_about_embedded_objects_on_sync_path() {
+        let bytes = make_zip_with_entry("xl/embeddings/Workbook1.xlsx", b"fake embedded workbook bytes");
+        let warning = scan_for_embedded_objects(
+            &bytes,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .expect("embedded object under xl/embeddings/ must produce a warning");
+        assert_eq!(warning.source, "excel");
+        assert_eq!(
+            warning.message,
+            "Workbook contains 1 embedded object that were not extracted (xl/embeddings/Workbook1.xlsx)"
+        );
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn should_not_warn_when_no_embedded_objects_present() {
+        let bytes = make_zip_with_entry("xl/worksheets/sheet1.xml", b"<worksheet/>");
+        assert!(
+            scan_for_embedded_objects(
+                &bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn should_not_scan_non_ooxml_zip_mime_types_for_embedded_objects() {
+        let bytes = make_zip_with_entry("xl/embeddings/Object1.bin", b"data");
+        assert!(scan_for_embedded_objects(&bytes, "application/vnd.ms-excel").is_none());
     }
 }

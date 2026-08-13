@@ -25,9 +25,8 @@ use super::metadata::Metadata;
 use super::ocr_elements::{OcrBoundingGeometry, OcrConfidence, OcrElementLevel, OcrRotation};
 use super::tables::Table;
 use crate::types::ExtractedImage;
-// ============================================================================
-// ID Type
-// ============================================================================
+
+const SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE: &str = "xberg:internal:suppress-image-ocr-render";
 
 #[cfg_attr(alef, alef(skip))]
 /// Deterministic element identifier, generated via blake3 hashing.
@@ -115,9 +114,6 @@ impl AsRef<str> for InternalElementId {
         self.as_str()
     }
 }
-// ============================================================================
-// Internal Document
-// ============================================================================
 
 #[cfg_attr(alef, alef(skip))]
 /// The internal flat document representation.
@@ -150,8 +146,26 @@ pub struct InternalDocument {
     /// Extracted tables (structured data). Referenced by index from `ElementKind::Table`.
     pub tables: Vec<Table>,
 
+    /// Node/edge graphs recovered from vector diagrams in the source.
+    ///
+    /// Populated by extractors that can read diagram geometry deterministically
+    /// (SVG today). The `dot` renderer turns these into Graphviz DOT; every
+    /// other renderer ignores them, so the field only ever adds output.
+    #[serde(default)]
+    pub diagrams: Vec<super::diagram::DiagramGraph>,
+
     /// URIs/links discovered during extraction (hyperlinks, image refs, citations, etc.).
     pub uris: Vec<super::uri::ExtractedUri>,
+
+    /// Number of URIs [`InternalDocument::push_uri`] refused because `uris` was
+    /// already at the per-document `MAX_URIS` cap.
+    ///
+    /// Not part of the plugin-bridge wire format: a foreign plugin deserializes
+    /// straight into `uris` and never goes through the cap, so it has nothing to
+    /// report here. `derive_extraction_result` turns a non-zero count into a
+    /// `ProcessingWarning` (#76).
+    #[serde(skip)]
+    pub uris_dropped: usize,
 
     /// Archive children: fully-extracted results for files within an archive.
     ///
@@ -230,20 +244,54 @@ pub struct InternalDocument {
     /// `ImageExtractionConfig.append_ocr_text`.
     #[serde(skip)]
     pub append_ocr_text: bool,
+
+    /// When `true` (the default), Markdown rendering backslash-escapes
+    /// CommonMark-significant characters (`_[]()*=-#`) so the output round-trips
+    /// safely through a CommonMark parser. When `false`, those escapes are
+    /// stripped so prose reads identically to the already-unescaped text used in
+    /// table cells. Set by the pipeline from `ExtractionConfig::escape_markdown`.
+    #[serde(skip)]
+    pub escape_markdown: bool,
+
+    /// Page marker format (with `{page_num}` placeholder) when
+    /// `PageConfig::insert_page_markers` is enabled, `None` otherwise. Set by
+    /// the pipeline. Renderers use it to emit page markers verbatim instead of
+    /// escaping or stripping them.
+    #[serde(skip)]
+    pub page_marker_format: Option<String>,
+
+    /// When `true`, Markdown rendering inserts a `[TABLE:{table_id}]` marker
+    /// immediately before each table's rendered Markdown block. Set by the
+    /// pipeline from `ExtractionConfig::table_anchors`. Defaults to `false`.
+    #[serde(skip)]
+    pub table_anchors: bool,
 }
 
 impl From<crate::types::extraction::ExtractedDocument> for InternalDocument {
-    /// Lossy conversion used at FFI/trait-bridge boundaries where a foreign-language
-    /// plugin returns the public `ExtractedDocument` shape but the canonical Rust trait
+    /// Conversion used at FFI/trait-bridge boundaries where a foreign-language plugin
+    /// returns the public `ExtractedDocument` shape but the canonical Rust trait
     /// signature requires an `InternalDocument`. The text content is stashed in
     /// `pre_rendered_content` so the pipeline returns it verbatim instead of trying
     /// to re-render from a non-existent element tree.
+    ///
+    /// Every field with an exact `InternalDocument` destination is carried over. The
+    /// conversion is still lossy for the derived-only parts of the public shape — the
+    /// flat element list, the relationship graph, and `DocumentStructure` cannot be
+    /// reconstructed from `ExtractedDocument`, which is why `pre_rendered_content`
+    /// carries the text.
     fn from(result: crate::types::extraction::ExtractedDocument) -> Self {
         let mut doc = Self::new(result.mime_type.as_ref());
         doc.mime_type = result.mime_type.into_owned();
         doc.metadata = result.metadata;
         doc.tables = result.tables;
         doc.images = result.images.unwrap_or_default();
+        doc.uris = result.uris.unwrap_or_default();
+        doc.children = result.children;
+        doc.annotations = result.annotations;
+        doc.processing_warnings = result.processing_warnings;
+        doc.llm_usage = result.llm_usage;
+        doc.prebuilt_pages = result.pages;
+        doc.prebuilt_ocr_elements = result.ocr_elements;
         doc.revisions = result.revisions;
         doc.form_fields = result.form_fields;
         doc.formulas = result.formulas;
@@ -275,7 +323,9 @@ impl InternalDocument {
             metadata: Metadata::default(),
             images: Vec::new(),
             tables: Vec::new(),
+            diagrams: Vec::new(),
             uris: Vec::new(),
+            uris_dropped: 0,
             children: None,
             mime_type: "application/octet-stream".to_string(),
             processing_warnings: Vec::new(),
@@ -287,6 +337,9 @@ impl InternalDocument {
             revisions: None,
             ocr_text_only: false,
             append_ocr_text: false,
+            escape_markdown: true,
+            page_marker_format: None,
+            table_anchors: false,
             form_fields: Vec::new(),
             formulas: Vec::new(),
         }
@@ -294,8 +347,6 @@ impl InternalDocument {
 
     /// Push an element and return its index.
     pub fn push_element(&mut self, element: InternalElement) -> u32 {
-        // Safety: element count is bounded by available memory; u32::MAX (~4 billion)
-        // elements would require hundreds of GB, so truncation cannot occur in practice.
         let idx = self.elements.len() as u32;
         self.elements.push(element);
         idx
@@ -308,8 +359,6 @@ impl InternalDocument {
 
     /// Push a table and return its index (for use in `ElementKind::Table`).
     pub fn push_table(&mut self, table: Table) -> u32 {
-        // Safety: table count is bounded by document size; overflow at u32::MAX is
-        // practically unreachable (would require ~4 billion tables).
         let idx = self.tables.len() as u32;
         self.tables.push(table);
         idx
@@ -317,21 +366,24 @@ impl InternalDocument {
 
     /// Push an image and return its index (for use in `ElementKind::Image`).
     pub fn push_image(&mut self, image: ExtractedImage) -> u32 {
-        // Safety: image count is bounded by document size; overflow at u32::MAX is
-        // practically unreachable (would require ~4 billion images).
         let idx = self.images.len() as u32;
         self.images.push(image);
         idx
     }
 
     /// Maximum number of URIs to collect per document (DoS prevention).
-    const MAX_URIS: usize = 100_000;
+    pub(crate) const MAX_URIS: usize = 100_000;
 
     /// Push a URI discovered during extraction.
-    /// Silently drops URIs beyond `MAX_URIS` to prevent unbounded memory growth.
+    ///
+    /// URIs beyond the `MAX_URIS` cap are dropped to prevent unbounded memory
+    /// growth, and counted in [`Self::uris_dropped`] so the derivation step can
+    /// tell the caller the list was truncated (#76).
     pub fn push_uri(&mut self, uri: super::uri::ExtractedUri) {
         if self.uris.len() < Self::MAX_URIS {
             self.uris.push(uri);
+        } else {
+            self.uris_dropped += 1;
         }
     }
 
@@ -345,10 +397,6 @@ impl InternalDocument {
             .join("\n")
     }
 }
-
-// ============================================================================
-// Internal Element
-// ============================================================================
 
 /// A single element in the internal flat document.
 ///
@@ -396,7 +444,6 @@ pub struct InternalElement {
     /// citation key `"smith2024"`, figure label `"fig:diagram"`.
     pub anchor: Option<String>,
 
-    // === OCR-specific fields (zero-cost when None) ===
     /// OCR bounding geometry (rectangle or quadrilateral).
     pub ocr_geometry: Option<OcrBoundingGeometry>,
 
@@ -434,13 +481,14 @@ impl InternalElement {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
-        feature = "chunking"
+        feature = "chunking",
+        test
     ))]
-    #[allow(dead_code)] // callers live behind ocr/office/pdf/etc, not chunking alone
+    #[allow(dead_code)]
     pub(crate) fn with_page(mut self, page: u32) -> Self {
         self.page = Some(page);
         self
@@ -456,13 +504,7 @@ impl InternalElement {
     /// Set the content layer.
     #[cfg(all(
         test,
-        any(
-            feature = "ocr",
-            feature = "pdf",
-            feature = "paddle-ocr",
-            feature = "xml",
-            feature = "office"
-        )
+        any(feature = "ocr", feature = "pdf", paddle_ocr, feature = "xml", feature = "office")
     ))]
     pub(crate) fn with_layer(mut self, layer: ContentLayer) -> Self {
         self.layer = layer;
@@ -484,16 +526,55 @@ impl InternalElement {
     }
 
     /// Regenerate the ID with the correct index (call after pushing to the document).
-    #[cfg(any(feature = "ocr", feature = "xml", feature = "archives", feature = "hwpx"))]
+    #[cfg(any(
+        feature = "ocr",
+        feature = "xml",
+        feature = "archives",
+        feature = "hwpx",
+        // The only bare-`ocr-pipeline` caller lives in `extractors::pdf::ocr`, so gate on
+        // pdf+ocr-pipeline. `ocr-wasm` enables ocr-pipeline without pdf and has no caller. ~keep
+        all(feature = "pdf", feature = "ocr-pipeline")
+    ))]
     pub(crate) fn with_index(mut self, index: u32) -> Self {
         self.id = InternalElementId::generate(self.kind.discriminant(), &self.text, self.page, index);
         self
     }
-}
 
-// ============================================================================
-// Element Kind
-// ============================================================================
+    /// Mark an image element so whole-page OCR can replace its nested OCR text
+    /// without removing the image placeholder or mutating the public image data.
+    ///
+    /// Only called by the PDF OCR merge planner (`extractors::pdf::ocr`); dead in
+    /// builds that enable `ocr`/`ocr-pipeline` without `pdf`. ~keep
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    pub(crate) fn suppress_image_ocr_rendering(&mut self) {
+        self.attributes
+            .get_or_insert_with(AHashMap::new)
+            .insert(SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE.to_string(), "true".to_string());
+    }
+
+    /// Whether renderers should include nested OCR text for this image element.
+    pub(crate) fn should_render_image_ocr(&self) -> bool {
+        !self
+            .attributes
+            .as_ref()
+            .is_some_and(|attributes| attributes.contains_key(SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE))
+    }
+
+    /// Attributes safe to expose through the public document structure.
+    pub(crate) fn public_attributes(&self) -> Option<std::collections::HashMap<String, String>> {
+        let original = self.attributes.as_ref()?;
+        let attributes: std::collections::HashMap<String, String> = original
+            .iter()
+            .filter(|(key, _)| key.as_str() != SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if attributes.is_empty() && !original.is_empty() {
+            None
+        } else {
+            Some(attributes)
+        }
+    }
+}
 
 /// Semantic role of an internal element.
 ///
@@ -502,7 +583,6 @@ impl InternalElement {
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElementKind {
-    // --- Text-carrying ---
     /// Document title.
     Title,
     /// Section heading with level (1-6).
@@ -525,6 +605,11 @@ pub enum ElementKind {
     FootnoteDefinition,
     /// Footnote reference marker in body text.
     FootnoteRef,
+    /// Comment content (the definition, not the reference marker). See
+    /// [`NodeContent::Comment`](super::document_structure::NodeContent::Comment).
+    CommentDefinition,
+    /// Comment reference marker in body text.
+    CommentRef,
     /// Citation or bibliographic reference.
     Citation,
     /// Presentation slide container.
@@ -543,7 +628,6 @@ pub enum ElementKind {
     /// Structured metadata block (frontmatter, email headers).
     MetadataBlock,
 
-    // --- Container markers (optional, improve tree precision) ---
     /// Start of a list container.
     ListStart {
         /// `true` for ordered (numbered) lists; `false` for unordered (bullet) lists.
@@ -560,7 +644,6 @@ pub enum ElementKind {
     /// End of a generic group/section.
     GroupEnd,
 
-    // --- Structural ---
     /// Table reference. `table_index` is an index into `InternalDocument::tables`.
     Table {
         /// Index into `InternalDocument::tables` for the referenced table.
@@ -574,7 +657,6 @@ pub enum ElementKind {
     /// Page break marker.
     PageBreak,
 
-    // --- OCR ---
     /// OCR-detected text at a given hierarchical level.
     OcrText {
         /// Hierarchical level (word, line, paragraph, block) of this OCR element.
@@ -594,6 +676,8 @@ impl ElementKind {
             Self::Formula => "formula",
             Self::FootnoteDefinition => "footnote_definition",
             Self::FootnoteRef => "footnote_ref",
+            Self::CommentDefinition => "comment_definition",
+            Self::CommentRef => "comment_ref",
             Self::Citation => "citation",
             Self::Slide { .. } => "slide",
             Self::DefinitionTerm => "definition_term",
@@ -636,10 +720,6 @@ impl ElementKind {
     }
 }
 
-// ============================================================================
-// Relationships
-// ============================================================================
-
 /// A relationship between two elements in the document.
 ///
 /// During extraction, targets may be unresolved keys (`RelationshipTarget::Key`).
@@ -667,10 +747,8 @@ pub enum RelationshipTarget {
     Key(String),
 }
 
-// Re-export RelationshipKind from the public API module where it is defined.
 pub use super::document_structure::RelationshipKind;
 
-// Compile-time assertions: these types must be Send + Sync for concurrent extraction.
 const _: () = {
     #[allow(dead_code)]
     fn assert_send_sync<T: Send + Sync>() {}
@@ -680,10 +758,6 @@ const _: () = {
         assert_send_sync::<InternalElement>();
     }
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -707,8 +781,7 @@ mod tests {
     fn test_internal_element_id_format() {
         let id = InternalElementId::generate("title", "Hello", None, 0);
         assert!(id.as_str().starts_with("ie-"));
-        // 12 hex chars = 6 bytes
-        assert_eq!(id.as_str().len(), 3 + 12); // "ie-" + 12 hex
+        assert_eq!(id.as_str().len(), 3 + 12);
     }
 
     #[test]
@@ -736,13 +809,25 @@ mod tests {
         assert_eq!(doc.elements[0].text, "Hello world");
     }
 
-    #[cfg(any(
-        feature = "ocr",
-        feature = "pdf",
-        feature = "paddle-ocr",
-        feature = "xml",
-        feature = "office"
-    ))]
+    #[test]
+    fn public_attributes_preserve_explicit_empty_map() {
+        let mut element = InternalElement::text(ElementKind::Paragraph, "text", 0);
+        element.attributes = Some(AHashMap::new());
+
+        assert_eq!(element.public_attributes(), Some(std::collections::HashMap::new()));
+    }
+
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    fn public_attributes_hide_internal_image_ocr_suppression() {
+        let mut element = InternalElement::text(ElementKind::Image { image_index: 0 }, "", 0);
+        element.suppress_image_ocr_rendering();
+
+        assert!(element.public_attributes().is_none());
+        assert!(!element.should_render_image_ocr());
+    }
+
+    #[cfg(any(feature = "ocr", feature = "pdf", paddle_ocr, feature = "xml", feature = "office"))]
     #[test]
     fn test_internal_element_builder_pattern() {
         let elem = InternalElement::text(ElementKind::Heading { level: 2 }, "Methods", 1)
@@ -776,19 +861,15 @@ mod tests {
         let mut doc = InternalDocument::new("pdf");
         doc.mime_type = "application/pdf".to_string();
 
-        // Title element
         let title = InternalElement::text(ElementKind::Title, "Test Document", 0);
         doc.push_element(title);
 
-        // Heading
         let heading = InternalElement::text(ElementKind::Heading { level: 2 }, "Introduction", 1);
         doc.push_element(heading);
 
-        // Paragraph
         let para = InternalElement::text(ElementKind::Paragraph, "Body text here.", 1);
         doc.push_element(para);
 
-        // ListStart + ListItem + ListEnd
         let list_start = InternalElement::text(ElementKind::ListStart { ordered: true }, "", 1);
         doc.push_element(list_start);
         let item = InternalElement::text(ElementKind::ListItem { ordered: true }, "First item", 2);
@@ -796,19 +877,15 @@ mod tests {
         let list_end = InternalElement::text(ElementKind::ListEnd, "", 1);
         doc.push_element(list_end);
 
-        // Code block
         let code = InternalElement::text(ElementKind::Code, "fn main() {}", 0);
         doc.push_element(code);
 
-        // PageBreak
         let pb = InternalElement::text(ElementKind::PageBreak, "", 0);
         doc.push_element(pb);
 
-        // Image reference (index 0, no actual image data needed for serde test)
         let img_elem = InternalElement::text(ElementKind::Image { image_index: 0 }, "", 0);
         doc.push_element(img_elem);
 
-        // OcrText
         let ocr = InternalElement::text(
             ElementKind::OcrText {
                 level: OcrElementLevel::Word,
@@ -818,7 +895,6 @@ mod tests {
         );
         doc.push_element(ocr);
 
-        // Relationships
         doc.push_relationship(Relationship {
             source: 0,
             target: RelationshipTarget::Index(2),
@@ -830,7 +906,6 @@ mod tests {
             kind: RelationshipKind::CrossReference,
         });
 
-        // Round-trip
         let json = serde_json::to_string(&doc).expect("serialize InternalDocument");
         let restored: InternalDocument = serde_json::from_str(&json).expect("deserialize InternalDocument");
 
@@ -839,7 +914,6 @@ mod tests {
         assert_eq!(restored.elements.len(), doc.elements.len());
         assert_eq!(restored.relationships.len(), doc.relationships.len());
 
-        // Spot-check element kinds
         assert_eq!(restored.elements[0].kind, ElementKind::Title);
         assert_eq!(restored.elements[1].kind, ElementKind::Heading { level: 2 });
         assert_eq!(restored.elements[4].kind, ElementKind::ListItem { ordered: true });
@@ -851,17 +925,14 @@ mod tests {
             }
         );
 
-        // Spot-check relationship targets
         assert_eq!(restored.relationships[0].target, RelationshipTarget::Index(2));
         assert_eq!(
             restored.relationships[1].target,
             RelationshipTarget::Key("introduction".to_string())
         );
 
-        // Element IDs survive the round-trip
         assert_eq!(restored.elements[0].id, doc.elements[0].id);
 
-        // ContentLayer default is preserved
         assert_eq!(restored.elements[0].layer, ContentLayer::Body);
     }
 
@@ -874,7 +945,6 @@ mod tests {
     fn should_cover_all_element_kind_variants() {
         let mut doc = InternalDocument::new("test");
 
-        // --- text-carrying variants -----------------------------------------
         doc.push_element(InternalElement::text(ElementKind::Title, "T", 0));
         assert_eq!(doc.elements.last().unwrap().kind, ElementKind::Title);
 
@@ -923,7 +993,6 @@ mod tests {
         doc.push_element(InternalElement::text(ElementKind::MetadataBlock, "---", 0));
         assert_eq!(doc.elements.last().unwrap().kind, ElementKind::MetadataBlock);
 
-        // --- container markers ----------------------------------------------
         doc.push_element(InternalElement::text(ElementKind::ListStart { ordered: true }, "", 0));
         assert_eq!(
             doc.elements.last().unwrap().kind,
@@ -945,7 +1014,6 @@ mod tests {
         doc.push_element(InternalElement::text(ElementKind::GroupEnd, "", 0));
         assert_eq!(doc.elements.last().unwrap().kind, ElementKind::GroupEnd);
 
-        // --- structural -----------------------------------------------------
         doc.push_element(InternalElement::text(ElementKind::Table { table_index: 0 }, "", 0));
         assert_eq!(doc.elements.last().unwrap().kind, ElementKind::Table { table_index: 0 });
 
@@ -955,7 +1023,6 @@ mod tests {
         doc.push_element(InternalElement::text(ElementKind::PageBreak, "", 0));
         assert_eq!(doc.elements.last().unwrap().kind, ElementKind::PageBreak);
 
-        // --- OCR: all four OcrElementLevel variants -------------------------
         for level in [
             OcrElementLevel::Word,
             OcrElementLevel::Line,
@@ -966,14 +1033,11 @@ mod tests {
             assert_eq!(doc.elements.last().unwrap().kind, ElementKind::OcrText { level });
         }
 
-        // --- full round-trip ------------------------------------------------
         let json = serde_json::to_string(&doc).expect("serialize all-variant InternalDocument");
         let restored: InternalDocument = serde_json::from_str(&json).expect("deserialize all-variant InternalDocument");
 
-        // 15 text-carrying + 6 container + 3 structural + 4 OCR levels = 28
         assert_eq!(restored.elements.len(), doc.elements.len());
 
-        // Spot-check a selection of deserialized kinds across all groups.
         assert_eq!(restored.elements[0].kind, ElementKind::Title);
         assert_eq!(restored.elements[5].kind, ElementKind::Formula);
         assert_eq!(restored.elements[9].kind, ElementKind::Slide { number: 3 });
@@ -1004,17 +1068,14 @@ mod tests {
     #[test]
     fn should_round_trip_relationship_targets() {
         let mut doc = InternalDocument::new("test");
-        // Add a couple of elements so indices are valid.
         doc.push_element(InternalElement::text(ElementKind::Paragraph, "source", 0));
         doc.push_element(InternalElement::text(ElementKind::Paragraph, "target", 0));
 
-        // Index target
         doc.push_relationship(Relationship {
             source: 0,
             target: RelationshipTarget::Index(1),
             kind: RelationshipKind::CrossReference,
         });
-        // Key target
         doc.push_relationship(Relationship {
             source: 0,
             target: RelationshipTarget::Key("anchor-abc".to_string()),
@@ -1030,7 +1091,6 @@ mod tests {
             restored.relationships[1].target,
             RelationshipTarget::Key("anchor-abc".to_string())
         );
-        // Verify kind field also survives
         assert_eq!(restored.relationships[0].kind, RelationshipKind::CrossReference);
         assert_eq!(restored.relationships[1].kind, RelationshipKind::FootnoteReference);
     }

@@ -1,8 +1,8 @@
 // Vendored from jhqxxx/aha (Apache-2.0). See repo-root ATTRIBUTIONS.md § jhqxxx/aha.
 
 //! Subset of `aha::utils::{img_utils, video_utils, interpolate}` covering image loading,
-//! smart-resize, and bilinear interpolation used by Hunyuan-OCR / DeepSeek-OCR /
-//! PaddleOCR-VL 1.5 processors.
+//! smart-resize, and bilinear interpolation used by DeepSeek-OCR / PaddleOCR-VL 1.5
+//! processors.
 //!
 //! Changes from upstream:
 //! - URL-fetch path removed from `get_image` (no HTTP in backend image loading).

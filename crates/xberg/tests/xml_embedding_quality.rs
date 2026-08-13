@@ -16,7 +16,6 @@ async fn test_xml_preserves_hierarchy() {
 
     let result = extract_bytes_document(xml, "application/xml", &config).await.unwrap();
 
-    // PLANT children should be indented under PLANT
     assert!(result.content.contains("PLANT"));
     assert!(result.content.contains("  COMMON\n    Bloodroot"));
     assert!(result.content.contains("  ZONE\n    4"));
@@ -41,9 +40,6 @@ async fn test_xml_attributes_inline() {
 
     let result = extract_bytes_document(xml, "application/xml", &config).await.unwrap();
 
-    // Both attributes must appear inline with the `item` label, but order
-    // is not part of the contract — `AHashMap` iteration is non-deterministic
-    // and the renderer sorts alphabetically for stability across runs.
     let item_line = result
         .content
         .lines()
@@ -63,14 +59,12 @@ async fn test_xml_sibling_separation() {
 
     let result = extract_bytes_document(xml, "application/xml", &config).await.unwrap();
 
-    // Both siblings are present.
     assert_eq!(
         result.content.matches("PLANT").count(),
         2,
         "expected two PLANT siblings, got: {:?}",
         result.content
     );
-    // A blank line appears somewhere between the two PLANT labels.
     let parts: Vec<&str> = result.content.split("PLANT").collect();
     assert!(parts.len() >= 3, "expected >=2 PLANT splits, got: {parts:?}");
     assert!(
@@ -159,17 +153,12 @@ async fn test_xml_real_file_plant_catalog() {
         .await
         .unwrap();
 
-    // Both plants are present and their COMMON values appear within the same
-    // grouped block — assertion is loose on exact indentation so that future
-    // tweaks to the indent step or blank-line policy don't break it.
     for plant in ["Bloodroot", "Columbine"] {
         let pos_plant = result.content.rfind("PLANT").expect("missing PLANT label");
         let pos_value = result
             .content
             .find(plant)
             .unwrap_or_else(|| panic!("missing plant value: {plant}"));
-        // Either a PLANT label precedes this value, or COMMON appears between
-        // them — both suffice for "grouped together".
         let between = &result.content[..pos_value];
         assert!(
             between.contains("PLANT") && between.rfind("COMMON").map(|c| c < pos_value).unwrap_or(false),

@@ -23,8 +23,16 @@ name = "xberg_paddle_ocr"
 crate-type = ["lib"]
 
 [features]
+# No default backend: consumers pick `ort` or `tract` explicitly, and `lib.rs` fails the
+# build with a `compile_error!` if neither is set. First-party crate, so there is no
+# external-consumer default to preserve. ~keep
 default = []
-load-dynamic = ["ort/load-dynamic"]
+# Native ONNX Runtime backend (desktop/server; today's only path). ~keep
+ort = ["dep:ort"]
+# Pure-Rust ONNX backend (wasm32, and the Android x86_64 emulator where `ort` cannot link). ~keep
+tract = ["dep:tract-onnx"]
+# ort loading libonnxruntime at runtime via ORT_DYLIB_PATH; implies the `ort` backend. ~keep
+load-dynamic = ["ort", "ort/load-dynamic"]
 
 [dependencies]
 geo-clipper = "0.9"
@@ -35,8 +43,9 @@ image = { workspace = true }
 # Disable rayon - OCR parallelism is handled at higher level
 imageproc = { version = "0.27", default-features = false }
 ndarray = "0.17"
-ort = { workspace = true, features = ["ndarray"] }
+ort = { workspace = true, features = ["ndarray"], optional = true }
 # Workspace dependencies
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tract-onnx = { workspace = true, optional = true }

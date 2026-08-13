@@ -8,8 +8,6 @@
 
 use xberg::core::config::extraction::{ImageOutputFormat, SvgOptions};
 
-// ── ImageOutputFormat::Svg wire tag ─────────────────────────────────────────
-
 /// The enum is tagged (`{"type": "..."}`, snake_case rename).  The `Svg`
 /// variant (capital S, lower v) must serialise to `{"type":"svg"}`.
 #[test]
@@ -34,8 +32,6 @@ fn svg_output_format_round_trips_via_json() {
     let back: ImageOutputFormat = serde_json::from_str(&json).expect("deserialisation must succeed");
     assert_eq!(back, original);
 }
-
-// ── SvgOptions serde ─────────────────────────────────────────────────────────
 
 /// Default `SvgOptions` must serialise to the canonical wire shape and
 /// round-trip back to an equal value.

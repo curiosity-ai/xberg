@@ -1,5 +1,3 @@
-#![cfg(feature = "url-ingestion")]
-
 //! Shared-URL batch extraction: input-order preservation, duplicate-URL
 //! mapping, per-URL error isolation, and the batch timeout nuance.
 //!
@@ -9,6 +7,8 @@
 //! COMPLETION order; the engine must remap them back to INPUT order and isolate
 //! per-URL failures. These tests drive that path through local HTTP fixtures
 //! (wiremock) and a dead loopback port — no real network access.
+
+#![cfg(feature = "url-ingestion")]
 
 use serde_json::Value;
 use wiremock::matchers::{method, path};
@@ -95,7 +95,6 @@ async fn batch_preserves_input_order_for_shared_urls() {
     assert_eq!(output.summary.errors, 0);
     assert!(output.errors.is_empty(), "unexpected errors: {:?}", output.errors);
 
-    // Results land in INPUT order even though crawlberg returns completion order.
     assert_eq!(source_index(&output.results[0]), Some(0));
     assert_eq!(source_index(&output.results[1]), Some(1));
     assert_eq!(source_index(&output.results[2]), Some(2));
@@ -116,7 +115,6 @@ async fn batch_maps_duplicate_urls_to_correct_indices() {
     let dup = format!("{}/dup.html", server.uri());
     let other = format!("{}/other.html", server.uri());
 
-    // Same URL at index 0 and index 2; a distinct URL at index 1.
     let inputs = vec![
         ExtractInput::from_uri(dup.clone()),
         ExtractInput::from_uri(other.clone()),
@@ -131,13 +129,11 @@ async fn batch_maps_duplicate_urls_to_correct_indices() {
     assert_eq!(output.summary.results, 3);
     assert_eq!(output.summary.errors, 0);
 
-    // The duplicate URL maps to BOTH index 0 and index 2; the distinct URL to 1.
     assert_eq!(source_uri(result_for_index(&output, 0)), Some(dup.as_str()));
     assert_eq!(source_uri(result_for_index(&output, 1)), Some(other.as_str()));
     assert_eq!(source_uri(result_for_index(&output, 2)), Some(dup.as_str()));
     assert!(result_for_index(&output, 1).content.contains("OTHER"));
 
-    // Output order is still input order.
     assert_eq!(source_index(&output.results[0]), Some(0));
     assert_eq!(source_index(&output.results[1]), Some(1));
     assert_eq!(source_index(&output.results[2]), Some(2));
@@ -149,8 +145,6 @@ async fn batch_isolates_a_single_failing_url() {
     mount_html(&server, "/ok1.html", "FIRST").await;
     mount_html(&server, "/ok2.html", "SECOND").await;
 
-    // A dead loopback port: bind, capture the address, drop the listener so the
-    // port is closed -> connection refused -> a per-URL crawl error.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let dead_addr = listener.local_addr().expect("read local addr");
     drop(listener);
@@ -170,8 +164,6 @@ async fn batch_isolates_a_single_failing_url() {
         .await
         .expect("batch with one failing URL must still succeed as a whole");
 
-    // The failing URL is isolated to the errors slot at its input index; the
-    // other two URLs still produce results.
     assert_eq!(output.summary.results, 2, "two URLs must still succeed");
     assert_eq!(output.errors.len(), 1, "exactly one URL must fail: {:?}", output.errors);
     assert_eq!(output.errors[0].index, 1, "failure must carry the failing input index");
@@ -181,7 +173,6 @@ async fn batch_isolates_a_single_failing_url() {
     assert!(result_for_index(&output, 0).content.contains("FIRST"));
     assert_eq!(source_uri(result_for_index(&output, 2)), Some(ok2.as_str()));
     assert!(result_for_index(&output, 2).content.contains("SECOND"));
-    // No result was produced for the failing index.
     assert!(output.results.iter().all(|result| source_index(result) != Some(1)));
 }
 
@@ -199,7 +190,6 @@ async fn batch_conversion_timeout_governs_shared_url_results() {
 
     let url = format!("{}/timed.html", server.uri());
     let mut config = url_config(UrlExtractionMode::Document);
-    // Per-item timeout that comfortably covers the conversion of a tiny page.
     config.extraction_timeout_secs = Some(30);
 
     let output = Engine::new_default()
@@ -210,7 +200,6 @@ async fn batch_conversion_timeout_governs_shared_url_results() {
     assert_eq!(output.summary.results, 1);
     assert_eq!(output.summary.errors, 0);
     assert!(output.results[0].content.contains("TIMED"));
-    // The timeout-aware finalize path stamps a duration on the converted result.
     assert!(
         output.results[0].metadata.extraction_duration_ms.is_some(),
         "shared-URL finalize must stamp extraction_duration_ms"

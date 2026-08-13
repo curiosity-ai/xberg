@@ -29,7 +29,6 @@ default = []
 trocr = []
 paddleocr-vl = []
 glm-ocr = []
-hunyuan-ocr = []
 deepseek-ocr = []
 
 # Device acceleration pass-throughs to candle.
@@ -51,19 +50,20 @@ base64 = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
+fs2 = { workspace = true }
 image = { workspace = true, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif"] }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
 thiserror = { workspace = true }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 tracing = { workspace = true }
 
-[target.'cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
-
-[target.'cfg(all(target_os = "windows", not(target_arch = "wasm32")))'.dependencies]
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+# hf-hub 1.0 uses its own reqwest/rustls stack, so a single non-wasm declaration covers every
+# native target (the `blocking` feature provides the sync API over an internal tokio runtime).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+hf-hub = { version = "1.0", default-features = false, features = ["blocking"] }
 
 [lints]
 workspace = true

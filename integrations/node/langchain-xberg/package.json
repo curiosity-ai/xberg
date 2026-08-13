@@ -1,0 +1,66 @@
+{
+  "name": "@xberg-io/langchain-xberg",
+  "version": "1.1.0",
+  "description": "LangChain.js document loader for Xberg — extract text, tables, and metadata from 101 document formats with optional OCR.",
+  "keywords": [
+    "langchain",
+    "langchainjs",
+    "document-loader",
+    "xberg",
+    "document-extraction",
+    "ocr",
+    "pdf",
+    "text-extraction",
+    "rag"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/xberg-io/xberg/tree/main/integrations/node/langchain-xberg",
+  "author": {
+    "name": "Xberg.dev",
+    "email": "contact@xberg.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xberg-io/xberg.git",
+    "directory": "integrations/node/langchain-xberg"
+  },
+  "engines": {
+    "node": ">=20.15"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@xberg-io/xberg": "1.1.0",
+    "fast-glob": "^3.3.2"
+  },
+  "peerDependencies": {
+    "@langchain/core": ">=0.3.0"
+  },
+  "devDependencies": {
+    "@langchain/core": "^0.3.0",
+    "@types/node": "^20.19.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

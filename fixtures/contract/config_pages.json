@@ -1,6 +1,12 @@
 {
 	"id": "config_pages",
 	"description": "Tests page extraction and page marker configuration",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests page extraction and page marker configuration",
+		"description": "Tests page extraction and page marker configuration",
+		"side_effects": "server"
+	},
 	"tags": ["contract", "config"],
 	"call": "extract",
 	"input": {
@@ -36,10 +42,6 @@
 			"values": ["PAGE"]
 		}
 	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM cannot access filesystem; use bytes input with file content instead"
-	},
 	"config": {
 		"pages": {
 			"extract_pages": true,

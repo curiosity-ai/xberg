@@ -76,6 +76,15 @@ else
   echo "✓ libheif already installed"
 fi
 
+if ! brew list boost &>/dev/null; then
+  echo "Installing boost (build-time header dep of librevenge + libwpd)..."
+  retry_with_backoff brew install boost || {
+    echo "::warning::Failed to install boost after retries"
+  }
+else
+  echo "✓ boost already installed"
+fi
+
 if ! brew list pkg-config &>/dev/null; then
   echo "Installing pkg-config..."
   retry_with_backoff brew install pkg-config || {
@@ -86,19 +95,22 @@ else
   echo "✓ pkg-config already installed"
 fi
 
-if ! brew list php &>/dev/null; then
+# Only install PHP if none is active. When a job has already run
+# shivammathur/setup-php (the php-extension build matrix does, per matrix.php),
+# an active `php` is on PATH — brew-installing the unversioned `php` formula
+# pours the latest (e.g. 8.5) and UNLINKS the matrix-selected keg (php@8.4),
+# so ext-php-rs then builds against the wrong PHP. Guard on `command -v php`,
+# not `brew list php` (which misses the versioned php@X.Y keg setup-php links),
+# mirroring the Windows script. ~keep
+if command -v php >/dev/null 2>&1; then
+  echo "✓ PHP already active: $(php --version | head -1)"
+else
   echo "Installing PHP..."
   retry_with_backoff brew install php || {
     echo "::error::Failed to install PHP after retries"
     exit 1
   }
-else
-  echo "✓ PHP already installed"
-fi
-
-if ! command -v php >/dev/null 2>&1; then
-  echo "PHP not on PATH after install; attempting brew link..."
-  brew link --overwrite php >/dev/null 2>&1 || true
+  command -v php >/dev/null 2>&1 || brew link --overwrite php >/dev/null 2>&1 || true
 fi
 
 echo "::endgroup::"
@@ -108,13 +120,11 @@ echo "::group::Verifying macOS installations"
 echo "CMake:"
 if command -v cmake >/dev/null 2>&1; then
   cmake --version | head -1
-  # Export CMAKE environment variable for immediate availability in build scripts
   CMAKE_FULL_PATH="$(command -v cmake)"
   if [[ -n "$GITHUB_ENV" ]]; then
     echo "CMAKE=$CMAKE_FULL_PATH" >>"$GITHUB_ENV"
     echo "✓ Set CMAKE=$CMAKE_FULL_PATH in GITHUB_ENV"
   fi
-  # Also add cmake binary directory to GITHUB_PATH for subsequent steps
   CMAKE_BIN="$(dirname "$CMAKE_FULL_PATH")"
   if [[ -n "$GITHUB_PATH" && -d "$CMAKE_BIN" ]]; then
     echo "$CMAKE_BIN" >>"$GITHUB_PATH"

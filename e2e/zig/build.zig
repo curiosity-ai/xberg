@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_step = b.step("test", "Run tests");
+    const smoke_step = b.step("smoke", "Run smoke tests only");
     const ffi_path = b.option([]const u8, "ffi_path", "Path to directory containing libxberg_ffi") orelse "../../target/release";
     const ffi_include = b.option([]const u8, "ffi_include_path", "Path to directory containing FFI header") orelse "../../crates/xberg-ffi/include";
     const ffi_path_abs = b.pathFromRoot(ffi_path);
@@ -122,6 +123,36 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(&batch_run.step);
 
+    const code_module = b.createModule(.{
+        .root_source_file = b.path("src/code_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    code_module.addImport("xberg", xberg_module);
+    const code_tests = b.addTest(.{
+        .name = "code_test",
+        .root_module = code_module,
+        .use_llvm = true,
+    });
+    code_tests.root_module.addRPath(.{ .cwd_relative = ffi_path_abs });
+    const code_run = b.addRunArtifact(code_tests);
+    code_run.setEnvironmentVariable("CRAWLBERG_ALLOW_PRIVATE_NETWORK", "true");
+    if (mock_server_url) |_url| {
+        code_run.setEnvironmentVariable("MOCK_SERVER_URL", _url);
+    }
+    if (mock_servers_json) |_json| {
+        code_run.setEnvironmentVariable("MOCK_SERVERS", _json);
+    }
+    {
+        var _it = mock_servers_map.iterator();
+        while (_it.next()) |_entry| {
+            code_run.setEnvironmentVariable(_entry.key_ptr.*, _entry.value_ptr.*);
+        }
+    }
+    code_run.step.dependOn(&batch_run.step);
+    test_step.dependOn(&code_run.step);
+
     const contract_module = b.createModule(.{
         .root_source_file = b.path("src/contract_test.zig"),
         .target = target,
@@ -149,7 +180,7 @@ pub fn build(b: *std.Build) void {
             contract_run.setEnvironmentVariable(_entry.key_ptr.*, _entry.value_ptr.*);
         }
     }
-    contract_run.step.dependOn(&batch_run.step);
+    contract_run.step.dependOn(&code_run.step);
     test_step.dependOn(&contract_run.step);
 
     const embedding_backend_management_module = b.createModule(.{
@@ -481,6 +512,22 @@ pub fn build(b: *std.Build) void {
     }
     smoke_run.step.dependOn(&reranker_backend_management_run.step);
     test_step.dependOn(&smoke_run.step);
+
+    const smoke_smoke_run = b.addRunArtifact(smoke_tests);
+    smoke_smoke_run.setEnvironmentVariable("CRAWLBERG_ALLOW_PRIVATE_NETWORK", "true");
+    if (mock_server_url) |_url| {
+        smoke_smoke_run.setEnvironmentVariable("MOCK_SERVER_URL", _url);
+    }
+    if (mock_servers_json) |_json| {
+        smoke_smoke_run.setEnvironmentVariable("MOCK_SERVERS", _json);
+    }
+    {
+        var _it = mock_servers_map.iterator();
+        while (_it.next()) |_entry| {
+            smoke_smoke_run.setEnvironmentVariable(_entry.key_ptr.*, _entry.value_ptr.*);
+        }
+    }
+    smoke_step.dependOn(&smoke_smoke_run.step);
 
     const summarization_module = b.createModule(.{
         .root_source_file = b.path("src/summarization_test.zig"),

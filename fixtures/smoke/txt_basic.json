@@ -2,6 +2,12 @@
 	"id": "smoke_txt_basic",
 	"category": "smoke",
 	"description": "Smoke test: Plain text file",
+	"docs": {
+		"topic": "smoke",
+		"title": "Smoke test: Plain text file",
+		"description": "Smoke test: Plain text file",
+		"side_effects": "server"
+	},
 	"tags": ["smoke", "text", "plaintext"],
 	"input": {
 		"mock_responses": [
@@ -32,10 +38,6 @@
 			"value": 5
 		}
 	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM cannot access filesystem; use bytes input with file content instead"
-	},
 	"call": "extract",
 	"config": {}
 }

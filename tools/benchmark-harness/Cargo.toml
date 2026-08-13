@@ -18,26 +18,35 @@ path = "src/lib.rs"
 name = "benchmark-harness"
 path = "src/main.rs"
 
+[[bin]]
+name = "xberg-batch-diagnostic"
+path = "src/xberg_batch_diagnostic_main.rs"
+
+[[bin]]
+name = "xberg-runtime-responsiveness"
+path = "src/xberg_runtime_responsiveness_main.rs"
+
 [features]
 default = []
 profiling = ["pprof"]
 memory-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 glm-ocr-bench = ["xberg/candle-glm-ocr"]
-candle-hunyuan-ocr-bench = ["xberg/candle-hunyuan-ocr"]
 candle-deepseek-ocr-bench = ["xberg/candle-deepseek-ocr"]
 candle-paddleocr-vl-15-bench = ["xberg/candle-paddleocr-vl"]
 
 [dependencies]
 
 ahash = { workspace = true }
-anyhow = { workspace = true }
 
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 
 clap = { workspace = true }
+dirs = "6"
 futures = { workspace = true }
-jsonschema = "0.46"
+jsonschema = "0.49"
+libc = { workspace = true }
 num_cpus = { workspace = true }
 
 pprof = { version = "0.15", features = ["flamegraph", "criterion"], optional = true }
@@ -45,6 +54,7 @@ pulldown-cmark = "0.13"
 rayon = { workspace = true }
 regex = "1"
 serde = { workspace = true }
+serde_ignored = "0.1"
 serde_json = { workspace = true }
 shellexpand = "3"
 
@@ -56,6 +66,8 @@ tikv-jemallocator = { version = "0.7", optional = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1.25"
+url = { workspace = true }
 which = "8"
 xberg = { path = "../../crates/xberg", features = ["full"] }
 

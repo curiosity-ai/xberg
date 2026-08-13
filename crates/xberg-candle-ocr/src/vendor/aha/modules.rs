@@ -3,15 +3,15 @@
 //! Subset of `aha::models::common::modules` covering the attention/MLP primitives
 // Phase 4 model impls will consume all symbols here; suppress dead-code until then.
 #![allow(dead_code)]
-//! used by Hunyuan-OCR, DeepSeek-OCR (via Qwen2), and PaddleOCR-VL 1.5.
+//! used by DeepSeek-OCR (via Qwen2) and PaddleOCR-VL 1.5.
 //!
 //! Symbols provided:
 //!
-//! - [`GateUpDownMLP`] — gate/up/down SwiGLU-style MLP (Qwen2, HunYuan decoder, DeepSeek MoE experts)
+//! - [`GateUpDownMLP`] — gate/up/down SwiGLU-style MLP (Qwen2, DeepSeek MoE experts)
 //! - [`TwoLinearMLP`] — two-linear MLP with activation (vision transformer blocks)
 //! - [`NaiveAttention`] — GQA attention with optional RoPE and KV cache
 //! - [`QKVCatAttention`] — fused QKV projection attention with optional RoPE and KV cache
-//! - [`NaiveAttnTwoLinearMLPBlock`] — pre-norm transformer block (Hunyuan vision, PaddleOCR-VL vision)
+//! - [`NaiveAttnTwoLinearMLPBlock`] — pre-norm transformer block (PaddleOCR-VL vision)
 //! - [`NaiveAttnGateUpDownMLPBlock`] — pre-norm transformer block with GateUpDown MLP (PaddleOCR-VL text)
 //! - [`eager_attention_forward`] — scaled dot-product attention kernel
 //! - [`get_conv2d`] — `Conv2d` builder with full config
@@ -62,7 +62,7 @@ fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
 // GateUpDownMLP
 // ---------------------------------------------------------------------------
 
-/// SwiGLU / SiLU-gated MLP used in Qwen2, HunYuan, DeepSeek decoder layers.
+/// SwiGLU / SiLU-gated MLP used in Qwen2, DeepSeek decoder layers.
 ///
 /// Forward: `down_proj(act_fn(gate_proj(x)) * up_proj(x))`
 #[derive(Debug, Clone)]
@@ -123,8 +123,8 @@ impl Module for GateUpDownMLP {
 
 /// Two-layer MLP with a single activation in between.
 ///
-/// Used inside `NaiveAttnTwoLinearMLPBlock` vision-encoder blocks (Hunyuan
-/// vision encoder, PaddleOCR-VL SigLIP encoder, DeepSeek ViT).
+/// Used inside `NaiveAttnTwoLinearMLPBlock` vision-encoder blocks
+/// (PaddleOCR-VL SigLIP encoder, DeepSeek ViT).
 #[derive(Debug)]
 pub struct TwoLinearMLP {
     linear1: Linear,
@@ -550,7 +550,7 @@ impl QKVCatAttention {
 
 /// Pre-norm transformer block combining [`NaiveAttention`] with [`TwoLinearMLP`].
 ///
-/// Used by Hunyuan-OCR vision encoder and PaddleOCR-VL SigLIP encoder.
+/// Used by the PaddleOCR-VL SigLIP encoder.
 pub struct NaiveAttnTwoLinearMLPBlock {
     self_attn: NaiveAttention,
     mlp: TwoLinearMLP,

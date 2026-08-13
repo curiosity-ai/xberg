@@ -5,15 +5,16 @@ package io.xberg;
  * The document's MIME type is not supported by any registered extractor.
  */
 public class UnsupportedFormatException extends XbergErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new UnsupportedFormatException with the given message. */
-    public UnsupportedFormatException(final String message) {
-        super(message);
-    }
+  /** Creates a new UnsupportedFormatException with the given message. */
+  public UnsupportedFormatException(final String message) { super(message); }
 
-    /** Creates a new UnsupportedFormatException with the given message and cause. */
-    public UnsupportedFormatException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /**
+   * Creates a new UnsupportedFormatException with the given message and cause.
+   */
+  public UnsupportedFormatException(final String message,
+                                    final Throwable cause) {
+    super(message, cause);
+  }
 }

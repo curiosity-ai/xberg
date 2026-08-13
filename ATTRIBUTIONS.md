@@ -360,6 +360,91 @@ extraction via `nom-exif` is pure Rust and works on every target.
 
 ---
 
+## ttf-parser
+
+A safe, zero-allocation TrueType / OpenType / AAT font parser. xberg consumes it
+as the published `xberg-ttf-parser` crate, a fork of upstream carrying fixes
+that have not yet been released upstream:
+
+- **Source**: <https://github.com/harfbuzz/ttf-parser>
+- **License**: MIT OR Apache-2.0 upstream; the fork takes the MIT option and is
+  redistributed under MIT, retaining the upstream copyright notice.
+- **Author(s)**: Yevhenii Reizner, Khaled Hosny, Laurenz Stampfl, Caleb
+  Maclennan and contributors
+- **Version**: `xberg-ttf-parser` 1.1.0, which is upstream 0.25.1 plus nine
+  upstream pull requests carried on top: `#203` (`b422ac0`), `#207` (`52a9811`),
+  `#216` (`9b9e55f`), `#222` (`3a585f1`), `#223` (`32439d2`), `#224` (`dd2337b`),
+  `#225` (`99aa5e3`), `#226` (`86daf57`) and `#228` (`023f8163`).
+- **Location**: consumed from crates.io — <https://crates.io/crates/xberg-ttf-parser>.
+  Only `crates/ttf-parser-compat/` lives in this repo; see below.
+- **Purpose**: Parse embedded font programs when rendering PDF pages. No
+  first-party xberg code calls it. It reaches xberg transitively through
+  `pdf_oxide` and `fontdb`, the only two consumers in `Cargo.lock`.
+
+### Why a fork is still in the dependency graph
+
+Upstream v0.25.1 rejects any CFF charstring containing the deprecated
+`dotsection` operator, dropping the affected glyphs entirely (`i`, `j`, `!`,
+`.`), so PDF pages using Type 1 derived CFF fonts silently lose those
+characters. The fix (upstream `#228`) is merged upstream but **unreleased** —
+crates.io still shows 0.25.1 as the newest `ttf-parser`. Until upstream cuts a
+0.25.2, the fork is the only way to get the fix into `pdf_oxide` and `fontdb`,
+neither of which xberg can edit.
+
+### The compat shim
+
+`crates/ttf-parser-compat/` is an xberg addition, not upstream code: a package
+literally named `ttf-parser` whose entire body is `pub use xberg_ttf_parser::*`.
+Cargo matches `[patch.crates-io]` entries on package name alone and refuses to
+patch across a rename or onto another crates.io package, so this shim is the
+only mechanism that can redirect the transitive consumers onto the fixed parser.
+It is never published. `crates/ttf-parser-compat/tests/patch_engaged.rs` fails
+loudly if the redirect ever stops taking effect, which is otherwise silent.
+
+When upstream releases a 0.25.2 carrying the nine fixes, the shim and the
+`[patch.crates-io]` entry can both be deleted and this section removed. A 0.26
+would not satisfy the `^0.25` requirement either consumer declares, so the
+release number matters.
+
+### License Compatibility
+
+MIT and Apache-2.0 are both permissive and already on the `deny.toml` allow
+list. The published crate carries upstream's license text verbatim.
+
+---
+
+## libwpd + librevenge
+
+Native WordPerfect document libraries built from source and statically linked
+into the `xberg-libwpd` crate:
+
+- **Source**: <https://libwpd.sourceforge.net/>
+- **License**: MPL-2.0 OR LGPL-2.1+ (xberg builds under the MPL-2.0 arm)
+- **Authors**: Document Liberation Project (LibreOffice/AbiWord ecosystem) contributors
+- **Versions**: librevenge 0.0.6, libwpd 0.10.3
+- **Location**: vendored as committed `.tar.gz` archives under `crates/xberg-libwpd/vendor/`, decompressed and compiled by `crates/xberg-libwpd/build.rs` (checksum-verified at extract time); consumed via `crates/xberg-libwpd/src/shim.cpp`
+- **Purpose**: WordPerfect (.wpd) document extraction
+- **Modifications**: none; both libraries are built from unmodified upstream source
+
+### License Compatibility
+
+See `THIRD_PARTY_LICENSES.md` for the full MPL-2.0 vs LGPL-2.1+ linking analysis. In short: xberg statically links under the MPL-2.0 arm (file-level copyleft, static linking explicitly permitted), so no copyleft obligation reaches xberg's MIT-licensed core or language bindings.
+
+---
+
+## Boost C++ Libraries (build-time, xberg-libwpd)
+
+A header-only subset of Boost, used at build time by the `xberg-libwpd` C++ shim:
+
+- **Source**: <https://www.boost.org/>
+- **License**: BSL-1.0 (Boost Software License 1.0)
+- **Author**: Boost contributors
+- **Location**: `bcp`-extracted subset vendored as `crates/xberg-libwpd/vendor/boost-subset.tar.gz`, decompressed by `crates/xberg-libwpd/build.rs`
+- **Purpose**: header-only dependency of libwpd/librevenge (build-time only; no Boost code is redistributed in xberg binaries)
+- **Modifications**: none; subset extracted verbatim with `bcp`
+
+---
+
 ## jhqxxx/aha
 
 Rust-native VLM-OCR backends vendored into `crates/xberg-candle-ocr/`:
@@ -368,8 +453,8 @@ Rust-native VLM-OCR backends vendored into `crates/xberg-candle-ocr/`:
 - **License**: Apache-2.0
 - **Author**: jhqxxx
 - **Vendored Version**: `e29ddc589d089042afd66ab8ea76409d8d33f701` (jhqxxx/aha @ HEAD on 2026-06-17)
-- **Location**: `crates/xberg-candle-ocr/src/vendor/aha/` (shared infra), `crates/xberg-candle-ocr/src/models/hunyuan_ocr/` (Hunyuan-OCR), `crates/xberg-candle-ocr/src/models/deepseek_ocr/` (DeepSeek-OCR + Qwen2 decoder), `crates/xberg-candle-ocr/src/models/paddleocr_vl/` (PaddleOCR-VL 1.5 upgrade)
-- **Purpose**: Rust-native VLM-OCR backends (Hunyuan-OCR, PaddleOCR-VL 1.5, DeepSeek-OCR) including their Qwen2 decoder dependency and shared SigLIP/CLIP/MRoPE infrastructure subsets.
+- **Location**: `crates/xberg-candle-ocr/src/vendor/aha/` (shared infra), `crates/xberg-candle-ocr/src/models/deepseek_ocr/` (DeepSeek-OCR + Qwen2 decoder), `crates/xberg-candle-ocr/src/models/paddleocr_vl/` (PaddleOCR-VL 1.5 upgrade)
+- **Purpose**: Rust-native VLM-OCR backends (PaddleOCR-VL 1.5, DeepSeek-OCR) including their Qwen2 decoder dependency and shared SigLIP/CLIP/MRoPE infrastructure subsets.
 
 ### Vendored Files
 
@@ -385,12 +470,90 @@ Rust-native VLM-OCR backends vendored into `crates/xberg-candle-ocr/`:
 - Generation loop routed through `xberg_candle_ocr::models::glm_ocr::mtp::generate_mrope` (with a new `forward_step_with_position_ids` trait extension per A3) — NOT aha's `common/generate.rs`
 - rustdoc on every `pub` item
 - Dead code blocks dropped (specific examples: aha `modules.rs:214-230, 265-266`)
+- `paddleocr_vl::model::get_rope_index`: vision-block position ids restored to aha's (t, h, w) mrope layout after the vendoring rewrite transposed the h index and dropped the t row (crashed on non-square grids); images always carry a single frame so the t row is constant
+- `paddleocr_vl::model::forward`: restored aha's seqlen_offset-based position continuation for cache_position-less decode steps (dropped during vendoring, failing every decode step with a dtype mismatch)
+- `paddleocr_vl::engine::generate`: rewritten from a full-sequence re-feed (which double-appended the KV cache each step and read the argmax at the wrong rank) to aha's prefill + cached single-token step loop
+- `paddleocr_vl::model::Ernie4_5Model::forward`: restored aha's causal attention mask for the multi-token prefill (dropped during vendoring; bidirectional prefill degenerated generation into single-token repetition)
 
 ### License Compatibility
 
 Apache-2.0 is compatible with Xberg's Elastic License 2.0 (ELv2). Original Apache-2.0 copyright headers are preserved at file-top in each vendored file.
 
 **Last Updated**: 2026-06-17
+
+---
+
+## Self-hosted retrieval models
+
+xberg re-hosts ONNX weights for 17 upstream retrieval models across four `xberg-io/*` Hugging Face
+repos and serves them as embedding/reranker/sparse/late-interaction presets. Weights are re-hosted
+unmodified (unchanged upstream weights, xberg-added ONNX export/manifest/tokenizer artifacts only)
+under the `xberg-io` org. All upstream licenses are permissive (Apache-2.0 or MIT), consistent with
+xberg's permissive-only dependency policy.
+
+### xberg-io/embedding-models
+
+Dense sentence-embedding presets:
+
+- **Runtime artifact repository**: <https://huggingface.co/xberg-io/embedding-models>
+- **Usage**: ONNX weights, tokenizer files, and manifests for xberg's embeddings engine
+
+| Upstream model | License | Preset |
+| --- | --- | --- |
+| [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | Apache-2.0 | `fast` |
+| [BAAI/bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | MIT | `balanced` |
+| [BAAI/bge-large-en-v1.5](https://huggingface.co/BAAI/bge-large-en-v1.5) | MIT | `quality` |
+| [intfloat/multilingual-e5-base](https://huggingface.co/intfloat/multilingual-e5-base) | MIT | `multilingual` |
+| [Alibaba-NLP/gte-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-modernbert-base) | Apache-2.0 | `gte-modernbert-base` (default) |
+| [minishlab/potion-base-8M](https://huggingface.co/minishlab/potion-base-8M) | MIT | `lightweight` (model2vec static) |
+| [Snowflake/snowflake-arctic-embed-m-v2.0](https://huggingface.co/Snowflake/snowflake-arctic-embed-m-v2.0) | Apache-2.0 | `arctic-embed-m-v2.0` |
+| [Qwen/Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) | Apache-2.0 | `qwen3-embedding-0.6b` |
+
+### xberg-io/reranker-models
+
+Cross-encoder reranker presets:
+
+- **Runtime artifact repository**: <https://huggingface.co/xberg-io/reranker-models>
+- **Usage**: ONNX weights, tokenizer files, and manifests for xberg's reranking engine
+
+| Upstream model | License | Preset |
+| --- | --- | --- |
+| [BAAI/bge-reranker-base](https://huggingface.co/BAAI/bge-reranker-base) | MIT | — |
+| [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | Apache-2.0 | — |
+| [jinaai/jina-reranker-v1-turbo-en](https://huggingface.co/jinaai/jina-reranker-v1-turbo-en) | Apache-2.0 | — |
+| [Qwen/Qwen3-Reranker-0.6B](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) | Apache-2.0 | — |
+| [cross-encoder/ettin-reranker-150m-v1](https://huggingface.co/cross-encoder/ettin-reranker-150m-v1) | Apache-2.0 | `balanced` (default alias) |
+
+### xberg-io/sparse-embeddings
+
+SPLADE-family sparse embedding presets:
+
+- **Runtime artifact repository**: <https://huggingface.co/xberg-io/sparse-embeddings>
+- **Usage**: ONNX weights, tokenizer files, and manifests for xberg's sparse embeddings engine
+
+| Upstream model | License | Preset |
+| --- | --- | --- |
+| [prithivida/Splade_PP_en_v1](https://huggingface.co/prithivida/Splade_PP_en_v1) | Apache-2.0 | `splade` |
+| [opensearch-project/opensearch-neural-sparse-encoding-doc-v3-distill](https://huggingface.co/opensearch-project/opensearch-neural-sparse-encoding-doc-v3-distill) | Apache-2.0 | `opensearch-v3-distill` (default) |
+
+### xberg-io/late-interaction-models
+
+ColBERT-family late-interaction presets:
+
+- **Runtime artifact repository**: <https://huggingface.co/xberg-io/late-interaction-models>
+- **Usage**: ONNX weights, tokenizer files, and manifests for xberg's late-interaction engine
+
+| Upstream model | License | Preset |
+| --- | --- | --- |
+| [answerdotai/answerai-colbert-small-v1](https://huggingface.co/answerdotai/answerai-colbert-small-v1) | Apache-2.0 | `colbert` |
+| [lightonai/GTE-ModernColBERT-v1](https://huggingface.co/lightonai/GTE-ModernColBERT-v1) | Apache-2.0 | `gte-moderncolbert` (default) |
+
+### Policy
+
+Model weights are not committed to this repository; verified artifacts are downloaded into the
+xberg model cache at runtime, matching the GLiNER Models policy above.
+
+**Last Updated**: 2026-07-08
 
 ---
 

@@ -14,6 +14,7 @@
 //!
 //! Note: These tests require the `office` feature to be enabled and Pandoc to be installed.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "office")]
 
 use std::path::{Path, PathBuf};
@@ -345,6 +346,37 @@ async fn test_odt_formula_extraction() {
     );
 
     println!("✅ ODT formula extraction test passed!");
+}
+
+/// Tests that the embedded MathML formula in formula.odt is converted to real,
+/// well-formed LaTeX (not the old plain-text `num/den`-style approximation).
+///
+/// The formula object's MathML is `E = m \cdot c^2` wrapped in a `<semantics>` /
+/// `<annotation>` (StarMath fallback) pair; the annotation text must not leak
+/// into the converted output.
+#[tokio::test]
+async fn test_odt_formula_extraction_produces_real_latex() {
+    let test_file = get_test_file_path("formula.odt");
+    if !ensure_test_file_exists(&test_file) {
+        return;
+    }
+
+    let config = ExtractionConfig::default();
+    let result = extract_uri_document(&test_file, None, &config)
+        .await
+        .expect("Should extract formula successfully");
+
+    assert_eq!(
+        result.content.trim(),
+        "E=m\\cdot c^{2}",
+        "Formula should render as real LaTeX, not a StarMath annotation or num/den approximation"
+    );
+    assert!(
+        !result.content.contains("StarMath"),
+        "The StarMath annotation fallback must not leak into extracted content"
+    );
+
+    println!("✅ ODT formula LaTeX extraction test passed!");
 }
 
 /// Tests extraction of footnotes

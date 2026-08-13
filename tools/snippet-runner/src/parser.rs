@@ -10,7 +10,6 @@ pub struct CodeBlock {
     pub start_line: usize,
     pub preceding_comment: Option<String>,
 }
-
 /// Extract fenced code blocks from markdown content.
 ///
 /// Recognizes blocks like:
@@ -29,9 +28,7 @@ pub fn extract_fenced_blocks(content: &str) -> Vec<CodeBlock> {
         let trimmed = line.trim();
 
         if let Some(rest) = trimmed.strip_prefix("```") {
-            // Opening fence — parse lang + attributes
             if rest.is_empty() || rest.starts_with('`') {
-                // Bare ``` or ````+ — skip
                 i += 1;
                 continue;
             }
@@ -42,7 +39,6 @@ pub fn extract_fenced_blocks(content: &str) -> Vec<CodeBlock> {
                 continue;
             }
 
-            // Capture preceding HTML comment for annotation
             let preceding_comment = if i > 0 {
                 let prev = lines[i - 1].trim();
                 if prev.starts_with("<!--") && prev.ends_with("-->") {
@@ -54,11 +50,10 @@ pub fn extract_fenced_blocks(content: &str) -> Vec<CodeBlock> {
                 None
             };
 
-            let start_line = i + 1; // 1-indexed
+            let start_line = i + 1;
             let mut code_lines = Vec::new();
             i += 1;
 
-            // Collect until closing fence
             while i < lines.len() {
                 let cl = lines[i].trim();
                 if cl == "```" || cl.starts_with("```") && cl.chars().skip(3).all(|c| c == '`') {
@@ -95,16 +90,13 @@ pub fn parse_code_blocks(path: &Path) -> crate::error::Result<Vec<CodeBlock>> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     if ext == "md" || ext == "markdown" {
-        // Markdown file — extract fenced blocks
         Ok(extract_fenced_blocks(&content))
     } else {
-        // Raw source file — check if it contains markdown fences
         let fenced = extract_fenced_blocks(&content);
         if !fenced.is_empty() {
             return Ok(fenced);
         }
 
-        // Treat entire file as a single code block
         let lang = Language::from_extension(&ext);
         if lang == Language::Unknown {
             return Ok(Vec::new());
@@ -125,19 +117,16 @@ pub fn parse_code_blocks(path: &Path) -> crate::error::Result<Vec<CodeBlock>> {
 fn parse_fence_info(info: &str) -> (String, Option<String>) {
     let info = info.trim();
 
-    // Split on whitespace to get lang + rest
     let mut parts = info.splitn(2, char::is_whitespace);
     let lang = parts.next().unwrap_or("").to_string();
     let rest = parts.next().unwrap_or("");
 
-    // Parse title="..." attribute
     let title = parse_title_attr(rest);
 
     (lang, title)
 }
 
 fn parse_title_attr(attrs: &str) -> Option<String> {
-    // Match title="..." or title='...'
     let attrs = attrs.trim();
     if let Some(after) = attrs.strip_prefix("title=") {
         let after = after.trim();
@@ -149,14 +138,12 @@ fn parse_title_attr(attrs: &str) -> Option<String> {
             let end = stripped.find('\'')?;
             return Some(stripped[..end].to_string());
         }
-        // No quotes — take until whitespace
         let val: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
         if !val.is_empty() {
             return Some(val);
         }
     }
 
-    // Also search for title= anywhere in attributes
     for part in attrs.split_whitespace() {
         if let Some(after) = part.strip_prefix("title=") {
             let after = after.trim_matches(|c| c == '"' || c == '\'');

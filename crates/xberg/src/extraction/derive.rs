@@ -22,22 +22,21 @@ use crate::types::ocr_elements::{OcrConfidence, OcrElement};
 use crate::types::page::PageContent;
 use crate::types::tables::Table;
 
-// ============================================================================
-// 1. Relationship Resolution
-// ============================================================================
+/// Cap on how many unresolvable keys a single warning names before it summarises
+/// the rest as a count, so a badly broken document cannot produce an unbounded
+/// message.
+const MAX_REPORTED_UNRESOLVED_KEYS: usize = 10;
 
 /// Resolve `RelationshipTarget::Key` entries to `RelationshipTarget::Index`.
 ///
 /// Builds an anchor index from elements with non-`None` anchors, then resolves
-/// each key-based relationship target. Unresolvable keys are logged and skipped
-/// (the relationship is left as `Key` — it will be excluded from the final
-/// `DocumentStructure` relationships).
+/// each key-based relationship target. Unresolvable keys are skipped — the
+/// relationship is left as `Key` and excluded from the final `DocumentStructure`
+/// relationships — and reported in one `ProcessingWarning` naming them.
 pub(crate) fn resolve_relationships(doc: &mut InternalDocument) {
-    // Build anchor → element index map (first element with a given anchor wins).
-    // Skip FootnoteRef elements so that refs resolve to definitions, not to themselves.
     let mut anchor_map: AHashMap<&str, u32> = AHashMap::new();
     for (idx, elem) in doc.elements.iter().enumerate() {
-        if matches!(elem.kind, ElementKind::FootnoteRef) {
+        if matches!(elem.kind, ElementKind::FootnoteRef | ElementKind::CommentRef) {
             continue;
         }
         if let Some(anchor) = elem.anchor.as_deref() {
@@ -45,6 +44,7 @@ pub(crate) fn resolve_relationships(doc: &mut InternalDocument) {
         }
     }
 
+    let mut unresolved: Vec<String> = Vec::new();
     for rel in &mut doc.relationships {
         if let RelationshipTarget::Key(ref key) = rel.target {
             match anchor_map.get(key.as_str()) {
@@ -53,15 +53,38 @@ pub(crate) fn resolve_relationships(doc: &mut InternalDocument) {
                 }
                 None => {
                     log::debug!("Unresolvable relationship key: {}", key);
+                    unresolved.push(key.clone());
                 }
             }
         }
     }
-}
 
-// ============================================================================
-// 2. Document Structure Derivation
-// ============================================================================
+    if !unresolved.is_empty() {
+        unresolved.sort();
+        unresolved.dedup();
+        let total = unresolved.len();
+        unresolved.truncate(MAX_REPORTED_UNRESOLVED_KEYS);
+        let listed = unresolved.join(", ");
+        let suffix = if total > unresolved.len() {
+            format!(" (and {} more)", total - unresolved.len())
+        } else {
+            String::new()
+        };
+        // One warning for the document rather than one per key: cross-references usually
+        // break as a set, and a per-key warning would flood `processing_warnings` on a
+        // large document. Previously this was `log::debug!` only, so a citation or
+        // cross-reference that failed to resolve vanished from `DocumentStructure` with
+        // no diagnostic at all (#74). ~keep
+        crate::core::diagnostics::push_warning(
+            &mut doc.processing_warnings,
+            "relationships",
+            format!(
+                "{total} cross-reference target(s) could not be resolved and were dropped from the \
+                 document structure: {listed}{suffix}"
+            ),
+        );
+    }
+}
 
 /// Inner implementation that assumes relationships are already resolved.
 ///
@@ -72,19 +95,13 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
     let mut ds = DocumentStructure::with_capacity(doc.elements.len());
     ds.source_format = Some(doc.source_format.to_string());
 
-    // Stack: (depth, NodeIndex) — depth is the element depth that "owns" this level
     let mut stack: Vec<(u16, NodeIndex)> = Vec::new();
 
-    // Map element index → node index (for relationship mapping).
-    // Not every element produces a node (end markers, FootnoteRef are skipped).
     let mut elem_to_node: Vec<Option<NodeIndex>> = vec![None; doc.elements.len()];
 
-    // Track which elements have been consumed by pairing (e.g. DefinitionDescription paired with preceding Term)
     let mut consumed: Vec<bool> = vec![false; doc.elements.len()];
 
-    // Pre-compute definition term/description pairings:
-    // When a DefinitionTerm is immediately followed by a DefinitionDescription, mark the description as consumed.
-    let mut def_pairs: AHashMap<usize, usize> = AHashMap::new(); // term_idx -> desc_idx
+    let mut def_pairs: AHashMap<usize, usize> = AHashMap::new();
     for i in 0..doc.elements.len().saturating_sub(1) {
         if matches!(doc.elements[i].kind, ElementKind::DefinitionTerm)
             && matches!(doc.elements[i + 1].kind, ElementKind::DefinitionDescription)
@@ -95,30 +112,15 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
     }
 
     for elem_idx in 0..doc.elements.len() {
-        // Skip elements consumed by pairing
         if consumed[elem_idx] {
             continue;
         }
-        // Skip container end markers — they just pop the stack
         match doc.elements[elem_idx].kind {
             ElementKind::ListEnd | ElementKind::QuoteEnd | ElementKind::GroupEnd => {
-                // Pop matching container from stack, but only if the top matches
-                if let Some((_, top_idx)) = stack.last() {
-                    let top_content = &ds.nodes[top_idx.0 as usize].content;
-                    if matches!(
-                        (&doc.elements[elem_idx].kind, top_content),
-                        (ElementKind::ListEnd, NodeContent::List { .. })
-                            | (ElementKind::QuoteEnd, NodeContent::Quote)
-                            | (ElementKind::GroupEnd, NodeContent::Group { .. })
-                    ) {
-                        stack.pop();
-                    }
-                    // If it doesn't match, skip the end marker
-                }
+                close_container(&mut stack, &ds, doc.elements[elem_idx].kind);
                 continue;
             }
-            ElementKind::FootnoteRef => {
-                // Footnote refs are represented as annotations, not separate nodes
+            ElementKind::FootnoteRef | ElementKind::CommentRef => {
                 continue;
             }
             _ => {}
@@ -126,7 +128,6 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
 
         let elem = &doc.elements[elem_idx];
 
-        // Container start markers
         if elem.kind.is_container_start() {
             pop_stack_to_depth(&mut stack, elem.depth);
             let content = match elem.kind {
@@ -137,9 +138,6 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
                     heading_level: None,
                     heading_text: None,
                 },
-                // INVARIANT: the `is_container_start()` guard above already
-                // confirmed this is a ListStart, QuoteStart, or GroupStart variant;
-                // any other variant cannot reach this arm.
                 _ => unreachable!("variant already checked by is_container_start()"),
             };
             let node_idx = push_node(&mut ds, &stack, content, elem, elem_idx as u32);
@@ -148,12 +146,9 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
             continue;
         }
 
-        // Headings create a Group + Heading child and push the group
         if let ElementKind::Heading { level } = elem.kind {
-            // Pop stack until we find a shallower depth
             pop_stack_to_depth(&mut stack, elem.depth);
 
-            // Take text and annotations — pages/OCR have already consumed what they need
             let text = std::mem::take(&mut doc.elements[elem_idx].text);
             let annotations = std::mem::take(&mut doc.elements[elem_idx].annotations);
             let elem = &doc.elements[elem_idx];
@@ -166,10 +161,9 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
 
             let group_idx = push_node(&mut ds, &stack, group_content, elem, elem_idx as u32);
 
-            // Create Heading child node inside the group
             let heading_node_index = ds.len() as u32;
             let heading_node = DocumentNode {
-                id: NodeId::generate("heading", &text, elem.page, heading_node_index),
+                id: NodeId::generate("heading", &text, elem.page, heading_node_index).to_string(),
                 content: NodeContent::Heading { level, text },
                 parent: Some(group_idx),
                 children: vec![],
@@ -178,26 +172,19 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
                 page_end: None,
                 bbox: elem.bbox,
                 annotations,
-                attributes: elem
-                    .attributes
-                    .as_ref()
-                    .map(|a| a.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                attributes: elem.public_attributes(),
             };
             let heading_idx = ds.push_node(heading_node);
             ds.nodes[group_idx.0 as usize].children.push(heading_idx);
 
-            // The element maps to the group node (heading is a child detail)
             elem_to_node[elem_idx] = Some(group_idx);
             stack.push((elem.depth, group_idx));
             continue;
         }
 
-        // DefinitionTerm with a paired DefinitionDescription: create a combined DefinitionItem
-        // wrapped in a DefinitionList container.
         if let Some(&desc_idx) = def_pairs.get(&elem_idx) {
             pop_stack_to_depth(&mut stack, elem.depth);
 
-            // Ensure a DefinitionList container is on the stack
             let is_in_def_list = stack
                 .last()
                 .is_some_and(|(_, idx)| matches!(ds.nodes[idx.0 as usize].content, NodeContent::DefinitionList));
@@ -216,7 +203,6 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
             continue;
         }
 
-        // Unpaired DefinitionTerm or DefinitionDescription: wrap in DefinitionList too
         if matches!(
             elem.kind,
             ElementKind::DefinitionTerm | ElementKind::DefinitionDescription
@@ -245,7 +231,6 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
             continue;
         }
 
-        // Close any open DefinitionList when a non-definition element is encountered
         if stack
             .last()
             .is_some_and(|(_, idx)| matches!(ds.nodes[idx.0 as usize].content, NodeContent::DefinitionList))
@@ -253,7 +238,6 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
             stack.pop();
         }
 
-        // All other elements
         pop_stack_to_depth(&mut stack, elem.depth);
         let content = element_to_node_content(&mut doc.elements[elem_idx], &doc.tables, &doc.images);
         let annotations = std::mem::take(&mut doc.elements[elem_idx].annotations);
@@ -268,11 +252,8 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
         elem_to_node[elem_idx] = Some(node_idx);
     }
 
-    // Convert resolved relationships to DocumentRelationship
     for rel in &doc.relationships {
         if let RelationshipTarget::Index(target_elem_idx) = rel.target {
-            // When source elem_to_node is None (e.g. FootnoteRef was skipped),
-            // walk backwards to find the nearest mapped element as the source.
             let source_node = elem_to_node
                 .get(rel.source as usize)
                 .and_then(|n| *n)
@@ -296,6 +277,33 @@ fn derive_document_structure_inner(doc: &mut InternalDocument) -> DocumentStruct
 
     ds.finalize_node_types();
     ds
+}
+
+/// Close the nearest explicit container matching an end marker.
+///
+/// Derived heading groups may sit above an explicit container on the stack. An
+/// end marker closes both those derived groups and its matching container,
+/// rather than mistaking the heading group for the explicit group itself.
+fn close_container(stack: &mut Vec<(u16, NodeIndex)>, ds: &DocumentStructure, end_kind: ElementKind) {
+    let Some(container_position) = stack.iter().rposition(|(_, node_idx)| {
+        let content = &ds.nodes[node_idx.0 as usize].content;
+        matches!(
+            (end_kind, content),
+            (ElementKind::ListEnd, NodeContent::List { .. })
+                | (ElementKind::QuoteEnd, NodeContent::Quote)
+                | (
+                    ElementKind::GroupEnd,
+                    NodeContent::Group {
+                        heading_level: None,
+                        ..
+                    }
+                )
+        )
+    }) else {
+        return;
+    };
+
+    stack.truncate(container_position);
 }
 
 /// Pop the stack until the top has depth strictly less than `target_depth`.
@@ -333,7 +341,7 @@ fn push_node_with_annotations(
 
     let node_index_val = ds.len() as u32;
     let node = DocumentNode {
-        id: NodeId::generate(node_type, text_for_id, elem.page, node_index_val),
+        id: NodeId::generate(node_type, text_for_id, elem.page, node_index_val).to_string(),
         content,
         parent: None,
         children: vec![],
@@ -342,12 +350,7 @@ fn push_node_with_annotations(
         page_end: None,
         bbox: elem.bbox,
         annotations,
-        // Intentional AHashMap → HashMap conversion: DocumentNode.attributes uses
-        // std::collections::HashMap for utoipa/OpenAPI schema compatibility.
-        attributes: elem
-            .attributes
-            .as_ref()
-            .map(|a| a.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        attributes: elem.public_attributes(),
     };
 
     let node_idx = ds.push_node(node);
@@ -386,6 +389,9 @@ fn element_to_node_content(
             text: std::mem::take(&mut elem.text),
         },
         ElementKind::FootnoteDefinition => NodeContent::Footnote {
+            text: std::mem::take(&mut elem.text),
+        },
+        ElementKind::CommentDefinition => NodeContent::Comment {
             text: std::mem::take(&mut elem.text),
         },
         ElementKind::Citation => NodeContent::Citation {
@@ -459,8 +465,6 @@ fn element_to_node_content(
         ElementKind::OcrText { .. } => NodeContent::Paragraph {
             text: std::mem::take(&mut elem.text),
         },
-        // Container starts are handled separately above; these shouldn't be reached
-        // but we handle them defensively.
         ElementKind::ListStart { ordered } => NodeContent::List { ordered },
         ElementKind::QuoteStart => NodeContent::Quote,
         ElementKind::GroupStart => NodeContent::Group {
@@ -468,12 +472,11 @@ fn element_to_node_content(
             heading_level: None,
             heading_text: None,
         },
-        // These should have been filtered out before calling this function
         ElementKind::Heading { level } => NodeContent::Heading {
             level,
             text: std::mem::take(&mut elem.text),
         },
-        ElementKind::FootnoteRef => NodeContent::Paragraph {
+        ElementKind::FootnoteRef | ElementKind::CommentRef => NodeContent::Paragraph {
             text: std::mem::take(&mut elem.text),
         },
         ElementKind::ListEnd | ElementKind::QuoteEnd | ElementKind::GroupEnd => {
@@ -524,10 +527,6 @@ fn parse_metadata_entries(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-// ============================================================================
-// 4. ExtractedDocument Assembly
-// ============================================================================
-
 /// Derive a complete `ExtractedDocument` from an `InternalDocument`.
 ///
 /// This is the main entry point for the derivation pipeline. It:
@@ -550,26 +549,25 @@ pub fn derive_extraction_result(
         include_document_structure,
         "derivation pipeline starting"
     );
-    // 1. Resolve relationships first — renderers need resolved targets for footnotes.
     resolve_relationships(&mut doc);
 
-    // 2. Always derive plain-text content (post-processors operate on this).
-    let content = crate::rendering::render_plain(&doc);
+    // A document produced by `From<ExtractedDocument> for InternalDocument` has no
+    // element tree, so `render_plain` yields nothing. Its already-extracted text lives in
+    // `pre_rendered_content` and must be returned verbatim rather than dropped. Only the
+    // empty rendering falls back, so a document that does have elements always wins.
+    let mut content = crate::rendering::render_plain(&doc);
+    if content.is_empty()
+        && let Some(pre_rendered) = doc.pre_rendered_content.as_ref()
+    {
+        content = pre_rendered.clone();
+    }
 
-    // Use the explicit mime_type from the doc if it was set, otherwise derive from source_format
     let mime_type: Cow<'static, str> = if doc.mime_type != "application/octet-stream" {
         Cow::Owned(std::mem::take(&mut doc.mime_type))
     } else {
         Cow::Borrowed(source_format_to_mime_type(&doc.source_format))
     };
 
-    // 3. Pre-render formatted content if a non-plain output format is requested.
-    //    This runs while the InternalDocument still owns its element data.
-    //
-    //    If the extractor already produced high-quality formatted output (stored in
-    //    `pre_rendered_content`) and the requested format matches what the extractor
-    //    produced (`metadata.output_format`), use it directly to avoid the lossy
-    //    InternalDocument → renderer round-trip.
     let formatted_content = match output_format {
         crate::core::config::OutputFormat::Plain => None,
         crate::core::config::OutputFormat::Markdown => {
@@ -586,9 +584,28 @@ pub fn derive_extraction_result(
                 Some(crate::rendering::render_djot(&doc))
             }
         }
-        crate::core::config::OutputFormat::Html => Some(crate::rendering::render_html(&doc)),
-        crate::core::config::OutputFormat::Json => Some(crate::rendering::render_json(&doc)),
+        crate::core::config::OutputFormat::Html => {
+            if doc.pre_rendered_content.is_some() && doc.metadata.output_format.as_deref() == Some("html") {
+                doc.pre_rendered_content.take()
+            } else {
+                Some(crate::rendering::render_html(&doc))
+            }
+        }
+        crate::core::config::OutputFormat::Json => {
+            if doc.pre_rendered_content.is_some() && doc.metadata.output_format.as_deref() == Some("json") {
+                doc.pre_rendered_content.take()
+            } else {
+                Some(crate::rendering::render_json(&doc))
+            }
+        }
         crate::core::config::OutputFormat::Structured => None,
+        crate::core::config::OutputFormat::DocTags => {
+            if doc.pre_rendered_content.is_some() && doc.metadata.output_format.as_deref() == Some("doctags") {
+                doc.pre_rendered_content.take()
+            } else {
+                Some(crate::rendering::render_doctags(&doc))
+            }
+        }
         crate::core::config::OutputFormat::Custom(ref name) => {
             let registry = crate::plugins::registry::get_renderer_registry();
             let registry = registry.read();
@@ -596,38 +613,58 @@ pub fn derive_extraction_result(
                 Ok(rendered) => Some(rendered),
                 Err(e) => {
                     tracing::warn!(renderer = %name, error = %e, "Custom renderer failed, falling back to plain");
+                    // #208: `tracing::warn!` is invisible to API/binding consumers — the
+                    // only channel they can observe is `processing_warnings`. Without
+                    // this, a typo'd or unregistered custom format silently produced
+                    // plain text with no way for the caller to detect the fallback. ~keep
+                    crate::core::diagnostics::push_warning(
+                        &mut doc.processing_warnings,
+                        "output-format",
+                        format!(
+                            "requested output format '{name}' has no registered renderer ({e}); \
+                             returned plain text instead"
+                        ),
+                    );
                     None
                 }
             }
         }
     };
 
-    // 4. Build pages and OCR elements BEFORE document structure derivation,
-    //    so that derive_document_structure_inner can move (take) elem.text
-    //    and elem.annotations instead of cloning them.
-    //
-    //    Prefer pre-built pages from the extractor (e.g. PDF native page tracking)
-    //    over reconstructing from element-level page numbers.
     let raw_pages = doc.prebuilt_pages.take().or_else(|| build_pages(&doc));
-    // Apply the requested output format to per-page content. Must run while doc still
-    // owns its elements (before derive_document_structure_inner moves them).
     let pages = apply_page_content_format(raw_pages, &doc, &output_format);
-    // Prefer pre-built OCR elements stored directly by the extractor (e.g. image OCR
-    // via inject_ocr_elements_from_vec was replaced by prebuilt_ocr_elements to avoid
-    // injecting raw word tokens into the rendering pipeline — issue #706).
     let ocr_elements = doc.prebuilt_ocr_elements.take().or_else(|| build_ocr_elements(&doc));
 
-    // 5. Optionally derive DocumentStructure (relationships already resolved above).
     let document = if include_document_structure {
         Some(derive_document_structure_inner(&mut doc))
     } else {
         None
     };
 
-    // Convert images
     let images = if doc.images.is_empty() { None } else { Some(doc.images) };
 
-    // Transfer URIs, deduplicating by (url, kind) pair
+    // #76: `push_uri` caps collection at `InternalDocument::MAX_URIS` and silently
+    // discarded the rest, so a document with more links than the cap was
+    // indistinguishable from one that genuinely has exactly `MAX_URIS`. Name the
+    // loss; only when it actually happened, so a normal document stays warning-free. ~keep
+    if doc.uris_dropped > 0 {
+        let dropped = doc.uris_dropped;
+        // Report the cap itself, not `doc.uris.len()`: the derivation runs a second
+        // time after the captioning prepass, by which point the list has been
+        // de-duplicated and shortened. A length-derived count would produce a second,
+        // differently-worded warning that `push_warning`'s dedup could not collapse. ~keep
+        let kept = InternalDocument::MAX_URIS;
+        let found = kept + dropped;
+        crate::core::diagnostics::push_warning(
+            &mut doc.processing_warnings,
+            "uris",
+            format!(
+                "Collected the first {kept} of {found} URIs; {dropped} were dropped at the \
+                 per-document limit and are missing from the result"
+            ),
+        );
+    }
+
     let uris = if doc.uris.is_empty() {
         None
     } else {
@@ -636,12 +673,39 @@ pub fn derive_extraction_result(
         Some(doc.uris)
     };
 
-    // FormatMetadata::Code is a unit variant — no tree-sitter ProcessResult payload
-    // attached. Code intelligence integration was removed because the upstream
-    // ProcessResult type lives in an external crate that binding generators cannot
-    // resolve to a typed struct across all targets.
+    // #259: `code_intelligence` is documented (types/extraction.rs) as carrying
+    // the full `tree_sitter_language_pack::ProcessResult` — metrics, structure,
+    // imports, exports, comments, docstrings, symbols, diagnostics, chunks and
+    // the hierarchical data tree. `extractors/code.rs` stashes that entire
+    // serialized result under `CODE_INTELLIGENCE_SCRATCH_KEY` in
+    // `metadata.additional` (the typed `CodeMetadata` on `Metadata::format` only
+    // carries `chunks`/`data`, so it has no room for the rest). Prefer that full
+    // payload; `.remove()` so it never leaks into the final
+    // `ExtractedDocument.metadata.additional` map. Fall back to serializing just
+    // `CodeMetadata` for documents that reach this point without going through
+    // `CodeExtractor` (e.g. synthetic `InternalDocument`s built by tests or other
+    // callers that set `FormatMetadata::Code` directly). ~keep
     #[cfg(feature = "tree-sitter")]
-    let code_intelligence: Option<serde_json::Value> = None;
+    let is_code_metadata = matches!(
+        doc.metadata.format.as_ref(),
+        Some(crate::types::metadata::FormatMetadata::Code(_))
+    );
+    #[cfg(feature = "tree-sitter")]
+    let full_process_result = if is_code_metadata {
+        doc.metadata
+            .additional
+            .remove(crate::extractors::code::CODE_INTELLIGENCE_SCRATCH_KEY)
+    } else {
+        None
+    };
+    #[cfg(feature = "tree-sitter")]
+    let code_intelligence: Option<serde_json::Value> =
+        full_process_result.or_else(|| match doc.metadata.format.as_ref() {
+            Some(crate::types::metadata::FormatMetadata::Code(code_metadata)) => {
+                serde_json::to_value(code_metadata).ok()
+            }
+            _ => None,
+        });
 
     let extraction_method = doc
         .metadata
@@ -708,7 +772,6 @@ fn source_format_to_mime_type(format: &str) -> &'static str {
 
 /// Build per-page `PageContent` from page-grouped elements.
 fn build_pages(doc: &InternalDocument) -> Option<Vec<PageContent>> {
-    // Group elements by page number
     let mut page_map: std::collections::BTreeMap<u32, Vec<&InternalElement>> = std::collections::BTreeMap::new();
 
     for elem in &doc.elements {
@@ -721,7 +784,6 @@ fn build_pages(doc: &InternalDocument) -> Option<Vec<PageContent>> {
         return None;
     }
 
-    // Pre-wrap tables in Arc once; clone the Arc (cheap) per page reference.
     let arc_tables: Vec<Arc<Table>> = doc.tables.iter().map(|t| Arc::new(t.clone())).collect();
 
     let pages: Vec<PageContent> = page_map
@@ -731,6 +793,12 @@ fn build_pages(doc: &InternalDocument) -> Option<Vec<PageContent>> {
             let mut tables = Vec::new();
             let mut image_indices = Vec::new();
             for elem in &elems {
+                // `render_plain` drops everything outside the body layer, so page content
+                // must drop it too — otherwise running headers and footers appear in
+                // `pages[n].content` but not in `result.content` for `OutputFormat::Plain`. ~keep
+                if !crate::rendering::common::is_body_element(elem) {
+                    continue;
+                }
                 if elem.kind.is_container_start() || elem.kind.is_container_end() {
                     continue;
                 }
@@ -775,9 +843,9 @@ fn build_pages(doc: &InternalDocument) -> Option<Vec<PageContent>> {
 ///
 /// Called after pages are built but before `derive_document_structure_inner` moves
 /// element text out of the document. For Plain/Structured/Json/Custom formats this
-/// is a no-op. For Markdown/Djot/Html, each page's element subset is rendered with
-/// the same renderer used for the full document, so `pages[n].content` matches the
-/// format of `result.content` after `apply_output_format`.
+/// is a no-op. For Markdown/Djot/Html/DocTags, each page's element subset is
+/// rendered with the same renderer used for the full document, so `pages[n].content`
+/// matches the format of `result.content` after `apply_output_format`.
 ///
 /// Pages whose `page_number` has no matching page-tagged elements (e.g., natively
 /// extracted PDF pages where individual elements are not page-tracked) are returned
@@ -793,11 +861,7 @@ fn apply_page_content_format(
         OutputFormat::Markdown => crate::rendering::render_markdown,
         OutputFormat::Djot => crate::rendering::render_djot,
         OutputFormat::Html => crate::rendering::render_html,
-        // Json renders the whole document as a single structured object; splitting
-        // it into per-page sub-objects would produce malformed fragments. Leave
-        // page content as plain extracted text so callers get readable raw text.
-        // Plain and Structured need no markup at all.
-        // Custom renderers are global-only — no per-page API exists.
+        OutputFormat::DocTags => crate::rendering::render_doctags,
         OutputFormat::Plain | OutputFormat::Structured | OutputFormat::Json | OutputFormat::Custom(_) => {
             return pages;
         }
@@ -805,8 +869,6 @@ fn apply_page_content_format(
 
     let pages = pages?;
 
-    // Build a map from page number → element indices. Elements with page == None
-    // are not page-tracked and belong to no specific page.
     let mut elements_by_page: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
     for (idx, elem) in doc.elements.iter().enumerate() {
         if let Some(page_num) = elem.page {
@@ -814,9 +876,6 @@ fn apply_page_content_format(
         }
     }
 
-    // No elements carry page numbers (e.g., image or native-PDF extraction where
-    // the extractor sets prebuilt_pages but does not tag individual elements).
-    // Return prebuilt content unchanged.
     if elements_by_page.is_empty() {
         return Some(pages);
     }
@@ -825,16 +884,9 @@ fn apply_page_content_format(
         .into_iter()
         .map(|mut page| {
             let Some(elem_indices) = elements_by_page.get(&page.page_number) else {
-                // This page has no matching page-tagged elements; keep its content.
                 return page;
             };
 
-            // Only clone tables and images referenced by this page's elements and remap
-            // their indices into sub-doc space. Table cells (Vec<Vec<String>>) are not
-            // Arc-backed, so cloning the full doc.tables slice per page is O(all cells
-            // × num_pages). ExtractedImage.data is bytes::Bytes (reference-counted) but
-            // its metadata fields (String, Option<String>, …) would still be cloned for
-            // every unreferenced image on every page, so we filter those too.
             let mut table_remap: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
             let mut sub_tables: Vec<Table> = Vec::new();
             let mut image_remap: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
@@ -897,14 +949,17 @@ fn apply_page_content_format(
 }
 
 /// Extract `OcrElement` entries from OCR-typed internal elements.
+///
+/// An element without geometry is kept with a zero bounding box rather than
+/// discarded (#75): backends that report text without word boxes (VLM OCR, hOCR
+/// without `bbox` properties) would otherwise lose their recognised text entirely.
 fn build_ocr_elements(doc: &InternalDocument) -> Option<Vec<OcrElement>> {
     let ocr_elems: Vec<OcrElement> = doc
         .elements
         .iter()
         .filter_map(|elem| {
             if let ElementKind::OcrText { level } = elem.kind {
-                let geometry = elem.ocr_geometry.clone()?;
-                // Default confidence: 0.0 means "unknown, not measured" (not zero confidence).
+                let geometry = elem.ocr_geometry.clone().unwrap_or_default();
                 let confidence = elem.ocr_confidence.clone().unwrap_or(OcrConfidence {
                     detection: None,
                     recognition: 0.0,
@@ -915,7 +970,6 @@ fn build_ocr_elements(doc: &InternalDocument) -> Option<Vec<OcrElement>> {
                     confidence,
                     level,
                     rotation: elem.ocr_rotation.clone(),
-                    // Default to page 1 when page info is absent (OCR always has at least one page).
                     page_number: elem.page.unwrap_or(1),
                     parent_id: None,
                     backend_metadata: std::collections::HashMap::new(),
@@ -928,10 +982,6 @@ fn build_ocr_elements(doc: &InternalDocument) -> Option<Vec<OcrElement>> {
 
     if ocr_elems.is_empty() { None } else { Some(ocr_elems) }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -946,10 +996,6 @@ mod tests {
         InternalDocument::new(source_format)
     }
 
-    // -----------------------------------------------------------------------
-    // Test 1: Simple flat document → correct tree
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_flat_document_produces_flat_tree() {
         let mut doc = make_doc("markdown");
@@ -962,20 +1008,14 @@ mod tests {
         assert!(ds.validate().is_ok(), "validation: {:?}", ds.validate());
         assert_eq!(ds.len(), 3);
 
-        // All should be root-level
         let roots: Vec<_> = ds.body_roots().collect();
         assert_eq!(roots.len(), 3);
 
-        // First node is Title
         match &roots[0].1.content {
             NodeContent::Title { text } => assert_eq!(text, "My Title"),
             other => panic!("Expected Title, got {:?}", other),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Test 2: Heading-based nesting → correct Group/Heading parent-child
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_heading_nesting() {
@@ -993,7 +1033,6 @@ mod tests {
         let ds = derive_document_structure_inner(&mut doc);
         assert!(ds.validate().is_ok(), "validation: {:?}", ds.validate());
 
-        // Root should have exactly 1 Group for H1
         let roots: Vec<_> = ds.body_roots().collect();
         assert_eq!(roots.len(), 1);
 
@@ -1010,18 +1049,14 @@ mod tests {
             other => panic!("Expected Group, got {:?}", other),
         }
 
-        // H1 group should have children: Heading, Paragraph, H2 Group
         assert_eq!(h1_group.children.len(), 3);
 
-        // First child is the Heading node
         let heading_node = &ds.nodes[h1_group.children[0].0 as usize];
         assert!(matches!(&heading_node.content, NodeContent::Heading { level: 1, .. }));
 
-        // Second child is the paragraph
         let para_node = &ds.nodes[h1_group.children[1].0 as usize];
         assert!(matches!(&para_node.content, NodeContent::Paragraph { .. }));
 
-        // Third child is the H2 Group
         let h2_group = &ds.nodes[h1_group.children[2].0 as usize];
         match &h2_group.content {
             NodeContent::Group {
@@ -1035,30 +1070,80 @@ mod tests {
             other => panic!("Expected H2 Group, got {:?}", other),
         }
 
-        // H2 Group should have: Heading + Paragraph
         assert_eq!(h2_group.children.len(), 2);
     }
 
-    // -----------------------------------------------------------------------
-    // Test 3: Relationship resolution (footnote key matching)
-    // -----------------------------------------------------------------------
+    #[test]
+    fn test_group_end_closes_layout_group_beneath_heading() {
+        let mut doc = make_doc("pdf");
+        doc.push_element(InternalElement::text(ElementKind::GroupStart, "", 0));
+        doc.push_element(InternalElement::text(
+            ElementKind::Heading { level: 1 },
+            "Region heading",
+            1,
+        ));
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "Region body", 2));
+        doc.push_element(InternalElement::text(ElementKind::GroupEnd, "", 0));
+        doc.push_element(InternalElement::text(ElementKind::Table { table_index: 0 }, "", 1));
+        doc.push_element(InternalElement::text(ElementKind::PageBreak, "", 1));
+        doc.push_element(InternalElement::text(ElementKind::GroupStart, "", 1));
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "Next region", 2));
+        doc.push_element(InternalElement::text(ElementKind::GroupEnd, "", 1));
+
+        resolve_relationships(&mut doc);
+        let ds = derive_document_structure_inner(&mut doc);
+        assert!(ds.validate().is_ok(), "validation: {:?}", ds.validate());
+
+        let roots: Vec<_> = ds.body_roots().collect();
+        assert_eq!(roots.len(), 4);
+        assert!(matches!(
+            &roots[0].1.content,
+            NodeContent::Group {
+                heading_level: None,
+                ..
+            }
+        ));
+        assert!(matches!(&roots[1].1.content, NodeContent::Table { .. }));
+        assert!(matches!(&roots[2].1.content, NodeContent::PageBreak));
+        assert!(matches!(
+            &roots[3].1.content,
+            NodeContent::Group {
+                heading_level: None,
+                ..
+            }
+        ));
+
+        let first_group = &ds.nodes[roots[0].0.0 as usize];
+        assert_eq!(first_group.children.len(), 1);
+        let heading_group = &ds.nodes[first_group.children[0].0 as usize];
+        assert!(matches!(
+            &heading_group.content,
+            NodeContent::Group {
+                heading_level: Some(1),
+                ..
+            }
+        ));
+
+        let next_group = &ds.nodes[roots[3].0.0 as usize];
+        assert_eq!(next_group.children.len(), 1);
+        assert!(matches!(
+            &ds.nodes[next_group.children[0].0 as usize].content,
+            NodeContent::Paragraph { .. }
+        ));
+    }
 
     #[test]
     fn test_relationship_resolution() {
         let mut doc = make_doc("markdown");
 
-        // Element 0: paragraph with footnote ref
         doc.push_element(InternalElement::text(ElementKind::Paragraph, "See note [^fn1].", 0));
 
-        // Element 1: footnote ref marker
         doc.push_element(InternalElement::text(ElementKind::FootnoteRef, "fn1", 0).with_anchor("fn1"));
 
-        // Element 2: footnote definition
         doc.push_element(
             InternalElement::text(ElementKind::FootnoteDefinition, "This is the footnote.", 0).with_anchor("fn1"),
         );
 
-        // Relationship: element 1 → key "fn1"
         doc.push_relationship(Relationship {
             source: 1,
             target: RelationshipTarget::Key("fn1".to_string()),
@@ -1067,8 +1152,6 @@ mod tests {
 
         resolve_relationships(&mut doc);
 
-        // Should be resolved to Index(2) — the FootnoteDefinition, not the FootnoteRef itself
-        // (FootnoteRef elements are excluded from the anchor map)
         match &doc.relationships[0].target {
             RelationshipTarget::Index(idx) => assert_eq!(*idx, 2),
             RelationshipTarget::Key(k) => panic!("Expected resolved Index, got Key({:?})", k),
@@ -1088,7 +1171,6 @@ mod tests {
 
         resolve_relationships(&mut doc);
 
-        // Should remain as Key (unresolvable)
         assert!(matches!(
             &doc.relationships[0].target,
             RelationshipTarget::Key(k) if k == "nonexistent"
@@ -1115,9 +1197,59 @@ mod tests {
         assert_eq!(ds.relationships[0].kind, RelationshipKind::FootnoteReference);
     }
 
-    // -----------------------------------------------------------------------
-    // Container markers
-    // -----------------------------------------------------------------------
+    /// Regression test for #74: an unresolvable relationship key used to disappear at
+    /// `log::debug!` only, so a cross-reference or citation whose target was never
+    /// extracted vanished from `DocumentStructure` with no diagnostic at all — the
+    /// caller could not distinguish "this document has no cross-references" from
+    /// "this document's cross-references were silently dropped".
+    #[test]
+    fn should_warn_when_a_relationship_key_cannot_be_resolved() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "See [ref].", 0));
+        doc.push_relationship(Relationship {
+            source: 0,
+            target: RelationshipTarget::Key("missing-anchor".to_string()),
+            kind: RelationshipKind::CrossReference,
+        });
+
+        resolve_relationships(&mut doc);
+
+        assert_eq!(
+            doc.processing_warnings.len(),
+            1,
+            "one warning per document, not per key"
+        );
+        let warning = &doc.processing_warnings[0];
+        assert_eq!(warning.source, "relationships");
+        assert_eq!(
+            warning.message,
+            "1 cross-reference target(s) could not be resolved and were dropped from the \
+             document structure: missing-anchor"
+        );
+    }
+
+    /// A resolvable key must stay silent — the warning above is only meaningful if the
+    /// common case does not also emit it.
+    #[test]
+    fn should_not_warn_when_every_relationship_key_resolves() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "See note.", 0));
+        doc.push_element(InternalElement::text(ElementKind::FootnoteDefinition, "The note.", 0).with_anchor("fn1"));
+        doc.push_relationship(Relationship {
+            source: 0,
+            target: RelationshipTarget::Key("fn1".to_string()),
+            kind: RelationshipKind::FootnoteReference,
+        });
+
+        resolve_relationships(&mut doc);
+
+        assert!(
+            doc.processing_warnings.is_empty(),
+            "a resolvable key must not warn; got {:?}",
+            doc.processing_warnings
+        );
+        assert_eq!(doc.relationships[0].target, RelationshipTarget::Index(1));
+    }
 
     #[test]
     fn test_list_container() {
@@ -1139,18 +1271,12 @@ mod tests {
         let ds = derive_document_structure_inner(&mut doc);
         assert!(ds.validate().is_ok(), "validation: {:?}", ds.validate());
 
-        // Root: List container
         let roots: Vec<_> = ds.body_roots().collect();
         assert_eq!(roots.len(), 1);
         assert!(matches!(&roots[0].1.content, NodeContent::List { ordered: false }));
 
-        // List has 2 children
         assert_eq!(ds.nodes[roots[0].0.0 as usize].children.len(), 2);
     }
-
-    // -----------------------------------------------------------------------
-    // derive_extraction_result
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_derive_extraction_result_basic() {
@@ -1161,6 +1287,172 @@ mod tests {
         assert_eq!(result.content, "Hello world.");
         assert_eq!(result.mime_type, "text/markdown");
         assert!(result.document.is_none());
+    }
+
+    /// `OutputFormat::DocTags` must produce the same output as the always-registered
+    /// built-in "doctags" renderer (`plugins::registry::renderer::DocTagsRenderer`),
+    /// via its own first-class match arm rather than falling through to the
+    /// `Custom(_)` renderer-registry lookup path (and its warning-on-miss behavior).
+    #[test]
+    fn should_render_doctags_output_format_without_going_through_custom_fallback() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "Hello world.", 0));
+        let expected = crate::rendering::render_doctags(&doc);
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::DocTags);
+
+        assert_eq!(result.formatted_content.as_deref(), Some(expected.as_str()));
+        assert!(
+            result.processing_warnings.is_empty(),
+            "DocTags is a first-class, always-registered format and must never warn: {:?}",
+            result.processing_warnings
+        );
+    }
+
+    /// #208: requesting a custom output format with no matching renderer must
+    /// leave a `ProcessingWarning` behind — `tracing::warn!` alone is invisible
+    /// to API and binding consumers, who have no other way to learn that the
+    /// requested format ("markdwon", a typo) was not actually produced.
+    #[test]
+    fn test_derive_extraction_result_unregistered_custom_format_emits_processing_warning() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "Hello world.", 0));
+
+        let result = derive_extraction_result(
+            doc,
+            false,
+            crate::core::config::OutputFormat::Custom("markdwon".to_string()),
+        );
+
+        assert!(
+            result.formatted_content.is_none(),
+            "no renderer is registered for 'markdwon'"
+        );
+        assert_eq!(result.processing_warnings.len(), 1);
+        assert_eq!(result.processing_warnings[0].source, "output-format");
+        assert!(
+            result.processing_warnings[0].message.contains("markdwon"),
+            "warning must name the requested format: {}",
+            result.processing_warnings[0].message
+        );
+    }
+
+    /// A custom output format with a registered renderer must produce no
+    /// output-format warning at all.
+    #[test]
+    fn test_derive_extraction_result_registered_custom_format_emits_no_warning() {
+        struct UppercaseRenderer;
+        impl crate::plugins::Plugin for UppercaseRenderer {
+            fn name(&self) -> &str {
+                "shout-259"
+            }
+        }
+        impl crate::plugins::Renderer for UppercaseRenderer {
+            fn render_result(&self, result: &crate::types::ExtractedDocument) -> crate::Result<String> {
+                Ok(result.content.to_uppercase())
+            }
+        }
+        crate::plugins::register_renderer(std::sync::Arc::new(UppercaseRenderer)).unwrap();
+
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "Hello world.", 0));
+
+        let result = derive_extraction_result(
+            doc,
+            false,
+            crate::core::config::OutputFormat::Custom("shout-259".to_string()),
+        );
+
+        assert_eq!(result.formatted_content.as_deref(), Some("HELLO WORLD."));
+        assert!(
+            result.processing_warnings.is_empty(),
+            "a successful custom render must not warn: {:?}",
+            result.processing_warnings
+        );
+
+        crate::plugins::unregister_renderer("shout-259").unwrap();
+    }
+
+    /// #259: `code_intelligence` must surface the tree-sitter-derived
+    /// `FormatMetadata::Code` payload instead of being hardcoded to `None`, even
+    /// for an `InternalDocument` that never went through `CodeExtractor` (so has
+    /// no `CODE_INTELLIGENCE_SCRATCH_KEY` entry in `metadata.additional`) — the
+    /// fallback path serializes `CodeMetadata` directly. See
+    /// `test_derive_extraction_result_prefers_full_process_result_over_code_metadata`
+    /// for the primary, `CodeExtractor`-shaped path.
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_derive_extraction_result_populates_code_intelligence_from_code_metadata() {
+        use crate::types::metadata::{CodeChunkInfo, CodeMetadata, FormatMetadata};
+
+        let mut doc = make_doc("code");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "fn main() {}", 0));
+        doc.metadata.format = Some(FormatMetadata::Code(CodeMetadata {
+            chunks: vec![CodeChunkInfo {
+                text: "fn main() {}".to_string(),
+                context_path: vec!["main".to_string()],
+                node_types: vec!["function_definition".to_string()],
+                byte_start: 0,
+                byte_end: 12,
+            }],
+            data: None,
+        }));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+
+        let code_intelligence = result
+            .code_intelligence
+            .expect("code_intelligence must be populated when FormatMetadata::Code is present");
+        assert_eq!(
+            code_intelligence["chunks"][0]["context_path"][0],
+            serde_json::json!("main")
+        );
+    }
+
+    /// #259: when `metadata.additional` carries the full serialized
+    /// `tree_sitter_language_pack::ProcessResult` under
+    /// `extractors::code::CODE_INTELLIGENCE_SCRATCH_KEY` (as `CodeExtractor`
+    /// populates it), derivation must prefer that full payload over the
+    /// `CodeMetadata`-only fallback, and must remove the scratch key so it does
+    /// not leak into the final `ExtractedDocument.metadata.additional` map.
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_derive_extraction_result_prefers_full_process_result_over_code_metadata() {
+        use crate::types::metadata::{CodeMetadata, FormatMetadata};
+
+        let mut doc = make_doc("code");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "def f(): pass", 0));
+        doc.metadata.format = Some(FormatMetadata::Code(CodeMetadata::default()));
+        doc.metadata.additional.insert(
+            std::borrow::Cow::Borrowed(crate::extractors::code::CODE_INTELLIGENCE_SCRATCH_KEY),
+            serde_json::json!({"language": "python", "metrics": {"total_lines": 1}}),
+        );
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+
+        let code_intelligence = result
+            .code_intelligence
+            .expect("code_intelligence must be populated from the scratch key");
+        assert_eq!(code_intelligence["language"], serde_json::json!("python"));
+        assert_eq!(code_intelligence["metrics"]["total_lines"], serde_json::json!(1));
+        // The stashed key must not leak into the final metadata.
+        assert!(
+            !result
+                .metadata
+                .additional
+                .contains_key(crate::extractors::code::CODE_INTELLIGENCE_SCRATCH_KEY),
+            "scratch key must be removed before assembling the final ExtractedDocument"
+        );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn test_derive_extraction_result_code_intelligence_none_without_code_metadata() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Paragraph, "Hello world.", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        assert!(result.code_intelligence.is_none());
     }
 
     #[cfg(any(feature = "pdf", feature = "ocr"))]
@@ -1180,8 +1472,6 @@ mod tests {
     #[cfg(any(feature = "pdf", feature = "ocr"))]
     #[test]
     fn test_source_format_cow_owned_propagates() {
-        // Regression test for #622: Cow::Owned variant must not fail type inference
-        // when deriving document structure. Previously used unstable Cow::as_str().
         let owned: std::borrow::Cow<'static, str> = std::borrow::Cow::Owned("epub".to_string());
         let mut doc = InternalDocument::new(owned);
         doc.push_element(InternalElement::text(ElementKind::Heading { level: 1 }, "Ch1", 0).with_page(1));
@@ -1227,7 +1517,7 @@ mod tests {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
@@ -1240,7 +1530,6 @@ mod tests {
         doc.push_element(InternalElement::text(ElementKind::Paragraph, "Body text here.", 0).with_page(1));
 
         let raw = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Markdown);
-        // apply_output_format mirrors what run_pipeline does as its final step.
         let result = crate::core::pipeline::apply_output_format(raw, crate::core::config::OutputFormat::Markdown);
 
         let pages = result
@@ -1248,13 +1537,11 @@ mod tests {
             .expect("pages must be populated when elements have page numbers");
         assert_eq!(pages.len(), 1);
 
-        // Full content works correctly — guards against regressions in the full-doc path.
         assert!(
             result.content.contains("# Introduction"),
             "full content must have markdown heading, got: {:?}",
             result.content,
         );
-        // Per-page content must use the same format.
         assert!(
             pages[0].content.contains("# Introduction"),
             "page content must use markdown heading format, got: {:?}",
@@ -1272,7 +1559,7 @@ mod tests {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
@@ -1307,7 +1594,7 @@ mod tests {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
@@ -1357,7 +1644,7 @@ mod tests {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
@@ -1396,7 +1683,7 @@ mod tests {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
@@ -1433,7 +1720,6 @@ mod tests {
     #[test]
     fn page_content_prebuilt_pages_no_page_elements_unchanged() {
         let mut doc = make_doc("pdf");
-        // Elements have no .with_page() call → elem.page = None → elements_by_page is empty.
         doc.push_element(InternalElement::text(ElementKind::Heading { level: 1 }, "Title", 0));
         doc.push_element(InternalElement::text(ElementKind::Paragraph, "Body.", 0));
         doc.prebuilt_pages = Some(vec![crate::types::page::PageContent {
@@ -1468,7 +1754,7 @@ mod tests {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
@@ -1477,9 +1763,7 @@ mod tests {
     #[test]
     fn page_content_page_without_matching_elements_unchanged() {
         let mut doc = make_doc("docx");
-        // Only page 1 has page-tagged elements.
         doc.push_element(InternalElement::text(ElementKind::Heading { level: 1 }, "Chapter", 0).with_page(1));
-        // Page 2 exists in prebuilt_pages but has zero elements tagged with page=2.
         doc.prebuilt_pages = Some(vec![
             crate::types::page::PageContent {
                 page_number: 1,
@@ -1519,7 +1803,6 @@ mod tests {
             "page with no matching elements must keep its original content, got: {:?}",
             p2.content,
         );
-        // Page 1 must still get formatted.
         let p1 = pages.iter().find(|p| p.page_number == 1).expect("page 1");
         assert!(
             p1.content.contains("# Chapter"),
@@ -1536,7 +1819,7 @@ mod tests {
         feature = "ocr",
         feature = "office",
         feature = "pdf",
-        feature = "paddle-ocr",
+        paddle_ocr,
         feature = "xml",
         feature = "hwpx",
         feature = "quality",
@@ -1551,13 +1834,11 @@ mod tests {
         let raw = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Json);
         let result = crate::core::pipeline::apply_output_format(raw, crate::core::config::OutputFormat::Json);
 
-        // The full document content is rendered as a JSON structure.
         assert!(
             result.content.contains('"'),
             "json format must produce JSON-structured result.content, got: {:?}",
             result.content,
         );
-        // Per-page content is NOT JSON — it stays as raw extracted text.
         let pages = result
             .pages
             .expect("pages must be populated when elements have page numbers");

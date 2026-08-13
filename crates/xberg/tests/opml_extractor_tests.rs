@@ -10,6 +10,7 @@
 //! - Special character handling
 //! - Edge cases (empty bodies, nested structures, etc.)
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "office")]
 
 use std::path::PathBuf;
@@ -499,7 +500,6 @@ async fn test_opml_content_quality_all_files() {
 async fn test_opml_extractor_registration() {
     use xberg::plugins::registry::get_document_extractor_registry;
 
-    // Trigger initialization via a real extraction call so the registry is populated.
     let _ = extract_bytes_document(
         b"<opml/>",
         "text/x-opml",

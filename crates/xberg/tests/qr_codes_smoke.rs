@@ -66,7 +66,6 @@ fn detect_qr_codes_returns_empty_for_non_image_bytes() {
 fn detect_qr_codes_returns_empty_when_no_grid_present() {
     use xberg::extractors::qr::detect_qr_codes;
 
-    // A 32x32 fully white PNG — no QR grid to detect.
     let blank = image::ImageBuffer::<Luma<u8>, Vec<u8>>::from_pixel(32, 32, Luma([255]));
     let mut buf = Cursor::new(Vec::<u8>::new());
     image::codecs::png::PngEncoder::new(&mut buf)
@@ -120,7 +119,6 @@ fn detect_qr_codes_returns_all_grids_in_multi_code_image() {
 /// no-finds convention.
 #[tokio::test]
 async fn qr_post_processor_populates_extracted_image() {
-    // Build a synthetic image carrying our PNG payload.
     let png = render_qr_png(PAYLOAD);
     let mut result = ExtractedDocument::default();
     result.mime_type = Cow::Borrowed("application/octet-stream");
@@ -134,9 +132,6 @@ async fn qr_post_processor_populates_extracted_image() {
         ..Default::default()
     };
 
-    // Use the public `register_post_processor` path indirectly: we instantiate the
-    // processor explicitly because the registry already runs inside the pipeline,
-    // and we want a self-contained assertion here.
     let processor = SmokeQrProcessor;
     processor.process(&mut result, &config).await.expect("processor failed");
 

@@ -48,6 +48,17 @@ pub struct StructuredDataResult {
     pub metadata: HashMap<String, String>,
     /// JSON paths of fields that were classified as text-bearing.
     pub text_fields: Vec<String>,
+    /// The parsed document as a canonical `serde_json::Value` tree, when the
+    /// source format could be represented as one. `None` only for TOML inputs
+    /// whose `toml::Value` fails to round-trip through `serde_json::Value`
+    /// (xberg-io/xberg#155): the extractor falls back to a raw code block in
+    /// that case.
+    pub value: Option<serde_json::Value>,
+    /// Flattened `path: value` renderings for every leaf field, in traversal
+    /// order. Previously computed and discarded (xberg-io/xberg#166); now
+    /// surfaced so callers get a full-text view even when the structured
+    /// renderer only emits headings/lists for a subset of fields.
+    pub flattened: Vec<String>,
 }
 
 /// Configuration options for JSON extraction behaviour.
@@ -139,10 +150,8 @@ pub(crate) fn parse_json(data: &[u8], config: Option<JsonExtractionConfig>) -> R
         }
     }
 
-    // Still extract text fields for metadata population
     let mut path_buf = String::new();
-    let _ = extract_from_json_value(&value, &mut path_buf, &config, &mut metadata, &mut text_fields);
-    // Output pretty-printed JSON to preserve structure (matches ground truth format)
+    let flattened = extract_from_json_value(&value, &mut path_buf, &config, &mut metadata, &mut text_fields);
     let content = serde_json::to_string_pretty(&value).unwrap_or_else(|_| String::from_utf8_lossy(data).to_string());
 
     Ok(StructuredDataResult {
@@ -150,6 +159,8 @@ pub(crate) fn parse_json(data: &[u8], config: Option<JsonExtractionConfig>) -> R
         format: Cow::Borrowed("json"),
         metadata,
         text_fields,
+        value: Some(value),
+        flattened,
     })
 }
 
@@ -172,7 +183,6 @@ fn extract_json_schema(
             if arr.is_empty() {
                 serde_json::json!({"type": "array", "length": 0})
             } else if arr.len() <= config.array_item_limit {
-                // Push "[0]" suffix and recurse, then restore.
                 let base_len = path.len();
                 path.push_str("[0]");
                 let items = extract_json_schema(&arr[0], path, depth + 1, config);
@@ -194,7 +204,6 @@ fn extract_json_schema(
         serde_json::Value::Object(obj) => {
             let mut properties = serde_json::Map::new();
             for (key, val) in obj {
-                // Extend the path buffer with ".key" (or just "key" at root).
                 let base_len = path.len();
                 if !path.is_empty() {
                     path.push('.');
@@ -220,7 +229,6 @@ fn extract_from_json_value(
         serde_json::Value::Object(obj) => {
             let mut text_parts = Vec::new();
             for (key, val) in obj {
-                // Append ".key" (or just "key" at root) to the shared buffer.
                 let base_len = path.len();
                 if !path.is_empty() {
                     path.push('.');
@@ -234,7 +242,6 @@ fn extract_from_json_value(
         serde_json::Value::Array(arr) => {
             let mut text_parts = Vec::new();
             for (i, item) in arr.iter().enumerate() {
-                // Append "[i]" (or "item_i" at root) to the shared buffer.
                 let base_len = path.len();
                 if path.is_empty() {
                     path.push_str("item_");
@@ -288,9 +295,7 @@ fn extract_from_json_value(
 }
 
 fn is_text_field(key: &str, custom_patterns: &[String]) -> bool {
-    // Extract leaf field name (last dot-separated segment)
     let leaf = key.rsplit('.').next().unwrap_or(key);
-    // Strip array index suffix like "[0]"
     let leaf = if let Some(bracket_pos) = leaf.find('[') {
         &leaf[..bracket_pos]
     } else {
@@ -346,6 +351,7 @@ pub(crate) fn parse_jsonl(data: &[u8], config: Option<JsonExtractionConfig>) -> 
     let mut all_objects = Vec::with_capacity(line_count_estimate);
     let mut metadata = HashMap::new();
     let mut text_fields = Vec::new();
+    let mut flattened = Vec::new();
     let mut path_buf = String::new();
 
     for (line_num, line) in text.lines().enumerate() {
@@ -357,20 +363,27 @@ pub(crate) fn parse_jsonl(data: &[u8], config: Option<JsonExtractionConfig>) -> 
             .map_err(|e| XbergError::parsing(format!("Failed to parse JSONL line {}: {}", line_num + 1, e)))?;
 
         path_buf.clear();
-        extract_from_json_value(&value, &mut path_buf, &config, &mut metadata, &mut text_fields);
+        flattened.extend(extract_from_json_value(
+            &value,
+            &mut path_buf,
+            &config,
+            &mut metadata,
+            &mut text_fields,
+        ));
         all_objects.push(value);
     }
 
-    // Infallible: serde_json::to_string_pretty cannot fail on a Value::Array
-    // of already-parsed Value objects.
-    let content = serde_json::to_string_pretty(&serde_json::Value::Array(all_objects))
-        .expect("serializing Vec<serde_json::Value> to JSON cannot fail");
+    let array_value = serde_json::Value::Array(all_objects);
+    let content =
+        serde_json::to_string_pretty(&array_value).expect("serializing Vec<serde_json::Value> to JSON cannot fail");
 
     Ok(StructuredDataResult {
         content,
         format: Cow::Borrowed("jsonl"),
         metadata,
         text_fields,
+        value: Some(array_value),
+        flattened,
     })
 }
 
@@ -378,16 +391,26 @@ pub(crate) fn parse_yaml(data: &[u8]) -> Result<StructuredDataResult> {
     let yaml_str =
         utf8_validation::from_utf8(data).map_err(|e| XbergError::parsing(format!("Invalid UTF-8 in YAML: {}", e)))?;
 
-    let value: serde_json::Value =
-        serde_yaml_ng::from_str(yaml_str).map_err(|e| XbergError::parsing(format!("Failed to parse YAML: {}", e)))?;
+    // `serde_yaml_ng::from_str` rejects input containing more than one `---`-separated
+    // document. Kubernetes manifests, Docker Compose bundles, and Ansible playbooks all use
+    // multi-document YAML, so iterate the document stream via `Deserializer` instead
+    // (xberg-io/xberg#167). A single-document input still deserializes to that document's
+    // own value, unchanged from prior behavior; multiple documents are wrapped in an array. ~keep
+    let documents: Vec<serde_json::Value> = serde_yaml_ng::Deserializer::from_str(yaml_str)
+        .map(serde_json::Value::deserialize)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| XbergError::parsing(format!("Failed to parse YAML: {}", e)))?;
+
+    let value = match <[serde_json::Value; 1]>::try_from(documents) {
+        Ok([single]) => single,
+        Err(documents) => serde_json::Value::Array(documents),
+    };
 
     let mut metadata = HashMap::new();
     let mut text_fields = Vec::new();
 
-    // Still extract for metadata population
     let mut path_buf = String::new();
-    let _ = extract_from_value(&value, &mut path_buf, &mut metadata, &mut text_fields);
-    // Output original YAML content to preserve structure (matches ground truth format)
+    let flattened = extract_from_value(&value, &mut path_buf, &mut metadata, &mut text_fields);
     let content = yaml_str.to_string();
 
     Ok(StructuredDataResult {
@@ -395,6 +418,8 @@ pub(crate) fn parse_yaml(data: &[u8]) -> Result<StructuredDataResult> {
         format: Cow::Borrowed("yaml"),
         metadata,
         text_fields,
+        value: Some(value),
+        flattened,
     })
 }
 
@@ -465,17 +490,23 @@ pub(crate) fn parse_toml(data: &[u8]) -> Result<StructuredDataResult> {
     let mut metadata = HashMap::new();
     let mut text_fields = Vec::new();
 
-    // Still extract for metadata population
     let mut path_buf = String::new();
-    let _ = extract_from_toml_value(&value, &mut path_buf, &mut metadata, &mut text_fields);
-    // Output original TOML content to preserve structure (matches ground truth format)
+    let flattened = extract_from_toml_value(&value, &mut path_buf, &mut metadata, &mut text_fields);
     let content = toml_str.to_string();
+
+    // Convert to a canonical `serde_json::Value` so the extractor can render document
+    // structure (headings/lists) the same way as JSON/YAML/JSONL (xberg-io/xberg#155).
+    // `toml::Value` round-trips through `serde_json::Value` for every value this parser
+    // produces; `None` here just means the extractor falls back to a raw code block. ~keep
+    let json_value = serde_json::to_value(&value).ok();
 
     Ok(StructuredDataResult {
         content,
         format: Cow::Borrowed("toml"),
         metadata,
         text_fields,
+        value: json_value,
+        flattened,
     })
 }
 
@@ -595,6 +626,28 @@ mod tests {
         assert!(result.content.contains("email: alice@example.com"));
     }
 
+    /// #167: multi-document YAML (`---`-separated), as produced by Kubernetes
+    /// manifests, Docker Compose bundles, and Ansible playbooks, must parse
+    /// successfully instead of erroring on the second `---` marker.
+    #[test]
+    fn test_parse_yaml_multi_document() {
+        let yaml = "name: first\nkind: A\n---\nname: second\nkind: B\n";
+        let result = parse_yaml(yaml.as_bytes()).expect("multi-document YAML must parse");
+        assert_eq!(result.format, "yaml");
+        assert!(
+            result.content.contains("first") && result.content.contains("second"),
+            "content should reflect both documents: {}",
+            result.content
+        );
+        let value = result.value.expect("multi-doc yaml should produce a value");
+        let serde_json::Value::Array(docs) = value else {
+            panic!("multi-document yaml should produce a top-level array, got: {value:?}");
+        };
+        assert_eq!(docs.len(), 2, "expected two documents, got: {docs:?}");
+        assert_eq!(docs[0]["name"], serde_json::json!("first"));
+        assert_eq!(docs[1]["name"], serde_json::json!("second"));
+    }
+
     #[test]
     fn test_parse_toml_simple() {
         let toml = "name = \"John\"\nage = 30";
@@ -622,7 +675,6 @@ mod tests {
         assert!(is_text_field("metadata.label", &[]));
         assert!(!is_text_field("count", &[]));
         assert!(!is_text_field("offset", &[]));
-        // Exact match means "width" no longer matches just because it contains "id" substring
         assert!(!is_text_field("width", &[]));
         assert!(!is_text_field("valid", &[]));
     }
@@ -709,8 +761,6 @@ mod tests {
 
     #[test]
     fn test_parse_jsonl_metadata_last_writer_wins() {
-        // When multiple lines have the same key, last value wins in metadata.
-        // This matches JSON array behavior where duplicate paths overwrite.
         let jsonl = "{\"name\": \"Alice\"}\n{\"name\": \"Bob\"}";
         let result = parse_jsonl(jsonl.as_bytes(), None).unwrap();
         assert_eq!(result.metadata.get("name").unwrap(), "Bob");
@@ -755,14 +805,13 @@ mod tests {
         let jsonl = "{}\n{}";
         let result = parse_jsonl(jsonl.as_bytes(), None).unwrap();
         assert_eq!(result.format, "jsonl");
-        // Two empty objects produce a valid array
         let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn test_parse_jsonl_invalid_utf8() {
-        let data: &[u8] = &[0xFF, 0xFE, 0x7B, 0x7D]; // invalid UTF-8 + "{}"
+        let data: &[u8] = &[0xFF, 0xFE, 0x7B, 0x7D];
         let result = parse_jsonl(data, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

@@ -4,7 +4,7 @@
 //! in JSON format.
 
 use crate::stats::percentile_r7;
-use crate::types::{BenchmarkResult, ErrorKind};
+use crate::types::{BenchmarkResult, ErrorKind, successful_performance_samples};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,10 +19,6 @@ use std::path::Path;
 /// # Returns
 /// * `Ok(())` if valid, `Err` with description if invalid
 pub fn validate_result(result: &BenchmarkResult) -> Result<()> {
-    // Note: duration=0 is valid for sub-millisecond extractions (e.g., simple JSON files).
-    // We only record millisecond precision, so very fast extractions show as 0ms.
-
-    // Check for invalid state: success=true with error message
     if result.success && result.error_message.is_some() {
         return Err(Error::Benchmark(format!(
             "Invalid result state for {}/{}: success=true but error_message is set",
@@ -31,7 +27,6 @@ pub fn validate_result(result: &BenchmarkResult) -> Result<()> {
         )));
     }
 
-    // Check for invalid state: success=false without error message
     if !result.success && result.error_message.is_none() {
         return Err(Error::Benchmark(format!(
             "Invalid result state for {}/{}: success=false but error_message is None",
@@ -40,7 +35,6 @@ pub fn validate_result(result: &BenchmarkResult) -> Result<()> {
         )));
     }
 
-    // Check for invalid state: success=true but error_kind is not None
     if result.success && result.error_kind != ErrorKind::None {
         return Err(Error::Benchmark(format!(
             "Invalid result state for {}/{}: success=true but error_kind is {:?}",
@@ -48,6 +42,39 @@ pub fn validate_result(result: &BenchmarkResult) -> Result<()> {
             result.file_path.display(),
             result.error_kind
         )));
+    }
+
+    if !result.success && result.error_kind == ErrorKind::None {
+        return Err(Error::Benchmark(format!(
+            "Invalid result state for {}/{}: success=false but error_kind is None",
+            result.framework,
+            result.file_path.display()
+        )));
+    }
+
+    if let Some(quality) = &result.quality {
+        for (name, value) in [
+            ("f1_score_text", quality.f1_score_text),
+            ("f1_score_numeric", quality.f1_score_numeric),
+            ("quality_score", quality.quality_score),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Error::Benchmark(format!(
+                    "Invalid result state for {}/{}: {name} must be a finite value in [0, 1], got {value}",
+                    result.framework,
+                    result.file_path.display()
+                )));
+            }
+        }
+        if let Some(value) = quality.f1_score_layout
+            && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(Error::Benchmark(format!(
+                "Invalid result state for {}/{}: f1_score_layout must be a finite value in [0, 1], got {value}",
+                result.framework,
+                result.file_path.display()
+            )));
+        }
     }
 
     Ok(())
@@ -59,7 +86,6 @@ pub fn validate_result(result: &BenchmarkResult) -> Result<()> {
 /// * `results` - Vector of benchmark results to write
 /// * `output_path` - Path to output JSON file
 pub fn write_json(results: &[BenchmarkResult], output_path: &Path) -> Result<()> {
-    // Validate all results before writing
     for result in results {
         validate_result(result)?;
     }
@@ -83,18 +109,28 @@ pub struct FrameworkExtensionStats {
     pub count: usize,
     /// Number of successful extractions
     pub successful: usize,
+    /// Number of independent process samples used for duration and RSS.
+    #[serde(default)]
+    pub performance_samples: usize,
     /// Number of framework-side extraction errors (not our fault)
     pub framework_errors: usize,
     /// Number of harness-side errors (potentially our fault)
     pub harness_errors: usize,
+    /// Number of configuration/setup failures (infrastructure, not framework fault)
+    #[serde(default)]
+    pub config_setup_errors: usize,
     /// Number of extractions that timed out
     pub timeouts: usize,
     /// Number of extractions that returned empty content
     pub empty_content: usize,
+    /// Number of extractions that returned non-empty output sharing zero tokens with a
+    /// non-empty ground truth — distinct from `empty_content`.
+    #[serde(default)]
+    pub zero_overlap: usize,
     /// Unique framework error messages with occurrence counts
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub error_details: HashMap<String, usize>,
-    /// Success rate (0.0-1.0)
+    /// Success rate (0.0-1.0) over accountable samples; infrastructure failures are excluded.
     pub success_rate: f64,
     /// Average wall-clock duration in milliseconds (includes subprocess overhead)
     pub avg_duration_ms: f64,
@@ -115,6 +151,19 @@ pub struct FrameworkExtensionStats {
     pub avg_throughput_mbps: f64,
     /// Average peak memory in MB
     pub avg_peak_memory_mb: f64,
+    /// Mean text token F1 / TF1 (0.0-1.0), successful extractions only
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_f1_text: Option<f64>,
+    /// Mean numeric token F1 (0.0-1.0), successful extractions only
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_f1_numeric: Option<f64>,
+    /// Mean layout/structural F1 / SF1 (0.0-1.0), successful extractions only.
+    /// `None` when no result in this group reported a layout score (e.g. plaintext mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_f1_layout: Option<f64>,
+    /// Mean combined quality score (0.0-1.0), successful extractions only
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_quality_score: Option<f64>,
 }
 
 /// Analysis of results grouped by file extension
@@ -184,11 +233,6 @@ pub fn analyze_by_extension(results: &[BenchmarkResult]) -> ByExtensionReport {
 fn calculate_framework_stats(results: &[&BenchmarkResult]) -> FrameworkExtensionStats {
     let count = results.len();
     let successful = results.iter().filter(|r| r.success).count();
-    let success_rate = if count > 0 {
-        successful as f64 / count as f64
-    } else {
-        0.0
-    };
 
     let framework_errors = results
         .iter()
@@ -198,11 +242,28 @@ fn calculate_framework_stats(results: &[&BenchmarkResult]) -> FrameworkExtension
         .iter()
         .filter(|r| r.error_kind == ErrorKind::HarnessError)
         .count();
+    let config_setup_errors = results
+        .iter()
+        .filter(|r| r.error_kind == ErrorKind::ConfigSetupError)
+        .count();
     let timeouts = results.iter().filter(|r| r.error_kind == ErrorKind::Timeout).count();
     let empty_content = results
         .iter()
         .filter(|r| r.error_kind == ErrorKind::EmptyContent)
         .count();
+    let zero_overlap = results
+        .iter()
+        .filter(|r| r.error_kind == ErrorKind::ZeroOverlap)
+        .count();
+
+    // Match aggregate/CLI semantics: only successful rows and framework-accountable failures
+    // participate in the rate; harness and setup failures remain visible in their counters. ~keep
+    let accountable = successful + framework_errors + timeouts + empty_content + zero_overlap;
+    let success_rate = if accountable > 0 {
+        successful as f64 / accountable as f64
+    } else {
+        0.0
+    };
 
     let mut error_details: HashMap<String, usize> = HashMap::new();
     for result in results.iter().filter(|r| !r.success) {
@@ -211,19 +272,20 @@ fn calculate_framework_stats(results: &[&BenchmarkResult]) -> FrameworkExtension
         }
     }
 
-    let successful_results: Vec<&&BenchmarkResult> = results.iter().filter(|r| r.success).collect();
+    let successful_results: Vec<&BenchmarkResult> = results.iter().copied().filter(|result| result.success).collect();
+    let performance_results = successful_performance_samples(results.iter().copied());
 
-    let avg_duration_ms = if !successful_results.is_empty() {
-        successful_results
+    let avg_duration_ms = if !performance_results.is_empty() {
+        performance_results
             .iter()
             .map(|r| r.duration.as_secs_f64() * 1000.0)
             .sum::<f64>()
-            / successful_results.len() as f64
+            / performance_results.len() as f64
     } else {
         0.0
     };
 
-    let mut durations: Vec<f64> = successful_results
+    let mut durations: Vec<f64> = performance_results
         .iter()
         .map(|r| r.duration.as_secs_f64() * 1000.0)
         .collect();
@@ -241,7 +303,6 @@ fn calculate_framework_stats(results: &[&BenchmarkResult]) -> FrameworkExtension
         0.0
     };
 
-    // Extraction duration stats (pure extraction time, excludes subprocess overhead)
     let mut extraction_durations: Vec<f64> = successful_results
         .iter()
         .filter_map(|r| r.extraction_duration.map(|d| d.as_secs_f64() * 1000.0))
@@ -267,33 +328,74 @@ fn calculate_framework_stats(results: &[&BenchmarkResult]) -> FrameworkExtension
         None
     };
 
-    let avg_throughput_mbps = if !successful_results.is_empty() {
-        successful_results
-            .iter()
-            .map(|r| r.metrics.throughput_bytes_per_sec / 1_000_000.0)
-            .sum::<f64>()
-            / successful_results.len() as f64
+    // New batch rows repeat one process measurement across sibling documents
+    // and are deduplicated above; legacy rows expose one positive throughput
+    // anchor. Average only reported measurements in either representation. ~keep
+    let reported_throughputs: Vec<f64> = performance_results
+        .iter()
+        .map(|r| r.metrics.throughput_bytes_per_sec / 1_000_000.0)
+        .filter(|throughput| throughput.is_finite() && *throughput > 0.0)
+        .collect();
+    let avg_throughput_mbps = if !reported_throughputs.is_empty() {
+        reported_throughputs.iter().sum::<f64>() / reported_throughputs.len() as f64
     } else {
         0.0
     };
 
-    let avg_peak_memory_mb = if !successful_results.is_empty() {
-        successful_results
+    let avg_peak_memory_mb = if !performance_results.is_empty() {
+        performance_results
             .iter()
             .map(|r| r.metrics.peak_memory_bytes as f64 / 1_000_000.0)
             .sum::<f64>()
-            / successful_results.len() as f64
+            / performance_results.len() as f64
     } else {
         0.0
     };
+
+    let mean = |values: &[f64]| -> Option<f64> {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64)
+        }
+    };
+
+    let f1_texts: Vec<f64> = successful_results
+        .iter()
+        .filter_map(|r| r.quality.as_ref().map(|q| q.f1_score_text))
+        .filter(|v| !v.is_nan() && v.is_finite())
+        .collect();
+    let f1_numerics: Vec<f64> = successful_results
+        .iter()
+        .filter_map(|r| r.quality.as_ref().map(|q| q.f1_score_numeric))
+        .filter(|v| !v.is_nan() && v.is_finite())
+        .collect();
+    let f1_layouts: Vec<f64> = successful_results
+        .iter()
+        .filter_map(|r| r.quality.as_ref().and_then(|q| q.f1_score_layout))
+        .filter(|v| !v.is_nan() && v.is_finite())
+        .collect();
+    let quality_scores: Vec<f64> = successful_results
+        .iter()
+        .filter_map(|r| r.quality.as_ref().map(|q| q.quality_score))
+        .filter(|v| !v.is_nan() && v.is_finite())
+        .collect();
+
+    let avg_f1_text = mean(&f1_texts);
+    let avg_f1_numeric = mean(&f1_numerics);
+    let avg_f1_layout = mean(&f1_layouts);
+    let avg_quality_score = mean(&quality_scores);
 
     FrameworkExtensionStats {
         count,
         successful,
+        performance_samples: performance_results.len(),
         framework_errors,
         harness_errors,
+        config_setup_errors,
         timeouts,
         empty_content,
+        zero_overlap,
         error_details,
         success_rate,
         avg_duration_ms,
@@ -304,6 +406,10 @@ fn calculate_framework_stats(results: &[&BenchmarkResult]) -> FrameworkExtension
         p95_extraction_duration_ms,
         avg_throughput_mbps,
         avg_peak_memory_mb,
+        avg_f1_text,
+        avg_f1_numeric,
+        avg_f1_layout,
+        avg_quality_score,
     }
 }
 
@@ -330,7 +436,7 @@ pub fn write_by_extension_analysis(results: &[BenchmarkResult], output_path: &Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FrameworkCapabilities, OcrStatus, OutputFormat, PerformanceMetrics};
+    use crate::types::{FrameworkCapabilities, OcrStatus, OutputFormat, PerformanceMetrics, QualityMetrics};
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -358,8 +464,11 @@ mod tests {
             extraction_duration: extraction_duration_ms.map(Duration::from_millis),
             subprocess_overhead: extraction_duration_ms.map(|ed| Duration::from_millis(duration_ms.saturating_sub(ed))),
             metrics: PerformanceMetrics {
+                baseline_memory_bytes: 0,
                 peak_memory_bytes: memory_bytes,
+                peak_memory_delta_bytes: memory_bytes,
                 avg_cpu_percent: 50.0,
+                cpu_seconds: 50.0,
                 throughput_bytes_per_sec: throughput_bps,
                 p50_memory_bytes: memory_bytes,
                 p95_memory_bytes: memory_bytes,
@@ -374,6 +483,7 @@ mod tests {
             pdf_metadata: None,
             ocr_status: OcrStatus::Unknown,
             extracted_text: None,
+            system_load: None,
             output_format: OutputFormat::Markdown,
         }
     }
@@ -394,14 +504,26 @@ mod tests {
             extraction_duration: None,
             subprocess_overhead: None,
             metrics: PerformanceMetrics {
+                baseline_memory_bytes: 0,
                 peak_memory_bytes: 10_000_000,
+                peak_memory_delta_bytes: 10_000_000,
                 avg_cpu_percent: 50.0,
+                cpu_seconds: 50.0,
                 throughput_bytes_per_sec: 1024.0,
                 p50_memory_bytes: 8_000_000,
                 p95_memory_bytes: 9_500_000,
                 p99_memory_bytes: 9_900_000,
             },
-            quality: None,
+            quality: Some(QualityMetrics {
+                f1_score_text: 0.91,
+                f1_score_numeric: 0.83,
+                f1_score_layout: Some(0.74),
+                quality_score: 0.85,
+                missing_tokens: vec![],
+                extra_tokens: vec![],
+                correct: false,
+                reading_order_score: None,
+            }),
             iterations: vec![],
             statistics: None,
             cold_start_duration: None,
@@ -410,6 +532,7 @@ mod tests {
             pdf_metadata: None,
             ocr_status: OcrStatus::Unknown,
             extracted_text: None,
+            system_load: None,
             output_format: OutputFormat::Markdown,
         }];
 
@@ -421,6 +544,76 @@ mod tests {
         let parsed: Vec<BenchmarkResult> = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].framework, "test-framework");
+        let quality = parsed[0].quality.as_ref().expect("quality metrics round-trip");
+        assert_eq!(quality.f1_score_text, 0.91);
+        assert_eq!(quality.f1_score_layout, Some(0.74));
+
+        let raw: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(raw[0]["quality"]["f1_score_text"], 0.91);
+        assert_eq!(raw[0]["quality"]["f1_score_layout"], 0.74);
+    }
+
+    #[test]
+    fn write_json_rejects_every_invalid_numeric_quality_contract_value() {
+        let temp_dir = TempDir::new().unwrap();
+        for (field, value) in [
+            ("f1_score_text", f64::NAN),
+            ("f1_score_numeric", -0.01),
+            ("f1_score_layout", 1.01),
+            ("quality_score", f64::INFINITY),
+        ] {
+            let output_path = temp_dir.path().join(format!("{field}.json"));
+            let mut result = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
+            let mut quality = QualityMetrics {
+                f1_score_text: 0.9,
+                f1_score_numeric: 0.8,
+                f1_score_layout: Some(0.7),
+                quality_score: 0.85,
+                missing_tokens: vec![],
+                extra_tokens: vec![],
+                correct: false,
+                reading_order_score: None,
+            };
+            match field {
+                "f1_score_text" => quality.f1_score_text = value,
+                "f1_score_numeric" => quality.f1_score_numeric = value,
+                "f1_score_layout" => quality.f1_score_layout = Some(value),
+                "quality_score" => quality.quality_score = value,
+                _ => unreachable!(),
+            }
+            result.quality = Some(quality);
+
+            let error = write_json(&[result], &output_path).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{field} must be a finite value in [0, 1]")),
+                "unexpected validation error for {field}: {error}"
+            );
+            assert!(!output_path.exists());
+        }
+    }
+
+    #[test]
+    fn write_json_preserves_historical_plaintext_sf1_without_schema_context() {
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("results.json");
+        let mut result = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
+        result.output_format = OutputFormat::Plaintext;
+        result.quality = Some(QualityMetrics {
+            f1_score_text: 0.9,
+            f1_score_numeric: 0.8,
+            f1_score_layout: Some(0.7),
+            quality_score: 0.85,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: false,
+            reading_order_score: None,
+        });
+
+        write_json(&[result], &output_path).expect("generic writer remains backward-compatible");
+        let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(output_path).unwrap()).unwrap();
+        assert_eq!(value[0]["quality"]["f1_score_layout"], 0.7);
     }
 
     #[test]
@@ -436,13 +629,21 @@ mod tests {
         assert!(output_path.parent().unwrap().exists());
     }
 
-    // ============================================================================
-    // Tests for extraction_duration statistics in calculate_framework_stats
-    // ============================================================================
+    #[test]
+    fn write_json_rejects_failed_result_without_error_kind() {
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("results.json");
+        let mut result = create_benchmark_result("framework1", false, 0, None, 0.0, 0);
+        result.error_kind = ErrorKind::None;
+
+        let error = write_json(&[result], &output_path).unwrap_err();
+
+        assert!(error.to_string().contains("success=false but error_kind is None"));
+        assert!(!output_path.exists());
+    }
 
     #[test]
     fn test_framework_stats_extraction_duration_all_present() {
-        // Test: All results have extraction_duration -> percentiles populated
         let result1 = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
         let result2 = create_benchmark_result("framework1", true, 150, Some(120), 1_000_000.0, 10_000_000);
         let result3 = create_benchmark_result("framework1", true, 200, Some(160), 1_000_000.0, 10_000_000);
@@ -456,15 +657,12 @@ mod tests {
         assert!(stats.median_extraction_duration_ms.is_some());
         assert!(stats.p95_extraction_duration_ms.is_some());
 
-        // Average of 80, 120, 160 = 120 ms
         assert!((stats.avg_extraction_duration_ms.unwrap() - 120.0).abs() < 0.1);
-        // Median of 80, 120, 160 = 120 ms
         assert!((stats.median_extraction_duration_ms.unwrap() - 120.0).abs() < 0.1);
     }
 
     #[test]
     fn test_framework_stats_extraction_duration_all_none() {
-        // Test: All results have extraction_duration = None -> percentiles None
         let result1 = create_benchmark_result("framework1", true, 100, None, 1_000_000.0, 10_000_000);
         let result2 = create_benchmark_result("framework1", true, 150, None, 1_000_000.0, 10_000_000);
         let result3 = create_benchmark_result("framework1", true, 200, None, 1_000_000.0, 10_000_000);
@@ -481,7 +679,6 @@ mod tests {
 
     #[test]
     fn test_framework_stats_extraction_duration_mixed_some_none() {
-        // Test: Mixed Some/None extraction_duration -> only Some values used
         let result1 = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
         let result2 = create_benchmark_result("framework1", true, 150, None, 1_000_000.0, 10_000_000);
         let result3 = create_benchmark_result("framework1", true, 200, Some(160), 1_000_000.0, 10_000_000);
@@ -494,33 +691,26 @@ mod tests {
         assert!(stats.avg_extraction_duration_ms.is_some());
         assert!(stats.median_extraction_duration_ms.is_some());
 
-        // Only 80 and 160 ms, average = 120 ms
         assert!((stats.avg_extraction_duration_ms.unwrap() - 120.0).abs() < 0.1);
     }
 
     #[test]
     fn test_framework_stats_extraction_duration_filters_nan() {
-        // Test: NaN/infinite durations filtered out
         let result1 = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
         let result2 = create_benchmark_result("framework1", true, 150, Some(120), 1_000_000.0, 10_000_000);
         let result3 = create_benchmark_result("framework1", true, 200, Some(160), 1_000_000.0, 10_000_000);
 
-        // Inject NaN and infinity by manipulating durations (since Duration doesn't support NaN)
-        // We'll test this conceptually with valid values, but the filtering logic is tested
-        // by verifying that only finite, non-NaN values are used
         let results = vec![&result1, &result2, &result3];
 
         let stats = calculate_framework_stats(&results);
 
         assert_eq!(stats.count, 3);
-        // All three values are valid (80, 120, 160)
         assert!(stats.avg_extraction_duration_ms.is_some());
         assert_eq!(stats.avg_extraction_duration_ms.unwrap(), 120.0);
     }
 
     #[test]
     fn test_framework_stats_extraction_duration_empty_results() {
-        // Test: Empty results -> sensible defaults
         let results: Vec<&BenchmarkResult> = vec![];
 
         let stats = calculate_framework_stats(&results);
@@ -538,7 +728,6 @@ mod tests {
 
     #[test]
     fn test_framework_stats_extraction_duration_only_failed_results() {
-        // Test: Only failed results -> extraction_duration None (only successful results used)
         let result1 = create_benchmark_result("framework1", false, 0, None, 0.0, 0);
         let result2 = create_benchmark_result("framework1", false, 0, None, 0.0, 0);
         let results = vec![&result1, &result2];
@@ -554,7 +743,6 @@ mod tests {
 
     #[test]
     fn test_framework_stats_extraction_duration_single_value() {
-        // Test: Single extraction_duration value -> all percentiles return that value
         let result = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
         let results = vec![&result];
 
@@ -569,7 +757,6 @@ mod tests {
 
     #[test]
     fn test_framework_stats_success_rate_with_extraction_duration() {
-        // Test: Mixed success/failure with extraction_duration on successful results
         let result1 = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
         let result2 = create_benchmark_result("framework1", true, 150, Some(120), 1_000_000.0, 10_000_000);
         let result3 = create_benchmark_result("framework1", false, 0, None, 0.0, 0);
@@ -579,17 +766,57 @@ mod tests {
 
         assert_eq!(stats.count, 3);
         assert_eq!(stats.successful, 2);
-        assert_eq!(stats.success_rate, 2.0 / 3.0);
+        assert_eq!(stats.success_rate, 1.0);
 
-        // Only successful results have extraction_duration
         assert!(stats.avg_extraction_duration_ms.is_some());
-        // Average of 80 and 120 = 100
         assert!((stats.avg_extraction_duration_ms.unwrap() - 100.0).abs() < 0.1);
     }
 
     #[test]
+    fn framework_stats_success_rate_excludes_infrastructure_failures() {
+        let success = create_benchmark_result("framework1", true, 100, None, 1_000_000.0, 10_000_000);
+        let infrastructure_failure = create_benchmark_result("framework1", false, 0, None, 0.0, 0);
+        let mut framework_failure = create_benchmark_result("framework1", false, 0, None, 0.0, 0);
+        framework_failure.error_kind = ErrorKind::FrameworkError;
+        let results = vec![&success, &infrastructure_failure, &framework_failure];
+
+        let stats = calculate_framework_stats(&results);
+
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.successful, 1);
+        assert_eq!(stats.harness_errors, 1);
+        assert_eq!(stats.framework_errors, 1);
+        assert_eq!(stats.success_rate, 0.5);
+    }
+
+    #[test]
+    fn test_framework_stats_does_not_divide_batch_throughput_anchor_by_cardinality() {
+        let capability = crate::types::BatchCapability {
+            entry_point: crate::types::BatchEntryPoint::DoclingJobkit,
+            timing_scope: crate::types::BatchTimingScope::ColdEndToEndSubprocess,
+            per_item_timing: false,
+        };
+        let mut anchor = create_benchmark_result("framework1", true, 100, Some(10), 3_000_000.0, 10_000_000);
+        let mut sibling1 = create_benchmark_result("framework1", true, 900, Some(20), 0.0, 90_000_000);
+        let mut sibling2 = create_benchmark_result("framework1", true, 1_700, Some(30), 0.0, 170_000_000);
+        for (index, result) in [&mut anchor, &mut sibling1, &mut sibling2].into_iter().enumerate() {
+            result.framework_capabilities.batch_support = true;
+            result.framework_capabilities.batch_capability = Some(capability);
+            result.framework_capabilities.batch_performance_sample = Some(index == 0);
+        }
+        let results = vec![&anchor, &sibling1, &sibling2];
+
+        let stats = calculate_framework_stats(&results);
+
+        assert_eq!(stats.performance_samples, 1);
+        assert_eq!(stats.avg_throughput_mbps, 3.0);
+        assert_eq!(stats.avg_duration_ms, 100.0);
+        assert_eq!(stats.avg_peak_memory_mb, 10.0);
+        assert_eq!(stats.avg_extraction_duration_ms, Some(20.0));
+    }
+
+    #[test]
     fn test_framework_stats_large_number_extraction_durations() {
-        // Test: Many extraction_duration values -> percentiles calculated correctly
         let mut results = vec![];
         for i in 1..=100 {
             results.push(create_benchmark_result(
@@ -608,19 +835,15 @@ mod tests {
         assert_eq!(stats.count, 100);
         assert_eq!(stats.successful, 100);
 
-        // Average of 8, 16, 24, ..., 800 = 8*(1+2+...+100)/100 = 8*5050/100 = 404
         let expected_avg = 8.0 * (1..=100).sum::<u64>() as f64 / 100.0;
         assert!((stats.avg_extraction_duration_ms.unwrap() - expected_avg).abs() < 1.0);
 
-        // Median of 1-100: 50th percentile
         assert!(stats.median_extraction_duration_ms.is_some());
-        // P95: 95th percentile
         assert!(stats.p95_extraction_duration_ms.is_some());
     }
 
     #[test]
     fn test_analyze_by_extension_with_extraction_duration() {
-        // Integration test: analyze_by_extension properly aggregates extraction_duration
         let results = vec![
             create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000),
             create_benchmark_result("framework1", true, 150, Some(120), 1_000_000.0, 10_000_000),
@@ -640,7 +863,6 @@ mod tests {
 
     #[test]
     fn test_analyze_by_extension_mixed_extraction_duration() {
-        // Test: analyze_by_extension with mixed extraction_duration presence
         let mut result1 = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
         result1.file_extension = "pdf".to_string();
 
@@ -655,8 +877,102 @@ mod tests {
         let ext_analysis = &report.by_extension["pdf"];
         let framework_stats = &ext_analysis.framework_stats["framework1"];
 
-        // Should have extraction_duration stats (only from result1 which has Some)
         assert!(framework_stats.avg_extraction_duration_ms.is_some());
         assert_eq!(framework_stats.avg_extraction_duration_ms.unwrap(), 80.0);
+    }
+
+    #[test]
+    fn test_framework_stats_quality_absent_when_no_quality_metrics() {
+        let result = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
+        let results = vec![&result];
+
+        let stats = calculate_framework_stats(&results);
+
+        assert!(stats.avg_f1_text.is_none());
+        assert!(stats.avg_f1_numeric.is_none());
+        assert!(stats.avg_f1_layout.is_none());
+        assert!(stats.avg_quality_score.is_none());
+    }
+
+    #[test]
+    fn test_framework_stats_preserves_mean_tf1_and_sf1() {
+        let mut result1 = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
+        result1.quality = Some(QualityMetrics {
+            f1_score_text: 0.80,
+            f1_score_numeric: 0.90,
+            f1_score_layout: Some(0.60),
+            quality_score: 0.75,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: false,
+            reading_order_score: None,
+        });
+
+        let mut result2 = create_benchmark_result("framework1", true, 150, Some(120), 1_000_000.0, 10_000_000);
+        result2.quality = Some(QualityMetrics {
+            f1_score_text: 0.90,
+            f1_score_numeric: 0.95,
+            f1_score_layout: Some(0.70),
+            quality_score: 0.85,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: true,
+            reading_order_score: None,
+        });
+
+        let results = vec![&result1, &result2];
+        let stats = calculate_framework_stats(&results);
+
+        assert!((stats.avg_f1_text.unwrap() - 0.85).abs() < 1e-9);
+        assert!((stats.avg_f1_numeric.unwrap() - 0.925).abs() < 1e-9);
+        assert!((stats.avg_f1_layout.unwrap() - 0.65).abs() < 1e-9);
+        assert!((stats.avg_quality_score.unwrap() - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_framework_stats_layout_none_when_no_result_reports_it() {
+        let mut result = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
+        result.quality = Some(QualityMetrics {
+            f1_score_text: 0.80,
+            f1_score_numeric: 0.90,
+            f1_score_layout: None,
+            quality_score: 0.75,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: false,
+            reading_order_score: None,
+        });
+
+        let results = vec![&result];
+        let stats = calculate_framework_stats(&results);
+
+        assert!(stats.avg_f1_text.is_some());
+        assert!(stats.avg_f1_layout.is_none());
+    }
+
+    #[test]
+    fn test_framework_stats_quality_excludes_failed_results() {
+        let mut result1 = create_benchmark_result("framework1", true, 100, Some(80), 1_000_000.0, 10_000_000);
+        result1.quality = Some(QualityMetrics {
+            f1_score_text: 0.80,
+            f1_score_numeric: 0.90,
+            f1_score_layout: Some(0.60),
+            quality_score: 0.75,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: false,
+            reading_order_score: None,
+        });
+
+        // Failed result: create_benchmark_result forces quality to None for failures anyway,
+        // but assert explicitly that it never contributes to the mean. ~keep
+        let result2 = create_benchmark_result("framework1", false, 0, None, 0.0, 0);
+
+        let results = vec![&result1, &result2];
+        let stats = calculate_framework_stats(&results);
+
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.successful, 1);
+        assert!((stats.avg_f1_text.unwrap() - 0.80).abs() < 1e-9);
     }
 }

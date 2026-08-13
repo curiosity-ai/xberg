@@ -16,6 +16,10 @@ use zip::ZipArchive;
 use super::metadata::{EpubPackageDocument, ManifestItem};
 use super::parsing::read_file_from_zip;
 
+const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
+pub(super) const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+pub(super) const MATHML_NAMESPACE: &str = "http://www.w3.org/1998/Math/MathML";
+
 #[derive(Debug, Clone)]
 /// A resolved XHTML spine document prepared for EPUB extraction.
 ///
@@ -85,7 +89,9 @@ pub(super) fn read_body_documents(
         match read_file_from_zip(archive, &file_path) {
             Ok(raw_xhtml) => {
                 let normalized_xhtml = normalize_xhtml(&raw_xhtml);
-                let render_xhtml = strip_specialized_navigation_sections(&strip_document_head(&normalized_xhtml));
+                let render_xhtml = strip_embedded_media_elements(&strip_specialized_navigation_sections(
+                    &strip_document_head(&normalized_xhtml),
+                ));
 
                 if guide_toc_candidate && looks_like_navigation_document(&render_xhtml) {
                     continue;
@@ -194,6 +200,71 @@ pub(super) fn strip_specialized_navigation_sections(xhtml: &str) -> String {
     })
 }
 
+/// Audio and video elements are delivery controls rather than book text. HTML
+/// conversion otherwise emits their source URLs and serialized fallback markup
+/// in addition to the surrounding prose.
+pub(super) fn strip_embedded_media_elements(xhtml: &str) -> String {
+    strip_xml_elements(xhtml, |node| {
+        matches!(node.tag_name().name().to_ascii_lowercase().as_str(), "audio" | "video")
+    })
+}
+
+/// Resolve deprecated EPUB 3 `epub:switch` elements to the branch Xberg renders.
+/// Cases outside the downstream renderer's explicit namespace capabilities
+/// select `epub:default`. ~keep
+pub(super) fn resolve_epub_switch_elements(xhtml: &str, supported_namespaces: &[&str]) -> String {
+    let Ok(document) = roxmltree::Document::parse(xhtml) else {
+        return xhtml.to_string();
+    };
+    let mut removed_ranges = Vec::new();
+    for switch in document.descendants().filter(|node| is_epub_element(*node, "switch")) {
+        let selected = switch
+            .children()
+            .find(|child| {
+                is_epub_element(*child, "case")
+                    && child.attribute("required-namespace").is_some_and(|required| {
+                        supported_namespaces
+                            .iter()
+                            .any(|supported| required.trim() == *supported)
+                    })
+            })
+            .or_else(|| switch.children().find(|child| is_epub_element(*child, "default")));
+
+        removed_ranges.extend(
+            switch
+                .children()
+                .filter(|child| is_epub_element(*child, "case") || is_epub_element(*child, "default"))
+                .filter(|child| Some(*child) != selected)
+                .map(|child| child.range()),
+        );
+    }
+
+    removed_ranges.sort_unstable_by(|left, right| match left.start.cmp(&right.start) {
+        Ordering::Equal => right.end.cmp(&left.end),
+        order => order,
+    });
+    let mut outer_ranges = Vec::with_capacity(removed_ranges.len());
+    for range in removed_ranges {
+        if outer_ranges
+            .last()
+            .is_none_or(|outer: &std::ops::Range<usize>| range.start >= outer.end)
+        {
+            outer_ranges.push(range);
+        }
+    }
+    let mut resolved = xhtml.to_string();
+    for range in outer_ranges.into_iter().rev() {
+        resolved.replace_range(range, "");
+    }
+    resolved
+}
+
+fn is_epub_element(node: roxmltree::Node<'_, '_>, local_name: &str) -> bool {
+    node.is_element()
+        && node.tag_name().namespace() == Some(EPUB_NAMESPACE)
+        && node.tag_name().name().eq_ignore_ascii_case(local_name)
+}
+
 fn is_specialized_navigation_node(node: roxmltree::Node<'_, '_>) -> bool {
     node.attributes().any(|attr| {
         attr.name().eq_ignore_ascii_case("type")
@@ -296,9 +367,104 @@ const BLOCK_ELEMENTS: &[&str] = &[
 ];
 
 /// Elements whose entire subtree should be skipped (no text extracted).
-const SKIP_ELEMENTS: &[&str] = &[
-    "head", "script", "style", "svg", "math", "video", "audio", "source", "track", "object", "embed", "iframe",
-];
+///
+/// `math` is handled separately (see `render_math_element`): its subtree is
+/// converted to LaTeX rather than skipped, so it is deliberately absent here.
+///
+/// `svg` is also handled separately (see `visit_svg_node`): its subtree is walked
+/// selectively rather than skipped outright, so real alt-text (`<title>`/`<desc>`) is
+/// not lost (issue #140). `object`, `embed`, and `iframe` are likewise absent: their
+/// fallback content (`<object><p>fallback</p></object>`) is ordinary child markup, so
+/// letting the generic recursion below visit their children recovers it for free.
+const SKIP_ELEMENTS: &[&str] = &["head", "script", "style", "video", "audio", "source", "track"];
+
+/// SVG descendant tags that carry real, human-authored text: the visible `<text>`/
+/// `<tspan>`/`<textPath>` content and the accessible `<title>`/`<desc>` alt-text.
+/// Mirrors the allowlist already used by the standalone SVG/XML extractor
+/// (`extractors::xml`). Every other SVG element (`path`, `rect`, `circle`, `g`, ...) is
+/// pure drawing geometry with no meaningful text of its own.
+const SVG_TEXT_ELEMENTS: &[&str] = &["title", "desc", "text", "tspan", "textpath"];
+
+/// Walk an `<svg>` subtree, extracting text only from [`SVG_TEXT_ELEMENTS`] descendants.
+///
+/// Unlike the generic block-element walk, this never emits text from arbitrary elements —
+/// only once `in_text_context` has been set by entering an allowed tag — so drawing
+/// primitives (`path`, `rect`, ...) can never leak stray text even if a producer ever puts
+/// whitespace or comments between their tags.
+fn visit_svg_node(
+    node: roxmltree::Node<'_, '_>,
+    output: &mut String,
+    in_text_context: bool,
+    budget: Option<&mut SecurityBudget>,
+) {
+    let mut budget = budget;
+    match node.node_type() {
+        roxmltree::NodeType::Text if in_text_context => {
+            let text = node.text().unwrap_or("");
+            if let Some(b) = budget.as_deref_mut()
+                && b.check_entity(text).is_err()
+            {
+                return;
+            }
+            let normalised = normalise_inline_whitespace(text);
+            if normalised.is_empty() {
+                return;
+            }
+            let fragment = if output.is_empty() || output.ends_with('\n') {
+                normalised.trim_start().to_string()
+            } else {
+                normalised
+            };
+            if fragment.is_empty() {
+                return;
+            }
+            if let Some(b) = budget.as_deref_mut()
+                && b.account_text(fragment.len()).is_err()
+            {
+                return;
+            }
+            output.push_str(&fragment);
+        }
+        roxmltree::NodeType::Element => {
+            let tag = node.tag_name().name().to_ascii_lowercase();
+            let entering_text_tag = SVG_TEXT_ELEMENTS.contains(&tag.as_str());
+            let child_in_text_context = in_text_context || entering_text_tag;
+            if entering_text_tag && !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            for child in node.children() {
+                visit_svg_node(child, output, child_in_text_context, budget.as_deref_mut());
+            }
+            if entering_text_tag && !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert a `<math>` element to LaTeX and append it to `output` as its own
+/// `$$...$$` block, isolated by blank lines so it survives the `\n\n` paragraph
+/// split callers use downstream. Never leaks raw MathML tag text: on conversion
+/// failure (budget exhaustion on hostile input) the element is silently dropped.
+fn render_math_element(node: roxmltree::Node<'_, '_>, output: &mut String, budget: &mut SecurityBudget) {
+    let Ok(latex) = crate::extraction::mathml::convert_mathml_node_to_latex(node, budget) else {
+        return;
+    };
+    let trimmed = latex.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if budget.account_text(trimmed.len()).is_err() {
+        return;
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str("\n$$");
+    output.push_str(trimmed);
+    output.push_str("$$\n\n");
+}
 
 /// Extract text from XHTML content by traversing the XML tree directly.
 ///
@@ -317,7 +483,6 @@ pub(super) fn extract_text_from_xhtml_budgeted(xhtml: &str, budget: &mut Securit
 }
 
 fn extract_text_from_xhtml_with_budget(xhtml: &str, budget: Option<&mut SecurityBudget>) -> String {
-    // Try direct XML tree traversal first (lossless path).
     let result = match budget {
         Some(b) => try_extract_via_roxmltree_budgeted(xhtml, b),
         None => try_extract_via_roxmltree_unbounded(xhtml),
@@ -326,7 +491,6 @@ fn extract_text_from_xhtml_with_budget(xhtml: &str, budget: Option<&mut Security
         return text;
     }
 
-    // Fallback: strip HTML tags character-by-character.
     let normalized = normalize_xhtml(xhtml);
     strip_html_tags(&normalized)
 }
@@ -376,7 +540,34 @@ fn try_extract_via_roxmltree_budgeted(xhtml: &str, budget: &mut SecurityBudget) 
 /// This strips XML declarations and doctypes, which are valid in EPUB chapter
 /// files but should not surface in extracted Markdown or interfere with safe parsing.
 pub(super) fn normalize_xhtml(xml: &str) -> String {
-    strip_xml_prelude(xml)
+    strip_serialized_mathml_comments(&strip_xml_prelude(xml))
+}
+
+/// Some EPUB fixtures carry a readable MathML fallback immediately after a
+/// comment containing a serialized copy of the same equation. Keep the fallback
+/// while removing only the non-rendered serialization comment.
+fn strip_serialized_mathml_comments(xhtml: &str) -> String {
+    let mut output = String::with_capacity(xhtml.len());
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = xhtml[cursor..].find("<!--") {
+        let start = cursor + relative_start;
+        let comment_body_start = start + "<!--".len();
+        let Some(relative_end) = xhtml[comment_body_start..].find("-->") else {
+            break;
+        };
+        let end = comment_body_start + relative_end + "-->".len();
+        let comment_body = &xhtml[comment_body_start..comment_body_start + relative_end];
+
+        output.push_str(&xhtml[cursor..start]);
+        if !comment_body.trim_start().to_ascii_lowercase().starts_with("mathml:") {
+            output.push_str(&xhtml[start..end]);
+        }
+        cursor = end;
+    }
+
+    output.push_str(&xhtml[cursor..]);
+    output
 }
 
 /// Remove XML declarations and DOCTYPE declarations from XML/XHTML.
@@ -441,6 +632,20 @@ fn visit_node_unbounded(node: roxmltree::Node<'_, '_>, output: &mut String) {
         }
         roxmltree::NodeType::Element => {
             let tag = node.tag_name().name().to_ascii_lowercase();
+            if tag == "math" {
+                // No budget is threaded through this (unbounded) traversal, so use
+                // a default-limits budget scoped to this one formula's conversion.
+                let mut budget = SecurityBudget::from_limits(&crate::extractors::security::SecurityLimits::default());
+                render_math_element(node, output, &mut budget);
+                return;
+            }
+            // Issue #140: `<svg>` used to be a whole-subtree skip, dropping its real
+            // `<title>`/`<desc>` alt-text along with the (harmless to lose) drawing
+            // geometry. Walk it selectively instead of skipping outright.
+            if tag == "svg" {
+                visit_svg_node(node, output, false, None);
+                return;
+            }
             if SKIP_ELEMENTS.iter().any(|&s| s == tag) {
                 return;
             }
@@ -481,7 +686,6 @@ fn visit_node_budgeted(node: roxmltree::Node<'_, '_>, output: &mut String, budge
     match node.node_type() {
         roxmltree::NodeType::Text => {
             let text = node.text().unwrap_or("");
-            // Entity / billion-laughs check on raw text node value.
             if budget.check_entity(text).is_err() {
                 return;
             }
@@ -502,6 +706,14 @@ fn visit_node_budgeted(node: roxmltree::Node<'_, '_>, output: &mut String, budge
         }
         roxmltree::NodeType::Element => {
             let tag = node.tag_name().name().to_ascii_lowercase();
+            if tag == "math" {
+                render_math_element(node, output, budget);
+                return;
+            }
+            if tag == "svg" {
+                visit_svg_node(node, output, false, Some(budget));
+                return;
+            }
             if SKIP_ELEMENTS.iter().any(|&s| s == tag) {
                 return;
             }
@@ -671,8 +883,6 @@ mod tests {
         assert!(text.contains("Hello") && text.contains("World"));
     }
 
-    // --- Direct XHTML extraction tests ---
-
     #[test]
     fn test_extract_text_from_xhtml_basic() {
         let xhtml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -687,8 +897,45 @@ mod tests {
         let result = extract_text_from_xhtml(xhtml);
         assert!(result.contains("Chapter One"), "got: {result}");
         assert!(result.contains("This is paragraph text."), "got: {result}");
-        // head/title content should not appear in body text
         assert!(!result.contains("Test"), "head title should be excluded, got: {result}");
+    }
+
+    #[test]
+    fn test_extract_text_from_xhtml_converts_math_to_latex() {
+        let xhtml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body>
+    <p>Before</p>
+    <math xmlns="http://www.w3.org/1998/Math/MathML">
+      <mfrac><mn>1</mn><mn>2</mn></mfrac>
+    </math>
+    <p>After</p>
+  </body>
+</html>"#;
+        let result = extract_text_from_xhtml(xhtml);
+        assert!(result.contains("$$\\frac{1}{2}$$"), "got: {result}");
+        assert!(result.contains("Before"), "got: {result}");
+        assert!(result.contains("After"), "got: {result}");
+        assert!(
+            !result.contains("mfrac"),
+            "raw MathML tag names must not leak, got: {result}"
+        );
+        assert!(
+            !result.contains("mn"),
+            "raw MathML tag names must not leak, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_from_xhtml_budgeted_converts_math_to_latex() {
+        let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+  <body>
+    <math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>x</mi><mn>2</mn></msup></math>
+  </body>
+</html>"#;
+        let mut budget = SecurityBudget::from_limits(&crate::extractors::security::SecurityLimits::default());
+        let result = extract_text_from_xhtml_budgeted(xhtml, &mut budget);
+        assert_eq!(result, "$$x^{2}$$");
     }
 
     #[test]
@@ -748,7 +995,6 @@ mod tests {
         assert!(result.contains("Paragraph two."), "got: {result}");
         assert!(result.contains("Item A"), "got: {result}");
         assert!(result.contains("Item B"), "got: {result}");
-        // The two paragraphs should be on different lines
         assert!(result.contains('\n'), "should have newlines, got: {result}");
     }
 
@@ -761,7 +1007,6 @@ mod tests {
   </body>
 </html>"#;
         let result = extract_text_from_xhtml(xhtml);
-        // Text content should be preserved; no markdown syntax introduced
         assert!(result.contains("bold"), "got: {result}");
         assert!(result.contains("italic"), "got: {result}");
         assert!(!result.contains("**"), "no markdown bold, got: {result}");
@@ -770,11 +1015,89 @@ mod tests {
 
     #[test]
     fn test_extract_text_from_xhtml_fallback_for_invalid_xml() {
-        // Malformed XHTML that roxmltree cannot parse should fall back to tag stripping.
         let bad_xhtml = "<p>Hello <b>World</b> unclosed <p>second";
         let result = extract_text_from_xhtml(bad_xhtml);
         assert!(result.contains("Hello"), "got: {result}");
         assert!(result.contains("World"), "got: {result}");
+    }
+
+    #[test]
+    fn should_remove_serialized_mathml_comment_and_keep_readable_fallback() {
+        let xhtml = r#"<html><body>
+<!-- MathML: <math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi><mo>=</mo><mn>2</mn></math> -->
+<p>x = 2</p><!-- editorial note -->
+</body></html>"#;
+
+        let normalized = normalize_xhtml(xhtml);
+
+        assert!(!normalized.contains("MathML:"), "got: {normalized}");
+        assert!(!normalized.contains("<math"), "got: {normalized}");
+        assert!(normalized.contains("x = 2"), "got: {normalized}");
+        assert!(normalized.contains("<!-- editorial note -->"), "got: {normalized}");
+    }
+
+    #[test]
+    fn should_remove_embedded_media_without_losing_surrounding_prose() {
+        let xhtml = r#"<html><body>
+<p>Before</p>
+<video><source src="movie.mp4"/><div>Video fallback</div></video>
+<audio src="sound.mp3"><p>Audio fallback</p></audio>
+<p>After</p>
+</body></html>"#;
+
+        let stripped = strip_embedded_media_elements(xhtml);
+
+        assert!(stripped.contains("Before"), "got: {stripped}");
+        assert!(stripped.contains("After"), "got: {stripped}");
+        assert!(!stripped.contains("movie.mp4"), "got: {stripped}");
+        assert!(!stripped.contains("sound.mp3"), "got: {stripped}");
+        assert!(!stripped.contains("fallback"), "got: {stripped}");
+    }
+
+    #[test]
+    fn should_resolve_epub_switch_to_supported_case_or_default() {
+        let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+<epub:switch xmlns:epub="http://www.idpf.org/2007/ops">
+  <epub:case required-namespace="urn:unsupported"><p>UNKNOWN_CASE</p></epub:case>
+  <epub:default><p>DEFAULT</p></epub:default>
+</epub:switch>
+<epub:switch xmlns:epub="http://www.idpf.org/2007/ops">
+  <epub:case required-namespace="http://www.w3.org/1998/Math/MathML">
+    <math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>
+  </epub:case>
+  <epub:default><p>MATH_FALLBACK</p></epub:default>
+</epub:switch>
+<epub:switch xmlns:epub="http://www.idpf.org/2007/ops">
+  <epub:case required-namespace="http://www.w3.org/1999/xhtml">
+    <p>XHTML_CASE</p>
+    <epub:switch>
+      <epub:case required-namespace="urn:nested-unsupported"><p>NESTED_WRONG</p></epub:case>
+      <epub:default><p>NESTED_DEFAULT</p></epub:default>
+    </epub:switch>
+  </epub:case>
+  <epub:default><p>XHTML_FALLBACK</p></epub:default>
+</epub:switch>
+<switch><p>ORDINARY</p></switch>
+</body></html>"#;
+
+        let markup = resolve_epub_switch_elements(xhtml, &[XHTML_NAMESPACE, MATHML_NAMESPACE]);
+        let plain = resolve_epub_switch_elements(xhtml, &[XHTML_NAMESPACE]);
+
+        for resolved in [&markup, &plain] {
+            assert!(resolved.contains("DEFAULT"), "got: {resolved}");
+            assert!(resolved.contains("XHTML_CASE"), "got: {resolved}");
+            assert!(resolved.contains("NESTED_DEFAULT"), "got: {resolved}");
+            assert!(resolved.contains("<switch><p>ORDINARY</p></switch>"), "got: {resolved}");
+            assert!(!resolved.contains("UNKNOWN_CASE"), "got: {resolved}");
+            assert!(!resolved.contains("NESTED_WRONG"), "got: {resolved}");
+            assert!(!resolved.contains("XHTML_FALLBACK"), "got: {resolved}");
+            assert!(roxmltree::Document::parse(resolved).is_ok(), "got: {resolved}");
+        }
+        assert!(markup.contains("<mi>x</mi>"), "got: {markup}");
+        assert!(!markup.contains("MATH_FALLBACK"), "got: {markup}");
+        assert!(!plain.contains("<mi>x</mi>"), "got: {plain}");
+        assert!(plain.contains("MATH_FALLBACK"), "got: {plain}");
     }
 
     #[test]

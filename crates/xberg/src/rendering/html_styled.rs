@@ -22,10 +22,6 @@ use crate::rendering::common::{NestingKind, RenderState, render_annotated_text_w
 use crate::types::document_structure::{AnnotationKind, ContentLayer};
 use crate::types::internal::{ElementKind, InternalDocument};
 
-// ============================================================================
-// Theme CSS
-// ============================================================================
-
 fn theme_css(theme: &HtmlTheme) -> &'static str {
     match theme {
         HtmlTheme::Unstyled => "",
@@ -137,10 +133,6 @@ p .kb-code { background: var(--kb-code-bg); color: var(--kb-code-color); padding
 .kb-page-break { border: none; border-top: 1px dashed var(--kb-border-color); margin: 2em 0; }
 "#;
 
-// ============================================================================
-// StyledHtmlRenderer
-// ============================================================================
-
 /// Styled HTML renderer.
 ///
 /// Implements the [`crate::plugins::Renderer`] trait; registered as `"html"` when the
@@ -159,11 +151,9 @@ impl StyledHtmlRenderer {
     /// Loads `css_file` from disk and concatenates all CSS sources. Returns
     /// an error if `css_file` is set but cannot be read.
     /// Maximum size in bytes for a CSS file loaded via `css_file`.
-    const MAX_CSS_FILE_SIZE: u64 = 1_048_576; // 1 MiB
+    const MAX_CSS_FILE_SIZE: u64 = 1_048_576;
 
     pub(crate) fn new(config: HtmlOutputConfig) -> Result<Self> {
-        // Validate class_prefix: only allow alphanumerics, hyphens, and underscores
-        // to prevent HTML attribute injection.
         if !config
             .class_prefix
             .chars()
@@ -175,8 +165,6 @@ impl StyledHtmlRenderer {
             )));
         }
 
-        // Warn when using a non-default class_prefix with a non-unstyled theme,
-        // since built-in theme CSS targets `.kb-*` selectors.
         if config.class_prefix != "kb-" && config.theme != HtmlTheme::Unstyled {
             tracing::warn!(
                 "html_output.class_prefix is {:?} but theme is {:?}; \
@@ -190,7 +178,6 @@ impl StyledHtmlRenderer {
         let mut css = theme_css(&config.theme).to_owned();
 
         if let Some(ref path) = config.css_file {
-            // Check file size before reading to prevent excessive memory usage.
             let metadata = std::fs::metadata(path).map_err(|e| XbergError::Parsing {
                 message: format!("html_output.css_file \"{}\": {}", path.display(), e),
                 source: None,
@@ -216,9 +203,6 @@ impl StyledHtmlRenderer {
             css.push_str(inline);
         }
 
-        // Sanitize resolved CSS: strip `</style>` sequences (case-insensitive)
-        // to prevent style block breakout. This is a minimal defense; callers
-        // serving HTML to untrusted users should sanitize CSS at the application layer.
         let css = css.replace("</style>", "").replace("</STYLE>", "");
 
         Ok(Self {
@@ -238,7 +222,6 @@ impl InternalRenderer for StyledHtmlRenderer {
     fn render(&self, doc: &InternalDocument) -> Result<String> {
         let p = &self.config.class_prefix;
 
-        // Capacity heuristic: element text × 3 for tag overhead, capped at 64 MB.
         let text_bytes: usize = doc.elements.iter().map(|e| e.text.len()).sum();
         let cap = (text_bytes * 3).min(64 * 1024 * 1024);
         let mut buf = String::with_capacity(cap);
@@ -259,10 +242,6 @@ impl InternalRenderer for StyledHtmlRenderer {
     }
 }
 
-// ============================================================================
-// Element rendering
-// ============================================================================
-
 fn esc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     escape_string(text, &mut out);
@@ -271,17 +250,14 @@ fn esc(text: &str) -> String {
 
 fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
     let mut state = RenderState::default();
-    // Track current list ordered-ness for ListEnd
     let mut list_ordered_stack: Vec<bool> = Vec::new();
 
     for elem in &doc.elements {
-        // Skip non-body layers in the main content pass.
         if !matches!(elem.layer, ContentLayer::Body) {
             continue;
         }
 
         match elem.kind {
-            // ── Headings ──────────────────────────────────────────────
             ElementKind::Title => {
                 write!(buf, r#"<h1 class="{p}doc-title">{}</h1>"#, esc(&elem.text)).unwrap();
             }
@@ -295,12 +271,10 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 .unwrap();
             }
 
-            // ── Paragraph ─────────────────────────────────────────────
             ElementKind::Paragraph | ElementKind::OcrText { .. } => {
                 write!(buf, r#"<p class="{p}p">{}</p>"#, render_inline(doc, elem, p)).unwrap();
             }
 
-            // ── Lists ─────────────────────────────────────────────────
             ElementKind::ListStart { ordered } => {
                 list_ordered_stack.push(ordered);
                 state.push_container(NestingKind::List { ordered, item_count: 0 }, elem.depth);
@@ -323,7 +297,6 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 write!(buf, r#"<li class="{p}li">{}</li>"#, render_inline(doc, elem, p)).unwrap();
             }
 
-            // ── Blockquote ────────────────────────────────────────────
             ElementKind::QuoteStart => {
                 state.push_container(NestingKind::BlockQuote, elem.depth);
                 write!(buf, r#"<blockquote class="{p}blockquote">"#).unwrap();
@@ -333,7 +306,6 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 buf.push_str("</blockquote>");
             }
 
-            // ── Code ──────────────────────────────────────────────────
             ElementKind::Code => {
                 let lang = elem
                     .attributes
@@ -359,17 +331,21 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 }
             }
 
-            // ── Formula ───────────────────────────────────────────────
             ElementKind::Formula => {
+                // Math, not code: emit LaTeX in `$$...$$` display-math delimiters inside a
+                // math-classed element, matching the `dollar_math`/`display_math` convention
+                // used by the comrak and djot renderers. KaTeX/MathJax auto-render both pick
+                // up `$$...$$` by default, so this is renderable as-is once such a script is
+                // present on the page; without one it degrades to visible LaTeX source rather
+                // than a misleading monospace code block.
                 write!(
                     buf,
-                    r#"<pre class="{p}pre {p}formula"><code class="{p}code">{}</code></pre>"#,
+                    r#"<div class="{p}formula {p}math" data-math-style="display">$${}$$</div>"#,
                     esc(&elem.text)
                 )
                 .unwrap();
             }
 
-            // ── Footnotes & citations ─────────────────────────────────
             ElementKind::FootnoteDefinition => {
                 let anchor = elem.anchor.as_deref().unwrap_or("");
                 write!(
@@ -390,16 +366,42 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 )
                 .unwrap();
             }
+            ElementKind::CommentDefinition => {
+                let anchor = elem.anchor.as_deref().unwrap_or("");
+                write!(
+                    buf,
+                    r#"<aside class="{p}comment" id="fn-{}">{}</aside>"#,
+                    esc(anchor),
+                    render_inline(doc, elem, p)
+                )
+                .unwrap();
+            }
+            ElementKind::CommentRef => {
+                let anchor = elem.anchor.as_deref().unwrap_or("");
+                write!(
+                    buf,
+                    r##"<sup class="{p}comment-ref"><a href="#fn-{}">{}</a></sup>"##,
+                    esc(anchor),
+                    esc(&elem.text)
+                )
+                .unwrap();
+            }
             ElementKind::Citation => {
                 write!(buf, r#"<cite class="{p}citation">{}</cite>"#, esc(&elem.text)).unwrap();
             }
 
-            // ── Slides ────────────────────────────────────────────────
             ElementKind::Slide { number } => {
+                // `Slide` is a marker, not a container: there is no `SlideEnd` element kind, so
+                // an unbalanced opening tag would leave every slide deck's HTML malformed. Match
+                // the djot and comrak renderers, which emit a break followed by the slide title
+                // as a level-2 heading, and keep the `slide`/`data-slide` hooks for styling.
                 write!(buf, r#"<section class="{p}slide" data-slide="{number}">"#).unwrap();
+                if !elem.text.is_empty() {
+                    write!(buf, r#"<h2 class="{p}h {p}h2">{}</h2>"#, render_inline(doc, elem, p)).unwrap();
+                }
+                buf.push_str("</section>");
             }
 
-            // ── Definition lists ──────────────────────────────────────
             ElementKind::DefinitionTerm => {
                 write!(buf, r#"<dt class="{p}dt">{}</dt>"#, render_inline(doc, elem, p)).unwrap();
             }
@@ -407,7 +409,6 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 write!(buf, r#"<dd class="{p}dd">{}</dd>"#, render_inline(doc, elem, p)).unwrap();
             }
 
-            // ── Admonitions ───────────────────────────────────────────
             ElementKind::Admonition => {
                 let kind = elem
                     .attributes
@@ -424,19 +425,32 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 .unwrap();
             }
 
-            // ── Raw / metadata blocks ─────────────────────────────────
             ElementKind::RawBlock => {
-                // SAFETY: RawBlock elements are only created by internal extractors
-                // (e.g. HTML pass-through from email/HTML sources). They are never
-                // populated from untrusted user input. If this invariant changes,
-                // this must be updated to escape content.
-                buf.push_str(&elem.text);
+                // Only a block that declares itself HTML may be written through
+                // verbatim. Most producers of a raw block do not: `odp.rs` pushes
+                // speaker notes and master-page text as `odp-speaker-notes` /
+                // `odp-master-page`, `orgmode.rs` pushes Org source, `html/structure.rs`
+                // pushes `script`/`style` bodies, and `djot_format` pushes whatever
+                // format the source declared, including `unknown`. Emitting those
+                // unescaped puts arbitrary author-typed text — a `<` in a speaker
+                // note, or LibreOffice's literal `<number>` field placeholder — into
+                // the output as if it were markup, which both corrupts the document
+                // structure and is an injection vector (#69).
+                let is_html = elem
+                    .attributes
+                    .as_ref()
+                    .and_then(|a| a.get("format"))
+                    .is_some_and(|format| format == "html");
+                if is_html {
+                    buf.push_str(&elem.text);
+                } else {
+                    write!(buf, r#"<pre class="{p}pre {p}raw">{}</pre>"#, esc(&elem.text)).unwrap();
+                }
             }
             ElementKind::MetadataBlock => {
                 write!(buf, r#"<dl class="{p}metadata">{}</dl>"#, esc(&elem.text)).unwrap();
             }
 
-            // ── Group ─────────────────────────────────────────────────
             ElementKind::GroupStart => {
                 state.push_container(NestingKind::Group, elem.depth);
                 write!(buf, r#"<div class="{p}group">"#).unwrap();
@@ -446,21 +460,26 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 buf.push_str("</div>");
             }
 
-            // ── Table ─────────────────────────────────────────────────
             ElementKind::Table { table_index } => {
                 if let Some(table) = doc.tables.get(table_index as usize) {
                     render_table(table, p, buf);
                 }
             }
 
-            // ── Image ─────────────────────────────────────────────────
             ElementKind::Image { image_index } => {
                 if let Some(image) = doc.images.get(image_index as usize) {
-                    render_image(image, &elem.text, p, doc.ocr_text_only, doc.append_ocr_text, buf);
+                    let render_ocr = elem.should_render_image_ocr();
+                    render_image(
+                        image,
+                        &elem.text,
+                        p,
+                        doc.ocr_text_only && render_ocr,
+                        doc.append_ocr_text && render_ocr,
+                        buf,
+                    );
                 }
             }
 
-            // ── Page break ────────────────────────────────────────────
             ElementKind::PageBreak => {
                 let page = elem.page.unwrap_or(0);
                 write!(buf, r#"<hr class="{p}page-break" data-page="{page}">"#).unwrap();
@@ -468,10 +487,6 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
         }
     }
 }
-
-// ============================================================================
-// Inline annotation rendering
-// ============================================================================
 
 fn render_inline(_doc: &InternalDocument, elem: &crate::types::internal::InternalElement, p: &str) -> String {
     if elem.annotations.is_empty() {
@@ -495,15 +510,10 @@ fn render_inline(_doc: &InternalDocument, elem: &crate::types::internal::Interna
     )
 }
 
-// ============================================================================
-// Table rendering
-// ============================================================================
-
 fn render_table(table: &crate::types::tables::Table, p: &str, buf: &mut String) {
     write!(buf, r#"<table class="{p}table">"#).unwrap();
     let mut rows = table.cells.iter().peekable();
 
-    // First row → thead
     if let Some(header_row) = rows.next() {
         write!(buf, r#"<thead class="{p}thead"><tr class="{p}tr">"#).unwrap();
         for cell in header_row {
@@ -512,7 +522,6 @@ fn render_table(table: &crate::types::tables::Table, p: &str, buf: &mut String) 
         buf.push_str("</tr></thead>");
     }
 
-    // Remaining rows → tbody
     if rows.peek().is_some() {
         write!(buf, r#"<tbody class="{p}tbody">"#).unwrap();
         for row in rows {
@@ -527,10 +536,6 @@ fn render_table(table: &crate::types::tables::Table, p: &str, buf: &mut String) 
 
     buf.push_str("</table>");
 }
-
-// ============================================================================
-// Image rendering
-// ============================================================================
 
 fn render_image(
     image: &crate::types::ExtractedImage,
@@ -576,10 +581,6 @@ fn render_image(
 
     buf.push_str("</figure>");
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -675,6 +676,47 @@ mod tests {
     }
 
     #[test]
+    fn formula_emits_dollar_math_not_code_block() {
+        let doc = make_doc(ElementKind::Formula, "x^2 + y^2 = z^2");
+        let out = render(
+            HtmlOutputConfig {
+                embed_css: false,
+                ..Default::default()
+            },
+            &doc,
+        );
+        assert!(
+            out.contains(r#"<div class="kb-formula kb-math" data-math-style="display">$$x^2 + y^2 = z^2$$</div>"#),
+            "unexpected formula markup: {out}"
+        );
+        assert!(
+            !out.contains("<pre"),
+            "formula should not render as a code block: {out}"
+        );
+        assert!(
+            !out.contains("<code"),
+            "formula should not render as a code block: {out}"
+        );
+    }
+
+    #[test]
+    fn formula_escapes_html_special_characters() {
+        let doc = make_doc(ElementKind::Formula, "a < b & b > c");
+        let out = render(
+            HtmlOutputConfig {
+                embed_css: false,
+                ..Default::default()
+            },
+            &doc,
+        );
+        assert!(
+            out.contains("$$a &lt; b &amp; b &gt; c$$"),
+            "escaped formula missing: {out}"
+        );
+        assert!(!out.contains("a < b & b > c"), "raw unescaped formula leaked: {out}");
+    }
+
+    #[test]
     fn text_content_is_escaped() {
         let doc = make_doc(ElementKind::Paragraph, "<script>alert(1)</script>");
         let out = render(
@@ -722,6 +764,7 @@ mod tests {
             markdown: String::new(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         };
         let idx = doc.push_table(table);
         doc.push_element(InternalElement::text(ElementKind::Table { table_index: idx }, "", 0));
@@ -797,6 +840,25 @@ mod tests {
             !out.contains("OCR caption"),
             "unexpected OCR text when both flags false: {out}"
         );
+    }
+
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    fn image_internal_suppression_preserves_figure_without_nested_ocr() {
+        let mut doc = make_image_doc(false, true);
+        doc.elements[0].suppress_image_ocr_rendering();
+
+        let out = render(
+            HtmlOutputConfig {
+                embed_css: false,
+                ..Default::default()
+            },
+            &doc,
+        );
+
+        assert!(out.contains("<figure"));
+        assert!(!out.contains("OCR caption"));
+        assert!(doc.images[0].ocr_result.is_some());
     }
 
     #[test]

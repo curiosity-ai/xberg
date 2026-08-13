@@ -2,27 +2,34 @@
 
 use super::types::PdfParagraph;
 
+/// Maximum baseline-to-baseline gap, as a multiple of the larger paragraph's
+/// dominant font size, permitted when merging a continuation paragraph.
+///
+/// A wrapped continuation line sits roughly one line-height (leading is
+/// typically 1.0–1.6× the font size) below its predecessor. A gap several times
+/// larger means the two paragraphs come from spatially distinct regions — e.g. a
+/// recipient block near the top of an invoice and a legal footer near the
+/// bottom — and must never be joined into one logical paragraph, which would
+/// associate their text (and mangle the merged block's bounding box). See #1350.
+const MAX_CONTINUATION_LINE_GAP_MULTIPLE: f32 = 3.0;
+
 /// Merge consecutive body-text paragraphs that are continuations of the same logical paragraph.
 ///
 /// Two consecutive paragraphs are merged if:
 /// - Both are body text (no heading_level, not is_list_item)
 /// - The first paragraph doesn't end with sentence-ending punctuation
 /// - Font sizes are within 2pt of each other
+/// - Their baselines are within [`MAX_CONTINUATION_LINE_GAP_MULTIPLE`] line-heights
 pub(super) fn merge_continuation_paragraphs(paragraphs: &mut Vec<PdfParagraph>) {
     if paragraphs.len() < 2 {
         return;
     }
 
-    // O(N) single-pass merge: drain the original vec and rebuild, avoiding
-    // the O(N²) cost of repeated Vec::remove shifts.
     let old = std::mem::take(paragraphs);
     let mut iter = old.into_iter();
-    // SAFETY: we returned early above when paragraphs.len() < 2, so `old`
-    // contains at least two elements and the first next() always succeeds.
     let mut current = iter.next().unwrap();
 
     for next in iter {
-        // Both must be body text (no heading, list, code, or formula)
         let both_body = current.heading_level.is_none()
             && next.heading_level.is_none()
             && !current.is_list_item
@@ -31,15 +38,36 @@ pub(super) fn merge_continuation_paragraphs(paragraphs: &mut Vec<PdfParagraph>) 
             && !next.is_code_block
             && !current.is_formula
             && !next.is_formula;
-        // Font sizes close enough
         let fonts_compatible = (current.dominant_font_size - next.dominant_font_size).abs() < 2.0;
-        // Merge when current doesn't end with terminator, or when next
-        // starts with a lowercase letter (sentence continuation).
+        // Never merge across a bold-state boundary. A bold run following non-bold
+        // prose (or vice versa) is a formatting break — an emphasized heading or a
+        // list item's bold lead-in — not a wrapped continuation. Absorbing it would
+        // bury the heading as inline bold before it can be classified. This mirrors
+        // the `bold_change` paragraph break in the heuristic line grouper. ~keep
+        let bold_compatible = current.is_bold == next.is_bold;
         let continuation_signal = !ends_with_sentence_terminator(&current) || starts_with_lowercase_continuation(&next);
-        let should_merge = both_body && fonts_compatible && continuation_signal;
+        let same_region = current.layout_region_path == next.layout_region_path;
+        let same_rotation = paragraphs_share_rotation(&current, &next);
+        let vertical_gap_compatible = baselines_within_continuation_gap(&current, &next);
+        // A numbered section heading starts a new logical element and must never be
+        // absorbed as a continuation. A heading does not end in `.?!:;`, so
+        // `continuation_signal` is satisfied by the *previous* heading alone — it is
+        // an `||` boost, not a requirement — and a run of consecutive subsection
+        // headings would otherwise be re-joined here even after the line grouper
+        // split them. See #1386. ~keep
+        let next_starts_section = starts_numbered_section(&next);
+        let should_merge = both_body
+            && fonts_compatible
+            && bold_compatible
+            && continuation_signal
+            && same_region
+            && same_rotation
+            && vertical_gap_compatible
+            && !next_starts_section;
 
         if should_merge {
             current.text.clear();
+            current.block_bbox = union_block_bbox(current.block_bbox, next.block_bbox);
             current.lines.extend(next.lines);
         } else {
             paragraphs.push(current);
@@ -48,6 +76,70 @@ pub(super) fn merge_continuation_paragraphs(paragraphs: &mut Vec<PdfParagraph>) 
     }
 
     paragraphs.push(current);
+}
+
+fn paragraphs_share_rotation(current: &PdfParagraph, next: &PdfParagraph) -> bool {
+    let current_rotation = current.lines.last().and_then(|line| line.segments.last());
+    let next_rotation = next.lines.first().and_then(|line| line.segments.first());
+    match (current_rotation, next_rotation) {
+        (Some(current), Some(next)) => current.has_same_rotation(next),
+        _ => true,
+    }
+}
+
+/// Whether `next`'s first baseline is close enough below `current`'s last
+/// baseline to be a wrapped continuation rather than a spatially distant block.
+///
+/// Returns `true` when either paragraph lacks per-line geometry (`baseline_y`
+/// unset on the structure-tree path), preserving the prior behavior for inputs
+/// where a vertical distance cannot be computed.
+fn baselines_within_continuation_gap(current: &PdfParagraph, next: &PdfParagraph) -> bool {
+    let (Some(current_last), Some(next_first)) = (current.lines.last(), next.lines.first()) else {
+        return true;
+    };
+    // No geometry available (e.g. synthesized paragraphs): fall back to allowing
+    // the merge, gated by the other continuation signals.
+    if current_last.baseline_y == 0.0 || next_first.baseline_y == 0.0 {
+        return true;
+    }
+    let gap = (current_last.baseline_y - next_first.baseline_y).abs();
+    let line_height = current.dominant_font_size.max(next.dominant_font_size).max(1.0);
+    gap <= line_height * MAX_CONTINUATION_LINE_GAP_MULTIPLE
+}
+
+/// Union of two optional block bounding boxes in `(left, bottom, right, top)`
+/// PDF-coordinate form, so a merged paragraph's box spans all of its text.
+fn union_block_bbox(
+    current: Option<(f32, f32, f32, f32)>,
+    next: Option<(f32, f32, f32, f32)>,
+) -> Option<(f32, f32, f32, f32)> {
+    match (current, next) {
+        (Some((cl, cb, cr, ct)), Some((nl, nb, nr, nt))) => Some((cl.min(nl), cb.min(nb), cr.max(nr), ct.max(nt))),
+        (Some(bbox), None) | (None, Some(bbox)) => Some(bbox),
+        (None, None) => None,
+    }
+}
+
+/// Whether a paragraph's first visual line reads as a numbered section heading
+/// ("1.3 Gasinstallatie", "IV. Results", "1. INTRODUCTION").
+///
+/// The first line's segments are re-joined because word-processor output often
+/// splits the numbering into its own text run, so the leading segment alone can
+/// be a bare "1.3". The conservative `is_numbered_section_heading` is used rather
+/// than `starts_with_section_number` so a paragraph opening with a bare year
+/// ("2024 was een druk jaar") is still treated as prose.
+fn starts_numbered_section(para: &PdfParagraph) -> bool {
+    let Some(first_line) = para.lines.first() else {
+        return false;
+    };
+    let joined = first_line
+        .segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    super::classify::is_numbered_section_heading(&joined)
 }
 
 /// Check if a paragraph starts with a lowercase letter, indicating it's a
@@ -86,13 +178,11 @@ fn ends_with_sentence_terminator(para: &PdfParagraph) -> bool {
 pub(super) fn split_embedded_list_items(paragraphs: &mut Vec<PdfParagraph>) {
     let old = std::mem::take(paragraphs);
     for para in old {
-        // Only split non-heading, non-list, non-code paragraphs
         if para.heading_level.is_some() || para.is_list_item || para.is_code_block || para.is_formula {
             paragraphs.push(para);
             continue;
         }
 
-        // Collect full text to check for embedded bullets
         let full_text: String = para
             .lines
             .iter()
@@ -101,19 +191,15 @@ pub(super) fn split_embedded_list_items(paragraphs: &mut Vec<PdfParagraph>) {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Count bullet occurrences — only split if there are multiple. The
-        // text repair pass normalizes `•` to middle dot, so accept both forms.
         let bullet_count = full_text.matches(['\u{2022}', '\u{00B7}']).count();
         if bullet_count < 2 {
             paragraphs.push(para);
             continue;
         }
 
-        // Split on bullet character boundaries
         let font_size = para.dominant_font_size;
         let is_bold = para.is_bold;
 
-        // Split the full text on bullet markers and produce separate paragraphs.
         let parts: Vec<&str> = full_text.split(['\u{2022}', '\u{00B7}']).collect();
         let before = parts[0].trim().trim_end_matches('\u{00C2}').trim();
         if !before.is_empty() {
@@ -149,6 +235,7 @@ fn text_to_paragraph(text: &str, font_size: f32, is_bold: bool, is_list_item: bo
             is_italic: false,
             is_monospace: false,
             baseline_y: 0.0,
+            rotation_degrees: 0.0,
             assigned_role: None,
         })
         .collect();
@@ -174,6 +261,7 @@ fn text_to_paragraph(text: &str, font_size: f32, is_bold: bool, is_list_item: bo
         is_formula: false,
         is_page_furniture: false,
         layout_class: None,
+        layout_region_path: None,
         caption_for: None,
         block_bbox: None,
         word_count,
@@ -183,8 +271,6 @@ fn text_to_paragraph(text: &str, font_size: f32, is_bold: bool, is_list_item: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- merge_continuation_paragraphs tests --
 
     fn make_body_paragraph(text: &str, font_size: f32) -> PdfParagraph {
         use crate::pdf::hierarchy::SegmentData;
@@ -200,6 +286,7 @@ mod tests {
             is_italic: false,
             is_monospace: false,
             baseline_y: 700.0,
+            rotation_degrees: 0.0,
             assigned_role: None,
         }];
 
@@ -222,6 +309,7 @@ mod tests {
             is_formula: false,
             is_page_furniture: false,
             layout_class: None,
+            layout_region_path: None,
             caption_for: None,
             block_bbox: None,
             word_count,
@@ -229,8 +317,74 @@ mod tests {
     }
 
     #[test]
+    fn should_not_merge_paragraphs_across_rotation_boundary() {
+        let mut rotated = make_body_paragraph("Engine oil need only meet the", 12.0);
+        rotated.lines[0].segments[0].rotation_degrees = 90.0;
+        let footer = make_body_paragraph("vehicle footer", 12.0);
+        let mut paragraphs = vec![rotated, footer];
+
+        merge_continuation_paragraphs(&mut paragraphs);
+
+        assert_eq!(paragraphs.len(), 2);
+    }
+
+    fn make_body_paragraph_at(text: &str, font_size: f32, baseline_y: f32) -> PdfParagraph {
+        let mut para = make_body_paragraph(text, font_size);
+        para.lines[0].baseline_y = baseline_y;
+        if let Some(segment) = para.lines[0].segments.first_mut() {
+            segment.baseline_y = baseline_y;
+            segment.y = baseline_y;
+        }
+        para
+    }
+
+    #[test]
+    fn test_no_merge_across_distant_regions() {
+        // A buyer tax ID in the upper recipient block and a seller tax ID in the
+        // page footer are ~590pt apart. Neither ends with a sentence terminator,
+        // so the older heuristic would merge them; the vertical-gap guard must
+        // keep them separate. Regression for #1350.
+        let mut paragraphs = vec![
+            make_body_paragraph_at("Buyer tax ID SYNTH-BUYER-TAX-359370919", 8.0, 185.5),
+            make_body_paragraph_at("Seller tax ID SYNTH-SELLER-TAX-815876165", 8.0, 775.0),
+        ];
+        merge_continuation_paragraphs(&mut paragraphs);
+        assert_eq!(
+            paragraphs.len(),
+            2,
+            "paragraphs from spatially distant regions must not merge"
+        );
+    }
+
+    #[test]
+    fn test_merge_adjacent_lines_within_gap() {
+        // Genuine wrapped continuation one line-height apart still merges.
+        let mut paragraphs = vec![
+            make_body_paragraph_at("The committee reviewed the annual", 11.0, 712.0),
+            make_body_paragraph_at("report and approved the budget", 11.0, 698.0),
+        ];
+        merge_continuation_paragraphs(&mut paragraphs);
+        assert_eq!(paragraphs.len(), 1, "adjacent continuation lines should merge");
+    }
+
+    #[test]
+    fn test_merge_unions_block_bbox() {
+        let mut upper = make_body_paragraph_at("first line without terminator", 11.0, 712.0);
+        upper.block_bbox = Some((60.0, 705.0, 260.0, 720.0));
+        let mut lower = make_body_paragraph_at("second line continues", 11.0, 698.0);
+        lower.block_bbox = Some((60.0, 691.0, 300.0, 706.0));
+        let mut paragraphs = vec![upper, lower];
+        merge_continuation_paragraphs(&mut paragraphs);
+        assert_eq!(paragraphs.len(), 1, "adjacent lines should merge");
+        assert_eq!(
+            paragraphs[0].block_bbox,
+            Some((60.0, 691.0, 300.0, 720.0)),
+            "merged block bbox must span both source boxes"
+        );
+    }
+
+    #[test]
     fn test_merge_lowercase_continuation() {
-        // Second paragraph starts with lowercase → merge even if first ends with period
         let mut paragraphs = vec![
             make_body_paragraph("The regulation requires.", 12.0),
             make_body_paragraph("and all operators must comply", 12.0),
@@ -241,7 +395,6 @@ mod tests {
 
     #[test]
     fn test_no_merge_different_font_sizes() {
-        // Different font sizes (>2pt) should prevent merging
         let mut paragraphs = vec![
             make_body_paragraph("First paragraph", 12.0),
             make_body_paragraph("second paragraph", 16.0),
@@ -252,7 +405,6 @@ mod tests {
 
     #[test]
     fn test_merge_no_terminator() {
-        // First ends without terminator → merge
         let mut paragraphs = vec![
             make_body_paragraph("The regulation requires", 12.0),
             make_body_paragraph("All operators must comply", 12.0),
@@ -263,7 +415,6 @@ mod tests {
 
     #[test]
     fn test_no_merge_terminated_uppercase() {
-        // First ends with period, second starts with uppercase → don't merge
         let mut paragraphs = vec![
             make_body_paragraph("The regulation requires compliance.", 12.0),
             make_body_paragraph("All operators must comply", 12.0),
@@ -273,6 +424,121 @@ mod tests {
             paragraphs.len(),
             2,
             "terminated paragraph + uppercase start should not merge"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_across_bold_boundary() {
+        // A bold header following unterminated body prose must not be absorbed as
+        // a continuation — it should survive as its own paragraph for classification. ~keep
+        let body = make_body_paragraph(
+            "here is also available other sources of this Manual MetcalUser Guide",
+            12.0,
+        );
+        let mut header = make_body_paragraph("Impaired Glucose Tolerance And Impaired Fasting Glucose ...", 12.0);
+        header.is_bold = true;
+        let mut paragraphs = vec![body, header];
+        merge_continuation_paragraphs(&mut paragraphs);
+        assert_eq!(paragraphs.len(), 2, "bold header must not merge into non-bold prose");
+        assert!(paragraphs[1].is_bold, "the bold header paragraph must be preserved");
+    }
+
+    /// Text of a paragraph's first line, joined from its segments.
+    fn first_line_text(para: &PdfParagraph) -> String {
+        para.lines
+            .first()
+            .map(|line| {
+                line.segments
+                    .iter()
+                    .map(|s| s.text.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    }
+
+    /// Regression for #1386 (defect #290): a run of consecutive numbered
+    /// subsection headings at the same size and weight, one line-height apart,
+    /// must survive as four separate paragraphs. None of them ends in `.?!:;`,
+    /// so `continuation_signal` alone would merge the whole run into one element
+    /// and a consumer deriving a section hierarchy would see only "1.3".
+    #[test]
+    fn should_not_merge_consecutive_numbered_section_headings() {
+        let mut paragraphs = vec![
+            make_body_paragraph_at("1.3 Gasinstallatie", 11.0, 700.0),
+            make_body_paragraph_at("1.4 Elektrische installatie", 11.0, 686.0),
+            make_body_paragraph_at("1.5 Waterinstallatie", 11.0, 672.0),
+            make_body_paragraph_at("1.6 Ventilatie", 11.0, 658.0),
+        ];
+        merge_continuation_paragraphs(&mut paragraphs);
+
+        assert_eq!(
+            paragraphs.len(),
+            4,
+            "each numbered subsection heading must remain a separate element"
+        );
+        assert_eq!(first_line_text(&paragraphs[0]), "1.3 Gasinstallatie");
+        assert_eq!(first_line_text(&paragraphs[1]), "1.4 Elektrische installatie");
+        assert_eq!(first_line_text(&paragraphs[2]), "1.5 Waterinstallatie");
+        assert_eq!(first_line_text(&paragraphs[3]), "1.6 Ventilatie");
+    }
+
+    /// The over-fire guard for #1386: prose whose first token is a bare year is
+    /// NOT a section heading and must still merge with the unterminated line
+    /// above it. `starts_with_section_number` returns `true` here — using it
+    /// instead of `is_numbered_section_heading` would split ordinary prose.
+    #[test]
+    fn should_merge_prose_paragraph_starting_with_a_year() {
+        let mut paragraphs = vec![
+            make_body_paragraph_at("Het bestuur meldt", 11.0, 700.0),
+            make_body_paragraph_at("2024 was een druk jaar", 11.0, 686.0),
+        ];
+        merge_continuation_paragraphs(&mut paragraphs);
+
+        assert_eq!(
+            paragraphs.len(),
+            1,
+            "prose beginning with a bare year is not a section heading and must stay one paragraph"
+        );
+        assert_eq!(paragraphs[0].lines.len(), 2, "both prose lines must be present");
+    }
+
+    /// Roman-numeral and single-level ALL-CAPS headings are the other two shapes
+    /// `is_numbered_section_heading` accepts; both must block a merge.
+    #[test]
+    fn should_not_merge_roman_or_allcaps_numbered_headings() {
+        let mut paragraphs = vec![
+            make_body_paragraph_at("III. Scope", 11.0, 700.0),
+            make_body_paragraph_at("IV. Results", 11.0, 686.0),
+            make_body_paragraph_at("5. CONCLUSIONS", 11.0, 672.0),
+        ];
+        merge_continuation_paragraphs(&mut paragraphs);
+
+        assert_eq!(
+            paragraphs.len(),
+            3,
+            "roman and ALL-CAPS numbered headings must not merge"
+        );
+        assert_eq!(first_line_text(&paragraphs[0]), "III. Scope");
+        assert_eq!(first_line_text(&paragraphs[1]), "IV. Results");
+        assert_eq!(first_line_text(&paragraphs[2]), "5. CONCLUSIONS");
+    }
+
+    /// A single-level number followed by mixed-case text is a LIST item, not a
+    /// section heading, so the guard must not fire on it — this pins the
+    /// conservative boundary of the predicate the fix relies on.
+    #[test]
+    fn should_still_merge_single_level_mixed_case_numbering() {
+        let mut paragraphs = vec![
+            make_body_paragraph_at("De procedure verloopt als volgt", 11.0, 700.0),
+            make_body_paragraph_at("1. Eerste stap in het proces", 11.0, 686.0),
+        ];
+        merge_continuation_paragraphs(&mut paragraphs);
+
+        assert_eq!(
+            paragraphs.len(),
+            1,
+            "'1. Eerste stap' is list-shaped, not a section heading; the guard must not fire"
         );
     }
 
@@ -287,9 +553,6 @@ mod tests {
 
     #[test]
     fn test_merge_clears_precomputed_text_on_heuristic_path() {
-        // Heuristic-path paragraphs have non-empty text. After merging, text must
-        // be cleared so assembly re-derives the full content from segments via
-        // join_line_texts_plain rather than returning only the first fragment.
         let mut p1 = make_body_paragraph("een indicative", 12.0);
         p1.text = "een indicative".to_string();
         let mut p2 = make_body_paragraph("van toenemende merkbekendheid", 12.0);
@@ -306,12 +569,10 @@ mod tests {
 
     #[test]
     fn test_merge_struct_tree_path_text_stays_empty() {
-        // Struct-tree paragraphs always have empty text — clearing is a no-op.
         let mut paragraphs = vec![
             make_body_paragraph("first sentence without terminator", 12.0),
             make_body_paragraph("second continues here", 12.0),
         ];
-        // text is already empty from make_body_paragraph
         assert!(paragraphs[0].text.is_empty());
         merge_continuation_paragraphs(&mut paragraphs);
         assert_eq!(paragraphs.len(), 1);

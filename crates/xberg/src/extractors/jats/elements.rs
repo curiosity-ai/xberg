@@ -6,13 +6,14 @@ use crate::Result;
 use crate::extraction::cells_to_markdown;
 use crate::extractors::security::SecurityBudget;
 use crate::types::Table;
-use quick_xml::Reader;
 use quick_xml::events::Event;
+
+use crate::utils::xml_utils::EntityReader;
 
 /// Extract all content in a single optimized pass.
 /// Combines metadata extraction, content parsing, and table extraction into one pass.
 pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtracted, String, String, Vec<Table>)> {
-    let mut reader = Reader::from_str(content);
+    let mut reader = EntityReader::from_str(content);
     let mut budget = SecurityBudget::with_defaults();
     let mut metadata = JatsMetadataExtracted::default();
     let mut body_content = String::new();
@@ -78,7 +79,6 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                         in_contrib = true;
                         current_author.clear();
                         current_contrib_type.clear();
-                        // Extract contrib-type attribute
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref());
                             let val = String::from_utf8_lossy(attr.value.as_ref());
@@ -167,7 +167,6 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                         in_history = true;
                     }
                     "date" if in_history => {
-                        // Extract date-type attribute
                         let mut date_type = String::new();
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref());
@@ -303,7 +302,6 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                     "contrib" if in_contrib => {
                         if !current_author.is_empty() {
                             metadata.authors.push(current_author.clone());
-                            // Track contributor role
                             if !current_contrib_type.is_empty() {
                                 metadata
                                     .contributor_roles
@@ -357,6 +355,7 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                                 markdown,
                                 page_number: table_index + 1,
                                 bounding_box: None,
+                                ..Default::default()
                             });
                             table_index += 1;
                             current_table.clear();

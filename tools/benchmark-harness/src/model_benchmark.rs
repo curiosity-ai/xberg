@@ -59,7 +59,7 @@ pub async fn run_model_benchmark(config: &ModelBenchmarkConfig) -> Result<Vec<Mo
         file_types: Some(vec!["pdf".to_string()]),
         require_ground_truth: true,
         name_patterns: Vec::new(),
-        max_file_size: Some(5_000_000), // Skip huge PDFs for model benchmarks
+        max_file_size: Some(5_000_000),
         ..Default::default()
     };
 
@@ -74,7 +74,6 @@ pub async fn run_model_benchmark(config: &ModelBenchmarkConfig) -> Result<Vec<Mo
     let mut results = Vec::new();
 
     for doc in &docs {
-        // Model A: extract with layout + table model A
         let config_a = xberg::ExtractionConfig {
             output_format: xberg::core::config::OutputFormat::Markdown,
             layout: Some(xberg::core::config::layout::LayoutDetectionConfig {
@@ -99,7 +98,6 @@ pub async fn run_model_benchmark(config: &ModelBenchmarkConfig) -> Result<Vec<Mo
         };
         let model_a_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // Model B: extract with different table model
         let config_b = xberg::ExtractionConfig {
             output_format: xberg::core::config::OutputFormat::Markdown,
             layout: Some(xberg::core::config::layout::LayoutDetectionConfig {
@@ -124,7 +122,6 @@ pub async fn run_model_benchmark(config: &ModelBenchmarkConfig) -> Result<Vec<Mo
         };
         let model_b_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // Count headings as a proxy for detected regions
         let count_headings = |content: &str| content.lines().filter(|l| l.starts_with('#')).count();
 
         let model_a_regions = result_a.as_ref().map(|r| count_headings(&r.content)).unwrap_or(0);

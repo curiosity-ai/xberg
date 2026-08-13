@@ -30,7 +30,7 @@ tasks:
     dir: "{{.ROOT_DIR}}/test_apps/python"
     deps: [mock-server:build]
     cmds:
-      - uv sync
+      - uv sync --prerelease=allow
       - uv run --no-sync python -m pytest tests/test_smoke.py -v
 
   smoke:node:
@@ -54,8 +54,13 @@ tasks:
     env:
       GOWORK: "off"
     cmds:
-      - go mod download
-      - go test -v -run '^Test_Smoke' ./...
+      # The cgo binding needs the native lib resolved via `cmd/setup -print-env`
+      # export CGO_LDFLAGS in the same shell as the build so it is inherited.
+      - rm -rf .lib
+      - |
+        export CGO_LDFLAGS="$(go run github.com/xberg-io/xberg/packages/go/cmd/setup -print-env | sed -n 's/^export CGO_LDFLAGS="\(.*\)"$/\1/p')"
+        go mod tidy
+        go test -v -run '^Test_Smoke' ./...
 
   smoke:java:
     desc: Run Java test_app smoke test
@@ -85,7 +90,13 @@ tasks:
     deps: [mock-server:build]
     cmds:
       - composer install
-      - vendor/bin/phpunit
+      # install.sh (alef-generated) installs the native extension via PIE and appends
+      # `extension=xberg` to php.ini; that append persists across steps even though PIE's
+      # own env vars don't, so it must run before the test invocation but can be a
+      # separate step. run_tests.php (alef-generated) is the extension-load-aware runner —
+      # bare `vendor/bin/phpunit` never loads the extension. ~keep
+      - bash install.sh
+      - php run_tests.php
 
   smoke:rust:
     desc: Run Rust test_app smoke test
@@ -105,19 +116,28 @@ tasks:
     dir: "{{.ROOT_DIR}}/test_apps/dart"
     cmds:
       - dart pub get
+      # Pub.dev cannot ship the >100MB per-platform native set; the published package exposes a
+      # download_libs executable that fetches the native from the GitHub release. Without it,
+      # RustLib.init() finds no native and setUpAll fails. ~keep
+      - dart run xberg:download_libs
       - dart test test/smoke_test.dart
 
   smoke:zig:
     desc: Run Zig test_app smoke test
     dir: "{{.ROOT_DIR}}/test_apps/zig"
     cmds:
-      - zig build test --test-filter "smoke"
+      # zig 0.16's `zig build` has no --test-filter; build.zig exposes a dedicated
+      # `smoke` step that runs only smoke_test.zig (unchained from the full suite).
+      - zig build smoke
 
   smoke:swift:
     desc: Run Swift test_app smoke test
     dir: "{{.ROOT_DIR}}/test_apps/swift_e2e"
     cmds:
-      - swift test --filter SmokeTests
+      # Swift/XCTest has no self-spawning mock-server fixture (unlike Python's
+      # conftest), so the URI smoke tests need MOCK_SERVER_URL exported by the
+      # wrapper, which builds+starts the mock server around the command.
+      - "{{.ROOT_DIR}}/scripts/e2e/run-with-mock-server.sh swift test --filter SmokeTests"
 
   smoke:kotlin_android:
     desc: Run Kotlin Android test_app smoke test

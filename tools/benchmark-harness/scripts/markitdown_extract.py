@@ -88,7 +88,6 @@ def _run_with_timeout(fn, args, timeout):
         parent_conn.close()
         return result
     except Exception:
-        # Fork not available — fall back to in-process extraction
         try:
             return fn(*args)
         except Exception as e:
@@ -162,7 +161,6 @@ def main() -> None:
             print(f"Error extracting with MarkItDown: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        # Legacy fallback for direct file path
         try:
             payload = extract_sync(args[0])
             print(json.dumps(payload), end="")

@@ -2,7 +2,7 @@
 
 Gem::Specification.new do |spec|
   spec.name = "xberg"
-  spec.version = "1.0.0.pre.rc.9"
+  spec.version = "1.1.0"
   spec.authors       = ["Na'aman Hirschfeld <naaman@xberg.io>"]
   spec.summary       = "High-performance document intelligence library"
   spec.description   = "High-performance document intelligence library"
@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
 
   spec.license       = "MIT"
 
-  spec.required_ruby_version = [">= 3.2.0", "< 4.0"]
+  spec.required_ruby_version = ">= 3.2.0"
   spec.metadata["keywords"] = %w[document extraction ocr pdf text].join(",")
   spec.metadata["rubygems_mfa_required"] = "true"
 

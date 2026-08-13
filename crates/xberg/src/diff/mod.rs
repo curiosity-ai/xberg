@@ -85,8 +85,6 @@ pub fn compare(a: &ExtractedDocument, b: &ExtractedDocument, opts: &DiffOptions)
     }
 }
 
-// ── Content diff ─────────────────────────────────────────────────────────────
-
 fn diff_content(a: &str, b: &str, opts: &DiffOptions) -> Vec<DiffHunk> {
     let a_text = apply_truncation(a, opts.max_content_chars);
     let b_text = apply_truncation(b, opts.max_content_chars);
@@ -162,11 +160,11 @@ fn apply_truncation(text: &str, limit: Option<usize>) -> Option<String> {
     })
 }
 
-// ── Table diff ────────────────────────────────────────────────────────────────
-
 fn diff_tables(a_tables: &[Table], b_tables: &[Table]) -> (Vec<Table>, Vec<Table>, Vec<TableDiff>) {
     let min_len = a_tables.len().min(b_tables.len());
     let mut tables_changed = Vec::new();
+    let mut tables_removed = Vec::new();
+    let mut tables_added = Vec::new();
 
     for idx in 0..min_len {
         let a_t = &a_tables[idx];
@@ -182,30 +180,16 @@ fn diff_tables(a_tables: &[Table], b_tables: &[Table]) -> (Vec<Table>, Vec<Table
                 });
             }
         } else {
-            // Different shape — treat the pair as remove + add.
-            // The "removed" side is reported in tables_removed and "added" in tables_added.
-            // We handle this by falling through to the asymmetric slice handling below.
-            // But we need to signal that these shouldn't be counted as "paired" — so we
-            // emit them as add + remove even though they share the same index.
-            tables_changed.push(TableDiff {
-                from_index: idx,
-                to_index: idx,
-                // No cell-level changes: shapes differ; report as a structural replacement.
-                cell_changes: vec![],
-            });
+            tables_removed.push(a_t.clone());
+            tables_added.push(b_t.clone());
         }
     }
 
-    let tables_removed: Vec<Table> = if a_tables.len() > b_tables.len() {
-        a_tables[min_len..].to_vec()
-    } else {
-        vec![]
-    };
-    let tables_added: Vec<Table> = if b_tables.len() > a_tables.len() {
-        b_tables[min_len..].to_vec()
-    } else {
-        vec![]
-    };
+    if a_tables.len() > b_tables.len() {
+        tables_removed.extend(a_tables[min_len..].iter().cloned());
+    } else if b_tables.len() > a_tables.len() {
+        tables_added.extend(b_tables[min_len..].iter().cloned());
+    }
 
     (tables_added, tables_removed, tables_changed)
 }
@@ -214,9 +198,6 @@ fn diff_tables(a_tables: &[Table], b_tables: &[Table]) -> (Vec<Table>, Vec<Table
 ///
 /// Header content is NOT compared — column reordering with the same dimensions will produce
 /// per-cell `CellChange` entries for every cell whose value differs, not a structural replacement.
-///
-/// TODO: smarter shape-matching that aligns tables by header names (instead of positional
-/// index) is a follow-up; for now dimensions-only is the v1 default.
 fn tables_same_shape(a: &Table, b: &Table) -> bool {
     if a.cells.len() != b.cells.len() {
         return false;
@@ -242,8 +223,6 @@ fn diff_cells(a: &Table, b: &Table) -> Vec<CellChange> {
     }
     changes
 }
-
-// ── Metadata diff ─────────────────────────────────────────────────────────────
 
 fn diff_metadata(a: &crate::types::metadata::Metadata, b: &crate::types::metadata::Metadata) -> serde_json::Value {
     let a_val = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
@@ -275,8 +254,6 @@ fn diff_metadata(a: &crate::types::metadata::Metadata, b: &crate::types::metadat
 
     serde_json::json!({ "added": added, "removed": removed, "changed": changed })
 }
-
-// ── Embedded diff ─────────────────────────────────────────────────────────────
 
 fn diff_embedded(
     a_children: Option<&[ArchiveEntry]>,
@@ -336,8 +313,6 @@ fn is_nonempty_metadata_diff(val: &serde_json::Value) -> bool {
     val != &empty_obj
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(all(test, feature = "diff"))]
 mod tests {
     use super::*;
@@ -370,10 +345,9 @@ mod tests {
             markdown: String::new(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         }
     }
-
-    // ── identical inputs ──────────────────────────────────────────────────────
 
     #[test]
     fn should_produce_empty_diff_for_identical_inputs() {
@@ -399,8 +373,6 @@ mod tests {
         );
         assert!(!is_nonempty_diff(&diff));
     }
-
-    // ── content diff ─────────────────────────────────────────────────────────
 
     #[test]
     fn should_produce_one_hunk_for_single_line_change() {
@@ -430,15 +402,10 @@ mod tests {
 
         assert_eq!(diff.content_diff.len(), 1);
         let hunk = &diff.content_diff[0];
-        // With 3-line context the hunk expands to include surrounding lines.
-        // Three-line text with change at line 1 (0-indexed): context pulls the
-        // hunk start back to line 0 (beginning of file).
         assert_eq!(hunk.from_line, 0);
         assert_eq!(hunk.to_line, 0);
-        // All 3 lines appear: one context, one changed, one context.
         assert_eq!(hunk.from_count, 3);
         assert_eq!(hunk.to_count, 3);
-        // The hunk must contain the changed lines.
         let has_removed = hunk
             .lines
             .iter()
@@ -466,7 +433,25 @@ mod tests {
         assert!(!diff.tables_changed.is_empty(), "table change expected");
     }
 
-    // ── table diff ───────────────────────────────────────────────────────────
+    /// Regression for #1223: a table that changes shape (gains a column) at the
+    /// same index must be reported as removed + added, not as an information-free
+    /// empty `tables_changed` entry.
+    #[test]
+    fn shape_change_reports_removed_and_added_not_empty_change() {
+        let a = result_with_tables(vec![simple_table(vec![vec!["A", "B"], vec!["1", "2"]])]);
+        let b = result_with_tables(vec![simple_table(vec![vec!["A", "B", "C"], vec!["1", "2", "3"]])]);
+        let diff = compare(&a, &b, &DiffOptions::default());
+
+        assert!(
+            diff.tables_changed.is_empty(),
+            "a shape change must not produce an empty 'changed' entry; got: {:?}",
+            diff.tables_changed
+        );
+        assert_eq!(diff.tables_removed.len(), 1, "old-shape table must be reported removed");
+        assert_eq!(diff.tables_added.len(), 1, "new-shape table must be reported added");
+        assert_eq!(diff.tables_removed[0].cells[0].len(), 2);
+        assert_eq!(diff.tables_added[0].cells[0].len(), 3);
+    }
 
     #[test]
     fn should_detect_single_cell_change_in_same_table() {
@@ -505,8 +490,6 @@ mod tests {
         assert_eq!(diff.tables_removed[0].cells[0][0], "OLD");
         assert!(diff.tables_added.is_empty());
     }
-
-    // ── embedded diff ─────────────────────────────────────────────────────────
 
     #[test]
     fn should_detect_added_embedded_child() {

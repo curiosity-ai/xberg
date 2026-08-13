@@ -193,7 +193,6 @@ pub async fn classify_one(
     )
     .await?;
 
-    // page_number is irrelevant here — we only need the label vector.
     let parsed = parse_response(0, &value, config.multi_label);
     Ok((parsed.labels, usage))
 }

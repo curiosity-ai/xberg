@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Download the OmniDocBench dataset (opendatalab/OmniDocBench) from HuggingFace.
-#
-# Usage:
-#   ./download_omnidocbench.sh [TARGET_DIR]
-#
-# Default target: tools/benchmark-harness/datasets/omnidocbench
-#
-# Requirements: curl, unzip (standard on macOS/Linux)
-# No HuggingFace account or API key needed (public dataset).
 
 set -euo pipefail
 
@@ -19,7 +10,6 @@ HF_BASE="https://huggingface.co/datasets/opendatalab/OmniDocBench/resolve/main"
 
 mkdir -p "$TARGET_DIR"
 
-# Download the main annotation file (65 MB)
 if [ -f "$TARGET_DIR/OmniDocBench.json" ]; then
   echo "OmniDocBench.json already exists, skipping"
 else
@@ -27,7 +17,6 @@ else
   curl -L -o "$TARGET_DIR/OmniDocBench.json" "$HF_BASE/OmniDocBench.json"
 fi
 
-# Download images directory via HF CLI if available, otherwise use git-lfs clone
 if [ -d "$TARGET_DIR/images" ] && [ "$(find "$TARGET_DIR/images" -maxdepth 1 -type f 2>/dev/null | wc -l)" -gt 100 ]; then
   echo "images/ directory already populated ($(find "$TARGET_DIR/images" -maxdepth 1 -type f | wc -l) files), skipping"
 else
@@ -55,7 +44,6 @@ else
   fi
 fi
 
-# Summary
 echo ""
 echo "OmniDocBench downloaded to: $TARGET_DIR"
 echo "  Annotations: $(wc -c <"$TARGET_DIR/OmniDocBench.json" | tr -d ' ') bytes"

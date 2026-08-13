@@ -1,8 +1,4 @@
 //! Vendored from text-splitter v0.30.1 (MIT, © 2023 Benjamin Brandt). See ATTRIBUTIONS.md.
-/*!
-# [`TextSplitter`]
-Semantic splitting of text documents.
-*/
 
 use std::ops::Range;
 

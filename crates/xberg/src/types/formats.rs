@@ -20,25 +20,20 @@ where
 
     match value {
         serde_json::Value::String(s) => {
-            // Single string: split on "+" (Tesseract format) or treat as single language
             if s.contains('+') {
-                // Tesseract multi-language format: "eng+deu" -> vec!["eng", "deu"]
                 Ok(s.split('+').map(|l| l.to_string()).collect())
             } else {
-                // Single language: "eng" -> vec!["eng"]
                 Ok(vec![s])
             }
         }
-        serde_json::Value::Array(arr) => {
-            // Array of strings: deserialize directly
-            arr.into_iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(String::from)
-                        .ok_or_else(|| Error::custom("each language must be a string"))
-                })
-                .collect()
-        }
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| Error::custom("each language must be a string"))
+            })
+            .collect(),
         _ => Err(Error::custom(
             "language must be a string (e.g., \"eng\") or an array of strings (e.g., [\"eng\", \"deu\"])",
         )),
@@ -362,9 +357,13 @@ impl Default for ImagePreprocessingConfig {
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[serde(default)]
 pub struct TesseractConfig {
-    /// Language code(s) for OCR recognition.
-    /// Accepts either a single language code ("eng") or a list (["eng", "deu"]).
-    /// For Tesseract backend, languages are joined with "+".
+    /// Language code(s) for OCR recognition. For Tesseract, languages are joined with "+".
+    ///
+    /// A list is the canonical form and the only form accepted by the binding
+    /// object APIs (Python, Node, PHP, WASM, etc.): `["eng", "deu"]`. When
+    /// deserializing from a config file, JSON body, or the REST/MCP API, a
+    /// single string is also accepted, either as one code ("eng") or
+    /// "+"-joined ("eng+deu").
     #[serde(deserialize_with = "deserialize_languages")]
     pub language: Vec<String>,
 
@@ -449,7 +448,6 @@ impl Default for TesseractConfig {
     fn default() -> Self {
         Self {
             language: vec!["eng".to_string()],
-            // PSM_AUTO (3) hangs 60-90s on sparse/no-text images in WASM (issue #855)
             #[cfg(target_arch = "wasm32")]
             psm: 6,
             #[cfg(not(target_arch = "wasm32"))]

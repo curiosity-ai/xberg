@@ -20,6 +20,9 @@ pub mod error;
 #[cfg(feature = "pdf")]
 /// Document hierarchy reconstruction from PDF structure trees.
 pub mod hierarchy;
+#[cfg(all(feature = "pdf", feature = "layout-detection"))]
+/// Per-page pre-screen for adaptive layout detection.
+pub(crate) mod layout_gate;
 #[cfg(feature = "pdf")]
 /// PDF metadata types: document info dictionary and page structure.
 pub mod metadata;
@@ -31,8 +34,16 @@ pub(crate) mod oxide_text;
 /// PDF page rendering to raster images.
 pub mod render;
 #[cfg(feature = "pdf")]
+/// Drawn ruling-line detection shared by the layout gate and the table gate.
+pub(crate) mod rules;
+#[cfg(feature = "pdf")]
+/// Scanned-page detection.
+pub(crate) mod scan_detect;
+#[cfg(feature = "pdf")]
 /// PDF logical structure extraction (tagged PDF support).
 pub mod structure;
+#[cfg(feature = "pdf")]
+pub(crate) mod table_normalize;
 #[cfg(feature = "pdf")]
 /// Table reconstruction from PDF text-layer word positions.
 pub mod table_reconstruct;

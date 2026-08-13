@@ -5,8 +5,18 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum LayoutError {
     /// ONNX Runtime returned an error during session creation or inference.
+    ///
+    /// Only constructible under the ORT-backed `layout-detection` feature (session.rs,
+    /// `tatr.rs`, `slanet.rs` are the sole producers); absent under the pure-Rust
+    /// `layout-tract` variant, where seam-based models surface `Inference` instead.
+    #[cfg(feature = "layout-detection")]
     #[error("ORT error: {0}")]
     Ort(#[from] ort::Error),
+    /// A model on the engine-neutral [`crate::inference`] seam failed to load or
+    /// run. Engine-agnostic (ORT or tract) — carries the seam error's message so
+    /// the layout models need not name a concrete engine's error type.
+    #[error("inference error: {0}")]
+    Inference(String),
     /// Image decoding or preprocessing failed.
     #[error("Image error: {0}")]
     Image(#[from] image::ImageError),

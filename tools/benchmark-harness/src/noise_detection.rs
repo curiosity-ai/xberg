@@ -112,8 +112,8 @@ pub struct NoiseSummary {
 /// Represents a range of lines inside a fenced code block.
 #[derive(Debug, Clone, Copy)]
 struct CodeRange {
-    start: usize, // inclusive, 0-indexed
-    end: usize,   // inclusive, 0-indexed
+    start: usize,
+    end: usize,
 }
 
 /// Returns true if the given 0-indexed line is inside any code range.
@@ -129,7 +129,6 @@ fn find_code_ranges(lines: &[&str]) -> Vec<CodeRange> {
     let mut in_fence = false;
     let mut fence_start = 0;
 
-    // First pass: fenced code blocks
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
@@ -146,10 +145,8 @@ fn find_code_ranges(lines: &[&str]) -> Vec<CodeRange> {
         }
     }
 
-    // Second pass: indented code blocks (4 spaces or 1 tab, preceded by blank line)
     let mut i = 0;
     while i < lines.len() {
-        // Skip lines already inside fenced code blocks
         if in_code_block(i, &ranges) {
             i += 1;
             continue;
@@ -157,18 +154,14 @@ fn find_code_ranges(lines: &[&str]) -> Vec<CodeRange> {
 
         let is_indented_code = lines[i].starts_with("    ") || lines[i].starts_with('\t');
         if is_indented_code {
-            // Check that it's preceded by a blank line or start of document
             let preceded_by_blank = i == 0 || lines[i - 1].trim().is_empty();
             if preceded_by_blank {
                 let block_start = i;
-                // Consume all consecutive indented or blank lines
                 while i < lines.len()
                     && (lines[i].starts_with("    ") || lines[i].starts_with('\t') || lines[i].trim().is_empty())
                 {
                     i += 1;
                 }
-                // Only mark as code if we had at least one indented line
-                // (block_start was already verified as indented)
                 let block_end = i.saturating_sub(1);
                 ranges.push(CodeRange {
                     start: block_start,
@@ -189,7 +182,6 @@ fn truncate_context(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        // Find a valid char boundary at or before max_len
         let end = s.floor_char_boundary(max_len);
         format!("{}...", &s[..end])
     }
@@ -203,13 +195,12 @@ fn all_tag_occurrences_escaped(lower: &str, tag: &str) -> bool {
     while let Some(pos) = lower[start..].find(tag) {
         let abs_pos = start + pos;
         found_any = true;
-        // Check if preceded by backslash
         if abs_pos == 0 || lower.as_bytes()[abs_pos - 1] != b'\\' {
             return false;
         }
         start = abs_pos + tag.len();
     }
-    found_any // should always be true since caller verified contains()
+    found_any
 }
 
 /// Detects HTML tags outside code blocks.
@@ -238,7 +229,7 @@ fn detect_html_remnants(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseI
                     context: truncate_context(line, 80),
                     severity: Severity::Warning,
                 });
-                break; // one issue per line
+                break;
             }
         }
     }
@@ -284,7 +275,6 @@ fn detect_excessive_whitespace(lines: &[&str], code_ranges: &[CodeRange]) -> Vec
         }
     }
 
-    // Handle trailing blank lines
     flush_blank_run(&mut issues, blank_count, blank_run_start);
 
     issues
@@ -309,12 +299,8 @@ fn is_horizontal_rule(trimmed: &str) -> bool {
 /// Covers both block-level (`-`, `|`, `*`, etc.) and inline syntax (`!`, `[`, `]`,
 /// `(`, `)`, `\`, `.`, `/`) plus HTML entity delimiters (`&`, `;`).
 const MARKDOWN_STRUCTURAL_PUNCT: &[char] = &[
-    '-', '|', '*', '_', '=', '~', ':', '#', '>', // block-level
-    '.', '/', '!', '[', ']', '(', ')', '\\', // inline syntax
-    '{', '}', // LaTeX equations, e.g. \sum_{k=0}^{n}
-    '&', ';', // HTML entities
-    '\'', '"', // quotes (RST underlines, attribute values)
-    '+', // list markers, diff markers
+    '-', '|', '*', '_', '=', '~', ':', '#', '>', '.', '/', '!', '[', ']', '(', ')', '\\', '{', '}', '&', ';', '\'',
+    '"', '+',
 ];
 
 /// Returns true if the character belongs to a recognized non-Latin script that
@@ -325,59 +311,32 @@ const MARKDOWN_STRUCTURAL_PUNCT: &[char] = &[
 fn is_known_script_char(c: char) -> bool {
     let cp = c as u32;
     matches!(cp,
-        // Latin Extended / accented (not garbled)
         0x00C0..=0x024F |
-        // Greek and Coptic
         0x0370..=0x03FF |
-        // Cyrillic
         0x0400..=0x04FF |
-        // Armenian
         0x0530..=0x058F |
-        // Hebrew
         0x0590..=0x05FF |
-        // Arabic (including supplement, extended-A)
         0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF |
-        // Devanagari
         0x0900..=0x097F |
-        // Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam
         0x0980..=0x0DFF |
-        // Thai
         0x0E00..=0x0E7F |
-        // Georgian
         0x10A0..=0x10FF |
-        // Korean Hangul Jamo
         0x1100..=0x11FF |
-        // General punctuation (em dash, en dash, bullets, etc.)
         0x2000..=0x206F |
-        // Superscripts and subscripts
         0x2070..=0x209F |
-        // Currency symbols
         0x20A0..=0x20CF |
-        // Letterlike symbols
         0x2100..=0x214F |
-        // Number forms (fractions)
         0x2150..=0x218F |
-        // Arrows
         0x2190..=0x21FF |
-        // Mathematical operators
         0x2200..=0x22FF |
-        // Enclosed alphanumerics
         0x2460..=0x24FF |
-        // Geometric shapes
         0x25A0..=0x25FF |
-        // Miscellaneous symbols
         0x2600..=0x26FF |
-        // Dingbats
         0x2700..=0x27BF |
-        // CJK Unified Ideographs (+ extension A + compatibility)
         0x2E80..=0x9FFF |
-        // Korean Hangul Syllables
         0xAC00..=0xD7AF |
-        // CJK Compatibility Ideographs
         0xF900..=0xFAFF |
-        // Arabic Presentation Forms
         0xFB50..=0xFDFF | 0xFE70..=0xFEFF |
-        // CJK extension B+ (supplementary)
         0x20000..=0x2FA1F
     )
 }
@@ -390,7 +349,6 @@ fn is_legitimate_multilingual(non_ws_chars: &[char]) -> bool {
         return true;
     }
     let known_count = non_ascii_chars.iter().filter(|c| is_known_script_char(**c)).count();
-    // If 80%+ of non-ASCII chars are from known scripts, it's likely legit
     (known_count as f64 / non_ascii_chars.len() as f64) >= 0.8
 }
 
@@ -408,8 +366,6 @@ fn detect_garbled_text(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseIs
             continue;
         }
 
-        // Skip table separator rows, horizontal rules, and markdown image references —
-        // they are legitimate markdown, not garbled text.
         if is_table_separator_row(trimmed) || is_horizontal_rule(trimmed) || is_markdown_image(trimmed) {
             continue;
         }
@@ -419,8 +375,6 @@ fn detect_garbled_text(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseIs
             continue;
         }
 
-        // Check non-ASCII ratio, but only flag if the non-ASCII characters are NOT
-        // from recognized scripts (Arabic, CJK, Cyrillic, Greek, etc.)
         let non_ascii_count = non_ws_chars.iter().filter(|c| !c.is_ascii()).count();
         let ratio = non_ascii_count as f64 / non_ws_chars.len() as f64;
         if ratio > 0.7 && !is_legitimate_multilingual(&non_ws_chars) {
@@ -433,9 +387,6 @@ fn detect_garbled_text(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseIs
             continue;
         }
 
-        // Check for 4+ consecutive punctuation, excluding markdown structural characters.
-        // Common markdown patterns like `---`, `***`, `|||`, `[^`, `$$` use structural
-        // punctuation and should not be flagged.
         let mut consecutive_punct = 0;
         let mut has_punct_run = false;
         for ch in trimmed.chars() {
@@ -471,7 +422,6 @@ fn detect_empty_headings(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<Noise
             continue;
         }
         let trimmed = line.trim();
-        // Match ^#{1,6}\s*$
         if trimmed.starts_with('#') {
             let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
             if (1..=6).contains(&hash_count) {
@@ -518,7 +468,6 @@ fn detect_broken_tables(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseI
 
     for (i, line) in lines.iter().enumerate() {
         if in_code_block(i, code_ranges) {
-            // End any open table
             table_start = None;
             header_col_count = None;
             continue;
@@ -528,11 +477,9 @@ fn detect_broken_tables(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseI
         if trimmed.starts_with('|') {
             let col_count = count_unescaped_pipes(trimmed);
             if table_start.is_none() {
-                // Start of a new table
                 table_start = Some(i);
                 header_col_count = Some(col_count);
             } else if let Some(expected) = header_col_count {
-                // Skip separator rows (e.g., |---|---|)
                 let is_separator = trimmed.chars().all(|c| c == '|' || c == '-' || c == ':' || c == ' ');
                 if !is_separator && col_count != expected {
                     issues.push(NoiseIssue {
@@ -544,7 +491,6 @@ fn detect_broken_tables(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseI
                 }
             }
         } else {
-            // Non-table line ends the current table
             table_start = None;
             header_col_count = None;
         }
@@ -563,13 +509,11 @@ fn detect_orphaned_list_markers(lines: &[&str], code_ranges: &[CodeRange]) -> Ve
         }
         let trimmed = line.trim();
 
-        // Unordered: -, *, + with nothing after
         let is_orphaned_unordered = (trimmed == "-" || trimmed == "*" || trimmed == "+")
             || (trimmed.len() >= 2
                 && (trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ "))
                 && trimmed[2..].trim().is_empty());
 
-        // Ordered: digits followed by . and nothing else
         let is_orphaned_ordered = if let Some(dot_pos) = trimmed.find('.') {
             let before_dot = &trimmed[..dot_pos];
             let after_dot = &trimmed[dot_pos + 1..];
@@ -597,7 +541,6 @@ fn detect_orphaned_list_markers(lines: &[&str], code_ranges: &[CodeRange]) -> Ve
 /// exist AND the sequential numbers span at least 20 lines apart (page-like
 /// spacing). Clustered numbers (like table cells) are not flagged.
 fn detect_page_number_artifacts(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseIssue> {
-    // Collect candidate lines: standalone numbers 1-9999
     let mut candidates: Vec<(usize, u32)> = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
@@ -617,7 +560,6 @@ fn detect_page_number_artifacts(lines: &[&str], code_ranges: &[CodeRange]) -> Ve
         return Vec::new();
     }
 
-    // Check for sequential/near-sequential values and track their line span
     let values: Vec<u32> = candidates.iter().map(|(_, v)| *v).collect();
     let line_indices: Vec<usize> = candidates.iter().map(|(i, _)| *i).collect();
     let mut sequential_count = 0;
@@ -632,13 +574,10 @@ fn detect_page_number_artifacts(lines: &[&str], code_ranges: &[CodeRange]) -> Ve
         }
     }
 
-    // Need at least 4 sequential pairs (5 sequential numbers)
     if sequential_count < 4 {
         return Vec::new();
     }
 
-    // Require the sequential numbers to span at least 20 lines (page-like spacing).
-    // Clustered numbers (e.g., table cells on adjacent lines) won't pass this check.
     let span = sequential_max_line.saturating_sub(sequential_min_line);
     if span < 20 {
         return Vec::new();
@@ -671,11 +610,9 @@ fn is_image_placeholder(trimmed: &str) -> bool {
 /// or an escaped variant `\[...\](...)`. Used to skip garbled-text detection
 /// on lines that are purely image/link markup.
 fn is_markdown_image(trimmed: &str) -> bool {
-    // Standard markdown image: ![...](...) possibly with trailing text
     if trimmed.starts_with("![") {
         return true;
     }
-    // Escaped markdown link/image: \[...\](...) or \[\![...\](...) from Wikipedia extraction
     if trimmed.starts_with("\\[") || trimmed.starts_with("\\!") {
         return true;
     }
@@ -726,29 +663,23 @@ fn detect_header_footer_repetition(lines: &[&str], code_ranges: &[CodeRange]) ->
             continue;
         }
 
-        // Skip pipe table rows (including separator rows like |---|---|)
         if is_pipe_table_row(trimmed) {
             continue;
         }
 
-        // Skip image placeholders
         if is_image_placeholder(trimmed) {
             continue;
         }
 
-        // Skip RST grid table borders (lines of +, -, =, |, spaces)
         if is_rst_grid_table_border(trimmed) {
             continue;
         }
 
-        // Require minimum non-whitespace characters to be a header/footer candidate
         let non_ws_count = trimmed.chars().filter(|c| !c.is_whitespace()).count();
         if non_ws_count < MIN_NON_WS_CHARS {
             continue;
         }
 
-        // Skip lines that look like table column headers: all words are Title Case
-        // or UPPERCASE and the line is short.
         if trimmed.len() <= TABLE_HEADER_MAX_LEN && looks_like_table_header(trimmed) {
             continue;
         }
@@ -770,10 +701,8 @@ fn detect_header_footer_repetition(lines: &[&str], code_ranges: &[CodeRange]) ->
         }
     }
 
-    // Sort by line number for deterministic output
     issues.sort_by_key(|issue| issue.line);
 
-    // Cap total issues to avoid inflating noise counts
     issues.truncate(MAX_ISSUES);
     issues
 }
@@ -797,7 +726,6 @@ fn is_periodic(positions: &[usize], max_ratio: f64) -> bool {
     let mean = gaps.iter().sum::<f64>() / n;
 
     if mean < 1.0 {
-        // All occurrences are adjacent — not a header/footer pattern
         return false;
     }
 
@@ -839,7 +767,7 @@ fn looks_like_table_header(line: &str) -> bool {
 
 /// Detects footnote references `[^N]` without corresponding `[^N]:` definitions.
 fn detect_dangling_references(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseIssue> {
-    let mut references: Vec<(usize, String)> = Vec::new(); // (line_idx, label)
+    let mut references: Vec<(usize, String)> = Vec::new();
     let mut definitions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (i, line) in lines.iter().enumerate() {
@@ -857,7 +785,6 @@ fn detect_dangling_references(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<
                 if after_close.starts_with(':') {
                     definitions.insert(label);
                 } else if !label.is_empty() && !after_close.starts_with('(') {
-                    // Skip empty labels and [^](url) which are regular links, not footnotes
                     references.push((i, label));
                 }
                 start = abs_pos + 2 + close + 1;
@@ -901,7 +828,6 @@ fn detect_excessive_heading_density(lines: &[&str], code_ranges: &[CodeRange]) -
             }
         }
 
-        // Skip list markers, table rows
         if trimmed.starts_with('|')
             || trimmed.starts_with("- ")
             || trimmed.starts_with("* ")
@@ -931,8 +857,6 @@ fn detect_excessive_heading_density(lines: &[&str], code_ranges: &[CodeRange]) -
 /// These are extraction artifacts where the HTML-to-markdown conversion failed to
 /// decode character references.
 fn detect_unresolved_html_entities(lines: &[&str], code_ranges: &[CodeRange]) -> Vec<NoiseIssue> {
-    // Match numeric (&#123;) and named (&amp;) HTML entities.
-    // We use a simple scan rather than pulling in the regex crate.
     let mut issues = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
@@ -946,7 +870,6 @@ fn detect_unresolved_html_entities(lines: &[&str], code_ranges: &[CodeRange]) ->
             if bytes[pos] == b'&' {
                 let rest = &line[pos..];
                 if let Some(semi) = rest.find(';') {
-                    // Limit entity length to avoid matching across large spans
                     if semi <= 10 {
                         let entity = &rest[1..semi];
                         let is_numeric = entity.starts_with('#')
@@ -961,7 +884,6 @@ fn detect_unresolved_html_entities(lines: &[&str], code_ranges: &[CodeRange]) ->
                                 context: truncate_context(line, 80),
                                 severity: Severity::Warning,
                             });
-                            // One issue per line is enough
                             break;
                         }
                     }
@@ -1144,9 +1066,6 @@ Normal paragraph.
 
     #[test]
     fn test_garbled_text() {
-        // Use private-use area characters and replacement chars to simulate
-        // real mojibake, which should still be flagged. Latin-Extended chars
-        // (like a-umlaut, o-umlaut) are legitimate and should NOT be flagged.
         let md = "\
 # Title
 
@@ -1168,7 +1087,6 @@ Normal text here.
 
     #[test]
     fn test_german_umlauts_not_flagged_as_garbled() {
-        // German text with umlauts is legitimate multilingual content
         let md = "\
 # Title
 
@@ -1191,7 +1109,6 @@ Normal text here.
 
     #[test]
     fn test_page_numbers() {
-        // Need 5+ sequential numbers spanning 20+ lines to trigger detection
         let mut lines = vec!["# Title".to_string(), String::new()];
         for page in 1..=6 {
             lines.push(format!("Page {page} content with enough text to fill the space."));
@@ -1218,7 +1135,6 @@ Normal text here.
 
     #[test]
     fn test_clustered_numbers_not_flagged_as_page_numbers() {
-        // Numbers on adjacent lines (table-like data) should NOT be flagged
         let md = "\
 # Table Data
 
@@ -1261,7 +1177,6 @@ This has a reference[^1] and another[^2].
             .filter(|i| i.kind == NoiseKind::DanglingReference)
             .collect();
         assert!(!dangling.is_empty(), "Expected dangling reference for [^2]");
-        // [^1] should not be flagged since it has a definition
         assert!(
             dangling.iter().all(|i| {
                 let line = &md.lines().collect::<Vec<_>>()[i.line - 1];
@@ -1279,11 +1194,8 @@ This has a reference[^1] and another[^2].
         assert_eq!(report.summary.noise_score, 0.0);
     }
 
-    // ---- False-positive regression tests ----
-
     #[test]
     fn test_pipe_table_rows_not_flagged_as_header_footer() {
-        // Pipe table rows like `|  |  |  |` should NOT be flagged as repetition
         let md = "\
 | Col1 | Col2 | Col3 |
 |------|------|------|
@@ -1380,9 +1292,6 @@ Even more text.
 
     #[test]
     fn test_arabic_text_not_flagged_as_garbled() {
-        // Arabic text is 100% non-ASCII but is legitimate multilingual content.
-        // At 70% threshold it would be flagged, but we want to verify that
-        // mixed content below 70% is NOT flagged.
         let md = "\
 # Document
 
@@ -1403,7 +1312,6 @@ Some English text mixed with \u{0645}\u{0631}\u{062d}\u{0628}\u{0627} Arabic wor
 
     #[test]
     fn test_cjk_text_below_threshold_not_flagged() {
-        // CJK text mixed with enough ASCII to stay below 70%
         let md = "\
 # Document
 
@@ -1424,8 +1332,6 @@ This line has some CJK chars \u{4f60}\u{597d} mixed with English text here.
 
     #[test]
     fn test_truly_garbled_text_still_flagged() {
-        // Mojibake using Private Use Area and misc symbols that don't belong
-        // to any recognized script. These should be flagged as garbled.
         let md = "\
 # Title
 
@@ -1447,7 +1353,6 @@ Normal text here.
 
     #[test]
     fn test_markdown_structural_punct_not_flagged_as_garbled() {
-        // Lines with markdown structural punctuation like `---`, `***`, `|||`, `$$`
         let md = "\
 # Title
 
@@ -1470,7 +1375,6 @@ Text with **bold** and ~~strike~~ formatting.
 
     #[test]
     fn test_short_repeated_lines_not_flagged_as_header_footer() {
-        // Short lines (< 20 non-ws chars) repeated many times should not be flagged
         let md = "\
 Hello world text
 Hello world text
@@ -1502,7 +1406,6 @@ Some other text here.
 
     #[test]
     fn test_genuine_header_footer_repetition_still_flagged() {
-        // Genuine header/footer text repeated 10+ times at regular intervals should be flagged
         let md = "\
 Copyright 2024 Acme Corporation All Rights Reserved
 # Chapter 1
@@ -1548,7 +1451,6 @@ Copyright 2024 Acme Corporation All Rights Reserved
 
     #[test]
     fn test_nine_repetitions_no_longer_flagged() {
-        // 9 repetitions should NOT be flagged (threshold is now 10)
         let md = "\
 Copyright 2024 Acme Corporation All Rights Reserved
 # Chapter 1
@@ -1589,11 +1491,8 @@ Copyright 2024 Acme Corporation All Rights Reserved
         );
     }
 
-    // ---- GarbledText false-positive regression tests ----
-
     #[test]
     fn test_empty_image_link_not_flagged_as_garbled() {
-        // `![]()` contains `!`, `[`, `]`, `(`, `)` — should NOT be flagged
         let md = "\
 # Gallery
 
@@ -1618,7 +1517,6 @@ Normal text.
 
     #[test]
     fn test_escaped_markdown_links_not_flagged_as_garbled() {
-        // Wikipedia extraction: `\[Big Machine Records\](/wiki/Big_Machine_Records)`
         let md = "\
 # Wikipedia Article
 
@@ -1642,7 +1540,6 @@ Normal text here.
 
     #[test]
     fn test_toc_dot_leaders_not_flagged_as_garbled() {
-        // Table of contents with dot leaders
         let md = "\
 # Table of Contents
 
@@ -1666,7 +1563,6 @@ Appendix ............. 200
 
     #[test]
     fn test_truly_garbled_punct_still_flagged() {
-        // Truly garbled punctuation that is NOT markdown structural
         let md = "\
 # Title
 
@@ -1685,8 +1581,6 @@ Normal text.
             "Non-structural consecutive punctuation (@@@@) should still be flagged as garbled text"
         );
     }
-
-    // ---- UnresolvedHtmlEntity tests ----
 
     #[test]
     fn test_numeric_html_entity_detected() {
@@ -1754,21 +1648,14 @@ Normal text.
         );
     }
 
-    // ---- HeaderFooterRepetition heuristic regression tests ----
-
     #[test]
     fn test_iso_column_headers_not_flagged_as_header_footer() {
-        // ISO-style column headers like "Item Content Description" appearing 200x
-        // at irregular intervals should NOT be flagged — they are legitimate table
-        // content, not page headers/footers. The table header filter catches Title
-        // Case lines under 40 chars, and the min-char filter catches shorter ones.
         let mut lines = Vec::new();
         for i in 0..200 {
             lines.push(format!("## Test Case {i}"));
             lines.push("Item Content Description".to_string());
             lines.push("Prerequisite Condition".to_string());
             lines.push("Expected Test Result".to_string());
-            // Irregular spacing: add extra lines for some entries
             if i % 3 == 0 {
                 lines.push("Additional Notes Section".to_string());
                 lines.push(String::new());
@@ -1792,7 +1679,6 @@ Normal text.
 
     #[test]
     fn test_periodic_real_headers_are_flagged() {
-        // Real page headers appearing every ~50 lines (periodic) should be flagged.
         let mut lines = Vec::new();
         for page in 0..12 {
             lines.push("ACME Corporation - Internal Document - Confidential Draft".to_string());
@@ -1816,7 +1702,6 @@ Normal text.
 
     #[test]
     fn test_header_footer_cap_at_30_issues() {
-        // Even with many periodic occurrences, results are capped at 30 issues.
         let mut lines = Vec::new();
         for page in 0..50 {
             lines.push("ACME Corporation - Internal Document - Confidential Draft".to_string());
@@ -1840,11 +1725,8 @@ Normal text.
 
     #[test]
     fn test_irregular_repetition_not_flagged() {
-        // Content repeated many times but at completely irregular intervals should
-        // NOT be flagged (fails periodicity check).
         let mut lines = Vec::new();
         let repeated = "This particular content line appears many times in the document";
-        // Insert at irregular positions: clustered at the start and then sparse
         let positions = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 50, 200];
         let total_lines = 300;
         for i in 0..total_lines {
@@ -1870,7 +1752,6 @@ Normal text.
 
     #[test]
     fn test_table_header_words_excluded() {
-        // Lines where all words are Title Case and under 40 chars should not be flagged
         let mut lines = Vec::new();
         for i in 0..15 {
             lines.push("Test Case Identifier".to_string());
@@ -1892,11 +1773,8 @@ Normal text.
         );
     }
 
-    // ---- False-positive regression tests for escaped HTML, indented code, escaped pipes ----
-
     #[test]
     fn test_escaped_html_tags_not_flagged() {
-        // Backslash-escaped HTML tags like \<br\> are literal text, not HTML remnants
         let md = "\
 # Wikipedia Infobox
 
@@ -1919,7 +1797,6 @@ Normal text.
 
     #[test]
     fn test_real_html_still_flagged_alongside_escaped() {
-        // A line with both escaped AND real HTML should still be flagged
         let md = "\
 # Title
 
@@ -1939,7 +1816,6 @@ Normal text.
 
     #[test]
     fn test_indented_code_block_html_not_flagged() {
-        // Indented code blocks (4 spaces) should not have their HTML flagged
         let md = "\
 # Title
 
@@ -1966,7 +1842,6 @@ Normal paragraph after.
 
     #[test]
     fn test_escaped_pipes_not_counted_in_broken_table() {
-        // Escaped pipes \| in cell content should not affect column count
         let md = "\
 | Col1 | Col2 | Col3 |
 |------|------|------|
@@ -1988,7 +1863,6 @@ Normal paragraph after.
 
     #[test]
     fn test_pure_arabic_text_not_flagged_as_garbled() {
-        // Pure Arabic text (>70% non-ASCII) from a recognized script should NOT be flagged
         let md = "\
 # Document
 
@@ -2009,7 +1883,6 @@ Normal paragraph after.
 
     #[test]
     fn test_pure_chinese_text_not_flagged_as_garbled() {
-        // Pure Chinese text (>70% non-ASCII) should NOT be flagged
         let md = "\
 # Document
 
@@ -2030,7 +1903,6 @@ Normal paragraph after.
 
     #[test]
     fn test_pure_cyrillic_text_not_flagged_as_garbled() {
-        // Pure Cyrillic/Russian text should NOT be flagged
         let md = "\
 # Document
 
@@ -2051,7 +1923,6 @@ Normal paragraph after.
 
     #[test]
     fn test_math_operators_not_flagged_as_garbled() {
-        // Mathematical operators like ∑, ∏, √, ∞, ≤, ≥ are legitimate
         let md = "\
 # Math
 
@@ -2072,7 +1943,6 @@ Normal paragraph after.
 
     #[test]
     fn test_latex_braces_not_flagged_as_garbled() {
-        // LaTeX equations like \sum_{k=0}^{n} use { and } which should not trigger garbled
         let md = "\
 # Equation
 
@@ -2093,7 +1963,6 @@ The formula is \\sum_{k=0}^{n} C{k}{n} x^{k}.
 
     #[test]
     fn test_rst_grid_table_borders_not_flagged_as_header_footer() {
-        // RST grid table borders like +---+---+ should not be flagged
         let mut lines = Vec::new();
         for i in 0..15 {
             lines.push("+-----+-----+-----+".to_string());
@@ -2116,8 +1985,6 @@ The formula is \\sum_{k=0}^{n} C{k}{n} x^{k}.
 
     #[test]
     fn test_excessive_heading_density_raised_threshold() {
-        // 8 headings vs 3 paragraphs used to be flagged (>5, > paragraphs)
-        // but with new threshold (>10, > 2*paragraphs) this should NOT be flagged
         let md = "\
 # Heading 1
 ## Heading 2

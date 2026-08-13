@@ -1,3 +1,8 @@
+//! Network-gated smoke test for GLM-OCR end-to-end inference: constructs the engine,
+//! runs OCR on a fixture image, and checks the output text for expected content and
+//! for degenerate repeated-token runs. Ignored by default; downloads ~3GB of weights.
+
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "glm-ocr")]
 
 use xberg_candle_ocr::DevicePreference;
@@ -11,23 +16,17 @@ use xberg_candle_ocr::models::glm_ocr::{GlmOcrEngine, GlmOcrTask};
 #[test]
 #[ignore = "downloads 3GB of GLM-OCR weights from HuggingFace Hub"]
 fn glm_ocr_smoke_ocr_on_fixture() {
-    // Use a fixture image with recognizable text
     let image_bytes = include_bytes!("../../../fixtures/images/test_hello_world.png");
 
-    // Resolve device and dtype
     let device = DevicePreference::Auto.select().expect("Failed to select device");
 
-    // F32 for portability — candle 0.10 lacks BF16 matmul on some kernels.
-    // BF16 path is the production target on Metal; revisit after smoke is green.
     let dtype = xberg_candle_ocr::DType::F32;
 
-    // Construct the engine (this downloads weights on first run)
     eprintln!("Constructing GLM-OCR engine (downloading weights if needed)...");
     let engine = GlmOcrEngine::new(GlmOcrTask::Ocr, device, dtype).expect("Failed to construct GLM-OCR engine");
 
     eprintln!("Engine constructed. Running inference on test image...");
 
-    // Run inference
     let output = engine.process_image(image_bytes).expect("Failed to process image");
 
     eprintln!("Inference completed successfully!");
@@ -41,14 +40,8 @@ fn glm_ocr_smoke_ocr_on_fixture() {
         "Output text should have more than 5 characters"
     );
     // NOTE: `is_structured_markdown` is informational only. The fixture is a
-    // plain "Hello World" image whose correct OCR output is plain text — not
-    // markdown (no headings/tables/lists) — so this flag is legitimately false.
-    // The real correctness signal is the "hello"/"world" content check below.
     eprintln!("is_structured_markdown: {}", output.is_structured_markdown);
 
-    // The fixture renders the words "hello" and "world". A working pipeline
-    // should recover at least one. Catches degenerate-repeat outputs that pass
-    // weaker length-only assertions.
     let lower = output.content.to_lowercase();
     assert!(
         lower.contains("hello") || lower.contains("world"),
@@ -56,10 +49,6 @@ fn glm_ocr_smoke_ocr_on_fixture() {
         output.content
     );
 
-    // Degenerate-repeat detector: catches the "binder title of binder title of…"
-    // failure mode where nucleus sampling collapses into a repeating loop.
-    // A healthy OCR output over a small fixture should never repeat the same
-    // 3-gram more than 4 times consecutively.
     fn longest_repeated_ngram_run(text: &str, n: usize) -> usize {
         let tokens: Vec<&str> = text.split_whitespace().collect();
         if tokens.len() < n * 2 {

@@ -20,7 +20,6 @@ pub enum Language {
     Docker,
     Unknown,
 }
-
 impl Language {
     pub fn from_fence_tag(tag: &str) -> Self {
         match tag.trim().to_lowercase().as_str() {

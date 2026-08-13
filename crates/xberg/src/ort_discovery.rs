@@ -12,10 +12,41 @@ use std::sync::Once;
 #[cfg(not(feature = "ort-bundled"))]
 static ORT_INIT: Once = Once::new();
 
+const XBERG_ORT_EP_ENV_VAR: &str = "XBERG_ORT_EP";
+
+pub(crate) fn parse_execution_provider_override(
+    value: &str,
+) -> Option<crate::core::config::acceleration::ExecutionProviderType> {
+    use crate::core::config::acceleration::ExecutionProviderType;
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cpu" => Some(ExecutionProviderType::Cpu),
+        "coreml" => Some(ExecutionProviderType::CoreMl),
+        "cuda" => Some(ExecutionProviderType::Cuda),
+        "tensorrt" => Some(ExecutionProviderType::TensorRt),
+        "auto" => Some(ExecutionProviderType::Auto),
+        _ => None,
+    }
+}
+
+// Deliberately ungated (unlike `apply_execution_providers`, which has `ort::` types in its
+// signature): every ORT-capable subsystem calls this independently under its own feature
+// gate, and those gates are numerous and not owned by this module. A feature combination
+// that compiles no ORT-capable subsystem at all (e.g. `paddle-ocr-tract` alone, with no
+// `layout-detection`/`embeddings`/`auto-rotate`/etc.) legitimately calls neither function;
+// that is not a bug in either the caller or here. ~keep
+#[allow(dead_code)]
+pub(crate) fn execution_provider_override() -> Option<crate::core::config::acceleration::ExecutionProviderType> {
+    std::env::var(XBERG_ORT_EP_ENV_VAR)
+        .ok()
+        .and_then(|value| parse_execution_provider_override(&value))
+}
+
 /// Ensure ONNX Runtime is discoverable. Safe to call multiple times (no-op after first).
 ///
 /// When the `ort-bundled` feature is enabled the ORT binaries are embedded via the
 /// official Microsoft release and no system library search is needed.
+#[allow(dead_code)]
 pub(crate) fn ensure_ort_available() {
     #[cfg(feature = "ort-bundled")]
     {
@@ -32,7 +63,6 @@ pub(crate) fn ensure_ort_available() {
 
 #[cfg(not(feature = "ort-bundled"))]
 fn try_discover_ort() -> Result<(), &'static str> {
-    // Already set and valid?
     if let Ok(path) = std::env::var("ORT_DYLIB_PATH")
         && std::path::Path::new(&path).exists()
     {
@@ -43,7 +73,6 @@ fn try_discover_ort() -> Result<(), &'static str> {
 
     for path in candidates {
         if std::path::Path::new(path).exists() {
-            // SAFETY: single-threaded inside Once::call_once
             #[allow(unsafe_code)]
             unsafe {
                 std::env::set_var("ORT_DYLIB_PATH", path);
@@ -103,9 +132,10 @@ fn platform_candidates() -> &'static [&'static str] {
 #[cfg(any(
     feature = "layout-detection",
     feature = "embeddings",
-    feature = "paddle-ocr",
+    feature = "paddle-ocr-ort",
     feature = "auto-rotate",
     feature = "reranker",
+    feature = "onnx-runtime",
     feature = "transcription"
 ))]
 pub(crate) fn apply_execution_providers(
@@ -113,29 +143,17 @@ pub(crate) fn apply_execution_providers(
     accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
 ) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
     use crate::core::config::acceleration::ExecutionProviderType;
+    #[cfg(any(target_os = "macos", feature = "cuda", feature = "tensorrt"))]
     use ort::ep::ExecutionProvider;
 
-    // Resolve the execution provider. An `XBERG_ORT_EP` env override wins over the
-    // configured provider so operators can force (and A/B) an EP without a recompile,
-    // across every ORT subsystem that shares this function (layout, embeddings,
-    // PaddleOCR, reranker, auto-rotate, transcription).
-    let provider = std::env::var("XBERG_ORT_EP")
-        .ok()
-        .and_then(|e| match e.trim().to_ascii_lowercase().as_str() {
-            "cpu" => Some(ExecutionProviderType::Cpu),
-            "coreml" => Some(ExecutionProviderType::CoreMl),
-            "cuda" => Some(ExecutionProviderType::Cuda),
-            "tensorrt" => Some(ExecutionProviderType::TensorRt),
-            "auto" => Some(ExecutionProviderType::Auto),
-            _ => None,
-        })
+    let provider = execution_provider_override()
         .unwrap_or_else(|| accel.map(|a| a.provider.clone()).unwrap_or(ExecutionProviderType::Auto));
+    // Only read by the CUDA/TensorRT EP arms, which are cfg-gated behind their respective
+    // Cargo features; unused without at least one of them enabled.
+    #[cfg_attr(not(any(feature = "cuda", feature = "tensorrt")), allow(unused_variables))]
     let device_id = accel.map(|a| a.device_id).unwrap_or(0);
 
-    // Build a CoreML EP, honoring optional env tuning for A/B experiments. Defaults to
-    // ORT's own defaults (NeuralNetwork format / All compute units) when unset, so the
-    // committed behavior is unchanged. `XBERG_COREML_FORMAT` = mlprogram|neuralnetwork;
-    // `XBERG_COREML_UNITS` = all|cpu_and_ne|cpu_and_gpu|cpu_only.
+    #[cfg(target_os = "macos")]
     fn build_coreml_ep() -> ort::ep::CoreML {
         use ort::ep::coreml::{ComputeUnits, ModelFormat};
         let mut ep = ort::ep::CoreML::default();
@@ -163,6 +181,7 @@ pub(crate) fn apply_execution_providers(
             tracing::debug!("ORT session: CPU execution provider (explicit)");
             builder
         }
+        #[cfg(target_os = "macos")]
         ExecutionProviderType::CoreMl => {
             let ep = build_coreml_ep();
             if ep.is_available().unwrap_or(false) {
@@ -178,6 +197,14 @@ pub(crate) fn apply_execution_providers(
                 ));
             }
         }
+        #[cfg(not(target_os = "macos"))]
+        ExecutionProviderType::CoreMl => {
+            return Err(ort::Error::new(
+                "CoreML execution provider requested but this build target is not macOS. \
+                 CoreML is only available on macOS.",
+            ));
+        }
+        #[cfg(feature = "cuda")]
         ExecutionProviderType::Cuda => {
             let ep = ort::ep::CUDA::default().with_device_id(device_id as i32);
             if ep.is_available().unwrap_or(false) {
@@ -194,6 +221,14 @@ pub(crate) fn apply_execution_providers(
                 ));
             }
         }
+        #[cfg(not(feature = "cuda"))]
+        ExecutionProviderType::Cuda => {
+            return Err(ort::Error::new(
+                "CUDA execution provider requested but this build was compiled without CUDA \
+                 support; rebuild with the `cuda` feature.",
+            ));
+        }
+        #[cfg(feature = "tensorrt")]
         ExecutionProviderType::TensorRt => {
             let ep = ort::ep::TensorRT::default().with_device_id(device_id as i32);
             if ep.is_available().unwrap_or(false) {
@@ -213,6 +248,13 @@ pub(crate) fn apply_execution_providers(
                 ));
             }
         }
+        #[cfg(not(feature = "tensorrt"))]
+        ExecutionProviderType::TensorRt => {
+            return Err(ort::Error::new(
+                "TensorRT execution provider requested but this build was compiled without \
+                 TensorRT support; rebuild with the `tensorrt` feature.",
+            ));
+        }
         ExecutionProviderType::Auto => {
             #[cfg(target_os = "macos")]
             let builder = {
@@ -227,7 +269,7 @@ pub(crate) fn apply_execution_providers(
                     builder
                 }
             };
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             let builder = {
                 let ep = ort::ep::CUDA::default();
                 if ep.is_available().unwrap_or(false) {
@@ -243,6 +285,11 @@ pub(crate) fn apply_execution_providers(
                     builder
                 }
             };
+            #[cfg(all(target_os = "linux", not(feature = "cuda")))]
+            let builder = {
+                tracing::debug!("ORT session: auto — using CPU. Rebuild with the `cuda` feature for GPU support.");
+                builder
+            };
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let builder = {
                 tracing::debug!("ORT session: auto — no platform GPU EP, using CPU");
@@ -253,4 +300,41 @@ pub(crate) fn apply_execution_providers(
     };
 
     Ok(builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_execution_provider_override;
+    use crate::core::config::acceleration::ExecutionProviderType;
+
+    #[test]
+    fn blank_execution_provider_overrides_are_absent() {
+        for value in ["", " ", "\t\r\n"] {
+            assert_eq!(parse_execution_provider_override(value), None, "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn unrecognized_execution_provider_overrides_are_absent() {
+        for value in ["invalid", "gpu", "core-ml", "cpu,cuda"] {
+            assert_eq!(parse_execution_provider_override(value), None, "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn recognized_execution_provider_overrides_are_parsed() {
+        for (value, expected) in [
+            ("cpu", ExecutionProviderType::Cpu),
+            (" COREML ", ExecutionProviderType::CoreMl),
+            ("cuda", ExecutionProviderType::Cuda),
+            ("TensorRT", ExecutionProviderType::TensorRt),
+            ("auto", ExecutionProviderType::Auto),
+        ] {
+            assert_eq!(
+                parse_execution_provider_override(value),
+                Some(expected),
+                "value: {value:?}"
+            );
+        }
+    }
 }

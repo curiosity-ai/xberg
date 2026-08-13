@@ -1,3 +1,8 @@
+//! Integration tests for `TesseractAPI` against the host's installed tessdata: OCR on
+//! a "hello world" image and a simple table image, resolving the tessdata directory
+//! from `TESSDATA_PREFIX` or platform-specific defaults.
+
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 use std::path::{Path, PathBuf};
 use xberg_tesseract::TesseractAPI;
 

@@ -29,7 +29,6 @@ mod additional_serde {
     where
         S: Serializer,
     {
-        // Convert to HashMap for serialization
         let converted: HashMap<String, serde_json::Value> =
             map.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         converted.serialize(serializer)
@@ -41,7 +40,6 @@ mod additional_serde {
     where
         D: Deserializer<'de>,
     {
-        // Deserialize from HashMap
         let map = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
         let result = map.into_iter().map(|(k, v)| (Cow::Owned(k), v)).collect();
         Ok(result)
@@ -108,10 +106,131 @@ pub enum FormatMetadata {
     /// Metadata extracted from an audio or video file.
     #[cfg(feature = "transcription-types")]
     Audio(AudioMetadata),
-    /// Code (tree-sitter analyzable source). The structured analysis result is exposed
-    /// via `ExtractedDocument::code_intelligence`; this variant only tags the format.
+    /// Code (tree-sitter analyzable source). Carries the structural chunks (function,
+    /// class, and module boundaries) produced by the tree-sitter extractor, consumed by
+    /// the chunking pipeline to emit structure-aware `Chunk`s instead of falling back to
+    /// text-based splitting.
+    ///
+    /// Wraps [`CodeMetadata`] (a named struct) rather than `Vec<CodeChunkInfo>` directly:
+    /// `FormatMetadata` is internally tagged (`#[serde(tag = "format_type")]`), and serde
+    /// cannot serialize a tagged newtype variant that wraps a sequence — the tag has no
+    /// map to live in. Wrapping a struct gives serde a map to hold the tag, and keeps this
+    /// variant shape consistent with every sibling (`Variant(XMetadata)`) so the derived
+    /// OpenAPI discriminator can reference a named component schema.
     #[cfg(feature = "tree-sitter")]
-    Code,
+    Code(CodeMetadata),
+}
+
+/// Code-format metadata: the structural chunks produced by tree-sitter parsing.
+///
+/// Wrapped by [`FormatMetadata::Code`]. Kept as a named struct (rather than an inline
+/// enum-variant body) so serde can tag it under internal tagging and utoipa can emit a
+/// referenceable `CodeMetadata` component in the OpenAPI schema.
+#[cfg(feature = "tree-sitter")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+pub struct CodeMetadata {
+    /// Structural code chunks (function/class/module boundaries).
+    pub chunks: Vec<CodeChunkInfo>,
+    /// Hierarchical key/value data tree extracted from data-format source
+    /// (JSON, YAML, TOML, XML, CSV, etc.), when data extraction was enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<CodeDataNode>,
+}
+
+/// A single structurally-meaningful code chunk produced by tree-sitter parsing.
+///
+/// Purpose-built payload owned by xberg — deliberately does not expose the upstream
+/// `tree_sitter_language_pack` types, so binding generators never need to resolve an
+/// external crate's types across FFI/language boundaries.
+#[cfg(feature = "tree-sitter")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+pub struct CodeChunkInfo {
+    /// The raw source text of this chunk.
+    pub text: String,
+    /// Hierarchical path of enclosing structural items (e.g. `["MyClass", "my_method"]`).
+    pub context_path: Vec<String>,
+    /// Tree-sitter node kinds that appear at the top level of this chunk (e.g.
+    /// `"function_definition"`, `"class_definition"`).
+    pub node_types: Vec<String>,
+    /// Inclusive start byte offset of this chunk in the original source.
+    pub byte_start: usize,
+    /// Exclusive end byte offset of this chunk in the original source.
+    pub byte_end: usize,
+}
+
+/// Discriminates the shape of a [`CodeDataNode`].
+///
+/// Purpose-built mirror of `tree_sitter_language_pack::DataNodeKind` — kept as an
+/// xberg-owned type so binding generators never need to resolve the upstream crate's
+/// types across FFI/language boundaries.
+#[cfg(feature = "tree-sitter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+pub enum CodeDataNodeKind {
+    /// A key/value pair or mapping (JSON/TOML/properties/YAML/HCL/CUE/KDL pair, or a
+    /// wrapper "object"/"mapping" container).
+    #[default]
+    KeyValue,
+    /// An XML element with a tag name in `key` and attributes in `attributes`.
+    Element,
+    /// A positional sequence item (JSON array element, YAML block sequence item,
+    /// CSV/PSV row or cell).
+    Sequence,
+}
+
+/// An XML-style attribute attached to an [`Element`](CodeDataNodeKind::Element) node.
+///
+/// Populated only for `CodeDataNodeKind::Element`; always empty for `KeyValue` and
+/// `Sequence` nodes.
+#[cfg(feature = "tree-sitter")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+pub struct CodeDataAttribute {
+    /// Attribute name (e.g. `"class"`, `"href"`).
+    pub name: String,
+    /// Attribute value as a raw string (quotes stripped).
+    pub value: String,
+    /// Inclusive start byte offset of the `name="value"` attribute token.
+    pub byte_start: usize,
+    /// Exclusive end byte offset of the `name="value"` attribute token.
+    pub byte_end: usize,
+}
+
+/// A node in the hierarchical data tree produced by data-format extraction.
+///
+/// Purpose-built payload owned by xberg — mirrors
+/// `tree_sitter_language_pack::DataNode` but flattens its `Span` down to plain byte
+/// offsets, so binding generators never need to resolve an external crate's types
+/// across FFI/language boundaries.
+#[cfg(feature = "tree-sitter")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "api", schema(no_recursion))]
+pub struct CodeDataNode {
+    /// Whether this node is a key/value pair, XML element, or sequence item.
+    pub kind: CodeDataNodeKind,
+    /// Key, attribute name, tag name, or positional index (`"0"`, `"1"`, …).
+    /// `None` at the document root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Leaf scalar value, if any. `None` for containers (objects, arrays, XML
+    /// elements with child elements).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Attributes on element-shape nodes (XML `STag` attributes). Empty for all
+    /// other kinds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<CodeDataAttribute>,
+    /// Children for nested containers and XML element bodies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<CodeDataNode>,
+    /// Inclusive start byte offset of this node in the original source.
+    pub byte_start: usize,
+    /// Exclusive end byte offset of this node in the original source.
+    pub byte_end: usize,
 }
 
 impl Default for FormatMetadata {
@@ -167,7 +286,7 @@ impl std::fmt::Display for FormatMetadata {
             #[cfg(feature = "transcription-types")]
             Self::Audio(_) => f.write_str("audio"),
             #[cfg(feature = "tree-sitter")]
-            Self::Code => f.write_str("code"),
+            Self::Code(_) => f.write_str("code"),
         }
     }
 }
@@ -178,9 +297,6 @@ impl utoipa::PartialSchema for FormatMetadata {
         use utoipa::openapi::Ref;
         use utoipa::openapi::schema::{Discriminator, OneOfBuilder};
 
-        // Emit a flat oneOf with $ref items and a discriminator so that
-        // codegen tools (openapi-python-client, swagger_parser) do not choke
-        // on the allOf-of-ref pattern that utoipa's derive macro would produce.
         let builder = OneOfBuilder::new()
             .description(Some(
                 "Format-specific metadata (discriminated union). \
@@ -218,6 +334,8 @@ impl utoipa::PartialSchema for FormatMetadata {
                     ("pst", "#/components/schemas/PstMetadata"),
                     #[cfg(feature = "transcription-types")]
                     ("audio", "#/components/schemas/AudioMetadata"),
+                    #[cfg(feature = "tree-sitter")]
+                    ("code", "#/components/schemas/CodeMetadata"),
                 ],
             )));
 
@@ -266,6 +384,11 @@ impl utoipa::PartialSchema for FormatMetadata {
             #[cfg(not(feature = "transcription-types"))]
             let builder = builder;
 
+            #[cfg(feature = "tree-sitter")]
+            let builder = builder.item(Ref::from_schema_name("CodeMetadata"));
+            #[cfg(not(feature = "tree-sitter"))]
+            let builder = builder;
+
             builder
         };
 
@@ -311,6 +434,8 @@ impl utoipa::ToSchema for FormatMetadata {
         push_schema!(PstMetadata);
         #[cfg(feature = "transcription-types")]
         push_schema!(AudioMetadata);
+        #[cfg(feature = "tree-sitter")]
+        push_schema!(CodeMetadata);
     }
 }
 
@@ -988,15 +1113,7 @@ pub struct DocxMetadata {
     /// Values can be strings, numbers, booleans, or dates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_properties: Option<HashMap<String, serde_json::Value>>,
-    // Future Week 1-21 additions (commented out for now):
-    // style_catalog: OnceCell<Arc<StyleCatalog>>,       // Week 1-2: Style resolution
-    // theme: OnceCell<Arc<Theme>>,                      // Week 5: Theme colors
-    // numbering_catalog: OnceCell<Arc<NumberingCatalog>>, // Week 12-13: Numbering
-    // sections: Vec<SectionProperties>,                 // Week 3-4: Section properties
-    // document_settings: DocumentSettings,              // Week 11: Settings.xml
 }
-
-// ── Format-specific metadata structs (non-additional) ──────────────────
 
 /// CSV/TSV file metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1199,4 +1316,41 @@ pub struct AudioMetadata {
     /// Audio bitrate in kbps from the source file tags/properties.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<u32>,
+}
+
+#[cfg(all(test, feature = "tree-sitter"))]
+mod code_metadata_serde_tests {
+    use super::{CodeChunkInfo, CodeMetadata, FormatMetadata};
+
+    /// `FormatMetadata` is internally tagged, so the `Code` variant wraps a named
+    /// struct (`CodeMetadata`) — a newtype variant wrapping a `Vec` cannot be
+    /// serialized under internal tagging (serde errors: "cannot serialize tagged
+    /// newtype variant ... containing a sequence"). This guards that regression.
+    #[test]
+    fn code_variant_round_trips_through_json() {
+        let value = FormatMetadata::Code(CodeMetadata {
+            chunks: vec![CodeChunkInfo {
+                text: "fn main() {}".to_string(),
+                context_path: vec!["main".to_string()],
+                node_types: vec!["function_item".to_string()],
+                byte_start: 0,
+                byte_end: 12,
+            }],
+            data: None,
+        });
+
+        let json = serde_json::to_string(&value).expect("Code metadata must serialize");
+        assert!(
+            json.contains("\"format_type\":\"code\""),
+            "internal tag present: {json}"
+        );
+        assert!(json.contains("\"chunks\""), "chunks field present: {json}");
+
+        let back: FormatMetadata = serde_json::from_str(&json).expect("Code metadata must deserialize");
+        let FormatMetadata::Code(CodeMetadata { chunks, .. }) = back else {
+            panic!("expected Code variant after round-trip");
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].node_types, vec!["function_item".to_string()]);
+    }
 }

@@ -18,7 +18,6 @@ where
 {
     let mut router = PromptRouter::new();
 
-    // --- extract_document ---
     router.add_route(PromptRoute::new_dyn(
         Prompt::new(
             "extract_document",
@@ -56,12 +55,12 @@ where
                          Use the extract tool with input={{\"kind\":\"uri\",\"uri\":\"{path}\"}} and \
                          response_format=\"{fmt}\"."
                     ),
-                )]))
+                )])
+                .into())
             })
         },
     ));
 
-    // --- extract_with_ocr ---
     router.add_route(PromptRoute::new_dyn(
         Prompt::new(
             "extract_with_ocr",
@@ -114,12 +113,12 @@ where
                          OCR languages: {languages}",
                         langs = lang_list.join(","),
                     ),
-                )]))
+                )])
+                .into())
             })
         },
     ));
 
-    // --- semantic_search ---
     router.add_route(PromptRoute::new_dyn(
         Prompt::new(
             "semantic_search",
@@ -129,7 +128,9 @@ where
                     .with_description("Path to the document to index")
                     .with_required(true),
                 PromptArgument::new("preset")
-                    .with_description("Embedding preset: 'speed', 'balanced' (default), or 'quality'")
+                    .with_description(
+                        "Embedding preset: 'fast', 'balanced', 'quality', 'multilingual', or 'gte-modernbert-base' (default)",
+                    )
                     .with_required(false),
                 PromptArgument::new("chunker_type")
                     .with_description("Chunker strategy: 'text' (default), 'markdown', 'yaml', or 'semantic'")
@@ -177,7 +178,8 @@ where
                          2. Pass config={{\"chunking\":{{\"chunker_type\":\"{chunker_type}\",\"max_characters\":{max_characters}}},\"embedding\":{{\"model\":{{\"type\":\"preset\",\"name\":\"{preset}\"}}}}}}.\n\
                          3. Store output.results[*].chunks and each chunk embedding in your vector store."
                     ),
-                )]))
+                )])
+                .into())
             })
         },
     ));
@@ -191,7 +193,6 @@ mod tests {
 
     #[test]
     fn test_prompt_router_has_expected_prompts() {
-        // Use () as a stand-in server type since the router is generic over S.
         let router = build_prompt_router::<()>();
         assert!(
             router.has_route("extract_document"),

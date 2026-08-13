@@ -1,0 +1,32 @@
+{
+  "name": "xberg",
+  "displayName": "Xberg",
+  "description": "Local document extraction: text, tables, metadata, images from 101 formats with optional OCR.",
+  "version": "1.1.0",
+  "author": {
+    "name": "Kreuzberg, Inc.",
+    "email": "contact@xberg.io",
+    "url": "https://xberg.io"
+  },
+  "homepage": "https://xberg.io",
+  "repository": "https://github.com/xberg-io/xberg",
+  "license": "MIT",
+  "keywords": [
+    "document-intelligence",
+    "extraction",
+    "ocr",
+    "pdf",
+    "tables"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "xberg": {
+      "command": "./scripts/mcp-launch.sh",
+      "args": [
+        "mcp",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}

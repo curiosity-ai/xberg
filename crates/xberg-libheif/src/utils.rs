@@ -12,7 +12,6 @@ pub(crate) fn cstr_to_str<'a>(c_str: *const c_char) -> Option<&'a str> {
     if c_str.is_null() {
         None
     } else {
-        // SAFETY: c_str is non-null and points to a valid NUL-terminated C string.
         let res = unsafe { CStr::from_ptr(c_str).to_str() };
         res.ok()
     }

@@ -2,6 +2,12 @@
 	"id": "format_docx_standalone",
 	"category": "format_specific",
 	"description": "Standalone DOCX extraction using extract",
+	"docs": {
+		"topic": "format_specific",
+		"title": "Standalone DOCX extraction using extract",
+		"description": "Standalone DOCX extraction using extract",
+		"side_effects": "server"
+	},
 	"tags": ["format_specific", "docx", "text_extraction"],
 	"call": "extract",
 	"input": {

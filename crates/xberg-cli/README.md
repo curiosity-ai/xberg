@@ -2,13 +2,16 @@
 
 [![Bindings](https://img.shields.io/badge/Bindings-alef%20%D7%90-007ec6)](https://github.com/xberg-io/alef)
 
+[![Docker](https://img.shields.io/badge/Docker-ghcr.io-007ec6?logo=docker&logoColor=white)](https://github.com/xberg-io/xberg/pkgs/container/xberg)
+[![Helm chart](https://img.shields.io/badge/Helm-chart-007ec6?logo=helm&logoColor=white)](https://docs.xberg.io/guides/kubernetes/)
+
 Command-line interface for the Xberg document intelligence library.
 
 ## Overview
 
 This crate provides a production-ready CLI tool for document extraction, MIME type detection, batch processing, embeddings, chunking, and cache management. It exposes the core extraction capabilities of the Xberg Rust library through an easy-to-use command-line interface.
 
-The CLI supports 96 file formats including PDF, DOCX, PPTX, XLSX, images, HTML, and more, with optional OCR support for scanned documents.
+The CLI supports 100 file formats across 120 file extensions including PDF, DOCX, PPTX, XLSX, images, HTML, and more, with optional OCR support for scanned documents.
 
 ## Architecture
 

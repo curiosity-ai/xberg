@@ -171,9 +171,6 @@ mod imp {
 
     impl Vision2dRope {
         fn new(head_dim: usize, device: Device) -> CandleResult<Self> {
-            // Upstream uses head_dim // 2 as the per-axis dim (see
-            // Glm4vVisionModel.__init__: self.rotary_pos_emb = Glm4vVisionRotaryEmbedding(head_dim // 2)).
-            // The inv_freq table itself has length (head_dim // 2) / 2 = head_dim / 4.
             let half_dim = head_dim / 2;
             let freq_dim = half_dim / 2;
             let inv_freq: Vec<f32> = (0..freq_dim)
@@ -196,17 +193,12 @@ mod imp {
             let positions_w: Vec<f32> = (0..grid_h).flat_map(|_| (0..grid_w).map(|w| w as f32)).collect();
             let seq_len = grid_h * grid_w;
 
-            // (seq_len, 1) @ (1, freq_dim) -> (seq_len, freq_dim)
             let pos_h = Tensor::from_vec(positions_h, (seq_len, 1), &self.device)?.to_dtype(DType::F32)?;
             let pos_w = Tensor::from_vec(positions_w, (seq_len, 1), &self.device)?.to_dtype(DType::F32)?;
             let inv_freq = self.inv_freq.reshape((1, ()))?;
             let freqs_h = pos_h.broadcast_mul(&inv_freq)?;
             let freqs_w = pos_w.broadcast_mul(&inv_freq)?;
 
-            // Concatenate row freqs and col freqs into a (seq_len, head_dim/2) tensor,
-            // then duplicate along the last axis to (seq_len, head_dim). This produces
-            // the [row, col, row, col] quarter layout that pairs index i with index
-            // i + head_dim/2 under rotate_half within the SAME spatial axis.
             let freqs = Tensor::cat(&[&freqs_h, &freqs_w], D::Minus1)?;
             let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
 
@@ -219,7 +211,6 @@ mod imp {
         fn apply(&self, q: &Tensor, k: &Tensor, grid_h: usize, grid_w: usize) -> CandleResult<(Tensor, Tensor)> {
             debug_assert_eq!(q.dim(D::Minus1)?, 2 * self.half_dim);
             let (cos, sin) = self.cos_sin(grid_h, grid_w, q.dtype())?;
-            // cos/sin: (N, head_dim) -> broadcast to (B, H, N, head_dim) via two unsqueezes.
             let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
             let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
             let q_rot = q.broadcast_mul(&cos)? + rotate_half(q)?.broadcast_mul(&sin)?;
@@ -264,13 +255,9 @@ mod imp {
                 candle_nn::linear_no_bias(hidden, 3 * hidden, vb.pp("qkv"))?
             };
 
-            // Per-head Q/K norm over head_dim. Upstream weight shape is [head_dim].
             let q_norm = RmsNorm::new(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
             let k_norm = RmsNorm::new(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
 
-            // `proj` carries a bias in the published GLM-OCR safetensors (the upstream
-            // transformers main branch has `bias=False` for vanilla Glm4v, but the
-            // GLM-OCR variant ships `proj.bias`). The tensor file is authoritative.
             let proj = candle_nn::linear(hidden, hidden, vb.pp("proj"))?;
 
             Ok(Self {
@@ -287,7 +274,6 @@ mod imp {
         fn forward(&self, xs: &Tensor, rope: &Vision2dRope, grid_h: usize, grid_w: usize) -> CandleResult<Tensor> {
             let (batch, seq_len, _) = xs.dims3()?;
 
-            // Fused QKV projection: (B, N, 3 * hidden) -> (3, B, H, N, D).
             let qkv = self.qkv.forward(xs)?;
             let qkv = qkv
                 .reshape((batch, seq_len, 3, self.num_heads, self.head_dim))?
@@ -296,19 +282,15 @@ mod imp {
             let k = qkv.i(1)?.contiguous()?;
             let v = qkv.i(2)?.contiguous()?;
 
-            // Per-head Q/K RMSNorm over head_dim.
             let q = self.q_norm.forward(&q)?;
             let k = self.k_norm.forward(&k)?;
 
-            // 2-D RoPE on Q and K.
             let (q, k) = rope.apply(&q, &k, grid_h, grid_w)?;
 
-            // Scaled dot-product attention.
             let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * self.scale)?;
             let attn = candle_nn::ops::softmax_last_dim(&scores)?;
             let out = attn.matmul(&v)?;
 
-            // (B, H, N, D) -> (B, N, H * D)
             let out = out
                 .permute([0, 2, 1, 3])?
                 .reshape((batch, seq_len, self.num_heads * self.head_dim))?;
@@ -389,7 +371,6 @@ mod imp {
 
     impl PatchEmbedding {
         fn new(config: &VisionConfig, vb: VarBuilder) -> CandleResult<Self> {
-            // Load the 5-D Conv3d weight: (out_channels, in_channels, T, kH, kW).
             let w5d = vb.get(
                 (
                     config.hidden_size,
@@ -400,7 +381,6 @@ mod imp {
                 ),
                 "proj.weight",
             )?;
-            // Sum over the temporal axis (dim 2): (out, in, kH, kW).
             let w2d = w5d.sum(2)?.contiguous()?;
             let bias = vb.get(config.hidden_size, "proj.bias")?;
 
@@ -418,7 +398,6 @@ mod imp {
         fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
             let x = self.conv.forward(x)?;
             let (b, c, h, w) = x.dims4()?;
-            // (B, hidden, h, w) -> (B, h * w, hidden)
             x.reshape((b, c, h * w))?.permute([0, 2, 1])
         }
     }
@@ -484,8 +463,6 @@ mod imp {
             let grid_h = height / patch;
             let grid_w = width / patch;
 
-            // Patch embedding: emulated Conv3d collapses the temporal axis at load time
-            // (see `PatchEmbedding`), so the 2-D forward here is exact for still images.
             let mut x = self
                 .patch_embed
                 .forward(pixel_values)

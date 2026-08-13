@@ -5,11 +5,10 @@
 //! delegates here. We collect the subtree into a `MathNode` tree, then
 //! recursively render it to LaTeX.
 
+use crate::extraction::math_symbols::render_run_text;
 use crate::extractors::security::{SecurityBudget, SecurityError};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-
-// --- MathNode tree ---
 
 #[derive(Debug, Clone)]
 enum FracType {
@@ -88,8 +87,6 @@ enum MathNode {
     },
 }
 
-// --- Public entry points ---
-
 /// Collect an `m:oMathPara` subtree and convert to LaTeX (display math).
 /// The reader should be positioned right after the `<m:oMathPara>` start tag.
 pub(crate) fn collect_and_convert_omath_para(
@@ -97,11 +94,9 @@ pub(crate) fn collect_and_convert_omath_para(
     budget: &mut SecurityBudget,
 ) -> Result<String, SecurityError> {
     let children = collect_children(reader, b"m:oMathPara", budget)?;
-    // An oMathPara may contain multiple oMath elements; render each.
     let mut parts = Vec::new();
     for child in &children {
         if let MathNode::Group { children: inner } = child {
-            // This is the result of an m:oMath inside m:oMathPara
             let rendered = render_nodes(inner);
             if !rendered.is_empty() {
                 parts.push(rendered);
@@ -109,7 +104,6 @@ pub(crate) fn collect_and_convert_omath_para(
         }
     }
     if parts.is_empty() {
-        // Fallback: render all children directly
         Ok(render_nodes(&children))
     } else {
         Ok(parts.join(" \\\\ "))
@@ -125,8 +119,6 @@ pub(crate) fn collect_and_convert_omath(
     let children = collect_children(reader, b"m:oMath", budget)?;
     Ok(render_nodes(&children))
 }
-
-// --- Tree builder ---
 
 /// Recursively collect child nodes until the matching close tag.
 fn collect_children(
@@ -200,13 +192,15 @@ fn collect_children(
                         nodes.push(collect_spre(reader, budget)?);
                     }
                     b"m:oMath" => {
-                        // Nested oMath (e.g. inside oMathPara)
                         let inner = collect_children(reader, b"m:oMath", budget)?;
                         nodes.push(MathNode::Group { children: inner });
                     }
                     _ => {
-                        // Unknown element — skip it entirely
+                        // `skip_to_end` reads through its own matching end tag directly,
+                        // so the `Event::End` arm below never sees it. Refund the enter
+                        // above or every unrecognized OMML tag leaks one depth level. ~keep
                         skip_to_end(reader, &tag);
+                        budget.leave();
                     }
                 }
             }
@@ -238,7 +232,11 @@ fn collect_run(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:t" => in_text = true,
-                    b"m:rPr" => skip_to_end(reader, b"m:rPr"),
+                    b"m:rPr" => {
+                        // Consumes its own `</m:rPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:rPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -248,6 +246,11 @@ fn collect_run(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
                     budget.account_text(t.len())?;
                     text.push_str(&t);
                 }
+            }
+            Ok(Event::GeneralRef(ref e)) if in_text => {
+                let t = crate::utils::xml_utils::resolve_general_ref(e);
+                budget.account_text(t.len())?;
+                text.push_str(&t);
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
@@ -280,7 +283,11 @@ fn collect_ssup(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
                 match e.name().as_ref() as &[u8] {
                     b"m:e" => base = collect_children(reader, b"m:e", budget)?,
                     b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
-                    b"m:sSupPr" => skip_to_end(reader, b"m:sSupPr"),
+                    b"m:sSupPr" => {
+                        // Consumes its own `</m:sSupPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:sSupPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -313,7 +320,11 @@ fn collect_ssub(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
                 match e.name().as_ref() as &[u8] {
                     b"m:e" => base = collect_children(reader, b"m:e", budget)?,
                     b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
-                    b"m:sSubPr" => skip_to_end(reader, b"m:sSubPr"),
+                    b"m:sSubPr" => {
+                        // Consumes its own `</m:sSubPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:sSubPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -348,7 +359,11 @@ fn collect_ssubsup(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> R
                     b"m:e" => base = collect_children(reader, b"m:e", budget)?,
                     b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
                     b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
-                    b"m:sSubSupPr" => skip_to_end(reader, b"m:sSubSupPr"),
+                    b"m:sSubSupPr" => {
+                        // Consumes its own `</m:sSubSupPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:sSubSupPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -381,7 +396,10 @@ fn collect_frac(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:fPr" => {
+                        // `collect_frac_pr` reads through its own `</m:fPr>` without
+                        // calling `budget.leave()`; refund the enter above.
                         frac_type = collect_frac_pr(reader, budget)?;
+                        budget.leave();
                     }
                     b"m:num" => num = collect_children(reader, b"m:num", budget)?,
                     b"m:den" => den = collect_children(reader, b"m:den", budget)?,
@@ -439,7 +457,7 @@ fn collect_frac_pr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> R
 fn collect_rad(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<MathNode, SecurityError> {
     let mut deg = Vec::new();
     let mut body = Vec::new();
-    let mut deg_hide = true; // default: no degree shown (plain \sqrt)
+    let mut deg_hide = true;
     let mut buf = Vec::new();
 
     loop {
@@ -449,7 +467,10 @@ fn collect_rad(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:radPr" => {
+                        // `collect_rad_pr` reads through its own `</m:radPr>` without
+                        // calling `budget.leave()`; refund the enter above.
                         deg_hide = collect_rad_pr(reader, budget)?;
+                        budget.leave();
                     }
                     b"m:deg" => deg = collect_children(reader, b"m:deg", budget)?,
                     b"m:e" => body = collect_children(reader, b"m:e", budget)?,
@@ -496,7 +517,7 @@ fn collect_rad_pr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
 
 /// Collect an m:nary (n-ary operator) element.
 fn collect_nary(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<MathNode, SecurityError> {
-    let mut chr = "\u{222B}".to_string(); // default: integral
+    let mut chr = "\u{222B}".to_string();
     let mut sub = Vec::new();
     let mut sup = Vec::new();
     let mut body = Vec::new();
@@ -511,7 +532,10 @@ fn collect_nary(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:naryPr" => {
+                        // `collect_nary_pr` reads through its own `</m:naryPr>` without
+                        // calling `budget.leave()`; refund the enter above.
                         collect_nary_pr(reader, &mut chr, &mut sub_hide, &mut sup_hide, budget)?;
+                        budget.leave();
                     }
                     b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
                     b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
@@ -595,7 +619,10 @@ fn collect_delim(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Res
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:dPr" => {
+                        // `collect_delim_pr` reads through its own `</m:dPr>` without
+                        // calling `budget.leave()`; refund the enter above.
                         collect_delim_pr(reader, &mut begin_chr, &mut end_chr, &mut sep_chr, budget)?;
+                        budget.leave();
                     }
                     b"m:e" => {
                         elements.push(collect_children(reader, b"m:e", budget)?);
@@ -680,7 +707,11 @@ fn collect_func(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
                 match e.name().as_ref() as &[u8] {
                     b"m:fName" => name = collect_children(reader, b"m:fName", budget)?,
                     b"m:e" => body = collect_children(reader, b"m:e", budget)?,
-                    b"m:funcPr" => skip_to_end(reader, b"m:funcPr"),
+                    b"m:funcPr" => {
+                        // Consumes its own `</m:funcPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:funcPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -701,7 +732,7 @@ fn collect_func(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
 
 /// Collect an m:acc (accent) element.
 fn collect_acc(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<MathNode, SecurityError> {
-    let mut chr = "\u{0302}".to_string(); // default: combining circumflex accent (hat)
+    let mut chr = "\u{0302}".to_string();
     let mut body = Vec::new();
     let mut buf = Vec::new();
 
@@ -712,7 +743,10 @@ fn collect_acc(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:accPr" => {
+                        // `collect_acc_pr` reads through its own `</m:accPr>` without
+                        // calling `budget.leave()`; refund the enter above.
                         collect_acc_pr(reader, &mut chr, budget)?;
+                        budget.leave();
                     }
                     b"m:e" => body = collect_children(reader, b"m:e", budget)?,
                     _ => {}
@@ -775,7 +809,11 @@ fn collect_eqarr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Res
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:e" => rows.push(collect_children(reader, b"m:e", budget)?),
-                    b"m:eqArrPr" => skip_to_end(reader, b"m:eqArrPr"),
+                    b"m:eqArrPr" => {
+                        // Consumes its own `</m:eqArrPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:eqArrPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -808,7 +846,11 @@ fn collect_limlow(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
                 match e.name().as_ref() as &[u8] {
                     b"m:e" => body = collect_children(reader, b"m:e", budget)?,
                     b"m:lim" => lim = collect_children(reader, b"m:lim", budget)?,
-                    b"m:limLowPr" => skip_to_end(reader, b"m:limLowPr"),
+                    b"m:limLowPr" => {
+                        // Consumes its own `</m:limLowPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:limLowPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -841,7 +883,11 @@ fn collect_limupp(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
                 match e.name().as_ref() as &[u8] {
                     b"m:e" => body = collect_children(reader, b"m:e", budget)?,
                     b"m:lim" => lim = collect_children(reader, b"m:lim", budget)?,
-                    b"m:limUppPr" => skip_to_end(reader, b"m:limUppPr"),
+                    b"m:limUppPr" => {
+                        // Consumes its own `</m:limUppPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:limUppPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -863,7 +909,7 @@ fn collect_limupp(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
 /// Collect an m:bar element.
 fn collect_bar(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<MathNode, SecurityError> {
     let mut body = Vec::new();
-    let mut top = true; // default: overline
+    let mut top = true;
     let mut buf = Vec::new();
 
     loop {
@@ -873,7 +919,10 @@ fn collect_bar(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:barPr" => {
+                        // `collect_bar_pr` reads through its own `</m:barPr>` without
+                        // calling `budget.leave()`; refund the enter above.
                         top = collect_bar_pr(reader, budget)?;
+                        budget.leave();
                     }
                     b"m:e" => body = collect_children(reader, b"m:e", budget)?,
                     _ => {}
@@ -933,7 +982,11 @@ fn collect_borderbox(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) ->
                 budget.enter()?;
                 match e.name().as_ref() as &[u8] {
                     b"m:e" => body = collect_children(reader, b"m:e", budget)?,
-                    b"m:borderBoxPr" => skip_to_end(reader, b"m:borderBoxPr"),
+                    b"m:borderBoxPr" => {
+                        // Consumes its own `</m:borderBoxPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:borderBoxPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -966,7 +1019,11 @@ fn collect_matrix(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
                     b"m:mr" => {
                         rows.push(collect_matrix_row(reader, budget)?);
                     }
-                    b"m:mPr" => skip_to_end(reader, b"m:mPr"),
+                    b"m:mPr" => {
+                        // Consumes its own `</m:mPr>`; refund the enter above.
+                        skip_to_end(reader, b"m:mPr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -1031,7 +1088,11 @@ fn collect_spre(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
                     b"m:e" => base = collect_children(reader, b"m:e", budget)?,
                     b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
                     b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
-                    b"m:sPrePr" => skip_to_end(reader, b"m:sPrePr"),
+                    b"m:sPrePr" => {
+                        // Consumes its own `</m:sPrePr>`; refund the enter above.
+                        skip_to_end(reader, b"m:sPrePr");
+                        budget.leave();
+                    }
                     _ => {}
                 }
             }
@@ -1066,12 +1127,15 @@ fn collect_element_body(
                 budget.enter()?;
                 let tag = (e.name().as_ref() as &[u8]).to_vec();
                 if tag.ends_with(b"Pr") {
+                    // Consumes its own matching end tag; refund the enter above.
                     skip_to_end(reader, &tag);
+                    budget.leave();
                 } else if tag == b"m:e" {
                     children.extend(collect_children(reader, b"m:e", budget)?);
                 } else {
-                    // Try to collect as a math element
+                    // Same as the `*Pr` branch: consumes its own matching end tag.
                     skip_to_end(reader, &tag);
+                    budget.leave();
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -1088,8 +1152,6 @@ fn collect_element_body(
 
     Ok(children)
 }
-
-// --- Helpers ---
 
 /// Get the `m:val` attribute value from a start/empty element.
 fn get_m_val(e: &quick_xml::events::BytesStart) -> Option<String> {
@@ -1124,8 +1186,6 @@ fn skip_to_end(reader: &mut Reader<&[u8]>, tag: &[u8]) {
         buf.clear();
     }
 }
-
-// --- LaTeX renderer ---
 
 /// Render a slice of MathNodes to LaTeX.
 fn render_nodes(nodes: &[MathNode]) -> String {
@@ -1180,7 +1240,6 @@ fn render_node(node: &MathNode, out: &mut String) {
             FracType::Linear | FracType::Skewed => {
                 let num_s = render_nodes(num);
                 let den_s = render_nodes(den);
-                // Wrap in braces if multi-character
                 if num_s.len() > 1 {
                     out.push('{');
                     out.push_str(&num_s);
@@ -1256,7 +1315,6 @@ fn render_node(node: &MathNode, out: &mut String) {
         }
         MathNode::Func { name, body } => {
             let func_name = render_nodes(name);
-            // Check if it's a known LaTeX function
             let latex_func = match func_name.trim() {
                 "sin" => "\\sin",
                 "cos" => "\\cos",
@@ -1371,7 +1429,6 @@ fn render_node(node: &MathNode, out: &mut String) {
 /// Render base nodes, wrapping in braces if needed for subscript/superscript.
 fn render_group(nodes: &[MathNode], out: &mut String) {
     let rendered = render_nodes(nodes);
-    // Wrap in braces if multi-character or contains special chars
     let needs_braces = rendered.chars().count() > 1 && !rendered.starts_with('\\') && !rendered.starts_with('{');
     if needs_braces {
         out.push('{');
@@ -1379,134 +1436,6 @@ fn render_group(nodes: &[MathNode], out: &mut String) {
         out.push('}');
     } else {
         out.push_str(&rendered);
-    }
-}
-
-/// Render run text, mapping Unicode math symbols to LaTeX commands.
-fn render_run_text(text: &str, out: &mut String) {
-    for ch in text.chars() {
-        if let Some(latex) = unicode_to_latex(ch) {
-            out.push_str(latex);
-        } else {
-            out.push(ch);
-        }
-    }
-}
-
-// --- Character mapping tables ---
-
-/// Map a Unicode character to its LaTeX command (if any).
-fn unicode_to_latex(ch: char) -> Option<&'static str> {
-    match ch {
-        // Greek lowercase
-        '\u{03B1}' => Some("\\alpha "),
-        '\u{03B2}' => Some("\\beta "),
-        '\u{03B3}' => Some("\\gamma "),
-        '\u{03B4}' => Some("\\delta "),
-        '\u{03B5}' => Some("\\epsilon "),
-        '\u{03B6}' => Some("\\zeta "),
-        '\u{03B7}' => Some("\\eta "),
-        '\u{03B8}' => Some("\\theta "),
-        '\u{03B9}' => Some("\\iota "),
-        '\u{03BA}' => Some("\\kappa "),
-        '\u{03BB}' => Some("\\lambda "),
-        '\u{03BC}' => Some("\\mu "),
-        '\u{03BD}' => Some("\\nu "),
-        '\u{03BE}' => Some("\\xi "),
-        '\u{03BF}' => Some("o"), // omicron is just 'o' in LaTeX
-        '\u{03C0}' => Some("\\pi "),
-        '\u{03C1}' => Some("\\rho "),
-        '\u{03C2}' => Some("\\varsigma "),
-        '\u{03C3}' => Some("\\sigma "),
-        '\u{03C4}' => Some("\\tau "),
-        '\u{03C5}' => Some("\\upsilon "),
-        '\u{03C6}' => Some("\\phi "),
-        '\u{03C7}' => Some("\\chi "),
-        '\u{03C8}' => Some("\\psi "),
-        '\u{03C9}' => Some("\\omega "),
-        // Greek uppercase
-        '\u{0393}' => Some("\\Gamma "),
-        '\u{0394}' => Some("\\Delta "),
-        '\u{0398}' => Some("\\Theta "),
-        '\u{039B}' => Some("\\Lambda "),
-        '\u{039E}' => Some("\\Xi "),
-        '\u{03A0}' => Some("\\Pi "),
-        '\u{03A3}' => Some("\\Sigma "),
-        '\u{03A5}' => Some("\\Upsilon "),
-        '\u{03A6}' => Some("\\Phi "),
-        '\u{03A8}' => Some("\\Psi "),
-        '\u{03A9}' => Some("\\Omega "),
-        // Operators
-        '\u{00B1}' => Some("\\pm "),
-        '\u{2213}' => Some("\\mp "),
-        '\u{00D7}' => Some("\\times "),
-        '\u{00F7}' => Some("\\div "),
-        '\u{22C5}' => Some("\\cdot "),
-        '\u{2217}' => Some("\\ast "),
-        '\u{2218}' => Some("\\circ "),
-        '\u{2219}' => Some("\\bullet "),
-        // Relations
-        '\u{2264}' => Some("\\leq "),
-        '\u{2265}' => Some("\\geq "),
-        '\u{2260}' => Some("\\neq "),
-        '\u{2248}' => Some("\\approx "),
-        '\u{2261}' => Some("\\equiv "),
-        '\u{227A}' => Some("\\prec "),
-        '\u{227B}' => Some("\\succ "),
-        '\u{2286}' => Some("\\subseteq "),
-        '\u{2287}' => Some("\\supseteq "),
-        '\u{2282}' => Some("\\subset "),
-        '\u{2283}' => Some("\\supset "),
-        '\u{2208}' => Some("\\in "),
-        '\u{2209}' => Some("\\notin "),
-        '\u{220B}' => Some("\\ni "),
-        // Arrows
-        '\u{2190}' => Some("\\leftarrow "),
-        '\u{2192}' => Some("\\rightarrow "),
-        '\u{2191}' => Some("\\uparrow "),
-        '\u{2193}' => Some("\\downarrow "),
-        '\u{2194}' => Some("\\leftrightarrow "),
-        '\u{21D0}' => Some("\\Leftarrow "),
-        '\u{21D2}' => Some("\\Rightarrow "),
-        '\u{21D4}' => Some("\\Leftrightarrow "),
-        '\u{21A6}' => Some("\\mapsto "),
-        // Special symbols
-        '\u{221E}' => Some("\\infty "),
-        '\u{2202}' => Some("\\partial "),
-        '\u{2207}' => Some("\\nabla "),
-        '\u{2200}' => Some("\\forall "),
-        '\u{2203}' => Some("\\exists "),
-        '\u{2205}' => Some("\\emptyset "),
-        '\u{2227}' => Some("\\wedge "),
-        '\u{2228}' => Some("\\vee "),
-        '\u{00AC}' => Some("\\neg "),
-        '\u{2229}' => Some("\\cap "),
-        '\u{222A}' => Some("\\cup "),
-        '\u{2026}' => Some("\\ldots "),
-        '\u{22EF}' => Some("\\cdots "),
-        '\u{22EE}' => Some("\\vdots "),
-        '\u{22F1}' => Some("\\ddots "),
-        '\u{2032}' => Some("'"),
-        '\u{2033}' => Some("''"),
-        '\u{210F}' => Some("\\hbar "),
-        '\u{2113}' => Some("\\ell "),
-        '\u{211C}' => Some("\\Re "),
-        '\u{2111}' => Some("\\Im "),
-        '\u{2118}' => Some("\\wp "),
-        '\u{2135}' => Some("\\aleph "),
-        // N-ary operators (when used as text)
-        '\u{2211}' => Some("\\sum "),
-        '\u{220F}' => Some("\\prod "),
-        '\u{222B}' => Some("\\int "),
-        '\u{222C}' => Some("\\iint "),
-        '\u{222D}' => Some("\\iiint "),
-        '\u{222E}' => Some("\\oint "),
-        '\u{2210}' => Some("\\coprod "),
-        '\u{22C0}' => Some("\\bigwedge "),
-        '\u{22C1}' => Some("\\bigvee "),
-        '\u{22C2}' => Some("\\bigcap "),
-        '\u{22C3}' => Some("\\bigcup "),
-        _ => None,
     }
 }
 
@@ -1528,7 +1457,6 @@ fn nary_chr_to_latex(chr: &str) -> String {
             _ => {}
         }
     }
-    // Fallback: use the character directly
     chr.to_string()
 }
 
@@ -1539,14 +1467,14 @@ fn delim_chr_to_latex(chr: &str) -> String {
         "{" => "\\{".to_string(),
         "}" => "\\}".to_string(),
         "|" => "|".to_string(),
-        "\u{2016}" => "\\|".to_string(), // double vertical bar
+        "\u{2016}" => "\\|".to_string(),
         "\u{2329}" | "\u{27E8}" => "\\langle".to_string(),
         "\u{232A}" | "\u{27E9}" => "\\rangle".to_string(),
         "\u{230A}" => "\\lfloor".to_string(),
         "\u{230B}" => "\\rfloor".to_string(),
         "\u{2308}" => "\\lceil".to_string(),
         "\u{2309}" => "\\rceil".to_string(),
-        "" => ".".to_string(), // empty delimiter
+        "" => ".".to_string(),
         _ => chr.to_string(),
     }
 }
@@ -1576,7 +1504,6 @@ fn accent_chr_to_latex(chr: &str) -> String {
             _ => {}
         }
     }
-    // Fallback
     "\\hat".to_string()
 }
 
@@ -1589,7 +1516,6 @@ mod tests {
         let wrapped = format!("<m:oMath>{}</m:oMath>", xml);
         let mut reader = Reader::from_str(&wrapped);
         reader.config_mut().trim_text(false);
-        // Skip to the start tag
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
@@ -1601,6 +1527,126 @@ mod tests {
         }
         let mut budget = SecurityBudget::with_defaults();
         collect_and_convert_omath(&mut reader, &mut budget).unwrap_or_default()
+    }
+
+    /// Helper (GH#1395): parse an OMML fragment through `collect_and_convert_omath`
+    /// using a caller-supplied budget, so the caller can inspect the budget's
+    /// residual depth state after conversion completes.
+    fn omml_with_budget(xml: &str, budget: &mut SecurityBudget) {
+        let wrapped = format!("<m:oMath>{}</m:oMath>", xml);
+        let mut reader = Reader::from_str(&wrapped);
+        reader.config_mut().trim_text(false);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"m:oMath" => break,
+                Ok(Event::Eof) => panic!("unexpected EOF before <m:oMath>"),
+                _ => {}
+            }
+            buf.clear();
+        }
+        collect_and_convert_omath(&mut reader, budget).expect("conversion ok");
+    }
+
+    /// Test-only probe (GH#1395): count how many more `budget.enter()` calls succeed
+    /// before the depth cap trips. A freshly-built budget accepts exactly `max_depth`
+    /// more entries; if the OMML conversion leaked N depth levels, only
+    /// `max_depth - N` succeed. This makes the depth counter observable through
+    /// `SecurityBudget`'s existing public API without touching `extractors/security.rs`.
+    fn probe_remaining_depth(budget: &mut SecurityBudget, max_depth: usize) -> usize {
+        let mut successes = 0usize;
+        for _ in 0..=max_depth {
+            if budget.enter().is_ok() {
+                successes += 1;
+            } else {
+                break;
+            }
+        }
+        successes
+    }
+
+    fn budget_with_max_depth(max_depth: usize) -> SecurityBudget {
+        let limits = crate::extractors::security::SecurityLimits {
+            max_nesting_depth: max_depth,
+            max_xml_depth: max_depth,
+            ..Default::default()
+        };
+        SecurityBudget::from_limits(&limits)
+    }
+
+    /// GH#1395: `m:rPr` is skipped via `skip_to_end`, which reads through its own
+    /// `</m:rPr>` directly — the outer loop's `Event::End` arm never sees it, so
+    /// the `budget.enter()` made for `m:rPr`'s start tag must be refunded at the
+    /// call site or every run with formatting properties leaks one depth level.
+    #[test]
+    fn should_reset_depth_counter_to_zero_after_parsing_run_with_rpr() {
+        let mut budget = budget_with_max_depth(64);
+        omml_with_budget(
+            r#"<m:r><m:rPr><m:sty m:val="p"/></m:rPr><m:t>x</m:t></m:r>"#,
+            &mut budget,
+        );
+        assert_eq!(
+            probe_remaining_depth(&mut budget, 64),
+            64,
+            "m:rPr must not leak a depth level"
+        );
+    }
+
+    /// GH#1395: same `skip_to_end` shape as `m:rPr`, but on a `*Pr` sibling that
+    /// hangs off a different element (`m:sSup`).
+    #[test]
+    fn should_reset_depth_counter_to_zero_after_parsing_ssup_with_ssuppr() {
+        let mut budget = budget_with_max_depth(64);
+        omml_with_budget(
+            r#"<m:sSup>
+                <m:sSupPr><m:ctrlPr/></m:sSupPr>
+                <m:e><m:r><m:t>x</m:t></m:r></m:e>
+                <m:sup><m:r><m:t>2</m:t></m:r></m:sup>
+            </m:sSup>"#,
+            &mut budget,
+        );
+        assert_eq!(
+            probe_remaining_depth(&mut budget, 64),
+            64,
+            "m:sSupPr must not leak a depth level"
+        );
+    }
+
+    /// GH#1395: `m:fPr` is handled by `collect_frac_pr`, a dedicated recursive
+    /// parser (not `skip_to_end`) that also reads through its own `</m:fPr>`
+    /// without calling `budget.leave()` — same leak shape, different mechanism.
+    #[test]
+    fn should_reset_depth_counter_to_zero_after_parsing_frac_with_fpr() {
+        let mut budget = budget_with_max_depth(64);
+        omml_with_budget(
+            r#"<m:f>
+                <m:fPr><m:type m:val="noBar"/></m:fPr>
+                <m:num><m:r><m:t>n</m:t></m:r></m:num>
+                <m:den><m:r><m:t>k</m:t></m:r></m:den>
+            </m:f>"#,
+            &mut budget,
+        );
+        assert_eq!(
+            probe_remaining_depth(&mut budget, 64),
+            64,
+            "m:fPr must not leak a depth level"
+        );
+    }
+
+    /// GH#1395: an unrecognized OMML tag falls into `collect_children`'s `_` arm,
+    /// which also delegates to `skip_to_end` and must refund the same way.
+    #[test]
+    fn should_reset_depth_counter_to_zero_after_parsing_unrecognized_tag() {
+        let mut budget = budget_with_max_depth(64);
+        omml_with_budget(
+            r#"<m:groupChr><m:e><m:r><m:t>x</m:t></m:r></m:e></m:groupChr>"#,
+            &mut budget,
+        );
+        assert_eq!(
+            probe_remaining_depth(&mut budget, 64),
+            64,
+            "an unrecognized OMML tag (skip_to_end fallback) must not leak a depth level"
+        );
     }
 
     #[test]
@@ -1836,7 +1882,6 @@ mod tests {
 
     #[test]
     fn test_nested_quadratic_formula() {
-        // x = \frac{-b \pm \sqrt{b^{2} - 4ac}}{2a}
         let latex = omml_to_latex(
             r#"<m:r><m:t>x=</m:t></m:r>
             <m:f>
@@ -1885,14 +1930,12 @@ mod tests {
 
     #[test]
     fn test_run_with_rpr() {
-        // m:rPr should be skipped, not treated as text
         let latex = omml_to_latex(r#"<m:r><m:rPr><m:sty m:val="p"/></m:rPr><m:t>x</m:t></m:r>"#);
         assert_eq!(latex, "x");
     }
 
     #[test]
     fn test_nary_integral_default() {
-        // When no chr is specified, default is integral
         let latex = omml_to_latex(
             r#"<m:nary>
                 <m:naryPr/>

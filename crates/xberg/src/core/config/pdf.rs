@@ -81,8 +81,17 @@ pub struct PdfConfig {
     ///
     /// When `true`, projects text spans onto layout-detected regions, performs
     /// column detection, and emits spans in natural reading order (important
-    /// for multi-column academic PDFs). Requires the `layout-detection`
-    /// feature; has no effect without it. Defaults to `false`.
+    /// for multi-column academic PDFs). It also repairs 90/180/270-degree
+    /// rotated text runs — sideways tables and captions — that otherwise read
+    /// word-reversed and glued (GH#1358); see
+    /// `crate::extractors::pdf::reading_order` for the rotation-handling
+    /// details and its limits. Requires the `layout-detection` feature and a
+    /// page for which layout detection actually produces hints: a page with
+    /// no detected regions falls back to the original, unrepaired extraction
+    /// order even with this enabled. Independent of
+    /// [`LayoutStrategy`](crate::core::config::LayoutStrategy), which only
+    /// controls whether layout detection runs at all — enabling `Always` or
+    /// `Auto` alone does not turn reordering on. Defaults to `false`.
     #[serde(default)]
     pub reading_order: bool,
 }
@@ -108,14 +117,6 @@ pub struct HierarchyConfig {
     /// Include bounding box information in hierarchy blocks
     #[serde(default = "default_true")]
     pub include_bbox: bool,
-
-    /// OCR coverage threshold for smart OCR triggering (0.0-1.0)
-    ///
-    /// Determines when OCR should be triggered based on text block coverage.
-    /// OCR is triggered when text blocks cover less than this fraction of the page.
-    /// Default: 0.5 (trigger OCR if less than 50% of page has text)
-    #[serde(default = "default_ocr_coverage_threshold")]
-    pub ocr_coverage_threshold: Option<f32>,
 }
 
 #[cfg(feature = "pdf")]
@@ -144,7 +145,6 @@ impl Default for HierarchyConfig {
             enabled: true,
             k_clusters: 3,
             include_bbox: true,
-            ocr_coverage_threshold: None,
         }
     }
 }
@@ -157,10 +157,6 @@ fn default_k_clusters() -> usize {
     3
 }
 
-fn default_ocr_coverage_threshold() -> Option<f32> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -171,7 +167,6 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.k_clusters, 3);
         assert!(config.include_bbox);
-        assert!(config.ocr_coverage_threshold.is_none());
     }
 
     #[test]
@@ -182,12 +177,10 @@ mod tests {
             enabled: false,
             k_clusters: 3,
             include_bbox: false,
-            ocr_coverage_threshold: Some(0.7),
         };
         assert!(!config.enabled);
         assert_eq!(config.k_clusters, 3);
         assert!(!config.include_bbox);
-        assert_eq!(config.ocr_coverage_threshold, Some(0.7));
     }
 
     #[test]
@@ -212,14 +205,10 @@ mod tests {
         assert_eq!(config.bottom_margin_fraction, Some(0.08));
     }
 
-    // ── backward-compat serde tests ──────────────────────────────────────────
-
     #[test]
     #[cfg(feature = "pdf")]
     fn pdf_config_omitting_extract_form_fields_defaults_to_true() {
         use super::*;
-        // extract_form_fields uses `default_true` — stored configs that predate
-        // this field must deserialize to `true` (default-on, not false).
         let json = r#"{"extract_tables": true, "extract_metadata": true}"#;
         let config: PdfConfig = serde_json::from_str(json).unwrap();
         assert!(

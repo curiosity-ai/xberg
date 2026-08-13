@@ -60,7 +60,9 @@ def _binary_name() -> str:
 class _HttpsOnlyRedirectHandler(HTTPRedirectHandler):
     """Reject any redirect whose target is not https (downgrade/SSRF guard)."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+    def redirect_request(  # noqa: PLR0917 -- overrides HTTPRedirectHandler's fixed positional signature
+        self, req, fp, code, msg, headers, newurl
+    ):  # type: ignore[no-untyped-def]
         if urlsplit(newurl).scheme.lower() != "https":
             raise URLError(f"refusing non-https redirect to: {newurl}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -173,7 +175,6 @@ def _reject_unsafe_member(name: str) -> None:
     pure = PurePosixPath(normalized)
     if pure.is_absolute() or normalized.startswith("/"):
         raise RuntimeError(f"refusing absolute path in archive: {name}")
-    # Windows drive letters / UNC prefixes are also absolute escapes.
     if len(normalized) >= 2 and normalized[1] == ":":
         raise RuntimeError(f"refusing absolute path in archive: {name}")
     if any(part == ".." for part in pure.parts):
@@ -204,7 +205,6 @@ def _safe_extract(archive_path: Path, asset_name: str, dest: Path) -> None:
                 _reject_unsafe_member(member.name)
                 if not _is_within(dest, dest / member.name):
                     raise RuntimeError(f"refusing archive entry escaping dest: {member.name}")
-                # Reject link members that point outside dest as well.
                 if member.islnk() or member.issym():
                     link_target = dest / member.name
                     if not _is_within(dest, link_target.parent / member.linkname):

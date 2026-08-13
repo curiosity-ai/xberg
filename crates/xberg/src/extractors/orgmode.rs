@@ -49,6 +49,10 @@ use std::borrow::Cow;
 ///
 /// Provides native Rust-based Org Mode extraction using the `org` library,
 /// extracting structured content and metadata.
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+#[cfg(feature = "office")]
+const ORGMODE_WARNING_SOURCE: &str = "orgmode";
+
 #[cfg_attr(alef, alef(skip))]
 #[cfg(feature = "office")]
 pub struct OrgModeExtractor;
@@ -104,7 +108,6 @@ impl OrgModeExtractor {
             }
         }
 
-        // Map standard fields from additional to typed Metadata fields
         metadata.title = additional
             .remove(&Cow::Borrowed("title"))
             .and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -112,13 +115,11 @@ impl OrgModeExtractor {
             v.as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         });
-        // Remove the duplicate "author" key since we used "authors"
         additional.remove(&Cow::Borrowed("author"));
         metadata.keywords = additional.remove(&Cow::Borrowed("keywords")).and_then(|v| {
             v.as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         });
-        // Note: created_at is already set above from #+DATE
 
         metadata.additional = additional;
 
@@ -159,7 +160,6 @@ impl OrgModeExtractor {
 
         let lines = org.content_as_ref();
         if !lines.is_empty() {
-            // Join consecutive non-empty lines into paragraphs separated by blank lines
             let mut paragraph_lines: Vec<&str> = Vec::new();
             for line in lines {
                 let trimmed = line.trim();
@@ -190,70 +190,6 @@ impl OrgModeExtractor {
         }
     }
 
-    /// Extract tables from an Org document.
-    ///
-    /// Recursively walks the tree and extracts table elements,
-    /// converting them to Table structs with markdown format.
-    fn extract_tables(org: &Org) -> Vec<Table> {
-        let mut tables = Vec::new();
-        Self::extract_tables_from_tree(org, &mut tables);
-        tables
-    }
-
-    /// Recursively extract tables from an Org tree node and its subtrees.
-    fn extract_tables_from_tree(org: &Org, tables: &mut Vec<Table>) {
-        let lines = org.content_as_ref();
-        if !lines.is_empty() {
-            let mut in_table = false;
-            let mut current_table: Vec<Vec<String>> = Vec::new();
-
-            for line in lines {
-                let trimmed = line.trim();
-
-                if trimmed.starts_with('|') && trimmed.ends_with('|') {
-                    in_table = true;
-
-                    let cells: Vec<String> = trimmed
-                        .split('|')
-                        .map(|cell| cell.trim().to_string())
-                        .filter(|cell| !cell.is_empty())
-                        .collect();
-
-                    if !cells.is_empty() {
-                        current_table.push(cells);
-                    }
-                } else if in_table {
-                    if !current_table.is_empty() {
-                        let markdown = Self::cells_to_markdown(&current_table);
-                        tables.push(Table {
-                            cells: current_table.clone(),
-                            markdown,
-                            page_number: 1,
-                            bounding_box: None,
-                        });
-                        current_table.clear();
-                    }
-                    in_table = false;
-                }
-            }
-
-            if !current_table.is_empty() {
-                let markdown = Self::cells_to_markdown(&current_table);
-                tables.push(Table {
-                    cells: current_table,
-                    markdown,
-                    page_number: 1,
-                    bounding_box: None,
-                });
-            }
-        }
-
-        let subtrees = org.subtrees_as_ref();
-        for subtree in subtrees {
-            Self::extract_tables_from_tree(subtree, tables);
-        }
-    }
-
     /// Strip OrgMode inline markup from text and produce annotations with byte offsets.
     ///
     /// Handles: `*bold*`, `/italic/`, `_underline_`, `=verbatim=`, `~code~`,
@@ -266,7 +202,6 @@ impl OrgModeExtractor {
         let mut i = 0;
 
         while i < len {
-            // [[url][description]] or [[url]]
             if i + 1 < len
                 && bytes[i] == b'['
                 && bytes[i + 1] == b'['
@@ -286,10 +221,8 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Org markup characters: *bold*, /italic/, _underline_, =verbatim=, ~code~, +strike+
             if bytes[i].is_ascii() && Self::is_org_markup_char(bytes[i]) {
                 let marker = bytes[i];
-                // Must be preceded by whitespace/BOL and followed by non-space
                 let preceded_ok =
                     i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b'(' || bytes[i - 1] == b'"';
                 if preceded_ok
@@ -307,8 +240,6 @@ impl OrgModeExtractor {
                         b'_' => AnnotationKind::Underline,
                         b'=' | b'~' => AnnotationKind::Code,
                         b'+' => AnnotationKind::Strikethrough,
-                        // INVARIANT: `is_org_markup_char` only returns true for the five
-                        // bytes matched above; no other byte can reach this arm.
                         _ => unreachable!("byte not in is_org_markup_char set"),
                     };
                     if start < end_off {
@@ -323,7 +254,6 @@ impl OrgModeExtractor {
                 }
             }
 
-            // Decode the current UTF-8 character properly instead of casting byte to char
             let ch = &raw[i..];
             let c = ch.chars().next().unwrap();
             out.push(c);
@@ -342,9 +272,10 @@ impl OrgModeExtractor {
     fn find_org_markup_close(bytes: &[u8], from: usize, marker: u8) -> Option<usize> {
         let mut j = from;
         while j < bytes.len() {
-            if bytes[j] == marker && j > from && !bytes[j - 1].is_ascii_whitespace() {
-                // Must be followed by whitespace, punctuation, or EOL
-                if j + 1 >= bytes.len()
+            if bytes[j] == marker
+                && j > from
+                && !bytes[j - 1].is_ascii_whitespace()
+                && (j + 1 >= bytes.len()
                     || bytes[j + 1].is_ascii_whitespace()
                     || bytes[j + 1] == b'.'
                     || bytes[j + 1] == b','
@@ -352,10 +283,9 @@ impl OrgModeExtractor {
                     || bytes[j + 1] == b':'
                     || bytes[j + 1] == b')'
                     || bytes[j + 1] == b']'
-                    || bytes[j + 1] == b'"'
-                {
-                    return Some(j);
-                }
+                    || bytes[j + 1] == b'"')
+            {
+                return Some(j);
             }
             j += 1;
         }
@@ -412,20 +342,36 @@ impl OrgModeExtractor {
         let lines: Vec<&str> = org_text.lines().collect();
         let mut i = 0;
 
-        // Collect metadata directives from preamble
         let mut metadata_entries: Vec<(String, String)> = Vec::new();
         while i < lines.len() {
             let trimmed = lines[i].trim();
             if let Some(rest) = trimmed.strip_prefix("#+") {
-                // Block delimiters (BEGIN/END) are not metadata — stop preamble
                 let rest_upper = rest.to_ascii_uppercase();
                 if rest_upper.starts_with("BEGIN") || rest_upper.starts_with("END") {
                     break;
                 }
                 if let Some((key, val)) = rest.split_once(':') {
                     let key_upper = key.trim().to_uppercase();
+                    // `#+CAPTION:`/`#+NAME:` are body-level affiliated keywords that attach to
+                    // the immediately-following element (image link, table, ...), not
+                    // document-level preamble metadata — hand them to the body loop below
+                    // instead of swallowing them into `metadata_entries`.
+                    if key_upper == "CAPTION" || key_upper == "NAME" {
+                        break;
+                    }
                     let value = val.trim().to_string();
                     if !value.is_empty() {
+                        if key_upper == "INCLUDE" {
+                            // Recorded as preamble metadata below, but the referenced file's
+                            // content itself is never read by this single-file parser (#171).
+                            b.add_warning(crate::core::diagnostics::warning(
+                                ORGMODE_WARNING_SOURCE,
+                                format!(
+                                    "'#+INCLUDE: {value}' references an external file that was not read; \
+                                     its content is missing from the extracted text"
+                                ),
+                            ));
+                        }
                         metadata_entries.push((key_upper, value));
                     }
                 }
@@ -441,21 +387,58 @@ impl OrgModeExtractor {
             b.push_metadata_block(&metadata_entries, None);
         }
 
+        let mut pending_caption: Option<String> = None;
+        let mut pending_name: Option<String> = None;
+
         while i < lines.len() {
             let trimmed = lines[i].trim();
 
-            // Skip metadata directives in body (but not block delimiters)
+            if !trimmed.is_empty()
+                && (pending_caption.is_some() || pending_name.is_some())
+                && !Self::is_caption_keyword_line(trimmed)
+                && !Self::is_caption_target_line(trimmed)
+            {
+                // The buffered `#+CAPTION:`/`#+NAME:` line was not immediately followed by an
+                // element that can carry it (image link or table); drop it rather than
+                // mis-attaching it to an unrelated, later element.
+                pending_caption = None;
+                pending_name = None;
+            }
+
             if trimmed.starts_with("#+")
                 && !trimmed.starts_with("#+BEGIN")
                 && !trimmed.starts_with("#+begin")
                 && !trimmed.starts_with("#+END")
                 && !trimmed.starts_with("#+end")
             {
+                if let Some((key, val)) = trimmed[2..].split_once(':') {
+                    let key_upper = key.trim().to_ascii_uppercase();
+                    let value = val.trim();
+                    if key_upper == "CAPTION" && !value.is_empty() {
+                        pending_caption = Some(match pending_caption.take() {
+                            Some(existing) => format!("{existing} {value}"),
+                            None => value.to_string(),
+                        });
+                    } else if key_upper == "NAME" && !value.is_empty() {
+                        pending_name = Some(value.to_string());
+                    } else if key_upper == "INCLUDE" && !value.is_empty() {
+                        // `#+INCLUDE: "file.org"` inlines another file's rendered content at
+                        // this point. This parser works on a single in-memory document and
+                        // never resolves the reference, so the referenced file's content is
+                        // always missing from the extracted text (#171).
+                        b.add_warning(crate::core::diagnostics::warning(
+                            ORGMODE_WARNING_SOURCE,
+                            format!(
+                                "'#+INCLUDE: {value}' references an external file that was not read; \
+                                 its content is missing from the extracted text"
+                            ),
+                        ));
+                    }
+                }
                 i += 1;
                 continue;
             }
 
-            // Properties drawer
             if trimmed == ":PROPERTIES:" {
                 let mut props: Vec<(String, String)> = Vec::new();
                 i += 1;
@@ -483,7 +466,6 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Headings
             if trimmed.starts_with('*') {
                 let mut level: u8 = 0;
                 for ch in trimmed.chars() {
@@ -496,7 +478,6 @@ impl OrgModeExtractor {
                 if level > 0 && trimmed.len() > level as usize && trimmed.as_bytes()[level as usize] == b' ' {
                     let raw_heading = trimmed[level as usize + 1..].trim();
                     if !raw_heading.is_empty() {
-                        // Strip TODO keywords and tags
                         let todo_keywords = ["TODO", "DONE", "NEXT", "WAITING", "CANCELLED", "CANCELED"];
                         let mut heading_text = raw_heading;
                         for kw in &todo_keywords {
@@ -508,7 +489,6 @@ impl OrgModeExtractor {
                                 }
                             }
                         }
-                        // Strip tags
                         if let Some(tag_start) = heading_text.rfind(" :") {
                             let potential_tags = &heading_text[tag_start + 1..];
                             if potential_tags.ends_with(':') && potential_tags.len() > 2 {
@@ -522,7 +502,6 @@ impl OrgModeExtractor {
                 }
             }
 
-            // Code blocks
             if trimmed.starts_with("#+BEGIN_SRC") || trimmed.starts_with("#+begin_src") {
                 let language: Option<&str> = trimmed.split_whitespace().nth(1);
                 i += 1;
@@ -543,7 +522,6 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Quote blocks
             if trimmed.starts_with("#+BEGIN_QUOTE") || trimmed.starts_with("#+begin_quote") {
                 b.push_quote_start();
                 i += 1;
@@ -562,7 +540,6 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Example blocks -> code blocks without language annotation
             if trimmed.starts_with("#+BEGIN_EXAMPLE") || trimmed.starts_with("#+begin_example") {
                 i += 1;
                 let mut block_content = String::new();
@@ -582,7 +559,6 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Other BEGIN/END blocks
             if trimmed.starts_with("#+BEGIN_") || trimmed.starts_with("#+begin_") {
                 let block_type = trimmed
                     .split_whitespace()
@@ -612,15 +588,16 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Tables
             if trimmed.starts_with('|') && trimmed.ends_with('|') {
                 let mut table_cells: Vec<Vec<String>> = Vec::new();
+                let mut has_header_separator = false;
                 while i < lines.len() {
                     let t = lines[i].trim();
                     if !t.starts_with('|') || !t.ends_with('|') {
                         break;
                     }
-                    if t.contains("---") || t.contains("+-") {
+                    if Self::is_org_table_horizontal_line(t) {
+                        has_header_separator |= !table_cells.is_empty();
                         i += 1;
                         continue;
                     }
@@ -635,12 +612,12 @@ impl OrgModeExtractor {
                     i += 1;
                 }
                 if !table_cells.is_empty() {
-                    b.push_table_from_cells(&table_cells, None, None);
+                    let element_idx = Self::push_org_table(&mut b, table_cells, has_header_separator);
+                    Self::attach_pending_caption_and_name(&mut b, element_idx, &mut pending_caption, &mut pending_name);
                 }
                 continue;
             }
 
-            // Lists
             if !trimmed.is_empty() && Self::is_org_list_item(trimmed) {
                 let is_ordered = Self::is_org_ordered_item(trimmed);
                 b.push_list(is_ordered);
@@ -650,12 +627,9 @@ impl OrgModeExtractor {
                         break;
                     }
                     if Self::is_org_list_item(t) {
-                        // New list item — collect its text plus any continuation lines
                         let item_text = Self::strip_list_prefix(t);
                         let mut item_parts: Vec<&str> = vec![item_text];
                         i += 1;
-                        // Continuation lines: indented, not a new list item, not empty,
-                        // not a structural start
                         while i < lines.len() {
                             let raw_next = lines[i];
                             let next_t = raw_next.trim();
@@ -663,7 +637,6 @@ impl OrgModeExtractor {
                             {
                                 break;
                             }
-                            // Must be indented (original line starts with whitespace) to be continuation
                             if raw_next.starts_with(' ') || raw_next.starts_with('\t') {
                                 item_parts.push(next_t);
                                 i += 1;
@@ -674,7 +647,6 @@ impl OrgModeExtractor {
                         let joined_item = item_parts.join(" ");
                         b.push_list_item(&joined_item, is_ordered, vec![], None, None);
                     } else {
-                        // Non-list-item, non-empty line that isn't indented continuation — stop the list
                         break;
                     }
                 }
@@ -682,7 +654,6 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Footnote definitions: [fn:name] definition text
             if trimmed.starts_with("[fn:") {
                 if let Some(close) = trimmed.find(']') {
                     let name = &trimmed[4..close];
@@ -697,10 +668,7 @@ impl OrgModeExtractor {
                 continue;
             }
 
-            // Regular paragraph with inline markup and internal links.
-            // Collect continuation lines to form a single paragraph (Bug fix: join hard-wrapped lines).
             if !trimmed.is_empty() {
-                // Check if the line is a standalone image link
                 if let Some((url, display, consumed_to)) = Self::parse_org_link(trimmed, 0)
                     && consumed_to == trimmed.len()
                     && Self::is_image_url(&url)
@@ -710,7 +678,7 @@ impl OrgModeExtractor {
                     let alt = if display == url { String::new() } else { display.clone() };
                     let kind = ElementKind::Image { image_index: u32::MAX };
                     let id = InternalElementId::generate(kind.discriminant(), &alt, None, 0);
-                    b.push_element(InternalElement {
+                    let element_idx = b.push_element(InternalElement {
                         id,
                         kind,
                         text: alt,
@@ -725,15 +693,13 @@ impl OrgModeExtractor {
                         ocr_confidence: None,
                         ocr_rotation: None,
                     });
-                    // Also emit a URI so path resolution can find the image
+                    Self::attach_pending_caption_and_name(&mut b, element_idx, &mut pending_caption, &mut pending_name);
                     let label = if display == url { None } else { Some(display) };
                     b.push_uri(ExtractedUri::image(&url, label));
                     i += 1;
                     continue;
                 }
 
-                // Collect all continuation lines for this paragraph.
-                // A continuation line is a non-empty line that doesn't start a structural element.
                 let mut para_raw_lines: Vec<&str> = vec![trimmed];
                 let mut next = i + 1;
                 while next < lines.len() {
@@ -741,7 +707,6 @@ impl OrgModeExtractor {
                     if next_trimmed.is_empty() || Self::is_structural_start(next_trimmed) {
                         break;
                     }
-                    // Also stop if it looks like a standalone image link
                     if let Some((url, _, consumed_to)) = Self::parse_org_link(next_trimmed, 0)
                         && consumed_to == next_trimmed.len()
                         && Self::is_image_url(&url)
@@ -754,11 +719,9 @@ impl OrgModeExtractor {
 
                 let joined_raw = para_raw_lines.join(" ");
 
-                // Check for footnote references [fn:name]
                 let footnote_refs = Self::find_footnote_references(&joined_raw);
                 let (stripped, annotations) = Self::parse_inline_markup(&joined_raw);
 
-                // Extract URIs from link annotations
                 for ann in &annotations {
                     if let AnnotationKind::Link { url, .. } = &ann.kind
                         && !url.is_empty()
@@ -783,16 +746,13 @@ impl OrgModeExtractor {
                     }
                 }
 
-                // Check if the line contains internal links (org links to headings)
                 let idx = b.push_paragraph(&stripped, annotations, None, None);
 
-                // Emit footnote reference relationships
                 for fref in &footnote_refs {
                     let ref_idx = b.push_footnote_ref(&format!("[fn:{}]", fref), fref, None);
                     let _ = ref_idx;
                 }
 
-                // Check for internal org links [[#anchor]] or [[*heading]]
                 Self::extract_internal_links(&joined_raw, idx, &mut b);
 
                 i = next;
@@ -805,13 +765,87 @@ impl OrgModeExtractor {
         b.build()
     }
 
+    /// Push an Org table while preserving whether the source declared a header separator.
+    ///
+    /// Returns the index of the created `Table` element so callers can attach a preceding
+    /// `#+CAPTION:`/`#+NAME:` affiliated keyword to it (see `attach_pending_caption_and_name`).
+    fn push_org_table(b: &mut InternalDocumentBuilder, cells: Vec<Vec<String>>, has_header: bool) -> u32 {
+        let columns = has_header.then(|| cells[0].clone());
+        let mut markdown_cells = cells.clone();
+        if !has_header {
+            let column_count = cells.iter().map(Vec::len).max().unwrap_or(0);
+            markdown_cells.insert(0, vec![String::new(); column_count]);
+        }
+        let table = Table {
+            cells,
+            markdown: Self::cells_to_markdown(&markdown_cells),
+            columns,
+            ..Default::default()
+        };
+        b.push_table(table, None, None)
+    }
+
+    /// Check whether a trimmed line is a `#+CAPTION:` or `#+NAME:` affiliated keyword line.
+    /// Used to decide whether a still-pending caption/name should keep being carried forward
+    /// to a subsequent line (multi-line captions, or a `#+NAME:` line following `#+CAPTION:`).
+    fn is_caption_keyword_line(trimmed: &str) -> bool {
+        let Some(rest) = trimmed.strip_prefix("#+") else {
+            return false;
+        };
+        let Some((key, _)) = rest.split_once(':') else {
+            return false;
+        };
+        matches!(key.trim().to_ascii_uppercase().as_str(), "CAPTION" | "NAME")
+    }
+
+    /// Check whether a trimmed line starts an element that Org "affiliated keywords"
+    /// (`#+CAPTION:`, `#+NAME:`) can attach to: an image link or a table row.
+    fn is_caption_target_line(trimmed: &str) -> bool {
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            return true;
+        }
+        if let Some((_, _, consumed_to)) = Self::parse_org_link(trimmed, 0)
+            && consumed_to == trimmed.len()
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Attach any buffered `#+CAPTION:` / `#+NAME:` affiliated keywords to the element at
+    /// `element_idx`, consuming (`take`-ing) them so they are not applied a second time.
+    fn attach_pending_caption_and_name(
+        b: &mut InternalDocumentBuilder,
+        element_idx: u32,
+        pending_caption: &mut Option<String>,
+        pending_name: &mut Option<String>,
+    ) {
+        if let Some(caption) = pending_caption.take() {
+            let mut attributes: AHashMap<String, String> = AHashMap::default();
+            attributes.insert("caption".to_string(), caption);
+            b.set_attributes(element_idx, attributes);
+        }
+        if let Some(name) = pending_name.take() {
+            b.set_anchor(element_idx, name);
+        }
+    }
+
+    fn is_org_table_horizontal_line(line: &str) -> bool {
+        let Some(inner) = line.trim().strip_prefix('|').and_then(|line| line.strip_suffix('|')) else {
+            return false;
+        };
+
+        inner
+            .split('+')
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte == b'-'))
+    }
+
     /// Extract internal org links from a line and add relationships.
     fn extract_internal_links(line: &str, source_idx: u32, b: &mut InternalDocumentBuilder) {
         let mut search_from = 0;
         while let Some(pos) = line[search_from..].find("[[") {
             let abs_pos = search_from + pos;
             let after = &line[abs_pos + 2..];
-            // Find closing ]]
             let close = if let Some(desc_start) = after.find("][") {
                 after[desc_start + 2..]
                     .find("]]")
@@ -821,14 +855,13 @@ impl OrgModeExtractor {
             };
 
             if let Some(consumed) = close {
-                let link_content = &after[..consumed - 2]; // before ]]
+                let link_content = &after[..consumed - 2];
                 let url_part = if let Some(sep) = link_content.find("][") {
                     &link_content[..sep]
                 } else {
                     link_content
                 };
 
-                // Internal link patterns: #anchor, *heading, custom-id
                 if let Some(anchor) = url_part.strip_prefix('#') {
                     b.push_relationship(
                         source_idx,
@@ -853,7 +886,6 @@ impl OrgModeExtractor {
     /// Check if a trimmed line starts a new structural element (heading, block, table, list, etc.).
     /// Used to determine paragraph continuation boundaries.
     fn is_structural_start(trimmed: &str) -> bool {
-        // Heading
         if trimmed.starts_with('*') {
             let mut level: u8 = 0;
             for ch in trimmed.chars() {
@@ -867,7 +899,6 @@ impl OrgModeExtractor {
                 return true;
             }
         }
-        // Block delimiters
         if trimmed.starts_with("#+BEGIN")
             || trimmed.starts_with("#+begin")
             || trimmed.starts_with("#+END")
@@ -875,23 +906,18 @@ impl OrgModeExtractor {
         {
             return true;
         }
-        // Metadata directives
         if trimmed.starts_with("#+") {
             return true;
         }
-        // Properties drawer
         if trimmed == ":PROPERTIES:" || trimmed == ":END:" {
             return true;
         }
-        // Table
         if trimmed.starts_with('|') && trimmed.ends_with('|') {
             return true;
         }
-        // List item
         if Self::is_org_list_item(trimmed) {
             return true;
         }
-        // Footnote definition
         if trimmed.starts_with("[fn:") {
             return true;
         }
@@ -904,7 +930,6 @@ impl OrgModeExtractor {
         if t.starts_with("- ") || t.starts_with("+ ") {
             return true;
         }
-        // Ordered: 1. or 1)
         if let Some(space_pos) = t.find(' ')
             && space_pos > 0
             && space_pos < 5
@@ -947,7 +972,6 @@ impl OrgModeExtractor {
 
     /// Check if a URL points to an image based on its file extension.
     fn is_image_url(url: &str) -> bool {
-        // Strip optional "file:" prefix and query/fragment
         let path = url
             .strip_prefix("file:")
             .unwrap_or(url)
@@ -968,32 +992,15 @@ impl OrgModeExtractor {
     }
 
     /// Convert table cells to markdown format.
+    ///
+    /// Delegates to the crate's single table renderer
+    /// ([`crate::rendering::common::render_table_markdown`]) so an Org table
+    /// serialises identically to the same table from any other source
+    /// (xberg-io/xberg#220). Org cells may legitimately contain `|` (escaped as
+    /// `\vert` in the source, but literal after unescaping), which this copy
+    /// emitted raw and thereby split into extra columns (xberg-io/xberg#163).
     fn cells_to_markdown(cells: &[Vec<String>]) -> String {
-        if cells.is_empty() {
-            return String::new();
-        }
-
-        let mut md = String::new();
-
-        for (row_idx, row) in cells.iter().enumerate() {
-            md.push('|');
-            for cell in row {
-                md.push(' ');
-                md.push_str(cell);
-                md.push_str(" |");
-            }
-            md.push('\n');
-
-            if row_idx == 0 && cells.len() > 1 {
-                md.push('|');
-                for _ in row {
-                    md.push_str(" --- |");
-                }
-                md.push('\n');
-            }
-        }
-
-        md
+        crate::rendering::common::render_table_markdown(cells)
     }
 }
 
@@ -1061,16 +1068,13 @@ impl InternalDocumentExtractor for OrgModeExtractor {
 
         let (metadata, _extracted_content) = Self::extract_metadata_and_content(&org_text, &org);
 
-        let tables = Self::extract_tables(&org);
-
+        // Tables are parsed in place inside `build_internal_document` (see `push_org_table`),
+        // which produces correctly-positioned table elements. A second `extract_tables` tree walk
+        // used to raw-push the same tables again, doubling `counts.tables` in structured output
+        // without contributing anything to rendered output.
         let mut doc = Self::build_internal_document(&org_text);
         doc.mime_type = mime_type.to_string();
         doc.metadata = metadata;
-
-        // Add tables to InternalDocument
-        for table in tables {
-            doc.push_table(table);
-        }
 
         tracing::debug!(
             element_count = doc.elements.len(),
@@ -1194,6 +1198,31 @@ mod tests {
         assert!(content.contains("Second paragraph"));
     }
 
+    /// Regression test: the trait-level `extract_content` used to additionally re-push every
+    /// table via the raw, element-less `InternalDocument::push_table`, on top of the correctly
+    /// created table element from `build_internal_document`'s `push_org_table`. That created a
+    /// duplicate, unreferenced entry in `doc.tables` for every table without changing rendered
+    /// output. Assert there is exactly one table, not two.
+    #[tokio::test]
+    async fn test_orgmode_table_is_not_duplicated_in_structured_output() {
+        let org_text = b"| Name | Age |\n| Alice | 30 |\n";
+        let extractor = OrgModeExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let doc = extractor
+            .extract_content(org_text, "text/x-org", &config)
+            .await
+            .expect("extraction should succeed");
+
+        assert_eq!(doc.tables.len(), 1, "table should not be duplicated: {:?}", doc.tables);
+        let table_element_count = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Table { .. }))
+            .count();
+        assert_eq!(table_element_count, 1);
+    }
+
     #[test]
     fn test_extract_content_with_lists() {
         let org_text = "- Item 1\n- Item 2\n- Item 3";
@@ -1220,6 +1249,68 @@ mod tests {
         assert!(markdown.contains("Alice"));
         assert!(markdown.contains("Bob"));
         assert!(markdown.contains("---"));
+    }
+
+    #[test]
+    fn should_preserve_separator_header_in_structured_and_rendered_org_table() {
+        let document = OrgModeExtractor::build_internal_document("| Name | Age |\n|------+-----|\n| Alice | 30 |");
+        assert_eq!(document.tables.len(), 1);
+        let table = &document.tables[0];
+
+        assert_eq!(
+            table.cells,
+            vec![
+                vec!["Name".to_string(), "Age".to_string()],
+                vec!["Alice".to_string(), "30".to_string()],
+            ]
+        );
+        assert_eq!(table.columns, Some(vec!["Name".to_string(), "Age".to_string()]));
+        assert_eq!(table.markdown, "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n");
+        assert_eq!(
+            crate::rendering::render_markdown(&document),
+            "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n"
+        );
+    }
+
+    #[test]
+    fn should_preserve_data_containing_horizontal_line_substrings() {
+        let document = OrgModeExtractor::build_internal_document(
+            "| Version | Status |\n|---------+--------|\n| release---candidate | stable |",
+        );
+        let table = &document.tables[0];
+
+        assert_eq!(
+            table.cells,
+            vec![
+                vec!["Version".to_string(), "Status".to_string()],
+                vec!["release---candidate".to_string(), "stable".to_string()],
+            ]
+        );
+        assert_eq!(
+            crate::rendering::render_markdown(&document),
+            "| Version | Status |\n| --- | --- |\n| release---candidate | stable |\n"
+        );
+    }
+
+    #[test]
+    fn should_preserve_headerless_rows_in_structured_and_rendered_org_table() {
+        let document = OrgModeExtractor::build_internal_document("| Alice | 30 |\n| Bob | 40 |");
+        assert_eq!(document.tables.len(), 1);
+        let table = &document.tables[0];
+
+        assert_eq!(
+            table.cells,
+            vec![
+                vec!["Alice".to_string(), "30".to_string()],
+                vec!["Bob".to_string(), "40".to_string()],
+            ]
+        );
+        assert_eq!(table.columns, None);
+        assert_eq!(table.markdown, "|  |  |\n| --- | --- |\n| Alice | 30 |\n| Bob | 40 |\n");
+        assert_eq!(
+            crate::rendering::render_markdown(&document),
+            "|  |  |\n| --- | --- |\n| Alice | 30 |\n| Bob | 40 |\n"
+        );
     }
 
     #[test]
@@ -1301,7 +1392,6 @@ mod tests {
         let content = OrgModeExtractor::extract_content(&org);
 
         assert!(content.contains("AT&T"), "Description should be prioritized over URL");
-        // Inline markup is now stripped: [[url][desc]] → desc (not [desc])
         assert!(
             !content.contains("[["),
             "Raw org link syntax should be stripped by inline markup processing"
@@ -1310,7 +1400,6 @@ mod tests {
 
     #[test]
     fn test_emoji_and_cjk_with_inline_markup() {
-        // Multi-byte characters with OrgMode inline markup — must not panic
         let (text, annotations) = OrgModeExtractor::parse_inline_markup("🎉 *太字* テスト");
         assert!(text.contains("🎉"), "Emoji preserved");
         assert!(text.contains("太字"), "Bold content present");
@@ -1349,7 +1438,6 @@ mod tests {
             code.text.contains("def hello():"),
             "Code element should contain the function definition"
         );
-        // Check language attribute
         let lang = code
             .attributes
             .as_ref()
@@ -1397,7 +1485,6 @@ mod tests {
             code_elements[0].text.contains("Some example text"),
             "Code element should contain example content"
         );
-        // EXAMPLE blocks should have no language attribute
         let lang = code_elements[0].attributes.as_ref().and_then(|a| a.get("language"));
         assert!(lang.is_none(), "EXAMPLE blocks should not have a language attribute");
     }
@@ -1417,6 +1504,64 @@ mod tests {
         assert!(
             !code_elements.is_empty(),
             "Should produce Code element for lowercase #+begin_example block"
+        );
+    }
+
+    fn orgmode_warnings(doc: &crate::types::internal::InternalDocument) -> Vec<String> {
+        doc.processing_warnings
+            .iter()
+            .filter(|w| w.source == ORGMODE_WARNING_SOURCE)
+            .map(|w| w.message.to_string())
+            .collect()
+    }
+
+    /// #171: `#+INCLUDE: "file.org"` inlines another file's rendered content,
+    /// which this single-file parser has no way to read, whether the keyword
+    /// appears in the document preamble or later in the body.
+    #[test]
+    fn should_warn_when_orgmode_include_keyword_in_preamble_is_skipped() {
+        let org_text = "#+TITLE: Doc\n#+INCLUDE: \"chapter1.org\"\n\n* Heading\nBody text\n";
+        let doc = OrgModeExtractor::build_internal_document(org_text);
+
+        let warnings = orgmode_warnings(&doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one orgmode warning, got {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("chapter1.org") && warnings[0].contains("was not read"),
+            "warning must name the skipped #+INCLUDE target, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn should_warn_when_orgmode_include_keyword_in_body_is_skipped() {
+        let org_text = "* Heading\nBody text\n#+INCLUDE: \"chapter2.org\"\nMore text\n";
+        let doc = OrgModeExtractor::build_internal_document(org_text);
+
+        let warnings = orgmode_warnings(&doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one orgmode warning, got {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("chapter2.org"),
+            "warning must name the skipped #+INCLUDE target, got {warnings:?}"
+        );
+    }
+
+    /// A document with no `#+INCLUDE` keyword must not warn.
+    #[test]
+    fn should_not_warn_for_orgmode_document_without_include() {
+        let org_text = "#+TITLE: Doc\n\n* Heading\nBody text\n";
+        let doc = OrgModeExtractor::build_internal_document(org_text);
+
+        assert!(
+            orgmode_warnings(&doc).is_empty(),
+            "a document without #+INCLUDE must not warn, got {:?}",
+            orgmode_warnings(&doc)
         );
     }
 }

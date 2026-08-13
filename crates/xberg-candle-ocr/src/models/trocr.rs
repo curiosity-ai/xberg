@@ -57,14 +57,39 @@ impl TrocrVariant {
         }
     }
 
-    /// HuggingFace git branch for this variant.
-    /// Some variants use PR branches; others use main.
-    pub fn branch(&self) -> &'static str {
+    /// Immutable Hugging Face revision for this variant.
+    ///
+    /// Some safetensors conversions originated on PR refs; pinning the resolved
+    /// commits prevents those mutable refs from changing beneath the cache.
+    pub fn revision(&self) -> &'static str {
         match self {
-            TrocrVariant::BasePrinted => "refs/pr/7",
-            TrocrVariant::LargePrinted => "main",
-            TrocrVariant::BaseHandwritten => "refs/pr/3",
-            TrocrVariant::LargeHandwritten => "refs/pr/6",
+            TrocrVariant::BasePrinted => "24216f24cd78fe1a9c8b4e6e4565aec5c9220e63",
+            TrocrVariant::LargePrinted => "9ff792d8e7c22061f2ee67e1ed2246b1f9ef1e98",
+            TrocrVariant::BaseHandwritten => "47db63bbc18d32eca4cb813eb7728c891903e289",
+            TrocrVariant::LargeHandwritten => "f07eb3a73a9b06a73141dba2ae1f1671c5c346af",
+        }
+    }
+
+    /// Backward-compatible alias for [`Self::revision`].
+    pub fn branch(&self) -> &'static str {
+        self.revision()
+    }
+
+    fn model_sha256(&self) -> &'static str {
+        match self {
+            TrocrVariant::BasePrinted => "1cf4a6eedab26afaaf505f1c7f73d9634944924dbd1ed049d569db98039cd596",
+            TrocrVariant::LargePrinted => "8d770e31b1d58a033bd023ddd5790764c78fc2ab8074c605c49bba1c4a938616",
+            TrocrVariant::BaseHandwritten => "25a40cddc7e6120140a3d5b9e3dd3878a92ada7b4f312953ab22edc19c2a5acc",
+            TrocrVariant::LargeHandwritten => "21b96861916e0c021488df17d90f33bef7d298f0bce464f8ff0ab1bd345b4e70",
+        }
+    }
+
+    fn config_sha256(&self) -> &'static str {
+        match self {
+            TrocrVariant::BasePrinted => "5bda1deab455661feb3d91906656e5600e2ca520d5c00a2a03836614b850c93e",
+            TrocrVariant::LargePrinted => "9fd06abe8e2b3b835968210cfaccbed6b8f5698ab3fe9743fa2ac021b69f2028",
+            TrocrVariant::BaseHandwritten => "4c779f24e063c437c3dafd5b2e6c9f59f2fa2bd1dbb4ae6a30153bbbbf19e647",
+            TrocrVariant::LargeHandwritten => "4e4b5be06883d2dcceb299c717dfc96c3853b85e4f62393eac649183b923c5ec",
         }
     }
 
@@ -135,33 +160,48 @@ impl TrocrEngine {
     /// - Device initialization fails
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(variant: TrocrVariant, device: Device) -> Result<Self> {
-        use hf_hub::RepoType;
-        use hf_hub::api::sync::Api;
+        Self::new_with_hf(variant, device, None, None)
+    }
 
-        let api = Api::new()
-            .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to initialize HF Hub API: {}", e)))?;
-
+    /// Load a pinned TrOCR variant with optional Hugging Face cache settings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_with_hf(
+        variant: TrocrVariant,
+        device: Device,
+        cache_dir: Option<&std::path::Path>,
+        revision: Option<&str>,
+    ) -> Result<Self> {
         tracing::info!("Loading TrOCR variant: {}", variant);
 
-        // Use per-variant branch for model repo
         let repo_id = variant.repo_id().to_string();
-        let branch = variant.branch().to_string();
-        let model_repo = hf_hub::Repo::with_revision(repo_id.clone(), RepoType::Model, branch.clone());
-
-        // Download model weights (~1.4GB for base variants)
-        let model_file = api.repo(model_repo.clone()).get("model.safetensors").map_err(|e| {
+        let pinned_revision = variant.revision();
+        let revision = revision.unwrap_or(pinned_revision);
+        if revision != pinned_revision {
+            return Err(CandleOcrError::UnsupportedConfig(format!(
+                "{variant} is checksum-pinned to revision {pinned_revision}; requested {revision}"
+            )));
+        }
+        let model_file = crate::download_guard::hf_download(
+            &repo_id,
+            "model.safetensors",
+            revision,
+            cache_dir,
+            variant.model_sha256(),
+        )
+        .map_err(|e| {
             CandleOcrError::ModelLoadFailed(format!(
-                "Failed to download model weights for {} (branch {}): {}",
-                variant, branch, e
+                "Failed to download model weights for {} (revision {}): {}",
+                variant, revision, e
             ))
         })?;
 
         tracing::info!("Downloaded model weights to: {}", model_file.display());
 
-        // Download and parse config.json to get both encoder and decoder configs
-        let config_file = api.repo(model_repo).get("config.json").map_err(|e| {
-            CandleOcrError::ModelLoadFailed(format!("Failed to download config.json for {}: {}", variant, e))
-        })?;
+        let config_file =
+            crate::download_guard::hf_download(&repo_id, "config.json", revision, cache_dir, variant.config_sha256())
+                .map_err(|e| {
+                CandleOcrError::ModelLoadFailed(format!("Failed to download config.json for {}: {}", variant, e))
+            })?;
 
         let config_str = std::fs::read_to_string(&config_file)
             .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to read config.json: {}", e)))?;
@@ -169,31 +209,24 @@ impl TrocrEngine {
         let full_config: TrocrFullConfig = serde_json::from_str(&config_str)
             .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to parse config.json: {}", e)))?;
 
-        // Load weights using memory mapping
-        // SAFETY: VarBuilder::from_mmaped_safetensors requires that:
-        // 1. The file path is valid and readable (guaranteed by hf_hub cache)
-        // 2. The safetensors format is valid (guaranteed by HF validation)
-        // 3. The device is compatible (guaranteed by candle)
-        // 4. No concurrent writes (guaranteed by hf_hub's file locking)
-        //
-        // The mmap'd buffer is kept in memory for the lifetime of the VarBuilder,
-        // and the underlying file handle is managed by hf_hub's cache system.
         #[allow(unsafe_code)]
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[model_file], DType::F32, &device)
                 .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to load safetensors: {}", e)))?
         };
 
-        // Build TrOCRModel with both encoder and decoder configs
         tracing::info!("Building TrOCR encoder-decoder model");
         let model = trocr::TrOCRModel::new(&full_config.encoder, &full_config.decoder, vb)
             .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to build TrOCR model: {}", e)))?;
 
-        // Download and load tokenizer from ToluClassics/candle-trocr-tokenizer
-        let tokenizer_repo = api.model("ToluClassics/candle-trocr-tokenizer".to_string());
-        let tokenizer_file = tokenizer_repo
-            .get("tokenizer.json")
-            .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to download tokenizer: {}", e)))?;
+        let tokenizer_file = crate::download_guard::hf_download(
+            "ToluClassics/candle-trocr-tokenizer",
+            "tokenizer.json",
+            "7253d6cb8df4b0beed072ff65092a90f22f98a89",
+            cache_dir,
+            "2f1a555a1ee93656b4e6f67aa75d492a843c225e5ef754bae24c36bd85851cd7",
+        )
+        .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to download tokenizer: {}", e)))?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_file)
             .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to load tokenizer: {}", e)))?;
@@ -232,14 +265,12 @@ impl TrocrEngine {
     /// - Image decode fails
     /// - Model inference fails
     pub fn process_image(&self, image_bytes: &[u8]) -> Result<CandleOcrOutput> {
-        // Validate image
         if image_bytes.is_empty() {
             return Err(CandleOcrError::UnsupportedConfig("Empty image data".to_string()));
         }
 
         tracing::debug!(image_size = image_bytes.len(), "TrOCR: preprocessing image");
 
-        // Preprocess image: resize to 384x384, normalize with mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]
         let processor = crate::models::image_processor::ImageProcessor::default();
         let image_tensor = processor
             .process(image_bytes, &self.device)
@@ -247,7 +278,6 @@ impl TrocrEngine {
 
         tracing::debug!(tensor_shape = ?image_tensor.shape().dims(), "TrOCR: image tensor shape after preprocessing");
 
-        // Run encoder forward pass to get encoder hidden states
         let mut model_guard = self.model.lock();
         model_guard.reset_kv_cache();
 
@@ -259,14 +289,11 @@ impl TrocrEngine {
 
         tracing::debug!(encoder_shape = ?encoder_hidden_states.shape().dims(), "TrOCR: encoder hidden states shape");
 
-        // Decoder configuration for generation (from the loaded checkpoint config)
         let decoder_start_token_id = self.decoder_start_token_id;
         let eos_token_id = self.eos_token_id;
 
-        // Initialize decoder input with start token
         let mut token_ids = vec![decoder_start_token_id];
 
-        // Logits processor for sampling
         let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(1337, None, None);
 
         tracing::debug!(
@@ -275,7 +302,6 @@ impl TrocrEngine {
             "TrOCR: beginning decoding loop"
         );
 
-        // Decoding loop (max 1000 iterations)
         for index in 0..1000 {
             let context_size = if index >= 1 { 1 } else { token_ids.len() };
             let start_pos = token_ids.len().saturating_sub(context_size);
@@ -284,12 +310,10 @@ impl TrocrEngine {
                 .unsqueeze(0)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Token unsqueeze failed: {}", e)))?;
 
-            // Decoder forward pass
             let logits = model_guard
                 .decode(&input_ids, &encoder_hidden_states, start_pos)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Decoder forward failed: {}", e)))?;
 
-            // Get logits for next token
             let logits = logits
                 .squeeze(0)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Logits squeeze(0) failed: {}", e)))?;
@@ -302,7 +326,6 @@ impl TrocrEngine {
                 )
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Logits indexing failed: {}", e)))?;
 
-            // Sample next token
             let token = logits_processor
                 .sample(&logits)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Token sampling failed: {}", e)))?;
@@ -318,7 +341,6 @@ impl TrocrEngine {
                 );
             }
 
-            // Stop on EOS token
             if token == eos_token_id {
                 tracing::debug!(
                     iterations = index + 1,
@@ -329,7 +351,6 @@ impl TrocrEngine {
             }
         }
 
-        // Decode all collected token ids to text
         let decoded_text = self
             .tokenizer
             .decode(&token_ids, true)
@@ -395,15 +416,21 @@ mod tests {
     }
 
     #[test]
-    fn test_trocr_variant_branches() {
-        assert_eq!(TrocrVariant::BasePrinted.branch(), "refs/pr/7");
-        assert_eq!(TrocrVariant::LargePrinted.branch(), "main");
-        assert_eq!(TrocrVariant::BaseHandwritten.branch(), "refs/pr/3");
-        assert_eq!(TrocrVariant::LargeHandwritten.branch(), "refs/pr/6");
+    fn test_trocr_variant_revisions_are_immutable_commits() {
+        for variant in [
+            TrocrVariant::BasePrinted,
+            TrocrVariant::LargePrinted,
+            TrocrVariant::BaseHandwritten,
+            TrocrVariant::LargeHandwritten,
+        ] {
+            let revision = variant.revision();
+            assert_eq!(revision.len(), 40);
+            assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 
     #[test]
-    #[ignore] // Expensive: downloads ~1.4GB model on first run
+    #[ignore]
     fn test_engine_creation() {
         let device = Device::Cpu;
         let engine = TrocrEngine::new(TrocrVariant::BasePrinted, device).expect("Engine creation failed");
@@ -412,12 +439,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Expensive: downloads ~1.4GB model on first run
+    #[ignore]
     fn test_inference_on_real_image() {
         use std::fs;
         use std::path::Path;
 
-        // Load test image
         let image_path = Path::new("../../test_documents/images/ocr_image.jpg");
         if !image_path.exists() {
             tracing::warn!(
@@ -429,17 +455,13 @@ mod tests {
 
         let image_bytes = fs::read(image_path).expect("Failed to read test image");
 
-        // Create engine (will download model on first run)
         let device = Device::Cpu;
         let engine = TrocrEngine::new(TrocrVariant::BasePrinted, device).expect("Failed to create TrOCR engine");
 
-        // Run OCR
         let result = engine.process_image(&image_bytes).expect("OCR inference failed");
 
-        // Verify we got text output
         assert!(!result.content.is_empty(), "OCR returned empty text");
 
-        // Verify at least one ASCII letter is present
         let has_letter = result.content.chars().any(|c| c.is_ascii_alphabetic());
         assert!(
             has_letter,

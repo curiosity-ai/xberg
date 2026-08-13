@@ -47,11 +47,9 @@ pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAu
         )));
     }
 
-    // Wrap bytes in a Cursor — io::Cursor<&[u8]> implements MediaSource.
     let cursor = Cursor::new(bytes);
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
-    // No extension hint — let symphonia detect format from container magic bytes.
     let hint = Hint::new();
     let fmt_opts: FormatOptions = Default::default();
     let meta_opts: MetadataOptions = Default::default();
@@ -60,14 +58,12 @@ pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAu
         .probe(&hint, mss, fmt_opts, meta_opts)
         .map_err(|e| XbergError::transcription(format!("symphonia probe failed: {e}")))?;
 
-    // Select the first decodable audio track.
     let track = format
         .default_track(TrackType::Audio)
         .ok_or_else(|| XbergError::transcription("no audio track found in input"))?;
 
     let track_id = track.id;
 
-    // Extract codec parameters before the mutable borrow of `format` below.
     let audio_codec_params = track
         .codec_params
         .as_ref()
@@ -83,18 +79,16 @@ pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAu
         .make_audio_decoder(&audio_codec_params, &dec_opts)
         .map_err(|e| XbergError::transcription(format!("unsupported audio codec: {e}")))?;
 
-    // Decode all packets, collecting interleaved f32 samples.
     let mut interleaved: Vec<f32> = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
             Ok(Some(pkt)) => pkt,
-            Ok(None) => break, // end of stream
+            Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(SymphoniaError::ResetRequired) => {
-                // Chained OGG streams: reset and continue.
                 decoder.reset();
                 continue;
             }
@@ -109,7 +103,6 @@ pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAu
 
         let audio_buf = match decoder.decode(&packet) {
             Ok(buf) => buf,
-            // Soft errors: skip the packet.
             Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => {
                 return Err(XbergError::transcription(format!("audio decode error: {e}")));
@@ -127,14 +120,12 @@ pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAu
         interleaved.extend_from_slice(&chunk);
     }
 
-    // Down-mix to mono if the source has more than one channel.
     let mono = if src_channels <= 1 {
         interleaved
     } else {
         down_mix_to_mono(&interleaved, src_channels)
     };
 
-    // Resample to 16 kHz.
     let samples = if src_sample_rate == 16_000 {
         mono
     } else {
@@ -187,7 +178,6 @@ fn resample_linear_to_16k(samples: &[f32], src_hz: u32) -> Vec<f32> {
     }
 
     let src_len = samples.len();
-    // Number of output frames: ceil(src_len * TARGET_HZ / src_hz).
     let out_len = (src_len as u64 * TARGET_HZ as u64).div_ceil(src_hz as u64) as usize;
 
     let mut out = Vec::with_capacity(out_len);
@@ -231,7 +221,6 @@ mod tests {
     #[cfg(feature = "transcription")]
     #[test]
     fn test_empty_bytes_returns_error() {
-        // Empty input has no audio track — should return an error.
         let result = decode_audio_to_pcm(&[], None);
         assert!(result.is_err());
     }
@@ -239,7 +228,6 @@ mod tests {
     #[cfg(feature = "transcription")]
     #[test]
     fn test_down_mix_to_mono_stereo() {
-        // L=1.0, R=-1.0 → mono=0.0
         let stereo = vec![1.0f32, -1.0, 0.5, 0.5];
         let mono = down_mix_to_mono(&stereo, 2);
         assert_eq!(mono.len(), 2);
@@ -258,7 +246,6 @@ mod tests {
     #[cfg(feature = "transcription")]
     #[test]
     fn test_resample_linear_halves_rate() {
-        // Source: 32 kHz, 2 samples → should produce 1 output sample at 16 kHz.
         let samples = vec![0.0f32, 1.0];
         let out = resample_linear_to_16k(&samples, 32_000);
         assert_eq!(out.len(), 1);

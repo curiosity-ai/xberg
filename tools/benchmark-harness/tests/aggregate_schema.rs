@@ -1,6 +1,8 @@
 use benchmark_harness::aggregate::aggregate_new_format;
+use benchmark_harness::system_load::SystemLoad;
 use benchmark_harness::types::{
-    BenchmarkResult, ErrorKind, FrameworkCapabilities, OcrStatus, OutputFormat, PerformanceMetrics, QualityMetrics,
+    BenchmarkResult, ErrorKind, FrameworkCapabilities, OcrStatus, OutputFormat, PdfMetadata, PerformanceMetrics,
+    QualityMetrics,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,8 +31,11 @@ fn make_benchmark_result(
         extraction_duration: Some(Duration::from_millis(80)),
         subprocess_overhead: Some(Duration::from_millis(20)),
         metrics: PerformanceMetrics {
+            baseline_memory_bytes: 0,
             peak_memory_bytes: 100_000_000,
+            peak_memory_delta_bytes: 100_000_000,
             avg_cpu_percent: 50.0,
+            cpu_seconds: 50.0,
             throughput_bytes_per_sec: 102_400.0,
             p50_memory_bytes: 90_000_000,
             p95_memory_bytes: 95_000_000,
@@ -45,11 +50,12 @@ fn make_benchmark_result(
         pdf_metadata: None,
         ocr_status: if ocr { OcrStatus::Used } else { OcrStatus::NotUsed },
         extracted_text: None,
+        system_load: None,
     }
 }
 
 #[test]
-fn test_schema_version_2_5_0() {
+fn test_schema_version_2_8_0() {
     let results = vec![make_benchmark_result(
         "xberg-markdown-baseline",
         OutputFormat::Markdown,
@@ -64,11 +70,12 @@ fn test_schema_version_2_5_0() {
             missing_tokens: vec![],
             extra_tokens: vec![],
             correct: true,
+            reading_order_score: None,
         }),
     )];
 
     let aggregated = aggregate_new_format(&results);
-    assert_eq!(aggregated.schema_version, "2.5.0");
+    assert_eq!(aggregated.schema_version, "2.9.0");
 }
 
 #[test]
@@ -88,6 +95,7 @@ fn test_per_fixture_results_populated() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
         make_benchmark_result(
@@ -104,6 +112,7 @@ fn test_per_fixture_results_populated() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
     ];
@@ -113,7 +122,6 @@ fn test_per_fixture_results_populated() {
     assert!(!aggregated.per_fixture_results.is_empty());
     assert_eq!(aggregated.per_fixture_results.len(), 2);
 
-    // Check that fixture_id is correctly extracted from file path
     let fixture_ids: Vec<String> = aggregated
         .per_fixture_results
         .iter()
@@ -122,7 +130,6 @@ fn test_per_fixture_results_populated() {
     assert!(fixture_ids.contains(&"fixture_1".to_string()));
     assert!(fixture_ids.contains(&"fixture_2".to_string()));
 
-    // Check that output_format is preserved
     for row in &aggregated.per_fixture_results {
         assert_eq!(row.output_format, OutputFormat::Markdown);
     }
@@ -140,11 +147,12 @@ fn test_plaintext_has_no_layout_percentiles() {
             Some(QualityMetrics {
                 f1_score_text: 0.90,
                 f1_score_numeric: 0.85,
-                f1_score_layout: None, // Plaintext mode has no layout
+                f1_score_layout: None,
                 quality_score: 0.88,
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
         make_benchmark_result(
@@ -161,13 +169,13 @@ fn test_plaintext_has_no_layout_percentiles() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
     ];
 
     let aggregated = aggregate_new_format(&results);
 
-    // Find the plaintext aggregation
     let plaintext_key = aggregated
         .by_framework_mode
         .keys()
@@ -205,6 +213,7 @@ fn test_output_format_in_aggregation_key() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
         make_benchmark_result(
@@ -221,13 +230,13 @@ fn test_output_format_in_aggregation_key() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
     ];
 
     let aggregated = aggregate_new_format(&results);
 
-    // Should have two separate aggregations: one for markdown, one for plaintext
     let markdown_key = aggregated.by_framework_mode.keys().find(|k| k.contains("markdown"));
     let plaintext_key = aggregated.by_framework_mode.keys().find(|k| k.contains("plaintext"));
 
@@ -238,7 +247,6 @@ fn test_output_format_in_aggregation_key() {
 #[test]
 fn test_plaintext_frameworks_excluded_from_sf1_ranking() {
     let results = vec![
-        // Markdown framework for PDF
         make_benchmark_result(
             "xberg-markdown",
             OutputFormat::Markdown,
@@ -253,9 +261,9 @@ fn test_plaintext_frameworks_excluded_from_sf1_ranking() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
-        // Plaintext-only framework
         make_benchmark_result(
             "docling",
             OutputFormat::Plaintext,
@@ -270,18 +278,17 @@ fn test_plaintext_frameworks_excluded_from_sf1_ranking() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
     ];
 
     let aggregated = aggregate_new_format(&results);
 
-    // plaintext frameworks should NOT appear in pdf_sf1_ranking_markdown
     for ranked in &aggregated.comparison.pdf_sf1_ranking_markdown {
         assert!(!ranked.framework_mode.contains("docling"));
     }
 
-    // markdown frameworks SHOULD appear in pdf_sf1_ranking_markdown
     let has_markdown = aggregated
         .comparison
         .pdf_sf1_ranking_markdown
@@ -307,6 +314,7 @@ fn test_quality_percentiles_all_three() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
         make_benchmark_result(
@@ -323,6 +331,7 @@ fn test_quality_percentiles_all_three() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: false,
+                reading_order_score: None,
             }),
         ),
         make_benchmark_result(
@@ -339,13 +348,13 @@ fn test_quality_percentiles_all_three() {
                 missing_tokens: vec![],
                 extra_tokens: vec![],
                 correct: true,
+                reading_order_score: None,
             }),
         ),
     ];
 
     let aggregated = aggregate_new_format(&results);
 
-    // Find the aggregation with quality metrics
     let has_quality_percentiles = aggregated.by_framework_mode.values().any(|agg| {
         agg.by_file_type.values().any(|ft| {
             [ft.no_ocr.as_ref(), ft.with_ocr.as_ref()]
@@ -353,7 +362,6 @@ fn test_quality_percentiles_all_three() {
                 .flatten()
                 .any(|perf| {
                     if let Some(q) = &perf.quality {
-                        // Check that all three percentiles are present
                         q.f1_text_p50 > 0.0
                             && q.f1_text_p95 > 0.0
                             && q.f1_text_p99 >= 0.0
@@ -371,6 +379,91 @@ fn test_quality_percentiles_all_three() {
         has_quality_percentiles,
         "Expected quality percentiles with p50, p95, p99"
     );
+}
+
+#[test]
+fn xberg_pdf_baseline_and_layout_keep_exact_tf1_sf1_by_format_and_in_rankings() {
+    let baseline = make_benchmark_result(
+        "xberg-markdown-baseline",
+        OutputFormat::Markdown,
+        "shared.pdf",
+        false,
+        true,
+        Some(QualityMetrics {
+            f1_score_text: 0.81,
+            f1_score_numeric: 0.72,
+            f1_score_layout: Some(0.63),
+            quality_score: 0.73,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: false,
+            reading_order_score: None,
+        }),
+    );
+    let layout = make_benchmark_result(
+        "xberg-markdown-layout",
+        OutputFormat::Markdown,
+        "shared.pdf",
+        false,
+        true,
+        Some(QualityMetrics {
+            f1_score_text: 0.91,
+            f1_score_numeric: 0.82,
+            f1_score_layout: Some(0.88),
+            quality_score: 0.88,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: false,
+            reading_order_score: None,
+        }),
+    );
+
+    let aggregated = aggregate_new_format(&[baseline, layout]);
+    let baseline_quality = aggregated.by_framework_mode["xberg-markdown-baseline:single"].by_file_type["pdf"]
+        .no_ocr
+        .as_ref()
+        .and_then(|performance| performance.quality.as_ref())
+        .expect("baseline PDF quality");
+    let layout_quality = aggregated.by_framework_mode["xberg-markdown-layout:single"].by_file_type["pdf"]
+        .no_ocr
+        .as_ref()
+        .and_then(|performance| performance.quality.as_ref())
+        .expect("layout PDF quality");
+    assert_eq!(baseline_quality.f1_text_p50, 0.81);
+    assert_eq!(baseline_quality.f1_layout_p50, Some(0.63));
+    assert_eq!(layout_quality.f1_text_p50, 0.91);
+    assert_eq!(layout_quality.f1_layout_p50, Some(0.88));
+
+    let baseline_row = aggregated
+        .per_fixture_results
+        .iter()
+        .find(|row| row.framework == "xberg-markdown-baseline")
+        .expect("baseline fixture row");
+    let layout_row = aggregated
+        .per_fixture_results
+        .iter()
+        .find(|row| row.framework == "xberg-markdown-layout")
+        .expect("layout fixture row");
+    assert_eq!((baseline_row.f1_text, baseline_row.f1_layout), (Some(0.81), Some(0.63)));
+    assert_eq!((layout_row.f1_text, layout_row.f1_layout), (Some(0.91), Some(0.88)));
+
+    let tf1_ranking = &aggregated.comparison.pdf_tf1_ranking_markdown;
+    assert_eq!(tf1_ranking.len(), 2);
+    assert_eq!(tf1_ranking[0].framework_mode, "xberg-markdown-layout:single");
+    assert_eq!(tf1_ranking[0].value, 0.91);
+    assert_eq!(tf1_ranking[1].framework_mode, "xberg-markdown-baseline:single");
+    assert_eq!(tf1_ranking[1].value, 0.81);
+
+    let sf1_ranking = &aggregated.comparison.pdf_sf1_ranking_markdown;
+    assert_eq!(sf1_ranking.len(), 2);
+    assert_eq!(sf1_ranking[0].framework_mode, "xberg-markdown-layout:single");
+    assert_eq!(sf1_ranking[0].value, 0.88);
+    assert_eq!(sf1_ranking[1].framework_mode, "xberg-markdown-baseline:single");
+    assert_eq!(sf1_ranking[1].value, 0.63);
+
+    let json = serde_json::to_value(&aggregated).unwrap();
+    assert!(json["per_fixture_results"][0]["f1_text"].is_number());
+    assert!(json["per_fixture_results"][0]["f1_layout"].is_number());
 }
 
 #[test]
@@ -404,8 +497,26 @@ fn test_ocr_flag_in_per_fixture() {
 
     assert!(no_ocr_row.is_some());
     assert!(with_ocr_row.is_some());
-    assert!(!no_ocr_row.unwrap().ocr);
-    assert!(with_ocr_row.unwrap().ocr);
+    assert_eq!(no_ocr_row.unwrap().ocr, Some(false));
+    assert_eq!(with_ocr_row.unwrap().ocr, Some(true));
+}
+
+#[test]
+fn test_unknown_ocr_status_serializes_as_null() {
+    let mut result = make_benchmark_result(
+        "test-framework",
+        OutputFormat::Markdown,
+        "unknown.pdf",
+        false,
+        true,
+        None,
+    );
+    result.ocr_status = OcrStatus::Unknown;
+
+    let aggregated = aggregate_new_format(&[result]);
+    assert_eq!(aggregated.per_fixture_results[0].ocr, None);
+    let serialized = serde_json::to_value(&aggregated).unwrap();
+    assert!(serialized["per_fixture_results"][0]["ocr"].is_null());
 }
 
 #[test]
@@ -413,8 +524,138 @@ fn test_empty_results() {
     let results = vec![];
     let aggregated = aggregate_new_format(&results);
 
-    assert_eq!(aggregated.schema_version, "2.5.0");
+    assert_eq!(aggregated.schema_version, "2.9.0");
     assert!(aggregated.by_framework_mode.is_empty());
     assert!(aggregated.per_fixture_results.is_empty());
     assert_eq!(aggregated.metadata.total_results, 0);
+    assert!(aggregated.comparison.pages_per_sec_ranking.is_empty());
+    assert!(aggregated.comparison.cpu_seconds_ranking.is_empty());
+    assert!(aggregated.comparison.pareto_frontier.is_empty());
+}
+
+/// Tier A comparative performance metrics (v2.7.0 additive fields): `pages_per_sec` and
+/// `cpu_seconds` percentiles, and the `batch_size` dimension, must reach the public
+/// `NewConsolidatedResults` schema produced by `aggregate_new_format`.
+#[test]
+fn test_pages_per_sec_and_cpu_seconds_populate_in_public_schema() {
+    let mut result = make_benchmark_result(
+        "xberg-markdown-baseline",
+        OutputFormat::Markdown,
+        "fixture_1.pdf",
+        false,
+        true,
+        Some(QualityMetrics {
+            f1_score_text: 0.95,
+            f1_score_numeric: 0.90,
+            f1_score_layout: Some(0.88),
+            quality_score: 0.91,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: true,
+            reading_order_score: None,
+        }),
+    );
+    result.pdf_metadata = Some(PdfMetadata {
+        has_text_layer: true,
+        detection_method: "pdftotext".to_string(),
+        page_count: Some(5),
+        ocr_enabled: false,
+        text_quality_score: None,
+    });
+    result.metrics.cpu_seconds = 0.08;
+
+    let aggregated = aggregate_new_format(&[result]);
+
+    let performance = aggregated.by_framework_mode["xberg-markdown-baseline:single"]
+        .overall_performance
+        .as_ref()
+        .expect("overall_performance must be populated");
+
+    let pages_per_sec = performance
+        .pages_per_sec
+        .as_ref()
+        .expect("pages_per_sec must be populated from PdfMetadata.page_count");
+    assert_eq!(pages_per_sec.p50, 50.0);
+
+    assert_eq!(performance.cpu_seconds.p50, 0.08);
+    assert_eq!(performance.batch_size, Some(1));
+
+    let serialized = serde_json::to_value(&aggregated).unwrap();
+    let performance_json = &serialized["by_framework_mode"]["xberg-markdown-baseline:single"]["overall_performance"];
+    assert_eq!(performance_json["pages_per_sec"]["p50"], 50.0);
+    assert_eq!(performance_json["cpu_seconds"]["p50"], 0.08);
+    assert_eq!(performance_json["batch_size"], 1);
+}
+
+#[test]
+fn test_system_load_surfaces_as_contention_qualifier() {
+    let mut result = make_benchmark_result(
+        "xberg-markdown-baseline",
+        OutputFormat::Markdown,
+        "fixture_1.pdf",
+        false,
+        true,
+        None,
+    );
+    result.system_load = Some(SystemLoad {
+        load_avg_1m: 8.0,
+        load_avg_5m: 8.0,
+        load_avg_15m: 8.0,
+        logical_cores: 4,
+        physical_cores: 4,
+    });
+
+    let aggregated = aggregate_new_format(&[result]);
+
+    let performance = aggregated.by_framework_mode["xberg-markdown-baseline:single"]
+        .overall_performance
+        .as_ref()
+        .expect("overall_performance must be populated");
+    let system_load = performance
+        .system_load
+        .as_ref()
+        .expect("system_load must surface the captured contention snapshot");
+
+    assert_eq!(system_load.total_sample_count, 1);
+    assert_eq!(
+        system_load.contended_sample_count, 1,
+        "load_per_core of 2.0 (8.0 / 4 cores) exceeds the contention threshold"
+    );
+}
+
+#[test]
+fn test_pareto_frontier_reaches_public_schema() {
+    let mut result = make_benchmark_result(
+        "xberg-markdown-baseline",
+        OutputFormat::Markdown,
+        "fixture_1.pdf",
+        false,
+        true,
+        Some(QualityMetrics {
+            f1_score_text: 0.95,
+            f1_score_numeric: 0.90,
+            f1_score_layout: Some(0.88),
+            quality_score: 0.91,
+            missing_tokens: vec![],
+            extra_tokens: vec![],
+            correct: true,
+            reading_order_score: None,
+        }),
+    );
+    result.pdf_metadata = Some(PdfMetadata {
+        has_text_layer: true,
+        detection_method: "pdftotext".to_string(),
+        page_count: Some(10),
+        ocr_enabled: false,
+        text_quality_score: None,
+    });
+
+    let aggregated = aggregate_new_format(&[result]);
+
+    assert_eq!(aggregated.comparison.pareto_frontier.len(), 1);
+    let point = &aggregated.comparison.pareto_frontier[0];
+    assert_eq!(point.framework_mode, "xberg-markdown-baseline:single");
+    assert_eq!(point.pages_per_sec, 100.0);
+    assert_eq!(point.sf1, 0.88);
+    assert_eq!(point.peak_memory_mb, 100.0);
 }

@@ -8,8 +8,6 @@ mod simd_text;
 pub use config::{ReductionLevel, TokenReductionConfig};
 pub use core::TokenReducer;
 
-// TODO: reorganize token_reduction - move out of text, and reorganize text properly into utils etc.
-
 /// Reduces token count in text while preserving meaning and structure.
 ///
 /// This function removes stopwords, redundancy, and applies compression techniques
@@ -32,7 +30,11 @@ pub use core::TokenReducer;
 ///
 /// # Examples
 ///
-/// ```rust
+/// Not run as a doctest: this function is `pub(crate)`. Downstream crates reach it by
+/// setting [`crate::TokenReductionConfig`] on the extraction config; only the config
+/// types ([`crate::TokenReductionConfig`], [`crate::ReductionLevel`]) are public.
+///
+/// ```ignore
 /// use xberg::text::token_reduction::{reduce_tokens, TokenReductionConfig, ReductionLevel};
 ///
 /// let text = "This is a simple example text with some stopwords.";

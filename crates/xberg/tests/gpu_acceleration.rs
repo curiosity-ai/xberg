@@ -13,13 +13,17 @@
 //! - Network access (models auto-downloaded from HuggingFace)
 //!
 //! Run all GPU tests:
-//!   cargo test -p xberg --features "full,ort-dynamic" --test gpu_acceleration -- --ignored
+//!   cargo test -p xberg --features "full,ort-dynamic,cuda" --test gpu_acceleration -- --ignored
 //!
 //! The `ort-dynamic` feature overrides the bundled CPU-only ORT so a
-//! GPU-enabled ONNX Runtime (via `ORT_DYLIB_PATH`) is loaded at runtime.
+//! GPU-enabled ONNX Runtime (via `ORT_DYLIB_PATH`) is loaded at runtime. The `cuda`
+//! feature compiles in `ort::ep::CUDA` (gated out of `full` by default — see
+//! `ort_discovery.rs` — since the plain `download-binaries` prebuilt has no CUDA support).
+
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+#![allow(dead_code)]
 
 mod helpers;
-use helpers::extract_bytes_document;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -36,7 +40,7 @@ fn test_documents_dir() -> PathBuf {
         .join("test_documents")
 }
 
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 fn test_cache_dir() -> PathBuf {
     std::env::temp_dir().join("xberg_gpu_test")
 }
@@ -47,11 +51,6 @@ fn cuda_accel() -> xberg::AccelerationConfig {
         device_id: 0,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tracing log capture — verifies CUDA EP is actually requested, not silently
-// falling back to CPU (the exact bug in issue #783).
-// ---------------------------------------------------------------------------
 
 struct LogCapture {
     messages: Arc<Mutex<Vec<String>>>,
@@ -112,11 +111,7 @@ fn assert_cuda_requested(captured: &Arc<Mutex<Vec<String>>>) {
     );
 }
 
-// ===========================================================================
-// 1. PaddleOCR with CUDA (det + cls + rec models)
-// ===========================================================================
-
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 mod paddle_ocr_cuda {
     use super::*;
     use xberg::core::config::OcrConfig;
@@ -229,10 +224,6 @@ mod paddle_ocr_cuda {
     }
 }
 
-// ===========================================================================
-// 2. Layout Detection with CUDA (RT-DETR)
-// ===========================================================================
-
 #[cfg(feature = "layout-detection")]
 mod layout_detection_cuda {
     use super::*;
@@ -294,10 +285,6 @@ mod layout_detection_cuda {
     }
 }
 
-// ===========================================================================
-// 3. Embeddings with CUDA
-// ===========================================================================
-
 #[cfg(feature = "embeddings")]
 mod embeddings_cuda {
     use super::*;
@@ -353,11 +340,7 @@ mod embeddings_cuda {
     }
 }
 
-// ===========================================================================
-// 4. Document Orientation Detection with CUDA (auto-rotate)
-// ===========================================================================
-
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 mod doc_orientation_cuda {
     use super::*;
     use xberg::core::config::OcrConfig;
@@ -392,11 +375,7 @@ mod doc_orientation_cuda {
     }
 }
 
-// ===========================================================================
-// 5. End-to-end extraction with CUDA
-// ===========================================================================
-
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 mod e2e_cuda {
     use super::*;
     use xberg::core::config::OcrConfig;
@@ -419,7 +398,7 @@ mod e2e_cuda {
             ..Default::default()
         };
 
-        let result = extract_bytes_document(&image_bytes, "image/png", &config).await;
+        let result = helpers::extract_bytes_document(&image_bytes, "image/png", &config).await;
         assert!(result.is_ok(), "E2E CUDA extraction failed: {:?}", result.err());
         assert_cuda_requested(&captured);
 

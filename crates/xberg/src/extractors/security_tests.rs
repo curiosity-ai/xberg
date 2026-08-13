@@ -8,7 +8,6 @@ mod latex_security_tests {
     fn test_latex_unterminated_braces_protection() {
         let latex = r#"\title{"#;
         let (text, _, _) = LatexExtractor::extract_from_latex(latex);
-        // Must not panic or hang; result is indeterminate but defined
         let _ = text;
     }
 
@@ -39,7 +38,6 @@ mod latex_security_tests {
     fn test_latex_unclosed_display_math() {
         let latex = r#"\begin{document}Display math: $$x^2 + y^2 without closing\end{document}"#;
         let (text, _, _) = LatexExtractor::extract_from_latex(latex);
-        // Must not panic; content before $$ should appear
         assert!(!text.is_empty());
     }
 
@@ -52,7 +50,6 @@ mod latex_security_tests {
         latex.push_str("{content}\n\\end{document}");
 
         let (text, _, _) = LatexExtractor::extract_from_latex(&latex);
-        // The "content" argument should survive extraction even if command is unknown
         assert!(text.contains("content"), "argument text must be preserved");
     }
 
@@ -96,15 +93,12 @@ mod latex_security_tests {
 mod epub_security_tests {
     #[test]
     fn test_epub_entity_expansion_protection() {
-        // Verify the sanitizer does not expand entity references into a billion-laughs payload.
-        // A safe parser must emit the literal text "&amp;" rather than recursively expanding it.
         let entity = "&amp;";
         assert_eq!(entity.len(), 5, "escaped entity has fixed length, not expanded");
     }
 
     #[test]
     fn test_epub_chapter_count_limit() {
-        // SecurityLimits::default() caps nesting depth and archive file count.
         let limits = crate::extractors::security::SecurityLimits::default();
         assert!(limits.max_files_in_archive > 0);
         assert!(limits.max_nesting_depth > 0);
@@ -115,13 +109,10 @@ mod epub_security_tests {
 mod odt_security_tests {
     #[test]
     fn test_odt_xxe_protection() {
-        // Our XML parser (quick-xml) does not support DTD entity expansion —
-        // a DOCTYPE declaration with SYSTEM entities is silently ignored.
         let malicious_xml = r#"<?xml version="1.0"?>
             <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
             <root>&xxe;</root>"#;
 
-        // quick-xml emits the unresolved reference, not the file contents.
         assert!(!malicious_xml.contains("/etc/passwd\n"), "entity must not be expanded");
     }
 
@@ -143,7 +134,6 @@ mod odt_security_tests {
 
     #[test]
     fn test_odt_xml_depth_protection() {
-        // Generate deeply nested XML; extraction must complete without stack overflow.
         let mut xml = String::from(r#"<?xml version="1.0"?><root>"#);
         for i in 0..500 {
             xml.push_str(&format!("<level{i}>"));
@@ -168,7 +158,6 @@ mod odt_security_tests {
 mod jupyter_security_tests {
     #[test]
     fn test_jupyter_cell_limit() {
-        // A notebook with an empty cells array must parse without error.
         let valid_json = r#"{"cells":[], "metadata":{}, "nbformat":4, "nbformat_minor":0}"#;
         let parsed: serde_json::Value = serde_json::from_str(valid_json).expect("valid JSON");
         assert_eq!(parsed["cells"].as_array().unwrap().len(), 0);
@@ -188,7 +177,6 @@ mod jupyter_security_tests {
 
     #[test]
     fn test_jupyter_json_depth_protection() {
-        // Build deeply nested JSON; serialization must not panic.
         let mut json = String::from("{");
         for i in 0..500 {
             json.push_str(&format!("\"a{i}\":{{"));
@@ -214,7 +202,6 @@ mod jupyter_security_tests {
 mod rst_security_tests {
     #[test]
     fn test_rst_line_limit() {
-        // Building a 2M-line string must not cause OOM or panic in string ops.
         let mut rst = String::new();
         for i in 0..2_000_000 {
             rst.push_str(&format!("Line {i}\n"));

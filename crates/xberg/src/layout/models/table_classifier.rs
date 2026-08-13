@@ -7,16 +7,13 @@
 //! Input:  `x` shape `[batch, 3, 224, 224]` f32 (fixed size, ImageNet normalization)
 //! Output: `fetch_name_0` shape `[batch, 2]` f32 — [wired_score, wireless_score]
 
+use std::path::Path;
+
 use image::RgbImage;
 use ndarray::Array4;
-use ort::{inputs, session::Session, value::Tensor};
 
+use crate::inference::{InferenceSession, InferenceTensor, default_backend};
 use crate::layout::error::LayoutError;
-use crate::layout::session::build_session;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 /// PP-LCNet fixed input dimensions.
 const INPUT_SIZE: u32 = 224;
@@ -29,10 +26,6 @@ const IMAGENET_MEAN_BGR: [f32; 3] = [0.485, 0.456, 0.406];
 /// ImageNet normalization std, applied in BGR channel order.
 const IMAGENET_STD_BGR: [f32; 3] = [0.229, 0.224, 0.225];
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 /// Table type classification result.
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,7 +37,8 @@ pub enum TableType {
 }
 
 impl TableType {
-    pub(crate) fn name(&self) -> &'static str {
+    /// Human-readable label (`"wired"` or `"wireless"`).
+    pub fn name(&self) -> &'static str {
         match self {
             Self::Wired => "wired",
             Self::Wireless => "wireless",
@@ -52,62 +46,85 @@ impl TableType {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
 /// PP-LCNet table classifier model.
 #[cfg_attr(alef, alef(skip))]
 pub struct TableClassifier {
-    session: Session,
+    session: Box<dyn InferenceSession>,
     input_name: String,
 }
 
 impl TableClassifier {
     /// Load the table classifier ONNX model from a file path.
-    pub(crate) fn from_file(
+    ///
+    /// The session (with its `GraphOptimizationLevel::All` config, thread budget,
+    /// execution-provider selection, and CPU-only fallback) is built by the
+    /// [`crate::inference`] seam's default backend, so this works on either engine:
+    /// the ORT-backed `layout-detection` feature or the pure-Rust `layout-tract` variant.
+    pub fn from_file(
         path: &str,
         accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
     ) -> Result<Self, LayoutError> {
-        let budget = crate::core::config::concurrency::resolve_thread_budget(None);
-        let session = match build_session(path, accel, budget) {
-            Ok(s) => s,
-            Err(first_err) => {
-                tracing::warn!("TableClassifier: platform EP failed ({first_err}), retrying CPU-only");
-                Self::build_cpu_session(path, budget)?
-            }
-        };
-        let input_name = session.inputs()[0].name().to_string();
+        Self::from_file_with_thread_budget(
+            path,
+            accel,
+            crate::core::config::concurrency::resolve_thread_budget(None),
+        )
+    }
+
+    pub(crate) fn from_file_with_thread_budget(
+        path: &str,
+        accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
+        thread_budget: usize,
+    ) -> Result<Self, LayoutError> {
+        let session = default_backend()
+            .load_with_thread_budget(Path::new(path), accel, thread_budget)
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
+        let input_name = session
+            .input_names()
+            .first()
+            .cloned()
+            .ok_or_else(|| LayoutError::InvalidOutput("table classifier model has no inputs".to_string()))?;
         Ok(Self { session, input_name })
     }
 
-    fn build_cpu_session(path: &str, thread_budget: usize) -> Result<Session, LayoutError> {
-        use ort::session::builder::GraphOptimizationLevel;
-        let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::All)
-            .map_err(|e| LayoutError::Ort(ort::Error::new(e.message())))?
-            .with_intra_threads(thread_budget)
-            .map_err(|e| LayoutError::Ort(ort::Error::new(e.message())))?
-            .with_inter_threads(1)
-            .map_err(|e| LayoutError::Ort(ort::Error::new(e.message())))?;
-        Ok(builder.commit_from_file(path)?)
+    /// Load the table classifier ONNX model from an in-memory byte buffer.
+    ///
+    /// Used where there is no filesystem path to read from, e.g. WASM builds where
+    /// the JS host fetches and hands over the model weights directly. Uses the same
+    /// engine-neutral [`crate::inference`] seam as [`Self::from_file`].
+    pub fn from_bytes(
+        model_bytes: &[u8],
+        accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
+    ) -> Result<Self, LayoutError> {
+        let session = default_backend()
+            .load_from_memory(model_bytes, accel)
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
+        let input_name = session
+            .input_names()
+            .first()
+            .cloned()
+            .ok_or_else(|| LayoutError::InvalidOutput("table classifier model has no inputs".to_string()))?;
+        Ok(Self { session, input_name })
     }
 
     /// Classify a cropped table image as wired or wireless.
-    pub(crate) fn classify(&mut self, table_img: &RgbImage) -> Result<TableType, LayoutError> {
+    pub fn classify(&mut self, table_img: &RgbImage) -> Result<TableType, LayoutError> {
         tracing::trace!(
             input_width = table_img.width(),
             input_height = table_img.height(),
             "TableClassifier: starting classification"
         );
 
-        let input_tensor = preprocess_lcnet(table_img);
-        let tensor = Tensor::from_array(input_tensor)?;
+        let input_tensor = preprocess_lcnet(table_img)?;
 
         let inference_start = std::time::Instant::now();
-        let outputs = self.session.run(inputs![
-            self.input_name.as_str() => tensor
-        ])?;
+        let outputs = self
+            .session
+            .run(vec![(
+                self.input_name.clone(),
+                InferenceTensor::F32(input_tensor.into_dyn()),
+            )])
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
         let inference_ms = inference_start.elapsed().as_secs_f64() * 1000.0;
 
         tracing::trace!(
@@ -115,16 +132,13 @@ impl TableClassifier {
             "TableClassifier: inference complete"
         );
 
-        // Output shape: [1, 2] — raw logits [wired, wireless].
-        // Apply softmax to get probabilities before comparing.
-        for (_name, value) in outputs.iter() {
-            if let Ok(view) = value.try_extract_tensor::<f32>() {
-                let data = view.1;
+        for (_name, value) in &outputs {
+            if let Some(array) = value.as_f32() {
+                let data = array.as_slice().unwrap_or(&[]);
                 if data.len() >= 2 {
                     let raw_wired = data[0];
                     let raw_wireless = data[1];
 
-                    // Softmax: exp(x - max) / sum(exp(x - max))
                     let max_val = raw_wired.max(raw_wireless);
                     let exp_wired = (raw_wired - max_val).exp();
                     let exp_wireless = (raw_wireless - max_val).exp();
@@ -150,15 +164,10 @@ impl TableClassifier {
             }
         }
 
-        // Fallback to wireless if output parsing fails
         tracing::warn!("TableClassifier: could not parse output, defaulting to wireless");
         Ok(TableType::Wireless)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Preprocessing
-// ---------------------------------------------------------------------------
 
 /// Minimum edge length before center-crop.
 const MIN_EDGE: u32 = 256;
@@ -170,18 +179,16 @@ const MIN_EDGE: u32 = 256;
 /// 2. Center-crop to 224×224
 /// 3. Normalize in BGR channel order (PaddleOCR convention)
 /// 4. Layout: NCHW `[1, 3, 224, 224]` f32
-fn preprocess_lcnet(img: &RgbImage) -> Array4<f32> {
+fn preprocess_lcnet(img: &RgbImage) -> Result<Array4<f32>, LayoutError> {
     let orig_w = img.width();
     let orig_h = img.height();
 
-    // Step 1: Resize so shortest edge = 256 (aspect-preserving)
     let scale = MIN_EDGE as f32 / orig_w.min(orig_h) as f32;
     let new_w = (orig_w as f32 * scale).round().max(1.0) as u32;
     let new_h = (orig_h as f32 * scale).round().max(1.0) as u32;
 
     let resized = image::imageops::resize(img, new_w, new_h, image::imageops::FilterType::Triangle);
 
-    // Step 2: Center-crop to 224×224
     let crop_x = (new_w.saturating_sub(INPUT_SIZE)) / 2;
     let crop_y = (new_h.saturating_sub(INPUT_SIZE)) / 2;
     let crop_w = INPUT_SIZE.min(new_w);
@@ -192,13 +199,10 @@ fn preprocess_lcnet(img: &RgbImage) -> Array4<f32> {
     let h = INPUT_SIZE as usize;
     let hw = h * w;
 
-    // Output tensor is BGR (channel 0=B, 1=G, 2=R).
-    // Input pixels are RGB, so we swap R↔B in the write loop below.
-    // Normalization: pixel * (scale/std) + (-mean/std)
     const INV_255: f32 = 1.0 / 255.0;
-    let alpha_b = INV_255 / IMAGENET_STD_BGR[0]; // B channel: mean=0.485, std=0.229
-    let alpha_g = INV_255 / IMAGENET_STD_BGR[1]; // G channel: mean=0.456, std=0.224
-    let alpha_r = INV_255 / IMAGENET_STD_BGR[2]; // R channel: mean=0.406, std=0.225
+    let alpha_b = INV_255 / IMAGENET_STD_BGR[0];
+    let alpha_g = INV_255 / IMAGENET_STD_BGR[1];
+    let alpha_r = INV_255 / IMAGENET_STD_BGR[2];
     let beta_b = -IMAGENET_MEAN_BGR[0] / IMAGENET_STD_BGR[0];
     let beta_g = -IMAGENET_MEAN_BGR[1] / IMAGENET_STD_BGR[1];
     let beta_r = -IMAGENET_MEAN_BGR[2] / IMAGENET_STD_BGR[2];
@@ -206,19 +210,15 @@ fn preprocess_lcnet(img: &RgbImage) -> Array4<f32> {
     let mut data = vec![0.0f32; 3 * hw];
     let pixels = cropped.as_raw();
 
-    // Output channel order: BGR (channel 0 = B, 1 = G, 2 = R)
-    // Input pixel order: RGB (index 0 = R, 1 = G, 2 = B)
     for (i, pixel) in pixels.chunks_exact(3).enumerate() {
         let r = pixel[0] as f32;
         let g = pixel[1] as f32;
         let b = pixel[2] as f32;
-        // Channel 0 = B
         data[i] = b * alpha_b + beta_b;
-        // Channel 1 = G
         data[hw + i] = g * alpha_g + beta_g;
-        // Channel 2 = R
         data[2 * hw + i] = r * alpha_r + beta_r;
     }
 
-    Array4::from_shape_vec((1, 3, h, w), data).expect("shape mismatch in preprocess_lcnet")
+    Array4::from_shape_vec((1, 3, h, w), data)
+        .map_err(|e| LayoutError::InvalidOutput(format!("preprocess_lcnet shape mismatch: {e}")))
 }

@@ -15,11 +15,11 @@ use xberg::core::config::{ExtractionConfig, PageConfig};
 /// Test that page markers are inserted when enabled.
 #[test]
 fn test_page_markers_inserted_when_enabled() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: true,
@@ -31,7 +31,6 @@ fn test_page_markers_inserted_when_enabled() {
     let result =
         extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF with page markers");
 
-    // Default marker format is "\n\n<!-- PAGE {page_num} -->\n\n"
     assert!(
         result.content.contains("<!-- PAGE"),
         "Content should contain page markers when insert_page_markers is true. Content: {}",
@@ -42,11 +41,11 @@ fn test_page_markers_inserted_when_enabled() {
 /// Test that page 1 gets a marker (regression test for the bug where page 1 was skipped).
 #[test]
 fn test_page_1_gets_marker() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: true,
@@ -58,7 +57,6 @@ fn test_page_1_gets_marker() {
     let result =
         extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF with page markers");
 
-    // Page 1 should have a marker at the start
     assert!(
         result.content.contains("<!-- PAGE 1 -->"),
         "Content should contain marker for page 1. Content start: {}",
@@ -69,11 +67,11 @@ fn test_page_1_gets_marker() {
 /// Test that custom marker format works correctly.
 #[test]
 fn test_custom_marker_format() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let custom_format = "=== Page {page_num} ===";
     let config = ExtractionConfig {
         pages: Some(PageConfig {
@@ -96,11 +94,11 @@ fn test_custom_marker_format() {
 /// Test that {page_num} placeholder is replaced with actual page numbers.
 #[test]
 fn test_page_num_placeholder_replacement() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: true,
@@ -113,13 +111,11 @@ fn test_page_num_placeholder_replacement() {
     let result =
         extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF with custom markers");
 
-    // Should NOT contain the placeholder itself
     assert!(
         !result.content.contains("{page_num}"),
         "Placeholder should be replaced, not appear in output"
     );
 
-    // Should contain actual page number
     assert!(
         result.content.contains("[PAGE 1]"),
         "Should contain marker with actual page number"
@@ -129,11 +125,11 @@ fn test_page_num_placeholder_replacement() {
 /// Test that page markers and extract_pages work together.
 #[test]
 fn test_markers_and_extract_pages_together() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: true,
@@ -146,7 +142,6 @@ fn test_markers_and_extract_pages_together() {
     let result =
         extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF with both features");
 
-    // Should have both features working
     assert!(
         result.pages.is_some(),
         "Pages array should be present when extract_pages is true"
@@ -161,11 +156,11 @@ fn test_markers_and_extract_pages_together() {
 /// Test that when markers are disabled, no markers appear in content.
 #[test]
 fn test_no_markers_when_disabled() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: false,
@@ -177,7 +172,6 @@ fn test_no_markers_when_disabled() {
     let result =
         extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF without markers");
 
-    // Should NOT contain default marker pattern
     assert!(
         !result.content.contains("<!-- PAGE"),
         "Content should not contain markers when insert_page_markers is false"
@@ -187,11 +181,11 @@ fn test_no_markers_when_disabled() {
 /// Test that markers appear before page content, not after.
 #[test]
 fn test_marker_appears_before_content() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: true,
@@ -203,11 +197,9 @@ fn test_marker_appears_before_content() {
 
     let result = extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF with markers");
 
-    // The marker should appear at or near the start
     let marker_pos = result.content.find("[[PAGE 1]]");
     assert!(marker_pos.is_some(), "Marker should be present");
 
-    // Marker should be very early in the content (within first 50 chars)
     let pos = marker_pos.expect("Operation failed");
     assert!(
         pos < 50,
@@ -219,11 +211,11 @@ fn test_marker_appears_before_content() {
 /// Test that multi-page PDFs get markers for all pages.
 #[test]
 fn test_multi_page_markers() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: true,
@@ -238,7 +230,6 @@ fn test_multi_page_markers() {
     if let Some(ref pages) = result.pages {
         let page_count = pages.len();
 
-        // Check that we have markers for each page
         for page_num in 1..=page_count.min(3) {
             let marker = format!("<!-- PAGE {} -->", page_num);
             assert!(
@@ -264,8 +255,6 @@ fn test_default_marker_format() {
 /// Test that empty page still gets a marker.
 #[test]
 fn test_empty_page_gets_marker() {
-    // This would require a specific test PDF with an empty page
-    // For now, we just verify the logic doesn't skip pages based on content length
     let config = PageConfig {
         insert_page_markers: true,
         ..Default::default()
@@ -280,11 +269,11 @@ fn test_empty_page_gets_marker() {
 /// Test page markers are inserted in markdown output format (regression test for #412).
 #[test]
 fn test_page_markers_in_markdown_output() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         output_format: xberg::OutputFormat::Markdown,
         pages: Some(PageConfig {
@@ -307,11 +296,11 @@ fn test_page_markers_in_markdown_output() {
 /// Test page markers with custom format in markdown output (regression test for #412).
 #[test]
 fn test_page_markers_custom_format_markdown() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         output_format: xberg::OutputFormat::Markdown,
         pages: Some(PageConfig {
@@ -334,11 +323,11 @@ fn test_page_markers_custom_format_markdown() {
 /// Test no page markers in markdown when disabled.
 #[test]
 fn test_no_markers_in_markdown_when_disabled() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         output_format: xberg::OutputFormat::Markdown,
         pages: Some(PageConfig {
@@ -359,11 +348,11 @@ fn test_no_markers_in_markdown_when_disabled() {
 /// Test page markers are inserted in djot output format.
 #[test]
 fn test_page_markers_in_djot_output() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         output_format: xberg::OutputFormat::Djot,
         pages: Some(PageConfig {
@@ -386,11 +375,11 @@ fn test_page_markers_in_djot_output() {
 /// Test marker format with multiple placeholders (edge case).
 #[test]
 fn test_marker_format_multiple_placeholders() {
-    if skip_if_missing("pdfs/sample.pdf") {
+    if skip_if_missing("pdf/multi_page.pdf") {
         return;
     }
 
-    let file_path = get_test_file_path("pdfs/sample.pdf");
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
     let config = ExtractionConfig {
         pages: Some(PageConfig {
             insert_page_markers: true,
@@ -405,5 +394,74 @@ fn test_marker_format_multiple_placeholders() {
     assert!(
         result.content.contains("Page 1 of document (page 1)"),
         "Multiple {{page_num}} placeholders should all be replaced"
+    );
+}
+
+/// Markdown output must emit the marker verbatim, not markdown-escaped (issue #1328).
+#[test]
+fn test_page_markers_not_escaped_in_markdown_output() {
+    if skip_if_missing("pdf/multi_page.pdf") {
+        return;
+    }
+
+    let file_path = get_test_file_path("pdf/multi_page.pdf");
+    let config = ExtractionConfig {
+        output_format: xberg::OutputFormat::Markdown,
+        pages: Some(PageConfig {
+            insert_page_markers: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let result = extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF as markdown");
+
+    assert!(
+        result.content.contains("<!-- PAGE 1 -->") && result.content.contains("<!-- PAGE 2 -->"),
+        "Markdown output should contain verbatim default markers. Content start: {}",
+        &result.content[..result.content.len().min(300)]
+    );
+    assert!(
+        !result.content.contains("\\<\\!--"),
+        "Markers must not be backslash-escaped. Content start: {}",
+        &result.content[..result.content.len().min(300)]
+    );
+}
+
+/// OCR-path markdown output must also emit markers verbatim (issue #1328).
+#[test]
+fn test_page_markers_not_escaped_in_ocr_markdown_output() {
+    if skip_if_missing("pdf/ocr_test.pdf") {
+        return;
+    }
+
+    let file_path = get_test_file_path("pdf/ocr_test.pdf");
+    let config = ExtractionConfig {
+        output_format: xberg::OutputFormat::Markdown,
+        ocr: Some(xberg::OcrConfig {
+            backend: "tesseract".to_string(),
+            language: vec!["eng".to_string()],
+            ..Default::default()
+        }),
+        force_ocr: true,
+        pages: Some(PageConfig {
+            insert_page_markers: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let result =
+        extract_uri_document_blocking(&file_path, None, &config).expect("Failed to extract PDF with OCR as markdown");
+
+    assert!(
+        result.content.contains("<!-- PAGE 1 -->"),
+        "OCR markdown output should contain verbatim page marker. Content start: {}",
+        &result.content[..result.content.len().min(300)]
+    );
+    assert!(
+        !result.content.contains("\\<\\!--"),
+        "OCR markdown output must not escape page markers. Content start: {}",
+        &result.content[..result.content.len().min(300)]
     );
 }

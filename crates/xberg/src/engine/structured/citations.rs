@@ -120,7 +120,6 @@ fn envelope_with_citations(
                 .collect();
             serde_json::Value::Array(result)
         }
-        // Leaf value: check if it's already a citation envelope, or wrap it.
         leaf => {
             if is_citation_envelope(leaf) {
                 leaf.clone()
@@ -221,13 +220,11 @@ fn extract_bbox(ocr: &serde_json::Value) -> Option<[f64; 4]> {
 fn flatten_cited(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(obj) => {
-            if is_citation_envelope(value) {
-                // This is a CitedField; extract the .value and recurse
-                if let Some(inner_value) = obj.get("value") {
-                    return flatten_cited(inner_value);
-                }
+            if is_citation_envelope(value)
+                && let Some(inner_value) = obj.get("value")
+            {
+                return flatten_cited(inner_value);
             }
-            // Regular object; recurse on each field
             let mut result = serde_json::Map::new();
             for (k, v) in obj {
                 result.insert(k.clone(), flatten_cited(v));
@@ -325,16 +322,12 @@ mod tests {
 
     #[test]
     fn text_similarity_identical_multibyte_strings_score_one() {
-        // Regression: byte-length denominator made identical CJK strings score
-        // chars/bytes (e.g. 2/6 = 0.33) instead of 1.0. Char-count denominator fixes it.
         assert_eq!(text_similarity("世界", "世界"), 1.0);
         assert_eq!(text_similarity("café", "café"), 1.0);
     }
 
     #[test]
     fn scalar_with_matching_non_ascii_ocr_fuses() {
-        // Regression: before the char-count denominator fix, a non-ASCII value
-        // could never clear the > 0.8 similarity gate, so source stayed `None`.
         let merged = serde_json::json!({"field": "世界"});
         let ocr = serde_json::json!({
             "text": "世界",

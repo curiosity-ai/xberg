@@ -5,15 +5,13 @@ package io.xberg;
  * The extraction operation exceeded the configured time limit.
  */
 public class TimeoutException extends XbergErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new TimeoutException with the given message. */
-    public TimeoutException(final String message) {
-        super(message);
-    }
+  /** Creates a new TimeoutException with the given message. */
+  public TimeoutException(final String message) { super(message); }
 
-    /** Creates a new TimeoutException with the given message and cause. */
-    public TimeoutException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new TimeoutException with the given message and cause. */
+  public TimeoutException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

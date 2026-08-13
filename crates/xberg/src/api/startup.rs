@@ -21,7 +21,6 @@ async fn shutdown_signal() {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("Failed to install SIGTERM handler: {}", e);
-                // Fall back to Ctrl-C only.
                 tokio::signal::ctrl_c()
                     .await
                     .unwrap_or_else(|e| tracing::warn!("Failed to listen for Ctrl-C: {}", e));
@@ -124,7 +123,6 @@ pub async fn serve(host: impl AsRef<str>, port: u16) -> Result<()> {
         server_config.max_multipart_field_bytes,
     );
 
-    // Initialize extractors and validate plugins at startup
     extractors::ensure_initialized()?;
     validate_plugins_at_startup()?;
 
@@ -161,7 +159,6 @@ pub async fn serve_with_config(host: impl AsRef<str>, port: u16, config: Extract
         limits.max_request_body_bytes
     );
 
-    // Initialize extractors and validate plugins at startup
     extractors::ensure_initialized()?;
     validate_plugins_at_startup()?;
 
@@ -213,7 +210,6 @@ pub async fn serve_with_config_and_limits(
     let addr = SocketAddr::new(ip, port);
     let app = create_router_with_limits_and_server_config(config, limits, server_config);
 
-    // Initialize extractors and validate plugins at startup
     extractors::ensure_initialized()?;
     validate_plugins_at_startup()?;
 
@@ -275,7 +271,6 @@ pub async fn serve_with_server_config(extraction_config: ExtractionConfig, serve
     let addr = SocketAddr::new(ip, server_config.port);
     let app = create_router_with_limits_and_server_config(extraction_config, limits, server_config.clone());
 
-    // Initialize extractors and validate plugins at startup
     extractors::ensure_initialized()?;
     validate_plugins_at_startup()?;
 

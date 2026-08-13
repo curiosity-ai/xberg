@@ -13,7 +13,6 @@ use std::io::Cursor;
 
 use thiserror::Error;
 
-// Imported from heuristics — the only call-mode source of truth.
 use crate::heuristics::StructuredCallMode;
 
 /// A rendered page ready for inline-base64 transport to the vision model.
@@ -54,13 +53,9 @@ pub async fn pages_for_call(
 ) -> Result<Vec<PageImage>, RasterizeError> {
     let pages = match mode {
         StructuredCallMode::Skip | StructuredCallMode::TextOnly | StructuredCallMode::TextOnlyWithVisionFallback => {
-            // TextOnlyWithVisionFallback is handled by the orchestrator — rasterize only if fallback escalates.
             Vec::new()
         }
         StructuredCallMode::VisionOnly | StructuredCallMode::TextPlusVision => {
-            // Rendering is CPU-bound (PDF xref parse + per-page raster, or image
-            // decode/re-encode). Run it on a blocking thread so a large document
-            // never stalls the async runtime's worker threads.
             let bytes = bytes.to_vec();
             let mime = mime.to_string();
             #[cfg(feature = "tokio-runtime")]
@@ -97,10 +92,6 @@ pub(crate) fn render_all_pages(bytes: &[u8], mime: &str, dpi: u32) -> Result<Vec
 }
 
 fn render_pdf(bytes: &[u8], dpi: u32) -> Result<Vec<PageImage>, RasterizeError> {
-    // Parse the document once and render every page from the same handle. The
-    // expensive work is the xref/trailer parse in `open_pdf_document`; rendering
-    // a page only reads the already-parsed structures, so reusing the handle
-    // avoids re-parsing the file once per page.
     let document = crate::pdf::render::open_pdf_document(bytes, None)
         .map_err(|e| RasterizeError::Pdf(format!("failed to open PDF: {e}")))?;
 
@@ -123,7 +114,6 @@ fn render_pdf(bytes: &[u8], dpi: u32) -> Result<Vec<PageImage>, RasterizeError> 
 }
 
 fn render_image(bytes: &[u8]) -> Result<Vec<PageImage>, RasterizeError> {
-    // Decode + re-encode as PNG via the `image` crate. Single-page result.
     let img =
         image::load_from_memory(bytes).map_err(|e| RasterizeError::Image(format!("failed to decode image: {e}")))?;
 
@@ -142,7 +132,6 @@ mod tests {
     use super::*;
 
     fn one_pixel_png() -> Vec<u8> {
-        // Minimal 1x1 PNG built via the image crate.
         let img = image::RgbImage::new(1, 1);
         let mut out = Vec::new();
         image::DynamicImage::ImageRgb8(img)
@@ -197,14 +186,6 @@ mod tests {
         assert!(pages.is_empty());
     }
 
-    // No multi-page PDF fixture exists under crates/xberg, so this exercises the
-    // open-once batch path (`render_pdf` -> `open_pdf_document` +
-    // `render_open_pdf_page_to_png`) on a single-page document and asserts the
-    // output is byte-identical to the per-call public path
-    // (`render_pdf_page_to_png`, which opens then delegates to the same
-    // primitive). 1-based page ordering is covered by the `page_number`
-    // assignment exercised here; broader multi-page ordering coverage would need
-    // a real multi-page fixture (limitation).
     #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn pdf_render_open_once_matches_per_call_bytes() {

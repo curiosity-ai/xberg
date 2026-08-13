@@ -23,8 +23,8 @@
   <a href="https://github.com/xberg-io/xberg/tree/main/packages/go">
     <img src="https://img.shields.io/github/v/tag/xberg-io/xberg?label=Go&color=007ec6&filter=v1*" alt="Go">
   </a>
-  <a href="https://www.nuget.org/packages/Xberg/">
-    <img src="https://img.shields.io/nuget/v/Xberg?label=C%23&color=007ec6" alt="C#">
+  <a href="https://www.nuget.org/packages/XbergIo.Xberg/">
+    <img src="https://img.shields.io/nuget/v/XbergIo.Xberg?label=C%23&color=007ec6" alt="C#">
   </a>
   <a href="https://packagist.org/packages/xberg-io/xberg">
     <img src="https://img.shields.io/packagist/v/xberg-io/xberg?label=PHP&color=007ec6" alt="PHP">
@@ -53,6 +53,9 @@
   <a href="https://github.com/xberg-io/xberg/pkgs/container/xberg">
     <img src="https://img.shields.io/badge/Docker-ghcr.io-007ec6?logo=docker&logoColor=white" alt="Docker">
   </a>
+  <a href="https://docs.xberg.io/guides/kubernetes/">
+    <img src="https://img.shields.io/badge/Helm-chart-007ec6?logo=helm&logoColor=white" alt="Helm chart">
+  </a>
   <!-- Project Info -->
   <a href="https://github.com/xberg-io/xberg/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-007ec6" alt="License">
@@ -77,7 +80,7 @@
   </a>
 </div>
 
-Extract text, tables, images, metadata, and code intelligence from 96 file formats and 306 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. C/C++ FFI bindings providing a stable ABI for native integration, shared library distribution, and cross-language interop.
+Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. C/C++ FFI bindings providing a stable ABI for native integration, shared library distribution, and cross-language interop.
 
 ## What This Package Provides
 
@@ -112,7 +115,44 @@ The built artifacts are emitted under `target/release/` (`libxberg_ffi.{so,dylib
 
 Extract text, metadata, and structure from any supported document format:
 
-<!-- snippet not found:  -->
+```c title="C"
+#include <xberg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    XBERGExtractionConfig *config = xberg_extraction_config_default();
+
+    XBERGExtractInput *input = xberg_extract_input_from_uri("document.pdf");
+    if (!input) {
+        fprintf(stderr, "Failed to create input (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    XBERGExtractionResult *result = xberg_extract(input, config);
+    if (!result) {
+        fprintf(stderr, "extraction failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extract_input_free(input);
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    char *content = xberg_extraction_result_results(result);
+    printf("%s\n", content ? content : "(empty)");
+    xberg_free_string(content);
+
+    xberg_extract_input_free(input);
+    xberg_extraction_result_free(result);
+    xberg_extraction_config_free(config);
+    return 0;
+}
+```
 
 ### Common Use Cases
 
@@ -120,32 +160,171 @@ Extract text, metadata, and structure from any supported document format:
 
 Most use cases benefit from configuration to control extraction behavior:
 
+**With OCR (for scanned documents):**
+
+```c title="C"
+#include "xberg.h"
+#include <stdio.h>
+
+int main(void) {
+    const char *config_json = "{"
+        "\"ocr\": {\"tesseract\": {\"language\": \"eng\"}}"
+        "}";
+
+    XBERGExtractionConfig *config = xberg_extraction_config_from_json(config_json);
+    if (!config) {
+        fprintf(stderr, "config parse failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        return 1;
+    }
+
+    XBERGExtractInput *input = xberg_extract_input_from_uri("scanned.png");
+    if (!input) {
+        fprintf(stderr, "Failed to create input (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    XBERGExtractionResult *result = xberg_extract(input, config);
+    if (result) {
+        char *results = xberg_extraction_result_results(result);
+        if (results) {
+            printf("OCR results: %s\n", results);
+        }
+        xberg_free_string(results);
+    } else {
+        fprintf(stderr, "OCR error (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+    }
+
+    xberg_extract_input_free(input);
+    xberg_extraction_result_free(result);
+    xberg_extraction_config_free(config);
+    return 0;
+}
+```
+
 #### Table Extraction
 
-See [Configuration Guide](https://docs.xberg.io/guides/configuration/) for table extraction options.
+```c title="C"
+#include "xberg.h"
+#include <stdio.h>
+
+int main(void) {
+    XBERGExtractInput *input = xberg_extract_input_from_uri("spreadsheet.xlsx");
+    if (!input) {
+        fprintf(stderr, "Failed to create input (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        return 1;
+    }
+
+    XBERGExtractionResult *result = xberg_extract(input, NULL);
+    if (!result) {
+        fprintf(stderr, "extraction failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extract_input_free(input);
+        return 1;
+    }
+
+    char *result_json = xberg_extraction_result_to_json(result);
+    if (result_json) {
+        printf("Extraction result (JSON): %s\n", result_json);
+    } else {
+        printf("No extraction result available\n");
+    }
+    xberg_free_string(result_json);
+
+    xberg_extract_input_free(input);
+    xberg_extraction_result_free(result);
+    return 0;
+}
+```
 
 #### Processing Multiple Files
+
+```c title="C"
+#include <xberg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    const char *config_json =
+        "{"
+        "\"force_ocr\": true,"
+        "\"ocr\": {\"backend\": \"tesseract\", \"language\": \"eng\"}"
+        "}";
+
+    XBERGExtractionConfig *config =
+        xberg_extraction_config_from_json(config_json);
+    if (!config) {
+        fprintf(stderr, "config init failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        return 1;
+    }
+
+    XBERGExtractInput *input = xberg_extract_input_from_uri("scanned.pdf");
+    if (!input) {
+        fprintf(stderr, "Failed to create input (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    XBERGExtractionResult *result = xberg_extract(input, config);
+    if (!result) {
+        fprintf(stderr, "extraction failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extract_input_free(input);
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    char *content = xberg_extraction_result_results(result);
+    printf("%s\n", content ? content : "(empty)");
+    xberg_free_string(content);
+
+    char *detected_languages = xberg_extraction_result_results(result);
+    printf("detected languages: %s\n",
+           detected_languages ? detected_languages : "(none)");
+    xberg_free_string(detected_languages);
+
+    xberg_extract_input_free(input);
+    xberg_extraction_result_free(result);
+    xberg_extraction_config_free(config);
+    return 0;
+}
+```
 
 ### Next Steps
 
 - **[Installation Guide](https://docs.xberg.io/getting-started/installation/)** - Platform-specific setup
-- **[API Documentation](https://docs.xberg.io/reference/api-python/)** - Complete API reference
+- **[API Documentation](https://docs.xberg.io/reference/api-c/)** - Complete API reference
 - **[Examples & Guides](https://docs.xberg.io/)** - Full code examples and usage guides
 - **[Configuration Guide](https://docs.xberg.io/guides/configuration/)** - Advanced configuration options
 
 ## Features
 
-### Supported File Formats (96)
+### Supported File Formats (100 formats · 120 file extensions)
 
-96 file formats across 8 major categories with intelligent format detection and comprehensive metadata extraction.
+100 formats across 120 file extensions in 8 major categories with intelligent format detection and comprehensive metadata extraction.
 
 #### Office Documents
 
 | Category | Formats | Capabilities |
 |----------|---------|--------------|
-| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages` | Full text, tables, images, metadata, styles |
+| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages`, `.wpd`, `.wp`, `.wp5`, `.wp6` | Full text, tables, images, metadata, styles |
 | **Spreadsheets** | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xla`, `.xlam`, `.xltm`, `.xltx`, `.xlt`, `.ods`, `.numbers` | Sheet data, formulas, cell metadata, charts |
-| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.key` | Slides, speaker notes, images, metadata |
+| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.odp`, `.key` | Slides, speaker notes, images, metadata |
 | **PDF** | `.pdf` | Text, tables, images, metadata, OCR support |
 | **eBooks** | `.epub`, `.fb2` | Chapters, metadata, embedded resources |
 | **Database** | `.dbf` | Table data extraction, field type support |
@@ -180,7 +359,7 @@ See [Configuration Guide](https://docs.xberg.io/guides/configuration/) for table
 | Category | Formats | Features |
 |----------|---------|----------|
 | **Email** | `.eml`, `.msg`, `.pst` | Headers, body (HTML/plain), attachments, threading |
-| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | File listing, nested archives, metadata |
+| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | Recursive extraction of nested archives, file listing, metadata, zip-bomb protection |
 
 #### Academic & Scientific
 
@@ -191,7 +370,7 @@ See [Configuration Guide](https://docs.xberg.io/guides/configuration/) for table
 | **Publishing** | `.fb2`, `.docbook`, `.dbk`, `.docbook4`, `.docbook5`, `.opml` | FictionBook, DocBook XML, OPML outlines |
 | **Documentation** | MIME-only POD, mdoc, troff | Technical documentation formats |
 
-#### Code Intelligence (306 Languages)
+#### Code Intelligence (371 Languages)
 
 | Feature | Description |
 |---------|-------------|
@@ -214,15 +393,14 @@ Powered by [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-l
 - **Image Extraction** - Extract embedded images and render page previews
 - **Audio/Video Transcription** - Extract speech transcripts from MP3, M4A, WAV, WebM, and MP4 inputs when the native transcription feature is available
 - **OCR Support** - Integrate multiple OCR backends for scanned documents
-- **Async/Await** - Non-blocking document processing with concurrent operations
 - **Plugin System** - Extensible post-processing for custom text transformation
 - **Embeddings** - Generate vector embeddings using ONNX Runtime models or provider-hosted services
 - **Batch Processing** - Efficiently process multiple documents in parallel
 - **Memory Efficient** - Stream large files without loading entirely into memory
 - **Language Detection** - Detect and support multiple languages in documents
-- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [306 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
+- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [371 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
 - **Configuration** - Fine-grained control over extraction behavior
-- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured JSON with OCR metadata
+- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured (same text as Plain with a `structured` metadata label)
 
 ## OCR Support
 
@@ -230,13 +408,51 @@ Xberg supports multiple OCR backends for extracting text from scanned documents 
 
 ### OCR Configuration Example
 
-<!-- snippet not found:  -->
+```c title="C"
+#include "xberg.h"
+#include <stdio.h>
 
-## Async Support
+int main(void) {
+    const char *config_json = "{"
+        "\"ocr\": {\"tesseract\": {\"language\": \"eng\"}}"
+        "}";
 
-This binding provides full async/await support for non-blocking document processing:
+    XBERGExtractionConfig *config = xberg_extraction_config_from_json(config_json);
+    if (!config) {
+        fprintf(stderr, "config parse failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        return 1;
+    }
 
-<!-- snippet not found:  -->
+    XBERGExtractInput *input = xberg_extract_input_from_uri("scanned.png");
+    if (!input) {
+        fprintf(stderr, "Failed to create input (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    XBERGExtractionResult *result = xberg_extract(input, config);
+    if (result) {
+        char *results = xberg_extraction_result_results(result);
+        if (results) {
+            printf("OCR results: %s\n", results);
+        }
+        xberg_free_string(results);
+    } else {
+        fprintf(stderr, "OCR error (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+    }
+
+    xberg_extract_input_free(input);
+    xberg_extraction_result_free(result);
+    xberg_extraction_config_free(config);
+    return 0;
+}
+```
 
 ## Plugin System
 
@@ -250,6 +466,67 @@ Generate vector embeddings for extracted text using the built-in ONNX Runtime su
 
 **[Embeddings Guide](https://docs.xberg.io/features/#embeddings)**
 
+## Batch Processing
+
+Process multiple documents efficiently:
+
+```c title="C"
+#include <xberg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    const char *config_json =
+        "{"
+        "\"force_ocr\": true,"
+        "\"ocr\": {\"backend\": \"tesseract\", \"language\": \"eng\"}"
+        "}";
+
+    XBERGExtractionConfig *config =
+        xberg_extraction_config_from_json(config_json);
+    if (!config) {
+        fprintf(stderr, "config init failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        return 1;
+    }
+
+    XBERGExtractInput *input = xberg_extract_input_from_uri("scanned.pdf");
+    if (!input) {
+        fprintf(stderr, "Failed to create input (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    XBERGExtractionResult *result = xberg_extract(input, config);
+    if (!result) {
+        fprintf(stderr, "extraction failed (code %d): %s\n",
+                xberg_last_error_code(),
+                xberg_last_error_context());
+        xberg_extract_input_free(input);
+        xberg_extraction_config_free(config);
+        return 1;
+    }
+
+    char *content = xberg_extraction_result_results(result);
+    printf("%s\n", content ? content : "(empty)");
+    xberg_free_string(content);
+
+    char *detected_languages = xberg_extraction_result_results(result);
+    printf("detected languages: %s\n",
+           detected_languages ? detected_languages : "(none)");
+    xberg_free_string(detected_languages);
+
+    xberg_extract_input_free(input);
+    xberg_extraction_result_free(result);
+    xberg_extraction_config_free(config);
+    return 0;
+}
+```
+
 ## Configuration
 
 For advanced configuration options including language detection, table extraction, OCR settings, and more:
@@ -259,7 +536,7 @@ For advanced configuration options including language detection, table extractio
 ## Documentation
 
 - **[Official Documentation](https://docs.xberg.io/)**
-- **[API Reference](https://docs.xberg.io/reference/api-python/)**
+- **[API Reference](https://docs.xberg.io/reference/api-c/)**
 - **[Examples & Guides](https://docs.xberg.io/)**
 
 ## Contributing
@@ -270,7 +547,7 @@ Contributions are welcome! See [Contributing Guide](https://github.com/xberg-io/
 
 - [crawlberg](https://github.com/xberg-io/crawlberg) — web crawling and scraping with HTML→Markdown and headless-Chrome fallback.
 - [html-to-markdown](https://github.com/xberg-io/html-to-markdown) — fast, lossless HTML→Markdown engine.
-- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 143 providers.
+- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 165 providers.
 - [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-language-pack) — tree-sitter grammars and code-intelligence primitives.
 - [alef](https://github.com/xberg-io/alef) — the polyglot binding generator that produces this README and all per-language bindings.
 - [Discord](https://discord.gg/xt9WY3GnKR) — community, roadmap, announcements.

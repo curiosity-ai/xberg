@@ -46,6 +46,26 @@ fn default_output_format() -> OutputFormat {
     OutputFormat::Markdown
 }
 
+/// Per-stage cold-start timing breakdown parsed from an xberg CLI JSON envelope's
+/// `stage_timings` field (see `crates/xberg-cli/src/output.rs::StageTimings`).
+///
+/// Field names and semantics mirror the CLI struct exactly; this is a plain-data mirror rather
+/// than a shared type because the benchmark harness does not depend on the `xberg-cli` crate.
+/// Only populated when the harness invokes the CLI with `XBERG_EMIT_STAGE_TIMING` set.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StageTimings {
+    /// Time from CLI process start to the point extraction begins (arg parsing, logging setup,
+    /// config load/merge), in milliseconds.
+    pub process_init_ms: f64,
+    /// Wall-clock time for the core library's extraction call to return, in milliseconds.
+    pub first_parse_ms: f64,
+    /// Coarse approximation of ONNX Runtime session-creation-plus-first-inference cost, present
+    /// only when a layout/OCR configuration that uses ORT was active. See the CLI-side
+    /// `StageTimings` doc comment for why this is not an independently measured sub-stage.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ort_session_and_inference_ms: Option<f64>,
+}
+
 /// Xberg extraction pipeline variant
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +77,24 @@ pub enum XbergPipeline {
     /// PaddleOCR: OCR with PaddleOCR backend
     #[serde(rename = "paddle-ocr")]
     PaddleOcr,
+    /// Baseline structure pipeline with the PaddleOCR engine (force-OCR, no layout model)
+    #[serde(rename = "baseline-paddle")]
+    BaselinePaddle,
+    /// Layout structure pipeline with the PaddleOCR engine (force-OCR + layout model)
+    #[serde(rename = "layout-paddle")]
+    LayoutPaddle,
+    /// Sceptre OCR using ONNX Runtime.
+    #[serde(rename = "sceptre-ort")]
+    SceptreOrt,
+    /// Sceptre OCR using ONNX Runtime with layout detection.
+    #[serde(rename = "sceptre-ort-layout")]
+    SceptreOrtLayout,
+    /// Sceptre OCR using ONNX Runtime with automatic page orientation correction.
+    #[serde(rename = "sceptre-ort-autorotate")]
+    SceptreOrtAutoRotate,
+    /// Sceptre OCR using tract. This is reserved for the bounded diagnostic matrix.
+    #[serde(rename = "sceptre-tract")]
+    SceptreTract,
     /// Candle TrOCR: OCR with candle-based TrOCR backend
     #[serde(rename = "candle-trocr")]
     CandleTrocr,
@@ -66,9 +104,6 @@ pub enum XbergPipeline {
     /// Candle GLM-OCR: OCR with candle-based GLM-OCR vision-language backend
     #[serde(rename = "candle-glm-ocr")]
     CandleGlmOcr,
-    /// Candle Hunyuan-OCR: OCR with candle-based Hunyuan-OCR vision-language backend
-    #[serde(rename = "candle-hunyuan-ocr")]
-    CandleHunyuanOcr,
     /// Candle DeepSeek-OCR: OCR with candle-based DeepSeek-OCR vision-language backend
     #[serde(rename = "candle-deepseek-ocr")]
     CandleDeepseekOcr,
@@ -84,10 +119,15 @@ impl XbergPipeline {
             XbergPipeline::Baseline => "baseline",
             XbergPipeline::Layout => "layout",
             XbergPipeline::PaddleOcr => "paddle-ocr",
+            XbergPipeline::BaselinePaddle => "baseline-paddle",
+            XbergPipeline::LayoutPaddle => "layout-paddle",
+            XbergPipeline::SceptreOrt => "sceptre-ort",
+            XbergPipeline::SceptreOrtLayout => "sceptre-ort-layout",
+            XbergPipeline::SceptreOrtAutoRotate => "sceptre-ort-autorotate",
+            XbergPipeline::SceptreTract => "sceptre-tract",
             XbergPipeline::CandleTrocr => "candle-trocr",
             XbergPipeline::CandlePaddleocrVl => "candle-paddleocr-vl",
             XbergPipeline::CandleGlmOcr => "candle-glm-ocr",
-            XbergPipeline::CandleHunyuanOcr => "candle-hunyuan-ocr",
             XbergPipeline::CandleDeepseekOcr => "candle-deepseek-ocr",
             XbergPipeline::CandlePaddleocrVl15 => "candle-paddleocr-vl-15",
         }
@@ -108,16 +148,25 @@ impl FromStr for XbergPipeline {
             "baseline" => Ok(XbergPipeline::Baseline),
             "layout" => Ok(XbergPipeline::Layout),
             "paddle-ocr" | "paddle_ocr" | "paddleocr" => Ok(XbergPipeline::PaddleOcr),
+            "baseline-paddle" | "baseline_paddle" => Ok(XbergPipeline::BaselinePaddle),
+            "layout-paddle" | "layout_paddle" => Ok(XbergPipeline::LayoutPaddle),
+            "sceptre" | "sceptre-ort" | "sceptre_ort" => Ok(XbergPipeline::SceptreOrt),
+            "sceptre-ort-layout" | "sceptre_ort_layout" | "sceptre-layout" | "sceptre_layout" => {
+                Ok(XbergPipeline::SceptreOrtLayout)
+            }
+            "sceptre-ort-autorotate" | "sceptre_ort_autorotate" | "sceptre-autorotate" | "sceptre_autorotate" => {
+                Ok(XbergPipeline::SceptreOrtAutoRotate)
+            }
+            "sceptre-tract" | "sceptre_tract" => Ok(XbergPipeline::SceptreTract),
             "candle-trocr" | "candle_trocr" | "trocr" => Ok(XbergPipeline::CandleTrocr),
             "candle-paddleocr-vl" | "candle_paddleocr_vl" | "paddleocr-vl" => Ok(XbergPipeline::CandlePaddleocrVl),
             "candle-glm-ocr" | "candle_glm_ocr" | "glm-ocr" => Ok(XbergPipeline::CandleGlmOcr),
-            "candle-hunyuan-ocr" | "candle_hunyuan_ocr" | "hunyuan-ocr" => Ok(XbergPipeline::CandleHunyuanOcr),
             "candle-deepseek-ocr" | "candle_deepseek_ocr" | "deepseek-ocr" => Ok(XbergPipeline::CandleDeepseekOcr),
             "candle-paddleocr-vl-15" | "candle_paddleocr_vl_15" | "paddleocr-vl-15" => {
                 Ok(XbergPipeline::CandlePaddleocrVl15)
             }
             _ => Err(format!(
-                "unknown Xberg pipeline: {}. Valid: baseline, layout, paddle-ocr, candle-trocr, candle-paddleocr-vl, candle-glm-ocr, candle-hunyuan-ocr, candle-deepseek-ocr, candle-paddleocr-vl-15",
+                "unknown Xberg pipeline: {}. Valid: baseline, layout, paddle-ocr, baseline-paddle, layout-paddle, sceptre-ort, sceptre-ort-layout, sceptre-ort-autorotate, sceptre-tract, candle-trocr, candle-paddleocr-vl, candle-glm-ocr, candle-deepseek-ocr, candle-paddleocr-vl-15",
                 s
             )),
         }
@@ -145,6 +194,8 @@ pub enum OcrStatus {
 /// - **ConfigSetupError**: environment/dependency misconfiguration (missing models, torch module not available, etc.)
 /// - **Timeout**: extraction exceeded configured timeout
 /// - **EmptyContent**: framework ran but produced no content
+/// - **ZeroOverlap**: framework produced non-empty output that shares zero tokens with a
+///   non-empty ground truth
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -161,6 +212,11 @@ pub enum ErrorKind {
     Timeout,
     /// Framework returned empty or missing content (ran but produced nothing).
     EmptyContent,
+    /// Framework produced non-empty output that shares zero tokens with a non-empty ground
+    /// truth (i.e. it ran to completion but the content is unusable garbage, not genuinely
+    /// empty). Distinct from [`ErrorKind::EmptyContent`], which means the framework produced
+    /// no content at all. Both are framework-fault failures and both are timing-eligible.
+    ZeroOverlap,
     /// No error occurred
     #[default]
     None,
@@ -201,8 +257,10 @@ pub struct BenchmarkResult {
     /// Only available for external frameworks with internal timing
     pub extraction_duration: Option<Duration>,
 
-    /// Subprocess overhead (duration - extraction_duration)
-    /// Only available when extraction_duration is present
+    /// Subprocess overhead outside framework-reported extraction work.
+    ///
+    /// For native batches this is process-wall time minus the reported batch
+    /// total. It is never inferred from per-item extraction timings.
     pub subprocess_overhead: Option<Duration>,
 
     /// Performance metrics (averaged across iterations if multiple)
@@ -243,6 +301,15 @@ pub struct BenchmarkResult {
     /// Not serialized to output JSON to save space
     #[serde(skip)]
     pub extracted_text: Option<String>,
+
+    /// System load captured at measurement time.
+    ///
+    /// Recorded so local timing comparisons can be qualified: throughput and
+    /// cold-start numbers taken under heavy background load are not comparable
+    /// to those taken on an idle machine. `None` for results that predate this
+    /// field or were constructed outside a measurement path.
+    #[serde(default)]
+    pub system_load: Option<crate::system_load::SystemLoad>,
 }
 
 impl BenchmarkResult {
@@ -252,16 +319,86 @@ impl BenchmarkResult {
     pub fn framework_key(&self, execution_mode: &str) -> String {
         format!("{}:{}:{}", self.framework, self.output_format, execution_mode)
     }
+
+    /// Whether this row owns the aggregate process metrics for its native batch.
+    ///
+    /// Native batch adapters mark exactly one process-metric sample. Single-file
+    /// results omit the marker and always own their metrics.
+    pub(crate) fn is_performance_sample(&self) -> bool {
+        self.framework_capabilities.batch_performance_sample.unwrap_or_else(|| {
+            self.framework_capabilities.batch_capability.is_none() || self.metrics.throughput_bytes_per_sec > 0.0
+        })
+    }
+}
+
+/// Whether a result's timing/resource measurements are valid to pool into performance
+/// percentiles, independent of whether it counts as a quality success.
+///
+/// A result is timing-eligible if the framework actually ran to completion and produced output
+/// within the measured window. That holds for every `success == true` result, and also for a
+/// result reclassified as [`ErrorKind::ZeroOverlap`]: the framework really did run and really did
+/// produce output in that time, even though the output turned out to share no tokens with the
+/// ground truth. Gating eligibility on `success` alone would delete exactly the fast-but-garbage
+/// samples from a competitor's distribution, biasing its duration/throughput percentiles toward
+/// looking slower than it actually is relative to a framework (like xberg) that rarely produces
+/// zero-overlap output.
+pub(crate) fn is_timing_eligible(result: &BenchmarkResult) -> bool {
+    result.success || result.error_kind == ErrorKind::ZeroOverlap
+}
+
+/// Deduplicated performance samples for a group of results: one row per single-file success, or
+/// one anchor row per native batch (see [`BenchmarkResult::is_performance_sample`]). Timing
+/// eligibility (see [`is_timing_eligible`]) gates inclusion, not raw `success` — a zero-overlap
+/// result still contributes its duration/throughput/memory/cpu_seconds measurements even though
+/// it is excluded from quality percentiles elsewhere.
+pub(crate) fn successful_performance_samples<'a>(
+    results: impl IntoIterator<Item = &'a BenchmarkResult>,
+) -> Vec<&'a BenchmarkResult> {
+    let mut batch_samples = std::collections::HashSet::new();
+    let mut samples = Vec::new();
+    for result in results {
+        if !is_timing_eligible(result) {
+            continue;
+        }
+        if let Some(sample_id) = result.framework_capabilities.batch_sample_id.as_deref() {
+            if batch_samples.insert(sample_id) {
+                samples.push(result);
+            }
+        } else if result.is_performance_sample() {
+            samples.push(result);
+        }
+    }
+    samples
 }
 
 /// Performance metrics collected during extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceMetrics {
-    /// Peak memory usage in bytes
+    /// RSS captured immediately after the monitor attached to the target.
+    #[serde(default)]
+    pub baseline_memory_bytes: u64,
+
+    /// Absolute peak RSS in bytes.
     pub peak_memory_bytes: u64,
+
+    /// Peak RSS above the captured baseline.
+    #[serde(default)]
+    pub peak_memory_delta_bytes: u64,
 
     /// Average CPU usage percentage (0-100)
     pub avg_cpu_percent: f64,
+
+    /// Total process-tree CPU time consumed, in core-seconds.
+    ///
+    /// Computed by trapezoidal integration of the un-normalized process-tree CPU percentage
+    /// over the resource sampler's timeline (see
+    /// `crate::monitoring::ResourceMonitor::calculate_stats`). Precision is bounded by the
+    /// sampling interval (1-10ms, adaptive on file size): CPU bursts shorter than the gap
+    /// between two samples are smoothed by the trapezoidal average rather than measured
+    /// exactly. `#[serde(default)]` so historical capture files without this field deserialize
+    /// as `0.0` rather than failing.
+    #[serde(default)]
+    pub cpu_seconds: f64,
 
     /// Throughput in bytes per second
     pub throughput_bytes_per_sec: f64,
@@ -305,6 +442,16 @@ pub struct QualityMetrics {
     /// Whether the extraction is considered correct (quality_score >= 0.95).
     #[serde(default)]
     pub correct: bool,
+
+    /// Reading-order fidelity (0.0-1.0), via anchor-based Longest Increasing Subsequence.
+    ///
+    /// REPORT-ONLY: intentionally excluded from `quality_score`. `f1_score_text` is a
+    /// bag-of-tokens metric and cannot detect reading-order failure by construction; this
+    /// field exists to make that failure mode visible without re-baselining any published
+    /// score. See `quality::reading_order_score` for the algorithm. `None` means either
+    /// side was empty or too few unambiguous anchor tokens were found to report a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_order_score: Option<f64>,
 }
 
 /// Framework capability metadata
@@ -325,6 +472,21 @@ pub struct FrameworkCapabilities {
     #[serde(default)]
     pub batch_support: bool,
 
+    /// Verified batch entry point and timing semantics used for this result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_capability: Option<BatchCapability>,
+
+    /// Whether this row owns its native batch's process metrics.
+    ///
+    /// `None` denotes a single-file measurement. Native batches set exactly
+    /// one row to `Some(true)` and all sibling rows to `Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_performance_sample: Option<bool>,
+
+    /// Opaque identity shared by every document row from one batch process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_sample_id: Option<String>,
+
     /// Whether framework supports async extraction
     #[serde(default)]
     pub async_support: bool,
@@ -340,6 +502,32 @@ pub struct FrameworkCapabilities {
     /// Disk installation size (if known)
     #[serde(default)]
     pub installation_size: Option<DiskSizeInfo>,
+}
+
+/// Concrete framework API used for a batch benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchEntryPoint {
+    XbergCliExtractBatch,
+    DoclingJobkit,
+    LiteparseBatchParse,
+    MineruDoParse,
+}
+
+/// Scope represented by the measured batch makespan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchTimingScope {
+    WarmSteadyState,
+    ColdEndToEndSubprocess,
+}
+
+/// Verified batch capability advertised by an adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchCapability {
+    pub entry_point: BatchEntryPoint,
+    pub timing_scope: BatchTimingScope,
+    pub per_item_timing: bool,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -443,4 +631,189 @@ pub struct DurationStatistics {
 
     /// Number of iterations included in statistics
     pub sample_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_paddle_pipeline_parses_supported_spellings() {
+        for value in ["paddle-ocr", "paddle_ocr", "paddleocr"] {
+            assert_eq!(value.parse::<XbergPipeline>(), Ok(XbergPipeline::PaddleOcr));
+        }
+    }
+
+    #[test]
+    fn sceptre_pipeline_identities_are_explicit_and_alias_defaults_to_ort() {
+        assert_eq!("sceptre".parse(), Ok(XbergPipeline::SceptreOrt));
+        for pipeline in [
+            XbergPipeline::SceptreOrt,
+            XbergPipeline::SceptreOrtLayout,
+            XbergPipeline::SceptreOrtAutoRotate,
+            XbergPipeline::SceptreTract,
+        ] {
+            assert_eq!(pipeline.as_str().parse(), Ok(pipeline));
+            assert!(pipeline.as_str().contains("ort") || pipeline.as_str().contains("tract"));
+        }
+    }
+
+    #[test]
+    fn stage_timings_round_trips_with_ort_field_present() {
+        let timings = StageTimings {
+            process_init_ms: 12.5,
+            first_parse_ms: 1150.25,
+            ort_session_and_inference_ms: Some(1150.25),
+        };
+
+        let json = serde_json::to_string(&timings).expect("serialize StageTimings");
+        let parsed: StageTimings = serde_json::from_str(&json).expect("deserialize StageTimings");
+
+        assert_eq!(parsed.process_init_ms, 12.5);
+        assert_eq!(parsed.first_parse_ms, 1150.25);
+        assert_eq!(parsed.ort_session_and_inference_ms, Some(1150.25));
+    }
+
+    #[test]
+    fn stage_timings_omits_ort_field_when_absent() {
+        let timings = StageTimings {
+            process_init_ms: 8.0,
+            first_parse_ms: 235.0,
+            ort_session_and_inference_ms: None,
+        };
+
+        let json = serde_json::to_string(&timings).expect("serialize StageTimings");
+
+        assert!(
+            !json.contains("ort_session_and_inference_ms"),
+            "expected ort_session_and_inference_ms to be skipped when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn stage_timings_parses_from_cli_json_shape() {
+        // Mirrors the exact JSON shape emitted by `xberg-cli`'s `output::StageTimings` when
+        // XBERG_EMIT_STAGE_TIMING is set and layout/OCR is active. ~keep
+        let raw = r#"{
+            "process_init_ms": 4.2,
+            "first_parse_ms": 1171.0,
+            "ort_session_and_inference_ms": 1171.0
+        }"#;
+
+        let parsed: StageTimings = serde_json::from_str(raw).expect("parse CLI stage_timings JSON");
+
+        assert_eq!(parsed.process_init_ms, 4.2);
+        assert_eq!(parsed.first_parse_ms, 1171.0);
+        assert_eq!(parsed.ort_session_and_inference_ms, Some(1171.0));
+    }
+
+    fn minimal_result(success: bool, error_kind: ErrorKind, duration_ms: u64, throughput_bps: f64) -> BenchmarkResult {
+        BenchmarkResult {
+            framework: "fw".to_string(),
+            output_format: OutputFormat::Markdown,
+            file_path: PathBuf::from("test.pdf"),
+            file_size: 1024,
+            success,
+            error_message: if success { None } else { Some("failed".to_string()) },
+            error_kind,
+            duration: Duration::from_millis(duration_ms),
+            extraction_duration: None,
+            subprocess_overhead: None,
+            metrics: PerformanceMetrics {
+                baseline_memory_bytes: 0,
+                peak_memory_bytes: 1_000_000,
+                peak_memory_delta_bytes: 1_000_000,
+                avg_cpu_percent: 50.0,
+                cpu_seconds: 1.0,
+                throughput_bytes_per_sec: throughput_bps,
+                p50_memory_bytes: 1_000_000,
+                p95_memory_bytes: 1_000_000,
+                p99_memory_bytes: 1_000_000,
+            },
+            quality: None,
+            iterations: vec![],
+            statistics: None,
+            cold_start_duration: None,
+            file_extension: "pdf".to_string(),
+            framework_capabilities: FrameworkCapabilities::default(),
+            pdf_metadata: None,
+            ocr_status: OcrStatus::NotUsed,
+            extracted_text: None,
+            system_load: None,
+        }
+    }
+
+    #[test]
+    fn error_kind_zero_overlap_round_trips_through_json() {
+        let json = serde_json::to_string(&ErrorKind::ZeroOverlap).expect("serialize ErrorKind::ZeroOverlap");
+        assert_eq!(json, "\"zero_overlap\"");
+
+        let parsed: ErrorKind = serde_json::from_str(&json).expect("deserialize ErrorKind::ZeroOverlap");
+        assert_eq!(parsed, ErrorKind::ZeroOverlap);
+    }
+
+    /// The Defect A fix: a zero-overlap result is not a quality success, but it is still
+    /// timing-eligible, so it must survive into the performance-sample set alongside genuine
+    /// successes. A genuinely-empty result (`ErrorKind::EmptyContent`) is not timing-eligible and
+    /// stays excluded, proving the two `success == false` cases are treated differently on
+    /// purpose rather than both being swept up by a broad `!success` check.
+    #[test]
+    fn successful_performance_samples_includes_zero_overlap_but_not_empty_content() {
+        let success = minimal_result(true, ErrorKind::None, 100, 1_000_000.0);
+        let zero_overlap = minimal_result(false, ErrorKind::ZeroOverlap, 200, 2_000_000.0);
+        let empty_content = minimal_result(false, ErrorKind::EmptyContent, 300, 3_000_000.0);
+
+        let results = [success, zero_overlap, empty_content];
+        let samples = successful_performance_samples(results.iter());
+
+        assert_eq!(
+            samples.len(),
+            2,
+            "expected the success and the zero-overlap result, got {samples:?}"
+        );
+        assert!(samples.iter().any(|r| r.error_kind == ErrorKind::None));
+        assert!(samples.iter().any(|r| r.error_kind == ErrorKind::ZeroOverlap));
+        assert!(!samples.iter().any(|r| r.error_kind == ErrorKind::EmptyContent));
+    }
+
+    #[test]
+    fn is_timing_eligible_matches_success_or_zero_overlap() {
+        assert!(is_timing_eligible(&minimal_result(true, ErrorKind::None, 100, 1.0)));
+        assert!(is_timing_eligible(&minimal_result(
+            false,
+            ErrorKind::ZeroOverlap,
+            100,
+            1.0
+        )));
+        assert!(!is_timing_eligible(&minimal_result(
+            false,
+            ErrorKind::EmptyContent,
+            100,
+            1.0
+        )));
+        assert!(!is_timing_eligible(&minimal_result(
+            false,
+            ErrorKind::FrameworkError,
+            100,
+            1.0
+        )));
+        assert!(!is_timing_eligible(&minimal_result(
+            false,
+            ErrorKind::HarnessError,
+            100,
+            1.0
+        )));
+        assert!(!is_timing_eligible(&minimal_result(
+            false,
+            ErrorKind::Timeout,
+            100,
+            1.0
+        )));
+        assert!(!is_timing_eligible(&minimal_result(
+            false,
+            ErrorKind::ConfigSetupError,
+            100,
+            1.0
+        )));
+    }
 }

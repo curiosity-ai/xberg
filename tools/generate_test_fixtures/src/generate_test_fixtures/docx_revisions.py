@@ -25,17 +25,12 @@ from .gt_schema import revisions_expectation, write_ground_truth
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-# Pinned timestamps. Determinism > realism — these are fixtures, not real
-# documents.
 TS_ALICE_INS_1 = "2024-03-15T10:30:00Z"
 TS_ALICE_INS_2 = "2024-03-15T10:35:00Z"
 TS_BOB_DEL = "2024-03-15T11:00:00Z"
 TS_CAROL_FMT = "2024-03-15T12:00:00Z"
 TS_DAVE_INS = "2024-03-15T12:15:00Z"
 
-# Deterministic mtime for every zip entry so fixtures hash stably across
-# runs and CI. (1980-01-01 is the ZIP epoch — using the start of 2024 is
-# arbitrary but visible in `unzip -v` output.)
 ZIP_MTIME = (2024, 1, 1, 0, 0, 0)
 
 

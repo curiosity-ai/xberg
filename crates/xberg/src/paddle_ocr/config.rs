@@ -7,6 +7,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub(super) const MIN_RECOGNITION_BATCH_SIZE: u32 = 1;
+pub(super) const DEFAULT_RECOGNITION_BATCH_SIZE: u32 = 6;
+pub(super) const MAX_RECOGNITION_BATCH_SIZE: u32 = 64;
+const DEFAULT_DETECTION_LIMIT_SIDE_LEN: u32 = 1024;
+
 /// Configuration for PaddleOCR backend.
 ///
 /// Configures PaddleOCR text detection and recognition with multi-language support.
@@ -34,7 +39,10 @@ pub struct PaddleOcrConfig {
     /// Language code (e.g., "en", "ch", "jpn", "kor", "deu", "fra")
     pub language: String,
 
-    /// Optional custom cache directory for model files
+    /// Optional Hugging Face Hub cache root for model files.
+    ///
+    /// When unset, the standard `HF_HUB_CACHE`, legacy
+    /// `HUGGINGFACE_HUB_CACHE`, and `HF_HOME` conventions are used.
     pub cache_dir: Option<PathBuf>,
 
     /// Enable angle classification for rotated text (default: false).
@@ -56,7 +64,7 @@ pub struct PaddleOcrConfig {
     /// Controls the expansion of detected text regions
     pub det_db_unclip_ratio: f32,
 
-    /// Maximum side length for detection image (default: 960)
+    /// Maximum side length for detection image (default: 1024)
     /// Larger images may be resized to this limit for faster inference
     pub det_limit_side_len: u32,
 
@@ -75,9 +83,50 @@ pub struct PaddleOcrConfig {
     pub drop_score: f32,
 
     /// Model tier controlling detection/recognition model size and accuracy trade-off.
+    ///
+    /// For PP-OCRv5 (`model_version = "pp-ocrv5"`):
     /// - `"mobile"` (default): Lightweight models (~4.5MB detection, ~16.5MB recognition), fast download and inference
     /// - `"server"`: Large, high-accuracy models (~88MB detection, ~84MB recognition), best for GPU or complex documents
+    ///
+    /// For PP-OCRv6 (`model_version = "pp-ocrv6"`): `"medium"` (default), `"small"`, or `"tiny"`.
+    /// A legacy `"mobile"`/`"server"` tier under v6 falls back to `"medium"`.
     pub model_tier: String,
+
+    /// Model generation: `"pp-ocrv6"` (default) or `"pp-ocrv5"`.
+    ///
+    /// PP-OCRv6 adds a unified CJK+Latin+JA/KO recognition model with `medium`/`small`/`tiny`
+    /// tiers (see `model_tier`). Scripts outside the v6 unified coverage (Arabic, Cyrillic,
+    /// Devanagari, Greek, Tamil, Telugu, Thai) transparently fall back to the PP-OCRv5
+    /// per-script recognition models. Defaults to `"pp-ocrv6"`; the default `model_tier`
+    /// (`"mobile"`) resolves to the v6 `"medium"` tier. Select `"pp-ocrv5"` to pin the
+    /// legacy per-script/unified fleet.
+    pub model_version: String,
+
+    /// Explicit inference engine choice.
+    ///
+    /// `None` (the default) resolves to the compiled default: `ort` when the
+    /// `paddle-ocr-ort` feature is compiled in, otherwise `tract`. An explicit choice
+    /// is validated against the compiled features when the OCR engine is constructed
+    /// (see `crate::paddle_ocr::backend::effective_backend`); requesting an engine
+    /// whose feature is not compiled in is a clear configuration error rather than a
+    /// silent fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_backend: Option<PaddleInferenceBackend>,
+}
+
+/// Which concrete ONNX inference engine PaddleOCR model loading uses.
+///
+/// Mirrors `sceptre::Backend` for the PaddleOCR backend: `Ort` is the native,
+/// full-featured path (acceleration/execution-provider hook, ONNX-embedded
+/// dictionary metadata); `Tract` is the pure-Rust, CPU-only path used on targets
+/// where `ort` cannot link (Android x86_64 emulator, WASM once wired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaddleInferenceBackend {
+    /// Native ONNX Runtime (requires the `paddle-ocr-ort` feature).
+    Ort,
+    /// Pure-Rust ONNX via `tract` (requires the `paddle-ocr-tract` feature).
+    Tract,
 }
 
 impl PaddleOcrConfig {
@@ -103,18 +152,19 @@ impl PaddleOcrConfig {
             det_db_thresh: 0.3,
             det_db_box_thresh: 0.5,
             det_db_unclip_ratio: 1.6,
-            det_limit_side_len: 960,
-            rec_batch_num: 6,
+            det_limit_side_len: DEFAULT_DETECTION_LIMIT_SIDE_LEN,
+            rec_batch_num: DEFAULT_RECOGNITION_BATCH_SIZE,
             padding: 10,
             drop_score: 0.5,
-            model_tier: "mobile".to_string(), // mobile is the default: fast, ~13MB total download
+            model_tier: "mobile".to_string(),
+            model_version: "pp-ocrv6".to_string(),
+            inference_backend: None,
         }
     }
 
-    /// Resolves the cache directory, checking in order:
-    /// 1. Configured `cache_dir` if set
-    /// 2. `XBERG_CACHE_DIR` environment variable + `/paddle-ocr`
-    /// 3. Default: `.xberg/paddle-ocr/` (consistent with other cache types)
+    /// Resolves the Hugging Face Hub cache directory, using an explicit
+    /// `cache_dir` when supplied and the standard Hugging Face environment
+    /// conventions otherwise.
     ///
     /// # Returns
     ///
@@ -131,17 +181,26 @@ impl PaddleOcrConfig {
     /// ```
     #[cfg_attr(alef, alef(skip))]
     pub fn resolve_cache_dir(&self) -> PathBuf {
-        // First check if cache_dir is explicitly set
         if let Some(path) = &self.cache_dir {
             return path.clone();
         }
 
-        crate::cache_dir::resolve_cache_dir("paddle-ocr")
+        // `hf_hub` (and model downloading in general) is unavailable on wasm32; PaddleOcrConfig
+        // itself stays available there under `paddle-ocr-types` (config/type definitions only,
+        // no ORT), so fall back to the shared cache-dir resolver instead of the excluded crate. ~keep
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            hf_hub::resolve_cache_dir()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::cache_dir::resolve_cache_dir("paddle-ocr")
+        }
     }
 }
 
 impl PaddleOcrConfig {
-    /// Sets a custom cache directory for model files.
+    /// Sets a custom Hugging Face Hub cache root for model files.
     ///
     /// # Arguments
     ///
@@ -236,7 +295,7 @@ impl PaddleOcrConfig {
     ///
     /// * `batch_size` - Number of text regions to process simultaneously
     pub fn with_rec_batch_num(mut self, batch_size: u32) -> Self {
-        self.rec_batch_num = batch_size.clamp(1, 64);
+        self.rec_batch_num = batch_size.clamp(MIN_RECOGNITION_BATCH_SIZE, MAX_RECOGNITION_BATCH_SIZE);
         self
     }
 
@@ -267,6 +326,17 @@ impl PaddleOcrConfig {
     /// * `tier` - `"mobile"` (default, lightweight, faster) or `"server"` (high accuracy, GPU/complex documents)
     pub fn with_model_tier(mut self, tier: impl Into<String>) -> Self {
         self.model_tier = tier.into();
+        self
+    }
+
+    /// Sets the model generation.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - `"pp-ocrv6"` (default) or `"pp-ocrv5"`. Under `"pp-ocrv6"`, `model_tier`
+    ///   selects among `"medium"`/`"small"`/`"tiny"`.
+    pub fn with_model_version(mut self, version: impl Into<String>) -> Self {
+        self.model_version = version.into();
         self
     }
 }
@@ -421,6 +491,7 @@ mod tests {
         assert!(!config.enable_table_detection);
         assert_eq!(config.padding, 10);
         assert_eq!(config.model_tier, "mobile");
+        assert_eq!(config.model_version, "pp-ocrv6");
     }
 
     #[test]
@@ -430,7 +501,7 @@ mod tests {
         assert_eq!(config.det_db_thresh, 0.3);
         assert_eq!(config.det_db_box_thresh, 0.5);
         assert_eq!(config.det_db_unclip_ratio, 1.6);
-        assert_eq!(config.det_limit_side_len, 960);
+        assert_eq!(config.det_limit_side_len, 1024);
         assert_eq!(config.rec_batch_num, 6);
         assert_eq!(config.padding, 10);
         assert_eq!(config.model_tier, "mobile");
@@ -468,25 +539,9 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn test_resolve_cache_dir_default() {
-        // Temporarily remove env override so we test the true default path
-        let saved = std::env::var("XBERG_CACHE_DIR").ok();
-        // SAFETY: This test is not run in parallel with other tests that depend on this env var.
-        // The env var manipulation is only used to test the default cache dir resolution.
-        unsafe { std::env::remove_var("XBERG_CACHE_DIR") };
-
         let config = PaddleOcrConfig::new("en");
-        let cache_dir = config.resolve_cache_dir();
-        // Should contain "xberg" and "paddle-ocr" in the path
-        assert!(cache_dir.to_string_lossy().contains("xberg"));
-        assert!(cache_dir.to_string_lossy().contains("paddle-ocr"));
-
-        // Restore env var if it was set
-        if let Some(val) = saved {
-            // SAFETY: Restoring the env var to its original state after the test.
-            unsafe { std::env::set_var("XBERG_CACHE_DIR", val) };
-        }
+        assert_eq!(config.resolve_cache_dir(), hf_hub::resolve_cache_dir());
     }
 
     #[test]
@@ -540,6 +595,18 @@ mod tests {
     }
 
     #[test]
+    fn should_default_detection_side_length_when_omitted() {
+        let config: PaddleOcrConfig = serde_json::from_str(r#"{"language":"en"}"#).unwrap();
+        assert_eq!(config.det_limit_side_len, 1024);
+    }
+
+    #[test]
+    fn should_preserve_explicit_detection_side_length_override() {
+        let config: PaddleOcrConfig = serde_json::from_str(r#"{"language":"en","det_limit_side_len":960}"#).unwrap();
+        assert_eq!(config.det_limit_side_len, 960);
+    }
+
+    #[test]
     fn test_serialization() {
         let config = PaddleOcrConfig::new("ch")
             .with_table_detection(true)
@@ -561,6 +628,39 @@ mod tests {
     }
 
     #[test]
+    fn test_model_version_builder() {
+        let config = PaddleOcrConfig::new("en")
+            .with_model_version("pp-ocrv6")
+            .with_model_tier("small");
+        assert_eq!(config.model_version, "pp-ocrv6");
+        assert_eq!(config.model_tier, "small");
+    }
+
+    #[test]
+    fn test_model_version_serde_roundtrip() {
+        let config = PaddleOcrConfig::new("ch").with_model_version("pp-ocrv6");
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"model_version\":\"pp-ocrv6\""));
+
+        let deserialized: PaddleOcrConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.model_version, "pp-ocrv6");
+    }
+
+    #[test]
+    fn test_model_version_defaults_when_omitted() {
+        let json = r#"{"language":"en","model_tier":"mobile"}"#;
+        let config: PaddleOcrConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model_version, "pp-ocrv6");
+    }
+
+    #[test]
+    fn test_model_version_pins_legacy_v5_when_requested() {
+        let json = r#"{"language":"en","model_tier":"mobile","model_version":"pp-ocrv5"}"#;
+        let config: PaddleOcrConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model_version, "pp-ocrv5");
+    }
+
+    #[test]
     fn test_model_tier_serde_roundtrip() {
         let config = PaddleOcrConfig::new("ch").with_model_tier("server");
         let json = serde_json::to_string(&config).unwrap();
@@ -572,7 +672,6 @@ mod tests {
 
     #[test]
     fn test_model_tier_backward_compat() {
-        // JSON without model_tier should deserialize to default "mobile"
         let json = r#"{"language":"en","det_db_thresh":0.3}"#;
         let config: PaddleOcrConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.model_tier, "mobile");

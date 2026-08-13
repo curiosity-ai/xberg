@@ -12,7 +12,7 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Information about a framework's disk size
@@ -29,6 +29,14 @@ pub struct FrameworkSize {
     /// ML model size in bytes (auto-downloaded on first use: torch models, OCR weights, etc.)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub model_bytes: u64,
+    /// `true` when [`Self::model_bytes`] is `0` because the model cache/store was missing or
+    /// empty at measurement time, rather than because a real measurement observed zero bytes of
+    /// models. Distinguishes "this framework genuinely ships no models" from "models were not
+    /// measured in this environment" (e.g. no ML pipeline has run yet on this machine to populate
+    /// the cache) — a reader comparing `model_bytes` across frameworks must be able to tell these
+    /// apart, since the second case silently understates the real installed footprint.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub model_size_unavailable: bool,
     /// Method used to measure (pip_package, npm_package, binary_size, jar_size, etc.)
     pub method: String,
     /// Human-readable description
@@ -43,12 +51,15 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Framework size measurement results
 pub type FrameworkSizes = HashMap<String, FrameworkSize>;
 
 /// Known frameworks with their measurement methods and descriptions
 const FRAMEWORKS: &[(&str, &str, &str)] = &[
-    // Xberg bindings
     ("xberg-rust", "binary_size", "Native Rust core binary"),
     ("xberg-python", "pip_package", "Python wheel package"),
     ("xberg-node", "npm_package", "Node.js native addon"),
@@ -61,7 +72,6 @@ const FRAMEWORKS: &[(&str, &str, &str)] = &[
     ("xberg-php", "php_extension", "PHP extension"),
     ("xberg-c", "binary_size", "C FFI binding"),
     ("xberg-rust-paddle", "binary_size", "Native Rust core with PaddleOCR"),
-    // Third-party frameworks
     ("docling", "pip_package", "IBM Docling document processing"),
     ("markitdown", "pip_package", "Mark It Down markdown converter"),
     ("unstructured", "pip_package", "Unstructured document processing"),
@@ -82,11 +92,7 @@ const FRAMEWORKS: &[(&str, &str, &str)] = &[
 /// Values measured on Linux x86_64 (Ubuntu 22.04) in March 2026.
 /// Sources: pip-weigh --json, PyPI wheel sizes, HuggingFace model pages, apt show.
 const KNOWN_THIRD_PARTY_SIZES: &[(&str, u64, u64, u64, &str)] = &[
-    // pymupdf4llm: 298 KB self + PyMuPDF 51.1 MB (bundles MuPDF natively).
-    // pip-weigh: 51.5 MB total.
     ("pymupdf4llm", 51_500_000, 0, 0, "PyMuPDF for LLM"),
-    // markitdown: Python deps ~80 MB (markitdown + mammoth + pptx-python + beautifulsoup4 etc).
-    // System: ffmpeg ~100 MB + exiftool ~25 MB.
     (
         "markitdown",
         80_000_000,
@@ -94,13 +100,7 @@ const KNOWN_THIRD_PARTY_SIZES: &[(&str, u64, u64, u64, &str)] = &[
         0,
         "Mark It Down markdown converter",
     ),
-    // tika: tika-app JAR ~57 MB. System: default-jre-headless ~215 MB.
     ("tika", 57_000_000, 215_000_000, 0, "Apache Tika content analysis"),
-    // docling (IBM): torch 916 MB + torchvision 7 MB + transformers 10 MB + docling-core +
-    // docling-ibm-models + OCR dependencies + opencv-python 70 MB + scipy 40 MB + pillow +
-    // numerous transitive deps. pip-weigh (if it completes): ~2.5 GB.
-    // Models: docling-models (TableFormer + LayoutLM) 358 MB from HuggingFace +
-    // OCR detection + recognition models = ~470 MB.
     (
         "docling",
         2_500_000_000,
@@ -108,10 +108,6 @@ const KNOWN_THIRD_PARTY_SIZES: &[(&str, u64, u64, u64, &str)] = &[
         470_000_000,
         "IBM Docling document processing",
     ),
-    // unstructured: ~300 MB Python deps (unstructured + nltk + langdetect + beautifulsoup4 etc).
-    // System: libreoffice-core ~300 MB + tesseract ~30 MB + pandoc ~40 MB + poppler ~20 MB +
-    // libmagic ~1 MB = ~840 MB total system deps (based on Docker image layer sizes).
-    // Models: YOLOX layout model 217 MB (default hi_res strategy, from HuggingFace).
     (
         "unstructured",
         300_000_000,
@@ -119,15 +115,7 @@ const KNOWN_THIRD_PARTY_SIZES: &[(&str, u64, u64, u64, &str)] = &[
         217_000_000,
         "Unstructured document processing",
     ),
-    // mineru (MinerU): PaddlePaddle 194 MB + paddleocr + torch 916 MB + torchvision +
-    // opencv-python 70 MB + numerous transitive deps. pip-weigh: ~2 GB.
-    // Models: DocLayout-YOLO ~100 MB + PaddleOCR det/rec/cls ~150 MB +
-    // UniMERNet ~200 MB + TATR + PP-FormulaNet = ~650 MB.
     ("mineru", 2_000_000_000, 0, 650_000_000, "MinerU document intelligence"),
-    // liteparse (run-llama): Rust CLI installed via `cargo install liteparse`.
-    // Binary is statically linked against pdfium-sys + tesseract-rs (default feature),
-    // approx ~35 MB on Linux x86_64. No persistent model footprint at rest; tessdata
-    // lives in the system's tesseract install (~30 MB shared with other backends).
     ("liteparse", 35_000_000, 0, 0, "LiteParse (run-llama) Rust PDF parser"),
 ];
 
@@ -141,6 +129,7 @@ fn lookup_known_size(name: &str) -> Option<FrameworkSize> {
             package_bytes: *pkg,
             system_deps_bytes: *sys,
             model_bytes: *models,
+            model_size_unavailable: false,
             method: "known_size".to_string(),
             description: desc.to_string(),
             system_deps_detail: HashMap::new(),
@@ -156,13 +145,24 @@ pub fn measure_framework_sizes() -> Result<FrameworkSizes> {
     let mut sizes = HashMap::new();
 
     for (name, method, description) in FRAMEWORKS {
-        // Use hardcoded sizes for third-party frameworks
         if let Some(known) = lookup_known_size(name) {
             sizes.insert(name.to_string(), known);
             continue;
         }
 
-        // Dynamically measure xberg bindings
+        // The native xberg CLI is measured with a shipped-vs-model breakdown so
+        // benchmark rows can report install size fairly (heuristic rows exclude
+        // the on-demand model cache; ML rows include it). ~keep
+        if *name == "xberg-rust" {
+            match measure_xberg_framework_size(description) {
+                Some(fs) => {
+                    sizes.insert(name.to_string(), fs);
+                }
+                None => eprintln!("Size measurement: xberg-rust - binary not found, skipping"),
+            }
+            continue;
+        }
+
         match measure_framework(name, method) {
             Ok(Some(pkg_size)) => {
                 sizes.insert(
@@ -172,6 +172,7 @@ pub fn measure_framework_sizes() -> Result<FrameworkSizes> {
                         package_bytes: pkg_size,
                         system_deps_bytes: 0,
                         model_bytes: 0,
+                        model_size_unavailable: false,
                         method: method.to_string(),
                         description: description.to_string(),
                         system_deps_detail: HashMap::new(),
@@ -199,13 +200,21 @@ pub fn measure_framework_sizes_strict() -> Result<FrameworkSizes> {
     let mut errors = Vec::new();
 
     for (name, method, description) in FRAMEWORKS {
-        // Use hardcoded sizes for third-party frameworks
         if let Some(known) = lookup_known_size(name) {
             sizes.insert(name.to_string(), known);
             continue;
         }
 
-        // Dynamically measure xberg bindings
+        if *name == "xberg-rust" {
+            match measure_xberg_framework_size(description) {
+                Some(fs) => {
+                    sizes.insert(name.to_string(), fs);
+                }
+                None => errors.push(format!("{} ({})", name, method)),
+            }
+            continue;
+        }
+
         match measure_framework(name, method) {
             Ok(Some(pkg_size)) => {
                 sizes.insert(
@@ -215,6 +224,7 @@ pub fn measure_framework_sizes_strict() -> Result<FrameworkSizes> {
                         package_bytes: pkg_size,
                         system_deps_bytes: 0,
                         model_bytes: 0,
+                        model_size_unavailable: false,
                         method: method.to_string(),
                         description: description.to_string(),
                         system_deps_detail: HashMap::new(),
@@ -244,14 +254,9 @@ fn measure_framework(name: &str, method: &str) -> Result<Option<u64>> {
     match method {
         "pip_package" => measure_pip_package(extract_package_name(name)),
         "npm_package" => measure_npm_package(extract_package_name(name)),
-        "binary_size" => {
-            // Special handling for xberg: measure CLI binary + runtime artifacts
-            if name == "xberg-rust" {
-                measure_xberg_binary_release()
-            } else {
-                measure_binary(name)
-            }
-        }
+        // Note: `xberg-rust` is measured separately via `measure_xberg_framework_size`
+        // (shipped-vs-model breakdown) before this generic dispatch is reached. ~keep
+        "binary_size" => measure_binary(name),
         "jar_size" => measure_jar(name),
         "gem_package" => measure_gem_package(extract_package_name(name)),
         "wasm_bundle" => measure_wasm_bundle(name),
@@ -264,7 +269,6 @@ fn measure_framework(name: &str, method: &str) -> Result<Option<u64>> {
 
 /// Extract Python/npm/gem package name from framework name
 fn extract_package_name(framework: &str) -> &str {
-    // Strip -batch suffix and xberg- prefix for lookups
     let name = framework.strip_suffix("-batch").unwrap_or(framework);
 
     match name {
@@ -291,34 +295,25 @@ fn extract_package_name(framework: &str) -> &str {
 /// isolated venv, capturing deps like torch/transformers that dominate the
 /// actual installation footprint.
 fn measure_pip_package(package: &str) -> Result<Option<u64>> {
-    // For xberg (native editable install via maturin develop), use Python
-    // to find the actual package directory which includes the native .so.
     if package == "xberg"
         && let Some(size) = measure_pip_package_via_python(package)
     {
         return Ok(Some(size));
     }
 
-    // For third-party packages, try pip-weigh first to get accurate total size
-    // including all transitive dependencies. pip-weigh creates an isolated venv,
-    // installs the package, and measures via .dist-info/RECORD.
-    // This MUST run before measure_pip_package_via_python, which only measures
-    // the single package directory (e.g. 1.4MB for docling instead of 4GB with torch).
     if package != "xberg"
         && let Some(size) = measure_pip_weigh(package)
     {
         return Ok(Some(size));
     }
 
-    // Fall back to Python module directory measurement
     if let Some(size) = measure_pip_package_via_python(package) {
         return Ok(Some(size));
     }
 
-    // Last resort: parse uv pip show -f output
     let output = match Command::new("uv").args(["pip", "show", "-f", package]).output() {
         Ok(output) => output,
-        Err(_) => return Ok(None), // uv not installed
+        Err(_) => return Ok(None),
     };
 
     if !output.status.success() {
@@ -347,41 +342,30 @@ fn measure_pip_weigh(package: &str) -> Option<u64> {
 
 /// Parse pip show -f output to extract package size
 fn parse_pip_show_size(stdout: &str, package: &str) -> Option<u64> {
-    // Find Location line
     let location_line = stdout.lines().find(|l| l.starts_with("Location:"))?;
     let location = location_line.strip_prefix("Location:")?.trim();
     let location_path = Path::new(location);
 
-    // For editable installs (e.g. maturin develop), pip show reports an
-    // "Editable project location:" and the Files: section only contains
-    // dist-info metadata (~16KB). Measure the actual package directory
-    // at the editable project location instead.
     if let Some(editable_line) = stdout.lines().find(|l| l.starts_with("Editable project location:"))
         && let Some(editable_path) = editable_line
             .strip_prefix("Editable project location:")
             .map(|s| s.trim())
     {
         let project_dir = Path::new(editable_path);
-        // Measure the Python package directory within the editable project
-        // (e.g. packages/python/xberg/ for the xberg package)
         let pkg_dir = project_dir.join(package.replace('-', "_"));
         if pkg_dir.exists() {
             return Some(dir_size(&pkg_dir));
         }
-        // Fall back to the project directory itself
         if project_dir.exists() {
             return Some(dir_size(project_dir));
         }
     }
 
-    // Try package directory first (e.g. {location}/xberg/)
     let package_dir = location_path.join(package.replace('-', "_"));
     if package_dir.exists() {
         return Some(dir_size(&package_dir));
     }
 
-    // Fall back to summing individual files listed by pip show -f
-    // This handles native extensions (maturin) where files are at top-level
     let mut in_files_section = false;
     let mut total_size: u64 = 0;
     let mut found_files = false;
@@ -395,7 +379,6 @@ fn parse_pip_show_size(stdout: &str, package: &str) -> Option<u64> {
             if file_rel.is_empty() {
                 continue;
             }
-            // Lines after Files: that don't start with whitespace are new sections
             if !line.starts_with(' ') && !line.starts_with('\t') {
                 break;
             }
@@ -415,35 +398,28 @@ fn parse_pip_show_size(stdout: &str, package: &str) -> Option<u64> {
 
 /// Measure npm package size including native addon binary
 fn measure_npm_package(package: &str) -> Result<Option<u64>> {
-    // For xberg-node, measure the native .node addon + JS wrapper
-    // The .node file contains the Rust FFI statically linked
     if package.contains("xberg") && package.contains("node") {
         let mut total: u64 = 0;
 
-        // Find the native .node addon in the crate directory
         let node_crate = Path::new("crates/xberg-node");
         if node_crate.exists() {
             if let Ok(entries) = fs::read_dir(node_crate) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        // The native addon: xberg-node.linux-x64-gnu.node, etc.
-                        if name.ends_with(".node")
-                            && let Ok(metadata) = fs::metadata(&path)
-                        {
-                            total += metadata.len();
-                        }
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && name.ends_with(".node")
+                        && let Ok(metadata) = fs::metadata(&path)
+                    {
+                        total += metadata.len();
                     }
                 }
             }
-            // Add JS wrapper (dist/ directory)
             let dist_dir = node_crate.join("dist");
             if dist_dir.exists() {
                 total += dir_size(&dist_dir);
             }
         }
 
-        // Also check npm platform packages (e.g. crates/xberg-node/npm/linux-x64-gnu/)
         let npm_dir = node_crate.join("npm");
         if npm_dir.exists()
             && let Ok(entries) = fs::read_dir(&npm_dir)
@@ -469,7 +445,6 @@ fn measure_npm_package(package: &str) -> Result<Option<u64>> {
         }
     }
 
-    // For third-party npm packages, fall back to npm pack --dry-run
     let output = Command::new("npm")
         .args(["pack", "--dry-run", "--json", package])
         .output()
@@ -489,51 +464,128 @@ fn measure_npm_package(package: &str) -> Result<Option<u64>> {
     Ok(None)
 }
 
-/// Measure Xberg CLI release binary and bundled artifacts.
+/// Measure the native xberg CLI install footprint, split so benchmark rows can
+/// report install size fairly against competitors.
 ///
-/// Builds/measures the actual xberg-cli release binary with a representative
-/// feature set (ocr, paddle-ocr, layout-detection, embeddings). Includes:
-/// - The compiled binary (target/release/xberg-cli or xberg)
-/// - Any bundled native libraries (tesseract, ONNX Runtime, tree-sitter)
-/// - Cached ML models (if pre-downloaded; otherwise just the binary)
-fn measure_xberg_binary_release() -> Result<Option<u64>> {
-    // Try common binary locations
-    let binary_paths = [
+/// - `package_bytes` = shipped footprint: the compiled `xberg`/`xberg-cli`
+///   release binary plus any bundled native libraries (ONNX Runtime, tesseract,
+///   tree-sitter). This is what a heuristic-only (no-ML) run needs on disk, and
+///   the fair comparison point against model-free tools like LiteParse.
+/// - `model_bytes` = the on-demand ML model cache (platform cache dir), pulled on
+///   first use by the layout/OCR/embedding paths. Comparable to how Docling's
+///   auto-downloaded models are reported separately.
+/// - `size_bytes` = `package_bytes + model_bytes` (total, matching the
+///   convention used for third-party frameworks).
+///
+/// Returns `None` if no binary is present.
+fn measure_xberg_framework_size(description: &str) -> Option<FrameworkSize> {
+    let binary_size = [
         "target/release/xberg",
         "target/release/xberg-cli",
         "target/debug/xberg",
         "target/debug/xberg-cli",
-    ];
+    ]
+    .iter()
+    .find_map(|path| fs::metadata(path).ok().map(|m| m.len()))
+    .filter(|size| *size > 0)?;
 
-    // First, look for an already-built binary
-    for path in binary_paths.iter() {
-        if let Ok(metadata) = fs::metadata(path) {
-            let binary_size = metadata.len();
+    let ffi_size = measure_native_ffi_libs();
 
-            // Also check for native FFI libraries that might be bundled
-            let ffi_size = measure_native_ffi_libs();
+    let cache_base = xberg_cache_base();
+    let (model_size, model_size_unavailable) = measure_model_cache_size(cache_base.as_deref());
+    if model_size_unavailable {
+        // xberg's ML pipelines (layout, paddle-ocr, candle-*) always download real model weights
+        // on first use, so an observed `0` here can never be a genuine "no models" measurement —
+        // it means the cache directory is missing or empty *in this environment* (e.g. no ML
+        // pipeline has run yet on this machine to populate it). Reporting it silently as 0 would
+        // make xberg's installed footprint look smaller than it really is once ML features are
+        // used, so this is surfaced loudly instead of folded into `model_bytes` unremarked.
+        eprintln!(
+            "Xberg measurement WARNING: model cache at {} is missing or empty -- model_bytes=0 is \
+             NOT a verified measurement (ML model weights may simply not have been downloaded on \
+             this machine yet); size_bytes for this run excludes model weights",
+            cache_base
+                .as_deref()
+                .map_or_else(|| "<unresolved>".to_string(), |path| path.display().to_string())
+        );
+    }
 
-            // Check for cached models in ~/.cache/xberg (if they exist)
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            let model_cache = Path::new(&home).join(".cache/xberg");
-            let model_size = if model_cache.exists() {
-                dir_size(&model_cache)
-            } else {
-                0
-            };
+    let package_bytes = binary_size + ffi_size;
+    eprintln!(
+        "Xberg measurement: binary={} bytes, ffi_libs={} bytes, cached_models={} bytes (shipped={}, total={})",
+        binary_size,
+        ffi_size,
+        model_size,
+        package_bytes,
+        package_bytes + model_size,
+    );
 
-            let total = binary_size + ffi_size + model_size;
-            if binary_size > 0 {
-                eprintln!(
-                    "Xberg measurement: binary={} bytes, ffi_libs={} bytes, cached_models={} bytes, total={}",
-                    binary_size, ffi_size, model_size, total
-                );
-                return Ok(Some(total));
-            }
+    Some(FrameworkSize {
+        size_bytes: package_bytes + model_size,
+        package_bytes,
+        system_deps_bytes: 0,
+        model_bytes: model_size,
+        model_size_unavailable,
+        method: "binary_size".to_string(),
+        description: description.to_string(),
+        system_deps_detail: HashMap::new(),
+    })
+}
+
+/// Computes the model cache size and whether that size is a genuine "zero" measurement.
+///
+/// Returns `(size_bytes, unavailable)`. `unavailable` is `true` whenever `size_bytes` is `0`
+/// because the directory could not be resolved, does not exist, or contains no files — as opposed
+/// to a directory that was actually walked and found to contain 0 bytes of models, which cannot
+/// happen for a populated xberg model cache in practice.
+fn measure_model_cache_size(dir: Option<&Path>) -> (u64, bool) {
+    let size = dir.filter(|candidate| candidate.exists()).map(dir_size).unwrap_or(0);
+    (size, size == 0)
+}
+
+/// Resolve the xberg model cache base directory, mirroring the core's
+/// `cache_dir::resolve_cache_base`: honor `XBERG_CACHE_DIR`, else the
+/// platform-appropriate global cache dir (`dirs::cache_dir()/xberg`), else a
+/// CWD-relative `.xberg` fallback.
+///
+/// This must match the core, or the measured `model_bytes` is wrong — notably
+/// on macOS the cache lives at `~/Library/Caches/xberg`, not `~/.cache/xberg`.
+/// The final CWD fallback matters too: `crates/xberg/src/cache_dir.rs::resolve_cache_base` falls
+/// back to `<cwd>/.xberg` when no cache-dir env var is set and no home directory can be resolved
+/// (e.g. a minimal container with `HOME` unset) — this function previously returned `None` in
+/// that case, which silently reported `model_bytes: 0` when core would have written the cache to
+/// a directory this function never looked at. Adding the same fallback here closes that gap.
+fn xberg_cache_base() -> Option<PathBuf> {
+    if let Ok(env_path) = std::env::var("XBERG_CACHE_DIR") {
+        return Some(PathBuf::from(env_path));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(Path::new(&home).join("Library/Caches/xberg"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return Some(Path::new(&local).join("xberg"));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            return Some(Path::new(&xdg).join("xberg"));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(Path::new(&home).join(".cache/xberg"));
         }
     }
 
-    Ok(None)
+    // Mirror the core's final fallback so this measurement can't silently diverge from where
+    // xberg itself actually writes the model cache when no cache-dir env var or home directory
+    // can be resolved (see the doc comment above).
+    std::env::current_dir().ok().map(|cwd| cwd.join(".xberg"))
 }
 
 /// Measure binary size
@@ -545,7 +597,6 @@ fn measure_binary(name: &str) -> Result<Option<u64>> {
         _ => return Ok(None),
     };
 
-    // For xberg-rust/c/rust-paddle, measure the FFI shared library (used by all bindings)
     if matches!(name, "xberg-rust" | "xberg-c" | "xberg-rust-paddle") {
         let target_paths = [
             "target/release/libxberg_ffi.so",
@@ -565,9 +616,6 @@ fn measure_binary(name: &str) -> Result<Option<u64>> {
         }
     }
 
-    // For xberg-go, measure the FFI shared library (Go links against it via CGO).
-    // Do NOT fall back to measuring the Go source directory — it includes test fixtures
-    // and build artifacts that inflate the size to ~843 MB.
     if name.starts_with("xberg-go") {
         let go_ffi_paths = [
             "target/release/libxberg_ffi.so",
@@ -579,7 +627,6 @@ fn measure_binary(name: &str) -> Result<Option<u64>> {
                 return Ok(Some(metadata.len()));
             }
         }
-        // Fall back to measuring all native FFI libs
         let ffi_size = measure_native_ffi_libs();
         if ffi_size > 0 {
             return Ok(Some(ffi_size));
@@ -587,7 +634,6 @@ fn measure_binary(name: &str) -> Result<Option<u64>> {
         return Ok(None);
     }
 
-    // Try which to find binary in PATH
     let output = Command::new("which").arg(binary_name).output().ok();
 
     if let Some(output) = output
@@ -604,7 +650,6 @@ fn measure_binary(name: &str) -> Result<Option<u64>> {
 
 /// Measure JAR size (Apache Tika)
 fn measure_jar(name: &str) -> Result<Option<u64>> {
-    // Common locations for Tika JAR
     let possible_paths = [
         "/usr/share/java/tika-app.jar",
         "/opt/tika/tika-app.jar",
@@ -620,14 +665,12 @@ fn measure_jar(name: &str) -> Result<Option<u64>> {
             }
         }
 
-        // Try TIKA_JAR environment variable
         if let Ok(jar_path) = std::env::var("TIKA_JAR")
             && let Ok(metadata) = fs::metadata(&jar_path)
         {
             return Ok(Some(metadata.len()));
         }
 
-        // Try tools/benchmark-harness/libs directory
         let libs_dir = Path::new("tools/benchmark-harness/libs");
         if let Ok(entries) = fs::read_dir(libs_dir) {
             for entry in entries.flatten() {
@@ -643,25 +686,19 @@ fn measure_jar(name: &str) -> Result<Option<u64>> {
         }
     }
 
-    // For xberg-java, measure classes (including JNI natives) + runtime dependencies
     if name.starts_with("xberg-java") {
         let mut total: u64 = 0;
 
-        // Compiled classes + bundled native libs (in target/classes/natives/)
         let classes_dir = Path::new("packages/java/target/classes");
         if classes_dir.exists() {
             total += dir_size(classes_dir);
         }
 
-        // Runtime dependency JARs (jackson, etc.)
         let deps_dir = Path::new("packages/java/target/dependency");
         if deps_dir.exists() {
             total += dir_size(deps_dir);
         }
 
-        // Check if native libs are actually bundled in classes/natives/.
-        // In CI, the natives/ dir may only contain .gitkeep placeholders
-        // without real .so/.dylib files. Add FFI libs from target/release/.
         let natives_dir = Path::new("packages/java/target/classes/natives");
         if !has_native_extension(natives_dir) {
             total += measure_native_ffi_libs();
@@ -671,7 +708,6 @@ fn measure_jar(name: &str) -> Result<Option<u64>> {
             return Ok(Some(total));
         }
 
-        // Fall back to a pre-built JAR
         let jar_path = Path::new("packages/java/target/xberg.jar");
         if let Ok(metadata) = fs::metadata(jar_path) {
             return Ok(Some(metadata.len()));
@@ -683,13 +719,11 @@ fn measure_jar(name: &str) -> Result<Option<u64>> {
 
 /// Measure Ruby gem size using bundle show or gem contents
 fn measure_gem_package(package: &str) -> Result<Option<u64>> {
-    // Map package names to actual gem names
     let gem_name = match package {
         "xberg" | "xberg-ruby" => "xberg_rb",
         other => other,
     };
 
-    // Try bundle show first (for Bundler-managed gems)
     if let Ok(output) = Command::new("bundle").args(["show", gem_name]).output()
         && output.status.success()
     {
@@ -702,7 +736,6 @@ fn measure_gem_package(package: &str) -> Result<Option<u64>> {
         }
     }
 
-    // Fall back to gem specification
     if let Ok(output) = Command::new("ruby")
         .arg("-e")
         .arg(format!(
@@ -721,8 +754,6 @@ fn measure_gem_package(package: &str) -> Result<Option<u64>> {
         }
     }
 
-    // Try workspace packages/ruby — measure only the built gem in pkg/ or lib/
-    // (not ext/, tmp/, vendor/ which contain build artifacts)
     let ruby_pkg = Path::new("packages/ruby/pkg");
     if ruby_pkg.exists() {
         return Ok(Some(dir_size(ruby_pkg)));
@@ -732,9 +763,6 @@ fn measure_gem_package(package: &str) -> Result<Option<u64>> {
         let lib_size = dir_size(ruby_lib);
         let mut total = lib_size;
 
-        // Add FFI native libs unless lib/ already contains a substantial native
-        // extension (> 5 MB). Small .so files may be stubs or incomplete artifacts
-        // that don't include the full FFI libs.
         let has_substantial_native = has_native_extension(ruby_lib) && lib_size > 5_000_000;
         if !has_substantial_native {
             total += measure_native_ffi_libs();
@@ -750,7 +778,6 @@ fn measure_gem_package(package: &str) -> Result<Option<u64>> {
 
 /// Measure WebAssembly bundle size
 fn measure_wasm_bundle(name: &str) -> Result<Option<u64>> {
-    // Look for .wasm files in common locations
     let wasm_paths = [
         "packages/wasm/pkg/xberg_bg.wasm",
         "packages/wasm/dist/xberg.wasm",
@@ -764,7 +791,6 @@ fn measure_wasm_bundle(name: &str) -> Result<Option<u64>> {
         }
     }
 
-    // Check node_modules for installed WASM package
     if name.contains("wasm") || name.contains("xberg") {
         let node_modules_paths = ["node_modules/@xberg-io/xberg-wasm"];
         for path in node_modules_paths {
@@ -785,18 +811,14 @@ fn measure_wasm_bundle(name: &str) -> Result<Option<u64>> {
 /// package depends on the Rust shared library at runtime.
 fn measure_nuget_package(name: &str) -> Result<Option<u64>> {
     if name.starts_with("xberg-csharp") {
-        // Check project build output directories first
         let project_dirs = ["packages/csharp/Xberg", "packages/csharp/Xberg.Native"];
         for proj_dir_str in project_dirs {
             let proj_dir = Path::new(proj_dir_str);
-            // Check bin/Release first, then bin/Debug
             for config in ["Release", "Debug"] {
                 let bin_dir = proj_dir.join("bin").join(config);
                 if bin_dir.exists() {
                     let mut total = dir_size(&bin_dir);
 
-                    // Always add native FFI libs if bin/ doesn't contain them.
-                    // In CI, the runtimes/*/native/ dir may not be populated.
                     if !has_native_extension(&bin_dir) {
                         total += measure_native_ffi_libs();
                     }
@@ -806,7 +828,6 @@ fn measure_nuget_package(name: &str) -> Result<Option<u64>> {
             }
         }
 
-        // Also check Benchmark project output
         for config in ["Release", "Debug"] {
             let bench_bin = Path::new("packages/csharp/Benchmark/bin").join(config);
             if bench_bin.exists() {
@@ -818,7 +839,6 @@ fn measure_nuget_package(name: &str) -> Result<Option<u64>> {
             }
         }
 
-        // Fall back to NuGet cache, but always add FFI libs
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let nuget_cache_paths = [
             format!("{}/.nuget/packages/xberg", home),
@@ -835,7 +855,6 @@ fn measure_nuget_package(name: &str) -> Result<Option<u64>> {
             }
         }
 
-        // Last resort: just the FFI libs
         let ffi_size = measure_native_ffi_libs();
         if ffi_size > 0 {
             return Ok(Some(ffi_size));
@@ -847,7 +866,6 @@ fn measure_nuget_package(name: &str) -> Result<Option<u64>> {
 
 /// Measure Elixir Hex package size
 fn measure_hex_package(name: &str) -> Result<Option<u64>> {
-    // Look in _build directory for compiled Elixir code
     let build_paths = [
         "packages/elixir/_build/prod/lib/xberg",
         "packages/elixir/_build/dev/lib/xberg",
@@ -860,7 +878,6 @@ fn measure_hex_package(name: &str) -> Result<Option<u64>> {
         }
     }
 
-    // Try to find in Hex cache
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let hex_paths = [
         format!("{}/.hex/packages/hexpm/xberg", home),
@@ -874,7 +891,6 @@ fn measure_hex_package(name: &str) -> Result<Option<u64>> {
         }
     }
 
-    // Measure workspace packages/elixir directory
     if name.starts_with("xberg-elixir") {
         let elixir_dir = Path::new("packages/elixir");
         if elixir_dir.exists() {
@@ -887,7 +903,6 @@ fn measure_hex_package(name: &str) -> Result<Option<u64>> {
 
 /// Measure PHP extension size
 fn measure_php_extension(name: &str) -> Result<Option<u64>> {
-    // Try to find the xberg.so extension
     if let Ok(output) = Command::new("php")
         .args(["-r", "echo ini_get('extension_dir');"])
         .output()
@@ -900,7 +915,6 @@ fn measure_php_extension(name: &str) -> Result<Option<u64>> {
         }
     }
 
-    // Check workspace for built extension
     let workspace_paths = [
         "packages/php-ext/target/release/libxberg_php.so",
         "packages/php-ext/target/release/libxberg_php.dylib",
@@ -914,7 +928,6 @@ fn measure_php_extension(name: &str) -> Result<Option<u64>> {
         }
     }
 
-    // Measure the entire PHP package directory as fallback
     if name.starts_with("xberg-php") {
         let php_dir = Path::new("packages/php-ext");
         if php_dir.exists() {
@@ -931,7 +944,6 @@ fn measure_php_extension(name: &str) -> Result<Option<u64>> {
 fn measure_native_ffi_libs() -> u64 {
     let mut total = 0u64;
 
-    // FFI shared library (one per platform)
     for path in [
         "target/release/libxberg_ffi.so",
         "target/release/libxberg_ffi.dylib",
@@ -969,8 +981,6 @@ fn measure_pip_package_via_python(package: &str) -> Option<u64> {
     let path = Path::new(&pkg_dir);
     if path.exists() {
         let size = dir_size(path);
-        // Sanity check: reject truly empty/broken packages (< 10KB).
-        // Pure Python packages may be legitimately small and should not be rejected.
         if size > 10_000 {
             return Some(size);
         }
@@ -1048,16 +1058,13 @@ mod tests {
 
     #[test]
     fn test_frameworks_list_complete() {
-        // 12 xberg bindings + 7 third-party = 19 total (R binding removed)
         assert_eq!(FRAMEWORKS.len(), 19);
 
-        // Check all xberg bindings present
         let names: Vec<&str> = FRAMEWORKS.iter().map(|(n, _, _)| *n).collect();
         assert!(names.contains(&"xberg-rust"));
         assert!(names.contains(&"xberg-python"));
         assert!(names.contains(&"xberg-node"));
 
-        // Check third-party frameworks present
         assert!(names.contains(&"docling"));
         assert!(names.contains(&"tika"));
         assert!(names.contains(&"unstructured"));
@@ -1077,12 +1084,60 @@ mod tests {
         fs::write(temp.path().join("b.txt"), "world!").unwrap();
 
         let size = dir_size(temp.path());
-        assert_eq!(size, 11); // "hello" (5) + "world!" (6)
+        assert_eq!(size, 11);
+    }
+
+    #[test]
+    fn model_cache_size_reports_unavailable_when_directory_missing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let missing = temp.path().join("does-not-exist");
+
+        let (size, unavailable) = measure_model_cache_size(Some(&missing));
+
+        assert_eq!(size, 0);
+        assert!(
+            unavailable,
+            "a missing cache directory must be reported unavailable, not a measured zero"
+        );
+    }
+
+    #[test]
+    fn model_cache_size_reports_unavailable_when_directory_empty() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let (size, unavailable) = measure_model_cache_size(Some(temp.path()));
+
+        assert_eq!(size, 0);
+        assert!(
+            unavailable,
+            "an empty cache directory must be reported unavailable, not a measured zero"
+        );
+    }
+
+    #[test]
+    fn model_cache_size_reports_unavailable_when_no_directory_resolved() {
+        let (size, unavailable) = measure_model_cache_size(None);
+
+        assert_eq!(size, 0);
+        assert!(
+            unavailable,
+            "an unresolved cache directory must be reported unavailable"
+        );
+    }
+
+    #[test]
+    fn model_cache_size_reports_available_when_directory_has_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        fs::write(temp.path().join("layout_model.onnx"), vec![0u8; 4096]).unwrap();
+
+        let (size, unavailable) = measure_model_cache_size(Some(temp.path()));
+
+        assert_eq!(size, 4096);
+        assert!(!unavailable, "a populated cache directory must be a real measurement");
     }
 
     #[test]
     fn test_measure_native_ffi_libs_does_not_panic() {
-        // Should return 0 or a positive value depending on build state
         let _size = measure_native_ffi_libs();
     }
 
@@ -1124,7 +1179,6 @@ mod tests {
 
     #[test]
     fn test_known_third_party_sizes_all_present() {
-        // Every third-party framework in FRAMEWORKS must have a KNOWN_THIRD_PARTY_SIZES entry
         let known_names: Vec<&str> = KNOWN_THIRD_PARTY_SIZES.iter().map(|(n, ..)| *n).collect();
         for (name, _, _) in FRAMEWORKS {
             if !name.starts_with("xberg-") {
@@ -1142,7 +1196,6 @@ mod tests {
         for (name, pkg, sys, models, _) in KNOWN_THIRD_PARTY_SIZES {
             let total = pkg + sys + models;
             assert!(total > 0, "Framework '{}' has zero total size", name,);
-            // No single framework should exceed 10 GB
             assert!(
                 total < 10_000_000_000,
                 "Framework '{}' total {} bytes seems too large",

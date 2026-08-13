@@ -59,19 +59,16 @@ if (-not $tesseractCacheHit) {
   }
   else {
     Write-Host "✓ Tesseract installed"
-    # Ensure tessdata directory exists and is accessible
     $tesseractPath = "C:\Program Files\Tesseract-OCR"
     if (Test-Path $tesseractPath) {
       Write-Host "  Configuring Tesseract data paths..."
 
-      # Create tessdata directory if it doesn't exist
       $tessdataPath = "$tesseractPath\tessdata"
       if (-not (Test-Path $tessdataPath)) {
         Write-Host "  Creating tessdata directory at: $tessdataPath"
         New-Item -ItemType Directory -Path $tessdataPath -Force | Out-Null
       }
 
-      # Download English language data if not present
       if (-not (Test-Path "$tessdataPath\eng.traineddata")) {
         Write-Host "  Downloading English language data..."
         try {
@@ -84,7 +81,6 @@ if (-not $tesseractCacheHit) {
         }
       }
 
-      # Download OSD data if not present (needed for orientation detection)
       if (-not (Test-Path "$tessdataPath\osd.traineddata")) {
         Write-Host "  Downloading OSD data..."
         try {
@@ -116,23 +112,13 @@ else {
   Write-Host "✓ LLVM/Clang found in cache"
 }
 
-# libheif via vcpkg. `libheif-sys` (transitively pulled by the `heic` feature)
-# does not use pkg-config on Windows — instead its build.rs calls
-# `vcpkg::Config::new().find_package("libheif")`. The `windows-latest` runner
-# image ships with vcpkg at C:\vcpkg, but the libheif port is not preinstalled.
-# Bindings that scaffolders don't yet gate behind `windows-target` (python,
-# node, ruby, php, elixir, swift, jni — alef target_dep_overrides only
-# emitted from the FFI and Dart scaffolders today) will still link
-# libheif-sys, so we install it here. x64-windows-static-md statically links
-# libheif while keeping the MSVC C runtime dynamic, matching `cargo build`'s
-# default MSVC toolchain.
 $libheifCacheHit = $env:LIBHEIF_CACHE_HIT -eq "true"
 if (-not $libheifCacheHit) {
-  Write-Host "libheif cache miss, installing via vcpkg..."
+  Write-Host "libheif/boost/zlib cache miss, installing via vcpkg..."
   $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
   $vcpkgExe = Join-Path $vcpkgRoot "vcpkg.exe"
   if (-not (Test-Path $vcpkgExe)) {
-    Write-Host "::warning::vcpkg.exe not found at $vcpkgExe; skipping libheif install"
+    Write-Host "::warning::vcpkg.exe not found at $vcpkgExe; skipping libheif/boost/zlib install"
   }
   else {
     if (-not (Retry-Command { & $vcpkgExe install "libheif:x64-windows-static-md" --recurse } -MaxAttempts 2)) {
@@ -141,12 +127,20 @@ if (-not $libheifCacheHit) {
     else {
       Write-Host "✓ libheif installed via vcpkg (x64-windows-static-md)"
     }
+    # boost-spirit + boost-serialization (header-only, used by librevenge/libwpd:
+    # RVNGBinaryData.cpp needs boost/archive/iterators/*) and zlib (linked
+    # by librevenge's zip stream) — needed by xberg-libwpd's build.rs.
+    if (-not (Retry-Command { & $vcpkgExe install "boost-spirit:x64-windows-static-md" "boost-serialization:x64-windows-static-md" "zlib:x64-windows-static-md" --recurse } -MaxAttempts 2)) {
+      Write-Host "::warning::Failed to install boost/zlib via vcpkg after retries (xberg-libwpd build will fail)"
+    }
+    else {
+      Write-Host "✓ boost-spirit + boost-serialization + zlib installed via vcpkg (x64-windows-static-md)"
+    }
   }
-  # Expose VCPKG_ROOT so the libheif-sys build.rs uses our install.
   Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgRoot"
 }
 else {
-  Write-Host "✓ libheif found in cache"
+  Write-Host "✓ libheif/boost/zlib found in cache"
   $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
   Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgRoot"
 }
@@ -201,7 +195,6 @@ foreach ($path in $paths) {
   }
 }
 
-# Ensure TESSDATA_PREFIX is set for Windows OCR tests
 $tesseractPath = "C:\Program Files\Tesseract-OCR"
 if (Test-Path $tesseractPath) {
   $tessdataPath = "$tesseractPath\tessdata"
@@ -223,11 +216,9 @@ try {
   Write-Host "  Found at: $tesseractPath"
   Write-Host "  Command type: $($tesseractCmd.CommandType)"
 
-  # Get installation directory
   $tesseractDir = Split-Path -Parent $tesseractPath
   Write-Host "  Installation directory: $tesseractDir"
 
-  # Check for tessdata
   $tessdataPath = Join-Path $tesseractDir "tessdata"
   if (Test-Path $tessdataPath) {
     Write-Host "  tessdata directory: $tessdataPath"
@@ -253,7 +244,6 @@ try {
     Write-Host "⚠ Warning: Tesseract found but failed to run: $($_.Exception.Message)"
   }
 
-  # Set TESSDATA_PREFIX environment variable for tests
   if (Test-Path $tessdataPath) {
     Write-Host ""
     Write-Host "Setting TESSDATA_PREFIX environment variable..."
@@ -301,7 +291,6 @@ Write-Host "CMake:"
 try {
   & cmake --version
   Write-Host "✓ CMake available"
-  # Export CMAKE environment variable for immediate availability in build scripts
   $cmakePath = (Get-Command cmake -ErrorAction Stop).Source
   if ($cmakePath) {
     Add-Content -Path $env:GITHUB_ENV -Value "CMAKE=$cmakePath"

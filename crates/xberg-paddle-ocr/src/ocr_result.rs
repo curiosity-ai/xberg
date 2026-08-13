@@ -2,7 +2,7 @@ use std::fmt::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Point {
     pub x: u32,
     pub y: u32,
@@ -16,8 +16,6 @@ pub struct TextBox {
 
 impl fmt::Display for TextBox {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // SAFETY: We must have at least 4 points in a valid TextBox
-        // This is enforced at the OCR processing level, but we check bounds here for safety
         if self.points.len() < 4 {
             return write!(
                 f,
@@ -56,7 +54,7 @@ impl fmt::Display for Angle {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TextLine {
     pub text: String,
     pub text_score: f32,
@@ -68,7 +66,7 @@ impl fmt::Display for TextLine {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TextBlock {
     pub box_points: Vec<Point>,
     pub box_score: f32,
@@ -80,9 +78,93 @@ pub struct TextBlock {
     pub text_score: f32,
 }
 
+/// A word aligned to the CTC output columns that produced it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RecognizedWord {
+    pub text: String,
+    #[serde(default)]
+    pub columns: Vec<u32>,
+    #[serde(default)]
+    pub start_column: u32,
+    #[serde(default)]
+    pub end_column: u32,
+    #[serde(default)]
+    pub confidence: f32,
+}
+
+/// A recognized line with word-level CTC alignment details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DetailedTextLine {
+    #[serde(flatten)]
+    pub line: TextLine,
+    #[serde(default)]
+    pub words: Vec<RecognizedWord>,
+    #[serde(default)]
+    pub line_column_count: f32,
+}
+
+impl From<DetailedTextLine> for TextLine {
+    fn from(value: DetailedTextLine) -> Self {
+        value.line
+    }
+}
+
+/// A recognized word with an optional source-image quadrilateral.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WordBlock {
+    #[serde(flatten)]
+    pub word: RecognizedWord,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub box_points: Vec<Point>,
+}
+
+impl From<RecognizedWord> for WordBlock {
+    fn from(word: RecognizedWord) -> Self {
+        Self {
+            word,
+            box_points: Vec::new(),
+        }
+    }
+}
+
+/// A text block with word-level CTC alignment details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetailedTextBlock {
+    #[serde(flatten)]
+    pub block: TextBlock,
+    #[serde(default)]
+    pub words: Vec<WordBlock>,
+    #[serde(default)]
+    pub line_column_count: f32,
+    /// Whether the classifier-requested 180-degree crop rotation was retained for recognition.
+    #[serde(default)]
+    pub rotation_retained: bool,
+}
+
+impl From<DetailedTextBlock> for TextBlock {
+    fn from(value: DetailedTextBlock) -> Self {
+        value.block
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct OcrResult {
     pub text_blocks: Vec<TextBlock>,
+}
+
+/// OCR output that retains word-level CTC alignment details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetailedOcrResult {
+    #[serde(default)]
+    pub text_blocks: Vec<DetailedTextBlock>,
+}
+
+impl From<DetailedOcrResult> for OcrResult {
+    fn from(value: DetailedOcrResult) -> Self {
+        Self {
+            text_blocks: value.text_blocks.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 impl fmt::Display for OcrResult {

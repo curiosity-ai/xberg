@@ -1,14 +1,3 @@
-//! TODO: Restored from 245539484 alef-migration cleanup. Currently exercises
-//! pub(crate) APIs that the migration deliberately narrowed; gated until
-//! either (a) these APIs are re-exposed publicly, or (b) the test is
-//! rewritten against the public extraction surface.
-
-#![cfg(any())]
-
-// Original content preserved below; recompiled once gating cfg drops.
-// Disabled by the file-level cfg(any()) above.
-
-/*
 //! Integration tests for PaddleOCR functionality.
 //!
 //! These tests require:
@@ -16,8 +5,17 @@
 //! - ONNX Runtime installed on the system
 //!
 //! Run with: `cargo test -p xberg --features paddle-ocr --test paddle_ocr_integration -- --ignored`
+//!
+//! Model-manager-level tests use only the public `ModelManager` surface
+//! (`new`, `ensure_all_models`, `manifest`) plus documented on-disk cache
+//! layout; the previous version of this suite relied on `pub(crate)` helpers
+//! (`ensure_models_exist`, `ensure_v2_det_model`, `resolve_rec_model`,
+//! `cache_stats`, `are_models_cached`) that the alef-migration cleanup
+//! deliberately narrowed to crate-internal visibility, which the rewritten
+//! suite below no longer needs.
 
-#![cfg(feature = "paddle-ocr")]
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+#![cfg(paddle_ocr)]
 
 use std::path::PathBuf;
 
@@ -43,68 +41,48 @@ fn test_cache_dir() -> PathBuf {
 
 /// Test that model manager can download models from HuggingFace.
 ///
-/// This test downloads actual models and verifies they are cached correctly.
-/// It's ignored by default since it requires network access and ~100MB download.
+/// This test downloads actual models and verifies they are cached correctly,
+/// using only the public `ModelManager` surface (`new`, `ensure_all_models`)
+/// plus the documented on-disk cache layout (`v2/det/<tier>`, `v2/cls`, etc.).
+/// It's ignored by default since it requires network access and a large
+/// (all-tier) download.
 #[tokio::test]
-#[ignore = "requires network access and ~100MB download"]
+#[ignore = "requires network access and a large (all-tier) download"]
 async fn test_model_download_from_huggingface() {
     let cache_dir = test_cache_dir();
 
-    // Clean up any existing cache
     let _ = std::fs::remove_dir_all(&cache_dir);
 
     let manager = ModelManager::new(cache_dir.clone());
 
-    // Verify cache is empty
-    assert!(!manager.are_models_cached());
-
-    // Download models (synchronous now)
-    let result = manager.ensure_models_exist();
+    let result = manager.ensure_all_models();
     assert!(result.is_ok(), "Model download failed: {:?}", result.err());
 
-    let paths: xberg::paddle_ocr::ModelPaths = result.unwrap();
+    let det_dir = cache_dir.join("v2").join("det").join("server");
+    let cls_dir = cache_dir.join("v2").join("cls");
+    let ori_dir = cache_dir.join("v2").join("doc_ori");
 
-    // Verify all model directories exist
-    assert!(paths.det_model.exists(), "Detection model dir not found");
-    assert!(paths.cls_model.exists(), "Classification model dir not found");
-    assert!(paths.rec_model.exists(), "Recognition model dir not found");
-
-    // Verify ONNX model files exist within directories
+    assert!(det_dir.join("model.onnx").exists(), "Detection ONNX file not found");
     assert!(
-        paths.det_model.join("model.onnx").exists(),
-        "Detection ONNX file not found"
-    );
-    assert!(
-        paths.cls_model.join("model.onnx").exists(),
+        cls_dir.join("model.onnx").exists(),
         "Classification ONNX file not found"
     );
     assert!(
-        paths.rec_model.join("model.onnx").exists(),
-        "Recognition ONNX file not found"
+        ori_dir.join("model.onnx").exists(),
+        "Document orientation ONNX file not found"
     );
 
-    // Verify dictionary file exists
-    assert!(paths.dict_file.exists(), "Dictionary file not found");
-
-    // Verify cache reports correctly
-    assert!(manager.are_models_cached());
-
-    // Check cache stats
-    let stats = manager.cache_stats().unwrap();
-    // 3 model dirs, each containing model.onnx (rec/ also has dict.txt)
+    let manifest = ModelManager::manifest();
     assert!(
-        stats.model_count >= 3,
-        "Expected at least 3 cached items, got {}",
-        stats.model_count
+        manifest.len() >= 3,
+        "Expected at least 3 manifest entries, got {}",
+        manifest.len()
     );
-    // Models should be > 1MB each
-    assert!(stats.total_size_bytes > 1_000_000);
 
-    println!("Cache stats: {:?}", stats);
-    println!("Detection model: {:?}", paths.det_model);
-    println!("Classification model: {:?}", paths.cls_model);
-    println!("Recognition model: {:?}", paths.rec_model);
-    println!("Dictionary file: {:?}", paths.dict_file);
+    println!("Manifest entries: {}", manifest.len());
+    println!("Detection model: {:?}", det_dir);
+    println!("Classification model: {:?}", cls_dir);
+    println!("Document orientation model: {:?}", ori_dir);
 }
 
 /// Test OCR on a simple English "Hello World" image.
@@ -124,7 +102,7 @@ async fn test_ocr_hello_world_english() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -136,7 +114,6 @@ async fn test_ocr_hello_world_english() {
 
     println!("OCR result: {}", extraction.content);
 
-    // Should contain "hello" and "world"
     assert!(
         text.contains("hello") || text.contains("helo"),
         "Expected 'hello' in OCR result: {}",
@@ -147,6 +124,95 @@ async fn test_ocr_hello_world_english() {
         "Expected 'world' in OCR result: {}",
         text
     );
+}
+
+/// Requested languages the selected recognition model cannot cover must surface
+/// as a `ProcessingWarning` instead of silently dropping their text (#1346),
+/// and OCR metadata must report the model actually used rather than every
+/// requested language.
+#[tokio::test]
+#[ignore = "requires ONNX Runtime and downloaded models"]
+async fn test_ocr_uncovered_language_emits_warning() {
+    let image_path = test_documents_dir().join("images/test_hello_world.png");
+    assert!(image_path.exists(), "Test image not found: {:?}", image_path);
+
+    let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
+
+    let config = PaddleOcrConfig::new("en").with_cache_dir(test_cache_dir());
+    let backend = PaddleOcrBackend::with_config(config).expect("Failed to create backend");
+
+    let ocr_config = OcrConfig {
+        backend: "paddle-ocr".to_string(),
+        language: vec!["en".to_string(), "ru".to_string()],
+        ..Default::default()
+    };
+
+    let extraction: ExtractedDocument = backend
+        .process_image(&image_bytes, &ocr_config)
+        .await
+        .expect("OCR failed");
+
+    assert_eq!(
+        extraction.processing_warnings.len(),
+        1,
+        "expected one uncovered-language warning, got: {:?}",
+        extraction.processing_warnings
+    );
+    let warning = &extraction.processing_warnings[0];
+    assert_eq!(warning.source, "paddle-ocr");
+    assert!(
+        warning.message.contains("[ru]") && warning.message.contains("'en'"),
+        "warning should name the uncovered language and the selected model: {}",
+        warning.message
+    );
+
+    let language = match &extraction.metadata.format {
+        Some(xberg::types::FormatMetadata::Ocr(ocr)) => ocr.language.clone(),
+        other => panic!("expected OCR metadata, got: {:?}", other),
+    };
+    assert_eq!(language, "en", "metadata must report the model actually used");
+}
+
+/// Test PP-OCRv6 recognition on English across all three v6 tiers.
+///
+/// v6 routes English (a v6-unified family) to the unified recognition model at the
+/// configured tier (medium/small/tiny), with a v6 detector and the shared PP-LCNet
+/// classifier. Verifies the version-aware wiring end to end against the live models.
+#[tokio::test]
+#[ignore = "requires network access and ONNX Runtime (PP-OCRv6 model download)"]
+async fn test_ocr_pp_ocrv6_english_tiers() {
+    let image_path = test_documents_dir().join("images/test_hello_world.png");
+    assert!(image_path.exists(), "Test image not found: {:?}", image_path);
+    let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
+
+    for tier in ["medium", "small", "tiny"] {
+        let config = PaddleOcrConfig::new("en")
+            .with_model_version("pp-ocrv6")
+            .with_model_tier(tier)
+            .with_cache_dir(test_cache_dir());
+
+        let backend = PaddleOcrBackend::with_config(config).expect("Failed to create backend");
+
+        let ocr_config = OcrConfig {
+            backend: "paddle-ocr".to_string(),
+            language: vec!["en".to_string()],
+            ..Default::default()
+        };
+
+        let result: xberg::Result<ExtractedDocument> = backend.process_image(&image_bytes, &ocr_config).await;
+        assert!(result.is_ok(), "PP-OCRv6 {tier} OCR failed: {:?}", result.err());
+
+        let text = result.unwrap().content.to_lowercase();
+        println!("PP-OCRv6 {tier} OCR result: {text}");
+        assert!(
+            text.contains("hello") || text.contains("helo"),
+            "Expected 'hello' in PP-OCRv6 {tier} result: {text}"
+        );
+        assert!(
+            text.contains("world") || text.contains("worid"),
+            "Expected 'world' in PP-OCRv6 {tier} result: {text}"
+        );
+    }
 }
 
 /// Test OCR on a complex English document (newspaper).
@@ -164,7 +230,7 @@ async fn test_ocr_newspaper_english() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -179,7 +245,6 @@ async fn test_ocr_newspaper_english() {
         &extraction.content[..extraction.content.len().min(500)]
     );
 
-    // Should contain "NASDAQ" and "AMEX" from the header
     assert!(
         text.contains("NASDAQ") || text.contains("NASOAQ"),
         "Expected 'NASDAQ' in OCR result"
@@ -203,14 +268,13 @@ async fn test_ocr_chinese_text() {
 
     let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
 
-    // Use Chinese language setting
     let config = PaddleOcrConfig::new("ch").with_cache_dir(test_cache_dir());
 
     let backend = PaddleOcrBackend::with_config(config).expect("Failed to create backend");
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "ch".to_string(),
+        language: vec!["ch".to_string()],
         ..Default::default()
     };
 
@@ -221,9 +285,6 @@ async fn test_ocr_chinese_text() {
 
     println!("OCR result: {}", extraction.content);
 
-    // The pipeline should produce some output without crashing.
-    // With the English-only model, Chinese characters are not recognized,
-    // but the detection and recognition pipeline should still function.
     assert!(
         !extraction.content.is_empty(),
         "Expected non-empty OCR result for Chinese image"
@@ -235,20 +296,17 @@ async fn test_ocr_chinese_text() {
 fn test_supported_languages() {
     let backend = PaddleOcrBackend::new().expect("Failed to create backend");
 
-    // Direct PaddleOCR codes
     assert!(backend.supports_language("ch"));
     assert!(backend.supports_language("en"));
     assert!(backend.supports_language("japan"));
     assert!(backend.supports_language("korean"));
 
-    // Mapped Tesseract/ISO codes
     assert!(backend.supports_language("chi_sim"));
     assert!(backend.supports_language("eng"));
     assert!(backend.supports_language("jpn"));
     assert!(backend.supports_language("fra"));
     assert!(backend.supports_language("deu"));
 
-    // Unsupported
     assert!(!backend.supports_language("xyz"));
     assert!(!backend.supports_language("klingon"));
 }
@@ -260,7 +318,7 @@ async fn test_empty_image_error() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -277,11 +335,10 @@ async fn test_invalid_image_error() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
-    // Random bytes that aren't a valid image
     let invalid_bytes = vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
     let result: xberg::Result<ExtractedDocument> = backend.process_image(&invalid_bytes, &ocr_config).await;
@@ -300,7 +357,7 @@ async fn test_process_image_file() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -319,11 +376,9 @@ async fn test_process_image_file() {
 /// Test that explicit cache_dir in config overrides default.
 #[test]
 fn test_cache_dir_explicit_config() {
-    // Set explicit config - this should always work regardless of env vars
     let config = PaddleOcrConfig::new("en").with_cache_dir(PathBuf::from("/explicit/path"));
     let resolved = config.resolve_cache_dir();
 
-    // Explicit config should always win
     assert_eq!(resolved, PathBuf::from("/explicit/path"));
 }
 
@@ -343,7 +398,7 @@ async fn test_paddle_ocr_elements_geometry() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -352,7 +407,6 @@ async fn test_paddle_ocr_elements_geometry() {
 
     let extraction: ExtractedDocument = result.unwrap();
 
-    // Check that OCR elements are present
     assert!(
         extraction.ocr_elements.is_some(),
         "Expected ocr_elements to be populated"
@@ -361,12 +415,9 @@ async fn test_paddle_ocr_elements_geometry() {
     let elements = extraction.ocr_elements.as_ref().unwrap();
     assert!(!elements.is_empty(), "Expected at least one OCR element");
 
-    // Verify each element has geometry
     for element in elements {
-        // Check geometry based on variant
         match &element.geometry {
             OcrBoundingGeometry::Quadrilateral { points } => {
-                // Quadrilateral should have 4 points
                 assert_eq!(points.len(), 4, "Quadrilateral should have 4 points");
                 println!("Quadrilateral with 4 points");
             }
@@ -400,7 +451,7 @@ async fn test_paddle_ocr_elements_confidence() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -417,16 +468,13 @@ async fn test_paddle_ocr_elements_confidence() {
     let elements = extraction.ocr_elements.as_ref().unwrap();
     assert!(!elements.is_empty(), "Expected at least one OCR element");
 
-    // Verify each element has confidence score
     for element in elements {
-        // Recognition confidence should be between 0 and 1
         assert!(
             element.confidence.recognition >= 0.0 && element.confidence.recognition <= 1.0,
             "Recognition confidence should be between 0 and 1, got {}",
             element.confidence.recognition
         );
 
-        // PaddleOCR also provides detection confidence
         if let Some(det_conf) = element.confidence.detection {
             assert!(
                 (0.0..=1.0).contains(&det_conf),
@@ -447,20 +495,18 @@ async fn test_paddle_ocr_elements_confidence() {
 #[tokio::test]
 #[ignore = "requires ONNX Runtime and downloaded models"]
 async fn test_paddle_ocr_rotation_detection() {
-    // Use an image that might have rotated text
     let image_path = test_documents_dir().join("images/ocr_image.jpg");
     assert!(image_path.exists(), "Test image not found: {:?}", image_path);
 
     let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
 
-    // Enable angle classification
     let config = PaddleOcrConfig::new("en").with_cache_dir(test_cache_dir());
 
     let backend = PaddleOcrBackend::with_config(config).expect("Failed to create backend");
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -476,7 +522,6 @@ async fn test_paddle_ocr_rotation_detection() {
 
     let elements = extraction.ocr_elements.as_ref().unwrap();
 
-    // Check that rotation info is populated when available
     let elements_with_rotation = elements.iter().filter(|e| e.rotation.is_some()).count();
 
     println!(
@@ -485,10 +530,8 @@ async fn test_paddle_ocr_rotation_detection() {
         elements_with_rotation
     );
 
-    // For elements with rotation, verify the angle is valid
     for element in elements.iter().filter(|e| e.rotation.is_some()) {
         let rotation = element.rotation.as_ref().unwrap();
-        // Rotation should be in degrees (typically 0, 90, 180, 270)
         assert!(
             rotation.angle_degrees >= 0.0 && rotation.angle_degrees < 360.0,
             "Rotation angle should be between 0 and 360, got {}",
@@ -506,7 +549,6 @@ async fn test_paddle_ocr_table_reconstruction() {
 
     let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
 
-    // Enable table detection
     let config = PaddleOcrConfig::new("en")
         .with_cache_dir(test_cache_dir())
         .with_table_detection(true);
@@ -515,7 +557,7 @@ async fn test_paddle_ocr_table_reconstruction() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -529,7 +571,6 @@ async fn test_paddle_ocr_table_reconstruction() {
         &extraction.content[..extraction.content.len().min(500)]
     );
 
-    // Check if tables were detected
     if !extraction.tables.is_empty() {
         println!("Found {} tables", extraction.tables.len());
         for (i, table) in extraction.tables.iter().enumerate() {
@@ -542,19 +583,13 @@ async fn test_paddle_ocr_table_reconstruction() {
         }
     }
 
-    // OCR elements should also be populated
     if let Some(elements) = &extraction.ocr_elements {
         println!("Found {} OCR elements", elements.len());
 
-        // Elements should have text content
         let non_empty_elements = elements.iter().filter(|e| !e.text.is_empty()).count();
         assert!(non_empty_elements > 0, "Expected at least one element with text");
     }
 }
-
-// ============================================================================
-// Mobile tier integration tests with quality measurement (TF1)
-// ============================================================================
 
 /// Compute Text F1 score: token-level precision/recall between predicted and reference text.
 fn compute_tf1(predicted: &str, reference: &str) -> f64 {
@@ -593,7 +628,6 @@ async fn test_mobile_tier_ocr_quality() {
 
     let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
 
-    // Mobile tier config
     let config = PaddleOcrConfig::new("en")
         .with_cache_dir(test_cache_dir())
         .with_model_tier("mobile");
@@ -602,7 +636,7 @@ async fn test_mobile_tier_ocr_quality() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         paddle_ocr_config: Some(serde_json::json!({"model_tier": "mobile"})),
         ..Default::default()
     };
@@ -622,7 +656,6 @@ async fn test_mobile_tier_ocr_quality() {
         &extraction.content[..extraction.content.len().min(200)]
     );
 
-    // Mobile tier should achieve at least 50% TF1 on this document
     assert!(
         tf1 > 0.5,
         "Mobile tier TF1 too low: {:.1}% (expected >50%)",
@@ -639,7 +672,6 @@ async fn test_server_tier_ocr_quality() {
 
     let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
 
-    // Server tier config (default)
     let config = PaddleOcrConfig::new("en")
         .with_cache_dir(test_cache_dir())
         .with_model_tier("server");
@@ -648,7 +680,7 @@ async fn test_server_tier_ocr_quality() {
 
     let ocr_config = OcrConfig {
         backend: "paddle-ocr".to_string(),
-        language: "en".to_string(),
+        language: vec!["en".to_string()],
         ..Default::default()
     };
 
@@ -663,7 +695,6 @@ async fn test_server_tier_ocr_quality() {
 
     println!("Server tier TF1: {:.1}% ({} ms)", tf1 * 100.0, elapsed_ms);
 
-    // Server tier should achieve at least 60% TF1
     assert!(
         tf1 > 0.6,
         "Server tier TF1 too low: {:.1}% (expected >60%)",
@@ -701,7 +732,7 @@ async fn test_mobile_tier_auto_rotate() {
 
         let ocr_config = OcrConfig {
             backend: "paddle-ocr".to_string(),
-            language: "en".to_string(),
+            language: vec!["en".to_string()],
             auto_rotate: true,
             paddle_ocr_config: Some(serde_json::json!({"model_tier": "mobile"})),
             ..Default::default()
@@ -720,7 +751,6 @@ async fn test_mobile_tier_auto_rotate() {
         println!("{}: TF1={:.1}% ({} ms)", label, tf1 * 100.0, elapsed_ms);
     }
 
-    // All orientations should produce consistent quality (within 20% of each other)
     let min_tf1 = tf1_scores.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_tf1 = tf1_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
@@ -731,14 +761,12 @@ async fn test_mobile_tier_auto_rotate() {
         (max_tf1 - min_tf1) * 100.0
     );
 
-    // Auto-rotate should make all orientations achieve at least 40% TF1
     assert!(
         min_tf1 > 0.4,
         "Worst orientation TF1 too low: {:.1}% (expected >40% with auto_rotate)",
         min_tf1 * 100.0
     );
 
-    // Spread should be <30% — auto_rotate should normalize quality across orientations
     assert!(
         max_tf1 - min_tf1 < 0.3,
         "TF1 spread too large: {:.1}% (expected <30% with auto_rotate)",
@@ -747,21 +775,38 @@ async fn test_mobile_tier_auto_rotate() {
 }
 
 /// Test that mobile tier model download caches correctly.
+///
+/// Drives the download through the mobile-tier OCR path (`PaddleOcrBackend`
+/// with `model_tier = "mobile"`) and verifies the resulting cache layout on
+/// disk, since tier-specific model resolution (`ensure_v2_det_model`,
+/// `resolve_rec_model`) is a crate-internal `ModelManager` detail.
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn test_mobile_tier_model_cache() {
     let cache_dir = test_cache_dir();
-    let manager = ModelManager::new(cache_dir.clone());
+    let image_path = test_documents_dir().join("images/test_hello_world.png");
+    assert!(image_path.exists(), "Test image not found: {:?}", image_path);
+    let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
 
-    // Download mobile det model
-    let det_result = manager.ensure_v2_det_model("mobile");
-    assert!(det_result.is_ok(), "Mobile det download failed: {:?}", det_result.err());
+    let config = PaddleOcrConfig::new("en")
+        .with_cache_dir(cache_dir.clone())
+        .with_model_tier("mobile");
+    let backend = PaddleOcrBackend::with_config(config).expect("Failed to create backend");
 
-    let det_dir = det_result.unwrap();
-    assert!(det_dir.join("model.onnx").exists(), "Mobile det model not cached");
+    let ocr_config = OcrConfig {
+        backend: "paddle-ocr".to_string(),
+        language: vec!["en".to_string()],
+        paddle_ocr_config: Some(serde_json::json!({"model_tier": "mobile"})),
+        ..Default::default()
+    };
 
-    // Mobile det should be ~4.7MB (much smaller than server ~88MB)
-    let det_size = std::fs::metadata(det_dir.join("model.onnx")).unwrap().len();
+    let result: xberg::Result<ExtractedDocument> = backend.process_image(&image_bytes, &ocr_config).await;
+    assert!(result.is_ok(), "Mobile tier OCR failed: {:?}", result.err());
+
+    let det_file = cache_dir.join("v2").join("det").join("mobile").join("model.onnx");
+    assert!(det_file.exists(), "Mobile det model not cached at {:?}", det_file);
+
+    let det_size = std::fs::metadata(&det_file).unwrap().len();
     assert!(
         det_size < 10_000_000,
         "Mobile det model too large: {} bytes (expected <10MB)",
@@ -772,78 +817,73 @@ async fn test_mobile_tier_model_cache() {
         det_size,
         det_size as f64 / 1_048_576.0
     );
-
-    // Download en_mobile rec model
-    let rec_result = manager.resolve_rec_model("english", "mobile");
-    assert!(rec_result.is_ok(), "Mobile rec download failed: {:?}", rec_result.err());
-
-    let rec = rec_result.unwrap();
-    assert!(rec.model_dir.join("model.onnx").exists(), "Mobile rec model not cached");
-    assert!(rec.dict_file.exists(), "Mobile rec dict not cached");
-
-    let rec_size = std::fs::metadata(rec.model_dir.join("model.onnx")).unwrap().len();
-    assert!(
-        rec_size < 20_000_000,
-        "Mobile rec model too large: {} bytes (expected <20MB)",
-        rec_size
-    );
-    println!(
-        "Mobile rec model size: {} bytes ({:.1} MB)",
-        rec_size,
-        rec_size as f64 / 1_048_576.0
-    );
-    println!("Mobile rec model key: {}", rec.model_key);
 }
 
-/// Test that server and mobile tiers produce different model paths.
+/// Test that server and mobile tiers produce different cached model files.
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn test_tier_model_differentiation() {
     let cache_dir = test_cache_dir();
-    let manager = ModelManager::new(cache_dir);
+    let image_path = test_documents_dir().join("images/test_hello_world.png");
+    assert!(image_path.exists(), "Test image not found: {:?}", image_path);
+    let image_bytes = std::fs::read(&image_path).expect("Failed to read image");
 
-    let server_det = manager.ensure_v2_det_model("server").unwrap();
-    let mobile_det = manager.ensure_v2_det_model("mobile").unwrap();
+    for tier in ["server", "mobile"] {
+        let config = PaddleOcrConfig::new("en")
+            .with_cache_dir(cache_dir.clone())
+            .with_model_tier(tier);
+        let backend = PaddleOcrBackend::with_config(config).expect("Failed to create backend");
+
+        let ocr_config = OcrConfig {
+            backend: "paddle-ocr".to_string(),
+            language: vec!["en".to_string()],
+            paddle_ocr_config: Some(serde_json::json!({"model_tier": tier})),
+            ..Default::default()
+        };
+
+        let result: xberg::Result<ExtractedDocument> = backend.process_image(&image_bytes, &ocr_config).await;
+        assert!(result.is_ok(), "{tier} tier OCR failed: {:?}", result.err());
+    }
+
+    let server_det = cache_dir.join("v2").join("det").join("server").join("model.onnx");
+    let mobile_det = cache_dir.join("v2").join("det").join("mobile").join("model.onnx");
+    assert!(server_det.exists(), "Server det model not cached");
+    assert!(mobile_det.exists(), "Mobile det model not cached");
     assert_ne!(server_det, mobile_det, "Server and mobile det paths should differ");
-
-    let server_rec = manager.resolve_rec_model("english", "server").unwrap();
-    let mobile_rec = manager.resolve_rec_model("english", "mobile").unwrap();
-    assert_ne!(
-        server_rec.model_key, mobile_rec.model_key,
-        "Server and mobile rec model keys should differ"
-    );
 
     println!("Server det: {:?}", server_det);
     println!("Mobile det: {:?}", mobile_det);
-    println!("Server rec key: {}", server_rec.model_key);
-    println!("Mobile rec key: {}", mobile_rec.model_key);
 }
 
-/// Test default cache directory when no explicit config is set.
+/// Default cache resolution follows the Hugging Face conventions since the
+/// model cache moved to hf-hub: `HF_HUB_CACHE` wins when set, and an explicit
+/// `cache_dir` on the config overrides the environment entirely.
 #[test]
+#[allow(unsafe_code)]
 fn test_cache_dir_default() {
-    // Save and clear env var to test default behavior
-    let original = std::env::var("XBERG_CACHE_DIR").ok();
+    let original = std::env::var("HF_HUB_CACHE").ok();
+    let hub_cache = std::env::temp_dir().join("xberg-test-hf-hub-cache");
 
-    // SAFETY: This is a test that manipulates environment variables.
-    // Tests should be run with --test-threads=1 if this causes issues.
     unsafe {
-        std::env::remove_var("XBERG_CACHE_DIR");
+        std::env::set_var("HF_HUB_CACHE", &hub_cache);
     }
 
-    let config = PaddleOcrConfig::new("en");
-    let resolved = config.resolve_cache_dir();
+    let resolved = PaddleOcrConfig::new("en").resolve_cache_dir();
+    let explicit = PaddleOcrConfig::new("en")
+        .with_cache_dir(PathBuf::from("/explicit/override"))
+        .resolve_cache_dir();
 
-    // Default should use .xberg/paddle-ocr/
-    assert!(resolved.to_string_lossy().contains(".xberg"));
-    assert!(resolved.to_string_lossy().contains("paddle-ocr"));
-
-    // Restore
     unsafe {
-        if let Some(val) = original {
-            std::env::set_var("XBERG_CACHE_DIR", val);
+        match original {
+            Some(val) => std::env::set_var("HF_HUB_CACHE", val),
+            None => std::env::remove_var("HF_HUB_CACHE"),
         }
     }
-}
 
-*/
+    assert_eq!(resolved, hub_cache, "default resolution must honor HF_HUB_CACHE");
+    assert_eq!(
+        explicit,
+        PathBuf::from("/explicit/override"),
+        "an explicit cache_dir must win over the environment"
+    );
+}

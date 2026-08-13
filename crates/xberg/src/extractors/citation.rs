@@ -86,38 +86,23 @@ impl InternalDocumentExtractor for CitationExtractor {
         let mut dois_vec = Vec::new();
         let mut keywords_set = AHashSet::new();
         let mut formatted_content = String::new();
+        let mut citation_details: Vec<String> = Vec::new();
 
-        // Parse based on MIME type
         let (parse_result, format_string) = match mime_type {
             "application/x-research-info-systems" => (RisParser::new().parse(&citation_str), "RIS"),
             "application/x-pubmed" => (PubMedParser::new().parse(&citation_str), "PubMed"),
             "application/x-endnote+xml" => (EndNoteXmlParser::new().parse(&citation_str), "EndNote XML"),
-            _ => {
-                // Fallback: return empty document if MIME type is unexpected
-                let citation_metadata = CitationMetadata {
-                    citation_count: 0,
-                    format: Some("Unknown".to_string()),
-                    ..Default::default()
-                };
-
-                let mut doc = InternalDocument::new("citation");
-                doc.metadata = Metadata {
-                    format: Some(FormatMetadata::Citation(citation_metadata)),
-                    ..Default::default()
-                };
-                return Ok(doc);
-            }
+            _ => return Err(crate::XbergError::UnsupportedFormat(mime_type.to_string())),
         };
 
-        // Build InternalDocument with citation elements
         let mut builder = InternalDocumentBuilder::new("citation");
 
         match parse_result {
             Ok(citations) => {
                 for citation in &citations {
                     citations_vec.push(citation.title.clone());
+                    let entry_start = formatted_content.len();
 
-                    // Collect authors
                     for author in &citation.authors {
                         let author_name = if let Some(given) = &author.given_name {
                             format!("{} {}", given, author.name)
@@ -129,14 +114,12 @@ impl InternalDocumentExtractor for CitationExtractor {
                         }
                     }
 
-                    // Collect years
                     if let Some(date) = &citation.date
                         && date.year > 0
                     {
                         years_set.insert(date.year as u32);
                     }
 
-                    // Collect DOIs and add as URI
                     if let Some(doi) = &citation.doi
                         && !doi.is_empty()
                     {
@@ -147,14 +130,12 @@ impl InternalDocumentExtractor for CitationExtractor {
                         ));
                     }
 
-                    // Collect keywords
                     for keyword in &citation.keywords {
                         if !keyword.is_empty() {
                             keywords_set.insert(keyword.clone());
                         }
                     }
 
-                    // Format citation as readable text
                     if !citation.title.is_empty() {
                         formatted_content.push_str(&format!("Title: {}\n", citation.title));
                     }
@@ -211,24 +192,28 @@ impl InternalDocumentExtractor for CitationExtractor {
                         formatted_content.push_str(&format!("Keywords: {}\n", citation.keywords.join(", ")));
                     }
 
+                    citation_details.push(formatted_content[entry_start..].trim().to_string());
+
                     formatted_content.push_str("---\n");
                 }
 
-                // Push citation elements
-                for (i, title) in citations_vec.iter().enumerate() {
+                for (i, (title, detail)) in citations_vec.iter().zip(citation_details.iter()).enumerate() {
                     let key = if title.is_empty() {
                         format!("citation_{}", i + 1)
                     } else {
                         title.clone()
                     };
-                    builder.push_citation(title, &key, None);
+                    builder.push_citation(detail, &key, None);
                 }
             }
             Err(_err) => {
                 #[cfg(feature = "otel")]
                 tracing::warn!("Citation parsing failed, returning raw content: {}", _err);
+                builder.add_warning(crate::core::diagnostics::warning(
+                    "citation",
+                    "Citation parsing failed; returning raw text as a fallback",
+                ));
                 formatted_content = citation_str.to_string();
-                // Push as a single code block when parsing fails
                 builder.push_code(&formatted_content, None, None, None);
             }
         }
@@ -434,8 +419,6 @@ ER  -"#;
         assert!(result.is_ok());
         let result = result.expect("Should extract malformed as raw content");
 
-        // When RIS parser encounters unparseable content, it may return empty results
-        // Verify we get a result either way
         let metadata = &result.metadata;
         if let Some(FormatMetadata::Citation(cit)) = &metadata.format {
             assert_eq!(cit.citation_count, 0);

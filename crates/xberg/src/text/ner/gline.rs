@@ -7,8 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use ahash::AHashMap;
@@ -20,11 +19,19 @@ use crate::Result;
 use crate::types::entity::{Entity, EntityCategory};
 
 use super::backend::NerBackend;
+use super::offsets;
 
 /// Hugging Face repository that stores xberg-managed GLiNER ONNX exports.
 pub const GLINER_MODELS_REPO: &str = "xberg-io/gliner-models";
 
-const CHECKSUMS_FILE: &str = "checksums.sha256";
+/// Immutable Hugging Face revision containing the verified GLiNER artifacts.
+pub const GLINER_MODELS_REVISION: &str = "afb0faaa3c8e7d0de7796bd37e625026ff635fe0";
+
+/// SHA-256 manifest pinning every hosted GLiNER model/tokenizer file, checked in as the
+/// single source of truth. Trust attaches to the manifest, not the host — a changed or
+/// tampered upstream file fails verification instead of feeding wrong weights into
+/// inference.
+pub(crate) const GLINER_SHA256_MANIFEST: &str = include_str!("gliner-models.sha256");
 
 /// Default xberg GLiNER model alias.
 pub const DEFAULT_MODEL_NAME: &str = "balanced";
@@ -40,7 +47,12 @@ pub const KNOWN_MODELS: &[&str] = &["gliner_small-v2.5", "gliner_medium-v2.5", "
 /// Default entity labels used when the caller supplies an empty `categories` slice.
 const DEFAULT_LABELS: &[&str] = &["person", "organization", "location", "date", "email"];
 
-static PUBLISH_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Number of windows submitted to one GLiNER inference call.
+///
+/// Must stay at or below `xberg_gliner`'s own batch cap (32). Kept well under it
+/// so a long document's windows are processed in bounded-memory groups instead
+/// of one enormous padded batch.
+const WINDOW_BATCH_SIZE: usize = 8;
 
 type BackendCache = AHashMap<GlineBackendCacheKey, Arc<GlineBackend>>;
 
@@ -51,39 +63,41 @@ struct GlinerModelDefinition {
     id: &'static str,
     aliases: &'static [&'static str],
     upstream_repo: &'static str,
-    mode: &'static str,
-    variant: &'static str,
     model_file: &'static str,
+    model_size_bytes: u64,
     tokenizer_file: &'static str,
+    tokenizer_size_bytes: u64,
 }
 
+// Sizes reported by Hugging Face's expanded recursive tree metadata for
+// `xberg-io/gliner-models` at `GLINER_MODELS_REVISION`. ~keep
 const GLINER_MODELS: &[GlinerModelDefinition] = &[
     GlinerModelDefinition {
         id: "gliner_small-v2.5",
         aliases: &["fast"],
         upstream_repo: "gliner-community/gliner_small-v2.5",
-        mode: "span",
-        variant: "fp32",
         model_file: "models/gliner_small-v2.5/span/fp32/model.onnx",
+        model_size_bytes: 664_780_382,
         tokenizer_file: "models/gliner_small-v2.5/span/fp32/tokenizer.json",
+        tokenizer_size_bytes: 8_649_232,
     },
     GlinerModelDefinition {
         id: "gliner_medium-v2.5",
         aliases: &["balanced", "multilingual"],
         upstream_repo: "gliner-community/gliner_medium-v2.5",
-        mode: "span",
-        variant: "fp32",
         model_file: "models/gliner_medium-v2.5/span/fp32/model.onnx",
+        model_size_bytes: 835_514_666,
         tokenizer_file: "models/gliner_medium-v2.5/span/fp32/tokenizer.json",
+        tokenizer_size_bytes: 8_649_232,
     },
     GlinerModelDefinition {
         id: "gliner_large-v2.5",
         aliases: &["quality"],
         upstream_repo: "gliner-community/gliner_large-v2.5",
-        mode: "span",
-        variant: "fp32",
         model_file: "models/gliner_large-v2.5/span/fp32/model.onnx",
+        model_size_bytes: 1_840_548_694,
         tokenizer_file: "models/gliner_large-v2.5/span/fp32/tokenizer.json",
+        tokenizer_size_bytes: 8_649_232,
     },
 ];
 
@@ -98,11 +112,11 @@ struct GlinerModelFiles {
 /// A single GLiNER model artifact entry in the cache manifest.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GlinerManifestEntry {
-    /// Relative path within the xberg cache directory.
+    /// Relative path within the Hugging Face Hub cache directory.
     pub relative_path: String,
-    /// SHA256 checksum of the model file when pinned locally.
+    /// Expected SHA-256 checksum from the pinned Hugging Face revision.
     pub sha256: String,
-    /// Expected file size in bytes. Zero means unknown.
+    /// Expected file size in bytes from the pinned Hugging Face revision.
     pub size_bytes: u64,
     /// Hugging Face source URL for downloading.
     pub source_url: String,
@@ -114,95 +128,36 @@ struct GlineBackendCacheKey {
     thread_budget: usize,
 }
 
-/// Eagerly fetch a GLiNER model (ONNX + tokenizer) into the xberg cache.
+/// Eagerly fetch a GLiNER model (ONNX + tokenizer) into the Hugging Face cache.
 ///
 /// `name` must be a supported xberg GLiNER model alias or catalog id. Runtime
-/// artifacts are downloaded from `xberg-io/gliner-models`.
+/// artifacts are downloaded from `xberg-io/gliner-models` at an immutable
+/// revision. `cache_dir`, when provided, overrides the Hugging Face cache root.
 pub fn download_model(name: &str, cache_dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(ensure_model(name, cache_dir)?.model_path)
 }
 
 fn ensure_model(name: &str, cache_dir: Option<PathBuf>) -> Result<GlinerModelFiles> {
     let definition = resolve_model(name)?;
-    let base_dir = cache_dir.unwrap_or_else(|| crate::cache_dir::resolve_cache_dir("ner"));
-    let checksums = load_gliner_checksums(&base_dir)?;
+    let checksums = load_gliner_checksums()?;
     let model_sha256 = required_checksum(&checksums, definition.model_file)?;
     let tokenizer_sha256 = required_checksum(&checksums, definition.tokenizer_file)?;
-    let model_dir = base_dir
-        .join("gliner")
-        .join(definition.id)
-        .join(definition.mode)
-        .join(definition.variant);
-    let model_path = model_dir.join("model.onnx");
-    let tokenizer_path = model_dir.join("tokenizer.json");
-
-    if model_path.exists() && tokenizer_path.exists() {
-        let model_verified =
-            crate::model_download::verify_sha256(&model_path, model_sha256, "ner-gliner-model").is_ok();
-        let tokenizer_verified =
-            crate::model_download::verify_sha256(&tokenizer_path, tokenizer_sha256, "ner-gliner-tokenizer").is_ok();
-        if model_verified && tokenizer_verified {
-            tracing::debug!(model = definition.id, "GLiNER model found in cache");
-            return Ok(GlinerModelFiles {
-                definition,
-                model_path,
-                tokenizer_path,
-            });
-        }
-        tracing::warn!(
-            model = definition.id,
-            "cached GLiNER files failed checksum verification; refreshing"
-        );
-    }
-
-    std::fs::create_dir_all(&model_dir).map_err(|error| crate::XbergError::Plugin {
-        message: format!("Failed to create GLiNER cache dir '{}': {error}", model_dir.display()),
-        plugin_name: "ner-gliner".to_string(),
-    })?;
-
-    let cached_model =
-        crate::model_download::hf_download(GLINER_MODELS_REPO, definition.model_file).map_err(|error| {
-            crate::XbergError::Plugin {
-                message: format!(
-                    "Failed to download GLiNER model '{}' from {}: {error}",
-                    definition.id, GLINER_MODELS_REPO
-                ),
-                plugin_name: "ner-gliner".to_string(),
-            }
-        })?;
-    crate::model_download::verify_sha256(&cached_model, model_sha256, "ner-gliner-model")
-        .map_err(|error| crate::XbergError::validation(format!("GLiNER model SHA256 verification failed: {error}")))?;
-    atomic_publish(&cached_model, &model_path, &model_dir, model_sha256, "ner-gliner-model").map_err(|error| {
-        crate::XbergError::Plugin {
-            message: error,
-            plugin_name: "ner-gliner".to_string(),
-        }
-    })?;
-
-    let cached_tokenizer =
-        crate::model_download::hf_download(GLINER_MODELS_REPO, definition.tokenizer_file).map_err(|error| {
-            crate::XbergError::Plugin {
-                message: format!(
-                    "Failed to download GLiNER tokenizer '{}' from {}: {error}",
-                    definition.id, GLINER_MODELS_REPO
-                ),
-                plugin_name: "ner-gliner".to_string(),
-            }
-        })?;
-    crate::model_download::verify_sha256(&cached_tokenizer, tokenizer_sha256, "ner-gliner-tokenizer").map_err(
-        |error| crate::XbergError::validation(format!("GLiNER tokenizer SHA256 verification failed: {error}")),
-    )?;
-    atomic_publish(
-        &cached_tokenizer,
-        &tokenizer_path,
-        &model_dir,
-        tokenizer_sha256,
-        "ner-gliner-tokenizer",
+    let model_path = crate::model_download::hf_resolve_file(
+        GLINER_MODELS_REPO,
+        definition.model_file,
+        Some(GLINER_MODELS_REVISION),
+        cache_dir.as_deref(),
+        Some(model_sha256),
     )
-    .map_err(|error| crate::XbergError::Plugin {
-        message: error,
-        plugin_name: "ner-gliner".to_string(),
-    })?;
+    .map_err(|error| gliner_download_error(definition, "model", error))?;
+    let tokenizer_path = crate::model_download::hf_resolve_file(
+        GLINER_MODELS_REPO,
+        definition.tokenizer_file,
+        Some(GLINER_MODELS_REVISION),
+        cache_dir.as_deref(),
+        Some(tokenizer_sha256),
+    )
+    .map_err(|error| gliner_download_error(definition, "tokenizer", error))?;
 
     tracing::info!(
         model = definition.id,
@@ -219,36 +174,43 @@ fn ensure_model(name: &str, cache_dir: Option<PathBuf>) -> Result<GlinerModelFil
     })
 }
 
+fn gliner_download_error(definition: GlinerModelDefinition, artifact: &str, error: String) -> crate::XbergError {
+    crate::XbergError::Plugin {
+        message: format!(
+            "Failed to resolve GLiNER {artifact} '{}' from {}@{}: {error}",
+            definition.id, GLINER_MODELS_REPO, GLINER_MODELS_REVISION
+        ),
+        plugin_name: "ner-gliner".to_string(),
+    }
+}
+
 /// Returns the GLiNER files expected by `xberg cache manifest`.
 #[cfg_attr(alef, alef(skip))]
 pub fn manifest() -> Vec<GlinerManifestEntry> {
-    let mut entries = vec![GlinerManifestEntry {
-        relative_path: format!("ner/gliner/{CHECKSUMS_FILE}"),
-        sha256: String::new(),
-        size_bytes: 0,
-        source_url: format!("https://huggingface.co/{GLINER_MODELS_REPO}/resolve/main/{CHECKSUMS_FILE}"),
-    }];
+    let checksums = load_gliner_checksums().expect("vendored GLiNER checksum manifest must be valid");
+    let mut entries = Vec::new();
 
     for definition in GLINER_MODELS {
-        let cache_prefix = format!(
-            "ner/gliner/{}/{}/{}",
-            definition.id, definition.mode, definition.variant
-        );
+        let cache_prefix = format!("models--xberg-io--gliner-models/snapshots/{GLINER_MODELS_REVISION}");
         entries.push(GlinerManifestEntry {
-            relative_path: format!("{cache_prefix}/model.onnx"),
-            sha256: String::new(),
-            size_bytes: 0,
+            relative_path: format!("{cache_prefix}/{}", definition.model_file),
+            sha256: required_checksum(&checksums, definition.model_file)
+                .expect("declared GLiNER model must have a checksum")
+                .to_string(),
+            size_bytes: definition.model_size_bytes,
             source_url: format!(
-                "https://huggingface.co/{GLINER_MODELS_REPO}/resolve/main/{}",
+                "https://huggingface.co/{GLINER_MODELS_REPO}/resolve/{GLINER_MODELS_REVISION}/{}",
                 definition.model_file
             ),
         });
         entries.push(GlinerManifestEntry {
-            relative_path: format!("{cache_prefix}/tokenizer.json"),
-            sha256: String::new(),
-            size_bytes: 0,
+            relative_path: format!("{cache_prefix}/{}", definition.tokenizer_file),
+            sha256: required_checksum(&checksums, definition.tokenizer_file)
+                .expect("declared GLiNER tokenizer must have a checksum")
+                .to_string(),
+            size_bytes: definition.tokenizer_size_bytes,
             source_url: format!(
-                "https://huggingface.co/{GLINER_MODELS_REPO}/resolve/main/{}",
+                "https://huggingface.co/{GLINER_MODELS_REPO}/resolve/{GLINER_MODELS_REVISION}/{}",
                 definition.tokenizer_file
             ),
         });
@@ -256,67 +218,14 @@ pub fn manifest() -> Vec<GlinerManifestEntry> {
     entries
 }
 
-fn load_gliner_checksums(base_dir: &Path) -> Result<HashMap<String, String>> {
-    let checksums_dir = base_dir.join("gliner");
-    let checksums_path = checksums_dir.join(CHECKSUMS_FILE);
-    if checksums_path.exists() {
-        return read_gliner_checksums(&checksums_path);
-    }
-
-    let path = crate::model_download::hf_download(GLINER_MODELS_REPO, CHECKSUMS_FILE).map_err(|error| {
-        crate::XbergError::Plugin {
-            message: format!("Failed to download GLiNER checksums from {GLINER_MODELS_REPO}: {error}"),
-            plugin_name: "ner-gliner".to_string(),
-        }
-    })?;
-    let checksums = read_gliner_checksums(&path)?;
-    std::fs::create_dir_all(&checksums_dir).map_err(|error| crate::XbergError::Plugin {
-        message: format!(
-            "Failed to create GLiNER checksums cache dir '{}': {error}",
-            checksums_dir.display()
-        ),
-        plugin_name: "ner-gliner".to_string(),
-    })?;
-    atomic_publish(&path, &checksums_path, &checksums_dir, "", "ner-gliner-checksums").map_err(|error| {
-        crate::XbergError::Plugin {
-            message: error,
-            plugin_name: "ner-gliner".to_string(),
-        }
-    })?;
-    Ok(checksums)
-}
-
-fn read_gliner_checksums(path: &Path) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path).map_err(|error| crate::XbergError::Plugin {
-        message: format!("Failed to read GLiNER checksums '{}': {error}", path.display()),
-        plugin_name: "ner-gliner".to_string(),
-    })?;
-    parse_checksums(&content)
+fn load_gliner_checksums() -> Result<HashMap<String, String>> {
+    parse_checksums(GLINER_SHA256_MANIFEST)
 }
 
 fn parse_checksums(content: &str) -> Result<HashMap<String, String>> {
-    let mut checksums = HashMap::new();
-    for (index, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace();
-        let checksum = parts.next().ok_or_else(|| {
-            crate::XbergError::validation(format!("Invalid GLiNER checksum line {}: missing checksum", index + 1))
-        })?;
-        let path = parts.next().ok_or_else(|| {
-            crate::XbergError::validation(format!("Invalid GLiNER checksum line {}: missing path", index + 1))
-        })?;
-        if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(crate::XbergError::validation(format!(
-                "Invalid GLiNER checksum line {}: checksum must be SHA256 hex",
-                index + 1
-            )));
-        }
-        checksums.insert(path.trim_start_matches("./").to_string(), checksum.to_ascii_lowercase());
-    }
-    Ok(checksums)
+    let entries = crate::model_download::parse_sha256_manifest(content)
+        .map_err(|e| crate::XbergError::validation(format!("Invalid GLiNER checksums file: {e}")))?;
+    Ok(entries.into_iter().collect())
 }
 
 fn required_checksum<'a>(checksums: &'a HashMap<String, String>, path: &str) -> Result<&'a str> {
@@ -372,52 +281,6 @@ fn available_model_names() -> Vec<&'static str> {
     names
 }
 
-fn atomic_publish(
-    src: &Path,
-    dst: &Path,
-    dst_dir: &Path,
-    sha256: &str,
-    label: &str,
-) -> std::result::Result<(), String> {
-    let stem = dst.file_name().and_then(|name| name.to_str()).unwrap_or("model");
-    let tmp = dst_dir.join(format!(
-        ".{stem}.{}.{}.tmp",
-        std::process::id(),
-        PUBLISH_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-
-    std::fs::copy(src, &tmp).map_err(|error| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("Failed to stage GLiNER model at {}: {error}", tmp.display())
-    })?;
-
-    if let Err(error) = crate::model_download::verify_sha256(&tmp, sha256, label) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-
-    match std::fs::rename(&tmp, dst) {
-        Ok(()) => Ok(()),
-        Err(_) if dst.exists() && crate::model_download::verify_sha256(dst, sha256, label).is_ok() => {
-            let _ = std::fs::remove_file(&tmp);
-            tracing::debug!(path = %dst.display(), "GLiNER cache file already present");
-            Ok(())
-        }
-        Err(error) if dst.exists() => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(format!(
-                "Failed to publish GLiNER model to {} because the destination already exists: {error}. \
-                 Remove the cached file and retry.",
-                dst.display()
-            ))
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(format!("Failed to publish GLiNER model to {}: {error}", dst.display()))
-        }
-    }
-}
-
 /// Map an [`EntityCategory`] to the label string GLiNER expects.
 fn category_to_label(category: &EntityCategory) -> String {
     match category {
@@ -456,11 +319,17 @@ fn default_labels() -> Vec<String> {
     DEFAULT_LABELS.iter().map(|label| (*label).to_string()).collect()
 }
 
+/// Narrow a GLiNER byte offset to the `u32` the entity type carries.
+///
+/// `text` is only used for its length: the matched span is the PII this
+/// pipeline exists to hide, so it must never reach an error message, a log
+/// line, or telemetry.
 fn checked_offset_to_u32(offset: usize, field: &str, text: &str, class: &str) -> Result<u32> {
     u32::try_from(offset).map_err(|error| {
+        let span_len = text.len();
         crate::XbergError::validation_with_source(
             format!(
-                "GLiNER returned {field} offset {offset} for class '{class}' in span '{text}', \
+                "GLiNER returned {field} offset {offset} for class '{class}' in a {span_len}-byte span, \
                  which exceeds the u32 entity offset limit"
             ),
             error,
@@ -523,6 +392,10 @@ pub struct GlineBackend {
     /// Local path to the cached tokenizer file.
     pub tokenizer_path: PathBuf,
     model: Arc<Gliner>,
+    /// Word-token budget of a single inference call, taken from the
+    /// `Parameters` this model was built with. Input longer than this is
+    /// windowed rather than truncated (xberg-io/xberg#262).
+    window_tokens: usize,
 }
 
 impl GlineBackend {
@@ -539,8 +412,12 @@ impl GlineBackend {
     fn new_with_thread_budget(model_name: Option<&str>, thread_budget: usize) -> Result<Self> {
         let requested = requested_model_name(model_name)?;
         let files = ensure_model(&requested, None)?;
+        let parameters = Parameters::default();
+        // `TokenizedInput::from` truncates the word stream at `max_length`, so this
+        // is the hard ceiling a single inference call can actually see. ~keep
+        let window_tokens = parameters.max_length.unwrap_or(offsets::GLINER_WINDOW_TOKENS);
         let gliner = Gliner::with_runtime(
-            Parameters::default(),
+            parameters,
             RuntimeConfig::default().with_intra_threads(thread_budget),
             &files.tokenizer_path,
             &files.model_path,
@@ -554,6 +431,7 @@ impl GlineBackend {
             model_path: files.model_path,
             tokenizer_path: files.tokenizer_path,
             model: Arc::new(gliner),
+            window_tokens,
         })
     }
 }
@@ -589,59 +467,88 @@ impl NerBackend for GlineBackend {
 }
 
 impl GlineBackend {
+    /// Run inference over `text`, windowing it so nothing past the model's word
+    /// budget is silently dropped.
+    ///
+    /// The GLiNER preprocessor truncates its input at `Parameters::max_length`
+    /// words. Feeding a long document in one call therefore returned entities
+    /// for the head only, and the PII in the tail was never redacted
+    /// (xberg-io/xberg#262). Windows overlap so a mention on a boundary is
+    /// still seen whole by one of them, and the per-window spans are folded
+    /// back into source coordinates by
+    /// [`offsets::merge_windowed_entities`].
     async fn detect_labels(&self, text: &str, labels: Vec<String>) -> Result<Vec<Entity>> {
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        let text = text.to_string();
+        let windows = offsets::split_into_windows(text, self.window_tokens, offsets::GLINER_WINDOW_OVERLAP_TOKENS);
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let window_offsets: Vec<usize> = windows.iter().map(|window| window.byte_offset).collect();
+
         let backend = Arc::clone(&self.model);
         let model_path = self.model_path.clone();
         let tokenizer_path = self.tokenizer_path.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let per_window = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<Entity>>> {
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-            let input =
-                TextInput::from_str(&[text.as_str()], &label_refs).map_err(|error| crate::XbergError::Plugin {
+            let mut per_window: Vec<Vec<Entity>> = Vec::with_capacity(windows.len());
+
+            for batch in windows.chunks(WINDOW_BATCH_SIZE) {
+                let texts: Vec<&str> = batch.iter().map(|window| window.text.as_str()).collect();
+                let input = TextInput::from_str(&texts, &label_refs).map_err(|error| crate::XbergError::Plugin {
                     message: format!("Failed to build GLiNER input: {error}"),
                     plugin_name: "ner-gliner".to_string(),
                 })?;
-            let output = backend.inference(input).map_err(|error| crate::XbergError::Plugin {
-                message: format!(
-                    "GLiNER inference failed for model '{}' (tokenizer '{}'): {error}",
-                    model_path.display(),
-                    tokenizer_path.display()
-                ),
-                plugin_name: "ner-gliner".to_string(),
-            })?;
+                let output = backend.inference(input).map_err(|error| crate::XbergError::Plugin {
+                    message: format!(
+                        "GLiNER inference failed for model '{}' (tokenizer '{}'): {error}",
+                        model_path.display(),
+                        tokenizer_path.display()
+                    ),
+                    plugin_name: "ner-gliner".to_string(),
+                })?;
 
-            let entities = output
-                .spans
-                .into_iter()
-                .next()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|span| {
-                    let (start, end) = span.offsets();
-                    let start = checked_offset_to_u32(start, "start", span.text(), span.class())?;
-                    let end = checked_offset_to_u32(end, "end", span.text(), span.class())?;
-                    Ok(Entity {
-                        category: label_to_category(span.class()),
-                        text: span.text().to_string(),
-                        start,
-                        end,
-                        confidence: Some(span.probability()),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(entities)
+                // One span list per batched window; pad if the engine returns fewer so
+                // window offsets stay aligned with their detections. ~keep
+                let mut batch_spans = output.spans;
+                batch_spans.resize_with(batch.len(), Vec::new);
+                for spans in batch_spans.into_iter().take(batch.len()) {
+                    per_window.push(spans_to_entities(spans)?);
+                }
+            }
+
+            Ok(per_window)
         })
         .await
         .map_err(|error| crate::XbergError::Plugin {
             message: format!("GLiNER spawn_blocking task panicked: {error}"),
             plugin_name: "ner-gliner".to_string(),
-        })?
+        })??;
+
+        Ok(offsets::merge_windowed_entities(&window_offsets, per_window))
     }
+}
+
+/// Convert one window's decoded spans into window-relative entities.
+fn spans_to_entities(spans: Vec<xberg_gliner::Span>) -> Result<Vec<Entity>> {
+    spans
+        .into_iter()
+        .map(|span| {
+            let (start, end) = span.offsets();
+            let start = checked_offset_to_u32(start, "start", span.text(), span.class())?;
+            let end = checked_offset_to_u32(end, "end", span.text(), span.class())?;
+            Ok(Entity {
+                category: label_to_category(span.class()),
+                text: span.text().to_string(),
+                start,
+                end,
+                confidence: Some(span.probability()),
+            })
+        })
+        .collect()
 }
 
 #[cfg(all(test, feature = "ner-onnx"))]
@@ -761,39 +668,90 @@ mod tests {
     }
 
     #[test]
-    fn manifest_includes_gliner_models_and_checksums() {
+    fn manifest_includes_gliner_models() {
         let entries = manifest();
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.relative_path == "ner/gliner/checksums.sha256")
+        const EXPECTED_TOTAL_SIZE_BYTES: u64 = 3_366_791_438;
+
+        assert_eq!(entries.len(), 6);
+        assert_eq!(
+            entries.iter().map(|entry| entry.size_bytes).sum::<u64>(),
+            EXPECTED_TOTAL_SIZE_BYTES
         );
+        assert!(entries.iter().all(|entry| entry.size_bytes > 0));
         assert!(entries.iter().any(|entry| {
-            entry.relative_path == "ner/gliner/gliner_medium-v2.5/span/fp32/model.onnx"
+            entry.relative_path
+                == format!(
+                    "models--xberg-io--gliner-models/snapshots/{GLINER_MODELS_REVISION}/models/gliner_medium-v2.5/span/fp32/model.onnx"
+                )
                 && entry.source_url.contains(GLINER_MODELS_REPO)
         }));
         assert!(entries.iter().any(|entry| {
-            entry.relative_path == "ner/gliner/gliner_medium-v2.5/span/fp32/tokenizer.json"
+            entry.relative_path
+                == format!(
+                    "models--xberg-io--gliner-models/snapshots/{GLINER_MODELS_REVISION}/models/gliner_medium-v2.5/span/fp32/tokenizer.json"
+                )
                 && entry.source_url.contains(GLINER_MODELS_REPO)
+        }));
+        assert!(entries.iter().all(|entry| {
+            !entry.sha256.is_empty()
+                && entry
+                    .source_url
+                    .contains(&format!("/resolve/{GLINER_MODELS_REVISION}/"))
         }));
     }
 
     #[test]
-    fn load_gliner_checksums_reads_warmed_cache_without_network() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let checksums_dir = temp_dir.path().join("gliner");
-        std::fs::create_dir_all(&checksums_dir).expect("checksums dir");
-        std::fs::write(
-            checksums_dir.join(CHECKSUMS_FILE),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  models/gliner_medium-v2.5/span/fp32/model.onnx\n",
-        )
-        .expect("write checksums");
+    fn manifest_uses_sizes_from_pinned_hugging_face_metadata() {
+        let entries = manifest();
+        let expected = [
+            ("models/gliner_small-v2.5/span/fp32/model.onnx", 664_780_382),
+            ("models/gliner_small-v2.5/span/fp32/tokenizer.json", 8_649_232),
+            ("models/gliner_medium-v2.5/span/fp32/model.onnx", 835_514_666),
+            ("models/gliner_medium-v2.5/span/fp32/tokenizer.json", 8_649_232),
+            ("models/gliner_large-v2.5/span/fp32/model.onnx", 1_840_548_694),
+            ("models/gliner_large-v2.5/span/fp32/tokenizer.json", 8_649_232),
+        ];
 
-        let checksums = load_gliner_checksums(temp_dir.path()).expect("checksums");
+        for (suffix, expected_size) in expected {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.relative_path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing manifest entry for {suffix}"));
+            assert_eq!(entry.size_bytes, expected_size, "incorrect pinned size for {suffix}");
+        }
+    }
+
+    #[test]
+    fn load_gliner_checksums_reads_vendored_manifest_without_network() {
+        let checksums = load_gliner_checksums().expect("checksums");
         assert_eq!(
             required_checksum(&checksums, "models/gliner_medium-v2.5/span/fp32/model.onnx").expect("checksum"),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "014f8d7185ccd3e1d37af3932a7ade31bea20016359924eb25f35efb8572cc06"
         );
+    }
+
+    /// Every declared model's ONNX and tokenizer files must be pinned in the vendored
+    /// manifest, and the manifest must contain exactly the fleet's six entries — no
+    /// stale or missing artifacts.
+    #[test]
+    fn every_gliner_model_file_is_pinned_in_manifest() {
+        let manifest = crate::model_download::parse_sha256_manifest(GLINER_SHA256_MANIFEST).unwrap();
+        assert_eq!(manifest.len(), 6, "expected exactly 6 pinned GLiNER artifacts");
+        let pinned: std::collections::HashSet<&str> = manifest.iter().map(|(p, _)| p.as_str()).collect();
+        for definition in GLINER_MODELS {
+            assert!(
+                pinned.contains(definition.model_file),
+                "GLiNER model {} model_file {} is not pinned in gliner-models.sha256",
+                definition.id,
+                definition.model_file
+            );
+            assert!(
+                pinned.contains(definition.tokenizer_file),
+                "GLiNER model {} tokenizer_file {} is not pinned in gliner-models.sha256",
+                definition.id,
+                definition.tokenizer_file
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,105 @@
+# =============================================================================
+ARG MANYLINUX_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
+FROM ${MANYLINUX_IMAGE} AS builder
+
+ARG RUST_TOOLCHAIN=nightly-2026-03-10
+ARG TARGET=x86_64-unknown-linux-gnu
+ARG ONNXRUNTIME_VERSION=1.24.2
+
+WORKDIR /build
+
+# The manylinux base images ship bash, so use it with `-o pipefail`: without it
+# the `curl ... | sh` rustup bootstrap below reports only sh's status (a failed
+# or truncated download would silently install nothing) and the readelf NEEDED
+# linkage assertion reports success on an empty pipe.
+# The GLIBC-floor probe at the end of that same step keeps its explicit failure
+# tolerance, so it stays advisory. (hadolint DL4006)
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN dnf -y install epel-release || \
+    dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+RUN dnf -y module enable nodejs:20 && \
+    dnf -y install \
+        cmake make pkgconfig git file curl \
+        openssl-devel \
+        libpng-devel libjpeg-turbo-devel libtiff-devel zlib-devel \
+        nodejs npm && \
+    for codec in libdav1d-devel libde265-devel; do dnf -y install "$codec" || true; done && \
+    dnf clean all
+
+RUN cd /tmp && \
+    curl -fsSL -o libheif.tar.gz https://github.com/strukturag/libheif/releases/download/v1.23.0/libheif-1.23.0.tar.gz && \
+    tar -xzf libheif.tar.gz && \
+    cd libheif-1.23.0 && \
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_INSTALL_LIBDIR=lib -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF \
+        -DBUILD_TESTING=OFF \
+        -DWITH_X265=OFF -DWITH_AOM_ENCODER=OFF -DWITH_AOM_DECODER=OFF && \
+    cmake --build build -j"$(nproc)" && \
+    cmake --install build && \
+    ldconfig && \
+    cd / && rm -rf /tmp/libheif*
+
+RUN mkdir -p /build/onnxruntime && \
+    if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then ORT_ARCH="aarch64"; else ORT_ARCH="x64"; fi && \
+    curl -fL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
+        -o /build/onnxruntime.tgz && \
+    tar -xzf /build/onnxruntime.tgz -C /build/onnxruntime --strip-components=1 && \
+    cp /build/onnxruntime/lib/libonnxruntime.so* /usr/local/lib/ && \
+    ldconfig && \
+    rm /build/onnxruntime.tgz
+ENV ORT_LIB_LOCATION=/build/onnxruntime/lib \
+    ORT_PREFER_DYNAMIC_LINK=1 \
+    ORT_SKIP_DOWNLOAD=1 \
+    ORT_STRATEGY=system \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    LD_LIBRARY_PATH=/usr/local/lib
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --component rust-src
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/xberg/ crates/xberg/
+COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
+COPY crates/xberg-gliner/ crates/xberg-gliner/
+COPY crates/xberg-node/ crates/xberg-node/
+COPY crates/xberg-ffi/ crates/xberg-ffi/
+COPY crates/xberg-tesseract/ crates/xberg-tesseract/
+COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
+COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
+COPY crates/xberg-libheif/ crates/xberg-libheif/
+COPY crates/xberg-libwpd/ crates/xberg-libwpd/
+
+RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-cli/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
+
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc \
+    CC_x86_64_unknown_linux_gnu=gcc \
+    CXX_x86_64_unknown_linux_gnu=g++ \
+    CC_aarch64_unknown_linux_gnu=gcc \
+    CXX_aarch64_unknown_linux_gnu=g++
+
+RUN export RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN' && \
+    rustup target add "${TARGET}" && \
+    cd crates/xberg-node && \
+    npx --yes -p @napi-rs/cli@^3.6.2 napi build --platform --release --target "${TARGET}" && \
+    cp ./*.node /build/ && \
+    strip /build/*.node
+
+COPY scripts/ci/vendor-native-closure.sh /usr/local/bin/vendor-native-closure.sh
+RUN bash /usr/local/bin/vendor-native-closure.sh /build
+
+RUN file /build/*.node && \
+    echo "=== Dynamic dependencies ===" && \
+    readelf -d /build/*.node 2>/dev/null | grep NEEDED && \
+    echo "=== Vendored libs (ship beside the .node) ===" && \
+    ls -la /build/*.so* && \
+    echo "=== Max GLIBC symbol version (floor) ===" && \
+    { objdump -T /build/*.node 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1 || true; }
+
+FROM scratch
+COPY --from=builder /build/*.node /
+# `*.so*` (not `*.so`) matches versioned sonames like libonnxruntime.so.1,
+# which a plain `*.so` glob silently drops. ~keep
+COPY --from=builder /build/*.so* /

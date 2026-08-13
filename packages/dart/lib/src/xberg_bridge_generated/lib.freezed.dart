@@ -1853,6 +1853,471 @@ as PlatformInt64,
 }
 
 /// @nodoc
+mixin _$CredentialProviderConfig {
+
+
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CredentialProviderConfig);
+}
+
+
+@override
+int get hashCode => runtimeType.hashCode;
+
+@override
+String toString() {
+  return 'CredentialProviderConfig()';
+}
+
+
+}
+
+/// @nodoc
+class $CredentialProviderConfigCopyWith<$Res>  {
+$CredentialProviderConfigCopyWith(CredentialProviderConfig _, $Res Function(CredentialProviderConfig) __);
+}
+
+
+/// Adds pattern-matching-related methods to [CredentialProviderConfig].
+extension CredentialProviderConfigPatterns on CredentialProviderConfig {
+/// A variant of `map` that fallback to returning `orElse`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( CredentialProviderConfig_AzureAd value)?  azureAd,TResult Function( CredentialProviderConfig_VertexOauth2 value)?  vertexOauth2,TResult Function( CredentialProviderConfig_VertexAdc value)?  vertexAdc,TResult Function( CredentialProviderConfig_BedrockWebIdentity value)?  bedrockWebIdentity,required TResult orElse(),}){
+final _that = this;
+switch (_that) {
+case CredentialProviderConfig_AzureAd() when azureAd != null:
+return azureAd(_that);case CredentialProviderConfig_VertexOauth2() when vertexOauth2 != null:
+return vertexOauth2(_that);case CredentialProviderConfig_VertexAdc() when vertexAdc != null:
+return vertexAdc(_that);case CredentialProviderConfig_BedrockWebIdentity() when bedrockWebIdentity != null:
+return bedrockWebIdentity(_that);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// Callbacks receives the raw object, upcasted.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case final Subclass2 value:
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( CredentialProviderConfig_AzureAd value)  azureAd,required TResult Function( CredentialProviderConfig_VertexOauth2 value)  vertexOauth2,required TResult Function( CredentialProviderConfig_VertexAdc value)  vertexAdc,required TResult Function( CredentialProviderConfig_BedrockWebIdentity value)  bedrockWebIdentity,}){
+final _that = this;
+switch (_that) {
+case CredentialProviderConfig_AzureAd():
+return azureAd(_that);case CredentialProviderConfig_VertexOauth2():
+return vertexOauth2(_that);case CredentialProviderConfig_VertexAdc():
+return vertexAdc(_that);case CredentialProviderConfig_BedrockWebIdentity():
+return bedrockWebIdentity(_that);}
+}
+/// A variant of `map` that fallback to returning `null`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( CredentialProviderConfig_AzureAd value)?  azureAd,TResult? Function( CredentialProviderConfig_VertexOauth2 value)?  vertexOauth2,TResult? Function( CredentialProviderConfig_VertexAdc value)?  vertexAdc,TResult? Function( CredentialProviderConfig_BedrockWebIdentity value)?  bedrockWebIdentity,}){
+final _that = this;
+switch (_that) {
+case CredentialProviderConfig_AzureAd() when azureAd != null:
+return azureAd(_that);case CredentialProviderConfig_VertexOauth2() when vertexOauth2 != null:
+return vertexOauth2(_that);case CredentialProviderConfig_VertexAdc() when vertexAdc != null:
+return vertexAdc(_that);case CredentialProviderConfig_BedrockWebIdentity() when bedrockWebIdentity != null:
+return bedrockWebIdentity(_that);case _:
+  return null;
+
+}
+}
+/// A variant of `when` that fallback to an `orElse` callback.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String tenantId,  String clientId,  String clientSecret,  String scope)?  azureAd,TResult Function( String serviceAccountKeyFile,  String scope)?  vertexOauth2,TResult Function( String scope)?  vertexAdc,TResult Function( String roleArn,  String tokenFile,  String sessionName,  String region)?  bedrockWebIdentity,required TResult orElse(),}) {final _that = this;
+switch (_that) {
+case CredentialProviderConfig_AzureAd() when azureAd != null:
+return azureAd(_that.tenantId,_that.clientId,_that.clientSecret,_that.scope);case CredentialProviderConfig_VertexOauth2() when vertexOauth2 != null:
+return vertexOauth2(_that.serviceAccountKeyFile,_that.scope);case CredentialProviderConfig_VertexAdc() when vertexAdc != null:
+return vertexAdc(_that.scope);case CredentialProviderConfig_BedrockWebIdentity() when bedrockWebIdentity != null:
+return bedrockWebIdentity(_that.roleArn,_that.tokenFile,_that.sessionName,_that.region);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// As opposed to `map`, this offers destructuring.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case Subclass2(:final field2):
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String tenantId,  String clientId,  String clientSecret,  String scope)  azureAd,required TResult Function( String serviceAccountKeyFile,  String scope)  vertexOauth2,required TResult Function( String scope)  vertexAdc,required TResult Function( String roleArn,  String tokenFile,  String sessionName,  String region)  bedrockWebIdentity,}) {final _that = this;
+switch (_that) {
+case CredentialProviderConfig_AzureAd():
+return azureAd(_that.tenantId,_that.clientId,_that.clientSecret,_that.scope);case CredentialProviderConfig_VertexOauth2():
+return vertexOauth2(_that.serviceAccountKeyFile,_that.scope);case CredentialProviderConfig_VertexAdc():
+return vertexAdc(_that.scope);case CredentialProviderConfig_BedrockWebIdentity():
+return bedrockWebIdentity(_that.roleArn,_that.tokenFile,_that.sessionName,_that.region);}
+}
+/// A variant of `when` that fallback to returning `null`
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String tenantId,  String clientId,  String clientSecret,  String scope)?  azureAd,TResult? Function( String serviceAccountKeyFile,  String scope)?  vertexOauth2,TResult? Function( String scope)?  vertexAdc,TResult? Function( String roleArn,  String tokenFile,  String sessionName,  String region)?  bedrockWebIdentity,}) {final _that = this;
+switch (_that) {
+case CredentialProviderConfig_AzureAd() when azureAd != null:
+return azureAd(_that.tenantId,_that.clientId,_that.clientSecret,_that.scope);case CredentialProviderConfig_VertexOauth2() when vertexOauth2 != null:
+return vertexOauth2(_that.serviceAccountKeyFile,_that.scope);case CredentialProviderConfig_VertexAdc() when vertexAdc != null:
+return vertexAdc(_that.scope);case CredentialProviderConfig_BedrockWebIdentity() when bedrockWebIdentity != null:
+return bedrockWebIdentity(_that.roleArn,_that.tokenFile,_that.sessionName,_that.region);case _:
+  return null;
+
+}
+}
+
+}
+
+/// @nodoc
+
+
+class CredentialProviderConfig_AzureAd extends CredentialProviderConfig {
+  const CredentialProviderConfig_AzureAd({required this.tenantId, required this.clientId, required this.clientSecret, required this.scope}): super._();
+
+
+/// Azure AD tenant ID.
+ final  String tenantId;
+/// Application (client) ID.
+ final  String clientId;
+/// Client secret value. Secret — never logged.
+ final  String clientSecret;
+/// OAuth2 scope. Defaults to liter-llm's own
+/// `https://cognitiveservices.azure.com/.default` when unset.
+ final  String scope;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$CredentialProviderConfig_AzureAdCopyWith<CredentialProviderConfig_AzureAd> get copyWith => _$CredentialProviderConfig_AzureAdCopyWithImpl<CredentialProviderConfig_AzureAd>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CredentialProviderConfig_AzureAd&&(identical(other.tenantId, tenantId) || other.tenantId == tenantId)&&(identical(other.clientId, clientId) || other.clientId == clientId)&&(identical(other.clientSecret, clientSecret) || other.clientSecret == clientSecret)&&(identical(other.scope, scope) || other.scope == scope));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,tenantId,clientId,clientSecret,scope);
+
+@override
+String toString() {
+  return 'CredentialProviderConfig.azureAd(tenantId: $tenantId, clientId: $clientId, clientSecret: $clientSecret, scope: $scope)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $CredentialProviderConfig_AzureAdCopyWith<$Res> implements $CredentialProviderConfigCopyWith<$Res> {
+  factory $CredentialProviderConfig_AzureAdCopyWith(CredentialProviderConfig_AzureAd value, $Res Function(CredentialProviderConfig_AzureAd) _then) = _$CredentialProviderConfig_AzureAdCopyWithImpl;
+@useResult
+$Res call({
+ String tenantId, String clientId, String clientSecret, String scope
+});
+
+
+
+
+}
+/// @nodoc
+class _$CredentialProviderConfig_AzureAdCopyWithImpl<$Res>
+    implements $CredentialProviderConfig_AzureAdCopyWith<$Res> {
+  _$CredentialProviderConfig_AzureAdCopyWithImpl(this._self, this._then);
+
+  final CredentialProviderConfig_AzureAd _self;
+  final $Res Function(CredentialProviderConfig_AzureAd) _then;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? tenantId = null,Object? clientId = null,Object? clientSecret = null,Object? scope = null,}) {
+  return _then(CredentialProviderConfig_AzureAd(
+tenantId: null == tenantId ? _self.tenantId : tenantId // ignore: cast_nullable_to_non_nullable
+as String,clientId: null == clientId ? _self.clientId : clientId // ignore: cast_nullable_to_non_nullable
+as String,clientSecret: null == clientSecret ? _self.clientSecret : clientSecret // ignore: cast_nullable_to_non_nullable
+as String,scope: null == scope ? _self.scope : scope // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class CredentialProviderConfig_VertexOauth2 extends CredentialProviderConfig {
+  const CredentialProviderConfig_VertexOauth2({required this.serviceAccountKeyFile, required this.scope}): super._();
+
+
+/// Path to a Google service-account JSON key file (the same file
+/// `GOOGLE_APPLICATION_CREDENTIALS` would point to).
+ final  String serviceAccountKeyFile;
+/// OAuth2 scope. Defaults to liter-llm's own Vertex AI scope when unset.
+ final  String scope;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$CredentialProviderConfig_VertexOauth2CopyWith<CredentialProviderConfig_VertexOauth2> get copyWith => _$CredentialProviderConfig_VertexOauth2CopyWithImpl<CredentialProviderConfig_VertexOauth2>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CredentialProviderConfig_VertexOauth2&&(identical(other.serviceAccountKeyFile, serviceAccountKeyFile) || other.serviceAccountKeyFile == serviceAccountKeyFile)&&(identical(other.scope, scope) || other.scope == scope));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,serviceAccountKeyFile,scope);
+
+@override
+String toString() {
+  return 'CredentialProviderConfig.vertexOauth2(serviceAccountKeyFile: $serviceAccountKeyFile, scope: $scope)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $CredentialProviderConfig_VertexOauth2CopyWith<$Res> implements $CredentialProviderConfigCopyWith<$Res> {
+  factory $CredentialProviderConfig_VertexOauth2CopyWith(CredentialProviderConfig_VertexOauth2 value, $Res Function(CredentialProviderConfig_VertexOauth2) _then) = _$CredentialProviderConfig_VertexOauth2CopyWithImpl;
+@useResult
+$Res call({
+ String serviceAccountKeyFile, String scope
+});
+
+
+
+
+}
+/// @nodoc
+class _$CredentialProviderConfig_VertexOauth2CopyWithImpl<$Res>
+    implements $CredentialProviderConfig_VertexOauth2CopyWith<$Res> {
+  _$CredentialProviderConfig_VertexOauth2CopyWithImpl(this._self, this._then);
+
+  final CredentialProviderConfig_VertexOauth2 _self;
+  final $Res Function(CredentialProviderConfig_VertexOauth2) _then;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? serviceAccountKeyFile = null,Object? scope = null,}) {
+  return _then(CredentialProviderConfig_VertexOauth2(
+serviceAccountKeyFile: null == serviceAccountKeyFile ? _self.serviceAccountKeyFile : serviceAccountKeyFile // ignore: cast_nullable_to_non_nullable
+as String,scope: null == scope ? _self.scope : scope // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class CredentialProviderConfig_VertexAdc extends CredentialProviderConfig {
+  const CredentialProviderConfig_VertexAdc({required this.scope}): super._();
+
+
+/// OAuth2 scope. Defaults to liter-llm's own Vertex AI scope when unset.
+ final  String scope;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$CredentialProviderConfig_VertexAdcCopyWith<CredentialProviderConfig_VertexAdc> get copyWith => _$CredentialProviderConfig_VertexAdcCopyWithImpl<CredentialProviderConfig_VertexAdc>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CredentialProviderConfig_VertexAdc&&(identical(other.scope, scope) || other.scope == scope));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,scope);
+
+@override
+String toString() {
+  return 'CredentialProviderConfig.vertexAdc(scope: $scope)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $CredentialProviderConfig_VertexAdcCopyWith<$Res> implements $CredentialProviderConfigCopyWith<$Res> {
+  factory $CredentialProviderConfig_VertexAdcCopyWith(CredentialProviderConfig_VertexAdc value, $Res Function(CredentialProviderConfig_VertexAdc) _then) = _$CredentialProviderConfig_VertexAdcCopyWithImpl;
+@useResult
+$Res call({
+ String scope
+});
+
+
+
+
+}
+/// @nodoc
+class _$CredentialProviderConfig_VertexAdcCopyWithImpl<$Res>
+    implements $CredentialProviderConfig_VertexAdcCopyWith<$Res> {
+  _$CredentialProviderConfig_VertexAdcCopyWithImpl(this._self, this._then);
+
+  final CredentialProviderConfig_VertexAdc _self;
+  final $Res Function(CredentialProviderConfig_VertexAdc) _then;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? scope = null,}) {
+  return _then(CredentialProviderConfig_VertexAdc(
+scope: null == scope ? _self.scope : scope // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class CredentialProviderConfig_BedrockWebIdentity extends CredentialProviderConfig {
+  const CredentialProviderConfig_BedrockWebIdentity({required this.roleArn, required this.tokenFile, required this.sessionName, required this.region}): super._();
+
+
+/// ARN of the IAM role to assume.
+ final  String roleArn;
+/// Path to a file containing the OIDC JWT (the same file
+/// `AWS_WEB_IDENTITY_TOKEN_FILE` would point to).
+ final  String tokenFile;
+/// STS session name. Defaults to liter-llm's own default (`"liter-llm-session"`) when
+/// unset.
+ final  String sessionName;
+/// AWS region. Defaults to liter-llm's own default (`"us-east-1"`) when unset.
+ final  String region;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$CredentialProviderConfig_BedrockWebIdentityCopyWith<CredentialProviderConfig_BedrockWebIdentity> get copyWith => _$CredentialProviderConfig_BedrockWebIdentityCopyWithImpl<CredentialProviderConfig_BedrockWebIdentity>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CredentialProviderConfig_BedrockWebIdentity&&(identical(other.roleArn, roleArn) || other.roleArn == roleArn)&&(identical(other.tokenFile, tokenFile) || other.tokenFile == tokenFile)&&(identical(other.sessionName, sessionName) || other.sessionName == sessionName)&&(identical(other.region, region) || other.region == region));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,roleArn,tokenFile,sessionName,region);
+
+@override
+String toString() {
+  return 'CredentialProviderConfig.bedrockWebIdentity(roleArn: $roleArn, tokenFile: $tokenFile, sessionName: $sessionName, region: $region)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $CredentialProviderConfig_BedrockWebIdentityCopyWith<$Res> implements $CredentialProviderConfigCopyWith<$Res> {
+  factory $CredentialProviderConfig_BedrockWebIdentityCopyWith(CredentialProviderConfig_BedrockWebIdentity value, $Res Function(CredentialProviderConfig_BedrockWebIdentity) _then) = _$CredentialProviderConfig_BedrockWebIdentityCopyWithImpl;
+@useResult
+$Res call({
+ String roleArn, String tokenFile, String sessionName, String region
+});
+
+
+
+
+}
+/// @nodoc
+class _$CredentialProviderConfig_BedrockWebIdentityCopyWithImpl<$Res>
+    implements $CredentialProviderConfig_BedrockWebIdentityCopyWith<$Res> {
+  _$CredentialProviderConfig_BedrockWebIdentityCopyWithImpl(this._self, this._then);
+
+  final CredentialProviderConfig_BedrockWebIdentity _self;
+  final $Res Function(CredentialProviderConfig_BedrockWebIdentity) _then;
+
+/// Create a copy of CredentialProviderConfig
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? roleArn = null,Object? tokenFile = null,Object? sessionName = null,Object? region = null,}) {
+  return _then(CredentialProviderConfig_BedrockWebIdentity(
+roleArn: null == roleArn ? _self.roleArn : roleArn // ignore: cast_nullable_to_non_nullable
+as String,tokenFile: null == tokenFile ? _self.tokenFile : tokenFile // ignore: cast_nullable_to_non_nullable
+as String,sessionName: null == sessionName ? _self.sessionName : sessionName // ignore: cast_nullable_to_non_nullable
+as String,region: null == region ? _self.region : region // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
 mixin _$DiffLine {
 
  String get field0;
@@ -2564,6 +3029,10 @@ class EmbeddingModelType_Llm extends EmbeddingModelType {
 
 
 /// LLM provider configuration specifying the model and API credentials.
+///
+/// Boxed because `LlmConfig` carries liter-llm's full configuration surface and is
+/// an order of magnitude larger than the other variants, which would otherwise make
+/// every `Preset`/`Custom` value pay for it. ~keep
  final  LlmConfig llm;
 
 /// Create a copy of EmbeddingModelType
@@ -3293,22 +3762,22 @@ as String,
 /// @nodoc
 mixin _$FormatMetadata {
 
-
+ Object get field0;
 
 
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is FormatMetadata);
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is FormatMetadata&&const DeepCollectionEquality().equals(other.field0, field0));
 }
 
 
 @override
-int get hashCode => runtimeType.hashCode;
+int get hashCode => Object.hash(runtimeType,const DeepCollectionEquality().hash(field0));
 
 @override
 String toString() {
-  return 'FormatMetadata()';
+  return 'FormatMetadata(field0: $field0)';
 }
 
 
@@ -3455,7 +3924,7 @@ return code(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( PdfMetadata field0)?  pdf,TResult Function( DocxMetadata field0)?  docx,TResult Function( ExcelMetadata field0)?  excel,TResult Function( EmailMetadata field0)?  email,TResult Function( PptxMetadata field0)?  pptx,TResult Function( ArchiveMetadata field0)?  archive,TResult Function( ImageMetadata field0)?  image,TResult Function( XmlMetadata field0)?  xml,TResult Function( TextMetadata field0)?  text,TResult Function( HtmlMetadata field0)?  html,TResult Function( OcrMetadata field0)?  ocr,TResult Function( CsvMetadata field0)?  csv,TResult Function( BibtexMetadata field0)?  bibtex,TResult Function( CitationMetadata field0)?  citation,TResult Function( FictionBookMetadata field0)?  fictionBook,TResult Function( DbfMetadata field0)?  dbf,TResult Function( JatsMetadata field0)?  jats,TResult Function( EpubMetadata field0)?  epub,TResult Function( PstMetadata field0)?  pst,TResult Function( AudioMetadata field0)?  audio,TResult Function()?  code,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( PdfMetadata field0)?  pdf,TResult Function( DocxMetadata field0)?  docx,TResult Function( ExcelMetadata field0)?  excel,TResult Function( EmailMetadata field0)?  email,TResult Function( PptxMetadata field0)?  pptx,TResult Function( ArchiveMetadata field0)?  archive,TResult Function( ImageMetadata field0)?  image,TResult Function( XmlMetadata field0)?  xml,TResult Function( TextMetadata field0)?  text,TResult Function( HtmlMetadata field0)?  html,TResult Function( OcrMetadata field0)?  ocr,TResult Function( CsvMetadata field0)?  csv,TResult Function( BibtexMetadata field0)?  bibtex,TResult Function( CitationMetadata field0)?  citation,TResult Function( FictionBookMetadata field0)?  fictionBook,TResult Function( DbfMetadata field0)?  dbf,TResult Function( JatsMetadata field0)?  jats,TResult Function( EpubMetadata field0)?  epub,TResult Function( PstMetadata field0)?  pst,TResult Function( AudioMetadata field0)?  audio,TResult Function( CodeMetadata field0)?  code,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case FormatMetadata_Pdf() when pdf != null:
 return pdf(_that.field0);case FormatMetadata_Docx() when docx != null:
@@ -3478,7 +3947,7 @@ return jats(_that.field0);case FormatMetadata_Epub() when epub != null:
 return epub(_that.field0);case FormatMetadata_Pst() when pst != null:
 return pst(_that.field0);case FormatMetadata_Audio() when audio != null:
 return audio(_that.field0);case FormatMetadata_Code() when code != null:
-return code();case _:
+return code(_that.field0);case _:
   return orElse();
 
 }
@@ -3496,7 +3965,7 @@ return code();case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( PdfMetadata field0)  pdf,required TResult Function( DocxMetadata field0)  docx,required TResult Function( ExcelMetadata field0)  excel,required TResult Function( EmailMetadata field0)  email,required TResult Function( PptxMetadata field0)  pptx,required TResult Function( ArchiveMetadata field0)  archive,required TResult Function( ImageMetadata field0)  image,required TResult Function( XmlMetadata field0)  xml,required TResult Function( TextMetadata field0)  text,required TResult Function( HtmlMetadata field0)  html,required TResult Function( OcrMetadata field0)  ocr,required TResult Function( CsvMetadata field0)  csv,required TResult Function( BibtexMetadata field0)  bibtex,required TResult Function( CitationMetadata field0)  citation,required TResult Function( FictionBookMetadata field0)  fictionBook,required TResult Function( DbfMetadata field0)  dbf,required TResult Function( JatsMetadata field0)  jats,required TResult Function( EpubMetadata field0)  epub,required TResult Function( PstMetadata field0)  pst,required TResult Function( AudioMetadata field0)  audio,required TResult Function()  code,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( PdfMetadata field0)  pdf,required TResult Function( DocxMetadata field0)  docx,required TResult Function( ExcelMetadata field0)  excel,required TResult Function( EmailMetadata field0)  email,required TResult Function( PptxMetadata field0)  pptx,required TResult Function( ArchiveMetadata field0)  archive,required TResult Function( ImageMetadata field0)  image,required TResult Function( XmlMetadata field0)  xml,required TResult Function( TextMetadata field0)  text,required TResult Function( HtmlMetadata field0)  html,required TResult Function( OcrMetadata field0)  ocr,required TResult Function( CsvMetadata field0)  csv,required TResult Function( BibtexMetadata field0)  bibtex,required TResult Function( CitationMetadata field0)  citation,required TResult Function( FictionBookMetadata field0)  fictionBook,required TResult Function( DbfMetadata field0)  dbf,required TResult Function( JatsMetadata field0)  jats,required TResult Function( EpubMetadata field0)  epub,required TResult Function( PstMetadata field0)  pst,required TResult Function( AudioMetadata field0)  audio,required TResult Function( CodeMetadata field0)  code,}) {final _that = this;
 switch (_that) {
 case FormatMetadata_Pdf():
 return pdf(_that.field0);case FormatMetadata_Docx():
@@ -3519,7 +3988,7 @@ return jats(_that.field0);case FormatMetadata_Epub():
 return epub(_that.field0);case FormatMetadata_Pst():
 return pst(_that.field0);case FormatMetadata_Audio():
 return audio(_that.field0);case FormatMetadata_Code():
-return code();}
+return code(_that.field0);}
 }
 /// A variant of `when` that fallback to returning `null`
 ///
@@ -3533,7 +4002,7 @@ return code();}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( PdfMetadata field0)?  pdf,TResult? Function( DocxMetadata field0)?  docx,TResult? Function( ExcelMetadata field0)?  excel,TResult? Function( EmailMetadata field0)?  email,TResult? Function( PptxMetadata field0)?  pptx,TResult? Function( ArchiveMetadata field0)?  archive,TResult? Function( ImageMetadata field0)?  image,TResult? Function( XmlMetadata field0)?  xml,TResult? Function( TextMetadata field0)?  text,TResult? Function( HtmlMetadata field0)?  html,TResult? Function( OcrMetadata field0)?  ocr,TResult? Function( CsvMetadata field0)?  csv,TResult? Function( BibtexMetadata field0)?  bibtex,TResult? Function( CitationMetadata field0)?  citation,TResult? Function( FictionBookMetadata field0)?  fictionBook,TResult? Function( DbfMetadata field0)?  dbf,TResult? Function( JatsMetadata field0)?  jats,TResult? Function( EpubMetadata field0)?  epub,TResult? Function( PstMetadata field0)?  pst,TResult? Function( AudioMetadata field0)?  audio,TResult? Function()?  code,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( PdfMetadata field0)?  pdf,TResult? Function( DocxMetadata field0)?  docx,TResult? Function( ExcelMetadata field0)?  excel,TResult? Function( EmailMetadata field0)?  email,TResult? Function( PptxMetadata field0)?  pptx,TResult? Function( ArchiveMetadata field0)?  archive,TResult? Function( ImageMetadata field0)?  image,TResult? Function( XmlMetadata field0)?  xml,TResult? Function( TextMetadata field0)?  text,TResult? Function( HtmlMetadata field0)?  html,TResult? Function( OcrMetadata field0)?  ocr,TResult? Function( CsvMetadata field0)?  csv,TResult? Function( BibtexMetadata field0)?  bibtex,TResult? Function( CitationMetadata field0)?  citation,TResult? Function( FictionBookMetadata field0)?  fictionBook,TResult? Function( DbfMetadata field0)?  dbf,TResult? Function( JatsMetadata field0)?  jats,TResult? Function( EpubMetadata field0)?  epub,TResult? Function( PstMetadata field0)?  pst,TResult? Function( AudioMetadata field0)?  audio,TResult? Function( CodeMetadata field0)?  code,}) {final _that = this;
 switch (_that) {
 case FormatMetadata_Pdf() when pdf != null:
 return pdf(_that.field0);case FormatMetadata_Docx() when docx != null:
@@ -3556,7 +4025,7 @@ return jats(_that.field0);case FormatMetadata_Epub() when epub != null:
 return epub(_that.field0);case FormatMetadata_Pst() when pst != null:
 return pst(_that.field0);case FormatMetadata_Audio() when audio != null:
 return audio(_that.field0);case FormatMetadata_Code() when code != null:
-return code();case _:
+return code(_that.field0);case _:
   return null;
 
 }
@@ -3571,7 +4040,7 @@ class FormatMetadata_Pdf extends FormatMetadata {
   const FormatMetadata_Pdf({required this.field0}): super._();
 
 
- final  PdfMetadata field0;
+@override final  PdfMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -3637,7 +4106,7 @@ class FormatMetadata_Docx extends FormatMetadata {
   const FormatMetadata_Docx({required this.field0}): super._();
 
 
- final  DocxMetadata field0;
+@override final  DocxMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -3703,7 +4172,7 @@ class FormatMetadata_Excel extends FormatMetadata {
   const FormatMetadata_Excel({required this.field0}): super._();
 
 
- final  ExcelMetadata field0;
+@override final  ExcelMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -3769,7 +4238,7 @@ class FormatMetadata_Email extends FormatMetadata {
   const FormatMetadata_Email({required this.field0}): super._();
 
 
- final  EmailMetadata field0;
+@override final  EmailMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -3835,7 +4304,7 @@ class FormatMetadata_Pptx extends FormatMetadata {
   const FormatMetadata_Pptx({required this.field0}): super._();
 
 
- final  PptxMetadata field0;
+@override final  PptxMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -3901,7 +4370,7 @@ class FormatMetadata_Archive extends FormatMetadata {
   const FormatMetadata_Archive({required this.field0}): super._();
 
 
- final  ArchiveMetadata field0;
+@override final  ArchiveMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -3967,7 +4436,7 @@ class FormatMetadata_Image extends FormatMetadata {
   const FormatMetadata_Image({required this.field0}): super._();
 
 
- final  ImageMetadata field0;
+@override final  ImageMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4033,7 +4502,7 @@ class FormatMetadata_Xml extends FormatMetadata {
   const FormatMetadata_Xml({required this.field0}): super._();
 
 
- final  XmlMetadata field0;
+@override final  XmlMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4099,7 +4568,7 @@ class FormatMetadata_Text extends FormatMetadata {
   const FormatMetadata_Text({required this.field0}): super._();
 
 
- final  TextMetadata field0;
+@override final  TextMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4165,7 +4634,7 @@ class FormatMetadata_Html extends FormatMetadata {
   const FormatMetadata_Html({required this.field0}): super._();
 
 
- final  HtmlMetadata field0;
+@override final  HtmlMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4231,7 +4700,7 @@ class FormatMetadata_Ocr extends FormatMetadata {
   const FormatMetadata_Ocr({required this.field0}): super._();
 
 
- final  OcrMetadata field0;
+@override final  OcrMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4297,7 +4766,7 @@ class FormatMetadata_Csv extends FormatMetadata {
   const FormatMetadata_Csv({required this.field0}): super._();
 
 
- final  CsvMetadata field0;
+@override final  CsvMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4363,7 +4832,7 @@ class FormatMetadata_Bibtex extends FormatMetadata {
   const FormatMetadata_Bibtex({required this.field0}): super._();
 
 
- final  BibtexMetadata field0;
+@override final  BibtexMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4429,7 +4898,7 @@ class FormatMetadata_Citation extends FormatMetadata {
   const FormatMetadata_Citation({required this.field0}): super._();
 
 
- final  CitationMetadata field0;
+@override final  CitationMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4495,7 +4964,7 @@ class FormatMetadata_FictionBook extends FormatMetadata {
   const FormatMetadata_FictionBook({required this.field0}): super._();
 
 
- final  FictionBookMetadata field0;
+@override final  FictionBookMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4561,7 +5030,7 @@ class FormatMetadata_Dbf extends FormatMetadata {
   const FormatMetadata_Dbf({required this.field0}): super._();
 
 
- final  DbfMetadata field0;
+@override final  DbfMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4627,7 +5096,7 @@ class FormatMetadata_Jats extends FormatMetadata {
   const FormatMetadata_Jats({required this.field0}): super._();
 
 
- final  JatsMetadata field0;
+@override final  JatsMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4693,7 +5162,7 @@ class FormatMetadata_Epub extends FormatMetadata {
   const FormatMetadata_Epub({required this.field0}): super._();
 
 
- final  EpubMetadata field0;
+@override final  EpubMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4759,7 +5228,7 @@ class FormatMetadata_Pst extends FormatMetadata {
   const FormatMetadata_Pst({required this.field0}): super._();
 
 
- final  PstMetadata field0;
+@override final  PstMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4825,7 +5294,7 @@ class FormatMetadata_Audio extends FormatMetadata {
   const FormatMetadata_Audio({required this.field0}): super._();
 
 
- final  AudioMetadata field0;
+@override final  AudioMetadata field0;
 
 /// Create a copy of FormatMetadata
 /// with the given fields replaced by the non-null parameter values.
@@ -4888,33 +5357,67 @@ as AudioMetadata,
 
 
 class FormatMetadata_Code extends FormatMetadata {
-  const FormatMetadata_Code(): super._();
+  const FormatMetadata_Code({required this.field0}): super._();
 
 
+@override final  CodeMetadata field0;
 
-
+/// Create a copy of FormatMetadata
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$FormatMetadata_CodeCopyWith<FormatMetadata_Code> get copyWith => _$FormatMetadata_CodeCopyWithImpl<FormatMetadata_Code>(this, _$identity);
 
 
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is FormatMetadata_Code);
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is FormatMetadata_Code&&(identical(other.field0, field0) || other.field0 == field0));
 }
 
 
 @override
-int get hashCode => runtimeType.hashCode;
+int get hashCode => Object.hash(runtimeType,field0);
 
 @override
 String toString() {
-  return 'FormatMetadata.code()';
+  return 'FormatMetadata.code(field0: $field0)';
 }
 
 
 }
 
+/// @nodoc
+abstract mixin class $FormatMetadata_CodeCopyWith<$Res> implements $FormatMetadataCopyWith<$Res> {
+  factory $FormatMetadata_CodeCopyWith(FormatMetadata_Code value, $Res Function(FormatMetadata_Code) _then) = _$FormatMetadata_CodeCopyWithImpl;
+@useResult
+$Res call({
+ CodeMetadata field0
+});
 
 
+
+
+}
+/// @nodoc
+class _$FormatMetadata_CodeCopyWithImpl<$Res>
+    implements $FormatMetadata_CodeCopyWith<$Res> {
+  _$FormatMetadata_CodeCopyWithImpl(this._self, this._then);
+
+  final FormatMetadata_Code _self;
+  final $Res Function(FormatMetadata_Code) _then;
+
+/// Create a copy of FormatMetadata
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? field0 = null,}) {
+  return _then(FormatMetadata_Code(
+field0: null == field0 ? _self.field0 : field0 // ignore: cast_nullable_to_non_nullable
+as CodeMetadata,
+  ));
+}
+
+
+}
 
 /// @nodoc
 mixin _$HeuristicsError {
@@ -5232,6 +5735,406 @@ class _$HeuristicsError_PdfAnalysisErrorCopyWithImpl<$Res>
 @override @pragma('vm:prefer-inline') $Res call({Object? field0 = null,}) {
   return _then(HeuristicsError_PdfAnalysisError(
 field0: null == field0 ? _self.field0 : field0 // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+mixin _$HostMatcher {
+
+/// The hostname to match.
+ String get value;
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$HostMatcherCopyWith<HostMatcher> get copyWith => _$HostMatcherCopyWithImpl<HostMatcher>(this as HostMatcher, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is HostMatcher&&(identical(other.value, value) || other.value == value));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,value);
+
+@override
+String toString() {
+  return 'HostMatcher(value: $value)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $HostMatcherCopyWith<$Res>  {
+  factory $HostMatcherCopyWith(HostMatcher value, $Res Function(HostMatcher) _then) = _$HostMatcherCopyWithImpl;
+@useResult
+$Res call({
+ String value
+});
+
+
+
+
+}
+/// @nodoc
+class _$HostMatcherCopyWithImpl<$Res>
+    implements $HostMatcherCopyWith<$Res> {
+  _$HostMatcherCopyWithImpl(this._self, this._then);
+
+  final HostMatcher _self;
+  final $Res Function(HostMatcher) _then;
+
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') @override $Res call({Object? value = null,}) {
+  return _then(_self.copyWith(
+value: null == value ? _self.value : value // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+}
+
+
+/// Adds pattern-matching-related methods to [HostMatcher].
+extension HostMatcherPatterns on HostMatcher {
+/// A variant of `map` that fallback to returning `orElse`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( HostMatcher_Exact value)?  exact,TResult Function( HostMatcher_Suffix value)?  suffix,TResult Function( HostMatcher_Cidr value)?  cidr,required TResult orElse(),}){
+final _that = this;
+switch (_that) {
+case HostMatcher_Exact() when exact != null:
+return exact(_that);case HostMatcher_Suffix() when suffix != null:
+return suffix(_that);case HostMatcher_Cidr() when cidr != null:
+return cidr(_that);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// Callbacks receives the raw object, upcasted.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case final Subclass2 value:
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( HostMatcher_Exact value)  exact,required TResult Function( HostMatcher_Suffix value)  suffix,required TResult Function( HostMatcher_Cidr value)  cidr,}){
+final _that = this;
+switch (_that) {
+case HostMatcher_Exact():
+return exact(_that);case HostMatcher_Suffix():
+return suffix(_that);case HostMatcher_Cidr():
+return cidr(_that);}
+}
+/// A variant of `map` that fallback to returning `null`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( HostMatcher_Exact value)?  exact,TResult? Function( HostMatcher_Suffix value)?  suffix,TResult? Function( HostMatcher_Cidr value)?  cidr,}){
+final _that = this;
+switch (_that) {
+case HostMatcher_Exact() when exact != null:
+return exact(_that);case HostMatcher_Suffix() when suffix != null:
+return suffix(_that);case HostMatcher_Cidr() when cidr != null:
+return cidr(_that);case _:
+  return null;
+
+}
+}
+/// A variant of `when` that fallback to an `orElse` callback.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String value)?  exact,TResult Function( String value)?  suffix,TResult Function( String value)?  cidr,required TResult orElse(),}) {final _that = this;
+switch (_that) {
+case HostMatcher_Exact() when exact != null:
+return exact(_that.value);case HostMatcher_Suffix() when suffix != null:
+return suffix(_that.value);case HostMatcher_Cidr() when cidr != null:
+return cidr(_that.value);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// As opposed to `map`, this offers destructuring.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case Subclass2(:final field2):
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String value)  exact,required TResult Function( String value)  suffix,required TResult Function( String value)  cidr,}) {final _that = this;
+switch (_that) {
+case HostMatcher_Exact():
+return exact(_that.value);case HostMatcher_Suffix():
+return suffix(_that.value);case HostMatcher_Cidr():
+return cidr(_that.value);}
+}
+/// A variant of `when` that fallback to returning `null`
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String value)?  exact,TResult? Function( String value)?  suffix,TResult? Function( String value)?  cidr,}) {final _that = this;
+switch (_that) {
+case HostMatcher_Exact() when exact != null:
+return exact(_that.value);case HostMatcher_Suffix() when suffix != null:
+return suffix(_that.value);case HostMatcher_Cidr() when cidr != null:
+return cidr(_that.value);case _:
+  return null;
+
+}
+}
+
+}
+
+/// @nodoc
+
+
+class HostMatcher_Exact extends HostMatcher {
+  const HostMatcher_Exact({required this.value}): super._();
+
+
+/// The hostname to match.
+@override final  String value;
+
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@override @JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$HostMatcher_ExactCopyWith<HostMatcher_Exact> get copyWith => _$HostMatcher_ExactCopyWithImpl<HostMatcher_Exact>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is HostMatcher_Exact&&(identical(other.value, value) || other.value == value));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,value);
+
+@override
+String toString() {
+  return 'HostMatcher.exact(value: $value)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $HostMatcher_ExactCopyWith<$Res> implements $HostMatcherCopyWith<$Res> {
+  factory $HostMatcher_ExactCopyWith(HostMatcher_Exact value, $Res Function(HostMatcher_Exact) _then) = _$HostMatcher_ExactCopyWithImpl;
+@override @useResult
+$Res call({
+ String value
+});
+
+
+
+
+}
+/// @nodoc
+class _$HostMatcher_ExactCopyWithImpl<$Res>
+    implements $HostMatcher_ExactCopyWith<$Res> {
+  _$HostMatcher_ExactCopyWithImpl(this._self, this._then);
+
+  final HostMatcher_Exact _self;
+  final $Res Function(HostMatcher_Exact) _then;
+
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@override @pragma('vm:prefer-inline') $Res call({Object? value = null,}) {
+  return _then(HostMatcher_Exact(
+value: null == value ? _self.value : value // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class HostMatcher_Suffix extends HostMatcher {
+  const HostMatcher_Suffix({required this.value}): super._();
+
+
+/// The dot-prefixed suffix to match. A leading dot is optional.
+@override final  String value;
+
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@override @JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$HostMatcher_SuffixCopyWith<HostMatcher_Suffix> get copyWith => _$HostMatcher_SuffixCopyWithImpl<HostMatcher_Suffix>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is HostMatcher_Suffix&&(identical(other.value, value) || other.value == value));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,value);
+
+@override
+String toString() {
+  return 'HostMatcher.suffix(value: $value)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $HostMatcher_SuffixCopyWith<$Res> implements $HostMatcherCopyWith<$Res> {
+  factory $HostMatcher_SuffixCopyWith(HostMatcher_Suffix value, $Res Function(HostMatcher_Suffix) _then) = _$HostMatcher_SuffixCopyWithImpl;
+@override @useResult
+$Res call({
+ String value
+});
+
+
+
+
+}
+/// @nodoc
+class _$HostMatcher_SuffixCopyWithImpl<$Res>
+    implements $HostMatcher_SuffixCopyWith<$Res> {
+  _$HostMatcher_SuffixCopyWithImpl(this._self, this._then);
+
+  final HostMatcher_Suffix _self;
+  final $Res Function(HostMatcher_Suffix) _then;
+
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@override @pragma('vm:prefer-inline') $Res call({Object? value = null,}) {
+  return _then(HostMatcher_Suffix(
+value: null == value ? _self.value : value // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class HostMatcher_Cidr extends HostMatcher {
+  const HostMatcher_Cidr({required this.value}): super._();
+
+
+/// The CIDR block. Validated when built through [`HostMatcher::cidr`] or
+/// deserialization.
+@override final  String value;
+
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@override @JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$HostMatcher_CidrCopyWith<HostMatcher_Cidr> get copyWith => _$HostMatcher_CidrCopyWithImpl<HostMatcher_Cidr>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is HostMatcher_Cidr&&(identical(other.value, value) || other.value == value));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,value);
+
+@override
+String toString() {
+  return 'HostMatcher.cidr(value: $value)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $HostMatcher_CidrCopyWith<$Res> implements $HostMatcherCopyWith<$Res> {
+  factory $HostMatcher_CidrCopyWith(HostMatcher_Cidr value, $Res Function(HostMatcher_Cidr) _then) = _$HostMatcher_CidrCopyWithImpl;
+@override @useResult
+$Res call({
+ String value
+});
+
+
+
+
+}
+/// @nodoc
+class _$HostMatcher_CidrCopyWithImpl<$Res>
+    implements $HostMatcher_CidrCopyWith<$Res> {
+  _$HostMatcher_CidrCopyWithImpl(this._self, this._then);
+
+  final HostMatcher_Cidr _self;
+  final $Res Function(HostMatcher_Cidr) _then;
+
+/// Create a copy of HostMatcher
+/// with the given fields replaced by the non-null parameter values.
+@override @pragma('vm:prefer-inline') $Res call({Object? value = null,}) {
+  return _then(HostMatcher_Cidr(
+value: null == value ? _self.value : value // ignore: cast_nullable_to_non_nullable
 as String,
   ));
 }
@@ -5719,6 +6622,390 @@ String toString() {
 
 
 
+
+/// @nodoc
+mixin _$LateInteractionModelType {
+
+
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is LateInteractionModelType);
+}
+
+
+@override
+int get hashCode => runtimeType.hashCode;
+
+@override
+String toString() {
+  return 'LateInteractionModelType()';
+}
+
+
+}
+
+/// @nodoc
+class $LateInteractionModelTypeCopyWith<$Res>  {
+$LateInteractionModelTypeCopyWith(LateInteractionModelType _, $Res Function(LateInteractionModelType) __);
+}
+
+
+/// Adds pattern-matching-related methods to [LateInteractionModelType].
+extension LateInteractionModelTypePatterns on LateInteractionModelType {
+/// A variant of `map` that fallback to returning `orElse`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( LateInteractionModelType_Preset value)?  preset,TResult Function( LateInteractionModelType_Custom value)?  custom,TResult Function( LateInteractionModelType_Plugin value)?  plugin,required TResult orElse(),}){
+final _that = this;
+switch (_that) {
+case LateInteractionModelType_Preset() when preset != null:
+return preset(_that);case LateInteractionModelType_Custom() when custom != null:
+return custom(_that);case LateInteractionModelType_Plugin() when plugin != null:
+return plugin(_that);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// Callbacks receives the raw object, upcasted.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case final Subclass2 value:
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( LateInteractionModelType_Preset value)  preset,required TResult Function( LateInteractionModelType_Custom value)  custom,required TResult Function( LateInteractionModelType_Plugin value)  plugin,}){
+final _that = this;
+switch (_that) {
+case LateInteractionModelType_Preset():
+return preset(_that);case LateInteractionModelType_Custom():
+return custom(_that);case LateInteractionModelType_Plugin():
+return plugin(_that);}
+}
+/// A variant of `map` that fallback to returning `null`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( LateInteractionModelType_Preset value)?  preset,TResult? Function( LateInteractionModelType_Custom value)?  custom,TResult? Function( LateInteractionModelType_Plugin value)?  plugin,}){
+final _that = this;
+switch (_that) {
+case LateInteractionModelType_Preset() when preset != null:
+return preset(_that);case LateInteractionModelType_Custom() when custom != null:
+return custom(_that);case LateInteractionModelType_Plugin() when plugin != null:
+return plugin(_that);case _:
+  return null;
+
+}
+}
+/// A variant of `when` that fallback to an `orElse` callback.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String name)?  preset,TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)?  custom,TResult Function( String name)?  plugin,required TResult orElse(),}) {final _that = this;
+switch (_that) {
+case LateInteractionModelType_Preset() when preset != null:
+return preset(_that.name);case LateInteractionModelType_Custom() when custom != null:
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case LateInteractionModelType_Plugin() when plugin != null:
+return plugin(_that.name);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// As opposed to `map`, this offers destructuring.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case Subclass2(:final field2):
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String name)  preset,required TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)  custom,required TResult Function( String name)  plugin,}) {final _that = this;
+switch (_that) {
+case LateInteractionModelType_Preset():
+return preset(_that.name);case LateInteractionModelType_Custom():
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case LateInteractionModelType_Plugin():
+return plugin(_that.name);}
+}
+/// A variant of `when` that fallback to returning `null`
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String name)?  preset,TResult? Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)?  custom,TResult? Function( String name)?  plugin,}) {final _that = this;
+switch (_that) {
+case LateInteractionModelType_Preset() when preset != null:
+return preset(_that.name);case LateInteractionModelType_Custom() when custom != null:
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case LateInteractionModelType_Plugin() when plugin != null:
+return plugin(_that.name);case _:
+  return null;
+
+}
+}
+
+}
+
+/// @nodoc
+
+
+class LateInteractionModelType_Preset extends LateInteractionModelType {
+  const LateInteractionModelType_Preset({required this.name}): super._();
+
+
+/// Preset name (e.g. "colbert").
+ final  String name;
+
+/// Create a copy of LateInteractionModelType
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$LateInteractionModelType_PresetCopyWith<LateInteractionModelType_Preset> get copyWith => _$LateInteractionModelType_PresetCopyWithImpl<LateInteractionModelType_Preset>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is LateInteractionModelType_Preset&&(identical(other.name, name) || other.name == name));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,name);
+
+@override
+String toString() {
+  return 'LateInteractionModelType.preset(name: $name)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $LateInteractionModelType_PresetCopyWith<$Res> implements $LateInteractionModelTypeCopyWith<$Res> {
+  factory $LateInteractionModelType_PresetCopyWith(LateInteractionModelType_Preset value, $Res Function(LateInteractionModelType_Preset) _then) = _$LateInteractionModelType_PresetCopyWithImpl;
+@useResult
+$Res call({
+ String name
+});
+
+
+
+
+}
+/// @nodoc
+class _$LateInteractionModelType_PresetCopyWithImpl<$Res>
+    implements $LateInteractionModelType_PresetCopyWith<$Res> {
+  _$LateInteractionModelType_PresetCopyWithImpl(this._self, this._then);
+
+  final LateInteractionModelType_Preset _self;
+  final $Res Function(LateInteractionModelType_Preset) _then;
+
+/// Create a copy of LateInteractionModelType
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? name = null,}) {
+  return _then(LateInteractionModelType_Preset(
+name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class LateInteractionModelType_Custom extends LateInteractionModelType {
+  const LateInteractionModelType_Custom({required this.modelId, required this.modelFile, required final  List<String> additionalFiles, required this.maxLength}): _additionalFiles = additionalFiles,super._();
+
+
+/// HuggingFace model repository ID.
+ final  String modelId;
+/// Path to the ONNX file within the repo. Defaults to `"onnx/model.onnx"`.
+ final  String modelFile;
+/// Sibling files that must be downloaded alongside `model_file`.
+ final  List<String> _additionalFiles;
+/// Sibling files that must be downloaded alongside `model_file`.
+ List<String> get additionalFiles {
+  if (_additionalFiles is EqualUnmodifiableListView) return _additionalFiles;
+  // ignore: implicit_dynamic_type
+  return EqualUnmodifiableListView(_additionalFiles);
+}
+
+/// Maximum token sequence length. Stored as `i64` for FFI compatibility;
+/// negative values are clamped to the model default.
+ final  PlatformInt64 maxLength;
+
+/// Create a copy of LateInteractionModelType
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$LateInteractionModelType_CustomCopyWith<LateInteractionModelType_Custom> get copyWith => _$LateInteractionModelType_CustomCopyWithImpl<LateInteractionModelType_Custom>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is LateInteractionModelType_Custom&&(identical(other.modelId, modelId) || other.modelId == modelId)&&(identical(other.modelFile, modelFile) || other.modelFile == modelFile)&&const DeepCollectionEquality().equals(other._additionalFiles, _additionalFiles)&&(identical(other.maxLength, maxLength) || other.maxLength == maxLength));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,modelId,modelFile,const DeepCollectionEquality().hash(_additionalFiles),maxLength);
+
+@override
+String toString() {
+  return 'LateInteractionModelType.custom(modelId: $modelId, modelFile: $modelFile, additionalFiles: $additionalFiles, maxLength: $maxLength)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $LateInteractionModelType_CustomCopyWith<$Res> implements $LateInteractionModelTypeCopyWith<$Res> {
+  factory $LateInteractionModelType_CustomCopyWith(LateInteractionModelType_Custom value, $Res Function(LateInteractionModelType_Custom) _then) = _$LateInteractionModelType_CustomCopyWithImpl;
+@useResult
+$Res call({
+ String modelId, String modelFile, List<String> additionalFiles, PlatformInt64 maxLength
+});
+
+
+
+
+}
+/// @nodoc
+class _$LateInteractionModelType_CustomCopyWithImpl<$Res>
+    implements $LateInteractionModelType_CustomCopyWith<$Res> {
+  _$LateInteractionModelType_CustomCopyWithImpl(this._self, this._then);
+
+  final LateInteractionModelType_Custom _self;
+  final $Res Function(LateInteractionModelType_Custom) _then;
+
+/// Create a copy of LateInteractionModelType
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? modelId = null,Object? modelFile = null,Object? additionalFiles = null,Object? maxLength = null,}) {
+  return _then(LateInteractionModelType_Custom(
+modelId: null == modelId ? _self.modelId : modelId // ignore: cast_nullable_to_non_nullable
+as String,modelFile: null == modelFile ? _self.modelFile : modelFile // ignore: cast_nullable_to_non_nullable
+as String,additionalFiles: null == additionalFiles ? _self._additionalFiles : additionalFiles // ignore: cast_nullable_to_non_nullable
+as List<String>,maxLength: null == maxLength ? _self.maxLength : maxLength // ignore: cast_nullable_to_non_nullable
+as PlatformInt64,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class LateInteractionModelType_Plugin extends LateInteractionModelType {
+  const LateInteractionModelType_Plugin({required this.name}): super._();
+
+
+/// Name the backend was registered under.
+ final  String name;
+
+/// Create a copy of LateInteractionModelType
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$LateInteractionModelType_PluginCopyWith<LateInteractionModelType_Plugin> get copyWith => _$LateInteractionModelType_PluginCopyWithImpl<LateInteractionModelType_Plugin>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is LateInteractionModelType_Plugin&&(identical(other.name, name) || other.name == name));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,name);
+
+@override
+String toString() {
+  return 'LateInteractionModelType.plugin(name: $name)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $LateInteractionModelType_PluginCopyWith<$Res> implements $LateInteractionModelTypeCopyWith<$Res> {
+  factory $LateInteractionModelType_PluginCopyWith(LateInteractionModelType_Plugin value, $Res Function(LateInteractionModelType_Plugin) _then) = _$LateInteractionModelType_PluginCopyWithImpl;
+@useResult
+$Res call({
+ String name
+});
+
+
+
+
+}
+/// @nodoc
+class _$LateInteractionModelType_PluginCopyWithImpl<$Res>
+    implements $LateInteractionModelType_PluginCopyWith<$Res> {
+  _$LateInteractionModelType_PluginCopyWithImpl(this._self, this._then);
+
+  final LateInteractionModelType_Plugin _self;
+  final $Res Function(LateInteractionModelType_Plugin) _then;
+
+/// Create a copy of LateInteractionModelType
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? name = null,}) {
+  return _then(LateInteractionModelType_Plugin(
+name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
 
 /// @nodoc
 mixin _$LoadError {
@@ -6875,7 +8162,7 @@ extension NodeContentPatterns on NodeContent {
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( NodeContent_Title value)?  title,TResult Function( NodeContent_Heading value)?  heading,TResult Function( NodeContent_Paragraph value)?  paragraph,TResult Function( NodeContent_List value)?  list,TResult Function( NodeContent_ListItem value)?  listItem,TResult Function( NodeContent_Table value)?  table,TResult Function( NodeContent_Image value)?  image,TResult Function( NodeContent_Code value)?  code,TResult Function( NodeContent_Quote value)?  quote,TResult Function( NodeContent_Formula value)?  formula,TResult Function( NodeContent_Footnote value)?  footnote,TResult Function( NodeContent_Group value)?  group,TResult Function( NodeContent_PageBreak value)?  pageBreak,TResult Function( NodeContent_Slide value)?  slide,TResult Function( NodeContent_DefinitionList value)?  definitionList,TResult Function( NodeContent_DefinitionItem value)?  definitionItem,TResult Function( NodeContent_Citation value)?  citation,TResult Function( NodeContent_Admonition value)?  admonition,TResult Function( NodeContent_RawBlock value)?  rawBlock,TResult Function( NodeContent_MetadataBlock value)?  metadataBlock,required TResult orElse(),}){
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( NodeContent_Title value)?  title,TResult Function( NodeContent_Heading value)?  heading,TResult Function( NodeContent_Paragraph value)?  paragraph,TResult Function( NodeContent_List value)?  list,TResult Function( NodeContent_ListItem value)?  listItem,TResult Function( NodeContent_Table value)?  table,TResult Function( NodeContent_Image value)?  image,TResult Function( NodeContent_Code value)?  code,TResult Function( NodeContent_Quote value)?  quote,TResult Function( NodeContent_Formula value)?  formula,TResult Function( NodeContent_Footnote value)?  footnote,TResult Function( NodeContent_Comment value)?  comment,TResult Function( NodeContent_Group value)?  group,TResult Function( NodeContent_PageBreak value)?  pageBreak,TResult Function( NodeContent_Slide value)?  slide,TResult Function( NodeContent_DefinitionList value)?  definitionList,TResult Function( NodeContent_DefinitionItem value)?  definitionItem,TResult Function( NodeContent_Citation value)?  citation,TResult Function( NodeContent_Admonition value)?  admonition,TResult Function( NodeContent_RawBlock value)?  rawBlock,TResult Function( NodeContent_MetadataBlock value)?  metadataBlock,required TResult orElse(),}){
 final _that = this;
 switch (_that) {
 case NodeContent_Title() when title != null:
@@ -6889,7 +8176,8 @@ return image(_that);case NodeContent_Code() when code != null:
 return code(_that);case NodeContent_Quote() when quote != null:
 return quote(_that);case NodeContent_Formula() when formula != null:
 return formula(_that);case NodeContent_Footnote() when footnote != null:
-return footnote(_that);case NodeContent_Group() when group != null:
+return footnote(_that);case NodeContent_Comment() when comment != null:
+return comment(_that);case NodeContent_Group() when group != null:
 return group(_that);case NodeContent_PageBreak() when pageBreak != null:
 return pageBreak(_that);case NodeContent_Slide() when slide != null:
 return slide(_that);case NodeContent_DefinitionList() when definitionList != null:
@@ -6916,7 +8204,7 @@ return metadataBlock(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( NodeContent_Title value)  title,required TResult Function( NodeContent_Heading value)  heading,required TResult Function( NodeContent_Paragraph value)  paragraph,required TResult Function( NodeContent_List value)  list,required TResult Function( NodeContent_ListItem value)  listItem,required TResult Function( NodeContent_Table value)  table,required TResult Function( NodeContent_Image value)  image,required TResult Function( NodeContent_Code value)  code,required TResult Function( NodeContent_Quote value)  quote,required TResult Function( NodeContent_Formula value)  formula,required TResult Function( NodeContent_Footnote value)  footnote,required TResult Function( NodeContent_Group value)  group,required TResult Function( NodeContent_PageBreak value)  pageBreak,required TResult Function( NodeContent_Slide value)  slide,required TResult Function( NodeContent_DefinitionList value)  definitionList,required TResult Function( NodeContent_DefinitionItem value)  definitionItem,required TResult Function( NodeContent_Citation value)  citation,required TResult Function( NodeContent_Admonition value)  admonition,required TResult Function( NodeContent_RawBlock value)  rawBlock,required TResult Function( NodeContent_MetadataBlock value)  metadataBlock,}){
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( NodeContent_Title value)  title,required TResult Function( NodeContent_Heading value)  heading,required TResult Function( NodeContent_Paragraph value)  paragraph,required TResult Function( NodeContent_List value)  list,required TResult Function( NodeContent_ListItem value)  listItem,required TResult Function( NodeContent_Table value)  table,required TResult Function( NodeContent_Image value)  image,required TResult Function( NodeContent_Code value)  code,required TResult Function( NodeContent_Quote value)  quote,required TResult Function( NodeContent_Formula value)  formula,required TResult Function( NodeContent_Footnote value)  footnote,required TResult Function( NodeContent_Comment value)  comment,required TResult Function( NodeContent_Group value)  group,required TResult Function( NodeContent_PageBreak value)  pageBreak,required TResult Function( NodeContent_Slide value)  slide,required TResult Function( NodeContent_DefinitionList value)  definitionList,required TResult Function( NodeContent_DefinitionItem value)  definitionItem,required TResult Function( NodeContent_Citation value)  citation,required TResult Function( NodeContent_Admonition value)  admonition,required TResult Function( NodeContent_RawBlock value)  rawBlock,required TResult Function( NodeContent_MetadataBlock value)  metadataBlock,}){
 final _that = this;
 switch (_that) {
 case NodeContent_Title():
@@ -6930,7 +8218,8 @@ return image(_that);case NodeContent_Code():
 return code(_that);case NodeContent_Quote():
 return quote(_that);case NodeContent_Formula():
 return formula(_that);case NodeContent_Footnote():
-return footnote(_that);case NodeContent_Group():
+return footnote(_that);case NodeContent_Comment():
+return comment(_that);case NodeContent_Group():
 return group(_that);case NodeContent_PageBreak():
 return pageBreak(_that);case NodeContent_Slide():
 return slide(_that);case NodeContent_DefinitionList():
@@ -6953,7 +8242,7 @@ return metadataBlock(_that);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( NodeContent_Title value)?  title,TResult? Function( NodeContent_Heading value)?  heading,TResult? Function( NodeContent_Paragraph value)?  paragraph,TResult? Function( NodeContent_List value)?  list,TResult? Function( NodeContent_ListItem value)?  listItem,TResult? Function( NodeContent_Table value)?  table,TResult? Function( NodeContent_Image value)?  image,TResult? Function( NodeContent_Code value)?  code,TResult? Function( NodeContent_Quote value)?  quote,TResult? Function( NodeContent_Formula value)?  formula,TResult? Function( NodeContent_Footnote value)?  footnote,TResult? Function( NodeContent_Group value)?  group,TResult? Function( NodeContent_PageBreak value)?  pageBreak,TResult? Function( NodeContent_Slide value)?  slide,TResult? Function( NodeContent_DefinitionList value)?  definitionList,TResult? Function( NodeContent_DefinitionItem value)?  definitionItem,TResult? Function( NodeContent_Citation value)?  citation,TResult? Function( NodeContent_Admonition value)?  admonition,TResult? Function( NodeContent_RawBlock value)?  rawBlock,TResult? Function( NodeContent_MetadataBlock value)?  metadataBlock,}){
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( NodeContent_Title value)?  title,TResult? Function( NodeContent_Heading value)?  heading,TResult? Function( NodeContent_Paragraph value)?  paragraph,TResult? Function( NodeContent_List value)?  list,TResult? Function( NodeContent_ListItem value)?  listItem,TResult? Function( NodeContent_Table value)?  table,TResult? Function( NodeContent_Image value)?  image,TResult? Function( NodeContent_Code value)?  code,TResult? Function( NodeContent_Quote value)?  quote,TResult? Function( NodeContent_Formula value)?  formula,TResult? Function( NodeContent_Footnote value)?  footnote,TResult? Function( NodeContent_Comment value)?  comment,TResult? Function( NodeContent_Group value)?  group,TResult? Function( NodeContent_PageBreak value)?  pageBreak,TResult? Function( NodeContent_Slide value)?  slide,TResult? Function( NodeContent_DefinitionList value)?  definitionList,TResult? Function( NodeContent_DefinitionItem value)?  definitionItem,TResult? Function( NodeContent_Citation value)?  citation,TResult? Function( NodeContent_Admonition value)?  admonition,TResult? Function( NodeContent_RawBlock value)?  rawBlock,TResult? Function( NodeContent_MetadataBlock value)?  metadataBlock,}){
 final _that = this;
 switch (_that) {
 case NodeContent_Title() when title != null:
@@ -6967,7 +8256,8 @@ return image(_that);case NodeContent_Code() when code != null:
 return code(_that);case NodeContent_Quote() when quote != null:
 return quote(_that);case NodeContent_Formula() when formula != null:
 return formula(_that);case NodeContent_Footnote() when footnote != null:
-return footnote(_that);case NodeContent_Group() when group != null:
+return footnote(_that);case NodeContent_Comment() when comment != null:
+return comment(_that);case NodeContent_Group() when group != null:
 return group(_that);case NodeContent_PageBreak() when pageBreak != null:
 return pageBreak(_that);case NodeContent_Slide() when slide != null:
 return slide(_that);case NodeContent_DefinitionList() when definitionList != null:
@@ -6993,7 +8283,7 @@ return metadataBlock(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String text)?  title,TResult Function( PlatformInt64 level,  String text)?  heading,TResult Function( String text)?  paragraph,TResult Function( bool ordered)?  list,TResult Function( String text)?  listItem,TResult Function( TableGrid grid)?  table,TResult Function( String description,  PlatformInt64 imageIndex,  String src)?  image,TResult Function( String text,  String language)?  code,TResult Function()?  quote,TResult Function( String text)?  formula,TResult Function( String text)?  footnote,TResult Function( String label,  PlatformInt64 headingLevel,  String headingText)?  group,TResult Function()?  pageBreak,TResult Function( PlatformInt64 number,  String title)?  slide,TResult Function()?  definitionList,TResult Function( String term,  String definition)?  definitionItem,TResult Function( String key,  String text)?  citation,TResult Function( String kind,  String title)?  admonition,TResult Function( String format,  String content)?  rawBlock,TResult Function()?  metadataBlock,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String text)?  title,TResult Function( PlatformInt64 level,  String text)?  heading,TResult Function( String text)?  paragraph,TResult Function( bool ordered)?  list,TResult Function( String text)?  listItem,TResult Function( TableGrid grid)?  table,TResult Function( String description,  PlatformInt64 imageIndex,  String src)?  image,TResult Function( String text,  String language)?  code,TResult Function()?  quote,TResult Function( String text)?  formula,TResult Function( String text)?  footnote,TResult Function( String text)?  comment,TResult Function( String label,  PlatformInt64 headingLevel,  String headingText)?  group,TResult Function()?  pageBreak,TResult Function( PlatformInt64 number,  String title)?  slide,TResult Function()?  definitionList,TResult Function( String term,  String definition)?  definitionItem,TResult Function( String key,  String text)?  citation,TResult Function( String kind,  String title)?  admonition,TResult Function( String format,  String content)?  rawBlock,TResult Function()?  metadataBlock,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case NodeContent_Title() when title != null:
 return title(_that.text);case NodeContent_Heading() when heading != null:
@@ -7006,7 +8296,8 @@ return image(_that.description,_that.imageIndex,_that.src);case NodeContent_Code
 return code(_that.text,_that.language);case NodeContent_Quote() when quote != null:
 return quote();case NodeContent_Formula() when formula != null:
 return formula(_that.text);case NodeContent_Footnote() when footnote != null:
-return footnote(_that.text);case NodeContent_Group() when group != null:
+return footnote(_that.text);case NodeContent_Comment() when comment != null:
+return comment(_that.text);case NodeContent_Group() when group != null:
 return group(_that.label,_that.headingLevel,_that.headingText);case NodeContent_PageBreak() when pageBreak != null:
 return pageBreak();case NodeContent_Slide() when slide != null:
 return slide(_that.number,_that.title);case NodeContent_DefinitionList() when definitionList != null:
@@ -7033,7 +8324,7 @@ return metadataBlock();case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String text)  title,required TResult Function( PlatformInt64 level,  String text)  heading,required TResult Function( String text)  paragraph,required TResult Function( bool ordered)  list,required TResult Function( String text)  listItem,required TResult Function( TableGrid grid)  table,required TResult Function( String description,  PlatformInt64 imageIndex,  String src)  image,required TResult Function( String text,  String language)  code,required TResult Function()  quote,required TResult Function( String text)  formula,required TResult Function( String text)  footnote,required TResult Function( String label,  PlatformInt64 headingLevel,  String headingText)  group,required TResult Function()  pageBreak,required TResult Function( PlatformInt64 number,  String title)  slide,required TResult Function()  definitionList,required TResult Function( String term,  String definition)  definitionItem,required TResult Function( String key,  String text)  citation,required TResult Function( String kind,  String title)  admonition,required TResult Function( String format,  String content)  rawBlock,required TResult Function()  metadataBlock,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String text)  title,required TResult Function( PlatformInt64 level,  String text)  heading,required TResult Function( String text)  paragraph,required TResult Function( bool ordered)  list,required TResult Function( String text)  listItem,required TResult Function( TableGrid grid)  table,required TResult Function( String description,  PlatformInt64 imageIndex,  String src)  image,required TResult Function( String text,  String language)  code,required TResult Function()  quote,required TResult Function( String text)  formula,required TResult Function( String text)  footnote,required TResult Function( String text)  comment,required TResult Function( String label,  PlatformInt64 headingLevel,  String headingText)  group,required TResult Function()  pageBreak,required TResult Function( PlatformInt64 number,  String title)  slide,required TResult Function()  definitionList,required TResult Function( String term,  String definition)  definitionItem,required TResult Function( String key,  String text)  citation,required TResult Function( String kind,  String title)  admonition,required TResult Function( String format,  String content)  rawBlock,required TResult Function()  metadataBlock,}) {final _that = this;
 switch (_that) {
 case NodeContent_Title():
 return title(_that.text);case NodeContent_Heading():
@@ -7046,7 +8337,8 @@ return image(_that.description,_that.imageIndex,_that.src);case NodeContent_Code
 return code(_that.text,_that.language);case NodeContent_Quote():
 return quote();case NodeContent_Formula():
 return formula(_that.text);case NodeContent_Footnote():
-return footnote(_that.text);case NodeContent_Group():
+return footnote(_that.text);case NodeContent_Comment():
+return comment(_that.text);case NodeContent_Group():
 return group(_that.label,_that.headingLevel,_that.headingText);case NodeContent_PageBreak():
 return pageBreak();case NodeContent_Slide():
 return slide(_that.number,_that.title);case NodeContent_DefinitionList():
@@ -7069,7 +8361,7 @@ return metadataBlock();}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String text)?  title,TResult? Function( PlatformInt64 level,  String text)?  heading,TResult? Function( String text)?  paragraph,TResult? Function( bool ordered)?  list,TResult? Function( String text)?  listItem,TResult? Function( TableGrid grid)?  table,TResult? Function( String description,  PlatformInt64 imageIndex,  String src)?  image,TResult? Function( String text,  String language)?  code,TResult? Function()?  quote,TResult? Function( String text)?  formula,TResult? Function( String text)?  footnote,TResult? Function( String label,  PlatformInt64 headingLevel,  String headingText)?  group,TResult? Function()?  pageBreak,TResult? Function( PlatformInt64 number,  String title)?  slide,TResult? Function()?  definitionList,TResult? Function( String term,  String definition)?  definitionItem,TResult? Function( String key,  String text)?  citation,TResult? Function( String kind,  String title)?  admonition,TResult? Function( String format,  String content)?  rawBlock,TResult? Function()?  metadataBlock,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String text)?  title,TResult? Function( PlatformInt64 level,  String text)?  heading,TResult? Function( String text)?  paragraph,TResult? Function( bool ordered)?  list,TResult? Function( String text)?  listItem,TResult? Function( TableGrid grid)?  table,TResult? Function( String description,  PlatformInt64 imageIndex,  String src)?  image,TResult? Function( String text,  String language)?  code,TResult? Function()?  quote,TResult? Function( String text)?  formula,TResult? Function( String text)?  footnote,TResult? Function( String text)?  comment,TResult? Function( String label,  PlatformInt64 headingLevel,  String headingText)?  group,TResult? Function()?  pageBreak,TResult? Function( PlatformInt64 number,  String title)?  slide,TResult? Function()?  definitionList,TResult? Function( String term,  String definition)?  definitionItem,TResult? Function( String key,  String text)?  citation,TResult? Function( String kind,  String title)?  admonition,TResult? Function( String format,  String content)?  rawBlock,TResult? Function()?  metadataBlock,}) {final _that = this;
 switch (_that) {
 case NodeContent_Title() when title != null:
 return title(_that.text);case NodeContent_Heading() when heading != null:
@@ -7082,7 +8374,8 @@ return image(_that.description,_that.imageIndex,_that.src);case NodeContent_Code
 return code(_that.text,_that.language);case NodeContent_Quote() when quote != null:
 return quote();case NodeContent_Formula() when formula != null:
 return formula(_that.text);case NodeContent_Footnote() when footnote != null:
-return footnote(_that.text);case NodeContent_Group() when group != null:
+return footnote(_that.text);case NodeContent_Comment() when comment != null:
+return comment(_that.text);case NodeContent_Group() when group != null:
 return group(_that.label,_that.headingLevel,_that.headingText);case NodeContent_PageBreak() when pageBreak != null:
 return pageBreak();case NodeContent_Slide() when slide != null:
 return slide(_that.number,_that.title);case NodeContent_DefinitionList() when definitionList != null:
@@ -7805,6 +9098,73 @@ class _$NodeContent_FootnoteCopyWithImpl<$Res>
 /// with the given fields replaced by the non-null parameter values.
 @pragma('vm:prefer-inline') $Res call({Object? text = null,}) {
   return _then(NodeContent_Footnote(
+text: null == text ? _self.text : text // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class NodeContent_Comment extends NodeContent {
+  const NodeContent_Comment({required this.text}): super._();
+
+
+/// The comment body text.
+ final  String text;
+
+/// Create a copy of NodeContent
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$NodeContent_CommentCopyWith<NodeContent_Comment> get copyWith => _$NodeContent_CommentCopyWithImpl<NodeContent_Comment>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is NodeContent_Comment&&(identical(other.text, text) || other.text == text));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,text);
+
+@override
+String toString() {
+  return 'NodeContent.comment(text: $text)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $NodeContent_CommentCopyWith<$Res> implements $NodeContentCopyWith<$Res> {
+  factory $NodeContent_CommentCopyWith(NodeContent_Comment value, $Res Function(NodeContent_Comment) _then) = _$NodeContent_CommentCopyWithImpl;
+@useResult
+$Res call({
+ String text
+});
+
+
+
+
+}
+/// @nodoc
+class _$NodeContent_CommentCopyWithImpl<$Res>
+    implements $NodeContent_CommentCopyWith<$Res> {
+  _$NodeContent_CommentCopyWithImpl(this._self, this._then);
+
+  final NodeContent_Comment _self;
+  final $Res Function(NodeContent_Comment) _then;
+
+/// Create a copy of NodeContent
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? text = null,}) {
+  return _then(NodeContent_Comment(
 text: null == text ? _self.text : text // ignore: cast_nullable_to_non_nullable
 as String,
   ));
@@ -8601,6 +9961,266 @@ String toString() {
 
 
 /// @nodoc
+mixin _$OcrStrategy {
+
+
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is OcrStrategy);
+}
+
+
+@override
+int get hashCode => runtimeType.hashCode;
+
+@override
+String toString() {
+  return 'OcrStrategy()';
+}
+
+
+}
+
+/// @nodoc
+class $OcrStrategyCopyWith<$Res>  {
+$OcrStrategyCopyWith(OcrStrategy _, $Res Function(OcrStrategy) __);
+}
+
+
+/// Adds pattern-matching-related methods to [OcrStrategy].
+extension OcrStrategyPatterns on OcrStrategy {
+/// A variant of `map` that fallback to returning `orElse`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( OcrStrategy_Auto value)?  auto,TResult Function( OcrStrategy_ScannedPages value)?  scannedPages,required TResult orElse(),}){
+final _that = this;
+switch (_that) {
+case OcrStrategy_Auto() when auto != null:
+return auto(_that);case OcrStrategy_ScannedPages() when scannedPages != null:
+return scannedPages(_that);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// Callbacks receives the raw object, upcasted.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case final Subclass2 value:
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( OcrStrategy_Auto value)  auto,required TResult Function( OcrStrategy_ScannedPages value)  scannedPages,}){
+final _that = this;
+switch (_that) {
+case OcrStrategy_Auto():
+return auto(_that);case OcrStrategy_ScannedPages():
+return scannedPages(_that);}
+}
+/// A variant of `map` that fallback to returning `null`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( OcrStrategy_Auto value)?  auto,TResult? Function( OcrStrategy_ScannedPages value)?  scannedPages,}){
+final _that = this;
+switch (_that) {
+case OcrStrategy_Auto() when auto != null:
+return auto(_that);case OcrStrategy_ScannedPages() when scannedPages != null:
+return scannedPages(_that);case _:
+  return null;
+
+}
+}
+/// A variant of `when` that fallback to an `orElse` callback.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  auto,TResult Function( double minConfidence)?  scannedPages,required TResult orElse(),}) {final _that = this;
+switch (_that) {
+case OcrStrategy_Auto() when auto != null:
+return auto();case OcrStrategy_ScannedPages() when scannedPages != null:
+return scannedPages(_that.minConfidence);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// As opposed to `map`, this offers destructuring.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case Subclass2(:final field2):
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  auto,required TResult Function( double minConfidence)  scannedPages,}) {final _that = this;
+switch (_that) {
+case OcrStrategy_Auto():
+return auto();case OcrStrategy_ScannedPages():
+return scannedPages(_that.minConfidence);}
+}
+/// A variant of `when` that fallback to returning `null`
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  auto,TResult? Function( double minConfidence)?  scannedPages,}) {final _that = this;
+switch (_that) {
+case OcrStrategy_Auto() when auto != null:
+return auto();case OcrStrategy_ScannedPages() when scannedPages != null:
+return scannedPages(_that.minConfidence);case _:
+  return null;
+
+}
+}
+
+}
+
+/// @nodoc
+
+
+class OcrStrategy_Auto extends OcrStrategy {
+  const OcrStrategy_Auto(): super._();
+
+
+
+
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is OcrStrategy_Auto);
+}
+
+
+@override
+int get hashCode => runtimeType.hashCode;
+
+@override
+String toString() {
+  return 'OcrStrategy.auto()';
+}
+
+
+}
+
+
+
+
+/// @nodoc
+
+
+class OcrStrategy_ScannedPages extends OcrStrategy {
+  const OcrStrategy_ScannedPages({required this.minConfidence}): super._();
+
+
+/// Minimum scan confidence, in `[0.0, 1.0]`. Values outside the range are
+/// clamped. See [`DEFAULT_SCANNED_MIN_CONFIDENCE`] for how to pick one.
+ final  double minConfidence;
+
+/// Create a copy of OcrStrategy
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$OcrStrategy_ScannedPagesCopyWith<OcrStrategy_ScannedPages> get copyWith => _$OcrStrategy_ScannedPagesCopyWithImpl<OcrStrategy_ScannedPages>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is OcrStrategy_ScannedPages&&(identical(other.minConfidence, minConfidence) || other.minConfidence == minConfidence));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,minConfidence);
+
+@override
+String toString() {
+  return 'OcrStrategy.scannedPages(minConfidence: $minConfidence)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $OcrStrategy_ScannedPagesCopyWith<$Res> implements $OcrStrategyCopyWith<$Res> {
+  factory $OcrStrategy_ScannedPagesCopyWith(OcrStrategy_ScannedPages value, $Res Function(OcrStrategy_ScannedPages) _then) = _$OcrStrategy_ScannedPagesCopyWithImpl;
+@useResult
+$Res call({
+ double minConfidence
+});
+
+
+
+
+}
+/// @nodoc
+class _$OcrStrategy_ScannedPagesCopyWithImpl<$Res>
+    implements $OcrStrategy_ScannedPagesCopyWith<$Res> {
+  _$OcrStrategy_ScannedPagesCopyWithImpl(this._self, this._then);
+
+  final OcrStrategy_ScannedPages _self;
+  final $Res Function(OcrStrategy_ScannedPages) _then;
+
+/// Create a copy of OcrStrategy
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? minConfidence = null,}) {
+  return _then(OcrStrategy_ScannedPages(
+minConfidence: null == minConfidence ? _self.minConfidence : minConfidence // ignore: cast_nullable_to_non_nullable
+as double,
+  ));
+}
+
+
+}
+
+/// @nodoc
 mixin _$OutputFormat {
 
 
@@ -8644,7 +10264,7 @@ extension OutputFormatPatterns on OutputFormat {
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( OutputFormat_Plain value)?  plain,TResult Function( OutputFormat_Markdown value)?  markdown,TResult Function( OutputFormat_Djot value)?  djot,TResult Function( OutputFormat_Html value)?  html,TResult Function( OutputFormat_Json value)?  json,TResult Function( OutputFormat_Structured value)?  structured,TResult Function( OutputFormat_Custom value)?  custom,required TResult orElse(),}){
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( OutputFormat_Plain value)?  plain,TResult Function( OutputFormat_Markdown value)?  markdown,TResult Function( OutputFormat_Djot value)?  djot,TResult Function( OutputFormat_Html value)?  html,TResult Function( OutputFormat_Json value)?  json,TResult Function( OutputFormat_Structured value)?  structured,TResult Function( OutputFormat_DocTags value)?  docTags,TResult Function( OutputFormat_Custom value)?  custom,required TResult orElse(),}){
 final _that = this;
 switch (_that) {
 case OutputFormat_Plain() when plain != null:
@@ -8653,7 +10273,8 @@ return markdown(_that);case OutputFormat_Djot() when djot != null:
 return djot(_that);case OutputFormat_Html() when html != null:
 return html(_that);case OutputFormat_Json() when json != null:
 return json(_that);case OutputFormat_Structured() when structured != null:
-return structured(_that);case OutputFormat_Custom() when custom != null:
+return structured(_that);case OutputFormat_DocTags() when docTags != null:
+return docTags(_that);case OutputFormat_Custom() when custom != null:
 return custom(_that);case _:
   return orElse();
 
@@ -8672,7 +10293,7 @@ return custom(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( OutputFormat_Plain value)  plain,required TResult Function( OutputFormat_Markdown value)  markdown,required TResult Function( OutputFormat_Djot value)  djot,required TResult Function( OutputFormat_Html value)  html,required TResult Function( OutputFormat_Json value)  json,required TResult Function( OutputFormat_Structured value)  structured,required TResult Function( OutputFormat_Custom value)  custom,}){
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( OutputFormat_Plain value)  plain,required TResult Function( OutputFormat_Markdown value)  markdown,required TResult Function( OutputFormat_Djot value)  djot,required TResult Function( OutputFormat_Html value)  html,required TResult Function( OutputFormat_Json value)  json,required TResult Function( OutputFormat_Structured value)  structured,required TResult Function( OutputFormat_DocTags value)  docTags,required TResult Function( OutputFormat_Custom value)  custom,}){
 final _that = this;
 switch (_that) {
 case OutputFormat_Plain():
@@ -8681,7 +10302,8 @@ return markdown(_that);case OutputFormat_Djot():
 return djot(_that);case OutputFormat_Html():
 return html(_that);case OutputFormat_Json():
 return json(_that);case OutputFormat_Structured():
-return structured(_that);case OutputFormat_Custom():
+return structured(_that);case OutputFormat_DocTags():
+return docTags(_that);case OutputFormat_Custom():
 return custom(_that);}
 }
 /// A variant of `map` that fallback to returning `null`.
@@ -8696,7 +10318,7 @@ return custom(_that);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( OutputFormat_Plain value)?  plain,TResult? Function( OutputFormat_Markdown value)?  markdown,TResult? Function( OutputFormat_Djot value)?  djot,TResult? Function( OutputFormat_Html value)?  html,TResult? Function( OutputFormat_Json value)?  json,TResult? Function( OutputFormat_Structured value)?  structured,TResult? Function( OutputFormat_Custom value)?  custom,}){
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( OutputFormat_Plain value)?  plain,TResult? Function( OutputFormat_Markdown value)?  markdown,TResult? Function( OutputFormat_Djot value)?  djot,TResult? Function( OutputFormat_Html value)?  html,TResult? Function( OutputFormat_Json value)?  json,TResult? Function( OutputFormat_Structured value)?  structured,TResult? Function( OutputFormat_DocTags value)?  docTags,TResult? Function( OutputFormat_Custom value)?  custom,}){
 final _that = this;
 switch (_that) {
 case OutputFormat_Plain() when plain != null:
@@ -8705,7 +10327,8 @@ return markdown(_that);case OutputFormat_Djot() when djot != null:
 return djot(_that);case OutputFormat_Html() when html != null:
 return html(_that);case OutputFormat_Json() when json != null:
 return json(_that);case OutputFormat_Structured() when structured != null:
-return structured(_that);case OutputFormat_Custom() when custom != null:
+return structured(_that);case OutputFormat_DocTags() when docTags != null:
+return docTags(_that);case OutputFormat_Custom() when custom != null:
 return custom(_that);case _:
   return null;
 
@@ -8723,7 +10346,7 @@ return custom(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  plain,TResult Function()?  markdown,TResult Function()?  djot,TResult Function()?  html,TResult Function()?  json,TResult Function()?  structured,TResult Function( String field0)?  custom,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  plain,TResult Function()?  markdown,TResult Function()?  djot,TResult Function()?  html,TResult Function()?  json,TResult Function()?  structured,TResult Function()?  docTags,TResult Function( String field0)?  custom,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case OutputFormat_Plain() when plain != null:
 return plain();case OutputFormat_Markdown() when markdown != null:
@@ -8731,7 +10354,8 @@ return markdown();case OutputFormat_Djot() when djot != null:
 return djot();case OutputFormat_Html() when html != null:
 return html();case OutputFormat_Json() when json != null:
 return json();case OutputFormat_Structured() when structured != null:
-return structured();case OutputFormat_Custom() when custom != null:
+return structured();case OutputFormat_DocTags() when docTags != null:
+return docTags();case OutputFormat_Custom() when custom != null:
 return custom(_that.field0);case _:
   return orElse();
 
@@ -8750,7 +10374,7 @@ return custom(_that.field0);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  plain,required TResult Function()  markdown,required TResult Function()  djot,required TResult Function()  html,required TResult Function()  json,required TResult Function()  structured,required TResult Function( String field0)  custom,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  plain,required TResult Function()  markdown,required TResult Function()  djot,required TResult Function()  html,required TResult Function()  json,required TResult Function()  structured,required TResult Function()  docTags,required TResult Function( String field0)  custom,}) {final _that = this;
 switch (_that) {
 case OutputFormat_Plain():
 return plain();case OutputFormat_Markdown():
@@ -8758,7 +10382,8 @@ return markdown();case OutputFormat_Djot():
 return djot();case OutputFormat_Html():
 return html();case OutputFormat_Json():
 return json();case OutputFormat_Structured():
-return structured();case OutputFormat_Custom():
+return structured();case OutputFormat_DocTags():
+return docTags();case OutputFormat_Custom():
 return custom(_that.field0);}
 }
 /// A variant of `when` that fallback to returning `null`
@@ -8773,7 +10398,7 @@ return custom(_that.field0);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  plain,TResult? Function()?  markdown,TResult? Function()?  djot,TResult? Function()?  html,TResult? Function()?  json,TResult? Function()?  structured,TResult? Function( String field0)?  custom,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  plain,TResult? Function()?  markdown,TResult? Function()?  djot,TResult? Function()?  html,TResult? Function()?  json,TResult? Function()?  structured,TResult? Function()?  docTags,TResult? Function( String field0)?  custom,}) {final _that = this;
 switch (_that) {
 case OutputFormat_Plain() when plain != null:
 return plain();case OutputFormat_Markdown() when markdown != null:
@@ -8781,7 +10406,8 @@ return markdown();case OutputFormat_Djot() when djot != null:
 return djot();case OutputFormat_Html() when html != null:
 return html();case OutputFormat_Json() when json != null:
 return json();case OutputFormat_Structured() when structured != null:
-return structured();case OutputFormat_Custom() when custom != null:
+return structured();case OutputFormat_DocTags() when docTags != null:
+return docTags();case OutputFormat_Custom() when custom != null:
 return custom(_that.field0);case _:
   return null;
 
@@ -8974,6 +10600,38 @@ int get hashCode => runtimeType.hashCode;
 @override
 String toString() {
   return 'OutputFormat.structured()';
+}
+
+
+}
+
+
+
+
+/// @nodoc
+
+
+class OutputFormat_DocTags extends OutputFormat {
+  const OutputFormat_DocTags(): super._();
+
+
+
+
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is OutputFormat_DocTags);
+}
+
+
+@override
+int get hashCode => runtimeType.hashCode;
+
+@override
+String toString() {
+  return 'OutputFormat.docTags()';
 }
 
 
@@ -9838,11 +11496,11 @@ return plugin(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String name)?  preset,TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)?  custom,TResult Function( LlmConfig llm)?  llm,TResult Function( String name)?  plugin,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String name)?  preset,TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength,  RerankerHead head)?  custom,TResult Function( LlmConfig llm)?  llm,TResult Function( String name)?  plugin,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case RerankerModelType_Preset() when preset != null:
 return preset(_that.name);case RerankerModelType_Custom() when custom != null:
-return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case RerankerModelType_Llm() when llm != null:
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength,_that.head);case RerankerModelType_Llm() when llm != null:
 return llm(_that.llm);case RerankerModelType_Plugin() when plugin != null:
 return plugin(_that.name);case _:
   return orElse();
@@ -9862,11 +11520,11 @@ return plugin(_that.name);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String name)  preset,required TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)  custom,required TResult Function( LlmConfig llm)  llm,required TResult Function( String name)  plugin,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String name)  preset,required TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength,  RerankerHead head)  custom,required TResult Function( LlmConfig llm)  llm,required TResult Function( String name)  plugin,}) {final _that = this;
 switch (_that) {
 case RerankerModelType_Preset():
 return preset(_that.name);case RerankerModelType_Custom():
-return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case RerankerModelType_Llm():
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength,_that.head);case RerankerModelType_Llm():
 return llm(_that.llm);case RerankerModelType_Plugin():
 return plugin(_that.name);}
 }
@@ -9882,11 +11540,11 @@ return plugin(_that.name);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String name)?  preset,TResult? Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)?  custom,TResult? Function( LlmConfig llm)?  llm,TResult? Function( String name)?  plugin,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String name)?  preset,TResult? Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength,  RerankerHead head)?  custom,TResult? Function( LlmConfig llm)?  llm,TResult? Function( String name)?  plugin,}) {final _that = this;
 switch (_that) {
 case RerankerModelType_Preset() when preset != null:
 return preset(_that.name);case RerankerModelType_Custom() when custom != null:
-return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case RerankerModelType_Llm() when llm != null:
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength,_that.head);case RerankerModelType_Llm() when llm != null:
 return llm(_that.llm);case RerankerModelType_Plugin() when plugin != null:
 return plugin(_that.name);case _:
   return null;
@@ -9967,7 +11625,7 @@ as String,
 
 
 class RerankerModelType_Custom extends RerankerModelType {
-  const RerankerModelType_Custom({required this.modelId, required this.modelFile, required final  List<String> additionalFiles, required this.maxLength}): _additionalFiles = additionalFiles,super._();
+  const RerankerModelType_Custom({required this.modelId, required this.modelFile, required final  List<String> additionalFiles, required this.maxLength, required this.head}): _additionalFiles = additionalFiles,super._();
 
 
 /// HuggingFace model repository ID (e.g. "cross-encoder/ms-marco-MiniLM-L6-v2").
@@ -9998,8 +11656,14 @@ class RerankerModelType_Custom extends RerankerModelType {
 /// Maximum token sequence length for the tokenizer.
 ///
 /// Stored as `i64` for FFI compatibility across language bindings.
-/// Treated as a non-negative value; negative values are clamped to the model default.
+/// Must be positive; a non-positive value is rejected with a validation error.
  final  PlatformInt64 maxLength;
+/// Scoring head for the ONNX model's output tensor.
+///
+/// Defaults to [`RerankerHead::CrossEncoder`]. Set to
+/// [`RerankerHead::Qwen3Generative`] for Qwen3 generative-reranker
+/// checkpoints (e.g. `Qwen/Qwen3-Reranker-0.6B`).
+ final  RerankerHead head;
 
 /// Create a copy of RerankerModelType
 /// with the given fields replaced by the non-null parameter values.
@@ -10011,16 +11675,16 @@ $RerankerModelType_CustomCopyWith<RerankerModelType_Custom> get copyWith => _$Re
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is RerankerModelType_Custom&&(identical(other.modelId, modelId) || other.modelId == modelId)&&(identical(other.modelFile, modelFile) || other.modelFile == modelFile)&&const DeepCollectionEquality().equals(other._additionalFiles, _additionalFiles)&&(identical(other.maxLength, maxLength) || other.maxLength == maxLength));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is RerankerModelType_Custom&&(identical(other.modelId, modelId) || other.modelId == modelId)&&(identical(other.modelFile, modelFile) || other.modelFile == modelFile)&&const DeepCollectionEquality().equals(other._additionalFiles, _additionalFiles)&&(identical(other.maxLength, maxLength) || other.maxLength == maxLength)&&(identical(other.head, head) || other.head == head));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,modelId,modelFile,const DeepCollectionEquality().hash(_additionalFiles),maxLength);
+int get hashCode => Object.hash(runtimeType,modelId,modelFile,const DeepCollectionEquality().hash(_additionalFiles),maxLength,head);
 
 @override
 String toString() {
-  return 'RerankerModelType.custom(modelId: $modelId, modelFile: $modelFile, additionalFiles: $additionalFiles, maxLength: $maxLength)';
+  return 'RerankerModelType.custom(modelId: $modelId, modelFile: $modelFile, additionalFiles: $additionalFiles, maxLength: $maxLength, head: $head)';
 }
 
 
@@ -10031,7 +11695,7 @@ abstract mixin class $RerankerModelType_CustomCopyWith<$Res> implements $Reranke
   factory $RerankerModelType_CustomCopyWith(RerankerModelType_Custom value, $Res Function(RerankerModelType_Custom) _then) = _$RerankerModelType_CustomCopyWithImpl;
 @useResult
 $Res call({
- String modelId, String modelFile, List<String> additionalFiles, PlatformInt64 maxLength
+ String modelId, String modelFile, List<String> additionalFiles, PlatformInt64 maxLength, RerankerHead head
 });
 
 
@@ -10048,13 +11712,14 @@ class _$RerankerModelType_CustomCopyWithImpl<$Res>
 
 /// Create a copy of RerankerModelType
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') $Res call({Object? modelId = null,Object? modelFile = null,Object? additionalFiles = null,Object? maxLength = null,}) {
+@pragma('vm:prefer-inline') $Res call({Object? modelId = null,Object? modelFile = null,Object? additionalFiles = null,Object? maxLength = null,Object? head = null,}) {
   return _then(RerankerModelType_Custom(
 modelId: null == modelId ? _self.modelId : modelId // ignore: cast_nullable_to_non_nullable
 as String,modelFile: null == modelFile ? _self.modelFile : modelFile // ignore: cast_nullable_to_non_nullable
 as String,additionalFiles: null == additionalFiles ? _self._additionalFiles : additionalFiles // ignore: cast_nullable_to_non_nullable
 as List<String>,maxLength: null == maxLength ? _self.maxLength : maxLength // ignore: cast_nullable_to_non_nullable
-as PlatformInt64,
+as PlatformInt64,head: null == head ? _self.head : head // ignore: cast_nullable_to_non_nullable
+as RerankerHead,
   ));
 }
 
@@ -10069,6 +11734,9 @@ class RerankerModelType_Llm extends RerankerModelType {
 
 
 /// LLM provider configuration specifying the model and API credentials.
+///
+/// Boxed for the same reason as `EmbeddingModelType::Llm` -- kept in step so the two
+/// parallel enums present one shape to the generated bindings. ~keep
  final  LlmConfig llm;
 
 /// Create a copy of RerankerModelType
@@ -10710,6 +12378,390 @@ class _$RevisionAnchor_SheetCopyWithImpl<$Res>
   return _then(RevisionAnchor_Sheet(
 index: null == index ? _self.index : index // ignore: cast_nullable_to_non_nullable
 as PlatformInt64,name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+mixin _$SparseEmbeddingModelType {
+
+
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SparseEmbeddingModelType);
+}
+
+
+@override
+int get hashCode => runtimeType.hashCode;
+
+@override
+String toString() {
+  return 'SparseEmbeddingModelType()';
+}
+
+
+}
+
+/// @nodoc
+class $SparseEmbeddingModelTypeCopyWith<$Res>  {
+$SparseEmbeddingModelTypeCopyWith(SparseEmbeddingModelType _, $Res Function(SparseEmbeddingModelType) __);
+}
+
+
+/// Adds pattern-matching-related methods to [SparseEmbeddingModelType].
+extension SparseEmbeddingModelTypePatterns on SparseEmbeddingModelType {
+/// A variant of `map` that fallback to returning `orElse`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( SparseEmbeddingModelType_Preset value)?  preset,TResult Function( SparseEmbeddingModelType_Custom value)?  custom,TResult Function( SparseEmbeddingModelType_Plugin value)?  plugin,required TResult orElse(),}){
+final _that = this;
+switch (_that) {
+case SparseEmbeddingModelType_Preset() when preset != null:
+return preset(_that);case SparseEmbeddingModelType_Custom() when custom != null:
+return custom(_that);case SparseEmbeddingModelType_Plugin() when plugin != null:
+return plugin(_that);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// Callbacks receives the raw object, upcasted.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case final Subclass2 value:
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( SparseEmbeddingModelType_Preset value)  preset,required TResult Function( SparseEmbeddingModelType_Custom value)  custom,required TResult Function( SparseEmbeddingModelType_Plugin value)  plugin,}){
+final _that = this;
+switch (_that) {
+case SparseEmbeddingModelType_Preset():
+return preset(_that);case SparseEmbeddingModelType_Custom():
+return custom(_that);case SparseEmbeddingModelType_Plugin():
+return plugin(_that);}
+}
+/// A variant of `map` that fallback to returning `null`.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case final Subclass value:
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( SparseEmbeddingModelType_Preset value)?  preset,TResult? Function( SparseEmbeddingModelType_Custom value)?  custom,TResult? Function( SparseEmbeddingModelType_Plugin value)?  plugin,}){
+final _that = this;
+switch (_that) {
+case SparseEmbeddingModelType_Preset() when preset != null:
+return preset(_that);case SparseEmbeddingModelType_Custom() when custom != null:
+return custom(_that);case SparseEmbeddingModelType_Plugin() when plugin != null:
+return plugin(_that);case _:
+  return null;
+
+}
+}
+/// A variant of `when` that fallback to an `orElse` callback.
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return orElse();
+/// }
+/// ```
+
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( String name)?  preset,TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)?  custom,TResult Function( String name)?  plugin,required TResult orElse(),}) {final _that = this;
+switch (_that) {
+case SparseEmbeddingModelType_Preset() when preset != null:
+return preset(_that.name);case SparseEmbeddingModelType_Custom() when custom != null:
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case SparseEmbeddingModelType_Plugin() when plugin != null:
+return plugin(_that.name);case _:
+  return orElse();
+
+}
+}
+/// A `switch`-like method, using callbacks.
+///
+/// As opposed to `map`, this offers destructuring.
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case Subclass2(:final field2):
+///     return ...;
+/// }
+/// ```
+
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( String name)  preset,required TResult Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)  custom,required TResult Function( String name)  plugin,}) {final _that = this;
+switch (_that) {
+case SparseEmbeddingModelType_Preset():
+return preset(_that.name);case SparseEmbeddingModelType_Custom():
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case SparseEmbeddingModelType_Plugin():
+return plugin(_that.name);}
+}
+/// A variant of `when` that fallback to returning `null`
+///
+/// It is equivalent to doing:
+/// ```dart
+/// switch (sealedClass) {
+///   case Subclass(:final field):
+///     return ...;
+///   case _:
+///     return null;
+/// }
+/// ```
+
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( String name)?  preset,TResult? Function( String modelId,  String modelFile,  List<String> additionalFiles,  PlatformInt64 maxLength)?  custom,TResult? Function( String name)?  plugin,}) {final _that = this;
+switch (_that) {
+case SparseEmbeddingModelType_Preset() when preset != null:
+return preset(_that.name);case SparseEmbeddingModelType_Custom() when custom != null:
+return custom(_that.modelId,_that.modelFile,_that.additionalFiles,_that.maxLength);case SparseEmbeddingModelType_Plugin() when plugin != null:
+return plugin(_that.name);case _:
+  return null;
+
+}
+}
+
+}
+
+/// @nodoc
+
+
+class SparseEmbeddingModelType_Preset extends SparseEmbeddingModelType {
+  const SparseEmbeddingModelType_Preset({required this.name}): super._();
+
+
+/// Preset name (e.g. "splade").
+ final  String name;
+
+/// Create a copy of SparseEmbeddingModelType
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SparseEmbeddingModelType_PresetCopyWith<SparseEmbeddingModelType_Preset> get copyWith => _$SparseEmbeddingModelType_PresetCopyWithImpl<SparseEmbeddingModelType_Preset>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SparseEmbeddingModelType_Preset&&(identical(other.name, name) || other.name == name));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,name);
+
+@override
+String toString() {
+  return 'SparseEmbeddingModelType.preset(name: $name)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SparseEmbeddingModelType_PresetCopyWith<$Res> implements $SparseEmbeddingModelTypeCopyWith<$Res> {
+  factory $SparseEmbeddingModelType_PresetCopyWith(SparseEmbeddingModelType_Preset value, $Res Function(SparseEmbeddingModelType_Preset) _then) = _$SparseEmbeddingModelType_PresetCopyWithImpl;
+@useResult
+$Res call({
+ String name
+});
+
+
+
+
+}
+/// @nodoc
+class _$SparseEmbeddingModelType_PresetCopyWithImpl<$Res>
+    implements $SparseEmbeddingModelType_PresetCopyWith<$Res> {
+  _$SparseEmbeddingModelType_PresetCopyWithImpl(this._self, this._then);
+
+  final SparseEmbeddingModelType_Preset _self;
+  final $Res Function(SparseEmbeddingModelType_Preset) _then;
+
+/// Create a copy of SparseEmbeddingModelType
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? name = null,}) {
+  return _then(SparseEmbeddingModelType_Preset(
+name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class SparseEmbeddingModelType_Custom extends SparseEmbeddingModelType {
+  const SparseEmbeddingModelType_Custom({required this.modelId, required this.modelFile, required final  List<String> additionalFiles, required this.maxLength}): _additionalFiles = additionalFiles,super._();
+
+
+/// HuggingFace model repository ID.
+ final  String modelId;
+/// Path to the ONNX file within the repo. Defaults to `"onnx/model.onnx"`.
+ final  String modelFile;
+/// Sibling files that must be downloaded alongside `model_file`.
+ final  List<String> _additionalFiles;
+/// Sibling files that must be downloaded alongside `model_file`.
+ List<String> get additionalFiles {
+  if (_additionalFiles is EqualUnmodifiableListView) return _additionalFiles;
+  // ignore: implicit_dynamic_type
+  return EqualUnmodifiableListView(_additionalFiles);
+}
+
+/// Maximum token sequence length. Stored as `i64` for FFI compatibility;
+/// negative values are clamped to the model default.
+ final  PlatformInt64 maxLength;
+
+/// Create a copy of SparseEmbeddingModelType
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SparseEmbeddingModelType_CustomCopyWith<SparseEmbeddingModelType_Custom> get copyWith => _$SparseEmbeddingModelType_CustomCopyWithImpl<SparseEmbeddingModelType_Custom>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SparseEmbeddingModelType_Custom&&(identical(other.modelId, modelId) || other.modelId == modelId)&&(identical(other.modelFile, modelFile) || other.modelFile == modelFile)&&const DeepCollectionEquality().equals(other._additionalFiles, _additionalFiles)&&(identical(other.maxLength, maxLength) || other.maxLength == maxLength));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,modelId,modelFile,const DeepCollectionEquality().hash(_additionalFiles),maxLength);
+
+@override
+String toString() {
+  return 'SparseEmbeddingModelType.custom(modelId: $modelId, modelFile: $modelFile, additionalFiles: $additionalFiles, maxLength: $maxLength)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SparseEmbeddingModelType_CustomCopyWith<$Res> implements $SparseEmbeddingModelTypeCopyWith<$Res> {
+  factory $SparseEmbeddingModelType_CustomCopyWith(SparseEmbeddingModelType_Custom value, $Res Function(SparseEmbeddingModelType_Custom) _then) = _$SparseEmbeddingModelType_CustomCopyWithImpl;
+@useResult
+$Res call({
+ String modelId, String modelFile, List<String> additionalFiles, PlatformInt64 maxLength
+});
+
+
+
+
+}
+/// @nodoc
+class _$SparseEmbeddingModelType_CustomCopyWithImpl<$Res>
+    implements $SparseEmbeddingModelType_CustomCopyWith<$Res> {
+  _$SparseEmbeddingModelType_CustomCopyWithImpl(this._self, this._then);
+
+  final SparseEmbeddingModelType_Custom _self;
+  final $Res Function(SparseEmbeddingModelType_Custom) _then;
+
+/// Create a copy of SparseEmbeddingModelType
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? modelId = null,Object? modelFile = null,Object? additionalFiles = null,Object? maxLength = null,}) {
+  return _then(SparseEmbeddingModelType_Custom(
+modelId: null == modelId ? _self.modelId : modelId // ignore: cast_nullable_to_non_nullable
+as String,modelFile: null == modelFile ? _self.modelFile : modelFile // ignore: cast_nullable_to_non_nullable
+as String,additionalFiles: null == additionalFiles ? _self._additionalFiles : additionalFiles // ignore: cast_nullable_to_non_nullable
+as List<String>,maxLength: null == maxLength ? _self.maxLength : maxLength // ignore: cast_nullable_to_non_nullable
+as PlatformInt64,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class SparseEmbeddingModelType_Plugin extends SparseEmbeddingModelType {
+  const SparseEmbeddingModelType_Plugin({required this.name}): super._();
+
+
+/// Name the backend was registered under.
+ final  String name;
+
+/// Create a copy of SparseEmbeddingModelType
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SparseEmbeddingModelType_PluginCopyWith<SparseEmbeddingModelType_Plugin> get copyWith => _$SparseEmbeddingModelType_PluginCopyWithImpl<SparseEmbeddingModelType_Plugin>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SparseEmbeddingModelType_Plugin&&(identical(other.name, name) || other.name == name));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,name);
+
+@override
+String toString() {
+  return 'SparseEmbeddingModelType.plugin(name: $name)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SparseEmbeddingModelType_PluginCopyWith<$Res> implements $SparseEmbeddingModelTypeCopyWith<$Res> {
+  factory $SparseEmbeddingModelType_PluginCopyWith(SparseEmbeddingModelType_Plugin value, $Res Function(SparseEmbeddingModelType_Plugin) _then) = _$SparseEmbeddingModelType_PluginCopyWithImpl;
+@useResult
+$Res call({
+ String name
+});
+
+
+
+
+}
+/// @nodoc
+class _$SparseEmbeddingModelType_PluginCopyWithImpl<$Res>
+    implements $SparseEmbeddingModelType_PluginCopyWith<$Res> {
+  _$SparseEmbeddingModelType_PluginCopyWithImpl(this._self, this._then);
+
+  final SparseEmbeddingModelType_Plugin _self;
+  final $Res Function(SparseEmbeddingModelType_Plugin) _then;
+
+/// Create a copy of SparseEmbeddingModelType
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? name = null,}) {
+  return _then(SparseEmbeddingModelType_Plugin(
+name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
 as String,
   ));
 }

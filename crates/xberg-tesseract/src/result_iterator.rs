@@ -28,6 +28,25 @@ pub struct WordData {
     pub bottom: i32,
     pub confidence: f32,
     pub font_attrs: Option<FontAttributes>,
+    /// Language that recognized this specific word (e.g. `"eng"`, `"deu"`), from
+    /// `TessResultIteratorWordRecognitionLanguage`. `None` when Tesseract could
+    /// not report a language for this word.
+    pub language: Option<String>,
+}
+
+/// Outcome of a full-page word extraction pass over the `ResultIterator`.
+///
+/// `skipped` distinguishes "the page has no words" from "words exist but
+/// per-word FFI extraction failed for some of them" — both previously
+/// collapsed into an empty or partial `Vec<WordData>` with no signal.
+#[derive(Debug, Clone, Default)]
+pub struct WordExtractionOutcome {
+    /// Successfully extracted words, in iterator order.
+    pub words: Vec<WordData>,
+    /// Count of words for which `extract_word_data_unlocked` returned a
+    /// recoverable error (null pointer, invalid parameter, or invalid UTF-8)
+    /// and was therefore dropped from `words`.
+    pub skipped: usize,
 }
 
 pub struct ResultIterator {
@@ -64,30 +83,12 @@ impl ResultIterator {
     /// Returns the UTF-8 text as a `String` if successful, otherwise returns an error.
     pub fn get_utf8_text(&self, level: TessPageIteratorLevel) -> Result<String> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorGetUTF8Text() allocates and returns a pointer to a C string.
-        // This is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator (mutex-guarded)
-        // 2. level is a valid TessPageIteratorLevel enum converted to c_int (in valid range)
-        // 3. The returned pointer is either null (error) or a valid null-terminated C string
-        //    allocated on Tesseract's heap (must be freed with TessDeleteText)
         let text_ptr = unsafe { TessResultIteratorGetUTF8Text(*handle, level as c_int) };
         if text_ptr.is_null() {
             return Err(TesseractError::NullPointerError);
         }
-        // SAFETY: We've verified text_ptr is non-null. The allocation/deallocation pattern is:
-        // 1. text_ptr was allocated by TessResultIteratorGetUTF8Text() on the FFI boundary
-        // 2. CStr::from_ptr(text_ptr) is safe: pointer is non-null and points to valid C string
-        // 3. We read from the string (to_str() creates temporary immutable borrow)
-        // 4. We immediately copy all data to owned String before deallocation
-        // 5. The string data remains valid until TessDeleteText is called
         let c_str = unsafe { CStr::from_ptr(text_ptr) };
         let result = c_str.to_str()?.to_owned();
-        // SAFETY: TessDeleteText() deallocates memory allocated by TessResultIteratorGetUTF8Text():
-        // 1. text_ptr must be non-null (verified above)
-        // 2. text_ptr came from the Tesseract API (trusted source, correct allocation)
-        // 3. TessDeleteText() is the correct deallocation function for this allocation
-        // 4. Must be called exactly once per allocation to avoid double-free (we ensure this)
-        // 5. After this call, text_ptr is invalid; all uses must be via owned result String
         unsafe { TessDeleteText(text_ptr as *mut c_char) };
         Ok(result)
     }
@@ -103,11 +104,6 @@ impl ResultIterator {
     /// Returns the confidence as a `f32`.
     pub fn confidence(&self, level: TessPageIteratorLevel) -> Result<f32> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorConfidence() is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. level is a valid TessPageIteratorLevel enum converted to c_int
-        // 3. The function only reads state and returns an f32 value (copyable)
-        // 4. No pointer operations or memory access is needed
         Ok(unsafe { TessResultIteratorConfidence(*handle, level as c_int) })
     }
 
@@ -118,17 +114,10 @@ impl ResultIterator {
     /// Returns the recognition language as a `String` if successful, otherwise returns an error.
     pub fn word_recognition_language(&self) -> Result<String> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorWordRecognitionLanguage() returns a pointer to a C string
-        // in the iterator's memory. This is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. The returned pointer is either null or a valid null-terminated C string
         let lang_ptr = unsafe { TessResultIteratorWordRecognitionLanguage(*handle) };
         if lang_ptr.is_null() {
             return Err(TesseractError::NullPointerError);
         }
-        // SAFETY: We've verified lang_ptr is non-null. CStr::from_ptr() is safe because:
-        // 1. lang_ptr points to a valid null-terminated C string managed by Tesseract
-        // 2. We only read from it (to_str() creates temporary borrow)
         let c_str = unsafe { CStr::from_ptr(lang_ptr) };
         Ok(c_str.to_str()?.to_owned())
     }
@@ -149,15 +138,6 @@ impl ResultIterator {
         let mut pointsize = 0;
         let mut font_id = 0;
 
-        // SAFETY: TessResultIteratorWordFontAttributes() takes output parameter pointers
-        // and fills them with font attribute values. This is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator (mutex-guarded)
-        // 2. All mutable references (&mut ...) are valid local stack variables
-        // 3. Each reference has a distinct memory location (no aliasing)
-        // 4. The references outlive the FFI call (defined on stack, used immediately after)
-        // 5. The function writes output i32 values (0/1 for bools, integers for size/id)
-        // 6. Each reference has exclusive mutable access (Rust borrow checker enforces this)
-        // 7. The output parameters are independent (function cannot cause data races)
         let result = unsafe {
             TessResultIteratorWordFontAttributes(
                 *handle,
@@ -195,10 +175,6 @@ impl ResultIterator {
     /// Returns `true` if the current iterator is from the dictionary, otherwise returns `false`.
     pub fn word_is_from_dictionary(&self) -> Result<bool> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorWordIsFromDictionary() is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. The function only reads state and returns an i32 value (0 or non-zero)
-        // 3. No pointer operations or memory modifications are needed
         Ok(unsafe { TessResultIteratorWordIsFromDictionary(*handle) != 0 })
     }
 
@@ -209,10 +185,6 @@ impl ResultIterator {
     /// Returns `true` if the current iterator is numeric, otherwise returns `false`.
     pub fn word_is_numeric(&self) -> Result<bool> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorWordIsNumeric() is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. The function only reads state and returns an i32 value
-        // 3. No pointer operations or state modifications needed
         Ok(unsafe { TessResultIteratorWordIsNumeric(*handle) != 0 })
     }
 
@@ -223,10 +195,6 @@ impl ResultIterator {
     /// Returns `true` if the current iterator is superscript, otherwise returns `false`.
     pub fn symbol_is_superscript(&self) -> Result<bool> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorSymbolIsSuperscript() is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. The function only reads state and returns an i32 value
-        // 3. No pointer operations or state modifications needed
         Ok(unsafe { TessResultIteratorSymbolIsSuperscript(*handle) != 0 })
     }
 
@@ -237,10 +205,6 @@ impl ResultIterator {
     /// Returns `true` if the current iterator is subscript, otherwise returns `false`.
     pub fn symbol_is_subscript(&self) -> Result<bool> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorSymbolIsSubscript() is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. The function only reads state and returns an i32 value
-        // 3. No pointer operations or state modifications needed
         Ok(unsafe { TessResultIteratorSymbolIsSubscript(*handle) != 0 })
     }
 
@@ -251,10 +215,6 @@ impl ResultIterator {
     /// Returns `true` if the current iterator is dropcap, otherwise returns `false`.
     pub fn symbol_is_dropcap(&self) -> Result<bool> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorSymbolIsDropcap() is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. The function only reads state and returns an i32 value
-        // 3. No pointer operations or state modifications needed
         Ok(unsafe { TessResultIteratorSymbolIsDropcap(*handle) != 0 })
     }
 
@@ -269,11 +229,6 @@ impl ResultIterator {
     /// Returns `true` if the next iterator exists, otherwise returns `false`.
     pub fn next(&self, level: TessPageIteratorLevel) -> Result<bool> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        // SAFETY: TessResultIteratorNext() is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator
-        // 2. level is a valid TessPageIteratorLevel enum converted to c_int
-        // 3. The function modifies iterator state (advances position) and returns i32 result
-        // 4. The mutex ensures exclusive access during state modification
         Ok(unsafe { TessResultIteratorNext(*handle, level as c_int) != 0 })
     }
 
@@ -321,17 +276,6 @@ impl ResultIterator {
 
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
 
-        // SAFETY: TessPageIteratorBoundingBox() queries iterator state and returns coordinates
-        // via output parameters. This is safe because:
-        // 1. *handle is a valid pointer to an initialized ResultIterator or PageIterator (mutex-guarded)
-        // 2. level is a valid TessPageIteratorLevel enum converted to c_int (in valid range)
-        // 3. All mutable references (&mut left, &mut top, &mut right, &mut bottom)
-        //    are valid local stack variables with distinct memory locations
-        // 4. Each reference is exclusively borrowed (Rust enforces no aliasing)
-        // 5. The references outlive the FFI call (defined on stack, used immediately after)
-        // 6. The function writes four i32 coordinate values into these references
-        // 7. No pointer escaping: the function only writes to these parameters, doesn't store them
-        // 8. Return value indicates success/failure (checked below)
         let result = unsafe {
             TessPageIteratorBoundingBox(*handle, level as c_int, &mut left, &mut top, &mut right, &mut bottom)
         };
@@ -352,50 +296,33 @@ impl ResultIterator {
     /// The iterator is always reset to the beginning before traversal so that partial
     /// prior consumption does not cause words to be missed.
     ///
+    /// Per-word extraction failures (null pointer, invalid parameter, invalid UTF-8)
+    /// are recoverable and do not abort the pass, but they ARE counted in
+    /// `WordExtractionOutcome::skipped` so callers can distinguish "no words on this
+    /// page" from "words exist but some were dropped by the iterator" (#192).
+    ///
     /// # Returns
     ///
-    /// Returns a `Vec<WordData>` containing data for every word, or an error if the
-    /// mutex cannot be acquired.
-    pub fn extract_all_words(&self) -> Result<Vec<WordData>> {
+    /// Returns a [`WordExtractionOutcome`], or an error if the mutex cannot be
+    /// acquired or an unrecoverable iterator error occurs.
+    pub fn extract_all_words(&self) -> Result<WordExtractionOutcome> {
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
         let raw = *handle;
         let mut words = Vec::new();
+        let mut skipped = 0usize;
 
-        // Reset to the first element before traversal.  ResultIterator inherits from
-        // PageIterator in C++, so TessPageIteratorBegin operates on the same handle.
-        // SAFETY: raw is a valid mutex-guarded ResultIterator pointer; TessPageIteratorBegin
-        // simply resets the internal position and does not allocate or free memory.
         unsafe { TessPageIteratorBegin(raw) };
 
         loop {
-            // SAFETY: raw is the mutex-guarded *mut c_void handle. All calls within this
-            // loop are performed while holding the mutex lock, ensuring exclusive access.
-            // We pass raw directly to the unlocked helper to avoid re-locking.
-            match extract_word_data_unlocked(raw) {
-                Ok(word) => words.push(word),
-                // NullPointerError means the text pointer was null; skip this position.
-                // InvalidParameterError means bounding box failed; skip this position.
-                // Utf8Error means the text was not valid UTF-8; skip this word rather than
-                // aborting, so the remaining words in the iterator are not lost.
-                Err(TesseractError::NullPointerError)
-                | Err(TesseractError::InvalidParameterError)
-                | Err(TesseractError::Utf8Error(_)) => {}
-                Err(e) => return Err(e),
-            }
+            record_word_extraction_result(extract_word_data_unlocked(raw), &mut words, &mut skipped)?;
 
-            // SAFETY: TessResultIteratorNext() advances the iterator state and returns
-            // non-zero if a next element exists. This is safe because:
-            // 1. raw is a valid pointer to an initialized ResultIterator (mutex-guarded)
-            // 2. RIL_WORD is a valid TessPageIteratorLevel enum value
-            // 3. The mutex is held for the duration of this call (exclusive access)
-            // 4. The function modifies iterator position and returns an i32 result
             let has_next = unsafe { TessResultIteratorNext(raw, TessPageIteratorLevel::RIL_WORD as c_int) != 0 };
             if !has_next {
                 break;
             }
         }
 
-        Ok(words)
+        Ok(WordExtractionOutcome { words, skipped })
     }
 
     /// Extracts the current word's data in a single mutex lock.
@@ -413,36 +340,44 @@ impl ResultIterator {
     }
 }
 
+/// Classifies a single per-word extraction attempt and folds it into the running
+/// `words`/`skipped` totals used by [`ResultIterator::extract_all_words`].
+///
+/// Null pointer, invalid parameter, and invalid UTF-8 errors are recoverable: the
+/// word is dropped and `skipped` is incremented. Any other error is unrecoverable
+/// and is propagated to abort the pass. Extracted as a standalone, FFI-free
+/// function so the classification/counting logic itself is unit-testable without
+/// a live Tesseract handle (#192).
+fn record_word_extraction_result(
+    result: Result<WordData>,
+    words: &mut Vec<WordData>,
+    skipped: &mut usize,
+) -> Result<()> {
+    match result {
+        Ok(word) => words.push(word),
+        Err(TesseractError::NullPointerError)
+        | Err(TesseractError::InvalidParameterError)
+        | Err(TesseractError::Utf8Error(_)) => {
+            *skipped += 1;
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// Extracts word data from a raw iterator handle without acquiring the mutex.
 ///
 /// The caller MUST hold the mutex lock for the `ResultIterator` this handle belongs to
 /// before calling this function. Passing a handle that is not mutex-guarded, or calling
 /// this function concurrently on the same handle, is undefined behaviour.
 fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
-    // SAFETY: TessResultIteratorGetUTF8Text() allocates and returns a pointer to a C string.
-    // This is safe because:
-    // 1. raw is a valid pointer to an initialized ResultIterator (caller holds mutex lock)
-    // 2. RIL_WORD is a valid TessPageIteratorLevel enum value converted to c_int
-    // 3. The returned pointer is either null (error) or a valid null-terminated C string
-    //    allocated on Tesseract's heap (must be freed with TessDeleteText)
     let text_ptr = unsafe { TessResultIteratorGetUTF8Text(raw, TessPageIteratorLevel::RIL_WORD as c_int) };
     if text_ptr.is_null() {
         return Err(TesseractError::NullPointerError);
     }
-    // SAFETY: We've verified text_ptr is non-null. The allocation/deallocation pattern is:
-    // 1. text_ptr was allocated by TessResultIteratorGetUTF8Text() on the FFI boundary
-    // 2. CStr::from_ptr(text_ptr) is safe: pointer is non-null and points to valid C string
-    // 3. We immediately copy all data to an owned String before deallocation
-    // 4. The string data remains valid until TessDeleteText is called
     let text = {
         let c_str = unsafe { CStr::from_ptr(text_ptr) };
         let owned = c_str.to_str()?.to_owned();
-        // SAFETY: TessDeleteText() deallocates memory allocated by TessResultIteratorGetUTF8Text():
-        // 1. text_ptr is non-null (verified above)
-        // 2. text_ptr came from the Tesseract API (correct allocation type)
-        // 3. TessDeleteText() is the correct deallocation function for this allocation
-        // 4. Called exactly once per allocation to avoid double-free
-        // 5. owned String was already populated; text_ptr is no longer accessed after this call
         unsafe { TessDeleteText(text_ptr as *mut c_char) };
         owned
     };
@@ -451,14 +386,6 @@ fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
     let mut top = 0;
     let mut right = 0;
     let mut bottom = 0;
-    // SAFETY: TessPageIteratorBoundingBox() queries iterator state and fills output parameters.
-    // This is safe because:
-    // 1. raw is a valid pointer to an initialized ResultIterator (caller holds mutex lock)
-    // 2. RIL_WORD is a valid TessPageIteratorLevel enum value converted to c_int
-    // 3. All mutable references are valid local stack variables with distinct memory locations
-    // 4. Each reference is exclusively borrowed (Rust enforces no aliasing)
-    // 5. The references outlive the FFI call (defined on stack, used immediately after)
-    // 6. Return value indicates success/failure (checked below)
     let bbox_result = unsafe {
         TessPageIteratorBoundingBox(
             raw,
@@ -473,14 +400,8 @@ fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
         return Err(TesseractError::InvalidParameterError);
     }
 
-    // SAFETY: TessResultIteratorConfidence() reads iterator state and returns an f32 value.
-    // This is safe because:
-    // 1. raw is a valid pointer to an initialized ResultIterator (caller holds mutex lock)
-    // 2. RIL_WORD is a valid TessPageIteratorLevel enum value converted to c_int
-    // 3. The function only reads state and returns a copy (no pointer operations)
     let confidence = unsafe { TessResultIteratorConfidence(raw, TessPageIteratorLevel::RIL_WORD as c_int) };
 
-    // Collect font attributes; treat any failure as absent rather than propagating the error.
     let font_attrs = {
         let mut is_bold = 0;
         let mut is_italic = 0;
@@ -490,13 +411,6 @@ fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
         let mut is_smallcaps = 0;
         let mut pointsize = 0;
         let mut font_id = 0;
-        // SAFETY: TessResultIteratorWordFontAttributes() fills output parameters with font info.
-        // This is safe because:
-        // 1. raw is a valid pointer to an initialized ResultIterator (caller holds mutex lock)
-        // 2. All mutable references are valid local stack variables with distinct memory locations
-        // 3. Each reference is exclusively borrowed (no aliasing)
-        // 4. The references outlive the FFI call
-        // 5. Return value is non-zero on success, zero on failure (checked below)
         let result = unsafe {
             TessResultIteratorWordFontAttributes(
                 raw,
@@ -526,6 +440,21 @@ fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
         }
     };
 
+    // `TessResultIteratorWordRecognitionLanguage` returns a pointer owned by
+    // Tesseract (not by us), so it must NOT be freed via `TessDeleteText` —
+    // matching `ResultIterator::word_recognition_language`. A null pointer
+    // means Tesseract could not attribute this word to a specific language
+    // (e.g. non-LSTM engines, or a word outside the recognized text);
+    // that's a normal, non-fatal case, so it maps to `None`, not an error. ~keep
+    let language = {
+        let lang_ptr = unsafe { TessResultIteratorWordRecognitionLanguage(raw) };
+        if lang_ptr.is_null() {
+            None
+        } else {
+            unsafe { CStr::from_ptr(lang_ptr) }.to_str().ok().map(str::to_owned)
+        }
+    };
+
     Ok(WordData {
         text,
         left,
@@ -534,21 +463,13 @@ fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
         bottom,
         confidence,
         font_attrs,
+        language,
     })
 }
 
 impl Drop for ResultIterator {
     fn drop(&mut self) {
         if let Ok(handle) = self.handle.lock() {
-            // SAFETY: TessResultIteratorDelete() frees the ResultIterator handle allocated by Tesseract:
-            // 1. We use .ok() pattern to handle poisoned mutex gracefully (no panic in Drop)
-            // 2. *handle is a valid opaque pointer allocated by TessBaseAPIGetIterator()
-            //    or TessBaseAPIGetMutableIterator() - Tesseract owns this memory
-            // 3. TessResultIteratorDelete() is the single correct way to deallocate this type
-            // 4. The function must be called exactly once per allocation to avoid double-free
-            // 5. After calling delete, the pointer is invalid; future use would cause use-after-free
-            // 6. Drop impl never panics (we use .ok() guard), ensuring cleanup always executes
-            // 7. If mutex is poisoned, handle cleanup is skipped (OS will reclaim process memory)
             unsafe { TessResultIteratorDelete(*handle) };
         }
     }
@@ -586,4 +507,88 @@ ffi_extern! {
         right: *mut c_int,
         bottom: *mut c_int,
     ) -> c_int;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_word(text: &str) -> WordData {
+        WordData {
+            text: text.to_string(),
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 10,
+            confidence: 90.0,
+            font_attrs: None,
+            language: Some("eng".to_string()),
+        }
+    }
+
+    fn invalid_utf8_error() -> TesseractError {
+        let invalid_bytes: Vec<u8> = vec![0xFF, 0xFE];
+        std::str::from_utf8(&invalid_bytes).unwrap_err().into()
+    }
+
+    /// Drives [`record_word_extraction_result`] over a fixed, known sequence of
+    /// synthetic per-word outcomes — the same seam `extract_all_words` folds its
+    /// FFI-derived results through — and asserts the *exact* resulting `skipped`
+    /// count and surviving `words`. No live Tesseract handle is involved: this
+    /// isolates the counting/classification logic from the FFI iteration (#192).
+    #[test]
+    fn should_count_exact_number_of_recoverable_failures_and_keep_successful_words() {
+        let results: Vec<Result<WordData>> = vec![
+            Ok(sample_word("first")),
+            Err(TesseractError::NullPointerError),
+            Ok(sample_word("second")),
+            Err(TesseractError::InvalidParameterError),
+            Err(invalid_utf8_error()),
+            Ok(sample_word("third")),
+        ];
+
+        let mut words = Vec::new();
+        let mut skipped = 0usize;
+        for result in results {
+            record_word_extraction_result(result, &mut words, &mut skipped).expect("all failures here are recoverable");
+        }
+
+        assert_eq!(skipped, 3, "exactly three recoverable failures were fed in");
+        assert_eq!(words.len(), 3, "exactly three successful words were fed in");
+        assert_eq!(
+            words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    /// When nothing goes wrong, `skipped` must stay at exactly zero — not merely
+    /// "not incremented past some threshold" — so callers can rely on its absence
+    /// as a clean-extraction signal.
+    #[test]
+    fn should_report_zero_skipped_when_no_recoverable_failures_occur() {
+        let results: Vec<Result<WordData>> = vec![Ok(sample_word("only")), Ok(sample_word("word"))];
+
+        let mut words = Vec::new();
+        let mut skipped = 0usize;
+        for result in results {
+            record_word_extraction_result(result, &mut words, &mut skipped).unwrap();
+        }
+
+        assert_eq!(skipped, 0);
+        assert_eq!(words.len(), 2);
+    }
+
+    /// An unrecoverable error (anything outside the three recoverable variants)
+    /// must propagate instead of being silently folded into `skipped`.
+    #[test]
+    fn should_propagate_unrecoverable_error_instead_of_counting_it_as_skipped() {
+        let mut words = Vec::new();
+        let mut skipped = 0usize;
+
+        let outcome = record_word_extraction_result(Err(TesseractError::MutexLockError), &mut words, &mut skipped);
+
+        assert!(outcome.is_err());
+        assert_eq!(skipped, 0, "unrecoverable errors must not be counted as skipped");
+        assert!(words.is_empty());
+    }
 }

@@ -1,37 +1,19 @@
 # =============================================================================
-# Alpine-based builder for the musl-linked Node.js NAPI binding (.node).
-#
-# Usage:
-#   docker build -f docker/Dockerfile.musl-node \
-#     --build-arg TARGET=x86_64-unknown-linux-musl \
-#     --output type=local,dest=./dist .
-#
-# Produces the napi platform artifact (xberg.linux-<arch>-musl.node) at the
-# output root. napi-rs selects gnu vs musl at runtime via the package `libc`
-# field, so the musl `.node` flows into the existing napi prepublish path as the
-# `@xberg-io/xberg-linux-{x64,arm64}-musl` package (already declared in
-# crates/xberg-node/package.json optionalDependencies).
-# =============================================================================
 FROM alpine:3.22 AS builder
 
 ARG RUST_TOOLCHAIN=nightly-2026-03-10
-# Rust target triple (e.g. x86_64-unknown-linux-musl). Passed via --build-arg.
 ARG TARGET=x86_64-unknown-linux-musl
 
 WORKDIR /build
 
-# Install build dependencies — Alpine's g++ and libstdc++ are musl-native,
-# so tesseract C++ compilation works without glibc conflicts. nodejs + npm are
-# needed to run the napi CLI (via npx).
-#
-# Base is Alpine 3.22 (OpenSSL 3.4+ — provides EVP_MD_CTX_get_size_ex required
-# by Node.js; see ba4f1588ed). Alpine 3.22 stable dropped onnxruntime-dev from
-# main/community, so the edge repos are added to source onnxruntime-dev for
-# system ORT linking (ort-sys uses ORT_SKIP_DOWNLOAD + ORT_LIB_LOCATION below).
-# The Rust build itself uses rustls (no openssl), so only the runtime shared
-# libs are needed here — not openssl-dev / openssl-libs-static.
+# Alpine's /bin/sh is busybox ash, which supports `-o pipefail`. Without it the
+# `curl ... | sh` rustup bootstrap below reports only sh's status, so a failed or
+# truncated download silently installs nothing, and the `readelf ... | grep`
+# linkage diagnostic reports success on an empty pipe. (hadolint DL4006)
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+
 RUN apk add --no-cache \
-    curl musl-dev cmake make pkgconf \
+    curl musl-dev cmake make pkgconf bash patchelf \
     perl linux-headers git file && \
     apk add --no-cache \
         gcc g++ libstdc++ libstdc++-dev \
@@ -40,24 +22,20 @@ RUN apk add --no-cache \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
 
-# Install Rust via rustup (Alpine's packaged Rust may be too old / not nightly)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --component rust-src && \
     echo "Rust host: $(~/.cargo/bin/rustc -vV | grep host)" && \
     echo "Default target: $(~/.cargo/bin/rustc --print cfg | grep target)"
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Point ort-sys to Alpine's system ORT library instead of downloading prebuilt binaries.
 ENV ORT_LIB_LOCATION=/usr/lib
 ENV ORT_PREFER_DYNAMIC_LINK=1
 ENV ORT_SKIP_DOWNLOAD=1
 ENV ORT_STRATEGY=system
-# Allow cdylib output on musl targets (default is +crt-static which blocks shared libs)
-ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Copy workspace manifests and crates
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
+COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-node/ crates/xberg-node/
 COPY crates/xberg-ffi/ crates/xberg-ffi/
@@ -65,55 +43,36 @@ COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
+COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 
-# Remove workspace members that aren't included. Mirrors Dockerfile.musl-ffi's
-# sed but KEEPS xberg-node (the build target). The wasm member is matched
-# with the quoted `"crates/xberg-wasm"` form so the broad header match does
-# NOT delete the `[profile.release.package.xberg-wasm]` line out from under
-# the range delete below (which would orphan its body keys → "duplicate key").
 RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-cli/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
 
-# napi build passes an explicit --target, so cargo treats it as a cross-compile
-# and looks for a triple-prefixed linker (aarch64-linux-musl-gcc /
-# x86_64-linux-musl-gcc). Alpine's gcc is musl-native and unprefixed, so point
-# the *-musl targets at plain gcc (only the one matching TARGET is used). Mirrors
-# the CARGO_TARGET_*_LINKER=gcc that Dockerfile.musl-ffi's host build gets for free.
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=gcc
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=gcc
 
-# cc-rs (used by tesseract/leptonica and other C deps) ALSO treats the explicit
-# --target as a cross-compile and searches for a triple-prefixed compiler
-# (aarch64-linux-musl-gcc / -g++), independent of the cargo *_LINKER vars above.
-# Alpine's gcc/g++ are unprefixed and musl-native, so point cc-rs's per-target
-# CC_/CXX_ lookups at plain gcc/g++ (only the pair matching TARGET is consulted).
-# Without this, napi's cross path fails with `failed to find tool
-# "aarch64-linux-musl-gcc"` even though the linker is resolved.
 ENV CC_aarch64_unknown_linux_musl=gcc
 ENV CXX_aarch64_unknown_linux_musl=g++
 ENV CC_x86_64_unknown_linux_musl=gcc
 ENV CXX_x86_64_unknown_linux_musl=g++
 
-# Build the NAPI binding for the musl target.
-#
-# napi build wraps `cargo build` and emits xberg.<platform>.node. Run it via
-# npx (matching crates/xberg-node/package.json's build script) so no pnpm
-# workspace install is required. Add the musl target first.
-#
-# Neither --offline nor --locked: the `sed -i Cargo.toml` above removes workspace
-# members without touching Cargo.lock (see Dockerfile.musl-ffi for the rationale).
-RUN rustup target add "${TARGET}" && \
+RUN export RUSTFLAGS='-C target-feature=-crt-static -C link-arg=-Wl,-rpath,$ORIGIN' && \
+    rustup target add "${TARGET}" && \
     cd crates/xberg-node && \
     npx --yes -p @napi-rs/cli@^3.6.2 napi build --platform --release --target "${TARGET}" && \
     cp ./*.node /build/ && \
     strip /build/*.node
 
-# Verify the artifact
+COPY scripts/ci/vendor-native-closure.sh /usr/local/bin/vendor-native-closure.sh
+RUN bash /usr/local/bin/vendor-native-closure.sh /build
+
 RUN file /build/*.node && \
     echo "=== Dynamic dependencies ===" && \
-    readelf -d /build/*.node 2>/dev/null | grep NEEDED || echo "No dynamic dependencies (fully static)"
+    { readelf -d /build/*.node 2>/dev/null | grep NEEDED || echo "No dynamic dependencies (fully static)"; } && \
+    echo "=== Vendored libs (ship beside the .node) ===" && \
+    ls -la /build/*.so*
 
-# =============================================================================
-# Output stage — just the .node artifact(s)
-# =============================================================================
 FROM scratch
 COPY --from=builder /build/*.node /
+# `*.so*` (not `*.so`) matches versioned sonames like libonnxruntime.so.1,
+# which a plain `*.so` glob silently drops. ~keep
+COPY --from=builder /build/*.so* /

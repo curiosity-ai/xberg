@@ -1,7 +1,7 @@
 ---
 name: plugin-engineer
 description: Plugin system architecture, registry management, and Python FFI
-model: haiku
+model: sonnet
 ---
 
 When working on the plugin system:

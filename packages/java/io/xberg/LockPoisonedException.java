@@ -5,15 +5,13 @@ package io.xberg;
  * An internal `Mutex` or `RwLock` was found in a poisoned state.
  */
 public class LockPoisonedException extends XbergErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new LockPoisonedException with the given message. */
-    public LockPoisonedException(final String message) {
-        super(message);
-    }
+  /** Creates a new LockPoisonedException with the given message. */
+  public LockPoisonedException(final String message) { super(message); }
 
-    /** Creates a new LockPoisonedException with the given message and cause. */
-    public LockPoisonedException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new LockPoisonedException with the given message and cause. */
+  public LockPoisonedException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

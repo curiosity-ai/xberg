@@ -23,7 +23,7 @@ echo "  CARGO_TERM_COLOR: ${CARGO_TERM_COLOR:-not set}"
 
 echo "Workspace information:"
 echo "  Repository: $REPO_ROOT"
-echo "  Excluded packages: xberg-e2e-generator, xberg-py, xberg-node, xberg-candle-ocr, xberg-cli, benchmark-harness"
+echo "  Excluded packages: xberg-e2e-generator, xberg-py, xberg-node, xberg-candle-ocr, xberg-gliner, xberg-cli, xberg-wasm, benchmark-harness"
 
 if [ ! -d "$TESSDATA_PREFIX" ]; then
   echo "WARNING: TESSDATA_PREFIX directory not found: $TESSDATA_PREFIX"
@@ -53,39 +53,57 @@ if [ -n "${XBERG_PDFIUM_PREBUILT:-}" ]; then
   echo "  DYLD_FALLBACK_LIBRARY_PATH: $DYLD_FALLBACK_LIBRARY_PATH"
 fi
 
+# Live HF preset tests (*_live: embedding/reranker/sparse/late-interaction) download
+# models and run ONNX inference over the network. They are flaky and have a dedicated
+# retry job (`live-hf` in ci-rust.yaml) that invokes cargo directly and is unaffected
+# by this variable. Skip them in the plain unit-test legs so a network hiccup or a
+# backend crash (e.g. the macOS ORT SIGSEGV in embedding_preset_live) does not fail the
+# unit tests. ~keep
+export XBERG_SKIP_LIVE_HF=1
+
 echo "=== Starting cargo test ==="
 
 # NOTE: We intentionally avoid `--all-features` for the `xberg` crate because
 TEST_LOG="/tmp/cargo-test-$$.log"
 
+# ~keep The whole `{ ... } | tee` pipeline is the `if` condition, where `set -e`
+# ~keep is suspended (bash suppresses errexit for every command in an `if` test),
+# ~keep so the block's status is the LAST leg's. Each leg needs `|| exit` to stop
+# ~keep the block and surface its own failure; pipefail carries it past `tee`.
 if ! {
-  # `--all-targets` runs --lib --bins --tests --examples --benches but excludes
-  # `--doc`. 22 rustdoc examples in the xberg crate currently reference
-  # private items (extraction::capacity::estimate_content_capacity et al.) and
-  # fail to compile. Tracking the cleanup separately; doc-test coverage is not
-  # on the v5.0.0 publish path. TODO: re-enable doc tests once the failing
-  # examples are rewritten against the public API.
+  # ~keep `--all-targets` runs --lib --bins --tests --examples --benches but excludes
+  # ~keep `--doc`. Doctests are covered by the separate "Run doctests" step in
+  # ~keep .github/workflows/ci-rust.yaml, which uses the same feature set selected
+  # ~keep below (including the aarch64 substitution) so it reuses these artifacts.
   echo "=== cargo test -p xberg --features full ==="
-  RUST_BACKTRACE=full cargo test --locked -p xberg --features full --all-targets --verbose
+  # `full` now includes candle-vlm-ocr; candle's gemm-f16 matmul backend carries
+  # aarch64 inline asm requiring the fullfp16 target feature, which this runner's
+  # rustc baseline lacks ("instruction requires: fullfp16"). On Linux aarch64 test
+  # `full-no-heic,heic` (== full minus candle, heic kept) so the crate still covers
+  # everything except the un-buildable candle backends. Matches the candle drop in
+  # the gliner leg below; Apple Silicon has fullfp16 and keeps candle. ~keep
+  xberg_test_features=full
+  if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
+    echo "Linux aarch64: using full-no-heic,heic (full pulls candle -> gemm-f16 needs fullfp16)"
+    xberg_test_features=full-no-heic,heic
+  fi
+  RUST_BACKTRACE=full cargo test --locked -p xberg --features "$xberg_test_features" --all-targets --verbose || exit
 
   echo "=== cargo test --workspace (all features, excluding xberg) ==="
   extra_excludes=()
-  # Exclude xberg-candle-ocr and xberg-cli from --all-features on every
-  # platform: both have platform-hostile accelerator features. xberg-candle-ocr
-  # has `metal` (Apple-only, breaks Linux) and `cuda` (needs nvcc, absent on macOS).
-  # xberg-cli re-exports candle-cuda and candle-metal, so --all-features pulls
-  # cudarc (nvcc) and objc2-metal (Apple-only). Neither can be --all-features-built
-  # on any CI runner; their device features are exercised by a dedicated
-  # curated-feature job, not here.
   extra_excludes+=(--exclude xberg-candle-ocr)
+  # xberg-gliner: its cuda/metal features cannot build on CI runners, so
+  # --all-features is unusable; tested separately below with an explicit
+  # feature list. ~keep
+  extra_excludes+=(--exclude xberg-gliner)
   extra_excludes+=(--exclude xberg-cli)
-  # benchmark-harness is the only test target that depends on `xberg` with
-  # `features = ["full"]`, which forces candle-core 0.11 -> gemm 0.19 -> gemm-f16
-  # 0.19 into the unified build. gemm-f16 0.19 fails to compile on aarch64 (both
-  # CI runners are arm64: ubuntu-24.04-arm and macos Apple Silicon) and on Windows.
-  # Candle is exercised on x86_64 CUDA in ci-gpu, so drop the sole candle puller
-  # from this CPU workspace test on every platform.
   extra_excludes+=(--exclude benchmark-harness)
+  # xberg-wasm: a cdylib whose tests are all cfg(target_arch = "wasm32"), so a native
+  # run covers nothing; they run under Node in the ci-e2e wasm leg. Excluding it also
+  # keeps candle out of this build: its xberg dependency is not target-gated, so
+  # wasm-target's ner-candle-wasm would pull gemm-f16 in on aarch64 (no fullfp16),
+  # past the --exclude xberg-gliner guard above. Matches every Taskfile path. ~keep
+  extra_excludes+=(--exclude xberg-wasm)
   RUST_BACKTRACE=full cargo test --locked \
     --workspace \
     --exclude xberg \
@@ -95,7 +113,24 @@ if ! {
     ${extra_excludes[@]+"${extra_excludes[@]}"} \
     --all-features \
     --all-targets \
-    --verbose
+    --verbose || exit
+
+  echo "=== cargo test -p xberg-gliner (explicit features) ==="
+  # cuda/metal cannot build on CPU-only runners, so xberg-gliner gets an
+  # explicit feature list instead of --all-features: the default ONNX
+  # features everywhere, plus candle where it can build. Only Linux aarch64
+  # drops candle: gemm-f16 (candle's matmul backend) carries aarch64 inline
+  # asm that requires the fullfp16 target feature, which that runner's
+  # baseline lacks ("instruction requires: fullfp16"). Apple Silicon
+  # includes fullfp16 and runs the candle tests. ~keep
+  gliner_features=(--features candle,ort-dynamic)
+  if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
+    echo "Dropping the candle feature on Linux aarch64 (gemm-f16 needs fullfp16)"
+    gliner_features=(--features ort-dynamic)
+  fi
+  RUST_BACKTRACE=full cargo test --locked -p xberg-gliner \
+    ${gliner_features[@]+"${gliner_features[@]}"} \
+    --all-targets --verbose || exit
 } 2>&1 | tee "$TEST_LOG"; then
   echo "=== Test execution failed ==="
   echo "Last 50 lines of test output:"

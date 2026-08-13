@@ -1,100 +1,19 @@
 use image::RgbImage;
 use ndarray::Array4;
 
-/// ImageNet normalization constants.
-const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
-
-/// Preprocess with aspect-preserving letterbox and ImageNet normalization.
-///
-/// Pipeline: letterbox-resize to target_size × target_size (Lanczos3, aspect-preserving)
-///           → rescale /255 → ImageNet normalize → NCHW f32.
-///
-/// Unlike `preprocess_imagenet` which squashes the image to a square (distorting
-/// aspect ratio), this preserves the original proportions and pads with the ImageNet
-/// mean color. This produces more accurate detection coordinates because the model
-/// sees undistorted geometry.
-///
-/// Returns `(tensor, scale, pad_x, pad_y)`:
-/// - `scale`: resize factor applied (for mapping detections back)
-/// - `pad_x`, `pad_y`: top-left offset of the resized image within the padded square
-pub(crate) fn preprocess_imagenet_letterbox(img: &RgbImage, target_size: u32) -> (Array4<f32>, f32, u32, u32) {
-    let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
-    let scale = (target_size as f32 / orig_w).min(target_size as f32 / orig_h);
-    let new_w = (orig_w * scale).round() as u32;
-    let new_h = (orig_h * scale).round() as u32;
-
-    // Resize with CatmullRom — good quality/speed trade-off for document images.
-    // Lanczos3 is ~2x slower with minimal quality gain for text-heavy pages.
-    let resized = image::imageops::resize(img, new_w, new_h, image::imageops::FilterType::CatmullRom);
-
-    // Center the resized image in the target square
-    let pad_x = (target_size - new_w) / 2;
-    let pad_y = (target_size - new_h) / 2;
-
-    let ts = target_size as usize;
-    let hw = ts * ts;
-
-    // Pre-compute reciprocals
-    let inv_std_r = 1.0 / IMAGENET_STD[0];
-    let inv_std_g = 1.0 / IMAGENET_STD[1];
-    let inv_std_b = 1.0 / IMAGENET_STD[2];
-
-    // Fill with normalized ImageNet mean (what a "blank" pixel looks like after normalization)
-    let pad_r = (0.5 - IMAGENET_MEAN[0]) * inv_std_r;
-    let pad_g = (0.5 - IMAGENET_MEAN[1]) * inv_std_g;
-    let pad_b = (0.5 - IMAGENET_MEAN[2]) * inv_std_b;
-
-    let mut data = vec![0.0f32; 3 * hw];
-    // Fill padding
-    for i in 0..hw {
-        data[i] = pad_r;
-        data[hw + i] = pad_g;
-        data[2 * hw + i] = pad_b;
-    }
-
-    // Copy resized pixels into the center
-    let rw = new_w as usize;
-    let rh = new_h as usize;
-    let resized_pixels = resized.as_raw();
-    let px = pad_x as usize;
-    let py = pad_y as usize;
-
-    for y in 0..rh {
-        for x in 0..rw {
-            let src_idx = (y * rw + x) * 3;
-            let dst_idx = (y + py) * ts + (x + px);
-            let r = resized_pixels[src_idx] as f32 * (1.0 / 255.0);
-            let g = resized_pixels[src_idx + 1] as f32 * (1.0 / 255.0);
-            let b = resized_pixels[src_idx + 2] as f32 * (1.0 / 255.0);
-            data[dst_idx] = (r - IMAGENET_MEAN[0]) * inv_std_r;
-            data[hw + dst_idx] = (g - IMAGENET_MEAN[1]) * inv_std_g;
-            data[2 * hw + dst_idx] = (b - IMAGENET_MEAN[2]) * inv_std_b;
-        }
-    }
-
-    let tensor = Array4::from_shape_vec((1, 3, ts, ts), data).expect("shape mismatch in preprocess_imagenet_letterbox");
-
-    (tensor, scale, pad_x, pad_y)
-}
-
 /// Preprocess with rescale only (no ImageNet normalization).
 ///
-/// Pipeline: resize to target_size x target_size -> rescale /255 -> NCHW f32.
+/// Pipeline: bilinear resize to target_size x target_size -> rescale /255
+/// -> NCHW f32. This is also the preprocessing contract of the original
+/// Docling Heron ONNX export.
 pub(crate) fn preprocess_rescale(img: &RgbImage, target_size: u32) -> Array4<f32> {
     let resized = image::imageops::resize(img, target_size, target_size, image::imageops::FilterType::Triangle);
     let pixels = resized.as_raw();
-    let hw = (target_size * target_size) as usize;
+    let ts = target_size as usize;
 
-    let mut data = vec![0.0f32; 3 * hw];
-    for i in 0..hw {
-        data[i] = pixels[i * 3] as f32 * (1.0 / 255.0);
-        data[hw + i] = pixels[i * 3 + 1] as f32 * (1.0 / 255.0);
-        data[2 * hw + i] = pixels[i * 3 + 2] as f32 * (1.0 / 255.0);
-    }
-
-    Array4::from_shape_vec((1, 3, target_size as usize, target_size as usize), data)
-        .expect("shape mismatch in preprocess_rescale")
+    Array4::from_shape_fn((1, 3, ts, ts), |(_, c, y, x)| {
+        pixels[(y * ts + x) * 3 + c] as f32 * (1.0 / 255.0)
+    })
 }
 
 /// Letterbox preprocessing for YOLOX-style models.
@@ -104,6 +23,10 @@ pub(crate) fn preprocess_rescale(img: &RgbImage, target_size: u32) -> Array4<f32
 /// No normalization — values are 0-255 as YOLOX expects.
 ///
 /// Returns the NCHW tensor and the scale ratio (for rescaling detections back).
+///
+/// ORT-only: used solely by [`crate::layout::models::yolo`], which is gated out of the
+/// pure-Rust `layout-tract` variant.
+#[cfg(feature = "layout-detection")]
 pub(crate) fn preprocess_letterbox(img: &RgbImage, target_width: u32, target_height: u32) -> (Array4<f32>, f32) {
     let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
     let scale = (target_height as f32 / orig_h).min(target_width as f32 / orig_w);
@@ -115,7 +38,6 @@ pub(crate) fn preprocess_letterbox(img: &RgbImage, target_width: u32, target_hei
     let tw = target_width as usize;
     let th = target_height as usize;
     let hw = th * tw;
-    // Fill with padding value 114.0 (raw pixel value, no normalization).
     let mut data = vec![114.0f32; 3 * hw];
 
     let rw = new_w as usize;
@@ -135,4 +57,56 @@ pub(crate) fn preprocess_letterbox(img: &RgbImage, target_width: u32, target_hei
     let tensor = Array4::from_shape_vec((1, 3, th, tw), data).expect("shape mismatch in preprocess_letterbox");
 
     (tensor, scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{Rgb, RgbImage};
+
+    use super::preprocess_rescale;
+
+    #[test]
+    fn preprocess_rescale_matches_heron_contract_for_portrait_input() {
+        let img = RgbImage::from_pixel(320, 640, Rgb([255, 0, 0]));
+        let tensor = preprocess_rescale(&img, 640);
+
+        assert_eq!(tensor.shape(), &[1, 3, 640, 640]);
+        assert_eq!(tensor[[0, 0, 0, 0]], 1.0);
+        assert_eq!(tensor[[0, 1, 0, 0]], 0.0);
+        assert_eq!(tensor[[0, 2, 639, 639]], 0.0);
+        assert_eq!(tensor[[0, 0, 639, 639]], 1.0);
+    }
+
+    #[test]
+    fn preprocess_rescale_matches_heron_contract_for_landscape_input() {
+        let img = RgbImage::from_pixel(640, 320, Rgb([0, 128, 255]));
+        let tensor = preprocess_rescale(&img, 640);
+
+        assert_eq!(tensor.shape(), &[1, 3, 640, 640]);
+        assert_eq!(tensor[[0, 0, 0, 0]], 0.0);
+        assert!((tensor[[0, 1, 0, 0]] - 128.0 / 255.0).abs() < f32::EPSILON);
+        assert_eq!(tensor[[0, 2, 639, 639]], 1.0);
+        assert_eq!(tensor[[0, 1, 639, 639]], 128.0 / 255.0);
+    }
+
+    #[test]
+    fn preprocess_rescale_preserves_odd_image_geometry_and_channel_order() {
+        let img = RgbImage::from_fn(3, 5, |x, y| {
+            Rgb([(x * 80 + y * 7) as u8, (x * 11 + y * 40) as u8, (x * 31 + y * 13) as u8])
+        });
+        let tensor = preprocess_rescale(&img, 5);
+
+        assert_eq!(tensor.shape(), &[1, 3, 5, 5]);
+        for (channel, expected) in [94.0, 91.0, 57.0].into_iter().enumerate() {
+            let actual = tensor[[0, channel, 2, 2]];
+            assert!(
+                (actual - expected / 255.0).abs() < f32::EPSILON,
+                "center channel {channel}: expected {expected}, got {}",
+                actual * 255.0
+            );
+        }
+        for (channel, expected) in [188.0, 182.0, 114.0].into_iter().enumerate() {
+            assert!((tensor[[0, channel, 4, 4]] - expected / 255.0).abs() < f32::EPSILON);
+        }
+    }
 }

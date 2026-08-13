@@ -8,7 +8,6 @@ echo "=== Staging FFI artifacts to ${STAGING_DIR} ==="
 
 shopt -s nullglob
 
-# Stage static library (.a) - required for Go static linking
 static_lib="target/release/libxberg_ffi.a"
 if [ -f "$static_lib" ]; then
   cp "$static_lib" "${STAGING_DIR}/lib/"
@@ -18,7 +17,6 @@ else
   exit 1
 fi
 
-# Stage dynamic libraries (.so, .dylib, .dll) - optional for runtime linking
 ffi_libs=(target/release/libxberg_ffi.{so,dylib,dll} target/release/libxberg_ffi.so.*)
 ffi_libs_found=()
 for lib in "${ffi_libs[@]}"; do
@@ -31,7 +29,6 @@ if [ ${#ffi_libs_found[@]} -gt 0 ]; then
   echo "✓ Staged dynamic libraries: ${ffi_libs_found[*]}"
 fi
 
-# Stage PDFium libraries
 pdfium_libs=(target/release/libpdfium.*)
 if [ ${#pdfium_libs[@]} -gt 0 ]; then
   cp "${pdfium_libs[@]}" "${STAGING_DIR}/lib/"
@@ -40,11 +37,9 @@ fi
 
 shopt -u nullglob
 
-# Stage header file
 cp crates/xberg-ffi/include/xberg.h "${STAGING_DIR}/include/"
 echo "✓ Staged header: xberg.h"
 
-# Stage pkg-config file (generated inline — the .pc carries the version and is gitignored).
 ffi_version="$(grep -m1 '^version' crates/xberg-ffi/Cargo.toml | cut -d '"' -f2)"
 cat > "${STAGING_DIR}/share/pkgconfig/xberg-ffi.pc" <<EOF
 prefix=/usr/local

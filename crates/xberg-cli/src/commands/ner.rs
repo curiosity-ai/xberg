@@ -1,8 +1,8 @@
 //! NER model download commands.
 //!
-//! Mirrors `tree_sitter::download_command` — eagerly fetches GLiNER ONNX
-//! models into the xberg cache so air-gapped / container-pre-bake
-//! workflows do not need a network call at inference time.
+//! Eagerly fetches GLiNER ONNX models into the standard Hugging Face Hub
+//! cache so air-gapped / container-pre-bake workflows do not need a network
+//! call at inference time.
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -16,6 +16,10 @@ use crate::{WireFormat, style};
 /// list of xberg GLiNER aliases or catalog ids. `all` downloads every variant
 /// xberg knows about.
 #[allow(dead_code)]
+#[expect(
+    clippy::print_stdout,
+    reason = "NER download summary is the command's stdout result output"
+)]
 pub fn download_command(
     ner: bool,
     models: Vec<String>,
@@ -82,12 +86,15 @@ pub fn select_models(ner: bool, models: Vec<String>, all: bool) -> Result<Vec<St
 }
 
 /// Download selected GLiNER NER models and return human-readable result labels.
+///
+/// `cache_dir`, when provided, is an explicit Hugging Face Hub cache root. A
+/// missing value preserves the standard `HF_HUB_CACHE` / `HF_HOME` behavior.
 pub fn download_models(models: &[String], cache_dir: Option<PathBuf>) -> Result<Vec<String>> {
     let mut downloaded: Vec<String> = Vec::with_capacity(models.len());
     for repo in models {
         let path = xberg::text::ner::download_model(repo, cache_dir.clone())
             .with_context(|| format!("Failed to download NER model '{repo}'"))?;
-        downloaded.push(format!("{repo} -> {}", path.display()));
+        downloaded.push(format!("{repo} -> {} (Hugging Face cache)", path.display()));
     }
 
     Ok(downloaded)

@@ -5,10 +5,9 @@
 
 #[cfg(test)]
 use crate::extraction::ooxml_constants::WORDPROCESSINGML_NAMESPACE;
+use crate::extractors::security::{SecurityBudget, SecurityError};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-
-// --- Types ---
 
 /// Page orientation.
 #[cfg_attr(alef, alef(skip))]
@@ -90,42 +89,8 @@ pub struct SectionProperties {
     pub doc_grid_line_pitch: Option<i32>,
 }
 
-// --- Conversion helpers ---
-
-impl PageMargins {
-    /// Convert all margins from twips to points.
-    ///
-    /// Conversion factor: 1 twip = 1/20 point, or equivalently divide by 20.
-    pub(crate) fn to_points(&self) -> PageMarginsPoints {
-        PageMarginsPoints {
-            top: self.top.map(|v| v as f64 / 20.0),
-            right: self.right.map(|v| v as f64 / 20.0),
-            bottom: self.bottom.map(|v| v as f64 / 20.0),
-            left: self.left.map(|v| v as f64 / 20.0),
-            header: self.header.map(|v| v as f64 / 20.0),
-            footer: self.footer.map(|v| v as f64 / 20.0),
-            gutter: self.gutter.map(|v| v as f64 / 20.0),
-        }
-    }
-}
-
-impl SectionProperties {
-    /// Convert page width from twips to points.
-    pub(crate) fn page_width_points(&self) -> Option<f64> {
-        self.page_width_twips.map(|v| v as f64 / 20.0)
-    }
-
-    /// Convert page height from twips to points.
-    pub(crate) fn page_height_points(&self) -> Option<f64> {
-        self.page_height_twips.map(|v| v as f64 / 20.0)
-    }
-}
-
-// --- XML Helpers ---
-
 /// Get a namespaced integer attribute.
 fn get_w_attr_i32(element: &BytesStart, local_name: &str) -> Option<i32> {
-    // First try "w:localname" format
     let w_prefixed = format!("w:{}", local_name);
     for attr in element.attributes().flatten() {
         let key = attr.key.as_ref();
@@ -168,8 +133,6 @@ fn roxmltree_get_i32_attr(node: &roxmltree::Node, local_name: &str) -> Option<i3
         .and_then(|v| v.parse::<i32>().ok())
 }
 
-// --- Parsing with roxmltree ---
-
 /// Parse a `w:sectPr` XML element (roxmltree node) into `SectionProperties`.
 #[cfg(test)]
 pub(crate) fn parse_section_properties(node: &roxmltree::Node) -> SectionProperties {
@@ -185,7 +148,6 @@ pub(crate) fn parse_section_properties(node: &roxmltree::Node) -> SectionPropert
                 props.page_width_twips = roxmltree_get_i32_attr(&child, "w");
                 props.page_height_twips = roxmltree_get_i32_attr(&child, "h");
 
-                // ECMA-376: default orientation is portrait when w:orient is absent
                 props.orientation = match roxmltree_get_attr(&child, "orient").as_deref() {
                     Some("landscape") => Some(Orientation::Landscape),
                     _ => Some(Orientation::Portrait),
@@ -218,8 +180,6 @@ pub(crate) fn parse_section_properties(node: &roxmltree::Node) -> SectionPropert
     props
 }
 
-// --- Streaming parser for quick_xml ---
-
 /// Parse section properties from a quick_xml event stream.
 ///
 /// Reads events from the reader until `</w:sectPr>` is encountered,
@@ -227,17 +187,31 @@ pub(crate) fn parse_section_properties(node: &roxmltree::Node) -> SectionPropert
 ///
 /// **Important:** This function advances the reader past the closing `</w:sectPr>` tag.
 /// The caller must not attempt to process the `w:sectPr` end event again.
-pub(crate) fn parse_section_properties_streaming(reader: &mut Reader<&[u8]>) -> SectionProperties {
+///
+/// Threads `budget` through every event so nesting inside `w:sectPr` is measured
+/// against the caller's depth cap instead of passing through unaccounted (GH#384).
+pub(crate) fn parse_section_properties_streaming(
+    reader: &mut Reader<&[u8]>,
+    budget: &mut SecurityBudget,
+) -> Result<SectionProperties, SecurityError> {
     let mut props = SectionProperties::default();
     let mut buf = Vec::new();
 
     loop {
+        budget.step()?;
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            Ok(Event::Start(ref e)) => {
+                budget.enter()?;
                 apply_section_element(e, &mut props);
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == b"w:sectPr" => {
-                break;
+            Ok(Event::Empty(ref e)) => {
+                apply_section_element(e, &mut props);
+            }
+            Ok(Event::End(ref e)) => {
+                budget.leave();
+                if e.name().as_ref() as &[u8] == b"w:sectPr" {
+                    break;
+                }
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -246,12 +220,11 @@ pub(crate) fn parse_section_properties_streaming(reader: &mut Reader<&[u8]>) -> 
         buf.clear();
     }
 
-    // Apply OOXML defaults: absent orientation means portrait
     if props.page_width_twips.is_some() && props.orientation.is_none() {
         props.orientation = Some(Orientation::Portrait);
     }
 
-    props
+    Ok(props)
 }
 
 /// Extract section properties from a quick_xml element.
@@ -310,10 +283,6 @@ mod tests {
 
         assert_eq!(props.page_width_twips, Some(11906));
         assert_eq!(props.page_height_twips, Some(16838));
-
-        // Convert to points
-        assert_eq!(props.page_width_points(), Some(595.3));
-        assert_eq!(props.page_height_points(), Some(841.9));
     }
 
     #[test]
@@ -329,10 +298,6 @@ mod tests {
 
         assert_eq!(props.page_width_twips, Some(12240));
         assert_eq!(props.page_height_twips, Some(15840));
-
-        // 12240 / 20 = 612.0 points, 15840 / 20 = 792.0 points (US Letter)
-        assert_eq!(props.page_width_points(), Some(612.0));
-        assert_eq!(props.page_height_points(), Some(792.0));
     }
 
     #[test]
@@ -369,11 +334,6 @@ mod tests {
         assert_eq!(props.margins.header, Some(720));
         assert_eq!(props.margins.footer, Some(720));
         assert_eq!(props.margins.gutter, Some(0));
-
-        // Convert to points
-        let margins_points = props.margins.to_points();
-        assert_eq!(margins_points.top, Some(72.0)); // 1440 / 20
-        assert_eq!(margins_points.header, Some(36.0)); // 720 / 20
     }
 
     #[test]
@@ -412,7 +372,6 @@ mod tests {
 
     #[test]
     fn test_streaming_parse_a4_page_size() {
-        // Streaming parser must handle self-closing elements (Event::Empty)
         let xml = r#"<w:sectPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:pgSz w:w="11906" w:h="16838"/>
             <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>
@@ -420,14 +379,10 @@ mod tests {
             <w:docGrid w:linePitch="360"/>
         </w:sectPr>"#;
 
-        // Simulate what happens in the parser: reader has already consumed <w:sectPr>,
-        // so parse_section_properties_streaming reads from after that opening tag.
-        // We need to read past the opening tag first.
         let mut reader = Reader::from_str(xml);
         reader.config_mut().trim_text(false);
         let mut buf = Vec::new();
 
-        // Consume the opening <w:sectPr> tag
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"w:sectPr" => break,
@@ -438,11 +393,12 @@ mod tests {
             buf.clear();
         }
 
-        let props = parse_section_properties_streaming(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let props = parse_section_properties_streaming(&mut reader, &mut budget).unwrap();
 
         assert_eq!(props.page_width_twips, Some(11906));
         assert_eq!(props.page_height_twips, Some(16838));
-        assert_eq!(props.orientation, Some(Orientation::Portrait)); // Default when absent
+        assert_eq!(props.orientation, Some(Orientation::Portrait));
         assert_eq!(props.margins.top, Some(1440));
         assert_eq!(props.margins.right, Some(1440));
         assert_eq!(props.margins.header, Some(708));
@@ -469,32 +425,10 @@ mod tests {
             buf.clear();
         }
 
-        let props = parse_section_properties_streaming(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let props = parse_section_properties_streaming(&mut reader, &mut budget).unwrap();
         assert_eq!(props.orientation, Some(Orientation::Landscape));
         assert_eq!(props.page_width_twips, Some(16838));
-    }
-
-    #[test]
-    fn test_page_margins_conversion() {
-        let margins = PageMargins {
-            top: Some(1440),
-            right: Some(1080),
-            bottom: Some(1440),
-            left: Some(1080),
-            header: Some(720),
-            footer: Some(720),
-            gutter: None,
-        };
-
-        let points = margins.to_points();
-
-        assert_eq!(points.top, Some(72.0));
-        assert_eq!(points.right, Some(54.0));
-        assert_eq!(points.bottom, Some(72.0));
-        assert_eq!(points.left, Some(54.0));
-        assert_eq!(points.header, Some(36.0));
-        assert_eq!(points.footer, Some(36.0));
-        assert_eq!(points.gutter, None);
     }
 
     #[test]

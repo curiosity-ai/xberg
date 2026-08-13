@@ -48,30 +48,6 @@ fn extract_markdown_with_layout(relative_path: &str) -> String {
         .content
 }
 
-// ── Noise filtering: figure-internal text ────────────────────────────
-
-#[cfg(feature = "layout-detection")]
-#[ignore = "TODO: pdf_oxide upstream — https://github.com/yfedoseev/pdf_oxide/issues/484"]
-#[test]
-fn test_docling_no_figure_internal_text() {
-    if !test_documents_available() {
-        return;
-    }
-    let content = extract_markdown_with_layout("pdf/docling.pdf");
-
-    // "Circling Minimums" is a heading from inside an appendix figure — should be suppressed
-    assert!(
-        !content.contains("Circling Minimums"),
-        "Figure-internal heading 'Circling Minimums' leaked into output"
-    );
-
-    // Figure diagram labels from Figure 1 should not appear as body text
-    assert!(
-        !content.contains("{;} Parse PDF pages"),
-        "Figure 1 diagram text leaked into output"
-    );
-}
-
 #[cfg(feature = "layout-detection")]
 #[test]
 fn test_docling_no_figure_text_as_headings() {
@@ -80,7 +56,6 @@ fn test_docling_no_figure_text_as_headings() {
     }
     let content = extract_markdown_with_layout("pdf/docling.pdf");
 
-    // "{;} Parse PDF pages" is from the pipeline diagram (Figure 1)
     for line in content.lines() {
         if line.starts_with('#') {
             assert!(
@@ -97,8 +72,6 @@ fn test_docling_no_figure_text_as_headings() {
     }
 }
 
-// ── Noise filtering: arXiv watermark ─────────────────────────────────
-
 #[cfg(feature = "layout-detection")]
 #[test]
 fn test_docling_no_arxiv_watermark() {
@@ -107,15 +80,11 @@ fn test_docling_no_arxiv_watermark() {
     }
     let content = extract_markdown_with_layout("pdf/docling.pdf");
 
-    // The arXiv sidebar watermark "arXiv:2408.09869v5" should be stripped.
-    // Legitimate references to arXiv in body text are fine (they don't include the ID).
     assert!(
         !content.contains("arXiv:2408.09869"),
         "arXiv watermark identifier not stripped from output"
     );
 }
-
-// ── Noise filtering: references as headings ──────────────────────────
 
 #[cfg(feature = "layout-detection")]
 #[test]
@@ -125,7 +94,6 @@ fn test_docling_references_not_headings() {
     }
     let content = extract_markdown_with_layout("pdf/docling.pdf");
 
-    // Individual reference entries should not be promoted to ## headings
     let heading_lines: Vec<&str> = content.lines().filter(|l| l.starts_with("## ")).collect();
     for h in &heading_lines {
         assert!(
@@ -145,8 +113,6 @@ fn test_docling_references_not_headings() {
         );
     }
 }
-
-// ── Content preservation ─────────────────────────────────────────────
 
 #[cfg(feature = "layout-detection")]
 #[test]
@@ -193,14 +159,11 @@ fn test_multipage_no_noise() {
     }
     let content = extract_markdown("pdf/multi_page.pdf");
 
-    // multipage.pdf is a clean document — should have no arXiv noise
     assert!(
         !content.contains("arXiv:"),
         "multipage.pdf should have no arXiv identifiers"
     );
 }
-
-// ── Layout detection regression: large multi-page PDFs ───────────────
 
 /// Regression test: nougat_014.pdf (105 pages) must complete layout extraction
 /// without error or panic.  Previously failed in CI because the single-shot
@@ -216,7 +179,6 @@ fn test_nougat_014_layout_extraction_completes() {
         return;
     }
     let content = extract_markdown_with_layout("pdf/nougat_014.pdf");
-    // Should produce non-trivial content from a 105-page academic PDF.
     assert!(
         content.len() > 500,
         "nougat_014.pdf layout extraction produced unexpectedly short output ({} chars)",
@@ -247,8 +209,6 @@ fn test_iso_21111_10_layout_extraction_completes() {
     );
 }
 
-// ── Reading order: PDF coordinate system ─────────────────────────────
-
 /// Regression test for reading-order inversion caused by coordinate system mismatch.
 ///
 /// pdf_oxide returns bounding boxes in PDF coordinates (y=0 at bottom of page, y increases
@@ -265,9 +225,6 @@ fn test_pdf_structure_reading_order() {
     }
     let content = extract_markdown("vendored/pdfplumber/pdf/pdf_structure.pdf");
 
-    // "Titre du document" is the page title near the top (PDF y ≈ 700 on a 792pt page).
-    // "Tableau" is a section heading near the bottom (PDF y ≈ 305).
-    // Correct descending sort on PDF coordinates places the title first.
     let title_pos = content.find("Titre du document").expect("title not found in output");
     let tableau_pos = content.find("Tableau").expect("'Tableau' section not found in output");
     assert!(
@@ -276,5 +233,62 @@ fn test_pdf_structure_reading_order() {
          got title at byte {title_pos}, Tableau at byte {tableau_pos}. \
          This indicates a reading-order inversion — check PDF coordinate handling in \
          crates/xberg/src/pdf/oxide/hierarchy.rs"
+    );
+}
+
+/// Regression test for yfedoseev/pdf_oxide#847: inter-word spaces were dropped
+/// on TJ-positioned runs, so words in this pdfplumber fixture's tabular
+/// rate-table header extracted glued (`Comparisonrate`, eight times) while the
+/// same words in flowing prose were spaced correctly. pdf_oxide 0.3.74 accounts
+/// for the `TJ` numeric adjustment that carries the space, so the header text
+/// is spaced too.
+#[test]
+fn test_tj_positioned_runs_keep_interword_spaces() {
+    if !test_documents_available() {
+        return;
+    }
+    let path = get_test_file_path("vendored/pdfplumber/pdf/pr-138-example.pdf");
+    if !path.exists() {
+        return;
+    }
+    let content = extract_uri_document_blocking(&path, None, &ExtractionConfig::default())
+        .expect("extraction should succeed")
+        .content;
+    assert!(
+        !content.contains("Comparisonrate"),
+        "TJ-positioned header still glues 'Comparisonrate' — pdf_oxide#847 regression"
+    );
+    assert!(
+        content.contains("Comparison rate"),
+        "expected the spaced phrase 'Comparison rate' in extracted text"
+    );
+}
+
+/// Regression test for same-line word gaps being mistaken for kerning-run splits.
+#[test]
+fn test_681693_same_line_words_keep_spaces() {
+    if !test_documents_available() {
+        return;
+    }
+    let path = get_test_file_path("pdf/681693.pdf");
+    if !path.exists() {
+        return;
+    }
+    let content = extract_markdown("pdf/681693.pdf");
+    assert!(
+        content.contains("Your data is clean:"),
+        "expected genuine same-line word gaps to remain spaces in 681693.pdf"
+    );
+    assert!(
+        content.contains("See \\#182 for more infos."),
+        "expected explicit source whitespace to survive overlapping text spans"
+    );
+    assert!(
+        content.contains("MongoKit is a python module"),
+        "expected the MongoKit introduction to retain its word boundary"
+    );
+    assert!(
+        content.contains("## Recent Change Log\n\n### v0.9.1"),
+        "expected the changelog section and adjacent semantic version to retain H2/H3 hierarchy"
     );
 }

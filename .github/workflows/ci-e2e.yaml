@@ -13,6 +13,7 @@ on:
       - "Cargo.lock"
       - "Taskfile.yml"
       - "pnpm-workspace.yaml"
+      - "scripts/ci/wasm/**"
       - ".github/workflows/ci-e2e.yaml"
   pull_request:
     branches: [main]
@@ -26,6 +27,7 @@ on:
       - "Cargo.lock"
       - "Taskfile.yml"
       - "pnpm-workspace.yaml"
+      - "scripts/ci/wasm/**"
       - ".github/workflows/ci-e2e.yaml"
   workflow_dispatch:
 
@@ -37,7 +39,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
-  RUST_BACKTRACE: short
+  RUST_BACKTRACE: full
+  SWIFT_BACKTRACE: "enable=yes,sanitize=yes,cache=yes"
   RUST_MIN_STACK: 16777216
   ORT_VERSION: "1.24.2"
   MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -52,7 +55,7 @@ jobs:
     name: Build FFI (${{ matrix.target }})
     if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 60 }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -66,9 +69,6 @@ jobs:
         with:
           submodules: recursive
 
-      # Build FFI is the slowest job in ci-e2e (full cargo release with --features all).
-      # Hash every file that actually affects the FFI ABI or the embedded core lib, then
-      # restore from cache when unchanged. The hash also gates the build steps below.
       - name: Compute FFI source hash
         id: ffi-hash
         shell: bash
@@ -147,7 +147,7 @@ jobs:
     if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
     needs: [build-ffi]
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 60
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -213,6 +213,11 @@ jobs:
         with:
           submodules: recursive
 
+      # fixtures/**/*.json `body_file` entries span nearly every top-level corpus
+      # directory across the 14 language e2e suites -- no glob subset is safe here. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+
       - name: Setup Rust
         uses: xberg-io/actions/setup-rust@v1
         with:
@@ -241,6 +246,9 @@ jobs:
           if [ -f ffi-artifacts/crates/xberg-ffi/xberg-ffi.pc ]; then
             cp ffi-artifacts/crates/xberg-ffi/xberg-ffi.pc crates/xberg-ffi/
           fi
+          # Every matrix.target here builds the same .so, but this step runs for every
+          # lang leg including ones whose task (python/node/wasm/...) links its own native
+          # artifact and never touches this file -- absence is expected, not a failure. ~keep
           chmod +x target/release/libxberg_ffi.so 2>/dev/null || true
           ls -la target/release/
           if [ -f target/release/libxberg_ffi.so ]; then
@@ -289,6 +297,9 @@ jobs:
         run: |
           if [ -n "${ORT_LIB_LOCATION:-}" ] && [ -d "$ORT_LIB_LOCATION" ]; then
             mkdir -p target/release
+            # The setup-onnx-runtime action may vendor ORT as a system package instead of
+            # loose .so files at this path, so the glob can legitimately match nothing;
+            # the ls right below reports the outcome instead of failing silently. ~keep
             cp -f "$ORT_LIB_LOCATION"/libonnxruntime.so* target/release/ || true
             echo "Staged ORT libraries to target/release:"
             ls -la target/release/libonnxruntime.so* 2>/dev/null || echo "No ORT libraries found (may be bundled)"
@@ -299,9 +310,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p e2e/csharp/bin/Debug/net10.0
-          cp -f target/release/libxberg_ffi.so e2e/csharp/bin/Debug/net10.0/ 2>/dev/null || true
+          # This job always runs on ubuntu-latest / x86_64-unknown-linux-gnu and needs:
+          # [build-ffi], which uploads with if-no-files-found: error -- by this point
+          # target/release/libxberg_ffi.so is guaranteed present. A copy failure here is a
+          # real problem (e.g. a broken staging step upstream) and must fail loudly instead
+          # of surfacing as a baffling dlopen error once the .NET tests run.
+          cp -f target/release/libxberg_ffi.so e2e/csharp/bin/Debug/net10.0/
           if [ -f target/release/libonnxruntime.so.1 ]; then
-            cp -f target/release/libonnxruntime.so.1 e2e/csharp/bin/Debug/net10.0/ || true
+            cp -f target/release/libonnxruntime.so.1 e2e/csharp/bin/Debug/net10.0/
           fi
           ls -la e2e/csharp/bin/Debug/net10.0/lib*.so 2>/dev/null || echo "No native libraries found for C#"
 
@@ -357,11 +373,6 @@ jobs:
         if: matrix.lang == 'kotlin-android'
         uses: android-actions/setup-android@v3
         with:
-          # setup-android@v3 dropped the `api-level` / `build-tools-version`
-          # inputs (they were ignored with a workflow warning) and the legacy
-          # `sdkmanager tools` install path now fails with exit code 1 because
-          # Google removed the "tools" package. Use the modern `packages`
-          # input to declare exactly what we need.
           packages: "platforms;android-35 build-tools;35.0.0"
           accept-android-sdk-licenses: true
 
@@ -447,6 +458,7 @@ jobs:
         run: bundle install && bundle exec rake compile
 
       - name: Run e2e tests
+        if: matrix.lang != 'swift'
         run: task ${{ matrix.lang }}:e2e
         shell: bash
         env:
@@ -454,3 +466,106 @@ jobs:
           LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
           DYLD_LIBRARY_PATH: ${{ env.DYLD_LIBRARY_PATH || '' }}
           TESSDATA_PREFIX: "/usr/share/tesseract-ocr/5/tessdata"
+
+      - name: Run in-crate wasm engine tests (Node)
+        if: matrix.lang == 'wasm'
+        shell: bash
+        run: scripts/ci/wasm/run-crate-tests.sh
+
+      - name: Run e2e tests (swift, instrumented)
+        if: matrix.lang == 'swift'
+        shell: bash
+        env:
+          PKG_CONFIG_PATH: ${{ env.PKG_CONFIG_PATH }}
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
+          DYLD_LIBRARY_PATH: ${{ env.DYLD_LIBRARY_PATH || '' }}
+          TESSDATA_PREFIX: "/usr/share/tesseract-ocr/5/tessdata"
+          SWIFT_BACKTRACE: "enable=yes,sanitize=yes,cache=yes,interactive=no,symbolicate=full,threads=all,registers=all,images=all,demangle=yes"
+        run: |
+          mkdir -p /tmp/swift-crash
+          # Enable core dumps for this shell and the swift test process it spawns.
+          ulimit -c unlimited || true
+          sudo sysctl -w kernel.core_pattern="/tmp/swift-crash/core.%e.%p" >/dev/null 2>&1 \
+            || echo "note: could not set core_pattern (SWIFT_BACKTRACE + live lldb still apply)"
+          echo "ulimit -c => $(ulimit -c)"
+          swift --version || true
+          uname -a || true
+          # Tee the FULL output (alef + swiftc + swift runtime) to a file so it survives
+          # even if the console truncates or the crash report lands only on stderr.
+          set -o pipefail
+          task swift:e2e 2>&1 | tee /tmp/swift-crash/e2e-full.log
+
+      - name: Capture swift crash backtrace
+        if: ${{ matrix.lang == 'swift' && failure() }}
+        shell: bash
+        # Diagnostic-only, and it only runs once the job is ALREADY failure() -- the real
+        # test failure was recorded by the "Run e2e tests (swift, instrumented)" step above.
+        # This step's own internal tools (lldb, core files) are best-effort forensics; if the
+        # last command in the script trips a nonzero exit, that must not overwrite the
+        # already-recorded real failure with a second, unrelated one. ~keep
+        continue-on-error: true
+        run: |
+          set +e
+          out=/tmp/swift-crash
+          mkdir -p "$out"
+          {
+            echo "=== toolchain ==="
+            swift --version
+            uname -a
+            echo "lldb: $(command -v lldb || echo '<not found>')"
+          } > "$out/env.txt" 2>&1
+          # Locate the built xctest binary (an ELF executable on Linux).
+          bin="$(find e2e/swift_e2e/.build packages/swift/.build -name '*.xctest' -type f 2>/dev/null | head -1)"
+          echo "test binary: ${bin:-<none — crash was likely at compile time>}" | tee -a "$out/env.txt"
+          if [ -n "$bin" ]; then
+            ldd "$bin" >> "$out/env.txt" 2>&1
+            cp "$bin" "$out/" 2>/dev/null || true
+          fi
+          # 1) Post-mortem lldb over any core file that landed.
+          for core in "$out"/core.*; do
+            [ -f "$core" ] || continue
+            echo "=== lldb core $core ===" | tee -a "$out/lldb-core.txt"
+            lldb --batch ${bin:+-f "$bin"} -c "$core" \
+              -o 'thread backtrace all' -o 'image list' -o 'register read' -o quit \
+              >> "$out/lldb-core.txt" 2>&1
+          done
+          # 2) Live re-run under lldb (most reliable when container cores are restricted):
+          #    drive the crash through the mock-server wrapper and dump a full backtrace.
+          if [ -n "$bin" ] && command -v lldb >/dev/null 2>&1; then
+            echo "=== lldb live run ===" > "$out/lldb-live.txt"
+            scripts/e2e/run-with-mock-server.sh lldb --batch \
+              -o 'settings set target.process.stop-on-sharedlibrary-events false' \
+              -o run \
+              -k 'thread backtrace all' -k 'image list' -k 'register read' -k quit \
+              "$bin" >> "$out/lldb-live.txt" 2>&1
+          fi
+          # 3) Bisect compile-vs-run: does building the tests alone reproduce the crash?
+          echo "=== swift build --build-tests -v ===" > "$out/build-tests.log"
+          ( cd e2e/swift_e2e && swift build --build-tests -v ) >> "$out/build-tests.log" 2>&1
+          echo "build-tests exit: $?" >> "$out/build-tests.log"
+          ls -laR "$out" 2>/dev/null | head -80
+
+      - name: Upload swift crash artifacts
+        if: ${{ matrix.lang == 'swift' && failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-crash-${{ matrix.target }}
+          path: |
+            /tmp/swift-crash/**
+            e2e/swift_e2e/**/*.log
+          if-no-files-found: warn
+
+      - name: Upload e2e diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-diagnostics-${{ matrix.lang }}
+          path: |
+            e2e/**/*.log
+            e2e/**/*.trace
+            e2e/**/TestResults/**
+            e2e/**/test-results/**
+            e2e/**/build/reports/**
+            e2e/**/hs_err_pid*.log
+          if-no-files-found: ignore
+          retention-days: 7

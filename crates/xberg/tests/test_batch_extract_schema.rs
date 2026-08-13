@@ -1,3 +1,7 @@
+//! Issue #877: the generated JSON schema for `ExtractBatchParams` must declare
+//! `inputs.items` as an object (not boolean `true`) and document the `kind`
+//! discriminator, since Moonshot AI rejects boolean `items` schemas.
+
 #![cfg(feature = "mcp")]
 
 use rmcp::schemars::schema_for;
@@ -5,10 +9,6 @@ use xberg::mcp::ExtractBatchParams;
 
 #[test]
 fn test_inputs_items_is_object_not_boolean() {
-    // Regression test for https://github.com/xberg-io/xberg/issues/877
-    // Moonshot AI (Kimi) rejects `"items": true` — array items must be an object.
-    // `inputs` is `Vec<serde_json::Value>`, which would default to `items: true`;
-    // a custom `schema_with` override must keep it an object schema instead.
     let schema = schema_for!(ExtractBatchParams);
     let schema_value = serde_json::to_value(&schema).unwrap();
 
@@ -22,8 +22,6 @@ fn test_inputs_items_is_object_not_boolean() {
 
 #[test]
 fn test_inputs_items_describes_the_input_envelope() {
-    // The per-input object schema must expose the unified input shape so MCP
-    // clients can construct `{kind, bytes|uri, mime_type, ...}` entries.
     let schema = schema_for!(ExtractBatchParams);
     let schema_value = serde_json::to_value(&schema).unwrap();
 
@@ -36,8 +34,6 @@ fn test_inputs_items_describes_the_input_envelope() {
 
 #[test]
 fn test_inputs_is_required() {
-    // `inputs` is a non-optional `Vec`, so it must appear in the schema's
-    // `required` set.
     let schema = schema_for!(ExtractBatchParams);
     let schema_value = serde_json::to_value(&schema).unwrap();
 

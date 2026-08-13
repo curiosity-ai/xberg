@@ -10,13 +10,36 @@
 //!
 //! ## Stage order
 //!
-//! 1. Classification — operates on the full document text (`content`)
-//! 2. NER — operates on the full document text (`content`)
-//! 3. Captioning — operates on images extracted into `ExtractedDocument::images`
+//! 1. Classification — operates on the per-page `content` (or the whole document when it
+//!    has no pages); writes `page_classifications` and appends `llm_usage`
+//! 2. Chunk classification — multi-labels each entry of `ExtractedDocument::chunks`
+//!    in place; a no-op when the document has no chunks
+//! 3. NER — operates on the full document text (`content`); writes `entities`
+//! 4. Captioning — operates on images extracted into `ExtractedDocument::images`; writes
+//!    each image's `caption` / `description` and appends `llm_usage`
 //!
-//! Transcription is reserved for a future backend and is kept present in the
-//! config surface so callers can wire it today; any attempt to activate it
-//! returns an explicit not-yet-implemented error.
+//! ## Results live on the document
+//!
+//! Every stage writes its output onto the [`ExtractedDocument`] field that already exists
+//! for it, not only into [`EnrichedResult`]. The document is the only thing downstream
+//! consumers see — it is what serializes to JSON, what the REST schema and the language
+//! bindings expose, and what `split_and_extract` and the post-processors operate on — so
+//! results returned solely in the side struct were invisible to all of them, and the LLM
+//! token / cost records for the classification and captioning calls were discarded
+//! outright (#263).
+//!
+//! ## Transcription is not an enrichment stage
+//!
+//! Transcription turns audio/video *bytes* into text, which makes it extraction-time
+//! work — it is implemented by `TranscriptionExtractor` and driven by
+//! `ExtractionConfig::transcription`. By the time a document reaches `enrich` the source
+//! bytes are gone, so there is nothing here to transcribe.
+//!
+//! `EnrichmentConfig::transcription` is kept on the config surface because it is
+//! reproduced across the generated binding packages, where removing it would be a
+//! breaking change. Setting it makes `enrich` append a
+//! [`ProcessingWarning`](crate::types::ProcessingWarning) pointing at the extraction-time
+//! path and carry on; it never fails the call and never blocks the other stages.
 //!
 //! # Example
 //!
@@ -43,8 +66,6 @@ use crate::ClassificationLabel;
 
 #[cfg(feature = "ner")]
 use crate::types::entity::{Entity, EntityCategory};
-
-// ── Per-stage config knobs ────────────────────────────────────────────────────
 
 /// NER enrichment knob: which backend to use and which categories to request.
 #[cfg(feature = "ner")]
@@ -74,6 +95,17 @@ pub struct ClassificationEnrichmentConfig {
     pub config: crate::core::config::PageClassificationConfig,
 }
 
+/// Chunk-classification enrichment knob: how to multi-label individual chunks.
+///
+/// Operates on `ExtractedDocument::chunks` in place — the caller must have
+/// already produced chunks (e.g. via `ExtractionConfig::chunking`) for this
+/// stage to have any effect; a document with no chunks is a no-op.
+#[cfg(feature = "classification")]
+pub struct ChunkClassificationEnrichmentConfig {
+    /// Label-definition set and LLM/batching settings for the chunk-classification stage.
+    pub config: crate::core::config::ChunkClassificationConfig,
+}
+
 /// Captioning enrichment knob: which LLM to use for image captions.
 ///
 /// The enrichment stage calls [`crate::captioning::caption_image`] for every
@@ -88,8 +120,6 @@ pub struct CaptioningEnrichmentConfig {
     /// `None` uses the default `RegionKind::Caption` prompt.
     pub custom_prompt: Option<String>,
 }
-
-// ── Aggregated config ─────────────────────────────────────────────────────────
 
 /// Aggregated enrichment configuration.
 ///
@@ -108,36 +138,53 @@ pub struct EnrichmentConfig {
     #[cfg(feature = "classification")]
     pub classification: Option<ClassificationEnrichmentConfig>,
 
+    /// Chunk-classification stage.  `None` skips per-chunk multi-label classification.
+    #[cfg(feature = "classification")]
+    pub chunk_classification: Option<ChunkClassificationEnrichmentConfig>,
+
     /// Image-captioning stage.  `None` skips captioning.
     #[cfg(feature = "captioning")]
     pub captioning: Option<CaptioningEnrichmentConfig>,
 
-    /// Transcription stage (reserved — not yet implemented).
+    /// Transcription stage — **inert here by design**; `None` and `Some(...)` both leave
+    /// the document unchanged apart from a warning.
     ///
-    /// Any `Some(...)` value causes `enrich` to return
-    /// `Err(XbergError::Other("transcription backend not yet implemented"))`.
-    /// Include config here now so call-sites compile and activate the stage once
-    /// the backend lands.
+    /// Transcription converts audio/video bytes to text, so it belongs to extraction, not
+    /// enrichment: by the time a document reaches [`enrich`] the source bytes are gone. To
+    /// actually transcribe, set `ExtractionConfig::transcription` and run `extract` on the
+    /// audio/video file with the `transcription` feature enabled.
+    ///
+    /// A `Some(...)` value makes [`enrich`] append a
+    /// [`ProcessingWarning`](crate::types::ProcessingWarning) with source `"transcription"`
+    /// to the returned document and continue; every other configured stage still runs.
+    /// The field is retained rather than removed because it is reproduced across the
+    /// generated binding packages, where removing it would be a breaking change.
     #[cfg(feature = "transcription-types")]
     pub transcription: Option<crate::core::config::TranscriptionConfig>,
 }
 
-// ── Result type ──────────────────────────────────────────────────────────────
-
 /// Extraction result with optional enrichment layers applied.
 ///
-/// The `extraction` field carries the original [`ExtractedDocument`] unchanged.
-/// Enrichment fields are `None` when the corresponding stage was not configured
-/// or when the feature was compiled out.
-// EnrichedResult cannot derive Debug automatically because the `ner` field
-// holds an `Arc<dyn NerBackend>` which is not Debug. The NerBackend trait
-// is defined upstream and cannot be extended. We skip Debug derivation and
-// rely on the public fields being individually accessible.
+/// `extraction` is the enriched [`ExtractedDocument`]: every stage writes its output onto
+/// the canonical field that already exists for it, so enrichment survives serialization,
+/// the REST/API schema, and the language bindings — all of which see the document and
+/// nothing else. The fields below mirror those writes for callers that want the stage
+/// output directly; they are `None` when the stage was not configured or the feature was
+/// compiled out.
+///
+/// | Stage | Written onto `extraction` |
+/// |---|---|
+/// | Classification | `page_classifications`, `llm_usage` |
+/// | Chunk classification | `chunks[].classification` (in place) |
+/// | NER | `entities` |
+/// | Captioning | `images[].caption`, `images[].description`, `llm_usage` |
 pub struct EnrichedResult {
-    /// The original extraction result, unchanged by the enrichment pipeline.
+    /// The extraction result with every configured stage's output applied.
     pub extraction: ExtractedDocument,
 
     /// Detected named entities (populated by the NER stage).
+    ///
+    /// Mirrors [`ExtractedDocument::entities`](crate::types::ExtractedDocument::entities).
     #[cfg(feature = "ner")]
     pub entities: Option<Vec<Entity>>,
 
@@ -159,13 +206,15 @@ pub struct EnrichedResult {
     pub captions: Option<Vec<String>>,
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
 /// Apply enrichment stages to an extraction result.
 ///
-/// Stages run sequentially: classification → NER → captioning.
+/// Stages run sequentially: classification → chunk classification → NER → captioning.
 /// On any error the partial result is dropped and the error is returned
 /// immediately.
+///
+/// A configured `transcription` stage is not run — see
+/// [`EnrichmentConfig`] — it only records a
+/// [`ProcessingWarning`](crate::types::ProcessingWarning) and does not affect the others.
 ///
 /// # Example
 ///
@@ -188,16 +237,18 @@ pub struct EnrichedResult {
 /// # Errors
 ///
 /// - [`crate::XbergError::Validation`] when the classification config has an
-///   empty label set (propagated from `classify_document`).
-/// - [`crate::XbergError::Other`] when the NER or captioning backends fail.
-/// - [`crate::XbergError::Other`] when `config.transcription` is `Some`:
-///   the transcription backend is not yet implemented.
+///   empty label set (propagated from `classify_document_onto`).
+/// - [`crate::XbergError::Other`] when the NER or captioning backends fail. A captioning
+///   failure still leaves `extraction.images` intact and records the usage for the calls
+///   that already succeeded before the error propagates.
+///
+/// A `Some` `config.transcription` is **not** an error: it appends a
+/// [`ProcessingWarning`](crate::types::ProcessingWarning) to the returned document and the
+/// remaining stages run normally.
 #[cfg_attr(alef, alef(skip))]
-pub async fn enrich(extraction: ExtractedDocument, config: &EnrichmentConfig) -> crate::Result<EnrichedResult> {
-    // When none of the enrichment features are enabled, `config` is only
+#[cfg_attr(not(feature = "classification"), allow(unused_mut))]
+pub async fn enrich(mut extraction: ExtractedDocument, config: &EnrichmentConfig) -> crate::Result<EnrichedResult> {
     // read inside `#[cfg(...)]` branches that are all compiled out — silence
-    // the unused-variable warning so `-D warnings` builds (e.g. Live HF preset)
-    // stay green.
     #[cfg(not(any(
         feature = "transcription-types",
         feature = "classification",
@@ -206,56 +257,62 @@ pub async fn enrich(extraction: ExtractedDocument, config: &EnrichmentConfig) ->
     )))]
     let _ = config;
 
-    // Transcription guard: config surface is present, backend is not.
-    // Any `Some(...)` value is an explicit caller intent — surface the gap clearly.
+    // Requesting transcription here used to `return Err(...)`, which failed the whole call
+    // and took the classification, NER and captioning stages down with it. Transcription is
+    // extraction-time work and there is nothing for `enrich` to run, so the request is
+    // reported the way the pipeline reports every other requested-but-unavailable stage —
+    // a non-fatal `ProcessingWarning`, partial results preserved (see the captioning and
+    // structured-extraction warnings in `core::pipeline`). ~keep
     #[cfg(feature = "transcription-types")]
-    if config.transcription.is_some() {
-        return Err(crate::XbergError::Other(
-            "transcription backend not yet implemented; set config.transcription = None to skip".into(),
-        ));
+    if let Some(ref transcription) = config.transcription {
+        extraction.processing_warnings.push(crate::types::ProcessingWarning {
+            source: std::borrow::Cow::Borrowed("transcription"),
+            message: std::borrow::Cow::Owned(format!(
+                "enrich() skipped the requested transcription stage (model {:?}, language {}): \
+                 enrich() runs on an already-extracted document and no longer has the source \
+                 audio/video bytes, so it cannot transcribe. Transcribe during extraction \
+                 instead — set `ExtractionConfig::transcription` and run `extract` on the \
+                 audio/video file in a build with the `transcription` feature enabled. All \
+                 other configured enrichment stages ran normally.",
+                transcription.model,
+                transcription
+                    .language
+                    .as_deref()
+                    .unwrap_or("unset (engine defaults to en)"),
+            )),
+        });
     }
 
-    // Stage 1: classification.
     #[cfg(feature = "classification")]
     let classification = if let Some(ref cfg) = config.classification {
-        let pages: Vec<&str> = match extraction.pages.as_deref() {
-            Some(pages) => pages.iter().map(|p| p.content.as_str()).collect(),
-            // Fall back to the full content blob when per-page data is absent.
-            None => vec![extraction.content.as_str()],
-        };
-        Some(crate::text::classification::classify_document(&pages, &cfg.config).await?)
+        // `classify_document_onto` also writes `page_classifications` and appends the
+        // per-page `LlmUsage`; the plain `classify_document` dropped both (#263).
+        Some(crate::text::classification::classify_document_onto(&mut extraction, &cfg.config).await?)
     } else {
         None
     };
 
-    // Stage 2: NER.
+    #[cfg(feature = "classification")]
+    if let Some(ref cfg) = config.chunk_classification {
+        crate::text::classification::classify_chunks(&mut extraction, &cfg.config).await?;
+    }
+
     #[cfg(feature = "ner")]
     let entities = if let Some(ref cfg) = config.ner {
-        Some(crate::text::ner::detect_entities(&extraction.content, cfg.backend.as_ref(), &cfg.categories).await?)
+        let detected =
+            crate::text::ner::detect_entities(&extraction.content, cfg.backend.as_ref(), &cfg.categories).await?;
+        // `ExtractedDocument::entities` is the field the API schema, the bindings, and every
+        // serializing consumer read. Without this write-back the detected entities existed
+        // only in `EnrichedResult` and were invisible downstream (#263). ~keep
+        extraction.entities = Some(detected.clone());
+        Some(detected)
     } else {
         None
     };
 
-    // Stage 3: captioning.
-    // Only images with non-empty data are forwarded to the VLM. Reference-only
-    // images (data.is_empty()) are skipped to avoid sending garbage bytes.
     #[cfg(feature = "captioning")]
     let captions = if let Some(ref cfg) = config.captioning {
-        match extraction.images.as_deref() {
-            None | Some([]) => Some(Vec::new()),
-            Some(images) => {
-                let mut out = Vec::with_capacity(images.len());
-                for image in images {
-                    let caption = if image.data.is_empty() {
-                        String::new()
-                    } else {
-                        crate::captioning::caption_image(&image.data, &cfg.config, cfg.custom_prompt.as_deref()).await?
-                    };
-                    out.push(caption);
-                }
-                Some(out)
-            }
-        }
+        Some(caption_images_onto(&mut extraction, cfg).await?)
     } else {
         None
     };
@@ -269,4 +326,82 @@ pub async fn enrich(extraction: ExtractedDocument, config: &EnrichmentConfig) ->
         #[cfg(feature = "captioning")]
         captions,
     })
+}
+
+/// Caption every image in `extraction` that carries bytes, writing each caption onto the
+/// image and every VLM call's [`crate::types::LlmUsage`] onto the document.
+///
+/// Returns the captions positionally parallel to `extraction.images`. Images with empty
+/// `data` (reference-only images populated via `source_path`) are skipped, cost no VLM
+/// call, and yield an empty string — matching the documented contract of
+/// [`CaptioningEnrichmentConfig`].
+///
+/// Captions land on `ExtractedImage::caption`, and additionally on
+/// `ExtractedImage::description` when that is unset, because renderers emit `description`
+/// at the image placeholder and never read `caption` — the same mirroring the built-in
+/// captioning post-processor does. Without this the caption existed only in
+/// `EnrichedResult::captions` and never reached the serialized document (#263).
+///
+/// On a VLM failure the images taken out of `extraction` are put back, and the usage for
+/// the calls that did succeed is recorded, before the error propagates; otherwise a failure
+/// on image *n* would silently strip the document's entire image list.
+#[cfg(feature = "captioning")]
+async fn caption_images_onto(
+    extraction: &mut ExtractedDocument,
+    cfg: &CaptioningEnrichmentConfig,
+) -> crate::Result<Vec<String>> {
+    /// Put the borrowed image list back and record the usage accumulated so far.
+    fn commit(
+        extraction: &mut ExtractedDocument,
+        images: Vec<crate::types::ExtractedImage>,
+        usages: Vec<crate::types::LlmUsage>,
+    ) {
+        extraction.images = Some(images);
+        if !usages.is_empty() {
+            extraction.llm_usage.get_or_insert_with(Vec::new).extend(usages);
+        }
+    }
+
+    // Taken out so `extraction.llm_usage` can be written inside the loop without holding a
+    // second mutable borrow of `extraction`.
+    let Some(mut images) = extraction.images.take() else {
+        return Ok(Vec::new());
+    };
+
+    let mut captions = Vec::with_capacity(images.len());
+    let mut usages: Vec<crate::types::LlmUsage> = Vec::new();
+
+    for index in 0..images.len() {
+        let data = images[index].data.clone();
+        if data.is_empty() {
+            captions.push(String::new());
+            continue;
+        }
+
+        match crate::captioning::caption_image_with_usage(&data, &cfg.config, cfg.custom_prompt.as_deref()).await {
+            Ok((caption, usage)) => {
+                let caption = caption.trim().to_string();
+                if !caption.is_empty() {
+                    if images[index].description.is_none() {
+                        images[index].description = Some(caption.clone());
+                    }
+                    images[index].caption = Some(caption.clone());
+                }
+                if let Some(mut usage) = usage {
+                    if usage.source.is_empty() || usage.source == "vlm_ocr" {
+                        usage.source = "captioning".to_string();
+                    }
+                    usages.push(usage);
+                }
+                captions.push(caption);
+            }
+            Err(error) => {
+                commit(extraction, images, usages);
+                return Err(error);
+            }
+        }
+    }
+
+    commit(extraction, images, usages);
+    Ok(captions)
 }

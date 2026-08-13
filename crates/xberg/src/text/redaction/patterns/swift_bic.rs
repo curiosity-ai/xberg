@@ -13,10 +13,6 @@ static RE_SWIFT: Lazy<Regex> =
 
 /// Find all SWIFT/BIC code spans in `text` (8 or 11 uppercase alphanumeric characters).
 pub fn find_all(text: &str) -> Vec<PatternMatch> {
-    // Match directly on source text (no case-folding). Real SWIFT BICs are
-    // always written in uppercase in financial documents; case-folding the
-    // entire input caused false positives on any 8-letter lowercase English
-    // word (e.g. "launches", "codename").
     RE_SWIFT
         .find_iter(text)
         .map(|m| PatternMatch {

@@ -1,25 +1,17 @@
 # =============================================================================
-# Minimal CLI-only Docker image for Xberg.
-#
-# Uses the musl-build stage to produce a fully static binary, then copies it
-# into a minimal Alpine image for shell access and volume mounts.
-#
-# Usage:
-#   docker build -f docker/Dockerfile.cli -t xberg-cli .
-#   docker run -v $(pwd):/data xberg-cli extract /data/document.pdf
 # =============================================================================
 
-# Stage 1: Build the static binary using the musl builder
 FROM alpine:3.21 AS builder
 
 ARG RUST_TOOLCHAIN=nightly-2026-03-10
 
 WORKDIR /build
 
-# Install build dependencies + ONNX Runtime from Alpine edge (musl-native).
-# ort-sys checks ORT_LIB_LOCATION before attempting download, so this overrides
-# the download-binaries feature transparently — no Cargo feature changes needed.
-# Edge repos needed because onnxruntime depends on abseil-cpp/protobuf from edge/main.
+# Alpine's /bin/sh is busybox ash, which supports `-o pipefail`. Without it the
+# `curl ... | sh` rustup bootstrap below reports only sh's status, so a failed or
+# truncated download silently installs nothing. (hadolint DL4006)
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+
 RUN apk add --no-cache \
     curl musl-dev cmake make pkgconf \
     perl linux-headers git file && \
@@ -29,49 +21,38 @@ RUN apk add --no-cache \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
 
-# Install Rust via rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --component rust-src
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Allow dynamic loading (dlopen) on musl targets by disabling crt-static.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Point ort-sys to Alpine's system ORT library instead of downloading prebuilt binaries.
 ENV ORT_LIB_LOCATION=/usr/lib
 ENV ORT_PREFER_DYNAMIC_LINK=1
 
-# Copy workspace manifests and crates
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
+COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-cli/ crates/xberg-cli/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
+COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
 
-# Remove workspace members that aren't included
 RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /\"crates\/xberg-wasm\"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
 
 RUN cargo build --release --package xberg-cli --features all && \
     cp target/release/xberg /build/xberg && \
     strip /build/xberg
 
-# Verify the binary was built successfully
 RUN file /build/xberg && \
     echo "=== Dynamic dependencies ===" && \
     readelf -d /build/xberg 2>/dev/null | grep NEEDED || echo "No external dependencies"
 
-# =============================================================================
-# Stage 2: Minimal runtime image
-# =============================================================================
 FROM alpine:3.21
 
-# Install runtime dependencies needed by dynamically linked binary.
-# libheif 1.23 ships codec backends as separate "plugin" packages
-# (libheif-libde265, libheif-aom, libheif-dav1d, libheif-x265 — pulled in
-# explicitly so HEVC + AVIF decode works at runtime).
 RUN apk add --no-cache libgcc && \
     apk add --no-cache \
         libstdc++ \

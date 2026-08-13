@@ -23,8 +23,6 @@ use crate::types::PageBoundary;
 #[cfg(test)]
 use std::io::Cursor;
 
-// --- DOCX Constants ---
-
 /// Maximum uncompressed size per file in a DOCX archive (100 MB).
 pub const MAX_UNCOMPRESSED_FILE_SIZE: u64 = 100 * 1024 * 1024;
 /// Maximum number of entries in a DOCX ZIP archive.
@@ -103,12 +101,10 @@ pub(crate) fn detect_table_page_numbers(bytes: &[u8]) -> Result<Vec<usize>> {
 
     let mut events: Vec<(usize, Marker)> = Vec::new();
 
-    // Explicit page breaks: <w:br w:type="page"/>
     for (pos, _) in document_xml.match_indices(r#"<w:br w:type="page"/>"#) {
         events.push((pos, Marker::PageBreak));
     }
 
-    // Top-level table opens: <w:tbl> or <w:tbl ...> — but NOT <w:tblPr>, <w:tblGrid>, etc.
     for (pos, _) in document_xml.match_indices("<w:tbl") {
         let after = pos + "<w:tbl".len();
         if matches!(
@@ -119,7 +115,6 @@ pub(crate) fn detect_table_page_numbers(bytes: &[u8]) -> Result<Vec<usize>> {
         }
     }
 
-    // Table closes: </w:tbl>
     for (pos, _) in document_xml.match_indices("</w:tbl>") {
         events.push((pos, Marker::TableClose));
     }
@@ -135,7 +130,6 @@ pub(crate) fn detect_table_page_numbers(bytes: &[u8]) -> Result<Vec<usize>> {
             Marker::PageBreak => current_page += 1,
             Marker::TableOpen => {
                 if table_depth == 0 {
-                    // Top-level table: record its page
                     table_page_numbers.push(current_page);
                 }
                 table_depth += 1;
@@ -465,8 +459,6 @@ mod tests {
         }
     }
 
-    // ---- detect_table_page_numbers tests ----
-
     /// Build a minimal in-memory DOCX ZIP with the given document.xml body content.
     fn build_test_docx(body: &str) -> Vec<u8> {
         use std::io::Write;
@@ -538,13 +530,11 @@ mod tests {
 "#;
         let docx = build_test_docx(body);
         let result = detect_table_page_numbers(&docx).unwrap();
-        // Tables 1 and 2 are on page 1; table 3 is on page 2
         assert_eq!(result, vec![1, 1, 2]);
     }
 
     #[test]
     fn test_detect_table_page_numbers_nested_table_not_counted() {
-        // Nested table (inside a cell) should NOT appear as an extra entry.
         let body = r#"
 <w:tbl>
   <w:tr><w:tc>
@@ -554,15 +544,12 @@ mod tests {
 "#;
         let docx = build_test_docx(body);
         let result = detect_table_page_numbers(&docx).unwrap();
-        // Only the outer top-level table is recorded
         assert_eq!(result, vec![1]);
     }
 
     #[test]
     fn test_detect_table_page_numbers_invalid_docx() {
-        // Should return empty, not panic or error
         let result = detect_table_page_numbers(b"not a docx");
-        // Either Ok(empty) or Err is acceptable; must not panic
         let _ = result;
     }
 }

@@ -1,5 +1,5 @@
 //! Validates that `render_json()` output conforms to the JSON Schema
-//! defined in `docs/schemas/document-content.schema.json`.
+//! defined in `schemas/document-content.schema.json`.
 
 use bytes::Bytes;
 use std::borrow::Cow;
@@ -9,7 +9,7 @@ use xberg::types::internal_builder::InternalDocumentBuilder;
 
 /// Load the JSON Schema once and return the parsed value.
 fn load_schema() -> serde_json::Value {
-    let raw = include_str!("../../../docs/schemas/document-content.schema.json");
+    let raw = include_str!("../../../schemas/document-content.schema.json");
     serde_json::from_str(raw).expect("schema is valid JSON")
 }
 
@@ -83,7 +83,6 @@ fn test_headings_and_paragraphs_validate() {
 fn test_tables_code_blocks_and_lists_validate() {
     let mut b = InternalDocumentBuilder::new("test");
 
-    // Table
     let cells = vec![
         vec!["Name".to_string(), "Age".to_string()],
         vec!["Alice".to_string(), "30".to_string()],
@@ -91,19 +90,15 @@ fn test_tables_code_blocks_and_lists_validate() {
     ];
     b.push_table_from_cells(&cells, None, None);
 
-    // Code block with language
     b.push_code("fn main() {}", Some("rust"), None, None);
 
-    // Code block without language
     b.push_code("echo hello", None, None, None);
 
-    // Unordered list
     b.push_list(false);
     b.push_list_item("Apples", false, vec![], None, None);
     b.push_list_item("Bananas", false, vec![], None, None);
     b.end_list();
 
-    // Ordered list
     b.push_list(true);
     b.push_list_item("First", true, vec![], None, None);
     b.push_list_item("Second", true, vec![], None, None);
@@ -118,7 +113,6 @@ fn test_tables_code_blocks_and_lists_validate() {
 fn test_images_formulas_blockquotes_validate() {
     let mut b = InternalDocumentBuilder::new("test");
 
-    // Image with description and data
     let image = make_image(
         Some("A diagram".to_string()),
         None,
@@ -126,15 +120,12 @@ fn test_images_formulas_blockquotes_validate() {
     );
     b.push_image(Some("A diagram"), image, None, None);
 
-    // Image with no description and a source path
     let image2 = make_image(None, Some("/images/photo.jpg".to_string()), Bytes::new());
     b.push_image(None, image2, None, None);
 
-    // Formula
     b.push_formula("E = mc^2", None, None);
     b.push_formula("\\int_0^1 x^2 dx", None, None);
 
-    // Blockquote
     b.push_quote_start();
     b.push_paragraph("To be or not to be.", vec![], None, None);
     b.push_quote_end();
@@ -149,11 +140,9 @@ fn test_complex_nested_document_validates() {
     let mut b = InternalDocumentBuilder::new("test");
     b.push_title("Complex Document", None, None);
 
-    // Section with mixed content
     b.push_heading(1, "Overview", None, None);
     b.push_paragraph("This document tests all node types.", vec![], None, None);
 
-    // Nested section
     b.push_heading(2, "Data", None, None);
     let cells = vec![
         vec!["Key".to_string(), "Value".to_string()],
@@ -162,7 +151,6 @@ fn test_complex_nested_document_validates() {
     b.push_table_from_cells(&cells, None, None);
     b.push_code("let x = 1;", Some("rust"), None, None);
 
-    // Another top-level section
     b.push_heading(1, "Appendix", None, None);
     b.push_formula("a^2 + b^2 = c^2", None, None);
 

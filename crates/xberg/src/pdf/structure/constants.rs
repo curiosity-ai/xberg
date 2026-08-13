@@ -1,20 +1,12 @@
 //! Threshold constants for PDF-to-Markdown spatial analysis.
 
-// ── Glyph-fragmentation repair (issue #962) ────────────────────────────────
-//
-// Word-exported PDFs position each glyph via its own BT…ET block with a
-// sinusoidal y-jitter (~3–5 pt amplitude, 6-glyph period). pdf_oxide's
-// ColumnAware reading order groups spans by y-level, scrambling reading
-// order for these documents. The constants below parameterise the
-// detection and reconstruction heuristic in `pdf::oxide::text`.
-//
-// TODO: remove this heuristic when xberg upgrades to pdf_oxide ≥ 0.3.51.
-// Upstream fix shipped in v0.3.51 (2026-05-19, closing issue #518): the Tm
-// continuation check now uses glyph height as the tolerance floor (≥ 0.5 pt)
-// so per-glyph sinusoidal jitter merges natively into a single span and the
-// reading-order scramble no longer occurs. xberg currently pins v0.3.50.
-// After bumping, verify with test_3_5pt_jitter_coalesced and the other tests
-// in tests/pdf_glyph_spacing_issue_962.rs before deleting this block.
+// ~keep ── Glyph-fragmentation repair (issue #962) ────────────────────────────────
+// ~keep
+// ~keep Word-exported PDFs position each glyph via its own BT…ET block with a
+// ~keep sinusoidal y-jitter (~3–5 pt amplitude, 6-glyph period). pdf_oxide's
+// ~keep ColumnAware reading order groups spans by y-level, scrambling reading
+// ~keep order for these documents. The constants below parameterise the
+// ~keep detection and reconstruction heuristic in `pdf::oxide::text`.
 
 /// Maximum y-gap (pt) between two spans that can still be considered "same
 /// line" under the glyph-fragmentation detection heuristic.
@@ -43,8 +35,6 @@ pub(crate) const MIN_DISORDER_COUNT: usize = 3;
 /// accepted by the detection gate is merged into the same group.
 pub(crate) const COALESCE_THRESHOLD: f32 = 5.0;
 
-// ── Structural heading analysis ────────────────────────────────────────────
-
 /// Maximum word count for a paragraph to qualify as a heading.
 pub(super) const MAX_HEADING_WORD_COUNT: usize = 20;
 /// Maximum distance multiplier relative to average inter-cluster gap for heading assignment.
@@ -57,6 +47,25 @@ pub(super) const MIN_HEADING_FONT_RATIO: f32 = 1.15;
 pub(super) const MIN_HEADING_FONT_GAP: f32 = 1.5;
 /// Maximum word count for a bold paragraph to be promoted to a section heading.
 pub(super) const MAX_BOLD_HEADING_WORD_COUNT: usize = 12;
+/// Minimum layout-hint confidence required for a `Text`/`Caption`/`Footnote` hint to
+/// *demote* an existing heading to body text. Demotion is destructive — erasing a real
+/// heading costs a 2.0-weight block in SF1 — so it uses a higher bar than the 0.5/0.7
+/// thresholds used for constructive overrides, and additionally requires the paragraph
+/// to carry no independent heading evidence (font-above-body, bold, or a section pattern).
+pub(super) const HEADING_DEMOTE_CONFIDENCE: f32 = 0.85;
+/// Minimum number of non-empty text blocks a document must contain before
+/// font-size clustering is allowed to promote any run to a heading.
+///
+/// Font-size heading inference is only reliable once there is enough text to
+/// establish a stable body-font baseline. In a document with only a handful of
+/// blocks (a title slide, a cover page, a one-line note) a single larger line is
+/// far more likely to be display/opening prose than a section heading, so
+/// promoting it costs the structural-F1 metric heavily (headings are weighted
+/// 2.0). Below this floor, `build_heading_map` returns a body-only map and the
+/// fallback title promotion is skipped. The floor is set so a genuine short
+/// document (title plus four body paragraphs, five blocks) still gets its
+/// heading, while two- or three-block fixtures do not.
+pub(super) const MIN_BLOCKS_FOR_FONT_HEADING: usize = 5;
 /// Fraction of the maximum right edge that a line must reach to be considered "full"
 /// (used for dehyphenation to avoid false joins on short/indented lines).
 pub(super) const FULL_LINE_FRACTION: f32 = 0.85;

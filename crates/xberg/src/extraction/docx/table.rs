@@ -3,6 +3,7 @@
 //! This module provides comprehensive support for parsing table-level, row-level, and cell-level
 //! properties from OOXML `<w:tblPr>`, `<w:trPr>`, and `<w:tcPr>` elements using streaming XML parsing.
 
+use crate::extractors::security::{SecurityBudget, SecurityError};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use serde::{Deserialize, Serialize};
@@ -191,13 +192,22 @@ pub struct TableGrid {
 ///
 /// Expects the reader to be positioned just after the `<w:tblPr>` start tag.
 /// Reads all child elements until the matching `</w:tblPr>` end tag.
-pub(crate) fn parse_table_properties(reader: &mut Reader<&[u8]>) -> TableProperties {
+///
+/// Threads `budget` through every event this function (and the delegating
+/// helpers it calls) reads, so nesting inside `w:tblPr` is measured against
+/// the caller's depth cap instead of passing through unaccounted (GH#384).
+pub(crate) fn parse_table_properties(
+    reader: &mut Reader<&[u8]>,
+    budget: &mut SecurityBudget,
+) -> Result<TableProperties, SecurityError> {
     let mut props = TableProperties::default();
     let mut buf = Vec::new();
 
     loop {
+        budget.step()?;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                budget.enter()?;
                 let local_name = e.local_name();
                 match local_name.as_ref() {
                     b"tblStyle" => {
@@ -217,9 +227,15 @@ pub(crate) fn parse_table_properties(reader: &mut Reader<&[u8]>) -> TablePropert
                     }
                     b"tblBorders" => {
                         props.borders = Some(parse_table_borders(reader));
+                        // `parse_table_borders` reads through its own `</w:tblBorders>`
+                        // without touching `budget`; refund the enter above or every
+                        // `tblBorders` child leaks one depth level.
+                        budget.leave();
                     }
                     b"tblCellMar" => {
                         props.cell_margins = Some(parse_cell_margins_element(reader));
+                        // Same as `tblBorders`: consumes its own end tag.
+                        budget.leave();
                     }
                     b"tblInd" => {
                         props.indent = parse_width_element(&e);
@@ -266,6 +282,7 @@ pub(crate) fn parse_table_properties(reader: &mut Reader<&[u8]>) -> TablePropert
                 buf.clear();
             }
             Ok(Event::End(e)) => {
+                budget.leave();
                 if e.local_name().as_ref() as &[u8] == b"tblPr" {
                     break;
                 }
@@ -278,19 +295,27 @@ pub(crate) fn parse_table_properties(reader: &mut Reader<&[u8]>) -> TablePropert
         }
     }
 
-    props
+    Ok(props)
 }
 
 /// Parse row-level properties from streaming XML reader.
 ///
 /// Expects the reader to be positioned just after the `<w:trPr>` start tag.
-pub(crate) fn parse_row_properties(reader: &mut Reader<&[u8]>) -> RowProperties {
+///
+/// Threads `budget` through every event so nesting inside `w:trPr` is
+/// measured against the caller's depth cap (GH#384).
+pub(crate) fn parse_row_properties(
+    reader: &mut Reader<&[u8]>,
+    budget: &mut SecurityBudget,
+) -> Result<RowProperties, SecurityError> {
     let mut props = RowProperties::default();
     let mut buf = Vec::new();
 
     loop {
+        budget.step()?;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                budget.enter()?;
                 let local_name = e.local_name();
                 match local_name.as_ref() {
                     b"trHeight" => {
@@ -325,6 +350,7 @@ pub(crate) fn parse_row_properties(reader: &mut Reader<&[u8]>) -> RowProperties 
                 buf.clear();
             }
             Ok(Event::End(e)) => {
+                budget.leave();
                 if e.local_name().as_ref() as &[u8] == b"trPr" {
                     break;
                 }
@@ -337,19 +363,28 @@ pub(crate) fn parse_row_properties(reader: &mut Reader<&[u8]>) -> RowProperties 
         }
     }
 
-    props
+    Ok(props)
 }
 
 /// Parse cell-level properties from streaming XML reader.
 ///
 /// Expects the reader to be positioned just after the `<w:tcPr>` start tag.
-pub(crate) fn parse_cell_properties(reader: &mut Reader<&[u8]>) -> CellProperties {
+///
+/// Threads `budget` through every event this function (and the delegating
+/// helpers it calls) reads, so nesting inside `w:tcPr` is measured against
+/// the caller's depth cap instead of passing through unaccounted (GH#384).
+pub(crate) fn parse_cell_properties(
+    reader: &mut Reader<&[u8]>,
+    budget: &mut SecurityBudget,
+) -> Result<CellProperties, SecurityError> {
     let mut props = CellProperties::default();
     let mut buf = Vec::new();
 
     loop {
+        budget.step()?;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                budget.enter()?;
                 let local_name = e.local_name();
                 match local_name.as_ref() {
                     b"tcW" => {
@@ -363,12 +398,18 @@ pub(crate) fn parse_cell_properties(reader: &mut Reader<&[u8]>) -> CellPropertie
                     }
                     b"tcBorders" => {
                         props.borders = Some(parse_cell_borders(reader));
+                        // `parse_cell_borders` reads through its own `</w:tcBorders>`
+                        // without touching `budget`; refund the enter above.
+                        budget.leave();
                     }
                     b"shd" => {
                         props.shading = Some(parse_cell_shading(&e));
                     }
                     b"tcMar" => {
                         props.margins = Some(parse_cell_margins_element(reader));
+                        // `parse_cell_margins_element` reads through its own
+                        // `</w:tcMar>` without touching `budget`; refund the enter above.
+                        budget.leave();
                     }
                     b"vAlign" => {
                         props.vertical_align = get_attribute(&e, b"val");
@@ -418,6 +459,7 @@ pub(crate) fn parse_cell_properties(reader: &mut Reader<&[u8]>) -> CellPropertie
                 buf.clear();
             }
             Ok(Event::End(e)) => {
+                budget.leave();
                 if e.local_name().as_ref() as &[u8] == b"tcPr" {
                     break;
                 }
@@ -430,19 +472,27 @@ pub(crate) fn parse_cell_properties(reader: &mut Reader<&[u8]>) -> CellPropertie
         }
     }
 
-    props
+    Ok(props)
 }
 
 /// Parse table grid (column widths) from streaming XML reader.
 ///
 /// Expects the reader to be positioned just after the `<w:tblGrid>` start tag.
-pub(crate) fn parse_table_grid(reader: &mut Reader<&[u8]>) -> TableGrid {
+///
+/// Threads `budget` through every event so nesting inside `w:tblGrid` is
+/// measured against the caller's depth cap (GH#384).
+pub(crate) fn parse_table_grid(
+    reader: &mut Reader<&[u8]>,
+    budget: &mut SecurityBudget,
+) -> Result<TableGrid, SecurityError> {
     let mut grid = TableGrid::default();
     let mut buf = Vec::new();
 
     loop {
+        budget.step()?;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                budget.enter()?;
                 if e.local_name().as_ref() as &[u8] == b"gridCol"
                     && let Some(width) = get_attribute_int(&e, b"w")
                 {
@@ -459,6 +509,7 @@ pub(crate) fn parse_table_grid(reader: &mut Reader<&[u8]>) -> TableGrid {
                 buf.clear();
             }
             Ok(Event::End(e)) => {
+                budget.leave();
                 if e.local_name().as_ref() as &[u8] == b"tblGrid" {
                     break;
                 }
@@ -471,7 +522,7 @@ pub(crate) fn parse_table_grid(reader: &mut Reader<&[u8]>) -> TableGrid {
         }
     }
 
-    grid
+    Ok(grid)
 }
 
 /// Helper: Check if an OOXML on/off toggle element is enabled.
@@ -507,8 +558,6 @@ fn parse_width_element(e: &BytesStart) -> Option<TableWidth> {
 fn parse_table_look(e: &BytesStart) -> TableLook {
     let mut look = TableLook::default();
 
-    // Try individual boolean attributes first (OOXML 2012+ Transitional).
-    // Check if ANY individual attribute is present to distinguish from bitmask-only.
     let has_individual = get_attribute(e, b"firstRow").is_some()
         || get_attribute(e, b"lastRow").is_some()
         || get_attribute(e, b"firstColumn").is_some()
@@ -523,16 +572,15 @@ fn parse_table_look(e: &BytesStart) -> TableLook {
         look.last_column = get_attribute(e, b"lastColumn").as_deref() == Some("1");
         look.no_h_band = get_attribute(e, b"noHBand").as_deref() == Some("1");
         look.no_v_band = get_attribute(e, b"noVBand").as_deref() == Some("1");
-    } else if let Some(val_str) = get_attribute(e, b"val") {
-        // Fall back to legacy hex bitmask
-        if let Ok(mask) = i32::from_str_radix(&val_str, 16) {
-            look.first_row = (mask & 0x0020) != 0;
-            look.last_row = (mask & 0x0040) != 0;
-            look.first_column = (mask & 0x0080) != 0;
-            look.last_column = (mask & 0x0100) != 0;
-            look.no_h_band = (mask & 0x0200) != 0;
-            look.no_v_band = (mask & 0x0400) != 0;
-        }
+    } else if let Some(val_str) = get_attribute(e, b"val")
+        && let Ok(mask) = i32::from_str_radix(&val_str, 16)
+    {
+        look.first_row = (mask & 0x0020) != 0;
+        look.last_row = (mask & 0x0040) != 0;
+        look.first_column = (mask & 0x0080) != 0;
+        look.last_column = (mask & 0x0100) != 0;
+        look.no_h_band = (mask & 0x0200) != 0;
+        look.no_v_band = (mask & 0x0400) != 0;
     }
 
     look
@@ -542,7 +590,7 @@ fn parse_table_look(e: &BytesStart) -> TableLook {
 fn parse_vmerge(e: &BytesStart) -> VerticalMerge {
     match get_attribute(e, b"val") {
         Some(val) if val == "restart" => VerticalMerge::Restart,
-        _ => VerticalMerge::Continue, // Empty element or missing attribute = Continue
+        _ => VerticalMerge::Continue,
     }
 }
 
@@ -799,10 +847,11 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:tblPr)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
-        let props = parse_table_properties(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let props = parse_table_properties(&mut reader, &mut budget).unwrap();
 
         assert_eq!(props.style_id, Some("TableGrid".to_string()));
         assert_eq!(
@@ -838,10 +887,11 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:trPr)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
-        let props = parse_row_properties(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let props = parse_row_properties(&mut reader, &mut budget).unwrap();
 
         assert_eq!(props.height, Some(720));
         assert_eq!(props.height_rule, Some("atLeast".to_string()));
@@ -861,10 +911,11 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:tcPr)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
-        let props = parse_cell_properties(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let props = parse_cell_properties(&mut reader, &mut budget).unwrap();
 
         assert_eq!(
             props.width,
@@ -892,10 +943,11 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:tcPr)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
-        let props = parse_cell_properties(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let props = parse_cell_properties(&mut reader, &mut budget).unwrap();
 
         assert!(props.shading.is_some());
         let shading = props.shading.unwrap();
@@ -920,10 +972,11 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:tblGrid)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
-        let grid = parse_table_grid(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let grid = parse_table_grid(&mut reader, &mut budget).unwrap();
 
         assert_eq!(grid.columns, vec![2500, 2500, 2000, 2000]);
     }
@@ -936,13 +989,11 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        let event = reader.read_event_into(&mut buf).unwrap(); // Empty(w:tblLook)
+        let event = reader.read_event_into(&mut buf).unwrap();
 
         if let Event::Empty(e) = event {
             let look = parse_table_look(&e);
 
-            // 0x0460 = 0000_0100_0110_0000
-            // first_row (0x0020) = 1, last_row (0x0040) = 1, first_column (0x0080) = 0, etc.
             assert!(look.first_row);
             assert!(look.last_row);
             assert!(!look.first_column);
@@ -961,12 +1012,12 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:tcPr)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
-        let props = parse_cell_properties(&mut reader);
+        let mut budget = SecurityBudget::with_defaults();
+        let props = parse_cell_properties(&mut reader, &mut budget).unwrap();
 
-        // Bare <w:vMerge/> without val attribute should be Continue
         assert_eq!(props.v_merge, Some(VerticalMerge::Continue));
     }
 
@@ -978,10 +1029,9 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Empty(w:tblPr)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
-        // Consume the Empty event and test with default
         let props = TableProperties::default();
 
         assert!(props.style_id.is_none());
@@ -1002,7 +1052,7 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:tblCellMar)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
         let margins = parse_cell_margins_element(&mut reader);
@@ -1026,7 +1076,7 @@ mod tests {
         reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        reader.read_event_into(&mut buf).unwrap(); // Start(w:tblBorders)
+        reader.read_event_into(&mut buf).unwrap();
         buf.clear();
 
         let borders = parse_table_borders(&mut reader);

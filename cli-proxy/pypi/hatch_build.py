@@ -22,8 +22,6 @@ from pathlib import Path
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
-# Rust target triple -> wheel platform tag. PyPI uses the platform tag to serve the
-# correct wheel per OS/arch/libc.
 _TAG_MAP = {
     "x86_64-pc-windows-msvc": "win_amd64",
     "x86_64-unknown-linux-gnu": "manylinux_2_28_x86_64",
@@ -86,13 +84,10 @@ class CustomBuildHook(BuildHookInterface):
         """Bundle a staged native binary when building a targeted wheel."""
         target = os.environ.get("XBERG_CLI_TARGET", "").strip()
         if not target:
-            # sdist build or unbundled wheel: leave a pure, download-at-runtime package.
             return
 
         archive = self._find_archive(target)
         if archive is None:
-            # Target requested but no binary staged — fail loudly rather than ship an
-            # empty platform wheel that shadows the working sdist on PyPI.
             raise RuntimeError(
                 f"XBERG_CLI_TARGET={target} but no xberg-cli-{target}.(tar.gz|zip) "
                 f"found in repo root or dist/; refusing to build an empty platform wheel."
@@ -104,25 +99,19 @@ class CustomBuildHook(BuildHookInterface):
 
         binary = self._extract_binary(archive, target)
 
-        # force_include maps absolute source paths -> in-wheel relative paths.
         relative = f"xberg_cli/bin/{target}/{binary.name}"
         force_include = build_data.setdefault("force_include", {})
         force_include[str(binary)] = relative
 
-        # Bundle runtime dylibs staged next to the binary. The native Intel-macOS
-        # build loads ONNX Runtime dynamically and ships libonnxruntime.dylib (plus
-        # its vendored deps) alongside the executable; ort resolves them relative to
-        # the binary, so they must sit in the same in-wheel directory.
         for lib in sorted(binary.parent.glob("*.dylib")):
             force_include[str(lib)] = f"xberg_cli/bin/{target}/{lib.name}"
 
-        # Make it a platform wheel (not pure-python, not py3-none-any).
         build_data["pure_python"] = False
         build_data["infer_tag"] = False
         build_data["tag"] = f"py3-none-{wheel_tag}"
 
     def _find_archive(self, target: str) -> Path | None:
-        root = Path(self.root)  # the project dir hatchling is building (cli-proxy/pypi)
+        root = Path(self.root)
         repo_root = root.parent.parent
         for base in (repo_root, repo_root / "dist", root, root / "dist"):
             for ext in ("tar.gz", "zip"):

@@ -14,7 +14,6 @@ mod sevenz;
 mod tar;
 mod zip;
 
-// Re-export all public functions for backward compatibility
 #[cfg(test)]
 pub(crate) use gzip::{decompress_gzip, extract_gzip_metadata, extract_gzip_text_content};
 pub(crate) use gzip::{extract_gzip, extract_gzip_with_bytes};
@@ -49,9 +48,91 @@ pub struct ArchiveEntry {
 }
 
 /// Common text file extensions that should be extracted from archives.
+///
+/// #113: the original list only covered a handful of formats, so real
+/// plain-text members (source code, config files, alternate markup/data
+/// formats) were treated as binary and skipped. Widened to cover the text
+/// families xberg already extracts elsewhere in the pipeline.
 pub(crate) const TEXT_EXTENSIONS: &[&str] = &[
-    ".txt", ".md", ".json", ".xml", ".html", ".csv", ".log", ".yaml", ".toml",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".json",
+    ".jsonl",
+    ".ndjson",
+    ".xml",
+    ".html",
+    ".htm",
+    ".csv",
+    ".tsv",
+    ".log",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".properties",
+    ".env",
+    ".rst",
+    ".adoc",
+    ".tex",
+    ".sql",
+    ".rs",
+    ".py",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".go",
+    ".java",
+    ".kt",
+    ".rb",
+    ".php",
+    ".c",
+    ".h",
+    ".cpp",
+    ".cc",
+    ".hpp",
+    ".cs",
+    ".swift",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".css",
+    ".scss",
+    ".less",
+    ".svg",
+    ".gitignore",
 ];
+
+/// Decode an archive text member's bytes to a string, detecting the charset
+/// instead of dropping non-UTF-8 members. Warns when the bytes weren't clean
+/// UTF-8 so a mojibake member is at least visible (xberg-io/xberg#1223).
+///
+/// `decode_with_provenance` (#395) reports whether the decode actually lost data --
+/// via `replaced_characters` -- at the point the decision is made, which is folded
+/// into this same warning rather than emitted separately: scanning the returned
+/// `String` for U+FFFD afterwards would be blind to that under the `quality`
+/// feature, whose mojibake cleanup strips replacement characters before this
+/// function's caller ever sees the text.
+pub(crate) fn decode_archive_text(bytes: &[u8], member: &str) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => crate::utils::strip_bom(s).to_string(),
+        Err(_) => {
+            let outcome = crate::utils::decode_with_provenance(bytes, None);
+            tracing::warn!(
+                member = %member,
+                replaced_characters = outcome.replaced_characters,
+                "archive member is not valid UTF-8; decoding with charset detection"
+            );
+            crate::utils::strip_bom(&outcome.text).to_string()
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -63,6 +144,49 @@ mod tests {
 
     fn default_limits() -> SecurityLimits {
         SecurityLimits::default()
+    }
+
+    /// Regression for #113: real text members with extensions absent from the
+    /// original narrow allowlist (source code, `.ini`/`.env` config, `.yml`,
+    /// `.rst`) must be extracted, not skipped as binary.
+    #[test]
+    fn test_extract_zip_text_content_includes_widened_extensions() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+
+            zip.start_file("main.rs", options).unwrap();
+            zip.write_all(b"fn main() {}").unwrap();
+
+            zip.start_file("settings.ini", options).unwrap();
+            zip.write_all(b"[core]\nkey=value").unwrap();
+
+            zip.start_file(".env", options).unwrap();
+            zip.write_all(b"API_KEY=secret").unwrap();
+
+            zip.start_file("pipeline.yml", options).unwrap();
+            zip.write_all(b"steps: []").unwrap();
+
+            zip.start_file("notes.rst", options).unwrap();
+            zip.write_all(b"Title\n=====").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let bytes = cursor.into_inner();
+        let contents = extract_zip_text_content(&bytes, &default_limits()).unwrap();
+
+        assert_eq!(
+            contents.len(),
+            5,
+            "all five widened-extension members should be extracted: {contents:?}"
+        );
+        assert_eq!(contents.get("main.rs").unwrap(), "fn main() {}");
+        assert_eq!(contents.get("settings.ini").unwrap(), "[core]\nkey=value");
+        assert_eq!(contents.get(".env").unwrap(), "API_KEY=secret");
+        assert_eq!(contents.get("pipeline.yml").unwrap(), "steps: []");
+        assert_eq!(contents.get("notes.rst").unwrap(), "Title\n=====");
     }
 
     #[test]
@@ -144,6 +268,28 @@ mod tests {
         assert_eq!(contents.len(), 2);
         assert_eq!(contents.get("test.txt").unwrap(), "Hello, World!");
         assert_eq!(contents.get("readme.md").unwrap(), "# README");
+    }
+
+    /// Regression for #1223: a non-UTF-8 (Latin-1) text member must be recovered,
+    /// not silently dropped by a failed read_to_string.
+    #[test]
+    fn non_utf8_zip_member_is_recovered_not_dropped() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+            zip.start_file("latin1.txt", options).unwrap();
+            zip.write_all(b"caf\xe9").unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+        let contents = extract_zip_text_content(&bytes, &default_limits()).unwrap();
+        assert!(
+            contents.contains_key("latin1.txt"),
+            "non-UTF-8 member must not be dropped"
+        );
+        let text = contents.get("latin1.txt").unwrap();
+        assert!(!text.is_empty(), "recovered content must be non-empty: {text:?}");
     }
 
     #[test]
@@ -870,13 +1016,12 @@ mod tests {
         use flate2::write::GzEncoder;
         use std::io::Write;
 
-        // Create data that exceeds a tiny limit
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&[b'A'; 1024]).unwrap();
         let compressed = encoder.finish().unwrap();
 
         let limits = SecurityLimits {
-            max_archive_size: 100, // 100 bytes limit
+            max_archive_size: 100,
             ..SecurityLimits::default()
         };
         let result = extract_gzip_metadata(&compressed, &limits);
@@ -889,7 +1034,6 @@ mod tests {
         use flate2::write::GzEncoder;
         use std::io::Write;
 
-        // Create a tar archive
         let mut tar_data = Vec::new();
         {
             let mut tar = TarBuilder::new(&mut tar_data);
@@ -911,12 +1055,10 @@ mod tests {
             tar.finish().unwrap();
         }
 
-        // Gzip compress the tar data
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar_data).unwrap();
         let gzip_compressed = encoder.finish().unwrap();
 
-        // Extract metadata from the gzip-compressed tar
         let metadata = extract_gzip_metadata(&gzip_compressed, &default_limits()).unwrap();
 
         assert_eq!(metadata.format, "GZIP+TAR");
@@ -924,7 +1066,6 @@ mod tests {
         assert_eq!(metadata.file_list.len(), 2);
         assert!(metadata.total_size > 0);
 
-        // Verify file paths are preserved
         let paths: Vec<&str> = metadata.file_list.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.contains(&"test.txt"));
         assert!(paths.contains(&"readme.md"));
@@ -936,7 +1077,6 @@ mod tests {
         use flate2::write::GzEncoder;
         use std::io::Write;
 
-        // Create a tar archive
         let mut tar_data = Vec::new();
         {
             let mut tar = TarBuilder::new(&mut tar_data);
@@ -958,12 +1098,10 @@ mod tests {
             tar.finish().unwrap();
         }
 
-        // Gzip compress the tar data
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar_data).unwrap();
         let gzip_compressed = encoder.finish().unwrap();
 
-        // Extract text content from the gzip-compressed tar
         let contents = extract_gzip_text_content(&gzip_compressed, &default_limits()).unwrap();
 
         assert_eq!(contents.len(), 2);
@@ -977,7 +1115,6 @@ mod tests {
         use flate2::write::GzEncoder;
         use std::io::Write;
 
-        // Create a tar archive
         let mut tar_data = Vec::new();
         {
             let mut tar = TarBuilder::new(&mut tar_data);
@@ -992,16 +1129,96 @@ mod tests {
             tar.finish().unwrap();
         }
 
-        // Gzip compress the tar data
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar_data).unwrap();
         let gzip_compressed = encoder.finish().unwrap();
 
-        // Extract both metadata and content in one call
         let (metadata, contents) = extract_gzip(&gzip_compressed, &default_limits()).unwrap();
 
         assert_eq!(metadata.format, "GZIP+TAR");
         assert_eq!(metadata.file_count, 1);
         assert_eq!(contents.get("combined.txt").unwrap(), "Combined test content");
+    }
+
+    /// A tracing `Layer` that records the `replaced_characters` field of every emitted
+    /// event, keyed by whether the field was present at all.
+    #[derive(Clone, Default)]
+    struct ReplacedCharactersCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<Option<bool>>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ReplacedCharactersCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            struct Visitor(Option<bool>);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    if field.name() == "replaced_characters" {
+                        self.0 = Some(value);
+                    }
+                }
+            }
+            let mut visitor = Visitor(None);
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    /// #395: `decode_with_provenance` reports data loss at the point the decode
+    /// actually happens, so it must survive into the existing lossy-decode warning
+    /// as a `replaced_characters` field instead of being discarded the way
+    /// `safe_decode` discarded it.
+    ///
+    /// Deliberately not run under `quality`: there chardetng resolves arbitrary
+    /// bytes to a single-byte encoding that maps all of 0x00-0xFF, so nothing is
+    /// *replaced* -- see the identical note on
+    /// `extractors::text::should_warn_when_text_source_is_not_valid_utf8`.
+    #[cfg(not(feature = "quality"))]
+    #[test]
+    fn decode_archive_text_reports_replaced_characters_true_for_invalid_utf8() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = ReplacedCharactersCapture::default();
+        let filter = tracing_subscriber::EnvFilter::new("warn");
+        let subscriber = tracing_subscriber::registry().with(filter).with(capture.clone());
+
+        let bytes: &[u8] = &[b'A', 0xFF, 0xFE, b'B'];
+        let text = tracing::subscriber::with_default(subscriber, || decode_archive_text(bytes, "bad.txt"));
+
+        assert!(!text.is_empty(), "decode must still return text, got {text:?}");
+        let events = capture.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "expected exactly one warning event, got {events:?}");
+        assert_eq!(
+            events[0],
+            Some(true),
+            "expected a replaced_characters=true field on the warning, got {:?}",
+            events[0]
+        );
+    }
+
+    /// A member that is already valid UTF-8 never reaches the lossy-decode branch at
+    /// all, so it must not emit any warning -- and therefore no `replaced_characters`
+    /// field -- regardless of build configuration.
+    #[test]
+    fn decode_archive_text_emits_no_warning_for_valid_utf8() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = ReplacedCharactersCapture::default();
+        let filter = tracing_subscriber::EnvFilter::new("warn");
+        let subscriber = tracing_subscriber::registry().with(filter).with(capture.clone());
+
+        let text = tracing::subscriber::with_default(subscriber, || {
+            decode_archive_text("Hello, World!".as_bytes(), "clean.txt")
+        });
+
+        assert_eq!(text, "Hello, World!");
+        assert!(
+            capture.events.lock().unwrap().is_empty(),
+            "valid UTF-8 must not emit a decode warning, got {:?}",
+            capture.events.lock().unwrap()
+        );
     }
 }

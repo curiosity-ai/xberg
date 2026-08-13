@@ -168,10 +168,6 @@ mod tests {
     use super::*;
     use crate::types::entity::{Entity, EntityCategory};
 
-    // ---------------------------------------------------------------------------
-    // EnrichOptions
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn enrich_options_defaults_are_all_off() {
         let opts = EnrichOptions::default();
@@ -203,10 +199,6 @@ mod tests {
         assert!(json.get("labels").is_none(), "empty labels should be omitted from JSON");
     }
 
-    // ---------------------------------------------------------------------------
-    // EnrichResult
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn enrich_result_defaults_are_empty() {
         let r = EnrichResult::default();
@@ -237,21 +229,15 @@ mod tests {
     fn enrich_result_empty_vecs_omitted_from_json() {
         let result = EnrichResult::default();
         let json = serde_json::to_value(&result).expect("serialize");
-        // skip_serializing_if = "Vec::is_empty" should suppress all three fields
         assert!(json.get("keywords").is_none());
         assert!(json.get("entities").is_none());
         assert!(json.get("labels").is_none());
     }
 
-    // ---------------------------------------------------------------------------
-    // EnrichStatus
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn enrich_status_pending_serialises_tag() {
         let json = serde_json::to_value(EnrichStatus::Pending).expect("serialize");
         assert_eq!(json["status"], "pending");
-        // no other fields
         assert_eq!(
             json.as_object().unwrap().len(),
             1,

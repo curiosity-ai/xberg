@@ -3,6 +3,7 @@
 //! Parses CSV/TSV files into structured table data and clean text output.
 //! Handles RFC 4180 quoted fields with embedded commas and newlines.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use crate::Result;
@@ -19,6 +20,9 @@ use async_trait::async_trait;
 static DATE_RE_ISO: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap());
 static DATE_RE_US: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^\d{1,2}/\d{1,2}/\d{2,4}").unwrap());
 static DATE_RE_EU: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^\d{1,2}\.\d{1,2}\.\d{2,4}").unwrap());
+
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+const CSV_WARNING_SOURCE: &str = "csv";
 #[cfg_attr(alef, alef(skip))]
 /// CSV/TSV extractor with proper field parsing.
 ///
@@ -76,16 +80,24 @@ impl InternalDocumentExtractor for CsvExtractor {
         tracing::debug!(format = "csv", size_bytes = content.len(), "extraction starting");
         let mut budget = SecurityBudget::from_config(config);
         let text = decode_csv_bytes(content);
+        let csv_config = config.csv.as_ref();
+        let comment_prefixes: &[String] = csv_config.map(|c| c.comment_prefixes.as_slice()).unwrap_or(&[]);
+        let configured_delimiter = csv_config
+            .and_then(|c| c.delimiter.as_deref())
+            .and_then(|d| d.chars().next());
+
+        let filtered_text = strip_comment_lines(&text, comment_prefixes);
+
         let delimiter = if mime_type == "text/tab-separated-values" {
             '\t'
+        } else if let Some(delimiter) = configured_delimiter {
+            delimiter
         } else {
-            detect_delimiter(&text)
+            detect_delimiter(&filtered_text)
         };
 
-        let rows = parse_csv(&text, delimiter);
+        let rows = parse_csv(&filtered_text, delimiter);
 
-        // Enforce security limits: one step per row, cell count, entity length,
-        // and cumulative content size.
         for row in &rows {
             budget.step()?;
             budget.add_cells(row.len())?;
@@ -100,14 +112,16 @@ impl InternalDocumentExtractor for CsvExtractor {
         let has_header = detect_header(&rows);
         let column_types = infer_column_types(&rows, has_header);
 
-        // Build markdown table before moving rows into Table::cells
-        let markdown = build_markdown_table(&rows);
+        let markdown = build_markdown_table(&rows, has_header);
+        let columns = has_header.then(|| rows.first().cloned()).flatten();
 
         let table = Table {
             cells: rows,
             markdown,
             page_number: 1,
             bounding_box: None,
+            columns,
+            ..Default::default()
         };
 
         let csv_metadata = CsvMetadata {
@@ -126,27 +140,39 @@ impl InternalDocumentExtractor for CsvExtractor {
             },
         };
 
-        // Build InternalDocument with the table
         let mut builder = InternalDocumentBuilder::new("csv");
 
-        // Generate embedding-friendly text: header-value pairs when a header row
-        // is detected, or fall back to space-separated output for headerless CSVs.
-        let content_text = if has_header {
-            render_csv_embedding_text(&table.cells)
-        } else {
-            render_table_plain_csv(&table.cells)
-        };
-        builder.push_paragraph(&content_text, vec![], None, None);
+        // Unlike the plain `from_utf8_lossy` used by html/rtf/text, `decode_csv_bytes`
+        // cannot leave a detectable "genuinely undecodable" signal in either build (#171):
+        // without `quality`, `decode_csv_bytes_fallback`'s encoding list ends in
+        // windows-1252/iso-8859-1, which the WHATWG Encoding Standard defines a mapping
+        // for every byte 0x00-0xFF, so it always succeeds -- the bytes are reinterpreted
+        // under a (possibly wrong) encoding, never dropped, and the trailing
+        // `String::from_utf8_lossy` fallback is unreachable dead code. With `quality`,
+        // `crate::utils::safe_decode` returns a string that has already had every
+        // replacement character stripped by its internal mojibake cleanup, so no
+        // marker of the loss survives to check for here either. Neither build can be
+        // told apart from a clean decode without changing that shared helper (out of
+        // this extractor's scope), so no lossy-decode warning is emitted for CSV. ~keep
+
+        if table
+            .cells
+            .iter()
+            .any(|row| row.iter().any(|cell| cell.contains('|') || cell.contains('\n')))
+        {
+            builder.add_warning(crate::core::diagnostics::warning(
+                CSV_WARNING_SOURCE,
+                "A cell contains a '|' or newline character, which is not escaped in the generated \
+                 Markdown table; the rendered table may have misaligned or split columns even though \
+                 the underlying cell data is intact",
+            ));
+        }
+
+        let content_text = render_plain_text(&table.cells);
+        let table_element = builder.push_table(table, None, None);
+        builder.set_text(table_element, &content_text);
 
         let mut doc = builder.build();
-        // Add the table to doc.tables so result.tables is populated for callers
-        // that need the structured data (e.g. element-based extraction).
-        doc.tables.push(Table {
-            cells: table.cells.clone(),
-            markdown: table.markdown.clone(),
-            page_number: table.page_number,
-            bounding_box: table.bounding_box,
-        });
         doc.mime_type = mime_type.to_string();
 
         doc.metadata = Metadata {
@@ -167,20 +193,40 @@ impl InternalDocumentExtractor for CsvExtractor {
     }
 
     fn priority(&self) -> i32 {
-        60 // Higher than PlainTextExtractor (50) to take precedence
+        60
     }
 }
+
+/// Maximum number of non-blank lines sampled by [`detect_delimiter`].
+///
+/// Widened from the original 10-line sample (xberg-io/xberg#164): a short
+/// sample is easily dominated by a handful of narrow leading rows (e.g. a
+/// title block) and picks the wrong delimiter for the rest of the file.
+const DELIMITER_SAMPLE_LINES: usize = 50;
 
 /// Auto-detect CSV delimiter using consistency-based approach.
 /// Tests each candidate delimiter and picks the one producing the most
 /// consistent column count across sample lines.
+///
+/// Blank lines and `#`-prefixed comment lines are skipped when building the
+/// sample so spacer rows and leading comments don't dilute the consistency
+/// score used to pick the delimiter.
 fn detect_delimiter(text: &str) -> char {
     const CANDIDATES: &[char] = &[',', '\t', '|', ';'];
     let mut best_delimiter = ',';
     let mut best_score = 0usize;
 
+    let sample: String = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .take(DELIMITER_SAMPLE_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+
     for &candidate in CANDIDATES {
-        let sample: String = text.lines().take(10).collect::<Vec<_>>().join("\n");
         let rows = parse_csv(&sample, candidate);
         if rows.len() < 2 {
             continue;
@@ -200,6 +246,32 @@ fn detect_delimiter(text: &str) -> char {
     best_delimiter
 }
 
+/// Remove lines whose trimmed start matches one of `prefixes` from `text`.
+///
+/// Comment lines are dropped entirely (not just their content), so row
+/// indices in the remaining data are unaffected by their removal. Preserves
+/// each surviving line's original terminator (`\n` or `\r\n`) so downstream
+/// CRLF handling in [`parse_csv`] is unaffected.
+///
+/// Returns the input unchanged (borrowed, no allocation) when `prefixes` is
+/// empty — the default when [`crate::core::config::CsvConfig`] is unset —
+/// so existing behavior is preserved byte-for-byte.
+fn strip_comment_lines<'a>(text: &'a str, prefixes: &[String]) -> Cow<'a, str> {
+    if prefixes.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    let mut result = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed_start = line.trim_start();
+        let is_comment = prefixes.iter().any(|prefix| trimmed_start.starts_with(prefix.as_str()));
+        if !is_comment {
+            result.push_str(line);
+        }
+    }
+    Cow::Owned(result)
+}
+
 /// Parse CSV text into rows of fields, handling RFC 4180 quoted fields.
 fn parse_csv(text: &str, delimiter: char) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -211,7 +283,6 @@ fn parse_csv(text: &str, delimiter: char) -> Vec<Vec<String>> {
     while let Some(c) = chars.next() {
         if in_quotes {
             if c == '"' {
-                // Check for escaped quote ("")
                 if chars.peek() == Some(&'"') {
                     current_field.push('"');
                     chars.next();
@@ -223,7 +294,7 @@ fn parse_csv(text: &str, delimiter: char) -> Vec<Vec<String>> {
             }
         } else {
             match c {
-                '"' => {
+                '"' if current_field.is_empty() => {
                     in_quotes = true;
                 }
                 c if c == delimiter => {
@@ -236,17 +307,15 @@ fn parse_csv(text: &str, delimiter: char) -> Vec<Vec<String>> {
                     }
                     current_row.push(current_field.clone());
                     current_field.clear();
-                    if !current_row.iter().all(|f| f.is_empty()) {
-                        rows.push(current_row);
-                    }
+                    // A genuinely blank line (e.g. a spacer row mid-file) must be kept as its
+                    // own row so subsequent row indices don't shift (xberg-io/xberg#164).
+                    rows.push(current_row);
                     current_row = Vec::new();
                 }
                 '\n' => {
                     current_row.push(current_field.clone());
                     current_field.clear();
-                    if !current_row.iter().all(|f| f.is_empty()) {
-                        rows.push(current_row);
-                    }
+                    rows.push(current_row);
                     current_row = Vec::new();
                 }
                 _ => {
@@ -256,12 +325,9 @@ fn parse_csv(text: &str, delimiter: char) -> Vec<Vec<String>> {
         }
     }
 
-    // Flush last field/row
     if !current_field.is_empty() || !current_row.is_empty() {
         current_row.push(current_field);
-        if !current_row.iter().all(|f| f.is_empty()) {
-            rows.push(current_row);
-        }
+        rows.push(current_row);
     }
 
     rows
@@ -276,15 +342,13 @@ fn parse_csv(text: &str, delimiter: char) -> Vec<Vec<String>> {
 /// When the `quality` feature is enabled, uses chardetng for more sophisticated
 /// encoding detection. Without it, tries common encodings in order.
 fn decode_csv_bytes(content: &[u8]) -> String {
-    // Fast path: valid UTF-8.
     if let Ok(s) = utf8_validation::from_utf8(content) {
-        return s.to_string();
+        return crate::utils::strip_bom(s).to_string();
     }
 
-    // Non-UTF-8 content: use encoding detection.
     #[cfg(feature = "quality")]
     {
-        crate::utils::safe_decode(content, None)
+        crate::utils::strip_bom(&crate::utils::safe_decode(content, None)).to_string()
     }
 
     #[cfg(not(feature = "quality"))]
@@ -299,17 +363,15 @@ fn decode_csv_bytes(content: &[u8]) -> String {
 /// selecting the first one that decodes without errors.
 #[cfg(not(feature = "quality"))]
 fn decode_csv_bytes_fallback(content: &[u8]) -> String {
-    // Common encoding labels used in CSV files, especially in East Asia
     let encoding_labels = [
-        "shift_jis",    // Japanese Shift-JIS (common for CSV from Japanese systems)
-        "windows-31j",  // Windows CP932 (Microsoft's Shift-JIS variant)
-        "windows-1252", // Western European (common default)
-        "iso-8859-1",   // Latin-1 fallback
-        "gb18030",      // Simplified Chinese
-        "big5",         // Traditional Chinese
+        "shift_jis",
+        "windows-31j",
+        "gb18030",
+        "big5",
+        "windows-1252",
+        "iso-8859-1",
     ];
 
-    // Try each encoding and use the first one that decodes without errors
     for label in &encoding_labels {
         if let Some(encoding) = encoding_rs::Encoding::for_label(label.as_bytes()) {
             let (decoded, _, had_errors) = encoding.decode(content);
@@ -319,23 +381,43 @@ fn decode_csv_bytes_fallback(content: &[u8]) -> String {
         }
     }
 
-    // If all encodings had errors, try Shift-JIS anyway
-    // This handles files with a few garbled characters gracefully
     if let Some(shift_jis) = encoding_rs::Encoding::for_label(b"shift_jis") {
         let (decoded, _, _) = shift_jis.decode(content);
         return decoded.into_owned();
     }
 
-    // Final fallback: lossy UTF-8 conversion
     String::from_utf8_lossy(content).into_owned()
+}
+
+/// Whether a CSV cell is a real number. `str::parse::<f64>` also accepts the
+/// tokens "NaN", "inf", "infinity" (case-insensitive), so a header cell or a
+/// column of those words would be misclassified as numeric — flipping header
+/// and column-type detection (xberg-io/xberg#1223). Reject those spellings.
+fn is_csv_number(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let lower = lower.strip_prefix(['+', '-']).unwrap_or(&lower);
+    if matches!(lower, "nan" | "inf" | "infinity") {
+        return false;
+    }
+    trimmed.parse::<f64>().is_ok()
 }
 
 /// Detect whether the first row is a header row.
 ///
 /// Heuristic: the first row is considered a header if:
-/// - It has at least 2 columns
+/// - There are at least 2 rows and the first row has at least 2 columns
 /// - No cell in the first row looks numeric (all text/labels)
-/// - At least one cell in the data rows (rows 1-5) is numeric
+///
+/// A numeric-looking first row is treated as data (headerless). An all-text
+/// first row is treated as a header even when the data rows are also all text:
+/// that is the dominant CSV convention, and the previous heuristic — which also
+/// required at least one numeric data cell — misclassified all-text tables such
+/// as `Name,City / Alice,NYC` as headerless, rendering a broken blank header row
+/// (xberg-io/xberg#1369).
 fn detect_header(rows: &[Vec<String>]) -> bool {
     if rows.len() < 2 {
         return false;
@@ -346,25 +428,7 @@ fn detect_header(rows: &[Vec<String>]) -> bool {
         return false;
     }
 
-    // Check if first row has no numeric values
-    let first_row_has_number = first_row.iter().any(|cell| {
-        let trimmed = cell.trim();
-        !trimmed.is_empty() && trimmed.parse::<f64>().is_ok()
-    });
-
-    if first_row_has_number {
-        return false;
-    }
-
-    // Check if at least one data row has numeric values
-    let data_rows = &rows[1..rows.len().min(6)];
-
-    data_rows.iter().any(|row| {
-        row.iter().any(|cell| {
-            let trimmed = cell.trim();
-            !trimmed.is_empty() && trimmed.parse::<f64>().is_ok()
-        })
-    })
+    !first_row.iter().any(|cell| is_csv_number(cell))
 }
 
 /// Infer column types by scanning the first N data rows.
@@ -388,7 +452,6 @@ fn infer_column_types(rows: &[Vec<String>], has_header: bool) -> Vec<String> {
 
     let data_rows = &rows[data_start..scan_end];
 
-    // Pre-compiled date regexes (LazyLock statics)
     let date_patterns: &[&regex::Regex] = &[&DATE_RE_ISO, &DATE_RE_US, &DATE_RE_EU];
 
     (0..col_count)
@@ -404,7 +467,7 @@ fn infer_column_types(rows: &[Vec<String>], has_header: bool) -> Vec<String> {
                 }
                 non_empty_count += 1;
 
-                if cell.parse::<f64>().is_ok() {
+                if is_csv_number(cell) {
                     numeric_count += 1;
                 } else {
                     for re in date_patterns {
@@ -429,95 +492,26 @@ fn infer_column_types(rows: &[Vec<String>], has_header: bool) -> Vec<String> {
         .collect()
 }
 
-/// Render CSV rows as embedding-friendly header-value pairs.
+/// Render rows as canonical space-separated plain text for `result.content`.
 ///
-/// Assumes the first row is a header. Each data row becomes a labeled block:
-///
-/// ```text
-/// Row 1:
-/// Name: Alice
-/// Age: 30
-///
-/// Row 2:
-/// Name: Bob
-/// Age: 25
-/// ```
-///
-/// Empty cells are skipped. Rows where all cells are empty are omitted entirely.
-/// Rows shorter than the header silently skip the missing columns.
-fn render_csv_embedding_text(cells: &[Vec<String>]) -> String {
-    if cells.len() < 2 {
-        // Header-only or empty: fall back to listing headers
-        if let Some(headers) = cells.first() {
-            return headers
-                .iter()
-                .filter(|h| !h.trim().is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" ");
-        }
-        return String::new();
-    }
-
-    let headers = &cells[0];
-    let data_rows = &cells[1..];
-
+/// Matches `rendering::common::render_table_plain` except that rows where every
+/// cell is empty after trimming are omitted entirely, rather than surviving as a
+/// blank-looking line of bare separators. The Markdown table and `result.tables`
+/// keep such rows, since they still convey real structure there.
+fn render_plain_text(cells: &[Vec<String>]) -> String {
     let mut out = String::new();
-    let mut row_number = 0usize;
-
-    for row in data_rows {
-        // Skip rows where every cell is empty
-        if row.iter().all(|c| c.trim().is_empty()) {
+    for row in cells {
+        if row.iter().all(|cell| cell.trim().is_empty()) {
             continue;
         }
-
-        row_number += 1;
-
-        if row_number > 1 {
-            out.push_str("\n\n");
-        }
-
-        out.push_str("Row ");
-        out.push_str(&row_number.to_string());
-        out.push(':');
-
-        for (col_idx, header) in headers.iter().enumerate() {
-            let header = header.trim();
-            if header.is_empty() {
-                continue;
-            }
-            let value = row.get(col_idx).map(|v| v.trim()).unwrap_or("");
-            if value.is_empty() {
-                continue;
-            }
-            out.push('\n');
-            out.push_str(header);
-            out.push_str(": ");
-            out.push_str(value);
-        }
+        out.push_str(&row.join(" "));
+        out.push('\n');
     }
-
     out
 }
 
-/// Render CSV rows as space-separated plain text (fallback when no header detected).
-fn render_table_plain_csv(cells: &[Vec<String>]) -> String {
-    cells
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|c| c.trim())
-                .filter(|c| !c.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Build a Markdown table from parsed rows.
-fn build_markdown_table(rows: &[Vec<String>]) -> String {
+fn build_markdown_table(rows: &[Vec<String>], has_header: bool) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -528,6 +522,18 @@ fn build_markdown_table(rows: &[Vec<String>]) -> String {
     }
 
     let mut markdown = String::new();
+    if !has_header {
+        markdown.push('|');
+        for _ in 0..col_count {
+            markdown.push_str("  |");
+        }
+        markdown.push('\n');
+        markdown.push('|');
+        for _ in 0..col_count {
+            markdown.push_str(" --- |");
+        }
+        markdown.push('\n');
+    }
 
     for (i, row) in rows.iter().enumerate() {
         markdown.push('|');
@@ -539,8 +545,7 @@ fn build_markdown_table(rows: &[Vec<String>]) -> String {
         }
         markdown.push('\n');
 
-        // Add separator after first row (header)
-        if i == 0 {
+        if has_header && i == 0 {
             markdown.push('|');
             for _ in 0..col_count {
                 markdown.push_str(" --- |");
@@ -598,10 +603,24 @@ mod tests {
             vec!["Name".to_string(), "Age".to_string()],
             vec!["Alice".to_string(), "30".to_string()],
         ];
-        let md = build_markdown_table(&rows);
+        let md = build_markdown_table(&rows, true);
         assert!(md.contains("| Name | Age |"));
         assert!(md.contains("| --- | --- |"));
         assert!(md.contains("| Alice | 30 |"));
+    }
+
+    #[test]
+    fn should_build_markdown_with_empty_header_for_headerless_rows() {
+        let rows = vec![
+            vec!["Alice".to_string(), "NYC".to_string()],
+            vec!["Bob".to_string(), "LA".to_string()],
+        ];
+
+        let markdown = build_markdown_table(&rows, false);
+
+        assert!(markdown.starts_with("|  |  |\n| --- | --- |\n"));
+        assert!(markdown.contains("| Alice | NYC |"));
+        assert!(markdown.contains("| Bob | LA |"));
     }
 
     #[tokio::test]
@@ -627,15 +646,51 @@ mod tests {
             .await
             .expect("CSV extraction should succeed");
 
-        // Tables should be populated in the InternalDocument
         assert!(!result.tables.is_empty());
+        assert!(matches!(
+            result.elements.as_slice(),
+            [crate::types::internal::InternalElement {
+                kind: crate::types::internal::ElementKind::Table { table_index: 0 },
+                ..
+            }]
+        ));
+        let markdown = crate::rendering::render_markdown(&result);
+        assert!(markdown.contains("| Name | Age | City |"));
+        assert!(markdown.contains("| Alice | 30 | NYC |"));
+        assert!(!markdown.contains("Row 1:"));
 
-        // Metadata should contain CSV-specific fields via FormatMetadata
+        let plain = crate::rendering::render_plain(&result);
+        assert_eq!(plain, "Name Age City\nAlice 30 NYC\nBob 25 LA");
+        assert!(!plain.contains('|'));
+
         if let Some(FormatMetadata::Csv(csv_meta)) = &result.metadata.format {
             assert!(csv_meta.has_header);
         } else {
             panic!("Expected FormatMetadata::Csv");
         }
+    }
+
+    #[tokio::test]
+    async fn should_render_headerless_csv_without_promoting_first_data_row() {
+        // A numeric first row is unambiguously data, so it stays headerless and
+        // the first row is not promoted into the header. (An all-text first row
+        // is treated as a header instead — see xberg-io/xberg#1369.)
+        let extractor = CsvExtractor::new();
+        let config = ExtractionConfig::default();
+        let csv_data = b"1,2,3\n4,5,6\n";
+
+        let result = extractor
+            .extract_content(csv_data, "text/csv", &config)
+            .await
+            .expect("CSV extraction should succeed");
+
+        let markdown = crate::rendering::render_markdown(&result);
+        assert!(markdown.starts_with("|  |  |  |\n| --- | --- | --- |\n"));
+        assert!(markdown.contains("| 1 | 2 | 3 |"));
+        assert!(markdown.contains("| 4 | 5 | 6 |"));
+
+        let plain = crate::rendering::render_plain(&result);
+        assert_eq!(plain, "1 2 3\n4 5 6");
     }
 
     #[tokio::test]
@@ -649,7 +704,6 @@ mod tests {
             .await
             .expect("CSV extraction with quoted fields should succeed");
 
-        // Tables should be populated
         assert!(!result.tables.is_empty());
     }
 
@@ -683,20 +737,16 @@ mod tests {
 
     #[test]
     fn test_decode_csv_bytes_shift_jis() {
-        // Shift-JIS encoded CSV: "名前,年齢,住所"
-        // This is the header row from test_mskanji.csv
         let shift_jis_data = vec![
             0x96u8, 0xbc, 0x91, 0x4f, 0x2c, 0x94, 0x4e, 0x97, 0xee, 0x2c, 0x8f, 0x5a, 0x8f, 0x8a,
         ];
 
         let decoded = decode_csv_bytes(&shift_jis_data);
 
-        // Should decode to correct Japanese text
         assert!(decoded.contains("名前"), "Should contain '名前' (Name)");
         assert!(decoded.contains("年齢"), "Should contain '年齢' (Age)");
         assert!(decoded.contains("住所"), "Should contain '住所' (Address)");
 
-        // Should NOT contain replacement characters (mojibake)
         assert!(
             !decoded.contains("□"),
             "Should not contain mojibake replacement characters"
@@ -709,7 +759,6 @@ mod tests {
 
     #[test]
     fn test_decode_csv_bytes_utf8() {
-        // UTF-8 encoded data should pass through unchanged
         let utf8_data = "名前,年齢,住所".as_bytes();
         let decoded = decode_csv_bytes(utf8_data);
         assert_eq!(decoded, "名前,年齢,住所");
@@ -732,7 +781,32 @@ mod tests {
             vec!["Alice".to_string(), "NYC".to_string()],
             vec!["Bob".to_string(), "LA".to_string()],
         ];
-        assert!(!detect_header(&rows), "Should not detect header when all data is text");
+        assert!(
+            detect_header(&rows),
+            "an all-text first row is the header by CSV convention, not a blank synthetic header (#1369)"
+        );
+    }
+
+    #[test]
+    fn all_text_csv_renders_first_row_as_header_not_blank() {
+        // Regression for xberg-io/xberg#1369: an all-text table must render its
+        // first row as the header, not a synthetic blank header with the real
+        // header pushed down into the data.
+        let rows = vec![
+            vec!["Name".to_string(), "City".to_string()],
+            vec!["Alice".to_string(), "NYC".to_string()],
+            vec!["Bob".to_string(), "LA".to_string()],
+        ];
+        let has_header = detect_header(&rows);
+        let markdown = build_markdown_table(&rows, has_header);
+
+        assert!(has_header);
+        assert!(
+            !markdown.contains("|  |  |"),
+            "must not emit a blank synthetic header row"
+        );
+        assert!(markdown.starts_with("| Name | City |\n| --- | --- |\n"));
+        assert!(markdown.contains("| Alice | NYC |"));
     }
 
     #[test]
@@ -744,6 +818,29 @@ mod tests {
         assert!(
             !detect_header(&rows),
             "Should not detect header when first row has numbers"
+        );
+    }
+
+    #[test]
+    fn nan_inf_are_not_numeric() {
+        assert!(!is_csv_number("NaN"));
+        assert!(!is_csv_number("inf"));
+        assert!(!is_csv_number("-Infinity"));
+        assert!(!is_csv_number("nan"));
+        assert!(is_csv_number("42"));
+        assert!(is_csv_number("-3.14"));
+        assert!(is_csv_number("1e6"));
+    }
+
+    #[test]
+    fn header_row_of_nan_inf_labels_still_detected_as_header() {
+        let rows = vec![
+            vec!["NaN".to_string(), "inf".to_string(), "label".to_string()],
+            vec!["1".to_string(), "2".to_string(), "x".to_string()],
+        ];
+        assert!(
+            detect_header(&rows),
+            "header of NaN/inf/label words must be treated as a header, not numeric data"
         );
     }
 
@@ -789,7 +886,188 @@ mod tests {
         let config = ExtractionConfig::default();
         let result = extractor.extract_content(&content, "text/csv", &config).await.unwrap();
 
-        // Tables should be populated
         assert!(!result.tables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plain_comma_csv_parses_identically_with_no_csv_config_set() {
+        // Regression guard: introducing `ExtractionConfig::csv` must not change
+        // default behavior when it is left `None`. ~keep
+        let extractor = CsvExtractor::new();
+        let config = ExtractionConfig::default();
+        assert!(config.csv.is_none());
+        let csv_data = b"Name,Age,City\nAlice,30,NYC\nBob,25,LA\n";
+
+        let result = extractor
+            .extract_content(csv_data, "text/csv", &config)
+            .await
+            .expect("CSV extraction should succeed");
+
+        assert_eq!(
+            result.tables[0].cells,
+            vec![
+                vec!["Name".to_string(), "Age".to_string(), "City".to_string()],
+                vec!["Alice".to_string(), "30".to_string(), "NYC".to_string()],
+                vec!["Bob".to_string(), "25".to_string(), "LA".to_string()],
+            ]
+        );
+
+        let plain = crate::rendering::render_plain(&result);
+        assert_eq!(plain, "Name Age City\nAlice 30 NYC\nBob 25 LA");
+    }
+
+    #[tokio::test]
+    async fn configured_semicolon_delimiter_is_used_instead_of_auto_detection() {
+        let extractor = CsvExtractor::new();
+        let config = ExtractionConfig {
+            csv: Some(crate::core::config::CsvConfig {
+                delimiter: Some(";".to_string()),
+                comment_prefixes: vec![],
+            }),
+            ..Default::default()
+        };
+        // A single-row, single-delimiter-occurrence sample defeats consistency-based
+        // auto-detection (`detect_delimiter` needs >= 2 rows to score a candidate),
+        // so this only parses correctly when the configured delimiter is honored. ~keep
+        let csv_data = b"Name;Age;City\nAlice;30;NYC\n";
+
+        let result = extractor
+            .extract_content(csv_data, "text/csv", &config)
+            .await
+            .expect("CSV extraction with configured delimiter should succeed");
+
+        assert_eq!(
+            result.tables[0].cells,
+            vec![
+                vec!["Name".to_string(), "Age".to_string(), "City".to_string()],
+                vec!["Alice".to_string(), "30".to_string(), "NYC".to_string()],
+            ]
+        );
+
+        if let Some(FormatMetadata::Csv(csv_meta)) = &result.metadata.format {
+            assert_eq!(csv_meta.delimiter.as_deref(), Some(";"));
+        } else {
+            panic!("Expected FormatMetadata::Csv");
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_comment_prefix_skips_matching_lines() {
+        let extractor = CsvExtractor::new();
+        let config = ExtractionConfig {
+            csv: Some(crate::core::config::CsvConfig {
+                delimiter: None,
+                comment_prefixes: vec!["#".to_string()],
+            }),
+            ..Default::default()
+        };
+        let csv_data = b"# this is a comment\nName,Age,City\n# another comment\nAlice,30,NYC\nBob,25,LA\n";
+
+        let result = extractor
+            .extract_content(csv_data, "text/csv", &config)
+            .await
+            .expect("CSV extraction with comment prefix should succeed");
+
+        assert_eq!(
+            result.tables[0].cells,
+            vec![
+                vec!["Name".to_string(), "Age".to_string(), "City".to_string()],
+                vec!["Alice".to_string(), "30".to_string(), "NYC".to_string()],
+                vec!["Bob".to_string(), "25".to_string(), "LA".to_string()],
+            ]
+        );
+
+        let plain = crate::rendering::render_plain(&result);
+        assert_eq!(plain, "Name Age City\nAlice 30 NYC\nBob 25 LA");
+        assert!(!plain.contains('#'));
+    }
+
+    #[test]
+    fn strip_comment_lines_is_a_no_op_when_no_prefixes_are_configured() {
+        let text = "a,b\n#c,d\n";
+        assert_eq!(strip_comment_lines(text, &[]), Cow::Borrowed(text));
+    }
+
+    #[test]
+    fn strip_comment_lines_drops_lines_whose_trimmed_start_matches_a_prefix() {
+        let text = "# header comment\na,b,c\n  # indented comment\n1,2,3\n";
+        let filtered = strip_comment_lines(text, &["#".to_string()]);
+        assert_eq!(filtered, "a,b,c\n1,2,3\n");
+    }
+
+    fn csv_warnings(doc: &crate::types::internal::InternalDocument) -> Vec<String> {
+        doc.processing_warnings
+            .iter()
+            .filter(|w| w.source == CSV_WARNING_SOURCE)
+            .map(|w| w.message.to_string())
+            .collect()
+    }
+
+    /// #171: `build_markdown_table` interpolates cell text into `| ... |` rows
+    /// with no escaping. A cell containing a literal `|` inserts a phantom
+    /// column boundary into the rendered Markdown, even though `Table::cells`
+    /// (the underlying data) is untouched.
+    #[tokio::test]
+    async fn should_warn_when_a_cell_contains_an_unescaped_pipe() {
+        let extractor = CsvExtractor::new();
+        let config = ExtractionConfig::default();
+        let csv_data = b"Name,Note\nAlice,\"a | b\"\n";
+
+        let result = extractor
+            .extract_content(csv_data, "text/csv", &config)
+            .await
+            .expect("CSV extraction should succeed");
+
+        let warnings = csv_warnings(&result);
+        assert_eq!(warnings.len(), 1, "expected exactly one csv warning, got {warnings:?}");
+        assert!(
+            warnings[0].contains("'|'") && warnings[0].contains("misaligned"),
+            "warning must describe the unescaped pipe corruption, got {warnings:?}"
+        );
+        // The underlying cell data is untouched -- only the rendered Markdown is at risk.
+        assert_eq!(
+            result.tables[0].cells,
+            vec![
+                vec!["Name".to_string(), "Note".to_string()],
+                vec!["Alice".to_string(), "a | b".to_string()],
+            ]
+        );
+    }
+
+    /// #171: a cell containing an embedded newline (RFC 4180 permits this inside a
+    /// quoted field) breaks the one-row-per-line Markdown table structure the same
+    /// way an unescaped `|` does.
+    #[tokio::test]
+    async fn should_warn_when_a_cell_contains_an_embedded_newline() {
+        let extractor = CsvExtractor::new();
+        let config = ExtractionConfig::default();
+        let csv_data = b"Name,Note\nAlice,\"line one\nline two\"\n";
+
+        let result = extractor
+            .extract_content(csv_data, "text/csv", &config)
+            .await
+            .expect("CSV extraction should succeed");
+
+        let warnings = csv_warnings(&result);
+        assert_eq!(warnings.len(), 1, "expected exactly one csv warning, got {warnings:?}");
+    }
+
+    /// An ordinary CSV file with no pipes or embedded newlines in any cell must not warn.
+    #[tokio::test]
+    async fn plain_csv_with_no_pipes_or_newlines_produces_zero_warnings() {
+        let extractor = CsvExtractor::new();
+        let config = ExtractionConfig::default();
+        let csv_data = b"Name,Age,City\nAlice,30,NYC\nBob,25,LA\n";
+
+        let result = extractor
+            .extract_content(csv_data, "text/csv", &config)
+            .await
+            .expect("CSV extraction should succeed");
+
+        assert!(
+            csv_warnings(&result).is_empty(),
+            "an ordinary CSV file must not warn, got {:?}",
+            csv_warnings(&result)
+        );
     }
 }

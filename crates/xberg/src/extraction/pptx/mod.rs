@@ -49,11 +49,12 @@ mod parser;
 use ahash::AHashMap;
 use bytes::Bytes;
 
+use crate::core::diagnostics::push_warning;
 use crate::error::Result;
 use crate::types::builder::{self, DocumentStructureBuilder};
 use crate::types::document_structure::TextAnnotation;
 use crate::types::extraction::BoundingBox;
-use crate::types::{ExtractedImage, PptxExtractionResult};
+use crate::types::{ExtractedImage, PptxExtractionResult, ProcessingWarning};
 
 use container::{PptxContainer, SlideIterator};
 use content_builder::ContentBuilder;
@@ -75,6 +76,17 @@ pub struct PptxExtractionOptions {
     pub include_structure: bool,
     /// Whether to emit `![alt](target)` references in markdown output.
     pub inject_placeholders: bool,
+}
+
+/// Crate-internal PPTX extraction output.
+///
+/// `slide_contents` keeps the archive-derived slide number alongside each
+/// rendered slide. The public result remains unchanged, while the internal
+/// extractor can rebuild page-aware elements without embedding forgeable
+/// boundary markers in user-controlled text.
+pub(crate) struct PptxInternalExtraction {
+    pub(crate) result: PptxExtractionResult,
+    pub(crate) slide_contents: Vec<(u32, String)>,
 }
 
 impl Default for PptxExtractionOptions {
@@ -117,10 +129,15 @@ fn join_runs_with_spacing(runs: &[Run], extract: impl Fn(&Run) -> String) -> Str
 ///
 /// # Returns
 ///
-/// A `PptxExtractionResult` containing extracted content, metadata, and images.
-pub(crate) fn extract_pptx_from_path(path: &str, options: &PptxExtractionOptions) -> Result<PptxExtractionResult> {
+/// The public extraction result plus archive-derived per-slide content used
+/// internally to assign trustworthy page metadata.
+pub(crate) fn extract_pptx_from_path_with_slide_contents(
+    path: &str,
+    options: &PptxExtractionOptions,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Result<PptxInternalExtraction> {
     let container = PptxContainer::open(path)?;
-    extract_pptx_from_container(container, options)
+    extract_pptx_from_container(container, options, warnings)
 }
 
 /// Extract PPTX content from a byte buffer.
@@ -133,15 +150,29 @@ pub(crate) fn extract_pptx_from_path(path: &str, options: &PptxExtractionOptions
 /// # Returns
 ///
 /// A `PptxExtractionResult` containing extracted content, metadata, and images.
-pub(crate) fn extract_pptx_from_bytes(data: &[u8], options: &PptxExtractionOptions) -> Result<PptxExtractionResult> {
+#[cfg(test)]
+pub(crate) fn extract_pptx_from_bytes(
+    data: &[u8],
+    options: &PptxExtractionOptions,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Result<PptxExtractionResult> {
+    Ok(extract_pptx_from_bytes_with_slide_contents(data, options, warnings)?.result)
+}
+
+pub(crate) fn extract_pptx_from_bytes_with_slide_contents(
+    data: &[u8],
+    options: &PptxExtractionOptions,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Result<PptxInternalExtraction> {
     let container = PptxContainer::from_bytes(data)?;
-    extract_pptx_from_container(container, options)
+    extract_pptx_from_container(container, options, warnings)
 }
 
 fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
     mut container: PptxContainer<R>,
     options: &PptxExtractionOptions,
-) -> Result<PptxExtractionResult> {
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Result<PptxInternalExtraction> {
     let config = ParserConfig {
         extract_images: options.extract_images,
         plain: options.plain,
@@ -151,14 +182,13 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
     let page_config = options.page_config.as_ref();
     let include_structure = options.include_structure;
 
-    let (metadata, office_metadata) = extract_metadata(&mut container.archive);
+    let (metadata, office_metadata) = extract_metadata(&mut container.archive, warnings);
 
-    let notes = extract_all_notes(&mut container)?;
+    let notes = extract_all_notes(&mut container, warnings)?;
     let section_names = extract_section_names(&mut container)?;
 
-    // Extract slide comments before the container is consumed by the iterator.
     let slide_paths_for_comments = container.slide_paths().to_vec();
-    let revisions = comments::extract_comments(&mut container, &slide_paths_for_comments);
+    let revisions = comments::extract_comments(&mut container, &slide_paths_for_comments, warnings);
 
     let mut iterator = SlideIterator::new(container);
     let slide_count = iterator.slide_count();
@@ -168,6 +198,7 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
 
     let mut total_image_count = 0;
     let mut total_table_count = 0;
+    let mut slide_contents = Vec::with_capacity(slide_count);
     let mut extracted_images = Vec::new();
     let mut collected_hyperlinks: Vec<(String, Option<String>)> = Vec::new();
     let mut doc_builder = if include_structure {
@@ -177,7 +208,7 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
     };
     let mut image_index_counter: u32 = 0;
 
-    while let Some(slide) = iterator.next_slide()? {
+    while let Some(slide) = iterator.next_slide(warnings)? {
         let byte_start = if page_config.is_some() {
             content_builder.start_slide(slide.slide_number)
         } else {
@@ -192,6 +223,19 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
             content_builder.add_notes(note_text);
         }
 
+        let mut internal_slide_content = slide_content.clone();
+        if let Some(ref note_text) = slide_notes
+            && !note_text.trim().is_empty()
+        {
+            if options.plain {
+                internal_slide_content.push_str("\n\nNotes:\n");
+            } else {
+                internal_slide_content.push_str("\n\n### Notes:\n");
+            }
+            internal_slide_content.push_str(note_text);
+        }
+        slide_contents.push((slide.slide_number, internal_slide_content));
+
         let slide_section = section_names.get(&slide.slide_number).cloned();
 
         if page_config.is_some() {
@@ -204,46 +248,48 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
             );
         }
 
-        // Build document structure for this slide (only when requested)
         if let Some(ref mut builder) = doc_builder {
             build_slide_structure(&slide, builder, &mut image_index_counter);
         }
 
-        // Collect hyperlinks from runs that have hlinkClick references
         collect_slide_hyperlinks(&slide, &mut collected_hyperlinks);
 
         if config.extract_images
             && let Ok(image_data) = iterator.get_slide_images(&slide)
         {
-            // Collect image element metadata for matching
-            let image_elements: Vec<_> = slide
-                .elements
-                .iter()
-                .filter_map(|e| {
-                    if let SlideElement::Image(img_ref, pos) = e {
-                        Some((img_ref, pos))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // Pair each image element with its bytes by relationship ID, not by
+            // iteration position: `image_data` is a hash map, so its iteration
+            // order is unrelated to the document order of `slide.elements`.
+            // Indexing into a separately-collected, document-ordered Vec by a
+            // hash-map enumeration index silently mismatched dimensions/alt-text
+            // with the wrong shape whenever a slide had more than one image (#91).
+            for (img_ref, pos) in slide.elements.iter().filter_map(|e| {
+                if let SlideElement::Image(img_ref, pos) = e {
+                    Some((img_ref, pos))
+                } else {
+                    None
+                }
+            }) {
+                let Some(data) = image_data.get(&img_ref.id) else {
+                    push_warning(
+                        warnings,
+                        "pptx",
+                        format!(
+                            "Image '{}' referenced on slide {} could not be read; it was not extracted",
+                            img_ref.id, slide.slide_number
+                        ),
+                    );
+                    continue;
+                };
 
-            for (img_idx_in_slide, (_, data)) in image_data.iter().enumerate() {
                 let format = detect_image_format(data);
                 let image_index = extracted_images.len();
 
-                // Try to get dimensions and description from corresponding element
-                // EMU to pixels at 96 DPI: 1 pixel = 9525 EMU
-                let (width, height, description, bbox) =
-                    if let Some((img_ref, pos)) = image_elements.get(img_idx_in_slide) {
-                        let w = if pos.cx > 0 { Some((pos.cx / 9525) as u32) } else { None };
-                        let h = if pos.cy > 0 { Some((pos.cy / 9525) as u32) } else { None };
-                        (w, h, img_ref.description.clone(), position_to_bbox(pos))
-                    } else {
-                        (None, None, None, None)
-                    };
+                let width = if pos.cx > 0 { Some((pos.cx / 9525) as u32) } else { None };
+                let height = if pos.cy > 0 { Some((pos.cy / 9525) as u32) } else { None };
+                let description = img_ref.description.clone();
+                let bbox = position_to_bbox(pos);
 
-                // Classify image based on metadata and visual properties
                 let (image_kind, kind_confidence) =
                     crate::extraction::image_kind::classify(data, format.as_ref(), width, height, None, None, false);
 
@@ -277,7 +323,6 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
 
     let (content, boundaries, mut page_contents) = content_builder.build();
 
-    // Refine is_blank: slides that have images are not blank
     if let Some(ref mut pcs) = page_contents {
         for pc in pcs.iter_mut() {
             if extracted_images
@@ -311,19 +356,22 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
 
     let document = doc_builder.map(|b| b.build()).filter(|d| !d.is_empty());
 
-    Ok(PptxExtractionResult {
-        content,
-        metadata,
-        slide_count,
-        image_count: total_image_count,
-        table_count: total_table_count,
-        images: extracted_images,
-        page_structure,
-        page_contents,
-        document,
-        hyperlinks: collected_hyperlinks,
-        office_metadata,
-        revisions,
+    Ok(PptxInternalExtraction {
+        result: PptxExtractionResult {
+            content,
+            metadata,
+            slide_count,
+            image_count: total_image_count,
+            table_count: total_table_count,
+            images: extracted_images,
+            page_structure,
+            page_contents,
+            document,
+            hyperlinks: collected_hyperlinks,
+            office_metadata,
+            revisions,
+        },
+        slide_contents,
     })
 }
 
@@ -335,12 +383,11 @@ fn runs_to_text_and_annotations(runs: &[Run]) -> (String, Vec<TextAnnotation>) {
     let mut annotations = Vec::new();
 
     for run in runs {
-        let run_text = &run.text;
+        let run_text = run.extract();
         if run_text.is_empty() {
             continue;
         }
 
-        // Insert a space between runs when needed
         if !text.is_empty() {
             let ends_ws = text.ends_with(|c: char| c.is_whitespace());
             let starts_ws = run_text.starts_with(|c: char| c.is_whitespace());
@@ -350,8 +397,14 @@ fn runs_to_text_and_annotations(runs: &[Run]) -> (String, Vec<TextAnnotation>) {
         }
 
         let start = text.len() as u32;
-        text.push_str(run_text);
+        text.push_str(&run_text);
         let end = text.len() as u32;
+
+        // Math runs carry their content as LaTeX with no bold/italic/etc.
+        // formatting to annotate.
+        if run.math_latex.is_some() {
+            continue;
+        }
 
         if run.formatting.bold {
             annotations.push(builder::bold(start, end));
@@ -366,7 +419,6 @@ fn runs_to_text_and_annotations(runs: &[Run]) -> (String, Vec<TextAnnotation>) {
             annotations.push(builder::strikethrough(start, end));
         }
         if let Some(sz) = run.formatting.font_size {
-            // sz is in hundredths of a point; convert to "Xpt" string
             let pts = sz as f64 / 100.0;
             let value = if pts.fract() == 0.0 {
                 format!("{}pt", pts as u32)
@@ -402,15 +454,12 @@ fn build_slide_structure(
     doc_builder: &mut DocumentStructureBuilder,
     image_index_counter: &mut u32,
 ) {
-    // Determine slide title: first short text element
     let mut sorted_indices: Vec<usize> = (0..slide.elements.len()).collect();
     sorted_indices.sort_by_key(|&i| {
         let pos = slide.elements[i].position();
         (pos.y, pos.x)
     });
 
-    // Find the slide title: prefer explicit title placeholder, fall back to
-    // first short text element.
     let slide_title = sorted_indices
         .iter()
         .find_map(|&idx| {
@@ -458,7 +507,6 @@ fn build_slide_structure(
                 } else if !plain_text.trim().is_empty() {
                     let node_idx = doc_builder.push_paragraph(&plain_text, annotations, None, bbox);
 
-                    // Store language from first run with a non-empty lang
                     if let Some(lang) = text.runs.iter().find_map(|r| {
                         let l = &r.formatting.lang;
                         if l.is_empty() { None } else { Some(l.clone()) }
@@ -497,7 +545,6 @@ fn build_slide_structure(
                 }
             }
             SlideElement::Image(img_ref, _) => {
-                // Prefer alt text description, fall back to target path
                 let desc = img_ref.description.as_deref().or({
                     if img_ref.target.is_empty() {
                         None
@@ -507,6 +554,20 @@ fn build_slide_structure(
                 });
                 doc_builder.push_image(desc, Some(*image_index_counter), None, bbox);
                 *image_index_counter += 1;
+            }
+            SlideElement::Chart(chart_ref, _) => {
+                if let Some(text) = chart_ref.resolved_text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    doc_builder.push_paragraph(text, vec![], None, bbox);
+                }
+            }
+            SlideElement::SmartArt(diagram_ref, _) => {
+                if let Some(text) = diagram_ref.resolved_text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    doc_builder.push_paragraph(text, vec![], None, bbox);
+                }
             }
             SlideElement::Unknown => {}
         }
@@ -518,7 +579,6 @@ fn build_slide_structure(
 /// Collect hyperlinks from all runs in a slide by resolving `hlinkClick` rIds
 /// against the slide's hyperlink relationships.
 fn collect_slide_hyperlinks(slide: &elements::Slide, out: &mut Vec<(String, Option<String>)>) {
-    // Helper: iterate all runs from all elements
     let mut visit_runs = |runs: &[Run]| {
         for run in runs {
             if let Some(ref hlink_id) = run.hyperlink_id
@@ -554,16 +614,15 @@ fn collect_slide_hyperlinks(slide: &elements::Slide, out: &mut Vec<(String, Opti
     }
 }
 
-// Re-export Slide implementation methods for internal use
 impl elements::Slide {
     fn from_xml(slide_number: u32, xml_data: &[u8], rels_data: Option<&[u8]>) -> Result<Self> {
         let elements = parser::parse_slide_xml(xml_data)?;
 
-        let (images, hyperlinks) = if let Some(rels) = rels_data {
+        let (images, hyperlinks, rel_targets) = if let Some(rels) = rels_data {
             let slide_rels = parser::parse_slide_rels(rels)?;
-            (slide_rels.images, slide_rels.hyperlinks)
+            (slide_rels.images, slide_rels.hyperlinks, slide_rels.targets)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), AHashMap::new())
         };
 
         Ok(Self {
@@ -571,6 +630,7 @@ impl elements::Slide {
             elements,
             images,
             hyperlinks,
+            rel_targets,
         })
     }
 
@@ -587,9 +647,6 @@ impl elements::Slide {
             (pos.y, pos.x)
         });
 
-        // Find the slide title: prefer a shape with an explicit title placeholder
-        // type (type="title" or type="ctrTitle"). Fall back to the first short text
-        // element in y-sorted order when no placeholder is marked.
         let title_idx = element_indices
             .iter()
             .find_map(|&idx| {
@@ -604,7 +661,6 @@ impl elements::Slide {
                 None
             })
             .or_else(|| {
-                // Fallback: first short text element
                 element_indices.iter().find_map(|&idx| {
                     if let SlideElement::Text(text, _) = &self.elements[idx] {
                         let plain = join_runs_with_spacing(&text.runs, Run::extract);
@@ -617,7 +673,6 @@ impl elements::Slide {
                 })
             });
 
-        // Emit title first as a heading
         if let Some(tidx) = title_idx
             && let SlideElement::Text(text, _) = &self.elements[tidx]
         {
@@ -631,7 +686,6 @@ impl elements::Slide {
         }
 
         for &idx in &element_indices {
-            // Skip the title element we already emitted
             if Some(idx) == title_idx {
                 continue;
             }
@@ -644,7 +698,6 @@ impl elements::Slide {
                         join_runs_with_spacing(&text.runs, Run::render_as_md)
                     };
 
-                    // All remaining text elements are body text, not titles
                     builder.add_text(&text_content);
                 }
                 SlideElement::Table(table, _) => {
@@ -668,18 +721,12 @@ impl elements::Slide {
                         if item.has_bullet {
                             builder.add_list_item(item.level, item.is_ordered, &item_text);
                         } else {
-                            // Non-bulleted preamble paragraph within a list shape.
-                            // Render as plain text, not a list item.
                             builder.add_text(&item_text);
                         }
                     }
                 }
                 SlideElement::Image(img_ref, _) => {
-                    // Only emit the markdown image reference when inject_placeholders
-                    // is enabled (default true). When false, image data may still be
-                    // extracted separately but the reference is not injected into text.
                     if config.inject_placeholders {
-                        // Resolve image target from rels
                         let target = self
                             .images
                             .iter()
@@ -687,6 +734,16 @@ impl elements::Slide {
                             .map(|rel| rel.target.as_str())
                             .unwrap_or("");
                         builder.add_image_with_desc(&img_ref.id, img_ref.description.as_deref(), target);
+                    }
+                }
+                SlideElement::Chart(chart_ref, _) => {
+                    if let Some(text) = chart_ref.resolved_text.as_deref() {
+                        builder.add_text(text);
+                    }
+                }
+                SlideElement::SmartArt(diagram_ref, _) => {
+                    if let Some(text) = diagram_ref.resolved_text.as_deref() {
+                        builder.add_text(text);
                     }
                 }
                 SlideElement::Unknown => {}
@@ -800,7 +857,6 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-            // Add app.xml with slide count
             let app_xml = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
@@ -827,6 +883,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -843,19 +900,30 @@ pub(crate) mod tests {
     #[test]
     fn test_extract_pptx_from_bytes_multiple_slides() {
         let pptx_bytes = create_test_pptx_bytes(vec!["Slide 1", "Slide 2", "Slide 3"]);
-        let result = extract_pptx_from_bytes(
+        let internal = extract_pptx_from_bytes_with_slide_contents(
             &pptx_bytes,
             &PptxExtractionOptions {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
+        let result = internal.result;
 
         assert_eq!(result.slide_count, 3);
         assert!(result.content.contains("Slide 1"));
         assert!(result.content.contains("Slide 2"));
         assert!(result.content.contains("Slide 3"));
+        assert!(!result.content.contains("<!-- Slide number:"));
+        assert_eq!(
+            internal
+                .slide_contents
+                .iter()
+                .map(|(number, _)| *number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -867,10 +935,10 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
-        // Metadata should be populated (slide_count should be 1 for the test content)
         assert_eq!(result.metadata.slide_count, 1);
     }
 
@@ -883,6 +951,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -900,6 +969,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         );
 
         assert!(result.is_err());
@@ -919,6 +989,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         );
 
         assert!(result.is_err());
@@ -926,8 +997,8 @@ pub(crate) mod tests {
 
     /// Build a PPTX bytes with sections and optional speaker notes for integration testing.
     pub(crate) fn create_pptx_with_sections_and_notes(
-        slides: &[(&str, Option<&str>)], // (text, notes)
-        sections: &[(&str, &[usize])],   // (name, 1-indexed slide positions)
+        slides: &[(&str, Option<&str>)],
+        sections: &[(&str, &[usize])],
     ) -> Vec<u8> {
         use std::io::Write;
         use zip::write::{SimpleFileOptions, ZipWriter};
@@ -952,7 +1023,6 @@ pub(crate) mod tests {
     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
 </Relationships>"#).unwrap();
 
-        // Build rels file listing each slide
         let mut pres_rels = String::from(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
@@ -969,7 +1039,6 @@ pub(crate) mod tests {
         zip.start_file("ppt/_rels/presentation.xml.rels", opts).unwrap();
         zip.write_all(pres_rels.as_bytes()).unwrap();
 
-        // Build sldIdLst: base ID = 256
         let base_id: u32 = 256;
         let mut sld_id_lst = String::new();
         for (i, _) in slides.iter().enumerate() {
@@ -982,7 +1051,6 @@ pub(crate) mod tests {
             );
         }
 
-        // Build sectionLst
         let mut section_lst = String::new();
         for (name, positions) in sections {
             use std::fmt::Write as FmtWrite;
@@ -1018,7 +1086,6 @@ pub(crate) mod tests {
         zip.start_file("ppt/presentation.xml", opts).unwrap();
         zip.write_all(presentation_xml.as_bytes()).unwrap();
 
-        // Write slide XML and optional notes XML
         for (i, (text, notes)) in slides.iter().enumerate() {
             let slide_xml = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1085,6 +1152,7 @@ pub(crate) mod tests {
                 page_config: Some(PageConfig::default()),
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -1115,6 +1183,7 @@ pub(crate) mod tests {
                 page_config: Some(PageConfig::default()),
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -1148,6 +1217,7 @@ pub(crate) mod tests {
                 page_config: Some(PageConfig::default()),
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -1169,9 +1239,9 @@ pub(crate) mod tests {
             &pptx,
             &PptxExtractionOptions {
                 extract_images: false,
-                // no page_config → page_contents should be None
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -1257,8 +1327,6 @@ pub(crate) mod tests {
         );
     }
 
-    // ── inject_placeholders tests (issue #671) ──
-
     /// Build a minimal PPTX ZIP with one slide that contains an image (<p:pic>) element.
     ///
     /// The slide XML includes a picture shape referencing rel id "rId2", and the
@@ -1298,7 +1366,6 @@ pub(crate) mod tests {
     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
 </Relationships>"#).unwrap();
 
-            // Slide with both a text run and a picture element
             let slide_xml = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -1331,14 +1398,12 @@ pub(crate) mod tests {
             zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
             zip.write_all(slide_xml.as_bytes()).unwrap();
 
-            // Rels for the slide: rId2 → media/image1.png
             zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts).unwrap();
             zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
     <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
 </Relationships>"#).unwrap();
 
-            // A tiny placeholder PNG (1×1 transparent)
             zip.start_file("ppt/media/image1.png", opts).unwrap();
             zip.write_all(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82").unwrap();
 
@@ -1369,6 +1434,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1388,6 +1454,7 @@ pub(crate) mod tests {
                 inject_placeholders: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1399,7 +1466,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_inject_placeholders_false_preserves_text_content() {
-        // Suppressing image references must not remove surrounding slide text.
         let pptx = create_pptx_with_image_slide("Quarterly Review");
         let result = extract_pptx_from_bytes(
             &pptx,
@@ -1408,6 +1474,7 @@ pub(crate) mod tests {
                 inject_placeholders: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1419,8 +1486,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_default_inject_placeholders_preserves_existing_behaviour() {
-        // inject_placeholders defaults to true — existing call sites without the
-        // new arg (via the public API passing true) must continue to emit refs.
         let pptx = create_pptx_with_image_slide("Slide Title");
         let result_true = extract_pptx_from_bytes(
             &pptx,
@@ -1428,6 +1493,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
         let result_false = extract_pptx_from_bytes(
@@ -1437,16 +1503,14 @@ pub(crate) mod tests {
                 inject_placeholders: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
-        // With placeholders: content is longer (image refs add characters)
         assert!(
             result_true.content.len() >= result_false.content.len(),
             "inject_placeholders=true should produce >= content length vs false"
         );
     }
-
-    // ── slide comment / revisions tests ──────────────────────────────────────
 
     /// Build a minimal PPTX with optional comment XML parts.
     ///
@@ -1488,7 +1552,6 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // Build ppt/_rels/presentation.xml.rels listing each slide
         let mut rels = String::from(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
@@ -1507,11 +1570,9 @@ pub(crate) mod tests {
         zip.start_file("ppt/_rels/presentation.xml.rels", opts).unwrap();
         zip.write_all(rels.as_bytes()).unwrap();
 
-        // Minimal presentation.xml
         zip.start_file("ppt/presentation.xml", opts).unwrap();
         zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldIdLst/></p:presentation>"#).unwrap();
 
-        // Write slide XML
         for (i, text) in slides.iter().enumerate() {
             let slide_xml = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1526,7 +1587,6 @@ pub(crate) mod tests {
             zip.write_all(slide_xml.as_bytes()).unwrap();
         }
 
-        // Write commentAuthors.xml if any authors provided
         if !authors.is_empty() {
             let mut authors_xml = String::from(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1544,7 +1604,6 @@ pub(crate) mod tests {
             zip.write_all(authors_xml.as_bytes()).unwrap();
         }
 
-        // Write per-slide comment files
         for (slide_idx, slide_comments) in comments_per_slide.iter().enumerate() {
             if slide_comments.is_empty() {
                 continue;
@@ -1566,7 +1625,6 @@ pub(crate) mod tests {
             zip.write_all(cm_xml.as_bytes()).unwrap();
         }
 
-        // Minimal docProps
         zip.start_file("docProps/core.xml", opts).unwrap();
         zip.write_all(
             br#"<?xml version="1.0"?>
@@ -1594,6 +1652,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1615,6 +1674,7 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -1658,11 +1718,11 @@ pub(crate) mod tests {
                 extract_images: false,
                 ..Default::default()
             },
+            &mut Vec::new(),
         )
         .unwrap();
 
         let revisions = result.revisions.as_ref().expect("revisions should be Some");
-        // 1 comment on slide 1 + 0 on slide 2 + 2 on slide 3 = 3 total
         assert_eq!(revisions.len(), 3);
 
         use crate::types::revisions::RevisionAnchor;
@@ -1671,5 +1731,483 @@ pub(crate) mod tests {
         assert!(matches!(&revisions[2].anchor, Some(RevisionAnchor::Slide { index: 2 })));
         assert_eq!(revisions[1].author.as_deref(), Some("Alice"));
         assert_eq!(revisions[2].author.as_deref(), Some("Bob"));
+    }
+
+    // --- Regression tests for #47, #79, #80, #90, #91, #238 ---
+    //
+    // Shared helper used by 5 of the 6 tests below (`build_single_slide_pptx`);
+    // #238 builds its own bytes since it needs corrupt, not merely custom,
+    // `docProps/core.xml`/comment parts. ~keep
+
+    /// Build a minimal single-slide PPTX with caller-supplied slide XML,
+    /// optional slide relationships XML, and optional extra ZIP parts (used
+    /// for chart/SmartArt data parts and referenced media).
+    pub(crate) fn build_single_slide_pptx(
+        slide_xml: &str,
+        slide_rels_xml: Option<&str>,
+        extra_parts: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+
+        let mut buffer = Vec::new();
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buffer));
+        let opts = SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+    <Default Extension="xml" ContentType="application/xml"/>
+    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+    <Default Extension="png" ContentType="image/png"/>
+</Types>"#,
+        )
+        .unwrap();
+
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>"#).unwrap();
+
+        zip.start_file("ppt/presentation.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><presentation/>").unwrap();
+
+        zip.start_file("ppt/_rels/presentation.xml.rels", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+</Relationships>"#).unwrap();
+
+        zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+        zip.write_all(slide_xml.as_bytes()).unwrap();
+
+        if let Some(rels) = slide_rels_xml {
+            zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts).unwrap();
+            zip.write_all(rels.as_bytes()).unwrap();
+        }
+
+        zip.start_file("docProps/core.xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+                   xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Test</dc:title></cp:coreProperties>"#,
+        )
+        .unwrap();
+
+        zip.start_file("docProps/app.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\"><Slides>1</Slides></Properties>").unwrap();
+
+        for (path, data) in extra_parts {
+            zip.start_file(*path, opts).unwrap();
+            zip.write_all(data).unwrap();
+        }
+
+        let _ = zip.finish().unwrap();
+        buffer
+    }
+
+    /// #47: OMML math wrapped in `mc:AlternateContent`/`mc:Choice`/`a14:m` must be
+    /// converted to LaTeX via the shared `docx::math` OMML converter, not dropped,
+    /// and the `mc:Fallback` text must not also appear (Choice content wins).
+    #[test]
+    fn test_issue_47_omml_math_wired_into_pptx() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+       xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+       xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+    <p:cSld><p:spTree><p:sp><p:txBody>
+        <a:p>
+            <mc:AlternateContent>
+                <mc:Choice Requires="a14">
+                    <a14:m>
+                        <m:oMathPara>
+                            <m:oMath>
+                                <m:sSup>
+                                    <m:e><m:r><m:t>x</m:t></m:r></m:e>
+                                    <m:sup><m:r><m:t>2</m:t></m:r></m:sup>
+                                </m:sSup>
+                            </m:oMath>
+                        </m:oMathPara>
+                    </a14:m>
+                </mc:Choice>
+                <mc:Fallback>
+                    <a:r><a:t>[equation]</a:t></a:r>
+                </mc:Fallback>
+            </mc:AlternateContent>
+        </a:p>
+    </p:txBody></p:sp></p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = build_single_slide_pptx(slide_xml, None, &[]);
+        let result = extract_pptx_from_bytes(
+            &pptx,
+            &PptxExtractionOptions {
+                extract_images: false,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            result.content.contains("$$x^{2}$$"),
+            "expected OMML math rendered as display LaTeX, got: {:?}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("[equation]"),
+            "mc:Choice content succeeded, so mc:Fallback text must not also appear, got: {:?}",
+            result.content
+        );
+    }
+
+    /// #79: `mc:AlternateContent` wrapping a whole shape must fall back to
+    /// `mc:Fallback` when `mc:Choice` carries no PresentationML-recognized
+    /// content, and `p:cxnSp` connectors must contribute their text.
+    #[test]
+    fn test_issue_79_alternate_content_fallback_and_connector_text() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+       xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main">
+    <p:cSld><p:spTree>
+        <mc:AlternateContent>
+            <mc:Choice Requires="p159">
+                <p14:futureShape/>
+            </mc:Choice>
+            <mc:Fallback>
+                <p:sp>
+                    <p:txBody><a:p><a:r><a:t>Fallback shape text</a:t></a:r></a:p></p:txBody>
+                </p:sp>
+            </mc:Fallback>
+        </mc:AlternateContent>
+        <p:cxnSp>
+            <p:txBody><a:p><a:r><a:t>Connector label</a:t></a:r></a:p></p:txBody>
+        </p:cxnSp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = build_single_slide_pptx(slide_xml, None, &[]);
+        let result = extract_pptx_from_bytes(
+            &pptx,
+            &PptxExtractionOptions {
+                extract_images: false,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            result.content.contains("Fallback shape text"),
+            "mc:Choice has no PresentationML content, so mc:Fallback must be used, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Connector label"),
+            "p:cxnSp connector text must be extracted, got: {:?}",
+            result.content
+        );
+    }
+
+    /// #80: chart (`c:chart`) and SmartArt/diagram (`dgm:relIds`) graphic frames
+    /// reference text-bearing parts in separate ZIP entries; that text must be
+    /// resolved and included in the extracted content.
+    #[test]
+    fn test_issue_80_chart_and_smartart_text_extracted() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+    <p:cSld><p:spTree>
+        <p:graphicFrame>
+            <p:nvGraphicFramePr><p:cNvPr id="2" name="Chart 1"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>
+            <a:graphic>
+                <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+                    <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId2"/>
+                </a:graphicData>
+            </a:graphic>
+        </p:graphicFrame>
+        <p:graphicFrame>
+            <p:nvGraphicFramePr><p:cNvPr id="3" name="SmartArt 1"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>
+            <a:graphic>
+                <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+                    <dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rId3"/>
+                </a:graphicData>
+            </a:graphic>
+        </p:graphicFrame>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let slide_rels = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/>
+    <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/>
+</Relationships>"#;
+
+        let chart_xml: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue by Quarter</a:t></a:r></a:p></c:rich></c:tx></c:title>
+    <c:plotArea><c:barChart><c:ser>
+      <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>Q1</c:v></c:pt></c:strCache></c:strRef></c:cat>
+      <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>42</c:v></c:pt></c:numCache></c:numRef></c:val>
+    </c:ser></c:barChart></c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+        let diagram_xml: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"
+               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <dgm:ptLst>
+    <dgm:pt modelId="1" type="node"><dgm:t><a:p><a:r><a:t>Step One</a:t></a:r></a:p></dgm:t></dgm:pt>
+    <dgm:pt modelId="2" type="node"><dgm:t><a:p><a:r><a:t>Step Two</a:t></a:r></a:p></dgm:t></dgm:pt>
+  </dgm:ptLst>
+</dgm:dataModel>"#;
+
+        let pptx = build_single_slide_pptx(
+            slide_xml,
+            Some(slide_rels),
+            &[
+                ("ppt/charts/chart1.xml", chart_xml),
+                ("ppt/diagrams/data1.xml", diagram_xml),
+            ],
+        );
+
+        let result = extract_pptx_from_bytes(
+            &pptx,
+            &PptxExtractionOptions {
+                extract_images: false,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            result.content.contains("Revenue by Quarter"),
+            "chart title must be extracted, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Q1") && result.content.contains("42"),
+            "chart category/value text must be extracted, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Step One") && result.content.contains("Step Two"),
+            "SmartArt node text must be extracted, got: {:?}",
+            result.content
+        );
+    }
+
+    /// #90: `a:fld` (cached field text, e.g. slide number) and `a:br` (explicit
+    /// line break) must contribute to paragraph text instead of being skipped.
+    ///
+    /// A separate title placeholder shape is included so the body paragraph
+    /// below is rendered through the normal paragraph path (`add_text`, which
+    /// preserves internal newlines) rather than being picked by the "shortest
+    /// text becomes the title" heuristic, whose title path collapses `\n` to
+    /// a space and would otherwise mask the very break this test verifies.
+    #[test]
+    fn test_issue_90_field_and_break_runs_extracted() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:cSld><p:spTree>
+        <p:sp>
+            <p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+            <p:txBody><a:p><a:r><a:t>Slide Title</a:t></a:r></a:p></p:txBody>
+        </p:sp>
+        <p:sp>
+            <p:txBody>
+                <a:p>
+                    <a:r><a:t>Page </a:t></a:r>
+                    <a:fld id="{00000000-0000-0000-0000-000000000000}" type="slidenum"><a:t>3</a:t></a:fld>
+                    <a:br/>
+                    <a:r><a:t>Second line</a:t></a:r>
+                </a:p>
+            </p:txBody>
+        </p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = build_single_slide_pptx(slide_xml, None, &[]);
+        let result = extract_pptx_from_bytes(
+            &pptx,
+            &PptxExtractionOptions {
+                extract_images: false,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            result.content.contains("Page 3\nSecond line"),
+            "a:fld cached text and a:br line break must both be extracted in order, got: {:?}",
+            result.content
+        );
+    }
+
+    /// #91: images must be paired with their own shape's dimensions/alt-text by
+    /// relationship ID, not by hash-map iteration order, and an image whose
+    /// target cannot be read must be warned about and skipped rather than
+    /// silently mis-paired.
+    #[test]
+    fn test_issue_91_image_pairing_by_rel_id_and_unreadable_image_warns() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+    <p:cSld><p:spTree>
+        <p:pic>
+            <p:nvPicPr><p:cNvPr id="2" name="Pic1" descr="First image"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+            <p:blipFill><a:blip r:embed="rId2"/></p:blipFill>
+            <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="952500" cy="952500"/></a:xfrm></p:spPr>
+        </p:pic>
+        <p:pic>
+            <p:nvPicPr><p:cNvPr id="3" name="Pic2" descr="Second image"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+            <p:blipFill><a:blip r:embed="rId3"/></p:blipFill>
+            <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1905000" cy="1905000"/></a:xfrm></p:spPr>
+        </p:pic>
+        <p:pic>
+            <p:nvPicPr><p:cNvPr id="4" name="Pic3" descr="Missing image"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+            <p:blipFill><a:blip r:embed="rId4"/></p:blipFill>
+            <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm></p:spPr>
+        </p:pic>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let slide_rels = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+    <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image2.png"/>
+    <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/missing.png"/>
+</Relationships>"#;
+
+        let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82";
+
+        let pptx = build_single_slide_pptx(
+            slide_xml,
+            Some(slide_rels),
+            &[("ppt/media/image1.png", png_bytes), ("ppt/media/image2.png", png_bytes)],
+        );
+
+        let mut warnings = Vec::new();
+        let result = extract_pptx_from_bytes(&pptx, &PptxExtractionOptions::default(), &mut warnings).unwrap();
+
+        assert_eq!(
+            result.images.len(),
+            2,
+            "the image with a missing target must not be counted as extracted"
+        );
+        assert_eq!(result.images[0].description.as_deref(), Some("First image"));
+        assert_eq!(result.images[0].width, Some(100));
+        assert_eq!(result.images[1].description.as_deref(), Some("Second image"));
+        assert_eq!(result.images[1].width, Some(200));
+
+        assert!(
+            warnings.iter().any(|w| w.source == "pptx"
+                && w.message == "Image 'rId4' referenced on slide 1 could not be read; it was not extracted"),
+            "expected a warning naming the unreadable image, got: {:?}",
+            warnings
+        );
+    }
+
+    /// #238: a corrupt `docProps/core.xml` or comment part must be surfaced as a
+    /// `ProcessingWarning` naming the part, not silently dropped while the rest
+    /// of the document is returned as if it were complete.
+    #[test]
+    fn test_issue_238_warns_on_corrupt_metadata_and_comments() {
+        use std::io::Write;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+
+        let mut buffer = Vec::new();
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buffer));
+        let opts = SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+    <Default Extension="xml" ContentType="application/xml"/>
+    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+</Types>"#,
+        )
+        .unwrap();
+
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>"#).unwrap();
+
+        zip.start_file("ppt/presentation.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><presentation/>").unwrap();
+
+        zip.start_file("ppt/_rels/presentation.xml.rels", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+</Relationships>"#).unwrap();
+
+        zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide text</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+</p:sld>"#,
+        )
+        .unwrap();
+
+        zip.start_file("ppt/comments/comment1.xml", opts).unwrap();
+        zip.write_all(b"not valid xml content").unwrap();
+
+        zip.start_file("docProps/core.xml", opts).unwrap();
+        zip.write_all(b"not valid xml content").unwrap();
+
+        zip.start_file("docProps/app.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\"?><Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\"><Slides>1</Slides></Properties>").unwrap();
+
+        let _ = zip.finish().unwrap();
+
+        let mut warnings = Vec::new();
+        let result = extract_pptx_from_bytes(
+            &buffer,
+            &PptxExtractionOptions {
+                extract_images: false,
+                ..Default::default()
+            },
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(
+            result.content.contains("Slide text"),
+            "extraction of the rest of the document must still succeed"
+        );
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.source == "pptx" && w.message.contains("docProps/core.xml")),
+            "expected a warning naming the corrupt docProps/core.xml, got: {:?}",
+            warnings
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.source == "pptx" && w.message.contains("comment1.xml")),
+            "expected a warning naming the corrupt comment file, got: {:?}",
+            warnings
+        );
     }
 }

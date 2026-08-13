@@ -26,7 +26,6 @@ from .gt_schema import revisions_expectation, write_ground_truth
 ZIP_MTIME = (2024, 1, 1, 0, 0, 0)
 
 REV_HEADERS = [
-    # (guid, userName, dateTime)
     ("11111111-1111-1111-1111-111111111111", "Alice", "2024-05-01T08:00:00Z"),
     ("22222222-2222-2222-2222-222222222222", "Bob", "2024-05-01T09:30:00Z"),
     ("33333333-3333-3333-3333-333333333333", "Carol", "2024-05-01T11:00:00Z"),
@@ -86,7 +85,6 @@ def _patch_workbook_rels(original: bytes) -> bytes:
     )
     if REVISION_HEADERS_RELID in text:
         return original
-    # ``</Relationships>`` should always be present; replace the last occurrence.
     return re.sub(r"</Relationships>\s*$", f"{rel}</Relationships>", text, count=1).encode("utf-8")
 
 

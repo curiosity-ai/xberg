@@ -11,8 +11,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 static RE_PHONE: Lazy<Regex> = Lazy::new(|| {
-    // (?:\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}
-    // Anchored with word boundaries to avoid grabbing inside longer digit runs.
     Regex::new(
         r"(?x)
         \b

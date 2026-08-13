@@ -17,7 +17,8 @@
 //! - Classification model (`*_cls_*.onnx`)
 //! - Recognition model (`*_rec_*.onnx`)
 //!
-//! Models are auto-downloaded on first use to `~/.cache/xberg/paddle-ocr/`.
+//! Models are auto-downloaded on first use through the standard Hugging Face
+//! cache (`HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, or `$HF_HOME/hub`).
 //!
 //! # Example
 //!
@@ -36,17 +37,25 @@
 //! println!("Extracted: {}", result.content);
 //! ```
 
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 mod backend;
 mod config;
-mod model_manager;
+pub(crate) mod model_manager;
 
-#[cfg(feature = "paddle-ocr")]
+/// Cross-engine (ORT vs tract) parity coverage for the classical PaddleOCR models.
+///
+/// Needs *both* engines linked into one binary, which is exactly the
+/// `paddle-ocr-ort` + `paddle-ocr-tract` combination — see the module docs for the
+/// full command line.
+#[cfg(all(test, feature = "paddle-ocr-ort", feature = "paddle-ocr-tract"))]
+mod tract_parity;
+
+#[cfg(paddle_ocr)]
 pub use backend::PaddleOcrBackend;
-pub use config::{PaddleLanguage, PaddleOcrConfig};
+pub use config::{PaddleInferenceBackend, PaddleLanguage, PaddleOcrConfig};
 pub use model_manager::{ModelPaths, RecModelPaths, ResolvedRecModel, SharedModelPaths};
 
-#[cfg(feature = "paddle-ocr")]
+#[cfg(paddle_ocr)]
 pub use model_manager::{ModelCacheStats, ModelManager, ModelManifestEntry};
 
 /// Supported languages for PaddleOCR.
@@ -54,25 +63,25 @@ pub use model_manager::{ModelCacheStats, ModelManager, ModelManifestEntry};
 /// PaddleOCR supports 15+ optimized language models covering 80+ languages
 /// via 11 script-family recognition models (all PP-OCRv5).
 pub const SUPPORTED_LANGUAGES: &[&str] = &[
-    "ch",          // Chinese (Simplified)
-    "en",          // English
-    "french",      // French
-    "german",      // German
-    "korean",      // Korean
-    "japan",       // Japanese
-    "chinese_cht", // Chinese (Traditional)
-    "latin",       // Latin script languages
-    "cyrillic",    // Cyrillic script languages
-    "thai",        // Thai
-    "greek",       // Greek
-    "arabic",      // Arabic script languages
-    "devanagari",  // Hindi, Marathi, Sanskrit, Nepali
-    "tamil",       // Tamil
-    "telugu",      // Telugu
+    "ch",
+    "en",
+    "french",
+    "german",
+    "korean",
+    "japan",
+    "chinese_cht",
+    "latin",
+    "cyrillic",
+    "thai",
+    "greek",
+    "arabic",
+    "devanagari",
+    "tamil",
+    "telugu",
 ];
 
 /// Check if a language code is supported by PaddleOCR.
-#[allow(dead_code)] // consumed by `paddle-ocr`; types crate ships it for ABI shape
+#[allow(dead_code)]
 pub(crate) fn is_language_supported(lang: &str) -> bool {
     SUPPORTED_LANGUAGES.contains(&lang)
 }
@@ -98,7 +107,7 @@ pub(crate) fn is_language_supported(lang: &str) -> bool {
 /// | `devanagari` | Hindi, Marathi, Sanskrit, Nepali |
 /// | `tamil` | Tamil |
 /// | `telugu` | Telugu |
-#[allow(dead_code)] // consumed by `paddle-ocr`; types crate ships it for ABI shape
+#[allow(dead_code)]
 pub(crate) fn language_to_script_family(paddle_lang: &str) -> &'static str {
     match paddle_lang {
         "en" => "english",
@@ -117,37 +126,176 @@ pub(crate) fn language_to_script_family(paddle_lang: &str) -> &'static str {
 }
 
 /// Map Xberg language codes to PaddleOCR language codes.
-#[allow(dead_code)] // consumed by `paddle-ocr`; types crate ships it for ABI shape
+#[allow(dead_code)]
 pub(crate) fn map_language_code(xberg_code: &str) -> Option<&'static str> {
     match xberg_code {
-        // Direct mappings
         "ch" | "chi_sim" | "zho" | "zh" | "chinese" => Some("ch"),
         "en" | "eng" | "english" => Some("en"),
         "fr" | "fra" | "french" => Some("french"),
         "de" | "deu" | "german" => Some("german"),
         "ko" | "kor" | "korean" => Some("korean"),
-        "ja" | "jpn" | "japanese" | "japan" => Some("japan"),
+        "ja" | "jpn" | "jpn_vert" | "japanese" | "japan" => Some("japan"),
         "chi_tra" | "zh_tw" | "zh_hant" | "chinese_cht" => Some("chinese_cht"),
         "ru" | "rus" | "russian" | "uk" | "ukr" | "ukrainian" | "be" | "bel" | "belarusian" | "cyrillic" => {
             Some("cyrillic")
         }
         "th" | "tha" | "thai" => Some("thai"),
         "el" | "ell" | "greek" => Some("greek"),
-        // Arabic script languages
         "ar" | "ara" | "arabic" | "fa" | "fas" | "persian" | "ur" | "urd" | "urdu" => Some("arabic"),
-        // Devanagari script languages
         "hi" | "hin" | "hindi" | "mr" | "mar" | "marathi" | "sa" | "san" | "sanskrit" | "ne" | "nep" | "nepali"
         | "devanagari" => Some("devanagari"),
-        // Tamil
         "ta" | "tam" | "tamil" => Some("tamil"),
-        // Telugu
         "te" | "tel" | "telugu" => Some("telugu"),
-        // Latin script fallback for European languages
         "latin" | "es" | "spa" | "spanish" | "it" | "ita" | "italian" | "pt" | "por" | "portuguese" | "nl" | "nld"
         | "dutch" | "pl" | "pol" | "polish" | "sv" | "swe" | "swedish" | "da" | "dan" | "danish" | "no" | "nor"
         | "norwegian" | "fi" | "fin" | "finnish" | "cs" | "ces" | "czech" | "sk" | "slk" | "slovak" | "hr" | "hrv"
         | "croatian" | "hu" | "hun" | "hungarian" | "ro" | "ron" | "romanian" | "tr" | "tur" | "turkish" | "id"
         | "ind" | "indonesian" | "ms" | "msa" | "malay" | "vi" | "vie" | "vietnamese" => Some("latin"),
         _ => None,
+    }
+}
+
+/// Select the PaddleOCR recognition language for a request and report what the
+/// selection cannot cover.
+///
+/// PaddleOCR loads one recognition model per call. The first requested language
+/// selects it, except that an English-first request prefers a later Korean or
+/// Japanese model because those models also cover Latin text. Any language the
+/// selected model does not cover emits a `ProcessingWarning` instead of being
+/// silently dropped (#1346). An unmapped first language falls back to English.
+#[cfg(paddle_ocr)]
+pub(crate) fn select_paddle_language(languages: &[String]) -> (&'static str, Vec<crate::types::ProcessingWarning>) {
+    use std::borrow::Cow;
+
+    let mut warnings = Vec::new();
+    let primary = languages.first().map(String::as_str).unwrap_or("eng");
+    let primary_code = map_language_code(primary);
+    let paddle_lang = match primary_code {
+        Some("en") => languages
+            .iter()
+            .filter_map(|language| map_language_code(language))
+            // Korean and Japanese recognition models also cover Latin text. ~keep
+            .find(|code| matches!(*code, "korean" | "japan"))
+            .unwrap_or("en"),
+        Some(code) => code,
+        None => {
+            tracing::warn!(
+                requested = %primary,
+                "paddle-ocr: requested language is not supported; falling back to the 'en' recognition model"
+            );
+            warnings.push(crate::types::ProcessingWarning {
+                source: Cow::Borrowed("paddle-ocr"),
+                message: Cow::Owned(format!(
+                    "requested language '{primary}' is not supported by paddle-ocr; falling back to the 'en' recognition model"
+                )),
+            });
+            "en"
+        }
+    };
+
+    let uncovered: Vec<&str> = languages
+        .iter()
+        .skip(usize::from(primary_code.is_none()))
+        .map(String::as_str)
+        .filter(|lang| map_language_code(lang).is_none_or(|code| !paddle_model_covers(paddle_lang, code)))
+        .collect();
+
+    if !uncovered.is_empty() {
+        tracing::warn!(
+            selected = %paddle_lang,
+            uncovered = %uncovered.join(", "),
+            "paddle-ocr: single recognition model per run; requested languages are not covered by the selected model and their text may be dropped"
+        );
+        warnings.push(crate::types::ProcessingWarning {
+            source: Cow::Borrowed("paddle-ocr"),
+            message: Cow::Owned(format!(
+                "paddle-ocr uses a single recognition model per run; requested languages [{}] are not covered by the selected '{paddle_lang}' model and their text may be dropped",
+                uncovered.join(", ")
+            )),
+        });
+    }
+
+    (paddle_lang, warnings)
+}
+
+#[cfg(paddle_ocr)]
+fn paddle_model_covers(selected: &str, requested: &str) -> bool {
+    language_to_script_family(selected) == language_to_script_family(requested)
+        || (matches!(selected, "korean" | "japan") && requested == "en")
+}
+
+#[cfg(all(test, paddle_ocr))]
+mod language_selection_tests {
+    use super::select_paddle_language;
+
+    fn langs(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn test_single_language_no_warnings() {
+        let (lang, warnings) = select_paddle_language(&langs(&["rus"]));
+        assert_eq!(lang, "cyrillic");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_same_family_languages_no_warnings() {
+        let (lang, warnings) = select_paddle_language(&langs(&["fra", "deu", "spa"]));
+        assert_eq!(lang, "french");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_cross_family_language_warns() {
+        let (lang, warnings) = select_paddle_language(&langs(&["eng", "rus"]));
+        assert_eq!(lang, "en");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("rus"));
+        assert!(warnings[0].message.contains("'en'"));
+    }
+
+    #[test]
+    fn test_unmapped_primary_falls_back_with_warning() {
+        let (lang, warnings) = select_paddle_language(&langs(&["xyz"]));
+        assert_eq!(lang, "en");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("xyz"));
+    }
+
+    #[test]
+    fn test_unmapped_secondary_warns() {
+        let (lang, warnings) = select_paddle_language(&langs(&["eng", "xyz"]));
+        assert_eq!(lang, "en");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("xyz"));
+    }
+
+    #[test]
+    fn test_empty_list_defaults_to_english() {
+        let (lang, warnings) = select_paddle_language(&[]);
+        assert_eq!(lang, "en");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn should_map_vertical_japanese_to_japanese_model() {
+        let (lang, warnings) = select_paddle_language(&langs(&["jpn_vert"]));
+        assert_eq!(lang, "japan");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn should_prioritize_korean_model_for_mixed_english_and_korean() {
+        let (lang, warnings) = select_paddle_language(&langs(&["eng", "kor"]));
+        assert_eq!(lang, "korean");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn should_prioritize_japanese_model_for_mixed_english_and_vertical_japanese() {
+        let (lang, warnings) = select_paddle_language(&langs(&["eng", "jpn_vert"]));
+        assert_eq!(lang, "japan");
+        assert!(warnings.is_empty());
     }
 }

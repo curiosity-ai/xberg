@@ -118,7 +118,6 @@ pub struct ColorProfileNCLX {
 #[allow(unsafe_code)]
 impl Drop for ColorProfileNCLX {
     fn drop(&mut self) {
-        // SAFETY: inner is non-null and owned by this ColorProfileNCLX; freeing it completes our ownership.
         unsafe {
             lh::heif_nclx_color_profile_free(self.inner);
         }
@@ -134,7 +133,6 @@ impl ColorProfile for ColorProfileNCLX {
 #[allow(unsafe_code)]
 impl ColorProfileNCLX {
     pub fn new() -> Option<Self> {
-        // SAFETY: libheif C API; returns a heap-allocated nclx profile or null.
         let inner = unsafe { lh::heif_nclx_color_profile_alloc() };
         (!inner.is_null()).then_some(Self { inner })
     }
@@ -142,14 +140,12 @@ impl ColorProfileNCLX {
     #[inline(always)]
     #[allow(unsafe_code)]
     fn inner_ref(&self) -> &lh::heif_color_profile_nclx {
-        // SAFETY: inner is non-null and valid for the lifetime of &self.
         unsafe { &(*self.inner) }
     }
 
     #[inline(always)]
     #[allow(unsafe_code)]
     fn inner_mut(&mut self) -> &mut lh::heif_color_profile_nclx {
-        // SAFETY: inner is non-null and valid for the lifetime of &mut self; we have exclusive access.
         unsafe { &mut (*self.inner) }
     }
 

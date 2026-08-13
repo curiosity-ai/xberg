@@ -1,0 +1,39 @@
+---
+id: fixture_rust_register_ocr_backend_trait_bridge
+language: rust
+target: rust
+level: typecheck
+requires: []
+side_effect: safe
+---
+
+register_ocr_backend: trait bridge
+
+```rust title="Rust"
+use xberg::register_ocr_backend;
+
+fn main() {
+    #[allow(unused_imports)]
+    use xberg::ExtractedDocument;
+    #[allow(unused_imports)]
+    use xberg::OcrBackend;
+    #[allow(unused_imports)]
+    use xberg::OcrBackendType;
+    #[allow(unused_imports)]
+    use xberg::OcrConfig;
+    #[allow(unused_imports)]
+    use xberg::XbergError;
+    struct TestStubRegisterOcrBackendTraitBridge { _name: &'static str }
+    impl xberg::plugins::Plugin for TestStubRegisterOcrBackendTraitBridge {
+        fn name(&self) -> &str { self._name }
+    }
+    #[async_trait::async_trait]
+    impl OcrBackend for TestStubRegisterOcrBackendTraitBridge {
+        async fn process_image(&self, _p0: &[u8], _p1: &OcrConfig) -> Result<ExtractedDocument, XbergError> { Ok(ExtractedDocument::default()) }
+        fn supports_language(&self, _p0: &str) -> bool { false }
+        fn backend_type(&self) -> OcrBackendType { OcrBackendType::default() }
+    }
+    let _ = register_ocr_backend(std::sync::Arc::new(TestStubRegisterOcrBackendTraitBridge { _name: "test-backend" }));
+}
+
+```

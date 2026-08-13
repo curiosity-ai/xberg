@@ -45,9 +45,11 @@ public static class JsonRenderer
         var state = new RenderState();
         OpenList? openList = null;
         JsonArray? openBlockquote = null;
+        var footnotes = new FootnoteCollector(doc);
 
-        foreach (var elem in doc.Elements)
+        for (int elemIndex = 0; elemIndex < doc.Elements.Count; elemIndex++)
         {
+            var elem = doc.Elements[elemIndex];
             if (!RenderCommon.IsBodyElement(elem)) continue;
 
             if (RenderCommon.IsContainerEnd(elem))
@@ -155,7 +157,65 @@ public static class JsonRenderer
                         PushToCurrent(rootBody, sectionStack, ref openBlockquote, ParagraphNode(elem.Text));
                     break;
 
-                // Everything else skipped.
+                case ElementKindTag.PageBreak:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote, PageBreakNode(elem.Page));
+                    break;
+
+                case ElementKindTag.FootnoteRef:
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        FootnoteRefNode(footnotes.RefNumber((uint)elemIndex), elem.Anchor));
+                    break;
+
+                case ElementKindTag.FootnoteDefinition:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        FootnoteDefinitionNode(elem.Text, elem.Anchor));
+                    break;
+
+                case ElementKindTag.Citation:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        CitationNode(elem.Text, elem.Anchor));
+                    break;
+
+                case ElementKindTag.Slide:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        SlideNode(elem.Kind.Number, elem.Text.Length == 0 ? null : elem.Text));
+                    break;
+
+                case ElementKindTag.DefinitionTerm:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        TextNode("definition_term", elem.Text));
+                    break;
+
+                case ElementKindTag.DefinitionDescription:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        TextNode("definition_description", elem.Text));
+                    break;
+
+                case ElementKindTag.Admonition:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote, AdmonitionNode(
+                        RenderCommon.GetAdmonitionKind(elem), RenderCommon.GetAdmonitionTitle(elem), elem.Text));
+                    break;
+
+                case ElementKindTag.RawBlock:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        RawBlockNode(elem.Text, elem.Attributes is not null && elem.Attributes.TryGetValue("format", out var rawFormat) ? rawFormat : null));
+                    break;
+
+                case ElementKindTag.MetadataBlock:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        MetadataBlockNode(RenderCommon.ParseMetadataEntries(elem.Text), elem.Text));
+                    break;
+
+                // ListEnd / QuoteEnd / GroupStart / GroupEnd carry no node of their own.
             }
         }
 
@@ -170,6 +230,17 @@ public static class JsonRenderer
         }
 
         CloseSectionsToLevel(sectionStack, rootBody, 0);
+
+        // Footnote definitions live on the Footnote layer, not Body, so the loop above never
+        // sees them — `IsBodyElement` filters them out. That filter is correct (a definition is
+        // document furniture, not body flow, and must not be interleaved into whatever section
+        // happened to be open), but it also dropped the definition a `[^n]` marker points at.
+        // Append them once, in document order, at the end — mirroring the Markdown renderer.
+        foreach (var elem in doc.Elements)
+        {
+            if (elem.Kind.Tag == ElementKindTag.FootnoteDefinition && !RenderCommon.IsBodyElement(elem))
+                rootBody.Add(FootnoteDefinitionNode(elem.Text, elem.Anchor));
+        }
 
         var result = new JsonObject();
         if (title is not null) result["title"] = title;
@@ -224,6 +295,70 @@ public static class JsonRenderer
             openList = null;
             PushToCurrent(rootBody, sectionStack, ref openBlockquote, node);
         }
+    }
+
+    private static JsonObject TextNode(string type, string text) => new() { ["type"] = type, ["text"] = text };
+
+    private static JsonObject PageBreakNode(uint? page)
+    {
+        var o = new JsonObject { ["type"] = "page_break" };
+        if (page is { } p) o["page"] = p;
+        return o;
+    }
+
+    private static JsonObject FootnoteRefNode(uint? number, string? id)
+    {
+        var o = new JsonObject { ["type"] = "footnote_ref" };
+        if (number is { } n) o["number"] = n;
+        if (id is not null) o["id"] = id;
+        return o;
+    }
+
+    private static JsonObject FootnoteDefinitionNode(string text, string? id)
+    {
+        var o = new JsonObject { ["type"] = "footnote_definition", ["text"] = text };
+        if (id is not null) o["id"] = id;
+        return o;
+    }
+
+    private static JsonObject CitationNode(string text, string? id)
+    {
+        var o = new JsonObject { ["type"] = "citation", ["text"] = text };
+        if (id is not null) o["id"] = id;
+        return o;
+    }
+
+    private static JsonObject SlideNode(uint number, string? title)
+    {
+        var o = new JsonObject { ["type"] = "slide", ["number"] = number };
+        if (title is not null) o["title"] = title;
+        return o;
+    }
+
+    private static JsonObject AdmonitionNode(string kind, string? title, string text)
+    {
+        var o = new JsonObject { ["type"] = "admonition", ["kind"] = kind };
+        if (title is not null) o["title"] = title;
+        o["text"] = text;
+        return o;
+    }
+
+    private static JsonObject RawBlockNode(string text, string? format)
+    {
+        var o = new JsonObject { ["type"] = "raw_block", ["text"] = text };
+        if (format is not null) o["format"] = format;
+        return o;
+    }
+
+    /// <summary>Raw block text is emitted only when no `key: value` entries could be parsed.</summary>
+    private static JsonObject MetadataBlockNode(List<(string Key, string Value)> entries, string rawText)
+    {
+        var arr = new JsonArray();
+        foreach (var (key, value) in entries)
+            arr.Add(new JsonObject { ["key"] = key, ["value"] = value });
+        var o = new JsonObject { ["type"] = "metadata_block", ["entries"] = arr };
+        if (entries.Count == 0 && rawText.Length > 0) o["text"] = rawText;
+        return o;
     }
 
     private static JsonObject ParagraphNode(string text) => new() { ["type"] = "paragraph", ["text"] = text };

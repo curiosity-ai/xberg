@@ -32,7 +32,6 @@ outputs:
 runs:
   using: composite
   steps:
-    # Validate inputs
     - name: Validate inputs
       shell: bash
       env:
@@ -51,7 +50,6 @@ runs:
         echo "  Build profile: $BUILD_PROFILE"
         echo "  Cache version: ${{ inputs.cache-version }}"
 
-    # Compute hash for benchmark-harness sources
     - name: Compute benchmark-harness source hash
       id: harness-hash
       shell: bash
@@ -60,10 +58,15 @@ runs:
 
         echo "=== Computing Benchmark Harness Source Hash ==="
 
-        # Compute hash for harness source files and Cargo.toml
+        # Keep every workspace/toolchain input that can change the compiled harness in the exact
+        # cache key; an exact hit skips compilation entirely, so omitting one can run stale code. ~keep
         HARNESS_HASH=$(scripts/ci/cache/compute-hash.sh \
-          "tools/benchmark-harness/src/**" \
+          "tools/benchmark-harness/src/**/*" \
+          "tools/benchmark-harness/build.rs" \
           "tools/benchmark-harness/Cargo.toml" \
+          "Cargo.toml" \
+          "rust-toolchain.toml" \
+          ".cargo/config.toml" \
           2>&1 | grep "^[a-f0-9]*$")
 
         if [[ -z "$HARNESS_HASH" ]]; then
@@ -74,7 +77,6 @@ runs:
         echo "harness-hash=$HARNESS_HASH" >> "$GITHUB_OUTPUT"
         echo "✓ Harness source hash: $HARNESS_HASH"
 
-    # Compute hash for xberg dependency
     - name: Compute xberg dependency hash
       id: xberg-hash
       shell: bash
@@ -83,9 +85,10 @@ runs:
 
         echo "=== Computing Xberg Dependency Hash ==="
 
-        # Compute hash for xberg crate (dependency)
+        # Hash every workspace crate because xberg reaches sibling path crates transitively; an
+        # exact dependency subset would be easy to under-approximate as workspace edges evolve. ~keep
         XBERG_HASH=$(scripts/ci/cache/compute-hash.sh --dirs \
-          "crates/xberg" \
+          "crates" \
           2>&1 | grep "^[a-f0-9]*$")
 
         if [[ -z "$XBERG_HASH" ]]; then
@@ -96,7 +99,6 @@ runs:
         echo "xberg-hash=$XBERG_HASH" >> "$GITHUB_OUTPUT"
         echo "✓ Xberg dependency hash: $XBERG_HASH"
 
-    # Compute hash for Cargo files
     - name: Compute Cargo files hash
       id: cargo-hash
       shell: bash
@@ -116,7 +118,6 @@ runs:
         echo "cargo-hash=$CARGO_HASH" >> "$GITHUB_OUTPUT"
         echo "✓ Cargo files hash: $CARGO_HASH"
 
-    # Generate cache key
     - name: Generate cache key
       id: generate-cache-key
       shell: bash
@@ -131,9 +132,27 @@ runs:
 
         echo "=== Cache Key Generated ==="
 
+        # Exact hits skip compilation, so compiler identity and codegen-affecting environment
+        # values must participate alongside source hashes. NUL separators avoid ambiguity. ~keep
+        BUILD_ENV_HASH=$(
+          {
+            printf '%s\0' \
+              "$(uname -s)" \
+              "$(uname -m)" \
+              "${RUSTFLAGS:-}" \
+              "${CARGO_ENCODED_RUSTFLAGS:-}" \
+              "${CARGO_BUILD_TARGET:-}" \
+              "${CARGO_INCREMENTAL:-}" \
+              "${CARGO_PROFILE_RELEASE_DEBUG:-}" \
+              "${CARGO_PROFILE_RELEASE_LTO:-}" \
+              "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}"
+            rustc -vV
+          } | shasum -a 256 | awk '{print $1}'
+        )
+
         # Build cache key following format:
-        # harness-{profile}-{platform}-src-{harness-hash}-xberg-{xberg-hash}-cargo-{cargo-hash}-v{version}
-        CACHE_KEY="harness-${BUILD_PROFILE}-$(uname -m)-src-${HARNESS_HASH}-xberg-${XBERG_HASH}-cargo-${CARGO_HASH}-${CACHE_VERSION}"
+        # harness-{profile}-{platform}-env-{env-hash}-src-{harness-hash}-xberg-{xberg-hash}-cargo-{cargo-hash}-v{version}
+        CACHE_KEY="harness-${BUILD_PROFILE}-$(uname -s)-$(uname -m)-env-${BUILD_ENV_HASH}-src-${HARNESS_HASH}-xberg-${XBERG_HASH}-cargo-${CARGO_HASH}-${CACHE_VERSION}"
 
         echo "cache-key=$CACHE_KEY" >> "$GITHUB_OUTPUT"
 
@@ -142,12 +161,12 @@ runs:
         echo "Key components:"
         echo "  Profile:         $BUILD_PROFILE"
         echo "  Platform:        $(uname -m)"
+        echo "  Build env hash:  $BUILD_ENV_HASH"
         echo "  Harness hash:    $HARNESS_HASH"
         echo "  Xberg hash:  $XBERG_HASH"
         echo "  Cargo hash:      $CARGO_HASH"
         echo "  Cache version:   $CACHE_VERSION"
 
-    # Determine target path based on profile
     - name: Determine target paths
       id: target-paths
       shell: bash
@@ -174,13 +193,11 @@ runs:
         echo "target-dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
         echo "✓ Target directory: $TARGET_DIR"
 
-    # Detect architecture for cache keys (shell expansion doesn't work in YAML with: context)
     - name: Detect architecture
       id: detect-arch
       shell: bash
       run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
 
-    # Restore from cache
     - name: Restore benchmark-harness binary from cache
       id: cache-restore
       uses: xberg-io/actions/cache-binding-artifact@v1
@@ -195,7 +212,6 @@ runs:
           ${{ steps.target-paths.outputs.target-dir }}/benchmark-harness
         operation: restore
 
-    # Log cache hit status
     - name: Log cache hit status
       shell: bash
       run: |
@@ -207,7 +223,6 @@ runs:
           echo "✗ Cache MISS - Building benchmark-harness from source"
         fi
 
-    # Build if cache miss
     - name: Build benchmark-harness
       id: build
       if: steps.cache-restore.outputs.cache-hit != 'true'
@@ -244,7 +259,6 @@ runs:
 
         echo "✓ Build succeeded"
 
-    # Validate binary exists and is executable
     - name: Validate benchmark-harness binary
       id: validate-binary
       shell: bash
@@ -281,7 +295,6 @@ runs:
         echo "  Size:        $BINARY_SIZE"
         echo "  Permissions: $BINARY_PERMS"
 
-    # Save to cache if build occurred
     - name: Save benchmark-harness binary to cache
       if: steps.cache-restore.outputs.cache-hit != 'true'
       uses: xberg-io/actions/cache-binding-artifact@v1
@@ -292,7 +305,6 @@ runs:
           ${{ steps.target-paths.outputs.target-dir }}/benchmark-harness
         operation: save
 
-    # Summary
     - name: Summary
       if: always()
       shell: bash

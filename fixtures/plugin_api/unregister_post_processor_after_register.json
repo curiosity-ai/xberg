@@ -2,6 +2,12 @@
 	"id": "unregister_post_processor_after_register",
 	"category": "plugin_api",
 	"description": "unregister_post_processor",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "unregister_post_processor",
+		"description": "unregister_post_processor",
+		"side_effects": "safe"
+	},
 	"call": "unregister_post_processor",
 	"input": {
 		"name": "test-processor"

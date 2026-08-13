@@ -73,7 +73,6 @@ impl LibHeif {
     /// `[<major>, <minor>, <maintenance>]`
     #[allow(unsafe_code)]
     pub fn version(&self) -> [u8; 3] {
-        // Numeric version of linked libheif library, encoded as 0xHHMMLL00 = HH.MM.LL.
         let version: u32 = unsafe { lh::heif_get_version_number() };
         let parts = version.to_be_bytes();
         [parts[0], parts[1], parts[2]]
@@ -87,7 +86,6 @@ impl LibHeif {
         self._load_plugins(dir_path.as_ref())
     }
 
-    // TODO: Consider using 'momo' crate in the future
     #[allow(unsafe_code)]
     fn _load_plugins(&self, dir_path: &Path) -> Result<usize> {
         let dir_path = path_to_cstring(dir_path);

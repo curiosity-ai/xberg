@@ -181,6 +181,44 @@ pub fn build_vision_fallback_prompt(
     }
 }
 
+/// Decide whether a text-only pass's confidence warrants escalating to a
+/// vision-fallback call, building the fallback prompt via
+/// [`build_vision_fallback_prompt`] when it does.
+///
+/// Returns `Some` when `confidence.combined` falls strictly below
+/// `fallback_threshold`; `None` when the text-only result is confident enough
+/// and no escalation is needed. Mirrors the fallback decision made by
+/// structured-extraction orchestrators built on this mechanism, but
+/// `fallback_threshold` is a caller-supplied parameter — this mechanism bakes
+/// in no default threshold.
+#[allow(clippy::too_many_arguments)]
+pub fn escalate_if_below_threshold(
+    system_prompt: &str,
+    context_template: Option<&str>,
+    extracted_text_excerpt: &str,
+    user_context: Option<&serde_json::Map<String, serde_json::Value>>,
+    prior_json: &serde_json::Value,
+    confidence: &crate::heuristics::confidence::ExtractionConfidence,
+    fallback_threshold: f32,
+    citation_instruction: Option<&str>,
+    max_excerpt_bytes: usize,
+) -> Option<BuiltPrompt> {
+    if confidence.combined >= fallback_threshold {
+        return None;
+    }
+
+    Some(build_vision_fallback_prompt(
+        system_prompt,
+        context_template,
+        extracted_text_excerpt,
+        user_context,
+        prior_json,
+        confidence,
+        citation_instruction,
+        max_excerpt_bytes,
+    ))
+}
+
 /// Substitute {{var}} placeholders from the provided context map.
 /// Missing vars leave the placeholder intact (do not error).
 fn substitute_vars(template: &str, context: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
@@ -257,8 +295,6 @@ mod tests {
     /// A literal citation instruction, supplied as a parameter — no preset, and
     /// not the worker's embedded `CITATION_INSTRUCTION` text.
     const TEST_CITATION_INSTRUCTION: &str = "\n\n---\n\nFORMAT EACH FIELD WITH value/page/bbox/confidence.\n";
-
-    // --- substitution behavior (exercised through build_prompt) ---
 
     #[test]
     fn context_substitution_all_vars_present() {
@@ -351,8 +387,6 @@ mod tests {
 
         assert!(prompt.system.contains("Strict mode: true"));
     }
-
-    // --- assembly behavior (literal templates, no Preset) ---
 
     #[test]
     fn text_only_includes_excerpt() {
@@ -540,17 +574,69 @@ mod tests {
         );
 
         let user_text = prompt.user_text.unwrap();
-        // The fenced excerpt is capped; full 300k input never appears verbatim.
         assert!(!user_text.contains(&"b".repeat(300_000)));
         assert!(user_text.contains(&"b".repeat(1000)));
     }
 
     #[test]
+    fn should_escalate_when_confidence_is_below_threshold() {
+        let confidence = ExtractionConfidence {
+            text_coverage: 0.5,
+            ocr_aggregate: Some(0.4),
+            schema_compliance: SchemaCompliance::PartialValid,
+            combined: 0.4,
+        };
+        let prior = serde_json::json!({"name": "Alice"});
+
+        let decision = escalate_if_below_threshold(
+            "You are a helpful extractor.",
+            None,
+            "Sample extracted text",
+            None,
+            &prior,
+            &confidence,
+            0.6,
+            None,
+            TEST_MAX_EXCERPT,
+        );
+
+        let prompt = decision.expect("confidence 0.4 < threshold 0.6 must escalate");
+        let user_text = prompt.user_text.expect("fallback prompt carries user text");
+        assert!(user_text.contains("Prior text-only extraction"));
+        assert!(user_text.contains("\"name\": \"Alice\""));
+    }
+
+    #[test]
+    fn should_not_escalate_when_confidence_meets_threshold() {
+        let confidence = ExtractionConfidence {
+            text_coverage: 0.9,
+            ocr_aggregate: None,
+            schema_compliance: SchemaCompliance::AllValid,
+            combined: 0.6,
+        };
+        let prior = serde_json::json!({"name": "Alice"});
+
+        let decision = escalate_if_below_threshold(
+            "You are a helpful extractor.",
+            None,
+            "Sample extracted text",
+            None,
+            &prior,
+            &confidence,
+            0.6,
+            None,
+            TEST_MAX_EXCERPT,
+        );
+
+        assert!(
+            decision.is_none(),
+            "confidence 0.6 meeting threshold 0.6 must not escalate"
+        );
+    }
+
+    #[test]
     fn multibyte_excerpt_truncation_does_not_panic() {
-        // '世' is 3 bytes in UTF-8; a byte budget of 100 lands mid-character
-        // (100 % 3 == 1), so a naive byte slice would panic. The excerpt is
-        // truncated to the preceding char boundary instead.
-        let multibyte = "世".repeat(200); // 600 bytes
+        let multibyte = "世".repeat(200);
         let max_bytes = 100usize;
 
         let prompt = build_prompt(
@@ -563,11 +649,9 @@ mod tests {
             max_bytes,
         );
         let user_text = prompt.user_text.expect("text-only mode yields user text");
-        // Truncated at a char boundary: at most `max_bytes` bytes, all valid UTF-8.
         assert!(user_text.len() <= max_bytes);
         assert!(user_text.chars().all(|c| c == '世'));
 
-        // Same for the vision-fallback assembly.
         let confidence = ExtractionConfidence {
             text_coverage: 1.0,
             ocr_aggregate: None,
@@ -584,7 +668,6 @@ mod tests {
             None,
             max_bytes,
         );
-        // Did not panic and produced a valid prompt.
         assert!(fallback.user_text.expect("fallback user text").contains('世'));
     }
 }

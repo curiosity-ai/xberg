@@ -29,6 +29,8 @@ use crate::{Result, core::ServerConfig};
 ///
 /// # Examples
 ///
+/// Not run as a doctest: `pub(crate)`, so it is unreachable from a downstream crate.
+///
 /// ```ignore
 /// use xberg::api::load_server_config;
 ///
@@ -48,7 +50,6 @@ pub(crate) fn load_server_config(config_path: Option<&str>) -> Result<ServerConf
         ServerConfig::default()
     };
 
-    // Apply environment variable overrides with proper logging
     config.apply_env_overrides()?;
 
     tracing::info!(

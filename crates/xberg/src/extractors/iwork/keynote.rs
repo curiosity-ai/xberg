@@ -2,8 +2,13 @@
 
 use crate::Result;
 use crate::core::config::ExtractionConfig;
-use crate::extractors::iwork::{dedup_text, extract_metadata_from_zip, extract_text_from_proto, read_iwa_file};
+use crate::extractors::iwork::{
+    IwaExpansionBudget, dedup_text, extract_metadata_from_zip, extract_text_from_proto, push_member_parse_warning,
+    read_iwa_file, validate_iwork_zip,
+};
+use crate::extractors::security::{SecurityBudget, SecurityLimits};
 use crate::plugins::{InternalDocumentExtractor, Plugin};
+use crate::types::ProcessingWarning;
 use crate::types::internal::InternalDocument;
 use crate::types::internal_builder::InternalDocumentBuilder;
 use async_trait::async_trait;
@@ -63,33 +68,34 @@ struct KeynoteData {
     other_texts: Vec<String>,
     /// Metadata extracted from the ZIP archive.
     metadata: crate::types::metadata::Metadata,
+    /// Warnings for IWA members that failed to parse (#106).
+    warnings: Vec<ProcessingWarning>,
 }
 
 /// Parse a Keynote ZIP and extract all text from IWA files.
 ///
 /// Keynote stores its content across many IWA files:
 /// - `Index/Presentation.iwa` — master slide structure and layout
-/// - `Index/Slide_*.iwa` — individual slide content and speaker notes
-/// - `Index/MasterSlide_*.iwa` — master slide text
+/// - `Index/Slide-*.iwa` / `Index/Slide_*.iwa` — individual slide content and speaker notes
+/// - `Index/MasterSlide-*.iwa` / `Index/MasterSlide_*.iwa` — master slide text
 ///
 /// We separate slide-specific IWA files from other files to produce
 /// per-slide structured output.
-fn parse_keynote(content: &[u8]) -> Result<KeynoteData> {
+fn parse_keynote(content: &[u8], limits: &SecurityLimits) -> Result<KeynoteData> {
+    validate_iwork_zip(content, limits)?;
+    let mut budget = SecurityBudget::for_iwork(limits);
+    let mut expansion = IwaExpansionBudget::from_limits(limits);
     let iwa_paths = super::collect_iwa_paths(content)?;
     let metadata = extract_metadata_from_zip(content);
 
-    // Separate individual slide paths from master slides and other files.
-    // Slide paths typically look like `Index/Slide-NNNNN.iwa`.
     let mut slide_paths: Vec<&String> = iwa_paths
         .iter()
         .filter(|p| {
-            // Match `Slide-` or `Slide_` but not `MasterSlide`
             let filename = p.rsplit('/').next().unwrap_or(p);
             filename.starts_with("Slide") && !filename.starts_with("MasterSlide")
         })
         .collect();
 
-    // Sort slide paths so slides are in order
     slide_paths.sort();
 
     let other_paths: Vec<&String> = iwa_paths
@@ -100,48 +106,59 @@ fn parse_keynote(content: &[u8]) -> Result<KeynoteData> {
         })
         .collect();
 
-    // Extract text per slide (each slide IWA becomes a separate group)
+    let mut warnings: Vec<ProcessingWarning> = Vec::new();
     let mut slide_texts: Vec<Vec<String>> = Vec::new();
-    let mut seen_global = std::collections::HashSet::new();
 
+    // Each slide keeps its own text, deduped only within itself (#101): a
+    // footer or title legitimately repeated across slides must survive on
+    // every slide it appears on, not just the first.
     for path in &slide_paths {
-        match read_iwa_file(content, path) {
+        match read_iwa_file(content, path, &mut expansion) {
             Ok(decompressed) => {
-                let texts = extract_text_from_proto(&decompressed);
-                let unique: Vec<String> = texts.into_iter().filter(|t| seen_global.insert(t.clone())).collect();
-                if !unique.is_empty() {
-                    slide_texts.push(unique);
+                let texts = extract_text_from_proto(&decompressed, &mut budget)?;
+                let deduped = dedup_text(texts);
+                if !deduped.is_empty() {
+                    slide_texts.push(deduped);
                 }
             }
-            Err(_) => {
-                tracing::debug!("Skipping IWA file (decompression failed): {path}");
+            Err(error) if matches!(&error, crate::error::XbergError::Security { .. }) => return Err(error),
+            Err(error) => {
+                tracing::debug!(%error, "Skipping IWA file (decompression failed): {path}");
+                push_member_parse_warning(&mut warnings, path, &error);
             }
         }
     }
 
-    // Extract remaining text from non-slide files
+    // Text already shown on a slide is only worth repeating in "Additional
+    // Content" if it says something new; text unique to a slide's own repeats
+    // was already preserved above.
+    let mut seen_in_slides: std::collections::HashSet<String> = slide_texts.iter().flatten().cloned().collect();
+
     let mut other_raw: Vec<String> = Vec::new();
     for path in &other_paths {
-        match read_iwa_file(content, path) {
+        match read_iwa_file(content, path, &mut expansion) {
             Ok(decompressed) => {
-                let texts = extract_text_from_proto(&decompressed);
+                let texts = extract_text_from_proto(&decompressed, &mut budget)?;
                 other_raw.extend(texts);
             }
-            Err(_) => {
-                tracing::debug!("Skipping IWA file (decompression failed): {path}");
+            Err(error) if matches!(&error, crate::error::XbergError::Security { .. }) => return Err(error),
+            Err(error) => {
+                tracing::debug!(%error, "Skipping IWA file (decompression failed): {path}");
+                push_member_parse_warning(&mut warnings, path, &error);
             }
         }
     }
 
     let other_texts: Vec<String> = dedup_text(other_raw)
         .into_iter()
-        .filter(|t| seen_global.insert(t.clone()))
+        .filter(|t| seen_in_slides.insert(t.clone()))
         .collect();
 
     Ok(KeynoteData {
         slide_texts,
         other_texts,
         metadata,
+        warnings,
     })
 }
 
@@ -161,15 +178,17 @@ impl InternalDocumentExtractor for KeynoteExtractor {
                     return Err(crate::error::XbergError::Cancelled);
                 }
                 let content_owned = content.to_vec();
+                let limits = config.security_limits.clone().unwrap_or_default();
                 let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
                     let _guard = span.entered();
-                    parse_keynote(&content_owned)
+                    parse_keynote(&content_owned, &limits)
                 })
                 .await
                 .map_err(|e| crate::error::XbergError::parsing(format!("Keynote extraction task failed: {e}")))??
             } else {
-                parse_keynote(content)?
+                let limits = config.security_limits.clone().unwrap_or_default();
+                parse_keynote(content, &limits)?
             }
 
             #[cfg(not(feature = "tokio-runtime"))]
@@ -177,12 +196,16 @@ impl InternalDocumentExtractor for KeynoteExtractor {
                 if config.cancel_token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
                     return Err(crate::error::XbergError::Cancelled);
                 }
-                parse_keynote(content)?
+                let limits = config.security_limits.clone().unwrap_or_default();
+                parse_keynote(content, &limits)?
             }
         };
 
         let mut doc = build_keynote_internal_document(&data);
         doc.mime_type = mime_type.to_string();
+        for warning in data.warnings {
+            crate::core::diagnostics::push_warning_deduped(&mut doc.processing_warnings, warning);
+        }
         Ok(doc)
     }
 
@@ -198,29 +221,23 @@ impl InternalDocumentExtractor for KeynoteExtractor {
 /// Build an `InternalDocument` from parsed Keynote data.
 ///
 /// Creates a slide element for each detected slide group, using the first text
-/// line as the slide title. Additional lines become paragraphs within the slide.
+/// line as the slide title. Additional lines become paragraphs.
 /// Metadata from the ZIP archive is applied to the document.
 fn build_keynote_internal_document(data: &KeynoteData) -> InternalDocument {
     let mut builder = InternalDocumentBuilder::new("keynote");
 
-    // Apply metadata
     if data.metadata.title.is_some() || data.metadata.authors.is_some() {
         builder.set_metadata(data.metadata.clone());
     }
 
-    // Emit per-slide elements
-    for (idx, slide_lines) in data.slide_texts.iter().enumerate() {
-        let slide_number = (idx + 1) as u32;
-
+    for (index, slide_lines) in data.slide_texts.iter().enumerate() {
         if slide_lines.is_empty() {
             continue;
         }
 
-        // Use the first line as the slide title
         let title = slide_lines[0].trim();
-        builder.push_slide(slide_number, Some(title), None);
+        builder.push_slide((index + 1) as u32, Some(title), None);
 
-        // Remaining lines become body paragraphs
         for line in &slide_lines[1..] {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
@@ -229,8 +246,6 @@ fn build_keynote_internal_document(data: &KeynoteData) -> InternalDocument {
         }
     }
 
-    // Emit any additional text that didn't belong to a specific slide
-    // (master slide text, presentation-level notes, etc.)
     if !data.other_texts.is_empty() {
         let has_slides = !data.slide_texts.is_empty();
         if has_slides {
@@ -250,6 +265,7 @@ fn build_keynote_internal_document(data: &KeynoteData) -> InternalDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::internal::ElementKind;
 
     #[test]
     fn test_keynote_extractor_plugin_interface() {
@@ -264,5 +280,98 @@ mod tests {
         let extractor = KeynoteExtractor::new();
         let types = extractor.supported_mime_types();
         assert!(types.contains(&"application/x-iwork-keynote-sffkey"));
+    }
+
+    /// Build an uncompressed (chunk type 0x01) IWA byte stream wrapping a
+    /// single length-delimited protobuf text field.
+    fn iwa_text_frame(text: &str) -> Vec<u8> {
+        let mut payload = vec![0x1A, text.len() as u8];
+        payload.extend_from_slice(text.as_bytes());
+        let mut frame = vec![1, 0, 0, 0];
+        let length = payload.len();
+        frame[1] = (length & 0xff) as u8;
+        frame[2] = ((length >> 8) & 0xff) as u8;
+        frame[3] = ((length >> 16) & 0xff) as u8;
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    fn keynote_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let options = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in entries {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// Regression for #101: the same repeated text ("Confidential") on two
+    /// different slides must appear on *both* slides, not just the first.
+    #[test]
+    fn should_keep_text_repeated_across_different_slides() {
+        let slide1 = iwa_text_frame("Confidential");
+        let slide2 = iwa_text_frame("Confidential");
+        let archive = keynote_zip(&[("Index/Slide-1.iwa", &slide1), ("Index/Slide-2.iwa", &slide2)]);
+
+        let data = parse_keynote(&archive, &SecurityLimits::default()).unwrap();
+
+        assert_eq!(
+            data.slide_texts.len(),
+            2,
+            "both slides must be kept: {:?}",
+            data.slide_texts
+        );
+        assert_eq!(data.slide_texts[0], vec!["Confidential".to_string()]);
+        assert_eq!(
+            data.slide_texts[1],
+            vec!["Confidential".to_string()],
+            "repeated content on the second slide must not be dropped"
+        );
+    }
+
+    /// Regression for #106: a member that fails to decompress must surface a
+    /// named `ProcessingWarning`, not vanish silently.
+    #[test]
+    fn should_warn_when_an_iwa_member_fails_to_parse() {
+        let good_slide = iwa_text_frame("Body");
+        // Malformed IWA framing: a chunk type byte with no length/payload.
+        let broken_slide: Vec<u8> = vec![1, 0, 0];
+        let archive = keynote_zip(&[("Index/Slide-1.iwa", &good_slide), ("Index/Slide-2.iwa", &broken_slide)]);
+
+        let data = parse_keynote(&archive, &SecurityLimits::default()).unwrap();
+
+        assert_eq!(data.slide_texts, vec![vec!["Body".to_string()]]);
+        assert_eq!(data.warnings.len(), 1, "the broken member must be named in a warning");
+        assert_eq!(data.warnings[0].source, "iwork");
+        assert!(
+            data.warnings[0].message.contains("Index/Slide-2.iwa"),
+            "warning must name the failed member: {}",
+            data.warnings[0].message
+        );
+    }
+
+    #[test]
+    fn should_preserve_slide_element_semantics() {
+        let data = KeynoteData {
+            slide_texts: vec![vec!["Title".to_string(), "Body".to_string()]],
+            other_texts: Vec::new(),
+            metadata: crate::types::metadata::Metadata::default(),
+            warnings: Vec::new(),
+        };
+
+        let document = build_keynote_internal_document(&data);
+
+        assert_eq!(document.elements[0].kind, ElementKind::Slide { number: 1 });
+        assert_eq!(document.elements[0].text, "Title");
+        assert_eq!(document.elements[1].kind, ElementKind::Paragraph);
+        assert_eq!(document.elements[1].text, "Body");
     }
 }

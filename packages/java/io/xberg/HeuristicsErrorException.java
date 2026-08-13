@@ -5,14 +5,14 @@ package io.xberg;
  * Errors that can occur during heuristics analysis.
  */
 public class HeuristicsErrorException extends Exception {
-    private static final long serialVersionUID = 1L;
-    /** Creates a new HeuristicsErrorException with the given message. */
-    public HeuristicsErrorException(final String message) {
-        super(message);
-    }
+  private static final long serialVersionUID = 1L;
+  /** Creates a new HeuristicsErrorException with the given message. */
+  public HeuristicsErrorException(final String message) { super(message); }
 
-    /** Creates a new HeuristicsErrorException with the given message and cause. */
-    public HeuristicsErrorException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /**
+   * Creates a new HeuristicsErrorException with the given message and cause.
+   */
+  public HeuristicsErrorException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Stage libxberg_ffi into packages/csharp/Xberg/runtimes/<rid>/native/
-# so dotnet test can locate it via runtime asset resolution.
-#
-# Auto-detects host RID. Idempotent.
 
 set -euo pipefail
 

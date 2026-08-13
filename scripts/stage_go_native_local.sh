@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Stage libxberg_ffi into packages/go/.lib/<platform>/ so `go test` links and
-# loads the freshly built library via the cgo LDFLAGS rpath instead of a stale
-# previously-staged copy. Auto-detects the host platform. Idempotent.
 
 set -euo pipefail
 

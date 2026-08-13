@@ -64,15 +64,10 @@ impl EmbeddingBackendRegistry {
             });
         }
 
-        // Run initialize() first so that backends which lazy-load their model
-        // (a common pattern — see the OCR Tesseract/Paddle backends) can
-        // report their real dimension from dimensions() once init is done.
         backend.initialize()?;
 
         let dimensions = backend.dimensions();
         if dimensions == 0 {
-            // initialize() already ran; give the backend a chance to release
-            // resources before we reject it.
             let _ = backend.shutdown();
             return Err(XbergError::Validation {
                 message: format!("Embedding backend '{name}' must report dimensions() > 0"),

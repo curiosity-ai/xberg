@@ -5,10 +5,7 @@
 mod registry;
 mod r#trait;
 
-// Re-export trait for backward compatibility
 pub use r#trait::Validator;
-
-// Re-export registry functions for backward compatibility
 
 use std::sync::Arc;
 
@@ -340,6 +337,7 @@ mod tests {
             markdown: "| A | B |".to_string(),
             page_number: 0,
             bounding_box: None,
+            ..Default::default()
         };
 
         let result = ExtractedDocument {

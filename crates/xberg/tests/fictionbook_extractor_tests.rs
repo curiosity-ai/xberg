@@ -1,3 +1,6 @@
+//! Extraction tests for the FictionBook2 (.fb2) format: metadata title/genre
+//! extraction and content-section extraction from fixture files.
+
 #![cfg(feature = "office")]
 
 mod helpers;

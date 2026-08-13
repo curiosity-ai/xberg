@@ -6,6 +6,7 @@
 //! - `pdf/single_page.pdf` — any native-text PDF with exactly 1 page; place the
 //!   reporter's `single-page.pdf` from issue #1105 here to keep the regression locked
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(all(feature = "pdf", feature = "chunking"))]
 
 mod helpers;
@@ -135,7 +136,6 @@ fn chunks_from_single_page_pdf_are_not_null() {
     let result = extract_uri_document_blocking(get_test_file_path("pdf/single_page.pdf"), None, &config)
         .expect("single_page.pdf extraction should succeed");
 
-    // chunks must be Some(...) — null means chunking silently failed (see issue #1105).
     let chunks = result
         .chunks
         .expect("chunks must be Some([...]) for a single-page PDF with chunking configured, not null");

@@ -181,8 +181,10 @@ dotnet/
 
 1. **Golden reference generation (Rust):** `tools/xberg-reference-gen` walks
    `../test_documents`, runs the *original* Rust extractors in each output format, and
-   writes `{filename}-results-rust.json` next to each fixture. These are committed to the
-   `test_documents` companion repo (submodule). Format:
+   writes `{filename}-results-rust.json` next to each fixture. The goldens are **generated
+   locally, not committed** — `test_documents` is upstream's repo, and the goldens must be
+   re-derived from whatever Rust revision you are syncing against anyway. Regenerate them
+   whenever `crates/xberg` or the submodule pin moves. Format:
 
    ```json
    {
@@ -207,6 +209,52 @@ dotnet/
 
 Exact byte-for-byte parity is the goal for plain/json; Markdown/HTML may differ in
 whitespace where the Rust path uses comrak — document any deliberate normalization.
+
+---
+
+## Re-syncing after an upstream merge
+
+The Rust tree under `../crates` is deliberately left untouched, so merging upstream is
+clean and the whole job is re-deriving the C# port's behaviour. The loop that works:
+
+1. **Merge upstream, then materialize the corpus.** The `test_documents` submodule is
+   LFS-free: text fixtures are in git, but every binary (office, PDF, epub, images) lives
+   in a public bucket listed in `corpus.lock.json`. Fetch them first, or the office and
+   PDF fixtures silently do not exist:
+
+   ```sh
+   git submodule update --init --depth 1 test_documents
+   python3 test_documents/scripts/fetch_corpus.py     # ~580 MiB, re-runnable
+   ```
+
+2. **Regenerate the goldens against the merged Rust.** This is the whole point — the
+   goldens encode current upstream behaviour, so the diff against them *is* the list of
+   upstream changes that still need porting:
+
+   ```sh
+   cargo build --release --manifest-path tools/xberg-reference-gen/Cargo.toml
+   tools/xberg-reference-gen/target/release/xberg-reference-gen ../test_documents
+   ```
+
+   It skips fixtures that already have a golden, so pass `--overwrite` after a Rust bump.
+
+3. **Measure, then triage by cluster, not by fixture.** `--cluster` groups plain-text
+   mismatches by the text at their first divergence, which turns "410 markdown fixtures
+   fail" into "395 of them diverge at the same smart-quote character":
+
+   ```sh
+   dotnet run --project tools/Xberg.TestRunner -c Release -- ../test_documents --ext md --cluster
+   dotnet run --project tools/Xberg.TestRunner -c Release -- ../test_documents --ext docx --diff --show 3
+   dotnet run --project tools/Xberg.TestRunner -c Release -- --dump-metadata ../test_documents/x.pdf
+   ```
+
+4. **Fix against the Rust source, not against the golden.** Read the current Rust for the
+   behaviour, port it, then confirm the numbers move. A golden tells you *that* something
+   differs; only the Rust tells you what the rule is.
+
+5. **Expect unit tests to fail where upstream changed behaviour.** A red test that pins
+   the old behaviour is the correct outcome — update it to the new rule and say so in the
+   commit, rather than working around it.
 
 ---
 

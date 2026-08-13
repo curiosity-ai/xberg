@@ -19,11 +19,11 @@ public class DataStructuredTests
     private static string PlainRender(InternalDocument doc) => Xberg.Rendering.PlainRenderer.Render(doc);
 
     [Fact]
-    public void JsonArray_ProducesPrettyCodeBlock()
+    public void JsonArray_ScalarsBecomeListItems()
     {
-        // Top-level array -> code-block fallback with serde-pretty content.
+        // A top-level array gets per-item structure rather than an opaque code block.
         string plain = Plain("[1, 2, 3]", "application/json");
-        Assert.Equal("[\n  1,\n  2,\n  3\n]", plain);
+        Assert.Equal("1\n2\n3", plain);
     }
 
     [Fact]
@@ -39,8 +39,8 @@ public class DataStructuredTests
     public void JsonFloat_FormattedLikeSerde()
     {
         // serde/ryu keeps a mandatory decimal point and normalizes exponents.
-        Assert.Equal("[\n  2.0\n]", Plain("[2.0]", "application/json"));
-        Assert.Equal("[\n  1000.0\n]", Plain("[1.0e3]", "application/json"));
+        Assert.Equal("2.0", Plain("[2.0]", "application/json"));
+        Assert.Equal("1000.0", Plain("[1.0e3]", "application/json"));
     }
 
     [Fact]
@@ -54,11 +54,11 @@ public class DataStructuredTests
     }
 
     [Fact]
-    public void Jsonl_ProducesArrayAndSkipsBlankLines()
+    public void Jsonl_ProducesPerRecordStructureAndSkipsBlankLines()
     {
+        // Each record becomes its own "Item N" section; blank lines contribute nothing.
         string plain = Plain("{\"a\": 1}\n\n\n{\"b\": 2}\n", "application/x-ndjson");
-        Assert.Contains("\"a\": 1", plain);
-        Assert.Contains("\"b\": 2", plain);
+        Assert.Equal("Item 1\na: 1\n\nItem 2\nb: 2", plain);
     }
 
     [Fact]
@@ -72,8 +72,10 @@ public class DataStructuredTests
     {
         string src = "title: Sample\ndatabase:\n  name: testdb\n  port: 8080\n";
         var doc = Extract(src, "application/x-yaml");
-        // Verbatim content is preserved as a single code element (the plain renderer trims the tail).
-        Assert.Equal(src, doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Code).Text);
+        // YAML renders structurally now: a nested mapping becomes a heading, scalars become
+        // "key: value" paragraphs. No code-block fallback.
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Code);
+        Assert.Equal("title: Sample\n\ndatabase\nname: testdb\n\nport: 8080", PlainRender(doc));
         Assert.Equal("yaml", doc.Metadata.Additional["data_format"].GetString());
         Assert.True(doc.Metadata.Additional.ContainsKey("title"));
         Assert.True(doc.Metadata.Additional.ContainsKey("database.name"));
@@ -84,7 +86,8 @@ public class DataStructuredTests
     {
         string src = "[package]\nname = \"xberg\"\nversion = \"1.0\"\ncount = 3\n";
         var doc = Extract(src, "application/toml");
-        Assert.Equal(src, doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Code).Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Code);
+        Assert.Equal("package\nname: xberg\n\nversion: 1.0\n\ncount: 3", PlainRender(doc));
         Assert.Equal("toml", doc.Metadata.Additional["data_format"].GetString());
         Assert.True(doc.Metadata.Additional.ContainsKey("package.name"));
         Assert.True(doc.Metadata.Additional.ContainsKey("package.version"));

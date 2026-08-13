@@ -1,14 +1,14 @@
-### Supported File Formats (96)
+### Supported File Formats (100 formats · 120 file extensions)
 
-96 file formats across 8 major categories with intelligent format detection and comprehensive metadata extraction.
+100 formats across 120 file extensions in 8 major categories with intelligent format detection and comprehensive metadata extraction.
 
 #### Office Documents
 
 | Category | Formats | Capabilities |
 |----------|---------|--------------|
-| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages` | Full text, tables, images, metadata, styles |
+| **Word Processing** | `.docx`, `.docm`, `.doc`, `.dotx`, `.dotm`, `.dot`, `.odt`, `.pages`, `.wpd`, `.wp`, `.wp5`, `.wp6` | Full text, tables, images, metadata, styles |
 | **Spreadsheets** | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xla`, `.xlam`, `.xltm`, `.xltx`, `.xlt`, `.ods`, `.numbers` | Sheet data, formulas, cell metadata, charts |
-| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.key` | Slides, speaker notes, images, metadata |
+| **Presentations** | `.pptx`, `.pptm`, `.ppt`, `.ppsx`, `.potx`, `.potm`, `.pot`, `.odp`, `.key` | Slides, speaker notes, images, metadata |
 | **PDF** | `.pdf` | Text, tables, images, metadata, OCR support |
 | **eBooks** | `.epub`, `.fb2` | Chapters, metadata, embedded resources |
 | **Database** | `.dbf` | Table data extraction, field type support |
@@ -47,7 +47,7 @@
 | Category | Formats | Features |
 |----------|---------|----------|
 | **Email** | `.eml`, `.msg`, `.pst` | Headers, body (HTML/plain), attachments, threading |
-| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | File listing, nested archives, metadata |
+| **Archives** | `.zip`, `.tar`, `.tgz`, `.gz`, `.7z` | Recursive extraction of nested archives, file listing, metadata, zip-bomb protection |
 
 #### Academic & Scientific
 
@@ -58,7 +58,7 @@
 | **Publishing** | `.fb2`, `.docbook`, `.dbk`, `.docbook4`, `.docbook5`, `.opml` | FictionBook, DocBook XML, OPML outlines |
 | **Documentation** | MIME-only POD, mdoc, troff | Technical documentation formats |
 
-#### Code Intelligence (306 Languages)
+#### Code Intelligence (371 Languages)
 
 | Feature | Description |
 |---------|-------------|
@@ -96,7 +96,7 @@ Powered by [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-l
 - **Memory Efficient** - Stream large files without loading entirely into memory
 - **Language Detection** - Detect and support multiple languages in documents
 {% if features.code_intelligence %}
-- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [306 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
+- **Code Intelligence** - Extract structure, imports, exports, symbols, and docstrings from [371 programming languages](https://docs.tree-sitter-language-pack.xberg.io) via tree-sitter
 {% endif %}
 - **Configuration** - Fine-grained control over extraction behavior
-- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured JSON with OCR metadata
+- **Six Output Formats** - Plain text, Markdown, Djot, HTML, JSON tree structure, or Structured (same text as Plain with a `structured` metadata label)

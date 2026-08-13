@@ -146,8 +146,6 @@ fn svg_without_sanitize_preserves_original_bytes_on_native_target() {
             "svg",
             "format must stay \"svg\" in no-sanitize pass-through mode"
         );
-        // Without sanitization and Native target the pipeline must not modify bytes.
-        // The original SVG contains "script" — verify it is still present.
         let svg_text = std::str::from_utf8(&img.data).expect("original SVG must be valid UTF-8");
         assert!(
             svg_text.contains("script") || svg_text.contains("alert"),

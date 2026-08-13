@@ -16,8 +16,6 @@ use crate::core::config::extraction::ImageOutputFormat;
 use crate::core::config::extraction::SvgOptions;
 use crate::types::ExtractedImage;
 
-// ── Public warning type ──────────────────────────────────────────────────────
-
 /// Describes why a re-encode attempt was skipped or failed.
 ///
 /// The pipeline converts `Err(EncodeWarning)` into a `ProcessingWarning` and leaves
@@ -97,8 +95,6 @@ impl std::fmt::Display for EncodeWarning {
     }
 }
 
-// ── Public entry point ───────────────────────────────────────────────────────
-
 /// Re-encode `image` in place to the requested `target` format.
 ///
 /// Returns `Ok(true)` when the image was re-encoded and both `data` and `format`
@@ -110,24 +106,20 @@ pub(crate) fn re_encode(
     target: ImageOutputFormat,
     #[cfg(feature = "svg")] svg_options: &SvgOptions,
 ) -> Result<bool, EncodeWarning> {
-    // Fast exit 1: caller said Native — do nothing, except SVG sanitize pass.
     if target == ImageOutputFormat::Native {
         #[cfg(feature = "svg")]
         if svg_options.sanitize && image.format.eq_ignore_ascii_case("svg") {
             let sanitized = sanitize_svg(&image.data)?;
             image.data = Bytes::from(sanitized.into_bytes());
-            // format stays "svg"
             return Ok(true);
         }
         return Ok(false);
     }
 
-    // Fast exit 2: source is already the target format — no-op.
     if target_matches_format(target, &image.format) {
         return Ok(false);
     }
 
-    // SVG source → SVG target: sanitize pass only.
     #[cfg(feature = "svg")]
     if image.format.eq_ignore_ascii_case("svg") {
         if let ImageOutputFormat::Svg = target {
@@ -136,14 +128,12 @@ pub(crate) fn re_encode(
             image.format = Cow::Borrowed("svg");
             return Ok(true);
         }
-        // SVG source → raster target: rasterize.
         let (new_bytes, new_format) = rasterize_svg(&image.data, target, svg_options)?;
         image.data = Bytes::from(new_bytes);
         image.format = Cow::Borrowed(new_format);
         return Ok(true);
     }
 
-    // Raster source → SVG target: not supported; leave bytes untouched.
     #[cfg(feature = "svg")]
     if let ImageOutputFormat::Svg = target {
         return Err(EncodeWarning::UnsupportedDirection {
@@ -152,33 +142,27 @@ pub(crate) fn re_encode(
         });
     }
 
-    // Reject remaining untranslatable vector / metafile formats.
     if is_untranslatable(&image.format) {
         return Err(EncodeWarning::Undecodable {
             source_format: image.format.to_string(),
         });
     }
 
-    // Decode source bytes to a DynamicImage.
     let dynamic = decode_source(image)?;
 
-    // Encode the DynamicImage to the target format.
     let (new_bytes, new_format) = encode_to_target(&dynamic, target)?;
 
-    // Commit the result — only reached on full success.
     image.data = Bytes::from(new_bytes);
     image.format = Cow::Borrowed(new_format);
 
     Ok(true)
 }
 
-// ── Format helpers ───────────────────────────────────────────────────────────
-
 /// Returns `true` when `target` already matches the source `format` string,
 /// meaning no re-encode is needed.
 fn target_matches_format(target: ImageOutputFormat, format: &str) -> bool {
     match target {
-        ImageOutputFormat::Native => true, // guarded at call site; included for exhaustiveness
+        ImageOutputFormat::Native => true,
         ImageOutputFormat::Png => format.eq_ignore_ascii_case("png"),
         ImageOutputFormat::Jpeg { .. } => format.eq_ignore_ascii_case("jpeg") || format.eq_ignore_ascii_case("jpg"),
         ImageOutputFormat::Webp { .. } => format.eq_ignore_ascii_case("webp"),
@@ -189,14 +173,8 @@ fn target_matches_format(target: ImageOutputFormat, format: &str) -> bool {
                 || format.eq_ignore_ascii_case("HEIF")
                 || format.eq_ignore_ascii_case("HEIC")
         }
-        // Heif variant is unconditional in the type; without the `heic` feature the
-        // encode path is unavailable, so we treat an already-HEIF source as a mismatch
-        // (forcing a no-op re-encode attempt that returns EncodeFailed gracefully).
         #[cfg(not(feature = "heic"))]
         ImageOutputFormat::Heif { .. } => false,
-        // SVG source matching is handled earlier in re_encode (sanitize pass);
-        // this branch is only reached for raster → SVG (which returns UnsupportedDirection).
-        // Return false here so the caller proceeds to the UnsupportedDirection guard.
         #[cfg(feature = "svg")]
         ImageOutputFormat::Svg => false,
     }
@@ -213,7 +191,6 @@ fn target_matches_format(target: ImageOutputFormat, format: &str) -> bool {
 fn is_untranslatable(format: &str) -> bool {
     let lc = format.to_ascii_lowercase();
     let s = lc.as_str();
-    // SVG is only untranslatable when the `svg` feature is absent.
     #[cfg(not(feature = "svg"))]
     {
         matches!(s, "svg" | "emf" | "wmf" | "jpeg2000" | "jp2" | "j2k")
@@ -223,8 +200,6 @@ fn is_untranslatable(format: &str) -> bool {
         matches!(s, "emf" | "wmf" | "jpeg2000" | "jp2" | "j2k")
     }
 }
-
-// ── SVG helpers ──────────────────────────────────────────────────────────────
 
 /// Parse SVG bytes through `usvg` and re-serialize, stripping external hrefs,
 /// JS event handlers, and `foreignObject` elements that `usvg` does not model.
@@ -269,11 +244,7 @@ fn sanitize_svg(data: &[u8]) -> Result<String, EncodeWarning> {
     }
 
     let opts = usvg::Options {
-        // No filesystem access: prevents external resource loading.
         resources_dir: None,
-        // Disable external href resolution: strip `<image xlink:href="http://…">`.
-        // resolve_data signature: (&str, Arc<Vec<u8>>, &Options) -> Option<ImageKind>
-        // resolve_string signature: (&str, &Options) -> Option<ImageKind>
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: Box::new(|_, _, _| None),
             resolve_string: Box::new(|_, _| None),
@@ -326,18 +297,12 @@ fn rasterize_svg(
         message: e.to_string(),
     })?;
 
-    // Clamp render_dpi defensively. `SvgOptions::default()` is 96.0; callers
-    // bypassing the default could otherwise hand us 1e9 or NaN and we'd compute
-    // a multi-terabyte pixmap below.  Bound matches typical print-quality usage.
     let dpi = svg_options.render_dpi.clamp(SVG_RENDER_DPI_MIN, SVG_RENDER_DPI_MAX);
     let scale = dpi / 96.0;
     let svg_size = tree.size();
     let width = ((svg_size.width() * scale) as u32).max(1);
     let height = ((svg_size.height() * scale) as u32).max(1);
 
-    // Reject before allocation if the adversarial viewBox × dpi product would
-    // produce a pixmap larger than SVG_MAX_PIXELS.  Each pixel is 4 bytes RGBA
-    // in tiny_skia, so the cap below corresponds to ~1 GB peak allocation.
     let pixel_count = u64::from(width) * u64::from(height);
     if pixel_count > SVG_MAX_PIXELS {
         return Err(EncodeWarning::EncodeFailed {
@@ -353,7 +318,6 @@ fn rasterize_svg(
 
     resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
 
-    // `take_demultiplied` converts premultiplied RGBA → straight RGBA.
     let rgba_bytes = pixmap.take_demultiplied();
     let rgba_img =
         image::RgbaImage::from_raw(width, height, rgba_bytes).ok_or_else(|| EncodeWarning::EncodeFailed {
@@ -365,8 +329,6 @@ fn rasterize_svg(
     encode_to_target(&dynamic, target)
 }
 
-// ── Decode ───────────────────────────────────────────────────────────────────
-
 /// Decode the source bytes inside `image` to a [`DynamicImage`].
 ///
 /// The dispatch order is:
@@ -376,13 +338,11 @@ fn rasterize_svg(
 fn decode_source(image: &ExtractedImage) -> Result<DynamicImage, EncodeWarning> {
     let format_lc = image.format.to_ascii_lowercase();
 
-    // Delegate heic/heif to xberg-libheif when available.
     #[cfg(feature = "heic")]
     if matches!(format_lc.as_str(), "heic" | "heif") {
         return decode_heic(&image.data, &format_lc);
     }
 
-    // For heic/heif without the feature flag, return Undecodable.
     #[cfg(not(feature = "heic"))]
     if matches!(format_lc.as_str(), "heic" | "heif") {
         return Err(EncodeWarning::Undecodable {
@@ -390,7 +350,6 @@ fn decode_source(image: &ExtractedImage) -> Result<DynamicImage, EncodeWarning> 
         });
     }
 
-    // Map known format strings to image::ImageFormat.
     let maybe_fmt: Option<ImageFormat> = match format_lc.as_str() {
         "jpeg" | "jpg" => Some(ImageFormat::Jpeg),
         "png" => Some(ImageFormat::Png),
@@ -407,12 +366,9 @@ fn decode_source(image: &ExtractedImage) -> Result<DynamicImage, EncodeWarning> 
             source_format: image.format.to_string(),
             message: err.to_string(),
         }),
-        None => {
-            // Unknown format — try magic-byte auto-detection.
-            image::load_from_memory(&image.data).map_err(|_err| EncodeWarning::Undecodable {
-                source_format: image.format.to_string(),
-            })
-        }
+        None => image::load_from_memory(&image.data).map_err(|_err| EncodeWarning::Undecodable {
+            source_format: image.format.to_string(),
+        }),
     }
 }
 
@@ -453,8 +409,7 @@ fn decode_heic(data: &[u8], source_format: &str) -> Result<DynamicImage, EncodeW
     let width = heif_img.width();
     let height = heif_img.height();
 
-    // The plane may have stride padding — collect only the valid pixels row-by-row.
-    let row_size = (width as usize) * 4; // RGBA = 4 bytes/pixel
+    let row_size = (width as usize) * 4;
     let mut rgba_bytes: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize) * 4);
     for row in plane.data.chunks(plane.stride) {
         rgba_bytes.extend_from_slice(&row[..row_size.min(row.len())]);
@@ -469,8 +424,6 @@ fn decode_heic(data: &[u8], source_format: &str) -> Result<DynamicImage, EncodeW
     Ok(DynamicImage::ImageRgba8(rgba_img))
 }
 
-// ── Encode ───────────────────────────────────────────────────────────────────
-
 /// Encode `img` into `target` format and return the raw bytes plus the canonical
 /// format name string.
 ///
@@ -478,7 +431,6 @@ fn decode_heic(data: &[u8], source_format: &str) -> Result<DynamicImage, EncodeW
 fn encode_to_target(img: &DynamicImage, target: ImageOutputFormat) -> Result<(Vec<u8>, &'static str), EncodeWarning> {
     match target {
         ImageOutputFormat::Native => {
-            // Guarded at call site; should never be reached.
             unreachable!("Native target must be handled before encode dispatch")
         }
         ImageOutputFormat::Png => {
@@ -491,12 +443,6 @@ fn encode_to_target(img: &DynamicImage, target: ImageOutputFormat) -> Result<(Ve
             Ok((bytes, "jpeg"))
         }
         ImageOutputFormat::Webp { quality: _ } => {
-            // The `image` 0.25 crate's built-in WebP encoder supports lossless
-            // encoding only (VP8L).  Lossy WebP would require an additional
-            // dependency (`webp` crate / libwebp FFI), which is not included to
-            // avoid pulling in a C library.  We emit lossless WebP regardless of
-            // the quality field and document that the quality knob is ignored
-            // until a lossy encoder is wired in.
             let bytes = encode_webp_lossless(img)?;
             Ok((bytes, "webp"))
         }
@@ -506,15 +452,11 @@ fn encode_to_target(img: &DynamicImage, target: ImageOutputFormat) -> Result<(Ve
             let bytes = encode_heif(img, clamped)?;
             Ok((bytes, "heif"))
         }
-        // Heif variant is unconditional; without the `heic` feature, signal a failure
-        // so the pipeline emits a warning and leaves the image bytes untouched.
         #[cfg(not(feature = "heic"))]
         ImageOutputFormat::Heif { quality: _ } => Err(EncodeWarning::EncodeFailed {
             target_format: "heif",
             message: "heic feature is not enabled in this build".to_string(),
         }),
-        // Svg-from-raster is rejected before encode_to_target is reached (in re_encode).
-        // This arm makes the match exhaustive when the `svg` feature is active.
         #[cfg(feature = "svg")]
         ImageOutputFormat::Svg => {
             unreachable!("raster → SVG must be rejected before reaching encode_to_target")
@@ -524,7 +466,6 @@ fn encode_to_target(img: &DynamicImage, target: ImageOutputFormat) -> Result<(Ve
 
 /// Clamp a quality value to `1..=100` and emit a warning when clamping occurs.
 fn clamp_quality(quality: u8, format_name: &'static str) -> u8 {
-    // u8 cannot be negative; upper bound is the only relevant check.
     if quality == 0 {
         warn!(
             target: "xberg::image_encode",
@@ -595,24 +536,20 @@ fn encode_heif(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, EncodeWarning
         Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif, RgbChroma,
     };
 
-    // Convert to RGBA8 — handles any input format uniformly.
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
 
-    // Create an output HEIF context.
     let mut context = HeifContext::new().map_err(|err| EncodeWarning::EncoderUnavailable {
         target_format: "heif",
         message: format!("HeifContext::new failed: {err:?}"),
     })?;
 
-    // Create a libheif Image with RGBA8 interleaved layout.
     let mut heif_img =
         Image::new(width, height, ColorSpace::Rgb(RgbChroma::Rgba)).map_err(|err| EncodeWarning::EncodeFailed {
             target_format: "heif",
             message: format!("Image::new failed: {err:?}"),
         })?;
 
-    // Add the single interleaved RGBA plane at 8 bits per channel.
     heif_img
         .create_plane(Channel::Interleaved, width, height, 8)
         .map_err(|err| EncodeWarning::EncodeFailed {
@@ -620,20 +557,18 @@ fn encode_heif(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, EncodeWarning
             message: format!("create_plane failed: {err:?}"),
         })?;
 
-    // Copy pixel data row-by-row respecting the plane's stride.
     {
         let mut planes = heif_img.planes_mut();
         let plane = planes.interleaved.as_mut().ok_or(EncodeWarning::EncodeFailed {
             target_format: "heif",
             message: "interleaved plane missing after create_plane".to_string(),
         })?;
-        let row_size = (width as usize) * 4; // RGBA = 4 bytes/pixel
+        let row_size = (width as usize) * 4;
         for (dst_row, src_row) in plane.data.chunks_mut(plane.stride).zip(rgba.chunks_exact(row_size)) {
             dst_row[..row_size].copy_from_slice(src_row);
         }
     }
 
-    // Obtain the HEVC encoder (highest-priority plugin for HEIF containers).
     let lib = LibHeif::new();
     let mut encoder =
         lib.encoder_for_format(CompressionFormat::Hevc)
@@ -642,7 +577,6 @@ fn encode_heif(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, EncodeWarning
                 message: format!("no HEVC encoder available: {err:?}"),
             })?;
 
-    // Set lossy quality (clamped to u8 range; quality is already 1–100 here).
     encoder
         .set_quality(EncoderQuality::Lossy(quality))
         .map_err(|err| EncodeWarning::EncodeFailed {
@@ -650,7 +584,6 @@ fn encode_heif(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, EncodeWarning
             message: format!("set_quality failed: {err:?}"),
         })?;
 
-    // Encode the image into the context.
     context
         .encode_image(&heif_img, &mut encoder, None)
         .map_err(|err| EncodeWarning::EncodeFailed {
@@ -658,14 +591,11 @@ fn encode_heif(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, EncodeWarning
             message: format!("encode_image failed: {err:?}"),
         })?;
 
-    // Serialise the context to raw HEIF bytes.
     context.write_to_bytes().map_err(|err| EncodeWarning::EncodeFailed {
         target_format: "heif",
         message: format!("write_to_bytes failed: {err:?}"),
     })
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -713,8 +643,6 @@ mod tests {
         }
     }
 
-    // ── No-op paths ──────────────────────────────────────────────────────────
-
     #[test]
     fn native_target_no_op() {
         let original_data = make_png_bytes();
@@ -733,8 +661,6 @@ mod tests {
         assert!(matches!(result, Ok(false)), "already-PNG → Png must return Ok(false)");
         assert_eq!(image.data, original_data, "bytes must be untouched");
     }
-
-    // ── Successful re-encode paths ────────────────────────────────────────────
 
     #[test]
     fn png_to_jpeg() {
@@ -775,8 +701,6 @@ mod tests {
         assert_eq!(guessed, ImageFormat::WebP);
     }
 
-    // ── Error paths ───────────────────────────────────────────────────────────
-
     /// Without `svg` feature: SVG is untranslatable → `Err(Undecodable)`.
     /// With `svg` feature: SVG → PNG rasterizes successfully → `Ok(true)`.
     #[test]
@@ -803,7 +727,6 @@ mod tests {
         #[cfg(feature = "svg")]
         {
             assert_eq!(image.format.as_ref(), "png");
-            // Suppress unused-variable warning when svg feature is off.
             let _ = original_data;
         }
     }
@@ -823,7 +746,6 @@ mod tests {
 
     #[test]
     fn unknown_format_auto_detects() {
-        // bytes are valid PNG but the stored format is "unknown"
         let png_bytes = make_png_bytes();
         let mut image = make_image(png_bytes, "unknown");
         let result = re_encode_default(&mut image, ImageOutputFormat::Jpeg { quality: 85 });
@@ -836,10 +758,7 @@ mod tests {
 
     #[test]
     fn quality_out_of_range_clamps() {
-        // quality 200 is beyond u8::MAX (255) but the type is u8, so the
-        // maximum representable out-of-range value is 101–255.  Test with 200.
         let mut image = make_image(make_png_bytes(), "png");
-        // quality: 200 — should clamp to 100 and still encode successfully.
         let result = re_encode_default(&mut image, ImageOutputFormat::Jpeg { quality: 200 });
         assert!(
             matches!(result, Ok(true)),
@@ -848,13 +767,9 @@ mod tests {
         assert_eq!(image.format.as_ref(), "jpeg");
     }
 
-    // ── Conditional SVG tests ─────────────────────────────────────────────────
-
     #[cfg(feature = "svg")]
     #[test]
     fn svg_sanitize_pass_on_native_target() {
-        // A minimal SVG: when target is Native and sanitize=true, the bytes are
-        // re-serialized through usvg but the format stays "svg".
         let svg_bytes = Bytes::from_static(b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"/>");
         let mut image = make_image(svg_bytes, "svg");
         let opts = SvgOptions {
@@ -867,7 +782,6 @@ mod tests {
             "SVG sanitize on Native must return Ok(true); got {result:?}"
         );
         assert_eq!(image.format.as_ref(), "svg", "format must remain 'svg'");
-        // Output must be valid UTF-8 XML.
         std::str::from_utf8(&image.data).expect("sanitized SVG must be valid UTF-8");
     }
 
@@ -912,7 +826,6 @@ mod tests {
             matches!(result, Err(EncodeWarning::UnsupportedDirection { ref from_format, to_format: "svg" }) if from_format == "png"),
             "png→svg must return Err(UnsupportedDirection); got {result:?}",
         );
-        // Original bytes must be untouched.
         let guessed = image::guess_format(&image.data).expect("data must still be valid PNG");
         assert_eq!(guessed, ImageFormat::Png);
     }
@@ -936,8 +849,6 @@ mod tests {
         assert_eq!(guessed, ImageFormat::Jpeg);
     }
 
-    // ── Conditional HEIF tests ─────────────────────────────────────────────
-
     #[cfg(feature = "heic")]
     #[test]
     fn png_to_heif_round_trip() {
@@ -948,7 +859,6 @@ mod tests {
             "png→heif must return Ok(true); got {result:?}"
         );
         assert_eq!(image.format.as_ref(), "heif");
-        // Verify the output is parseable as HEIF.
         let context = xberg_libheif::HeifContext::read_from_bytes(&image.data).expect("output should be valid HEIF");
         let handle = context.primary_image_handle().expect("should have primary image");
         assert_eq!(handle.width(), 4);
@@ -958,9 +868,6 @@ mod tests {
     #[cfg(feature = "heic")]
     #[test]
     fn heif_same_format_no_op() {
-        // We cannot easily construct HEIF bytes in a unit test without a full encode,
-        // so just verify the format-match short-circuit works by checking the return value
-        // when format == "heif".  The bytes are arbitrary; the shortcut fires before decode.
         let mut image = make_image(Bytes::from_static(b"placeholder"), "heif");
         let result = re_encode_default(&mut image, ImageOutputFormat::Heif { quality: 80 });
         assert!(matches!(result, Ok(false)), "heif→heif must return Ok(false)");
@@ -969,7 +876,6 @@ mod tests {
     #[cfg(feature = "heic")]
     #[test]
     fn heic_format_string_matches() {
-        // "heic" (Apple branding) should also match the Heif target.
         let mut image = make_image(Bytes::from_static(b"placeholder"), "heic");
         let result = re_encode_default(&mut image, ImageOutputFormat::Heif { quality: 80 });
         assert!(matches!(result, Ok(false)), "heic→Heif must return Ok(false)");

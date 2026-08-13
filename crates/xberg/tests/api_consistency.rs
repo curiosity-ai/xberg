@@ -17,7 +17,6 @@ fn test_extraction_config_serialization_includes_all_fields() {
     let config = ExtractionConfig::default();
     let json = serde_json::to_value(&config).expect("Failed to serialize config");
 
-    // Verify core fields exist and are accessible
     assert!(
         json.get("use_cache").is_some(),
         "Missing 'use_cache' field in serialized config"
@@ -64,14 +63,11 @@ fn test_extraction_config_defaults_are_correct() {
 fn test_extraction_config_serialization_roundtrip() {
     let config = ExtractionConfig::default();
 
-    // Serialize to JSON
     let json_string = serde_json::to_string(&config).expect("Failed to serialize");
 
-    // Deserialize back
     let deserialized: ExtractionConfig =
         serde_json::from_str(&json_string).expect("Failed to deserialize config from JSON");
 
-    // Verify roundtrip integrity
     assert_eq!(
         config.use_cache, deserialized.use_cache,
         "use_cache should survive roundtrip"
@@ -101,7 +97,6 @@ fn test_extraction_config_json_structure() {
 
     let obj = json.as_object().expect("Config should serialize as object");
 
-    // Verify all expected fields are present as keys
     let expected_fields = vec![
         "use_cache",
         "enable_quality_processing",
@@ -121,7 +116,6 @@ fn test_extraction_config_values_are_correct_types() {
     let config = ExtractionConfig::default();
     let json = serde_json::to_value(&config).expect("Failed to serialize config");
 
-    // Verify field types
     assert!(
         json.get("use_cache").expect("Value not found").is_boolean(),
         "use_cache should be boolean"
@@ -167,7 +161,6 @@ fn test_extraction_config_with_custom_values() {
 
 #[test]
 fn test_extraction_config_partial_json_parsing() {
-    // Test that we can parse partial JSON and fields get defaults
     let partial_json = json!({
         "use_cache": false,
     });
@@ -184,7 +177,6 @@ fn test_extraction_config_partial_json_parsing() {
 
 #[test]
 fn test_extraction_config_empty_json_uses_defaults() {
-    // Empty object should use all defaults
     let empty_json = json!({});
 
     let config: ExtractionConfig = serde_json::from_value(empty_json).expect("Failed to parse empty config");
@@ -202,7 +194,6 @@ fn test_extraction_config_empty_json_uses_defaults() {
 
 #[test]
 fn test_extraction_config_output_format_valid_values() {
-    // Test that output_format accepts valid values (case-insensitive)
     let json_plain = json!({"output_format": "plain"});
     let config_plain: ExtractionConfig =
         serde_json::from_value(json_plain).expect("Failed to parse plain output_format");
@@ -220,27 +211,24 @@ fn test_extraction_config_output_format_valid_values() {
 
 #[test]
 fn test_extraction_config_result_format_valid_values() {
-    // Test that result_format accepts valid values
     let json_unified = json!({"result_format": "unified"});
     let config_unified: ExtractionConfig =
         serde_json::from_value(json_unified).expect("Failed to parse unified result_format");
-    // result_format uses types::ExtractionMode, not core::config::OutputFormat
     let _ = config_unified.result_format;
 }
 
 #[test]
 fn test_extraction_config_no_unknown_fields_in_default() {
-    // Verify that the default config only has expected fields when serialized
     let config = ExtractionConfig::default();
     let json = serde_json::to_value(&config).expect("Failed to serialize");
     let obj = json.as_object().expect("Should be object");
 
-    // These are the fields we expect (some may be null based on feature flags)
     let expected_fields = vec![
         "use_cache",
         "enable_quality_processing",
         "ocr",
         "force_ocr",
+        "ocr_strategy",
         "disable_ocr",
         "chunking",
         "content_filter",
@@ -256,12 +244,16 @@ fn test_extraction_config_no_unknown_fields_in_default() {
         "max_concurrent_extractions",
         "result_format",
         "output_format",
+        "escape_markdown",
+        "table_anchors",
+        "jupyter_cell_rendering",
         "include_document_structure",
         "security_limits",
         "acceleration",
         "cache_namespace",
         "cache_ttl_secs",
         "concurrency",
+        "csv",
         "email",
         "layout",
         "max_archive_depth",
@@ -284,16 +276,13 @@ fn test_extraction_config_no_unknown_fields_in_default() {
 
 #[test]
 fn test_extraction_config_needs_image_processing() {
-    // Test the needs_image_processing helper method
     let mut config = ExtractionConfig::default();
 
-    // By default, should not need image processing
     assert!(
         !config.needs_image_processing(),
         "Default config should not need image processing"
     );
 
-    // With OCR enabled, should need image processing
     config.ocr = Some(xberg::OcrConfig {
         backend: "tesseract".to_string(),
         language: vec!["eng".to_string()],
@@ -304,7 +293,6 @@ fn test_extraction_config_needs_image_processing() {
         "Config with OCR should need image processing"
     );
 
-    // Reset for next test
     config.ocr = None;
     config.images = Some(xberg::ImageExtractionConfig {
         extract_images: true,
@@ -333,18 +321,15 @@ fn test_extraction_config_needs_image_processing() {
 
 #[test]
 fn test_output_format_serialization_lowercase() {
-    // Verify that OutputFormat serializes to lowercase values
     let json = serde_json::json!({"output_format": "markdown"});
     let config: ExtractionConfig = serde_json::from_value(json).expect("Failed to parse");
     let reserialized = serde_json::to_value(&config).expect("Failed to reserialize");
 
-    // Should serialize back to lowercase
     assert_eq!(reserialized["output_format"], "markdown");
 }
 
 #[test]
 fn test_extraction_config_field_presence_consistency() {
-    // Test that all serialized configs have the expected top-level fields
     let config = ExtractionConfig::default();
     let json1 = serde_json::to_value(&config).expect("Failed to serialize");
 
@@ -354,7 +339,6 @@ fn test_extraction_config_field_presence_consistency() {
     };
     let json2 = serde_json::to_value(&config2).expect("Failed to serialize");
 
-    // Both should have the same top-level keys
     let keys1: Vec<_> = json1.as_object().expect("Expected object value").keys().collect();
     let keys2: Vec<_> = json2.as_object().expect("Expected object value").keys().collect();
 
@@ -363,7 +347,6 @@ fn test_extraction_config_field_presence_consistency() {
 
 #[test]
 fn test_output_format_all_variants() {
-    // Test all output format variants can be serialized and deserialized
     let formats = vec![
         OutputFormat::Plain,
         OutputFormat::Markdown,
@@ -390,20 +373,16 @@ fn test_include_document_structure_default_is_false() {
 
 #[test]
 fn test_include_document_structure_serialization_roundtrip() {
-    // Test with include_document_structure explicitly set to true
     let config = ExtractionConfig {
         include_document_structure: true,
         ..ExtractionConfig::default()
     };
 
-    // Serialize to JSON
     let json_string = serde_json::to_string(&config).expect("Failed to serialize");
 
-    // Deserialize back
     let deserialized: ExtractionConfig =
         serde_json::from_str(&json_string).expect("Failed to deserialize config from JSON");
 
-    // Verify the field survived the roundtrip
     assert_eq!(
         config.include_document_structure, deserialized.include_document_structure,
         "include_document_structure should survive roundtrip"
@@ -413,7 +392,6 @@ fn test_include_document_structure_serialization_roundtrip() {
         "Deserialized include_document_structure should be true"
     );
 
-    // Also test with false to ensure explicit false values are preserved
     let config_false = ExtractionConfig {
         include_document_structure: false,
         ..ExtractionConfig::default()
@@ -428,8 +406,6 @@ fn test_include_document_structure_serialization_roundtrip() {
         "Explicitly false include_document_structure should survive roundtrip"
     );
 }
-
-// ── Tree-sitter API parity tests ───────────────────────────────────────
 
 #[cfg(feature = "tree-sitter")]
 #[test]
@@ -452,7 +428,6 @@ fn test_tree_sitter_config_defaults() {
     assert!(config.cache_dir.is_none(), "Default cache_dir should be None");
     assert!(config.languages.is_none(), "Default languages should be None");
     assert!(config.groups.is_none(), "Default groups should be None");
-    // process sub-config should use its own defaults
     assert!(config.process.structure, "Default process.structure should be true");
 }
 
@@ -472,6 +447,7 @@ fn test_tree_sitter_config_serialization_roundtrip() {
             docstrings: true,
             symbols: false,
             diagnostics: false,
+            data_extraction: false,
             chunk_max_size: Some(4000),
             content_mode: Default::default(),
         },
@@ -514,7 +490,6 @@ fn test_tree_sitter_config_in_extraction_config_roundtrip() {
 #[cfg(feature = "tree-sitter")]
 #[test]
 fn test_tree_sitter_partial_json_parsing() {
-    // Partial tree_sitter config with only some fields
     let json = json!({
         "tree_sitter": {
             "languages": ["rust"],
@@ -529,7 +504,6 @@ fn test_tree_sitter_partial_json_parsing() {
     assert_eq!(ts.languages, Some(vec!["rust".to_string()]));
     assert!(ts.groups.is_none(), "Omitted groups should be None");
     assert!(ts.process.comments, "Explicit comments=true should be respected");
-    // Omitted fields should use defaults
     assert!(ts.process.structure, "Omitted structure should default to true");
     assert!(!ts.process.symbols, "Omitted symbols should default to false");
 }
@@ -545,6 +519,7 @@ fn test_tree_sitter_process_config_all_fields_serialized() {
         docstrings: true,
         symbols: true,
         diagnostics: true,
+        data_extraction: true,
         chunk_max_size: Some(2000),
         content_mode: Default::default(),
     };
@@ -560,6 +535,7 @@ fn test_tree_sitter_process_config_all_fields_serialized() {
         "docstrings",
         "symbols",
         "diagnostics",
+        "data_extraction",
         "chunk_max_size",
     ];
     for field in expected_fields {
@@ -570,39 +546,36 @@ fn test_tree_sitter_process_config_all_fields_serialized() {
 #[cfg(feature = "tree-sitter")]
 #[test]
 fn test_format_metadata_code_variant_serialization() {
-    use xberg::types::metadata::FormatMetadata;
+    use xberg::types::metadata::{CodeMetadata, FormatMetadata};
 
-    let metadata = FormatMetadata::Code;
+    let metadata = FormatMetadata::Code(CodeMetadata {
+        chunks: Vec::new(),
+        data: None,
+    });
     let json = serde_json::to_value(&metadata).expect("Failed to serialize FormatMetadata::Code");
 
-    // Code is now a unit variant — serializes to just the format_type tag.
     assert_eq!(json["format_type"], "code", "format_type tag should be 'code'");
+    assert!(json["chunks"].is_array(), "chunks should serialize as an array");
 }
 
 #[cfg(feature = "tree-sitter")]
 #[test]
 fn test_tslp_types_reexported() {
-    // Verify that TSLP types are accessible through xberg's public API
     let _: xberg::ProcessConfig = xberg::ProcessConfig::new("rust");
 
-    // StructureKind enum variants
     let _kind = xberg::StructureKind::Function;
     let _kind = xberg::StructureKind::Class;
     let _kind = xberg::StructureKind::Method;
 
-    // ExportKind enum variants
     let _kind = xberg::ExportKind::Named;
     let _kind = xberg::ExportKind::Default;
 
-    // CommentKind enum variants
     let _kind = xberg::CommentKind::Line;
     let _kind = xberg::CommentKind::Block;
 
-    // DiagnosticSeverity enum variants
     let _sev = xberg::DiagnosticSeverity::Error;
     let _sev = xberg::DiagnosticSeverity::Warning;
 
-    // FileMetrics default
     let metrics = xberg::FileMetrics::default();
     assert_eq!(metrics.total_lines, 0);
 }

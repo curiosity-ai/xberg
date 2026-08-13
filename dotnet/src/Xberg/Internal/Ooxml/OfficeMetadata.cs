@@ -27,6 +27,37 @@ public sealed class AppProperties
 /// </summary>
 public static class OfficeMetadata
 {
+    /// <summary>Metadata key carrying the raw, undecoded <c>DocSecurity</c> integer.</summary>
+    public const string DocSecurityKey = "doc_security";
+
+    /// <summary>
+    /// Decode a <c>DocSecurity</c> bit field into named boolean flags.
+    /// ECMA-376 Part 1 §22.2.2.7 (as clarified by MS-OI29500) packs four independent
+    /// restrictions into one integer: 1 = password protected, 2 = read-only recommended,
+    /// 4 = read-only enforced, 8 = locked for annotation. Bits above 8 are not part of the
+    /// schema and are ignored.
+    /// <para>
+    /// All four flags are always returned, including when <paramref name="raw"/> is 0: an
+    /// explicit <c>false</c> records that the document <em>declares</em> no restrictions, as
+    /// opposed to the "no DocSecurity element at all" case, where the caller decodes nothing.
+    /// </para>
+    /// </summary>
+    public static (string Key, bool Value)[] DecodeDocSecurityFlags(int raw)
+    {
+        const int PasswordProtectedBit = 1;
+        const int ReadOnlyRecommendedBit = 2;
+        const int ReadOnlyEnforcedBit = 4;
+        const int LockedForAnnotationsBit = 8;
+
+        return new[]
+        {
+            ("doc_security_password_protected", (raw & PasswordProtectedBit) != 0),
+            ("doc_security_read_only_recommended", (raw & ReadOnlyRecommendedBit) != 0),
+            ("doc_security_read_only_enforced", (raw & ReadOnlyEnforcedBit) != 0),
+            ("doc_security_locked_for_annotations", (raw & LockedForAnnotationsBit) != 0),
+        };
+    }
+
     public static CoreProperties ExtractCore(OoxmlPackage pkg)
     {
         var props = new CoreProperties();

@@ -27,7 +27,7 @@ const LOW_ENTROPY_THRESHOLD: f64 = 3.0;
 /// Hard cap on the source-image pixel count we are willing to fully decode for
 /// entropy analysis. Beyond this we skip the entropy step rather than risk a
 /// multi-gigabyte allocation in `image::load_from_memory`.
-const MAX_CLASSIFY_PIXELS: u64 = 64 * 1024 * 1024; // 64 megapixels
+const MAX_CLASSIFY_PIXELS: u64 = 64 * 1024 * 1024;
 
 /// Classify an image based on its metadata and visual properties.
 ///
@@ -59,88 +59,65 @@ pub fn classify(
     bits_per_component: Option<u32>,
     is_mask: bool,
 ) -> (ImageKind, f32) {
-    // Short-circuit: explicit mask flag
     if is_mask {
         return (ImageKind::Mask, 0.95);
     }
 
-    // Extract dimensions, defaulting to 1 if missing to avoid panic on area calc
     let w = width.unwrap_or(1);
     let h = height.unwrap_or(1);
     let area = (w as u64) * (h as u64);
 
-    // Aspect ratio: prefer f64 for precision
     let aspect = if h > 0 { (w as f64) / (h as f64) } else { 1.0 };
 
-    // Degenerate dimensions (0×0 / 0×N / N×0): skip every dimension-gated rule.
-    // No useful classification can be inferred and entropy decode would fail
-    // anyway. Leave it for the entropy path or fall through to Unknown.
     if w == 0 || h == 0 {
         return (ImageKind::Unknown, 0.0);
     }
 
-    // Rule: Tiny square → Icon (small icons are typically 16×16 to 64×64)
     if area < SMALL_IMAGE_AREA && aspect > ICON_ASPECT_LOW && aspect < ICON_ASPECT_HIGH {
         return (ImageKind::Icon, 0.85);
     }
 
-    // Rule: Tiny image with anything-but-square aspect → Decoration.
-    // Note: this catches the gap between the Icon band and the prior Decoration
-    // band (e.g. small image with aspect 0.25), which would otherwise reach the
-    // entropy path and end up Unknown.
     if area < SMALL_IMAGE_AREA && !(ICON_ASPECT_LOW..=ICON_ASPECT_HIGH).contains(&aspect) {
         let confidence = if (DECORATION_ASPECT_LOW..=DECORATION_ASPECT_HIGH).contains(&aspect) {
-            0.65 // moderate-aspect tiny image: less confident
+            0.65
         } else {
-            0.80 // extreme-aspect tiny strip: high confidence
+            0.80
         };
         return (ImageKind::Decoration, confidence);
     }
 
-    // Rule: Gray + 1bpp → TextBlock
     if colorspace == Some("Gray") && bits_per_component == Some(1) {
         return (ImageKind::TextBlock, 0.75);
     }
 
-    // Rule: CMYK + 8bpp → Photograph
     if colorspace == Some("CMYK") && bits_per_component == Some(8) {
         return (ImageKind::Photograph, 0.70);
     }
 
-    // Rule: JPEG + large area → Photograph
     if format == "jpeg" && area > LARGE_JPEG_AREA {
         return (ImageKind::Photograph, 0.85);
     }
 
-    // Rule: FlateDecode + Indexed colorspace → Diagram (palette images = vector-rasterized)
     if format == "flate" && colorspace == Some("Indexed") {
         return (ImageKind::Diagram, 0.65);
     }
 
-    // Rule: CCITT format → Mask (bilevel, typically masks or text)
     if format == "ccitt" {
         return (ImageKind::Mask, 0.85);
     }
 
-    // Entropy-based classification: only attempt for images we are willing to
-    // fully decode. Rejecting oversized inputs up front prevents the
-    // `image::load_from_memory` call inside `compute_entropy_on_thumbnail` from
-    // allocating multi-gigabyte buffers for a crafted PDF/DOCX image stream.
     if area > 0
         && area <= MAX_CLASSIFY_PIXELS
         && let Ok(entropy) = compute_entropy_on_thumbnail(bytes, w, h)
     {
-        // High entropy → Photograph
         if entropy > HIGH_ENTROPY_THRESHOLD {
             return (ImageKind::Photograph, 0.65);
         }
-        // Low entropy + small → Chart
         if entropy < LOW_ENTROPY_THRESHOLD && area < SMALL_CHART_AREA {
             return (ImageKind::Chart, 0.60);
         }
     }
 
-    // Fallback
     (ImageKind::Unknown, 0.50)
 }
 
@@ -184,23 +161,18 @@ fn uf_union(parent: &mut [usize], x: usize, y: usize) {
 fn compute_entropy_on_thumbnail(bytes: &[u8], _width: u32, _height: u32) -> Result<f64, String> {
     use image::imageops::FilterType;
 
-    // Attempt to load the image
     let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
 
-    // Resize to 64×64 for analysis
     let thumb = img.resize_exact(64, 64, FilterType::Lanczos3);
 
-    // Convert to RGB for consistent analysis
     let rgb = thumb.to_rgb8();
     let pixels = rgb.as_raw();
 
-    // Compute histogram of all channels combined
     let mut histogram = vec![0u32; 256];
     for &byte in pixels {
         histogram[byte as usize] += 1;
     }
 
-    // Compute Shannon entropy
     let total = pixels.len() as f64;
     let mut entropy = 0.0;
     for count in histogram {
@@ -238,7 +210,6 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
         return;
     }
 
-    // Group by page
     let mut by_page: HashMap<Option<u32>, Vec<usize>> = HashMap::new();
     for (idx, img) in images.iter().enumerate() {
         by_page.entry(img.page_number).or_default().push(idx);
@@ -246,13 +217,11 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
 
     let mut next_cluster_id = 1u32;
 
-    // Process each page independently
     for (page_num, indices) in by_page {
         if indices.len() < 2 {
-            continue; // No clustering for singletons
+            continue;
         }
 
-        // Filter candidates: must be a drawable kind or unclassified with small area
         let mut candidates: Vec<usize> = indices
             .iter()
             .copied()
@@ -269,11 +238,9 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
             .collect();
 
         if candidates.len() < 2 {
-            continue; // Can't cluster fewer than 2
+            continue;
         }
 
-        // Pre-check: do candidates have similar dimensions?
-        // Collect all dimensions
         let dims: Vec<_> = candidates
             .iter()
             .map(|&idx| {
@@ -282,7 +249,6 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
             })
             .collect();
 
-        // Find median dimensions to establish a baseline
         let mut widths: Vec<_> = dims.iter().map(|(w, _)| *w).collect();
         let mut heights: Vec<_> = dims.iter().map(|(_, h)| *h).collect();
         widths.sort();
@@ -292,10 +258,9 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
         let median_h = heights[heights.len() / 2] as f64;
 
         if median_w < 1.0 || median_h < 1.0 {
-            continue; // Skip if dimensions are degenerate
+            continue;
         }
 
-        // Filter candidates again: keep only those within ±20% of median
         let candidates_filtered: Vec<usize> = candidates
             .iter()
             .copied()
@@ -310,16 +275,14 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
             .collect();
 
         if candidates_filtered.len() < 2 {
-            continue; // Can't cluster
+            continue;
         }
 
         candidates = candidates_filtered;
 
-        // Build union-find for spatial clustering
         let n = candidates.len();
         let mut parent: Vec<usize> = (0..n).collect();
 
-        // Connect spatially adjacent candidates
         for (i, idx_i) in candidates.iter().enumerate() {
             for (j, idx_j) in candidates.iter().enumerate().skip(i + 1) {
                 let idx_i = *idx_i;
@@ -328,7 +291,6 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
                 let img_j = &images[idx_j];
 
                 let should_connect = if let (Some(bbox_i), Some(bbox_j)) = (&img_i.bounding_box, &img_j.bounding_box) {
-                    // Both have bounding boxes: check spatial adjacency
                     let min_dim = (img_i.width.unwrap_or(0) as i32)
                         .min(img_i.height.unwrap_or(0) as i32)
                         .min(img_j.width.unwrap_or(0) as i32)
@@ -337,9 +299,6 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
                     if min_dim < 1.0 {
                         false
                     } else {
-                        // Tile grids typically have near-zero gaps between tiles; allow up
-                        // to half a tile of slack to absorb compression-induced jitter while
-                        // still separating logically-distinct figures on the same page.
                         let threshold = min_dim / 2.0;
                         let dx = (bbox_i.x0.max(bbox_j.x0) - bbox_i.x1.min(bbox_j.x1)).max(0.0);
                         let dy = (bbox_i.y0.max(bbox_j.y0) - bbox_i.y1.min(bbox_j.y1)).max(0.0);
@@ -347,10 +306,6 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
                         dist <= threshold
                     }
                 } else {
-                    // Fallback when bounding boxes are unavailable (lopdf path):
-                    // tiles in tile-grids tend to be emitted in a contiguous run
-                    // of image_index values. Cap proximity at a small window so
-                    // dozens of bbox-less images on a page don't all merge.
                     const NO_BBOX_INDEX_WINDOW: i32 = 3;
                     (idx_i as i32 - idx_j as i32).abs() <= NO_BBOX_INDEX_WINDOW
                 };
@@ -361,15 +316,12 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
             }
         }
 
-        // Group by connected component
         let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
         for (i, idx_i) in candidates.iter().enumerate() {
             let root = uf_find(&mut parent, i);
             clusters.entry(root).or_default().push(*idx_i);
         }
 
-        // Assign cluster_id to clusters with 2+ members. Sort by smallest member
-        // index so cluster IDs are deterministic and match document reading order.
         let mut cluster_count = 0;
         let mut max_cluster_size = 0;
         let mut multi_clusters: Vec<Vec<usize>> = clusters.into_values().filter(|cluster| cluster.len() >= 2).collect();
@@ -386,12 +338,9 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
                     images[idx].image_kind = Some(ImageKind::TileFragment);
                 }
             }
-            // Saturating to keep cluster_id well-defined even on the
-            // physically-impossible 4 -billion-cluster input.
             next_cluster_id = next_cluster_id.saturating_add(1);
         }
 
-        // Emit info span
         if cluster_count > 0 {
             tracing::info!(
                 target: "xberg::image_kind",
@@ -407,8 +356,8 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::ImageBuffer;
-    use image::Rgba;
+    #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
+    use image::{ImageBuffer, Rgba};
 
     #[test]
     fn test_classify_returns_mask_for_is_mask_true() {
@@ -466,6 +415,7 @@ mod tests {
         assert_eq!(conf, 0.85);
     }
 
+    #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
     #[test]
     fn test_classify_returns_photograph_for_high_entropy_thumbnail() {
         let mut state: u32 = 0x9E37_79B9;
@@ -487,14 +437,14 @@ mod tests {
         assert!(conf >= 0.6, "confidence {} should be >= 0.6", conf);
     }
 
+    #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
     #[test]
     fn test_classify_returns_chart_for_low_entropy_small_image() {
-        // Create a 2-color PNG (low entropy): half red, half blue
         let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(256, 256, |x, _y| {
             if x < 128 {
-                Rgba([255, 0, 0, 255]) // Red
+                Rgba([255, 0, 0, 255])
             } else {
-                Rgba([0, 0, 255, 255]) // Blue
+                Rgba([0, 0, 255, 255])
             }
         });
 
@@ -509,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_classify_returns_unknown_for_truncated_bytes() {
-        let truncated = vec![0x89, 0x50, 0x4E, 0x47]; // Partial PNG magic
+        let truncated = vec![0x89, 0x50, 0x4E, 0x47];
         let (kind, conf) = classify(&truncated, "png", Some(100), Some(100), None, None, false);
         assert_eq!(kind, ImageKind::Unknown);
         assert_eq!(conf, 0.50);
@@ -517,7 +467,6 @@ mod tests {
 
     #[test]
     fn test_classify_never_panics_on_garbage_input() {
-        // Test with various edge cases and garbage input
         let test_cases = vec![
             (&[][..], "unknown", Some(0u32), Some(0u32), None, None, false),
             (
@@ -551,7 +500,6 @@ mod tests {
         ];
 
         for (bytes, fmt, w, h, cs, bpc, is_mask) in test_cases {
-            // Should not panic
             let _ = classify(bytes, fmt, w, h, cs, bpc, is_mask);
         }
     }
@@ -816,7 +764,6 @@ mod tests {
 
         cluster_tiles(&mut images);
 
-        // Should cluster by proximity in index + matching dimensions
         assert_eq!(images[0].cluster_id, Some(1));
         assert_eq!(images[1].cluster_id, Some(1));
     }
@@ -824,7 +771,6 @@ mod tests {
     #[test]
     fn test_cluster_tiles_assigns_unique_ids() {
         let mut images = vec![
-            // Cluster 1
             ExtractedImage {
                 data: bytes::Bytes::new(),
                 format: "png".into(),
@@ -877,7 +823,6 @@ mod tests {
                 qr_codes: None,
                 data_base64: None,
             },
-            // Cluster 2
             ExtractedImage {
                 data: bytes::Bytes::new(),
                 format: "png".into(),
@@ -1001,10 +946,6 @@ mod tests {
 
     #[test]
     fn test_classify_skips_entropy_for_oversized_image() {
-        // Reported dimensions exceeding MAX_CLASSIFY_PIXELS must short-circuit
-        // before image::load_from_memory allocates the full source buffer. The
-        // function must never panic and must fall through to Unknown rather
-        // than spending CPU/memory on a thumbnail decode for a hostile input.
         let bytes = b"\x89PNG\r\n\x1a\nbogus body".to_vec();
         let (kind, conf) = classify(&bytes, "png", Some(20_000), Some(20_000), None, None, false);
         assert_eq!(kind, ImageKind::Unknown);
@@ -1013,8 +954,6 @@ mod tests {
 
     #[test]
     fn test_cluster_tiles_isolates_clusters_per_page() {
-        // Identical adjacent-tile pairs on two different pages must NEVER share
-        // a cluster_id — clustering is page-scoped.
         let mut images = vec![];
         for page in 1..=2 {
             for col in 0..2 {
@@ -1047,7 +986,6 @@ mod tests {
             }
         }
         cluster_tiles(&mut images);
-        // Page 1 tiles share a cluster, page 2 tiles share a different cluster.
         assert!(images[0].cluster_id.is_some());
         assert_eq!(images[0].cluster_id, images[1].cluster_id);
         assert_eq!(images[2].cluster_id, images[3].cluster_id);
@@ -1058,15 +996,12 @@ mod tests {
     fn test_classify_does_not_panic_on_zero_dimensions() {
         let bytes = b"\x89PNG\r\n\x1a\nbody".to_vec();
         let (kind, conf) = classify(&bytes, "png", Some(0), Some(0), None, None, false);
-        // Degenerate 0×0 inputs short-circuit to Unknown with zero confidence —
-        // every rule is dimension-gated and there is nothing meaningful to infer.
         assert_eq!(kind, ImageKind::Unknown);
         assert_eq!(conf, 0.0);
     }
 
     #[test]
     fn test_image_kind_serde_round_trips_all_variants() {
-        // Pin every variant's JSON spelling so future renames are caught.
         let variants = [
             (ImageKind::Photograph, "photograph"),
             (ImageKind::Diagram, "diagram"),

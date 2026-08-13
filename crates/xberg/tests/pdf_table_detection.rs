@@ -1,283 +1,233 @@
-//! PDF table detection comprehensive test.
+//! PDF table-detection regression tests.
 //!
-//! This test file analyzes table detection across all PDF test documents
-//! to understand the current state of table detection and identify false positives.
+//! Two properties are asserted against the real extraction pipeline:
 //!
-//! Run with:
-//!   cargo test --features pdf,ocr --test pdf_table_detection -- --ignored --nocapture 2>&1 | head -1000
+//! 1. **No false positives** — documents with no tabular content must produce
+//!    `result.tables == []`. A spurious table poisons downstream markdown.
+//! 2. **Well-formed positives** — on documents that do contain tables, every
+//!    detected table must be structurally sound (non-empty grid, non-empty
+//!    markdown, 1-indexed page number) and extraction must not error.
 //!
-//! This will extract tables from all PDFs and log:
-//! - Filename
-//! - Number of tables detected
-//! - Dimensions of each table (rows x cols)
-//! - First 3 cells of each table (to verify legitimacy)
+//! Both run in the default `cargo test -p xberg --features full` leg. They need
+//! `test_documents/`, which is bucket-fetched and absent from a bare checkout —
+//! run `python3 test_documents/scripts/fetch_corpus.py`. Missing fixtures cause a
+//! loud, named skip rather than a silent pass.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "pdf")]
 
 mod helpers;
 use helpers::extract_uri_document_blocking;
 
 use helpers::*;
-use xberg::core::config::{ExtractionConfig, OcrConfig};
+use std::path::PathBuf;
+use xberg::core::config::ExtractionConfig;
 
-/// All PDF filenames in test_documents/pdf/.
-#[allow(dead_code)]
-const ALL_PDFS: &[&str] = &[
-    "100_g_networking_technology_overview_slides_toronto_august_2016.pdf",
-    "5_level_paging_and_5_level_ept_intel_revision_1_1_may_2017.pdf",
-    "a_brief_introduction_to_neural_networks_neuronalenetze_en_zeta2_2col_dkrieselcom.pdf",
-    "a_brief_introduction_to_the_standard_annotation_language_sal_2006.pdf",
-    "a_catalogue_of_optimizing_transformations_1971_allen_catalog.pdf",
-    "a_comparison_of_programming_languages_in_economics_16_jun_2014.pdf",
-    "a_comprehensive_study_of_convergent_and_commutative_replicated_data_types.pdf",
-    "a_comprehensive_study_of_main_memory_partitioning_and_its_application_to_large_scale_comparison_and_radix_sort_sigmod14_i.pdf",
-    "a_course_in_machine_learning_ciml_v0_9_all.pdf",
-    "algebra_topology_differential_calculus_and_optimization_theory_for_computer_science_and_machine_learning_2019_math_deep.pdf",
-    "an_introduction_to_statistical_learning_with_applications_in_r_islr_sixth_printing.pdf",
-    "assembly_language_for_beginners_al4_b_en.pdf",
-    "bayesian_data_analysis_third_edition_13th_feb_2020.pdf",
-    "code_and_formula.pdf",
-    "copy_protected.pdf",
+/// Documents with no tabular content. Detecting any table in these is a false positive.
+const NON_TABLE_PDFS: &[&str] = &["simple.pdf", "fake_memo.pdf", "searchable.pdf"];
+
+/// Documents that do contain tabular content.
+///
+/// No per-document table *count* is asserted: counts shift legitimately with
+/// pdf_oxide's native grid detector and with the bordered/heuristic tiers (see
+/// `pdf_heuristic_tables.rs`, which documents `table_document.pdf` as borderline
+/// for the prose filter). What is asserted is that the group as a whole yields at
+/// least one table and that every table produced is well formed.
+const TABLE_PDFS: &[&str] = &[
     "embedded_images_tables.pdf",
-    "fake_memo.pdf",
-    "fundamentals_of_deep_learning_2014.pdf",
-    "google_doc_document.pdf",
-    "image_only_german_pdf.pdf",
-    "intel_64_and_ia_32_architectures_software_developer_s_manual_combined_volumes_1_4_june_2021_325462_sdm_vol_1_2abcd_3abcd.pdf",
-    "large.pdf",
-    "medium.pdf",
     "multi_page_tables.pdf",
-    "multi_page.pdf",
-    "non_ascii_text.pdf",
-    "non_searchable.pdf",
-    "ocr_test_rotated_180.pdf",
-    "ocr_test_rotated_270.pdf",
-    "ocr_test_rotated_90.pdf",
-    "ocr_test.pdf",
-    "password_protected.pdf",
-    "perfect_hash_functions_slides.pdf",
-    "program_design_in_the_unix_environment.pdf",
-    "proof_of_concept_or_gtfo_v13_october_18th_2016.pdf",
-    "right_to_left_01.pdf",
-    "sample_contract.pdf",
-    "scanned.pdf",
-    "searchable.pdf",
-    "sharable_web_guide.pdf",
-    "simple.pdf",
     "table_document.pdf",
-    "tatr.pdf",
-    "test_article.pdf",
-    "the_hideous_name_1985_pike85hideous.pdf",
-    "tiny.pdf",
-    "with_images.pdf",
-    "xerox_alta_link_series_mfp_sag_en_us_2.pdf",
+    "multi_page.pdf",
+    // Listed as a non-table document until this test was first run. It is a fully
+    // ruled 5x6 country/capital/currency grid -- 6 horizontal and 7 vertical rules,
+    // text landing inside every column -- so detecting it is correct. The sibling
+    // suite in pdf_table_ground_truth.rs already asserts no-tables for the other
+    // three, and pointedly never did for this one.
+    "google_doc_document.pdf",
 ];
 
-/// Format cell content for display (truncate long text)
+/// Extraction config used by both tests.
+///
+/// `use_cache: false` keeps the tests independent of any on-disk cache left behind
+/// by another test or an earlier run, so they are idempotent and order-independent.
+fn table_detection_config() -> ExtractionConfig {
+    ExtractionConfig {
+        use_cache: false,
+        force_ocr: false,
+        ..Default::default()
+    }
+}
+
+/// Resolve a fixture, returning `None` and logging the absolute path when absent.
+fn resolve_fixture(filename: &str) -> Option<PathBuf> {
+    let path = get_test_file_path(&format!("pdf/{filename}"));
+    if !path.exists() {
+        eprintln!(
+            "missing fixture {} — run `python3 test_documents/scripts/fetch_corpus.py`",
+            path.display()
+        );
+        return None;
+    }
+    Some(path)
+}
+
+/// Report that the corpus is absent. Returns `true` when the test must not proceed.
+fn corpus_missing() -> bool {
+    if test_documents_available() {
+        return false;
+    }
+    eprintln!(
+        "SKIPPING: test corpus not present at {} — run `python3 test_documents/scripts/fetch_corpus.py`",
+        get_test_documents_dir().display()
+    );
+    true
+}
+
+/// Truncate a cell for inclusion in a failure message.
 fn format_cell(cell: &str) -> String {
-    let max_len = 50;
-    if cell.len() > max_len {
-        // Find a valid UTF-8 boundary at or before max_len
-        let truncated = &cell[..cell.floor_char_boundary(max_len)];
-        format!("{truncated}...")
+    const MAX_LEN: usize = 50;
+    if cell.len() > MAX_LEN {
+        format!("{}...", &cell[..cell.floor_char_boundary(MAX_LEN)])
     } else {
         cell.to_string()
     }
 }
 
-#[test]
-#[ignore]
-fn test_table_detection_false_positives() {
-    if !test_documents_available() {
-        println!("Skipping: test_documents not available");
-        return;
-    }
-
-    let non_table_pdfs = vec![
-        "simple.pdf",
-        "fake_memo.pdf",
-        "google_doc_document.pdf",
-        "searchable.pdf",
-    ];
-
-    println!("\n");
-    println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║     False Positive Analysis - Non-Table Documents              ║");
-    println!("║  These documents should NOT have tables detected               ║");
-    println!("╚════════════════════════════════════════════════════════════════╝");
-    println!();
-
-    let mut false_positives = 0;
-    let mut correct_negatives = 0;
-
-    for filename in non_table_pdfs {
-        let path = get_test_file_path(&format!("pdf/{}", filename));
-
-        if !path.exists() {
-            println!("[SKIP] {} - file not found", filename);
-            continue;
-        }
-
-        let config = ExtractionConfig {
-            ocr: Some(OcrConfig {
-                backend: "tesseract".to_string(),
-                language: vec!["eng".to_string()],
-                ..Default::default()
-            }),
-            force_ocr: false,
-            ..Default::default()
-        };
-
-        match extract_uri_document_blocking(&path, None, &config) {
-            Ok(result) => {
-                if result.tables.is_empty() {
-                    println!("  [CORRECT] {} - no tables detected", filename);
-                    correct_negatives += 1;
-                } else {
-                    println!(
-                        "  [FALSE POSITIVE] {} - detected {} tables (should have none)",
-                        filename,
-                        result.tables.len()
-                    );
-                    false_positives += 1;
-
-                    for (idx, table) in result.tables.iter().enumerate() {
-                        let rows = table.cells.len();
-                        let cols = if rows > 0 { table.cells[0].len() } else { 0 };
-                        println!("    Table {}: {} rows × {} cols", idx + 1, rows, cols);
-
-                        if rows > 0 && cols > 0 {
-                            let preview_rows = rows.min(2);
-                            let preview_cols = cols.min(2);
-                            for r in 0..preview_rows {
-                                let mut row_str = String::from("      | ");
-                                for c in 0..preview_cols {
-                                    let cell_content = table.cells[r].get(c).map(|s| s.as_str()).unwrap_or("");
-                                    row_str.push_str(&format!("{} | ", format_cell(cell_content)));
-                                }
-                                if preview_cols < cols {
-                                    row_str.push_str("... |");
-                                }
-                                println!("{}", row_str);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                println!("  [ERROR] {}: {}", filename, e);
-            }
-        }
-    }
-
-    println!();
-    println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║                    False Positive Summary                      ║");
-    println!("╚════════════════════════════════════════════════════════════════╝");
-    println!();
-    println!("Correct negatives (no tables):  {}", correct_negatives);
-    println!("False positives (detected):    {}", false_positives);
-    if false_positives > 0 {
-        println!();
-        println!("WARNING: Detected {} false-positive tables!", false_positives);
-        println!("These should be investigated to improve detection accuracy.");
-    }
-    println!();
+/// Render the first rows of a table for a failure message.
+fn preview_table(table: &xberg::types::Table) -> String {
+    const PREVIEW_ROWS: usize = 2;
+    table
+        .cells
+        .iter()
+        .take(PREVIEW_ROWS)
+        .map(|row| {
+            let cells: Vec<String> = row.iter().map(|cell| format_cell(cell.as_str())).collect();
+            format!("| {} |", cells.join(" | "))
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
-/// Focused test on specific PDFs known to have tables
+/// Documents without tabular content must yield exactly zero tables.
 #[test]
-#[ignore]
-fn test_table_detection_focus_on_table_documents() {
-    if !test_documents_available() {
-        println!("Skipping: test_documents not available");
+fn should_detect_no_tables_in_documents_without_tabular_content() {
+    if corpus_missing() {
         return;
     }
 
-    let table_pdfs = vec![
-        "embedded_images_tables.pdf",
-        "multi_page_tables.pdf",
-        "table_document.pdf",
-        "multi_page.pdf",
-    ];
+    let config = table_detection_config();
+    let mut evaluated = 0usize;
+    let mut false_positives: Vec<String> = Vec::new();
 
-    println!("\n");
-    println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║      Focused Table Detection on Known Table Documents          ║");
-    println!("╚════════════════════════════════════════════════════════════════╝");
-    println!();
-
-    for filename in table_pdfs {
-        let path = get_test_file_path(&format!("pdf/{}", filename));
-
-        if !path.exists() {
-            println!("[SKIP] {} - file not found", filename);
+    for filename in NON_TABLE_PDFS {
+        let Some(path) = resolve_fixture(filename) else {
             continue;
-        }
-
-        println!("Analyzing: {}", filename);
-        println!();
-
-        let config = ExtractionConfig {
-            ocr: Some(OcrConfig {
-                backend: "tesseract".to_string(),
-                language: vec!["eng".to_string()],
-                ..Default::default()
-            }),
-            force_ocr: false,
-            ..Default::default()
         };
+        evaluated += 1;
 
-        match extract_uri_document_blocking(&path, None, &config) {
-            Ok(result) => {
-                println!("  Tables detected: {}", result.tables.len());
+        let result = extract_uri_document_blocking(&path, None, &config)
+            .unwrap_or_else(|error| panic!("extraction of {filename} must succeed, got: {error}"));
 
-                if result.tables.is_empty() {
-                    println!("  No tables detected - possible false negative");
-                }
+        if !result.tables.is_empty() {
+            let previews: Vec<String> = result
+                .tables
+                .iter()
+                .map(|table| {
+                    format!(
+                        "{}x{} [{}]",
+                        table.cells.len(),
+                        table.cells.first().map_or(0, Vec::len),
+                        preview_table(table)
+                    )
+                })
+                .collect();
+            false_positives.push(format!(
+                "{filename}: {} table(s) {}",
+                result.tables.len(),
+                previews.join("; ")
+            ));
+        }
+    }
 
-                for (idx, table) in result.tables.iter().enumerate() {
-                    let rows = table.cells.len();
-                    let cols = if rows > 0 { table.cells[0].len() } else { 0 };
+    if evaluated == 0 {
+        eprintln!(
+            "SKIPPING: none of the {} non-table fixtures are present",
+            NON_TABLE_PDFS.len()
+        );
+        return;
+    }
 
-                    println!();
-                    println!("  Table {} (page {}):", idx + 1, table.page_number);
-                    println!("    Dimensions: {} rows × {} cols", rows, cols);
-                    println!("    Cell count: {}", rows * cols);
+    assert_eq!(
+        false_positives,
+        Vec::<String>::new(),
+        "{} of {evaluated} document(s) without tabular content produced false-positive tables",
+        false_positives.len()
+    );
+}
 
-                    // Full preview (up to 10x10)
-                    if rows > 0 && cols > 0 {
-                        let preview_rows = rows.min(10);
-                        let preview_cols = cols.min(10);
-                        println!("    Full preview:");
-                        for r in 0..preview_rows {
-                            let mut row_str = String::from("      | ");
-                            for c in 0..preview_cols {
-                                let cell_content = table.cells[r].get(c).map(|s| s.as_str()).unwrap_or("");
-                                row_str.push_str(&format!("{} | ", format_cell(cell_content)));
-                            }
-                            if preview_cols < cols {
-                                row_str.push_str("... |");
-                            }
-                            println!("{}", row_str);
-                        }
-                        if preview_rows < rows {
-                            println!("      | ... |");
-                        }
-                    }
+/// Every table detected on a known-table document must be structurally well formed,
+/// and the group must yield at least one table.
+#[test]
+fn should_produce_well_formed_tables_for_documents_with_tabular_content() {
+    if corpus_missing() {
+        return;
+    }
 
-                    println!();
-                    println!("    Markdown:");
-                    println!("{}", table.markdown);
-                    println!();
-                }
+    let config = table_detection_config();
+    let mut evaluated = 0usize;
+    let mut total_tables = 0usize;
+    let mut defects: Vec<String> = Vec::new();
+
+    for filename in TABLE_PDFS {
+        let Some(path) = resolve_fixture(filename) else {
+            continue;
+        };
+        evaluated += 1;
+
+        let result = extract_uri_document_blocking(&path, None, &config)
+            .unwrap_or_else(|error| panic!("extraction of {filename} must succeed, got: {error}"));
+        total_tables += result.tables.len();
+
+        for (index, table) in result.tables.iter().enumerate() {
+            let label = format!("{filename} table {}", index + 1);
+
+            if table.cells.is_empty() {
+                defects.push(format!("{label}: zero rows"));
+                continue;
             }
-            Err(e) => {
-                println!("  ERROR: {}", e);
+            if table.cells.iter().all(Vec::is_empty) {
+                defects.push(format!("{label}: every row has zero cells"));
+            }
+            if table.markdown.trim().is_empty() {
+                defects.push(format!("{label}: empty markdown for a {}-row grid", table.cells.len()));
+            }
+            if table.page_number == 0 {
+                defects.push(format!("{label}: page_number must be 1-indexed, got 0"));
+            }
+            if table
+                .cells
+                .iter()
+                .all(|row| row.iter().all(|cell| cell.trim().is_empty()))
+            {
+                defects.push(format!("{label}: every cell is blank"));
             }
         }
-
-        println!("─────────────────────────────────────────────────────────────────");
-        println!();
     }
+
+    if evaluated == 0 {
+        eprintln!("SKIPPING: none of the {} table fixtures are present", TABLE_PDFS.len());
+        return;
+    }
+
+    assert_eq!(
+        defects,
+        Vec::<String>::new(),
+        "{} malformed table(s) detected across {evaluated} document(s)",
+        defects.len()
+    );
+    assert!(
+        total_tables >= 1,
+        "{evaluated} document(s) known to contain tabular content produced 0 tables in total — \
+         the native, bordered and heuristic detection tiers all failed"
+    );
 }

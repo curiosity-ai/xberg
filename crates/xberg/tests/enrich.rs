@@ -3,15 +3,11 @@
 use xberg::types::ExtractedDocument;
 use xberg::{EnrichedResult, EnrichmentConfig, enrich};
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
 fn bare_result(content: &str) -> ExtractedDocument {
     let mut result = ExtractedDocument::default();
     result.content = content.to_string();
     result
 }
-
-// ── tests ─────────────────────────────────────────────────────────────────────
 
 /// A default config is a no-op: the extraction passes through unchanged and
 /// every enrichment field is `None`.
@@ -77,17 +73,12 @@ async fn enrich_classification_leaves_other_stages_none() {
         ..Default::default()
     };
 
-    // We do not actually call the LLM in unit tests, so we only check that
-    // absent features remain None. If the LLM key is absent the call will
-    // fail; wrap in an ignore-on-error for the non-LLM CI environment.
     if let Ok(enriched) = enrich(extraction, &config).await {
-        // Classification ran (or returned empty on empty pages), everything else is None.
         #[cfg(feature = "ner")]
         assert!(enriched.entities.is_none());
         #[cfg(feature = "captioning")]
         assert!(enriched.captions.is_none());
     }
-    // LLM unavailable in this environment — that is acceptable for a unit test.
 }
 
 /// Stub NerBackend that returns two hardcoded entities.
@@ -135,6 +126,9 @@ async fn enrich_ner_with_stub_backend_populates_entities() {
     use stub_ner::StubBackend;
 
     let extraction = bare_result("Alice works at Acme Corp.");
+    // `EnrichmentConfig` gains fields under other features, so the update is
+    // load-bearing there and only redundant in this narrow combination. ~keep
+    #[allow(clippy::needless_update)]
     let config = EnrichmentConfig {
         ner: Some(NerEnrichmentConfig {
             backend: Arc::new(StubBackend),
@@ -157,10 +151,11 @@ async fn enrich_ner_with_stub_backend_populates_entities() {
     assert!(enriched.captions.is_none());
 }
 
-/// When `transcription` is `Some`, `enrich` must return an error (not yet implemented).
+/// A `Some` `transcription` must not fail the call: `enrich` records a non-fatal
+/// `ProcessingWarning` naming the extraction-time alternative and leaves the rest intact.
 #[cfg(feature = "transcription-types")]
 #[tokio::test]
-async fn enrich_transcription_returns_not_implemented_error() {
+async fn enrich_transcription_records_warning_and_preserves_other_stages() {
     use xberg::core::config::TranscriptionConfig;
 
     let extraction = bare_result("audio transcript placeholder");
@@ -169,15 +164,17 @@ async fn enrich_transcription_returns_not_implemented_error() {
         ..Default::default()
     };
 
-    let result = enrich(extraction, &config).await;
-    match result {
-        Ok(_) => panic!("transcription must return an error until the backend lands"),
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("transcription"),
-                "error message should mention transcription; got: {msg}"
-            );
-        }
-    }
+    let enriched = enrich(extraction, &config)
+        .await
+        .expect("transcription must not fail enrich");
+
+    let warnings = &enriched.extraction.processing_warnings;
+    assert_eq!(warnings.len(), 1, "expected exactly one warning, got {warnings:?}");
+    assert_eq!(warnings[0].source, "transcription");
+    assert!(
+        warnings[0].message.contains("ExtractionConfig::transcription"),
+        "warning must point at the extraction-time path; got: {}",
+        warnings[0].message
+    );
+    assert_eq!(enriched.extraction.content, "audio transcript placeholder");
 }

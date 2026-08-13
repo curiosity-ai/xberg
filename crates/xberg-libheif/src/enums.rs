@@ -10,7 +10,6 @@ pub enum Chroma {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum RgbChroma {
     C444,
-    // Interleaved
     Rgb,
     Rgba,
     HdrRgbBe,

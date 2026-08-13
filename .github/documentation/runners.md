@@ -1,39 +1,31 @@
 # Custom GitHub Actions Runners
 
+Almost all CI runs on GitHub-hosted runners (`ubuntu-latest`, `ubuntu-24.04-arm`). Only one
+self-hosted runner remains, because GitHub offers no hosted equivalent on this plan.
+
 ## Available Runners
 
-| Runner Label               | Architecture | Size   | Ephemeral | Notes                                                      |
-| -------------------------- | ------------ | ------ | --------- | ---------------------------------------------------------- |
-| `runner-small`             | x86_64       | Small  | No        | Light tasks: linting, formatting, validation               |
-| `runner-medium`            | x86_64       | Medium | No        | Standard CI: tests, builds                                 |
-| `runner-medium-arm64`      | arm64        | Medium | No        | ARM64 builds and tests                                     |
-| `runner-large`             | x86_64       | Large  | No        | Heavy workloads: benchmarks, coverage, release builds      |
-| `runner-large-spot`        | x86_64       | Large  | Yes       | Cost-optimized large jobs where interruption is acceptable |
-| `runner-medium-arm64-spot` | arm64        | Medium | Yes       | Cost-optimized ARM64 jobs where interruption is acceptable |
+| Runner Label    | Architecture | Notes                                                     |
+| --------------- | ------------ | --------------------------------------------------------- |
+| `runner-gpu-l4` | x86_64 + L4  | NVIDIA L4 GPU. `ci-gpu.yaml` only, `workflow_dispatch` only |
 
-## Spot Runners
+The pool scales to zero, so it costs nothing when idle.
 
-Spot runners (`*-spot`) use ephemeral cloud instances provisioned on a best-effort basis. They are significantly cheaper but can be preempted at any time if the cloud provider reclaims capacity.
+## Retired Runners
 
-**Use spot runners for:**
+`runner-small`, `runner-medium-arm64`, `runner-large`, `runner-large-arm64`,
+`runner-large-spot` and `runner-medium-arm64-spot` were removed. They served 55 hours of CI a
+month but consumed 1,204 node-hours across 1,621 nodes, because each runner pod requested
+4–12 vCPU and pinned one pod per host — so every job provisioned a fresh node that pulled its
+whole toolchain over the network.
 
-- Jobs that can be retried without consequence (test suites, linting)
-- Non-time-critical workloads
-- PR validation where re-runs are acceptable
+Use `ubuntu-latest` for x86_64 and `ubuntu-24.04-arm` for arm64 instead.
 
-**Do not use spot runners for:**
+`runner-medium` still exists but is reserved for `sceptre`'s benchmark provenance (ADR 0035);
+do not add jobs to it from this repo.
 
-- Benchmarks (preemption and noisy-neighbor effects skew results)
-- Release builds and publishing
-- Jobs requiring consistent, reproducible timing
+## Benchmarks
 
-## Choosing a Runner
-
-| Workload                        | Recommended Runner         |
-| ------------------------------- | -------------------------- |
-| Linting, formatting, validation | `runner-small`             |
-| Unit tests, standard builds     | `runner-medium`            |
-| ARM64 cross-compilation / tests | `runner-medium-arm64`      |
-| Benchmarks, coverage reports    | `runner-large`             |
-| Non-critical large builds       | `runner-large-spot`        |
-| Non-critical ARM64 builds       | `runner-medium-arm64-spot` |
+Benchmark figures produced before the migration were measured on dedicated non-spot hardware
+and are not directly comparable with numbers from shared hosted runners. Re-baseline before
+comparing.

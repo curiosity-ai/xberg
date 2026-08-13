@@ -62,6 +62,27 @@ typedef struct XBERGAuthConfig XBERGAuthConfig;
  */
 typedef struct XBERGBBox XBERGBBox;
 /**
+ * AWS Bedrock configuration for `bedrock/`-prefixed models.
+ *
+ * Mirrors liter-llm's `BedrockConfig`. Every field is optional: anything left
+ * unset falls back to the standard AWS environment variables
+ * (`AWS_DEFAULT_REGION` / `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+ * `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `BEDROCK_CROSS_REGION`) and the
+ * default AWS credential chain. Leave the credential fields unset unless you
+ * have an explicit reason to pin them.
+ * \\code
+ * `ocr.vlm_config`
+ * model = "bedrock/anthropic.claude-3-sonnet-20240229-v1:0"
+ *
+ * `ocr.vlm_config.bedrock`
+ * region = "eu-central-1"
+ * cross_region_prefix = "eu"
+ *
+ * `Debug` is implemented by hand so the three credential fields are never printed.
+ * \\endcode
+ */
+typedef struct XBERGBedrockConfig XBERGBedrockConfig;
+/**
  * BibTeX bibliography metadata.
  */
 typedef struct XBERGBibtexMetadata XBERGBibtexMetadata;
@@ -77,6 +98,48 @@ typedef struct XBERGBoundaryReason XBERGBoundaryReason;
  * Bounding box coordinates for element positioning.
  */
 typedef struct XBERGBoundingBox XBERGBoundingBox;
+/**
+ * **Deprecated and inert.** Chunking no longer writes a heading breadcrumb into
+ * `content` for either variant of this enum â see the revised design adopted in
+ * <https://github.com/xberg-io/xberg/issues/1393>. Setting this field has no
+ * effect on chunking output any more. It is kept only so the ~15 alef-generated
+ * binding packages that construct it keep compiling; removing it outright is a
+ * separate, coordinated breaking change.
+ *
+ * # Why this became inert
+ *
+ * The original design (this enum, plus
+ * `ChunkingConfig::prepend_heading_context`
+ * (super::super::processing::ChunkingConfig::prepend_heading_context))
+ * let `Content` mode prepend the heading breadcrumb directly into a chunk's
+ * `content`. GH#1393's follow-up discussion argued that a single flag on the
+ * chunker cannot serve all three retrieval consumers of the same chunk: dense/
+ * embedding retrieval wants the breadcrumb inline, but lexical (BM25/TF-IDF) and
+ * sparse learned (SPLADE) retrieval are actively harmed by it â SPLADE worse
+ * than BM25, because its term-expansion pulls each heading's whole learned
+ * neighbourhood (e.g. `"Authentication"` â `auth`, `login`, `credential`,
+ * `oauth`) into every chunk of that section, and that damage cannot be
+ * corrected by re-indexing since the expansion comes from a pretrained encoder,
+ * not the collection being indexed. Mutating `content` also desynced it from
+ * `byte_start`/`byte_end` (#1294): `chunk.content.len() != byte_end - byte_start`
+ * whenever a breadcrumb had been prepended, so slicing the source document by a
+ * chunk's own offsets silently returned different text than `content`.
+ *
+ * The revised design removes the mutation entirely: `chunk.content` now always
+ * equals the exact `byte_start, byte_end)` source span, regardless of this
+ * enum's value or `prepend_heading_context`.
+ *
+ * # What to do instead
+ *
+ * Call [`render_heading_breadcrumb` (crate::chunking::render_heading_breadcrumb)
+ * explicitly at index time, with a chunk's (always-clean) `content` and its
+ * `heading_context` (crate::types::ChunkMetadata::heading_context) â only for
+ * the consumer that wants the breadcrumb inline (typically dense/embedding).
+ * BM25 and SPLADE consumers need no special handling: index `chunk.content` as
+ * returned. See the `rag` (crate::chunking::rag) module docs for the full
+ * per-consumer guidance.
+ */
+typedef struct XBERGBreadcrumbTarget XBERGBreadcrumbTarget;
 /**
  * Browser backend used for JavaScript rendering.
  */
@@ -126,6 +189,33 @@ typedef struct XBERGCellChange XBERGCellChange;
  * is configured), and metadata about its position in the document.
  */
 typedef struct XBERGChunk XBERGChunk;
+/**
+ * Configuration for the chunk-classification post-processor.
+ *
+ * Chunk classification is always multi-label: a chunk may match zero, one, or
+ * many of the configured definitions. This is the chunk-level equivalent of
+ * `PageClassificationConfig`, but scoped to individual chunks
+ * (`ExtractedDocument::chunks`) rather than whole pages, and built for large
+ * taxonomies where each label needs its own description rather than a bare name.
+ */
+typedef struct XBERGChunkClassificationConfig XBERGChunkClassificationConfig;
+/**
+ * A single labeled definition the chunk classifier may emit.
+ *
+ * Unlike `PageClassificationConfig::labels` (bare label names), chunk
+ * classification targets potentially large domain taxonomies where every
+ * label carries its own semantic description, letting the LLM disambiguate
+ * similarly named labels without relying on the label string alone.
+ */
+typedef struct XBERGChunkClassificationDefinition XBERGChunkClassificationDefinition;
+/**
+ * Chunk-classification enrichment knob: how to multi-label individual chunks.
+ *
+ * Operates on `ExtractedDocument::chunks` in place â the caller must have
+ * already produced chunks (e.g. via `ExtractionConfig::chunking`) for this
+ * stage to have any effect; a document with no chunks is a no-op.
+ */
+typedef struct XBERGChunkClassificationEnrichmentConfig XBERGChunkClassificationEnrichmentConfig;
 /**
  * Information about a single chunk.
  */
@@ -208,12 +298,58 @@ typedef struct XBERGCitationMetadata XBERGCitationMetadata;
  */
 typedef struct XBERGClassificationLabel XBERGClassificationLabel;
 /**
+ * Code block fence style in Markdown output.
+ *
+ * Determines how code blocks (`<pre><code>`) are rendered in Markdown.
+ */
+typedef struct XBERGCodeBlockStyle XBERGCodeBlockStyle;
+/**
+ * A single structurally-meaningful code chunk produced by tree-sitter parsing.
+ *
+ * Purpose-built payload owned by xberg â deliberately does not expose the upstream
+ * `tree_sitter_language_pack` types, so binding generators never need to resolve an
+ * external crate's types across FFI/language boundaries.
+ */
+typedef struct XBERGCodeChunkInfo XBERGCodeChunkInfo;
+/**
  * Content rendering mode for code extraction.
  *
  * Controls how extracted code content is represented in the `content` field
  * of `ExtractedDocument`.
  */
 typedef struct XBERGCodeContentMode XBERGCodeContentMode;
+/**
+ * An XML-style attribute attached to an `Element` (CodeDataNodeKind::Element) node.
+ *
+ * Populated only for `CodeDataNodeKind::Element`; always empty for `KeyValue` and
+ * `Sequence` nodes.
+ */
+typedef struct XBERGCodeDataAttribute XBERGCodeDataAttribute;
+/**
+ * A node in the hierarchical data tree produced by data-format extraction.
+ *
+ * Purpose-built payload owned by xberg â mirrors
+ * `tree_sitter_language_pack::DataNode` but flattens its `Span` down to plain byte
+ * offsets, so binding generators never need to resolve an external crate's types
+ * across FFI/language boundaries.
+ */
+typedef struct XBERGCodeDataNode XBERGCodeDataNode;
+/**
+ * Discriminates the shape of a `CodeDataNode`.
+ *
+ * Purpose-built mirror of `tree_sitter_language_pack::DataNodeKind` â kept as an
+ * xberg-owned type so binding generators never need to resolve the upstream crate's
+ * types across FFI/language boundaries.
+ */
+typedef struct XBERGCodeDataNodeKind XBERGCodeDataNodeKind;
+/**
+ * Code-format metadata: the structural chunks produced by tree-sitter parsing.
+ *
+ * Wrapped by `FormatMetadata.Code`. Kept as a named struct (rather than an inline
+ * enum-variant body) so serde can tag it under internal tagging and utoipa can emit a
+ * referenceable `CodeMetadata` component in the OpenAPI schema.
+ */
+typedef struct XBERGCodeMetadata XBERGCodeMetadata;
 /**
  * Content extraction and conversion configuration.
  *
@@ -245,6 +381,21 @@ typedef struct XBERGContentLayer XBERGContentLayer;
  */
 typedef struct XBERGContributorRole XBERGContributorRole;
 /**
+ * Main conversion options for HTML to Markdown conversion.
+ *
+ * Use `ConversionOptions.builder()` to construct, or `Default.default()` for defaults.
+ * \\code
+ * use html_to_markdown_rs::{ConversionOptions, HeadingStyle};
+ *
+ * let options = ConversionOptions::builder()
+ *     .heading_style(HeadingStyle::Atx)
+ *     .wrap(true)
+ *     .wrap_width(100)
+ *     .build();
+ * \\endcode
+ */
+typedef struct XBERGConversionOptions XBERGConversionOptions;
+/**
  * Dublin Core metadata from docProps/core.xml
  *
  * Contains standard metadata fields defined by the Dublin Core standard
@@ -255,6 +406,33 @@ typedef struct XBERGCoreProperties XBERGCoreProperties;
  * Configuration for crawl, scrape, and map operations.
  */
 typedef struct XBERGCrawlConfig XBERGCrawlConfig;
+/**
+ * Managed credential-provider configuration for OAuth2/STS-based authentication modes liter-llm
+ * cannot express via a static `api_key`. See `LlmConfig.credential_provider`.
+ *
+ * `Debug` is implemented by hand: `CredentialProviderConfig.AzureAd`'s `client_secret` is a
+ * credential and must never be printed, matching `LlmConfig`'s own redaction policy. The
+ * other variants carry no secret material â `CredentialProviderConfig.VertexOauth2` and
+ * `CredentialProviderConfig.BedrockWebIdentity` reference a *file path*, never the key or
+ * token itself.
+ */
+typedef struct XBERGCredentialProviderConfig XBERGCredentialProviderConfig;
+/**
+ * Configuration for CSV/TSV extraction.
+ *
+ * When unset (`ExtractionConfig::csv == None`), the extractor keeps its
+ * existing default behavior: the delimiter is auto-detected by sampling the
+ * file (comma, tab, pipe, or semicolon), and no line is treated as a comment.
+ * \\code
+ * use xberg::core::config::CsvConfig;
+ *
+ * let config = CsvConfig {
+ *     delimiter: Some(";".to_string()),
+ *     comment_prefixes: vec!["#".to_string()],
+ * };
+ * \\endcode
+ */
+typedef struct XBERGCsvConfig XBERGCsvConfig;
 /**
  * CSV/TSV file metadata.
  */
@@ -314,9 +492,41 @@ typedef struct XBERGDjotImage XBERGDjotImage;
  */
 typedef struct XBERGDjotLink XBERGDjotLink;
 /**
+ * A single doctor verdict: what was checked, the outcome, and why.
+ */
+typedef struct XBERGDoctorCheck XBERGDoctorCheck;
+/**
+ * Aggregate doctor report over all configured backends and settings.
+ */
+typedef struct XBERGDoctorReport XBERGDoctorReport;
+/**
  * Detected document boundary within a PDF.
  */
 typedef struct XBERGDocumentBoundary XBERGDocumentBoundary;
+/**
+ * Opt-in encoding applied to a downloaded document's bytes for callers who need the
+ * content available in a serializable field rather than reading it from disk.
+ *
+ * `None` (the `CrawlConfig.document_content_encoding` default) produces neither â unlike
+ * screenshots, base64-encoding a document by default would duplicate an already
+ * up-to-`document_max_size` buffer (50 MB default) in memory per document.
+ */
+typedef struct XBERGDocumentContentEncoding XBERGDocumentContentEncoding;
+/**
+ * Cheap structural counts for an extracted document.
+ *
+ * Populated on every `ExtractedDocument` returned by `extract` /
+ * `extract_batch`, regardless of whether the heavy `pages` / `images`
+ * collections are materialized. A caller that only needs "how many pages /
+ * tables / images did this document have?" (reporting, cost estimation,
+ * progress, quotas) can read these without enabling per-page or per-image
+ * extraction.
+ *
+ * The page count comes from the parse (the extractor already walks the page
+ * tree); it does not require opting into per-page content. `pages` is `0` for
+ * inputs that are not page-addressable (e.g. plain text).
+ */
+typedef struct XBERGDocumentCounts XBERGDocumentCounts;
 /**
  * Trait for document extractor plugins.
  *
@@ -357,11 +567,13 @@ typedef struct XBERGDocumentBoundary XBERGDocumentBoundary;
  *     async fn extract(&self, input: ExtractInput, _config: &ExtractionConfig)
  *         -> Result<ExtractedDocument> {
  *         let bytes = input.bytes.unwrap_or_default();
- *         Ok(ExtractedDocument {
- *             content: String::from_utf8_lossy(&bytes).to_string(),
- *             mime_type: "text/plain".into(),
- *             ..Default::default()
- *         })
+ *         // `ExtractedDocument` has private internal fields, so a struct literal with
+ *         // `..Default::default()` does not compile outside the crate. Build a default
+ *         // and assign the public fields instead.
+ *         let mut document = ExtractedDocument::default();
+ *         document.content = String::from_utf8_lossy(&bytes).to_string();
+ *         document.mime_type = "text/plain".into();
+ *         Ok(document)
  *     }
  *
  *     fn supported_mime_types(&self) -> &[&str] {
@@ -536,6 +748,18 @@ typedef struct XBERGEmbeddingConfig XBERGEmbeddingConfig;
  * Embedding model types supported by Xberg.
  */
 typedef struct XBERGEmbeddingModelType XBERGEmbeddingModelType;
+/**
+ * Inference backend that an `EmbeddingPreset` runs on.
+ *
+ * `Onnx` presets require the `embeddings` feature (ONNX Runtime, not available on
+ * WASM/Android x86_64 emulator). `Static` presets require `static-embeddings`
+ * (pure-Rust model2vec inference, no ORT â the only dense-embedding backend
+ * available on `no-ort-target`).
+ *
+ * Defaults to `Onnx` via `#`serde(default)`` so every existing preset payload
+ * (which predates this field) keeps deserializing without change.
+ */
+typedef struct XBERGEmbeddingsEmbeddingBackend XBERGEmbeddingsEmbeddingBackend;
 /**
  * A single named entity detected in the extracted text.
  */
@@ -757,6 +981,12 @@ typedef struct XBERGHeadingContext XBERGHeadingContext;
  */
 typedef struct XBERGHeadingLevel XBERGHeadingLevel;
 /**
+ * Heading style options for Markdown output.
+ *
+ * Controls how headings (h1-h6) are rendered in the output Markdown.
+ */
+typedef struct XBERGHeadingStyle XBERGHeadingStyle;
+/**
  * Configuration for document chunking and analysis heuristics.
  *
  * Every threshold is a public field so callers can override any subset via
@@ -778,6 +1008,30 @@ typedef struct XBERGHierarchicalBlock XBERGHierarchicalBlock;
  * included in page content.
  */
 typedef struct XBERGHierarchyConfig XBERGHierarchyConfig;
+/**
+ * Highlight rendering style for `<mark>` elements.
+ *
+ * Controls how highlighted text is rendered in Markdown output.
+ */
+typedef struct XBERGHighlightStyle XBERGHighlightStyle;
+/**
+ * Hostname/IP allowlist matcher for SSRF policy.
+ *
+ * Serializes as an internally-tagged object so each variant is distinguishable on the
+ * wire and round-trips losslessly:
+ *
+ * ```json
+ * {"type": "exact",  "value": "api.example.com"}
+ * {"type": "suffix", "value": ".example.com"}
+ * {"type": "cidr",   "value": "10.0.0.0/8"}
+ * ```
+ *
+ * A bare JSON string is still accepted on deserialization and resolves to `Exact`,
+ * preserving configs written against the previous untagged representation.
+ *
+ * `Exact`: HostMatcher::Exact
+ */
+typedef struct XBERGHostMatcher XBERGHostMatcher;
 /**
  * HTML metadata extracted from HTML documents.
  *
@@ -877,6 +1131,20 @@ typedef struct XBERGInlineType XBERGInlineType;
  */
 typedef struct XBERGJatsMetadata XBERGJatsMetadata;
 /**
+ * Controls how Jupyter notebook code cells are rendered during extraction.
+ *
+ * A code cell carries both its **source** and any **outputs** that were saved in
+ * the notebook. Callers ingesting notebooks for AI agents want different slices of
+ * this depending on the task. Xberg never executes cells â `Outputs` and `Both`
+ * only surface outputs already stored in the `.ipynb`.
+ *
+ * This toggle governs a code cell's **source body** and its **saved outputs**.
+ * Markdown (prose) cells and structural markers (kernel language, cell id, tags,
+ * execution count) are unaffected â prose always renders and markers orient the
+ * reader regardless of mode.
+ */
+typedef struct XBERGJupyterCellRendering XBERGJupyterCellRendering;
+/**
  * Extracted keyword with metadata.
  */
 typedef struct XBERGKeyword XBERGKeyword;
@@ -889,9 +1157,45 @@ typedef struct XBERGKeywordAlgorithm XBERGKeywordAlgorithm;
  */
 typedef struct XBERGKeywordConfig XBERGKeywordConfig;
 /**
+ * Structured per-language detection result: confidence, document share, and script â
+ * the information the ISO-code-only `detected_languages` list cannot convey (#261).
+ *
+ * Populated by `language_detection` alongside `detected_languages`, with one
+ * entry per language, in the same order as `detected_languages`.
+ */
+typedef struct XBERGLanguageConfidence XBERGLanguageConfidence;
+/**
  * Language detection configuration.
  */
 typedef struct XBERGLanguageDetectionConfig XBERGLanguageDetectionConfig;
+/**
+ * Configuration for the late-interaction (ColBERT) pipeline.
+ *
+ * Controls which model to use, batching, and download/cache behavior for the
+ * local ONNX ColBERT model.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGLateInteractionConfig XBERGLateInteractionConfig;
+/**
+ * A single document match returned by `max_sim_rank`, with its position in
+ * the input and MaxSim score.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGLateInteractionMatch XBERGLateInteractionMatch;
+/**
+ * Late-interaction model types supported by Xberg.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGLateInteractionModelType XBERGLateInteractionModelType;
+/**
+ * Static metadata for a bundled ColBERT preset (WASM/Android-safe, no ORT).
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGLateInteractionPreset XBERGLateInteractionPreset;
 /**
  * The 18 canonical document layout classes.
  *
@@ -923,17 +1227,56 @@ typedef struct XBERGLayoutDetectionConfig XBERGLayoutDetectionConfig;
  */
 typedef struct XBERGLayoutRegion XBERGLayoutRegion;
 /**
+ * Which PDF pages the layout model runs on.
+ *
+ * Layout detection renders each selected page to a raster and runs ONNX
+ * inference on it, which dominates extraction cost. This controls page
+ * selection; `LayoutStrategy.Always` preserves the historical behavior of
+ * running on every page. Wire format is snake_case in all serializers
+ * (JSON, TOML, YAML).
+ */
+typedef struct XBERGLayoutStrategy XBERGLayoutStrategy;
+/**
  * Link element metadata.
  */
 typedef struct XBERGLinkMetadata XBERGLinkMetadata;
+/**
+ * Link rendering style in Markdown output.
+ *
+ * Controls whether links and images use inline `text (url)` syntax or
+ * reference-style ``text`[1]` syntax with definitions collected at the end.
+ */
+typedef struct XBERGLinkStyle XBERGLinkStyle;
 /**
  * Link type classification.
  */
 typedef struct XBERGLinkType XBERGLinkType;
 /**
+ * List indentation character type.
+ *
+ * Controls whether list items are indented with spaces or tabs.
+ */
+typedef struct XBERGListIndentType XBERGListIndentType;
+/**
  * Type of list detection.
  */
 typedef struct XBERGListType XBERGListType;
+/**
+ * Budget enforcement configuration.
+ *
+ * Mirrors liter-llm's `LlmBudgetConfig`. Only takes effect when liter-llm's `tower`
+ * feature is compiled in; otherwise the value round-trips through configuration
+ * but is not enforced at request time.
+ */
+typedef struct XBERGLlmBudgetConfig XBERGLlmBudgetConfig;
+/**
+ * Response cache configuration.
+ *
+ * Mirrors liter-llm's `LlmCacheConfig`. Only takes effect when liter-llm's `tower`
+ * feature is compiled in; otherwise the value round-trips through configuration
+ * but is not consulted at request time.
+ */
+typedef struct XBERGLlmCacheConfig XBERGLlmCacheConfig;
 /**
  * Configuration for an LLM provider/model via liter-llm.
  *
@@ -943,9 +1286,26 @@ typedef struct XBERGListType XBERGListType;
  * `structured_extraction.llm`
  * model = "openai/gpt-4o"
  * api_key = "sk-..."  # or use XBERG_LLM_API_KEY env var
+ *
+ * `Debug` is implemented by hand so `api_key`, header values, and the AWS
+ * credentials in `BedrockConfig` are never printed.
  * \\endcode
  */
 typedef struct XBERGLlmConfig XBERGLlmConfig;
+/**
+ * A custom provider configuration entry, in addition to liter-llm's built-in providers.
+ *
+ * Mirrors liter-llm's `LlmProviderConfig`.
+ */
+typedef struct XBERGLlmProviderConfig XBERGLlmProviderConfig;
+/**
+ * Per-model rate limiting configuration.
+ *
+ * Mirrors liter-llm's `LlmRateLimitConfig`. Only takes effect when liter-llm's
+ * `tower` feature is compiled in; otherwise the value round-trips through
+ * configuration but is not enforced at request time.
+ */
+typedef struct XBERGLlmRateLimitConfig XBERGLlmRateLimitConfig;
 /**
  * Token usage and cost data for a single LLM call made during extraction.
  *
@@ -982,6 +1342,17 @@ typedef struct XBERGMetadata XBERGMetadata;
  */
 typedef struct XBERGModelPaths XBERGModelPaths;
 /**
+ * A ColBERT multi-vector embedding: one row per attention-live token.
+ *
+ * `data` is a flat, row-major buffer of length `num_tokens * dim` â row `i`
+ * (the embedding for token `i`) occupies `data[i*dim .. (i+1)*dim]`. Flat
+ * storage keeps the type FFI-friendly across binding boundaries; use
+ * `MultiVectorEmbedding.rows` internally to iterate per-token slices.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGMultiVectorEmbedding XBERGMultiVectorEmbedding;
+/**
  * Input signals for multi-document boundary detection.
  */
 typedef struct XBERGMultidocInput XBERGMultidocInput;
@@ -999,6 +1370,12 @@ typedef struct XBERGNerBackendKind XBERGNerBackendKind;
  * Configuration for the NER post-processor.
  */
 typedef struct XBERGNerConfig XBERGNerConfig;
+/**
+ * Line break syntax in Markdown output.
+ *
+ * Controls how soft line breaks (from `<br>` or line breaks in source) are rendered.
+ */
+typedef struct XBERGNewlineStyle XBERGNewlineStyle;
 /**
  * Reason for not chunking a document.
  */
@@ -1042,11 +1419,10 @@ typedef struct XBERGNodeContent XBERGNodeContent;
  * impl OcrBackend for CustomOcrBackend {
  *     async fn process_image(&self, image_bytes: &`u8`, config: &OcrConfig) -> Result<ExtractedDocument> {
  *         // Implement OCR logic here
- *         Ok(ExtractedDocument {
- *             content: "Extracted text".to_string(),
- *             mime_type: Cow::Borrowed("text/plain"),
- *             ..Default::default()
- *         })
+ *         let mut document = ExtractedDocument::default();
+ *         document.content = "Extracted text".to_string();
+ *         document.mime_type = Cow::Borrowed("text/plain");
+ *         Ok(document)
  *     }
  *
  *     async fn process_image_file(&self, path: &Path, config: &OcrConfig) -> Result<ExtractedDocument> {
@@ -1125,7 +1501,10 @@ typedef struct XBERGOcrMetadata XBERGOcrMetadata;
  *
  * Backends are tried in priority order (highest first). After each backend
  * produces output, quality is evaluated. If it meets `quality_thresholds.pipeline_min_quality`,
- * the result is accepted. Otherwise the next backend is tried.
+ * the result is accepted. Otherwise the next backend is tried; if none clears the
+ * threshold, an internal selection policy derived from the `OcrConfig` decides which
+ * stage's result is returned as the best effort (`vlm_fallback` pipelines prefer their
+ * last non-empty stage; explicit and classical pipelines stay score-based).
  */
 typedef struct XBERGOcrPipelineConfig XBERGOcrPipelineConfig;
 /**
@@ -1143,6 +1522,20 @@ typedef struct XBERGOcrQualityThresholds XBERGOcrQualityThresholds;
  * Rotation information for an OCR element.
  */
 typedef struct XBERGOcrRotation XBERGOcrRotation;
+/**
+ * Which pages of a PDF get OCR'd when neither `force_ocr` nor `force_ocr_pages` applies.
+ * \\code
+ * use xberg::{ExtractionConfig, OcrStrategy};
+ *
+ * // OCR pages that look like scans; keep native text everywhere else.
+ * let config = ExtractionConfig {
+ *     ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+ *     ..Default::default()
+ * };
+ * assert!(matches!(config.ocr_strategy, OcrStrategy::ScannedPages { .. }));
+ * \\endcode
+ */
+typedef struct XBERGOcrStrategy XBERGOcrStrategy;
 /**
  * Table detected via OCR.
  *
@@ -1163,14 +1556,26 @@ typedef struct XBERGOrientationResult XBERGOrientationResult;
  * Controls the format of the `content` field in `ExtractedDocument`.
  * When set to `Markdown`, `Djot`, or `Html`, the output uses that format.
  * `Plain` returns the raw extracted text.
- * `Structured` returns JSON with full OCR element data including bounding
- * boxes and confidence scores.
+ * `Structured` is currently a metadata-only label: `derive_extraction_result`
+ * returns `None` for it (see `extraction/derive.rs`), so no renderer runs and
+ * the content is left exactly as `Plain` would leave it. Only
+ * `metadata.output_format` differs. It does NOT attach OCR element data,
+ * bounding boxes or confidence scores.
  */
 typedef struct XBERGOutputFormat XBERGOutputFormat;
 /**
  * Page Segmentation Mode for Tesseract OCR.
  */
 typedef struct XBERGPSMMode XBERGPSMMode;
+/**
+ * Which concrete ONNX inference engine PaddleOCR model loading uses.
+ *
+ * Mirrors `sceptre::Backend` for the PaddleOCR backend: `Ort` is the native,
+ * full-featured path (acceleration/execution-provider hook, ONNX-embedded
+ * dictionary metadata); `Tract` is the pure-Rust, CPU-only path used on targets
+ * where `ort` cannot link (Android x86_64 emulator, WASM once wired).
+ */
+typedef struct XBERGPaddleInferenceBackend XBERGPaddleInferenceBackend;
 /**
  * Supported languages in PaddleOCR.
  *
@@ -1263,6 +1668,12 @@ typedef struct XBERGPageRange XBERGPageRange;
  * Per-page signals extracted from PDF content.
  */
 typedef struct XBERGPageSignals XBERGPageSignals;
+/**
+ * A single page covered by a chunk, with an optional bounding box on that page.
+ *
+ * See `ChunkMetadata.page_spans` (#1295) for population semantics.
+ */
+typedef struct XBERGPageSpan XBERGPageSpan;
 /**
  * Unified page structure for documents.
  *
@@ -1445,6 +1856,16 @@ typedef struct XBERGPptxExtractionResult XBERGPptxExtractionResult;
  */
 typedef struct XBERGPptxMetadata XBERGPptxMetadata;
 /**
+ * HTML preprocessing options for document cleanup before conversion.
+ */
+typedef struct XBERGPreprocessingOptions XBERGPreprocessingOptions;
+/**
+ * HTML preprocessing aggressiveness level.
+ *
+ * Controls the extent of cleanup performed before conversion. Higher levels remove more elements.
+ */
+typedef struct XBERGPreprocessingPreset XBERGPreprocessingPreset;
+/**
  * A curated structured-extraction preset loaded from the embedded library.
  *
  * Each preset is a JSON file under `src/presets/library/<id>/v1.json` that
@@ -1469,6 +1890,10 @@ typedef struct XBERGPresetSample XBERGPresetSample;
  */
 typedef struct XBERGPresetSummary XBERGPresetSummary;
 /**
+ * Outcome of a single doctor check.
+ */
+typedef struct XBERGProbeStatus XBERGProbeStatus;
+/**
  * Processing stages for post-processors.
  *
  * Post-processors are executed in stage order (Early â Middle â Late).
@@ -1482,6 +1907,15 @@ typedef struct XBERGProcessingStage XBERGProcessingStage;
  * but may indicate degraded results.
  */
 typedef struct XBERGProcessingWarning XBERGProcessingWarning;
+/**
+ * A single run-level or style-level property change.
+ *
+ * Used for revisions that change formatting rather than text content. `from`
+ * and `to` store normalized property values when the source format exposes
+ * them; either side may be absent when the format only records one side of the
+ * change.
+ */
+typedef struct XBERGPropertyChange XBERGPropertyChange;
 /**
  * Proxy configuration for HTTP requests.
  */
@@ -1666,6 +2100,21 @@ typedef struct XBERGRerankerBackend XBERGRerankerBackend;
  */
 typedef struct XBERGRerankerConfig XBERGRerankerConfig;
 /**
+ * Selects how a local ONNX reranker's raw output tensor is turned into a score.
+ *
+ * - `RerankerHead.CrossEncoder` â classic single-logit cross-encoder head:
+ *   the model emits `[batch, 1]` (or ``batch``) logits; the caller applies
+ *   sigmoid to get a `[0, 1]` score. This is the original, unchanged path.
+ * - `RerankerHead.Qwen3Generative` â Qwen3 generative-reranker head: the
+ *   model emits `[batch, seq, vocab]` logits; the score is `P("yes")` read
+ *   from the last token's logits over the "yes"/"no" vocabulary entries,
+ *   via a softmax over those two logits. Already a `[0, 1]` probability â
+ *   no sigmoid is applied.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGRerankerHead XBERGRerankerHead;
+/**
  * Reranker model types supported by Xberg.
  *
  * Since v5.0.0.
@@ -1693,8 +2142,8 @@ typedef struct XBERGRevisionAnchor XBERGRevisionAnchor;
  *
  * For insertions and deletions the `content` field carries the added/removed
  * lines as `DiffLine::Added` / `DiffLine::Removed` entries. For format
- * changes, `content` is empty â the property diff is left as a TODO for a
- * later enrichment pass.
+ * changes, `property_changes` carries normalized before/after formatting
+ * values when the source document exposes them.
  */
 typedef struct XBERGRevisionDelta XBERGRevisionDelta;
 /**
@@ -1734,6 +2183,37 @@ typedef struct XBERGServerConfig XBERGServerConfig;
  * A URL entry from a sitemap.
  */
 typedef struct XBERGSitemapUrl XBERGSitemapUrl;
+/**
+ * A sparse learned embedding: vocabulary term indices and their weights.
+ *
+ * `indices` are ascending vocabulary token ids; `values`i`` is the weight for
+ * `indices`i``. The two arrays always have equal length. Only strictly-positive
+ * terms are retained, so the representation is genuinely sparse.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGSparseEmbedding XBERGSparseEmbedding;
+/**
+ * Configuration for the sparse-embedding pipeline.
+ *
+ * Controls which model to use, batching, and download/cache behavior for the
+ * local ONNX SPLADE model.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGSparseEmbeddingConfig XBERGSparseEmbeddingConfig;
+/**
+ * Sparse-embedding model types supported by Xberg.
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGSparseEmbeddingModelType XBERGSparseEmbeddingModelType;
+/**
+ * Static metadata for a bundled SPLADE preset (WASM/Android-safe, no ORT).
+ *
+ * Since v5.0.0.
+ */
+typedef struct XBERGSparseEmbeddingPreset XBERGSparseEmbeddingPreset;
 /**
  * SSRF policy configuration.
  */
@@ -1998,6 +2478,21 @@ typedef struct XBERGTreeSitterProcessConfig XBERGTreeSitterProcessConfig;
  */
 typedef struct XBERGUriKind XBERGUriKind;
 /**
+ * URL encoding strategy for link and image destinations.
+ *
+ * Controls how special characters in URL destinations are handled when they
+ * require escaping to produce valid Markdown.
+ *
+ * The `Angle` variant (default) wraps the destination in angle brackets:
+ * `text (<url with spaces>)`. This is the CommonMark-specified escape hatch
+ * but breaks when the URL itself contains `>`.
+ *
+ * The `Percent` variant percent-encodes every character that is not an RFC 3986
+ * unreserved character or `/`, producing a destination safe for all Markdown
+ * parsers: `text (url%20with%20spaces)`.
+ */
+typedef struct XBERGUrlEscapeStyle XBERGUrlEscapeStyle;
+/**
  * URL ingestion and crawl configuration.
  */
 typedef struct XBERGUrlExtractionConfig XBERGUrlExtractionConfig;
@@ -2113,6 +2608,12 @@ typedef struct XBERGVlmFallbackPolicy XBERGVlmFallbackPolicy;
  */
 typedef struct XBERGWhisperModel XBERGWhisperModel;
 /**
+ * Whitespace handling strategy during conversion.
+ *
+ * Determines how sequences of whitespace characters (spaces, tabs, newlines) are processed.
+ */
+typedef struct XBERGWhitespaceMode XBERGWhitespaceMode;
+/**
  * Application properties from docProps/app.xml for XLSX
  *
  * Contains Excel-specific document metadata.
@@ -2142,319 +2643,379 @@ typedef struct XBERGYearRange XBERGYearRange;
 """
 [defines]
 "target_os = windows" = "SKIF_WINDOWS"
+"feature = \"api\"" = "XBERG_FEATURE_API"
+"feature = \"api-types\"" = "XBERG_FEATURE_API_TYPES"
+"feature = \"auto-rotate-types\"" = "XBERG_FEATURE_AUTO_ROTATE_TYPES"
+"feature = \"classification\"" = "XBERG_FEATURE_CLASSIFICATION"
+"feature = \"diff\"" = "XBERG_FEATURE_DIFF"
+"feature = \"embedding-presets\"" = "XBERG_FEATURE_EMBEDDING_PRESETS"
+"feature = \"heuristics\"" = "XBERG_FEATURE_HEURISTICS"
+"feature = \"html\"" = "XBERG_FEATURE_HTML"
+"feature = \"keywords-rake\"" = "XBERG_FEATURE_KEYWORDS_RAKE"
+"feature = \"keywords-yake\"" = "XBERG_FEATURE_KEYWORDS_YAKE"
+"feature = \"late-interaction\"" = "XBERG_FEATURE_LATE_INTERACTION"
+"feature = \"late-interaction-presets\"" = "XBERG_FEATURE_LATE_INTERACTION_PRESETS"
+"feature = \"layout-types\"" = "XBERG_FEATURE_LAYOUT_TYPES"
+"feature = \"liter-llm\"" = "XBERG_FEATURE_LITER_LLM"
+"feature = \"markdown-footnotes\"" = "XBERG_FEATURE_MARKDOWN_FOOTNOTES"
+"feature = \"ocr\"" = "XBERG_FEATURE_OCR"
+"feature = \"ocr-wasm\"" = "XBERG_FEATURE_OCR_WASM"
+"feature = \"office\"" = "XBERG_FEATURE_OFFICE"
+"feature = \"paddle-ocr-types\"" = "XBERG_FEATURE_PADDLE_OCR_TYPES"
+"feature = \"pdf\"" = "XBERG_FEATURE_PDF"
+"feature = \"presets\"" = "XBERG_FEATURE_PRESETS"
+"feature = \"quality\"" = "XBERG_FEATURE_QUALITY"
+"feature = \"redaction\"" = "XBERG_FEATURE_REDACTION"
+"feature = \"reranker\"" = "XBERG_FEATURE_RERANKER"
+"feature = \"reranker-presets\"" = "XBERG_FEATURE_RERANKER_PRESETS"
+"feature = \"sparse-embedding-presets\"" = "XBERG_FEATURE_SPARSE_EMBEDDING_PRESETS"
+"feature = \"sparse-embeddings\"" = "XBERG_FEATURE_SPARSE_EMBEDDINGS"
+"feature = \"svg\"" = "XBERG_FEATURE_SVG"
+"feature = \"tokio-runtime\"" = "XBERG_FEATURE_TOKIO_RUNTIME"
+"feature = \"transcription\"" = "XBERG_FEATURE_TRANSCRIPTION"
+"feature = \"transcription-types\"" = "XBERG_FEATURE_TRANSCRIPTION_TYPES"
+"feature = \"tree-sitter\"" = "XBERG_FEATURE_TREE_SITTER"
+"feature = \"url-ingestion\"" = "XBERG_FEATURE_URL_INGESTION"
 
 [export]
 prefix = "XBERG"
 include = []
 exclude = [
-    "AnchorProperties",
-    "ApiDoc",
-    "ApiError",
-    "ApiSizeLimits",
-    "ApiState",
-    "ArchiveArchiveEntry",
-    "ArchiveArchiveMetadata",
-    "Attributes",
-    "AudioTags",
-    "Batch",
-    "BatchItemResult",
-    "BatchProcessor",
-    "BatchProcessorConfig",
-    "BibtexExtractor",
-    "BorderStyle",
-    "BuiltPrompt",
-    "ByteBufferPool",
-    "CacheBackend",
-    "CacheClearResponse",
-    "CacheStatsResponse",
-    "CacheWarmParams",
-    "CancellationToken",
-    "CandleModelId",
-    "CandleOcrConfig",
-    "CaptioningEnrichmentConfig",
-    "CaptioningProcessor",
-    "CellBBox",
-    "CellBorders",
-    "CellMargins",
-    "CellProperties",
-    "CellShading",
-    "CharShape",
-    "ChunkPlan",
-    "ChunkerConfig",
-    "ChunkingDecision",
-    "ChunkingProcessor",
-    "ChunkingResult",
-    "CitationExtractor",
-    "CitationOutput",
-    "CitationSource",
-    "CitedField",
-    "ClassificationEnrichmentConfig",
-    "ClassifyContext",
-    "CodeExtractor",
-    "ColorScheme",
-    "ColumnLayout",
-    "CommonPdfMetadata",
-    "ConcurrencyConfig",
-    "ConfidenceSignals",
-    "ConfidenceWeights",
-    "CorePresetResolver",
-    "CsvExtractor",
-    "CustomModelVariant",
-    "CustomProperties",
-    "DbfExtractor",
-    "DeepseekOcrBackend",
-    "DefaultModelProvider",
-    "DefaultStructuredPolicy",
-    "DetectMimeTypeParams",
-    "DetectTimings",
-    "DetectedBoundary",
-    "DjotExtractor",
-    "DocExtractor",
-    "DocOrientationDetector",
-    "DocProperties",
-    "DocbookExtractor",
-    "DoclingCompatDocument",
-    "DoclingCompatResponse",
-    "Document",
-    "DocumentExtractorRegistry",
-    "DocumentStructureBuilder",
-    "DocxExtractor",
-    "Drawing",
-    "DrawingType",
-    "ElementId",
-    "ElementKind",
-    "EmailExtractor",
-    "EmbedError",
-    "EmbeddingBackendRegistry",
-    "EmbeddingEngine",
-    "EmbeddingPreset",
-    "Engine",
-    "EngineBuilder",
-    "EnrichOptions",
-    "EnrichResult",
-    "EnrichStatus",
-    "EnrichedResult",
-    "EnrichmentConfig",
-    "EpubExtractor",
-    "ErrorResponse",
-    "ExcelExtractor",
-    "Extent",
-    "ExtractBatchParams",
-    "ExtractParams",
-    "ExtractedInlineImage",
-    "ExtractionMetrics",
-    "ExtractionRequest",
-    "ExtractionResult2",
-    "ExtractionService",
-    "ExtractionServiceBuilder",
-    "ExtractionSource",
-    "FictionBookExtractor",
-    "FileBytes",
-    "FileHeader",
-    "FontScheme",
-    "GenericCache",
-    "GlineBackend",
-    "GlinerManifestEntry",
-    "GlmOcrBackend",
-    "GzipExtractor",
-    "HeaderFooter",
-    "HeaderFooterType",
-    "HealthResponse",
-    "HierarchyBoundingBox",
-    "HocrWord",
-    "HtmlExtractionResult",
-    "HtmlExtractor",
-    "HunyuanOcrBackend",
-    "HwpDocument",
-    "HwpError",
-    "HwpExtractor",
-    "HwpImage",
-    "HwpxExtractor",
-    "ImageDpiConfig",
-    "ImageExtractor",
-    "ImageOcrResult",
-    "InfoResponse",
-    "InternalDocument",
-    "InternalDocumentBuilder",
-    "InternalDocumentExtractor",
-    "InternalElement",
-    "InternalElementId",
-    "InternedString",
-    "JatsExtractor",
-    "JsonExtractionConfig",
-    "JupyterExtractor",
-    "KeynoteExtractor",
-    "KeywordExtractor",
-    "LanguageDetector",
-    "LanguageRegistry",
-    "LatexExtractor",
-    "LayoutEngine",
-    "LayoutEngineConfig",
-    "LayoutError",
-    "LayoutMode",
-    "LayoutModel",
-    "LayoutModelManager",
-    "ListItemMetadata",
-    "LiterLlmClient",
-    "LlmBackend",
-    "LlmClient",
-    "ManifestEntryResponse",
-    "ManifestResponse",
-    "MarkdownExtractor",
-    "MdxExtractor",
-    "MergedChunk",
-    "MergedOutput",
-    "MetricsLayer",
-    "ModelBackend",
-    "ModelCacheStats",
-    "ModelId",
-    "ModelManager",
-    "ModelManifestEntry",
-    "ModelParagraph",
-    "ModelProvider",
-    "NerBackend",
-    "NerEnrichmentConfig",
-    "NerProcessor",
-    "NodeId",
-    "NoopCache",
-    "NoopProgressSink",
-    "NormalizeResult",
-    "Note",
-    "NoteType",
-    "NumbersExtractor",
-    "OcrBackendRegistry",
-    "OcrCache",
-    "OcrCacheStats",
-    "OcrError",
-    "OcrProcessor",
-    "OcrTesseractConfig",
-    "OdtExtractor",
-    "OdtProperties",
-    "OpenWebDocumentMetadata",
-    "OpenWebDocumentResponse",
-    "OpmlExtractor",
-    "OrgModeExtractor",
-    "Orientation",
-    "Outcome",
-    "PaddleOcrBackend",
-    "PaddleOcrVlBackend",
-    "PageClassificationProcessor",
-    "PageImage",
-    "PageMargins",
-    "PageMarginsPoints",
-    "PagesExtractor",
-    "ParaText",
-    "Paragraph",
-    "ParagraphProperties",
-    "ParsedDocument",
-    "ParserTable",
-    "ParserTableCell",
-    "PcmAudio",
-    "PdfError",
-    "PdfExtractionMetadata",
-    "PdfExtractor",
-    "PlainTextExtractor",
-    "PluginHealthStatus",
-    "PoolMetrics",
-    "PoolSizeHint",
-    "Pooling",
-    "Position",
-    "PostProcessorRegistry",
-    "PpDocLayoutV3Model",
-    "PptExtractionResult",
-    "PptExtractor",
-    "PptMetadata",
-    "PptxExtractionOptions",
-    "PptxExtractor",
-    "PresetResolver",
-    "ProgressEvent",
-    "ProgressSink",
-    "PstExtractor",
-    "QrCodeProcessor",
-    "QualityProcessor",
-    "RecModelPaths",
-    "Record",
-    "Recyclable",
-    "RedactionProcessor",
-    "Relationship",
-    "RelationshipTarget",
-    "RendererRegistry",
-    "RerankError",
-    "RerankerBackendRegistry",
-    "RerankerEngine",
-    "RerankerPreset",
-    "ResolvedRecModel",
-    "ResolvedStyle",
-    "RowProperties",
-    "RstExtractor",
-    "RtDetrModel",
-    "RtfExtractor",
-    "Run",
-    "RunProperties",
-    "Section",
-    "SectionProperties",
-    "SecurityError",
-    "Segment",
-    "SevenZExtractor",
-    "SharedModelPaths",
-    "SlanetCell",
-    "SlanetModel",
-    "SlanetResult",
-    "StreamReader",
-    "StringBufferPool",
-    "StructuredCallMode",
-    "StructuredExtractor",
-    "StructuredInput",
-    "StructuredPolicy",
-    "StructuredThresholds",
-    "StyleCatalog",
-    "StyleDefinition",
-    "StyleType",
-    "StyledHtmlRenderer",
-    "SummarizationProcessor",
-    "Table2",
-    "TableBorders",
-    "TableClassifier",
-    "TableLook",
-    "TableProperties",
-    "TableRow",
-    "TableTableGrid",
-    "TableType",
-    "TableWidth",
-    "TarExtractor",
-    "TatrClass",
-    "TatrDetection",
-    "TatrModel",
-    "TatrResult",
-    "TessdataManager",
-    "TesseractBackend",
-    "TesseractWasmBackend",
-    "Theme",
-    "ThemeColor",
-    "TokenReducer",
-    "TokenizerBackendRegistry",
-    "TracingLayer",
-    "TranscriptionError",
-    "TranscriptionExtractor",
-    "TranslationProcessor",
-    "TrocrBackend",
-    "TsvRow",
-    "TypstExtractor",
-    "ValidatorRegistry",
-    "VersionResponse",
-    "VerticalMerge",
-    "VlmOcrBackend",
-    "WarmRequest",
-    "WarmResponse",
-    "WhisperEngine",
-    "WhisperModelError",
-    "WhisperModelPaths",
-    "WrapType",
-    "XmlExtractor",
-    "YoloModel",
-    "YoloVariant",
-    "ZipBombValidator",
-    "ZipExtractor",
+  "AnchorProperties",
+  "ApiDoc",
+  "ApiError",
+  "ApiSizeLimits",
+  "ApiState",
+  "ArchiveArchiveEntry",
+  "ArchiveArchiveMetadata",
+  "AsciiDocExtractor",
+  "Attributes",
+  "AudioTags",
+  "Batch",
+  "BatchItemResult",
+  "BatchProcessor",
+  "BatchProcessorConfig",
+  "BibtexExtractor",
+  "BorderStyle",
+  "BuiltPrompt",
+  "ByteBufferPool",
+  "CacheBackend",
+  "CacheClearResponse",
+  "CacheStatsResponse",
+  "CacheWarmParams",
+  "CancellationToken",
+  "CandleBackend",
+  "CandleModelId",
+  "CandleOcrConfig",
+  "CaptioningEnrichmentConfig",
+  "CaptioningProcessor",
+  "CellBBox",
+  "CellBorders",
+  "CellMargins",
+  "CellProperties",
+  "CellShading",
+  "CharShape",
+  "ChunkClassificationProcessor",
+  "ChunkPlan",
+  "ChunkerConfig",
+  "ChunkingDecision",
+  "ChunkingProcessor",
+  "ChunkingResult",
+  "CitationExtractor",
+  "CitationOutput",
+  "CitationSource",
+  "CitedField",
+  "ClassificationEnrichmentConfig",
+  "ClassifyContext",
+  "CleanOutcome",
+  "CodeExtractor",
+  "ColorScheme",
+  "ColumnLayout",
+  "Comment",
+  "CommonPdfMetadata",
+  "ConcurrencyConfig",
+  "ConfidenceSignals",
+  "ConfidenceWeights",
+  "CorePresetResolver",
+  "CsvExtractor",
+  "CustomModelVariant",
+  "CustomProperties",
+  "DbfExtractor",
+  "DeepseekOcrBackend",
+  "DefaultModelProvider",
+  "DefaultStructuredPolicy",
+  "DetectMimeTypeParams",
+  "DetectTimings",
+  "DetectedBoundary",
+  "DiagramEdge",
+  "DiagramGraph",
+  "DiagramNode",
+  "DiagramShape",
+  "DjotExtractor",
+  "DocExtractor",
+  "DocOrientationDetector",
+  "DocProperties",
+  "DocTagsExtractor",
+  "DocbookExtractor",
+  "DoclingCompatDocument",
+  "DoclingCompatResponse",
+  "Document",
+  "DocumentExtractorRegistry",
+  "DocumentStructureBuilder",
+  "DocxExtractor",
+  "Drawing",
+  "DrawingType",
+  "ElementId",
+  "ElementKind",
+  "EmailExtractor",
+  "EmbedError",
+  "EmbeddingBackendRegistry",
+  "EmbeddingEngine",
+  "EmbeddingPreset",
+  "Engine",
+  "EngineBuilder",
+  "EnrichOptions",
+  "EnrichResult",
+  "EnrichStatus",
+  "EnrichedResult",
+  "EnrichmentConfig",
+  "EpubExtractor",
+  "ErrorResponse",
+  "ExcelExtractor",
+  "Extent",
+  "ExtractBatchParams",
+  "ExtractParams",
+  "ExtractedInlineImage",
+  "ExtractionMetrics",
+  "ExtractionRequest",
+  "ExtractionResult2",
+  "ExtractionService",
+  "ExtractionServiceBuilder",
+  "ExtractionSource",
+  "FictionBookExtractor",
+  "FileBytes",
+  "FileHeader",
+  "FinalizedOutput",
+  "FontScheme",
+  "GenericCache",
+  "GlineBackend",
+  "GlinerManifestEntry",
+  "GlmOcrBackend",
+  "GzipExtractor",
+  "HeaderFooter",
+  "HeaderFooterType",
+  "HealthResponse",
+  "HierarchyBoundingBox",
+  "HocrWord",
+  "HtmlExtractionResult",
+  "HtmlExtractor",
+  "HwpDocument",
+  "HwpError",
+  "HwpExtractor",
+  "HwpImage",
+  "HwpTable",
+  "HwpxExtractor",
+  "ImageDpiConfig",
+  "ImageExtractor",
+  "ImageOcrResult",
+  "InfoResponse",
+  "InternalDocument",
+  "InternalDocumentBuilder",
+  "InternalDocumentExtractor",
+  "InternalElement",
+  "InternalElementId",
+  "InternedString",
+  "JatsExtractor",
+  "JsonExtractionConfig",
+  "JupyterExtractor",
+  "KeynoteExtractor",
+  "KeywordExtractor",
+  "LanguageDetector",
+  "LateInteractionEngine",
+  "LateInteractionError",
+  "LatexExtractor",
+  "LayoutEngine",
+  "LayoutEngineConfig",
+  "LayoutError",
+  "LayoutMode",
+  "LayoutModel",
+  "LayoutModelManager",
+  "ListItemMetadata",
+  "LiterLlmClient",
+  "LlmBackend",
+  "LlmClient",
+  "ManifestEntryResponse",
+  "ManifestResponse",
+  "MarkdownExtractor",
+  "MdxExtractor",
+  "MergedChunk",
+  "MergedOutput",
+  "MetricsLayer",
+  "ModelBackend",
+  "ModelCacheStats",
+  "ModelId",
+  "ModelManager",
+  "ModelManifestEntry",
+  "ModelParagraph",
+  "ModelProvider",
+  "NerBackend",
+  "NerEnrichmentConfig",
+  "NerProcessor",
+  "NoopCache",
+  "NoopProgressSink",
+  "NormalizeResult",
+  "Note",
+  "NoteType",
+  "NumbersExtractor",
+  "OcrBackendRegistry",
+  "OcrCache",
+  "OcrCacheStats",
+  "OcrError",
+  "OcrProcessor",
+  "OcrTesseractConfig",
+  "OdpExtractor",
+  "OdtExtractor",
+  "OdtProperties",
+  "OpenWebDocumentMetadata",
+  "OpenWebDocumentResponse",
+  "OpmlExtractor",
+  "OrgModeExtractor",
+  "Orientation",
+  "Outcome",
+  "PaddleOcrBackend",
+  "PaddleOcrVlBackend",
+  "PageClassificationProcessor",
+  "PageImage",
+  "PageMargins",
+  "PageMarginsPoints",
+  "PagesExtractor",
+  "ParaText",
+  "Paragraph",
+  "ParagraphProperties",
+  "ParsedDocument",
+  "ParserTable",
+  "ParserTableCell",
+  "PcmAudio",
+  "PdfError",
+  "PdfExtractionMetadata",
+  "PdfExtractor",
+  "PlainTextExtractor",
+  "PluginHealthStatus",
+  "PoolMetrics",
+  "PoolSizeHint",
+  "Pooling",
+  "Position",
+  "PostProcessorRegistry",
+  "PpDocLayoutV3Model",
+  "PptExtractionResult",
+  "PptExtractor",
+  "PptMetadata",
+  "PptSlideText",
+  "PptxExtractionOptions",
+  "PptxExtractor",
+  "PresetResolver",
+  "ProgressEvent",
+  "ProgressSink",
+  "PstExtractor",
+  "QrCodeProcessor",
+  "QualityProcessor",
+  "RecModelPaths",
+  "Record",
+  "Recyclable",
+  "RedactionProcessor",
+  "RehydrationMap",
+  "Relationship",
+  "RelationshipTarget",
+  "RendererRegistry",
+  "RerankError",
+  "RerankerBackendRegistry",
+  "RerankerEngine",
+  "RerankerPreset",
+  "ResolvedRecModel",
+  "ResolvedStyle",
+  "RowProperties",
+  "RstExtractor",
+  "RtDetrModel",
+  "RtfExtractor",
+  "Run",
+  "RunProperties",
+  "SceptreOcrBackend",
+  "SceptreWasmEngine",
+  "Section",
+  "SectionProperties",
+  "SecurityError",
+  "Segment",
+  "SevenZExtractor",
+  "SharedModelPaths",
+  "SlanetCell",
+  "SlanetModel",
+  "SlanetResult",
+  "SparseEmbedError",
+  "SparseEmbeddingEngine",
+  "SplitConfig",
+  "SplitSegment",
+  "SplitStrategy",
+  "StaticEmbeddingEngine",
+  "StreamReader",
+  "StringBufferPool",
+  "StructuredCallMode",
+  "StructuredExtractor",
+  "StructuredInput",
+  "StructuredPolicy",
+  "StructuredThresholds",
+  "StyleCatalog",
+  "StyleDefinition",
+  "StyleType",
+  "StyledHtmlRenderer",
+  "SubjectMatch",
+  "SummarizationProcessor",
+  "SummaryInfo",
+  "Table2",
+  "TableBorders",
+  "TableClassifier",
+  "TableLook",
+  "TableProperties",
+  "TableRow",
+  "TableTableGrid",
+  "TableType",
+  "TableWidth",
+  "TarExtractor",
+  "TatrClass",
+  "TatrDetection",
+  "TatrModel",
+  "TatrResult",
+  "TessdataManager",
+  "TesseractBackend",
+  "TesseractWasmBackend",
+  "TextWindow",
+  "Theme",
+  "ThemeColor",
+  "TokenReducer",
+  "TokenizerBackendRegistry",
+  "TracingLayer",
+  "TranscriptionError",
+  "TranscriptionExtractor",
+  "TranslationProcessor",
+  "TrocrBackend",
+  "TsvRow",
+  "TypstExtractor",
+  "ValidatorRegistry",
+  "VersionResponse",
+  "VerticalMerge",
+  "VlmOcrBackend",
+  "WarmRequest",
+  "WarmResponse",
+  "WebVttExtractor",
+  "WhisperEngine",
+  "WhisperModelError",
+  "WhisperModelPaths",
+  "WordPerfectExtractor",
+  "WrapType",
+  "XmlExtractor",
+  "YoloModel",
+  "YoloVariant",
+  "ZipBombValidator",
+  "ZipExtractor",
 ]
 
 [fn]

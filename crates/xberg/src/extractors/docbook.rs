@@ -26,10 +26,15 @@ use crate::types::internal_builder::InternalDocumentBuilder;
 use crate::types::uri::ExtractedUri;
 use crate::types::{Metadata, Table};
 use async_trait::async_trait;
-use quick_xml::Reader;
 use quick_xml::events::Event;
+
+use crate::utils::xml_utils::EntityReader;
+use std::collections::HashMap;
 #[cfg(feature = "tokio-runtime")]
 use std::path::Path;
+
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+const DOCBOOK_WARNING_SOURCE: &str = "docbook";
 
 /// Strip namespace prefix from XML tag names.
 /// Converts "{http://docbook.org/ns/docbook}title" to "title"
@@ -91,9 +96,7 @@ type DocBookParseResult = (
 /// so we wrap the content in `<_root>...</_root>` when needed.
 fn ensure_root_element(content: &str) -> std::borrow::Cow<'_, str> {
     let trimmed = content.trim_start();
-    // Skip XML declaration and DOCTYPE if present
     let body = if trimmed.starts_with("<?xml") {
-        // Find the end of the XML declaration
         trimmed
             .find("?>")
             .map(|pos| trimmed[pos + 2..].trim_start())
@@ -101,13 +104,11 @@ fn ensure_root_element(content: &str) -> std::borrow::Cow<'_, str> {
     } else {
         trimmed
     };
-    // Skip DOCTYPE
     let body = if body.starts_with("<!DOCTYPE") {
         body.find('>').map(|pos| body[pos + 1..].trim_start()).unwrap_or(body)
     } else {
         body
     };
-    // Check if the remaining content starts with a known DocBook root element
     let has_root = body.starts_with("<article")
         || body.starts_with("<book")
         || body.starts_with("<chapter")
@@ -131,14 +132,112 @@ fn ensure_root_element(content: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Pre-scan DocBook content to build a map of element `id` (or `xml:id`) to the
+/// title text of the nearest enclosing element that declares that id.
+///
+/// Used to resolve `<xref linkend="...">` and empty `<link linkend="...">`
+/// elements to human-readable text: DocBook cross-references carry no text of
+/// their own, so the reader is expected to see the target's title (or the
+/// `xreflabel` override) substituted in at render time.
+fn collect_id_titles(content: &str, budget: &mut SecurityBudget) -> Result<HashMap<String, String>> {
+    let wrapped = ensure_root_element(content);
+    let mut reader = EntityReader::from_str(&wrapped);
+    let mut map = HashMap::new();
+    let mut id_stack: Vec<Option<String>> = Vec::new();
+
+    loop {
+        budget.step()?;
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                budget.enter()?;
+                let name = e.name();
+                let tag_cow = crate::utils::xml_tag_name(name.as_ref());
+                let tag = strip_namespace(&tag_cow).to_string();
+
+                let mut id_attr = None;
+                for attr in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(attr.key.as_ref());
+                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    budget.check_attr(&key, &val)?;
+                    if key == "id" || key == "xml:id" {
+                        id_attr = Some(val.to_string());
+                    }
+                }
+
+                if tag == "title" {
+                    let text = extract_element_text(&mut reader, budget)?;
+                    if !text.is_empty()
+                        && let Some(id) = id_stack.iter().rev().flatten().next()
+                    {
+                        map.entry(id.clone()).or_insert(text);
+                    }
+                } else {
+                    id_stack.push(id_attr);
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                budget.enter()?;
+                for attr in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(attr.key.as_ref());
+                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    budget.check_attr(&key, &val)?;
+                }
+                budget.leave();
+            }
+            Ok(Event::End(_)) => {
+                budget.leave();
+                id_stack.pop();
+            }
+            Ok(Event::Text(t)) => {
+                let s = String::from_utf8_lossy(t.as_ref());
+                budget.check_entity(&s)?;
+                budget.account_text(s.trim().len())?;
+            }
+            Ok(Event::CData(t)) => {
+                let s = String::from_utf8_lossy(t.as_ref());
+                budget.check_entity(&s)?;
+                budget.account_text(s.trim().len())?;
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(crate::error::XbergError::parsing(format!("XML parsing error: {}", e)));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(map)
+}
+
+/// Resolve a `<xref>` / empty `<link>` cross-reference to display text.
+///
+/// Priority: an explicit `xreflabel` attribute wins, then the target
+/// element's title (from `xref_titles`), then a `[linkend]` fallback so the
+/// reference is never silently dropped.
+fn resolve_xref_text(linkend: Option<&str>, xreflabel: Option<&str>, xref_titles: &HashMap<String, String>) -> String {
+    if let Some(label) = xreflabel {
+        return label.to_string();
+    }
+    if let Some(id) = linkend {
+        if let Some(title) = xref_titles.get(id) {
+            return title.clone();
+        }
+        return format!("[{}]", id);
+    }
+    String::new()
+}
+
 /// Build an `InternalDocument` from DocBook XML content.
 fn build_docbook_internal_document(
     content: &str,
     inject_placeholders: bool,
     budget: &mut SecurityBudget,
 ) -> Result<InternalDocument> {
+    let mut id_budget = budget.clone();
+    let xref_titles = collect_id_titles(content, &mut id_budget)?;
+
     let wrapped = ensure_root_element(content);
-    let mut reader = Reader::from_str(&wrapped);
+    let mut reader = EntityReader::from_str(&wrapped);
     let mut builder = InternalDocumentBuilder::new("docbook");
 
     let mut title_extracted = false;
@@ -155,6 +254,7 @@ fn build_docbook_internal_document(
     let mut footnote_counter: u32 = 0;
     let mut in_list = false;
     let mut list_ordered = false;
+    let mut in_variablelist = false;
 
     loop {
         budget.step()?;
@@ -165,10 +265,14 @@ fn build_docbook_internal_document(
                 let tag_cow = crate::utils::xml_tag_name(name.as_ref());
                 let tag = strip_namespace(&tag_cow);
 
+                let mut language_attr: Option<String> = None;
                 for attr in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(attr.key.as_ref());
                     let val = String::from_utf8_lossy(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
+                    if key == "language" {
+                        language_attr = Some(val.to_string());
+                    }
                 }
 
                 match tag {
@@ -197,17 +301,14 @@ fn build_docbook_internal_document(
                     "title" if title_extracted => {
                         let text = extract_element_text(&mut reader, budget)?;
                         if !text.is_empty() {
-                            // Compute heading level relative to the depth where the document
-                            // title was extracted, so the first nested section starts at level 2.
                             let relative = section_depth.saturating_sub(title_depth);
                             let level = std::cmp::min(relative.saturating_add(1), 6);
                             builder.push_heading(level, &text, None, None);
                         }
                     }
-                    "para" => {
-                        let (text, annotations) = extract_para_with_annotations(&mut reader, budget)?;
+                    "para" | "simpara" => {
+                        let (text, annotations) = extract_para_with_annotations(&mut reader, budget, &xref_titles)?;
                         if !text.is_empty() {
-                            // Extract URIs from link annotations
                             for ann in &annotations {
                                 if let crate::types::document_structure::AnnotationKind::Link { url, .. } = &ann.kind
                                     && !url.is_empty()
@@ -222,7 +323,7 @@ fn build_docbook_internal_document(
                     "programlisting" | "screen" => {
                         let text = extract_element_text(&mut reader, budget)?;
                         if !text.is_empty() {
-                            builder.push_code(&text, None, None, None);
+                            builder.push_code(&text, language_attr.as_deref(), None, None);
                         }
                     }
                     "itemizedlist" => {
@@ -239,6 +340,21 @@ fn build_docbook_internal_document(
                         let text = extract_element_text(&mut reader, budget)?;
                         if !text.is_empty() {
                             builder.push_list_item(&text, list_ordered, vec![], None, None);
+                        }
+                    }
+                    "variablelist" => {
+                        in_variablelist = true;
+                    }
+                    "term" if in_variablelist => {
+                        let text = extract_element_text(&mut reader, budget)?;
+                        if !text.is_empty() {
+                            builder.push_definition_term(&text, None);
+                        }
+                    }
+                    "listitem" if in_variablelist => {
+                        let text = extract_element_text(&mut reader, budget)?;
+                        if !text.is_empty() {
+                            builder.push_definition_description(&text, None);
                         }
                     }
                     "blockquote" => {
@@ -315,6 +431,9 @@ fn build_docbook_internal_document(
                         builder.end_list();
                         in_list = false;
                     }
+                    "variablelist" if in_variablelist => {
+                        in_variablelist = false;
+                    }
                     "table" | "informaltable" if in_table => {
                         if !current_table.is_empty() {
                             builder.push_table_from_cells(&current_table, None, None);
@@ -364,8 +483,11 @@ fn build_docbook_internal_document(
 /// Single-pass DocBook parser that extracts all content in one document traversal.
 /// Returns: (content, title, author, date, tables, publisher, copyright)
 fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBudget) -> Result<DocBookParseResult> {
+    let mut id_budget = budget.clone();
+    let xref_titles = collect_id_titles(content, &mut id_budget)?;
+
     let wrapped = ensure_root_element(content);
-    let mut reader = Reader::from_str(&wrapped);
+    let mut reader = EntityReader::from_str(&wrapped);
     let mut output = String::new();
     let mut title = String::new();
     let mut author = Option::None;
@@ -390,6 +512,7 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
     let mut current_table: Vec<Vec<String>> = Vec::new();
     let mut current_row: Vec<String> = Vec::new();
     let mut list_type = "";
+    let mut in_variablelist = false;
 
     loop {
         budget.step()?;
@@ -400,10 +523,14 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                 let tag_cow = crate::utils::xml_tag_name(name.as_ref());
                 let tag = strip_namespace(&tag_cow);
 
+                let mut language_attr: Option<String> = None;
                 for attr in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(attr.key.as_ref());
                     let val = String::from_utf8_lossy(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
+                    if key == "language" {
+                        language_attr = Some(val.to_string());
+                    }
                 }
 
                 match tag {
@@ -456,8 +583,8 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                         }
                     }
 
-                    "para" => {
-                        let para_text = extract_element_text_with_inline(&mut reader, plain, budget)?;
+                    "para" | "simpara" => {
+                        let para_text = extract_element_text_with_inline(&mut reader, plain, budget, &xref_titles)?;
                         if !para_text.is_empty() {
                             output.push_str(&para_text);
                             output.push_str("\n\n");
@@ -468,7 +595,11 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                         let code_text = extract_element_text(&mut reader, budget)?;
                         if !code_text.is_empty() {
                             if !plain {
-                                output.push_str("```\n");
+                                output.push_str("```");
+                                if let Some(lang) = language_attr.as_deref() {
+                                    output.push_str(lang);
+                                }
+                                output.push('\n');
                             }
                             output.push_str(&code_text);
                             if !plain {
@@ -499,6 +630,29 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                         output.push('\n');
                         state.in_list_item = false;
                     }
+                    "variablelist" => {
+                        in_variablelist = true;
+                    }
+                    "term" if in_variablelist => {
+                        let term_text = extract_element_text(&mut reader, budget)?;
+                        if !term_text.is_empty() {
+                            if !plain {
+                                output.push_str("**");
+                                output.push_str(&term_text);
+                                output.push_str("**: ");
+                            } else {
+                                output.push_str(&term_text);
+                                output.push_str(": ");
+                            }
+                        }
+                    }
+                    "listitem" if in_variablelist => {
+                        let def_text = extract_element_text(&mut reader, budget)?;
+                        if !def_text.is_empty() {
+                            output.push_str(&def_text);
+                        }
+                        output.push_str("\n\n");
+                    }
 
                     "blockquote" => {
                         if !plain {
@@ -511,7 +665,6 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                         output.push_str("\n\n");
                     }
 
-                    // Admonitions
                     "note" | "warning" | "tip" | "caution" | "important" => {
                         let admonition_type = tag.to_string();
                         let admonition_text = extract_element_text(&mut reader, budget)?;
@@ -586,6 +739,9 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                         output.push('\n');
                         state.in_list = false;
                     }
+                    "variablelist" if in_variablelist => {
+                        in_variablelist = false;
+                    }
                     "table" | "informaltable" if state.in_table => {
                         if !current_table.is_empty() {
                             let markdown = cells_to_markdown(&current_table);
@@ -600,6 +756,7 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                                 markdown,
                                 page_number: table_index + 1,
                                 bounding_box: None,
+                                ..Default::default()
                             });
                             table_index += 1;
                         }
@@ -661,13 +818,13 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
 /// Handles `<emphasis>`, `<emphasis role="bold">`, `<literal>`, `<command>`,
 /// `<link>`, and `<ulink>` elements.
 fn extract_element_text_with_inline(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut EntityReader<'_>,
     plain: bool,
     budget: &mut SecurityBudget,
+    xref_titles: &HashMap<String, String>,
 ) -> Result<String> {
     let mut text = String::new();
     let mut depth = 0;
-    // Track emphasis type (bold vs italic) per nesting level
     let mut emphasis_bold_stack: Vec<bool> = Vec::new();
 
     loop {
@@ -761,6 +918,43 @@ fn extract_element_text_with_inline(
                 }
                 depth -= 1;
             }
+            Ok(Event::Empty(e)) => {
+                budget.enter()?;
+                let name = e.name();
+                let tag_cow = crate::utils::xml_tag_name(name.as_ref());
+                let tag = strip_namespace(&tag_cow);
+
+                let mut linkend: Option<String> = None;
+                let mut xreflabel: Option<String> = None;
+                for attr in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(attr.key.as_ref());
+                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    budget.check_attr(&key, &val)?;
+                    if key == "linkend" {
+                        linkend = Some(val.to_string());
+                    } else if key == "xreflabel" {
+                        xreflabel = Some(val.to_string());
+                    }
+                }
+
+                if tag == "xref" || tag == "link" {
+                    let resolved = resolve_xref_text(linkend.as_deref(), xreflabel.as_deref(), xref_titles);
+                    if !resolved.is_empty() {
+                        budget.account_text(resolved.len())?;
+                        if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('\n') {
+                            text.push(' ');
+                        }
+                        if !plain && tag == "link" {
+                            text.push('[');
+                            text.push_str(&resolved);
+                            text.push(']');
+                        } else {
+                            text.push_str(&resolved);
+                        }
+                    }
+                }
+                budget.leave();
+            }
             Ok(Event::Text(t)) => {
                 let decoded = String::from_utf8_lossy(t.as_ref());
                 budget.check_entity(&decoded)?;
@@ -803,7 +997,7 @@ fn extract_element_text_with_inline(
 }
 
 /// Extract figure element, capturing the `<title>` as the caption.
-fn extract_figure_with_caption(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<String> {
+fn extract_figure_with_caption(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<String> {
     let mut caption = String::new();
     let mut depth = 0;
 
@@ -880,8 +1074,9 @@ fn extract_figure_with_caption(reader: &mut Reader<&[u8]>, budget: &mut Security
 /// - `<subscript>` → subscript
 /// - `<superscript>` → superscript
 fn extract_para_with_annotations(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut EntityReader<'_>,
     budget: &mut SecurityBudget,
+    xref_titles: &HashMap<String, String>,
 ) -> Result<(String, Vec<crate::types::document_structure::TextAnnotation>)> {
     use crate::types::builder;
 
@@ -889,7 +1084,6 @@ fn extract_para_with_annotations(
     let mut annotations = Vec::new();
     let mut depth: u32 = 0;
 
-    // Stack of (kind, depth_at_open, start_byte_offset, optional_href).
     let mut inline_stack: Vec<(&'static str, u32, u32, Option<String>)> = Vec::new();
 
     loop {
@@ -972,12 +1166,10 @@ fn extract_para_with_annotations(
                 }
                 budget.leave();
 
-                // Check if this closes an inline element on our stack
                 if let Some(&(kind, open_depth, start, ref href)) = inline_stack.last()
                     && open_depth == depth
                 {
                     let end = text.len() as u32;
-                    // Skip any leading whitespace separator that was prepended
                     let actual_start = if (start as usize) < text.len() {
                         let span = &text[start as usize..end as usize];
                         let trimmed = span.trim_start();
@@ -997,7 +1189,11 @@ fn extract_para_with_annotations(
                                 let url = href_clone.as_deref().unwrap_or("");
                                 builder::link(actual_start, end, url, None)
                             }
-                            _ => unreachable!(),
+                            // `inline_stack` is only ever pushed to with "bold"/"italic" (from
+                            // "emphasis"), "code" (from "literal"/"command"), "link" (from
+                            // "link"/"ulink"), "subscript", or "superscript" — every one of
+                            // those six kinds is handled above, so no other value can appear.
+                            _ => unreachable!("inline_stack only ever holds the six kinds handled above"),
                         };
                         annotations.push(annotation);
                     }
@@ -1005,6 +1201,43 @@ fn extract_para_with_annotations(
                 }
 
                 depth -= 1;
+            }
+            Ok(Event::Empty(e)) => {
+                budget.enter()?;
+                let name = e.name();
+                let tag_cow = crate::utils::xml_tag_name(name.as_ref());
+                let tag = strip_namespace(&tag_cow);
+
+                let mut linkend: Option<String> = None;
+                let mut xreflabel: Option<String> = None;
+                for attr in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(attr.key.as_ref());
+                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    budget.check_attr(&key, &val)?;
+                    if key == "linkend" {
+                        linkend = Some(val.to_string());
+                    } else if key == "xreflabel" {
+                        xreflabel = Some(val.to_string());
+                    }
+                }
+
+                if tag == "xref" || tag == "link" {
+                    let resolved = resolve_xref_text(linkend.as_deref(), xreflabel.as_deref(), xref_titles);
+                    if !resolved.is_empty() {
+                        budget.account_text(resolved.len())?;
+                        if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('\n') {
+                            text.push(' ');
+                        }
+                        let start = text.len() as u32;
+                        text.push_str(&resolved);
+                        let end = text.len() as u32;
+                        if tag == "link" {
+                            let url = linkend.clone().unwrap_or_default();
+                            annotations.push(builder::link(start, end, &url, None));
+                        }
+                    }
+                }
+                budget.leave();
             }
             Ok(Event::Text(t)) => {
                 let decoded = String::from_utf8_lossy(t.as_ref());
@@ -1043,7 +1276,7 @@ fn extract_para_with_annotations(
 
 /// Extract text content from a DocBook element and its children.
 /// Used for extracting nested content within elements.
-fn extract_element_text(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Result<String> {
+fn extract_element_text(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<String> {
     let mut text = String::new();
     let mut depth = 0;
 
@@ -1138,11 +1371,13 @@ impl InternalDocumentExtractor for DocbookExtractor {
         mime_type: &str,
         config: &ExtractionConfig,
     ) -> Result<InternalDocument> {
-        let docbook_content = utf8_validation::from_utf8(content)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(content).into_owned());
+        // Track the fallback: a non-UTF-8 source is decoded lossily and every byte the
+        // decoder could not read is already U+FFFD before parsing starts (#171).
+        let (docbook_content, decoded_lossily) = match utf8_validation::from_utf8(content) {
+            Ok(valid) => (valid.to_string(), false),
+            Err(_) => (String::from_utf8_lossy(content).into_owned(), true),
+        };
 
-        // Extract metadata via single pass for the metadata fields
         let mut budget = SecurityBudget::from_config(config);
         let (_extracted_content, title, author, date, _tables, publisher, copyright) =
             parse_docbook_single_pass(&docbook_content, true, &mut budget)?;
@@ -1188,6 +1423,14 @@ impl InternalDocumentExtractor for DocbookExtractor {
         let mut doc = build_docbook_internal_document(&docbook_content, inject_placeholders, &mut budget2)?;
         doc.mime_type = mime_type.to_string();
         doc.metadata = metadata;
+
+        if decoded_lossily {
+            crate::core::diagnostics::push_lossy_decode_warning(
+                &mut doc.processing_warnings,
+                DOCBOOK_WARNING_SOURCE,
+                "DocBook source",
+            );
+        }
 
         Ok(doc)
     }

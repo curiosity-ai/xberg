@@ -274,6 +274,5 @@ fn test_pdf_unicode_content() {
 #[test]
 #[cfg(feature = "pdf")]
 fn test_pdf_module_availability() {
-    // pdf module compiles when feature is active
     let _: Option<xberg::pdf::PdfError> = None;
 }

@@ -6,13 +6,34 @@
 //!
 //! Fixtures live in the repository-root `test_documents/` submodule. No HEIF
 //! binaries are stored in the xberg codebase itself.
+//!
+//! `test_documents/` is a bucket-fetched corpus (see
+//! `test_documents/scripts/fetch_corpus.py`) and is not present in a bare
+//! checkout, so fixtures are read at runtime rather than baked in via
+//! `include_bytes!`; tests skip cleanly with a greppable message when the
+//! corpus hasn't been fetched.
+
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 
 use xberg_libheif::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 
-const TEST_HEIC: &[u8] = include_bytes!("../../../test_documents/images/test.heic");
-const TEST_HEIF: &[u8] = include_bytes!("../../../test_documents/images/test.heif");
-const TEST_AVIF: &[u8] = include_bytes!("../../../test_documents/images/test.avif");
-const TEST_HEIF_ALPHA: &[u8] = include_bytes!("../../../test_documents/images/alpha.heif");
+/// Read a `test_documents/` fixture at runtime, skipping the calling test
+/// with a greppable message when the bucket-fetched corpus is absent.
+fn load_fixture(relative: &str) -> Option<Vec<u8>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_documents")
+        .join(relative);
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            eprintln!(
+                "SKIP: fixture {} not available ({e}); run `python3 test_documents/scripts/fetch_corpus.py` to fetch it",
+                path.display()
+            );
+            None
+        }
+    }
+}
 
 fn decode_to_rgba(bytes: &[u8]) -> (u32, u32, usize) {
     let lib = LibHeif::new();
@@ -28,7 +49,10 @@ fn decode_to_rgba(bytes: &[u8]) -> (u32, u32, usize) {
 
 #[test]
 fn decodes_heic_to_rgba() {
-    let (w, h, len) = decode_to_rgba(TEST_HEIC);
+    let Some(bytes) = load_fixture("images/test.heic") else {
+        return;
+    };
+    let (w, h, len) = decode_to_rgba(&bytes);
     assert!(w > 0 && h > 0, "expected positive dimensions, got {w}x{h}");
     assert!(
         len >= (w as usize) * (h as usize) * 4,
@@ -38,19 +62,28 @@ fn decodes_heic_to_rgba() {
 
 #[test]
 fn decodes_heif_to_rgba() {
-    let (w, h, _) = decode_to_rgba(TEST_HEIF);
+    let Some(bytes) = load_fixture("images/test.heif") else {
+        return;
+    };
+    let (w, h, _) = decode_to_rgba(&bytes);
     assert!(w > 0 && h > 0);
 }
 
 #[test]
 fn decodes_avif_to_rgba() {
-    let (w, h, _) = decode_to_rgba(TEST_AVIF);
+    let Some(bytes) = load_fixture("images/test.avif") else {
+        return;
+    };
+    let (w, h, _) = decode_to_rgba(&bytes);
     assert!(w > 0 && h > 0);
 }
 
 #[test]
 fn decodes_heif_with_alpha_to_rgba() {
-    let (w, h, _) = decode_to_rgba(TEST_HEIF_ALPHA);
+    let Some(bytes) = load_fixture("images/alpha.heif") else {
+        return;
+    };
+    let (w, h, _) = decode_to_rgba(&bytes);
     assert!(w > 0 && h > 0);
 }
 

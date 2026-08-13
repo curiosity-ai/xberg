@@ -217,8 +217,6 @@ impl Attention {
         let key_states = qkv.i(1)?.contiguous()?;
         let value_states = qkv.i(2)?.contiguous()?;
         let xs = if self.use_rel_pos {
-            // use_rel_pos implies the decomposed rel-pos tables were loaded; surface a
-            // clear error instead of panicking if a checkpoint set the flag without them.
             let rel_pos_h = self.rel_pos_h.as_ref().ok_or_else(|| {
                 CandleOcrError::InferenceFailed("SAM attention: use_rel_pos set but rel_pos_h is missing".into())
             })?;
@@ -783,9 +781,6 @@ impl VitModel {
             ffn_hidden_size,
             eps,
         )?;
-        // HuggingFace CLIP genuinely names this "pre_layrnorm" (sic) and the released
-        // DeepSeek-OCR checkpoint keeps that spelling; accept both the misspelled and
-        // the corrected key, like view_seperator below.
         let pre_layernorm = if vb.contains_tensor("pre_layrnorm.weight") {
             get_layer_norm(vb.pp("pre_layrnorm"), eps, hidden_size, true)?
         } else {
@@ -859,8 +854,6 @@ impl MoEGate {
                 self.scoring_func
             )));
         };
-        // topk returns (indices, weights) in that order; keep them straight so the
-        // U32 expert indices feed onehot/gather and the F32 weights get normalized.
         let (topk_idx, topk_weight) = if self.topk_method == "greedy" {
             topk(&scores, self.top_k)?
         } else {
@@ -1299,14 +1292,7 @@ impl DeepseekOCRModel {
             config.vision_config.width.sam_vit_b.global_attn_indexes.clone(),
             version,
         )?;
-        // The SAM neck version (net_3 = 896 vs 1024) and the second vision-encoder
-        // type (CLIP ViT vs Qwen2) are independent axes: the released
-        // deepseek-ai/DeepSeek-OCR checkpoint pairs a v2 SAM neck (net_3 = 1024)
-        // with a CLIP tower at model.vision_model and has no model.qwen2_model.
-        // Select the tower by which tensors are actually present rather than by the
-        // SAM version, so a v2-neck + CLIP checkpoint loads the CLIP path.
-        let has_qwen2_tower =
-            vb_m.contains_tensor("qwen2_model.model.model.layers.0.self_attn.q_proj.weight");
+        let has_qwen2_tower = vb_m.contains_tensor("qwen2_model.model.model.layers.0.self_attn.q_proj.weight");
         let (vision_model, image_newline) = if has_qwen2_tower {
             let qwen2 = Qwen2Decoder2Encoder::new(vb_m.pp("qwen2_model"))?;
             (VisionModel::Qwen2(qwen2), None)
@@ -1322,8 +1308,6 @@ impl DeepseekOCRModel {
             vb_m.pp("projector.layers"),
         )?;
 
-        // The released checkpoint stores this as "view_seperator" (sic); accept
-        // both the misspelled and the corrected key.
         let view_separator = if vb_m.contains_tensor("view_seperator") {
             vb_m.get_with_hints(1280, "view_seperator", Init::Const(0.))?
         } else {
@@ -1582,10 +1566,6 @@ mod tests {
         "vocab_size": 100264
     }"#;
 
-    // ──────────────────────────────────────────────────────────────
-    // E1-1: Config round-trip deserialization
-    // ──────────────────────────────────────────────────────────────
-
     /// Deserializing a representative JSON snippet must succeed and produce
     /// exact field values matching the source document.
     #[test]
@@ -1604,7 +1584,6 @@ mod tests {
             vec![2usize, 5, 8, 11],
             "global_attn_indexes mismatch"
         );
-        // Language config sub-struct
         assert_eq!(cfg.language_config.hidden_size, 4096, "language hidden_size mismatch");
         assert_eq!(cfg.language_config.n_routed_experts, 64, "n_routed_experts mismatch");
         assert_eq!(cfg.language_config.topk_method, "greedy", "topk_method mismatch");
@@ -1613,35 +1592,25 @@ mod tests {
     /// Fields with serde defaults must be populated correctly when absent from JSON.
     #[test]
     fn config_serde_defaults_are_applied_when_fields_absent() {
-        // A minimal JSON without moe_layer_freq, routed_scaling_factor,
-        // scoring_func, norm_topk_prob — all have serde defaults.
         let cfg: DeepseekOCRConfig = serde_json::from_str(MINIMAL_CONFIG_JSON).expect("config must deserialize");
 
-        // moe_layer_freq defaults to 1
         assert_eq!(
             cfg.language_config.moe_layer_freq, 1,
             "default moe_layer_freq should be 1"
         );
-        // routed_scaling_factor defaults to 1.0
         assert!(
             (cfg.language_config.routed_scaling_factor - 1.0_f64).abs() < 1e-9,
             "default routed_scaling_factor should be 1.0"
         );
-        // scoring_func defaults to "softmax"
         assert_eq!(
             cfg.language_config.scoring_func, "softmax",
             "default scoring_func should be 'softmax'"
         );
-        // norm_topk_prob defaults to false
         assert!(
             !cfg.language_config.norm_topk_prob,
             "default norm_topk_prob should be false"
         );
     }
-
-    // ──────────────────────────────────────────────────────────────
-    // E1-2: VisionModel enum — variant dispatch
-    // ──────────────────────────────────────────────────────────────
 
     /// Both VisionModel variants must compile and be matchable at runtime.
     /// Uses zero-weight VarBuilders to avoid any weight download.
@@ -1650,20 +1619,8 @@ mod tests {
         let dev = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &dev);
 
-        // Build a minimal VitModel — it lives under VisionModel::Vit.
-        // Tiny dimensions: image_size=28, patch_size=14 (2×2 patches), 1 layer, 2 heads.
-        let vit = VitModel::new(
-            vb.pp("vit"),
-            28,   // image_size
-            14,   // patch_size
-            3,    // num_channels
-            1,    // num_layers
-            16,   // hidden_size (must be divisible by num_heads)
-            2,    // num_heads (16/2 = 8 per head)
-            128,  // ffn_hidden_size
-            1e-5, // eps
-        )
-        .expect("VitModel must construct from zeros");
+        let vit =
+            VitModel::new(vb.pp("vit"), 28, 14, 3, 1, 16, 2, 128, 1e-5).expect("VitModel must construct from zeros");
 
         let vit_model = VisionModel::Vit(vit);
         let is_vit = matches!(vit_model, VisionModel::Vit(_));
@@ -1671,10 +1628,6 @@ mod tests {
         let is_qwen2 = matches!(vit_model, VisionModel::Qwen2(_));
         assert!(!is_qwen2, "VisionModel::Vit must not match Qwen2 arm");
     }
-
-    // ──────────────────────────────────────────────────────────────
-    // E1-3: SAM-style vision encoder — shape verification
-    // ──────────────────────────────────────────────────────────────
 
     /// ImageEncoderViT with tiny dimensions must produce a tensor of the
     /// expected shape on a synthetic zero-valued input.
@@ -1692,31 +1645,29 @@ mod tests {
 
         let encoder = ImageEncoderViT::new(
             vb,
-            64,               // img_size
-            16,               // patch_size
-            3,                // in_chans
-            16,               // embed_dim (tiny)
-            1,                // depth (one block, fast)
-            2,                // num_heads (16/2 = 8 per head)
-            4.0,              // mlp_ratio
-            256,              // out_chans (must be 256 — hardcoded in net_2 input)
-            true,             // qkv_bias
-            Activation::Gelu, // act
-            true,             // use_abs_pos
-            false,            // use_rel_pos (off avoids rel_pos buffers in tiny test)
-            0,                // window_size (0 = global attention for all blocks)
-            vec![0usize],     // global_attn_indexes (block 0 is global)
-            1,                // version (net_3 outputs 896 channels)
+            64,
+            16,
+            3,
+            16,
+            1,
+            2,
+            4.0,
+            256,
+            true,
+            Activation::Gelu,
+            true,
+            false,
+            0,
+            vec![0usize],
+            1,
         )
         .expect("ImageEncoderViT must construct from zeros");
 
-        // Input: (batch=1, channels=3, height=64, width=64)
         let input =
             Tensor::zeros((1usize, 3usize, 64usize, 64usize), DType::F32, &dev).expect("synthetic input must allocate");
 
         let output = encoder.forward(&input).expect("forward must succeed");
 
-        // With version=1: net_3 emits 896 channels; 4-patch → stride-2 × stride-2 = 1×1 spatial.
         let shape = output.dims().to_vec();
         assert_eq!(
             shape,
@@ -1733,21 +1684,21 @@ mod tests {
 
         let encoder = ImageEncoderViT::new(
             vb,
-            64,               // img_size
-            16,               // patch_size
-            3,                // in_chans
-            16,               // embed_dim
-            1,                // depth
-            2,                // num_heads
-            4.0,              // mlp_ratio
-            256,              // out_chans (must be 256 for net_2)
-            true,             // qkv_bias
-            Activation::Gelu, // act
-            true,             // use_abs_pos
-            false,            // use_rel_pos
-            0,                // window_size (global)
-            vec![0usize],     // global_attn_indexes
-            2,                // version → net_3 outputs 1024
+            64,
+            16,
+            3,
+            16,
+            1,
+            2,
+            4.0,
+            256,
+            true,
+            Activation::Gelu,
+            true,
+            false,
+            0,
+            vec![0usize],
+            2,
         )
         .expect("ImageEncoderViT v2 must construct");
 
@@ -1762,10 +1713,6 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────
-    // E1-4: Qwen2Decoder2Encoder — construction
-    // ──────────────────────────────────────────────────────────────
-
     /// Qwen2Decoder2Encoder must construct from zero-weight VarBuilder without
     /// panicking. Construction validates that the hardcoded Qwen2 config
     /// (hidden_size=896, 24 layers, query embeddings at 144/256) is
@@ -1779,9 +1726,6 @@ mod tests {
         let dev = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &dev);
 
-        // Constructor hard-wires: hidden_size=896, 24 layers, query_768 (144 tokens),
-        // query_1024 (256 tokens).  VarBuilder::zeros allocates all weight tensors
-        // with the correct shapes without reading any file.
         let encoder = Qwen2Decoder2Encoder::new(vb);
         assert!(
             encoder.is_ok(),
@@ -1802,8 +1746,6 @@ mod tests {
 
         let encoder = Qwen2Decoder2Encoder::new(vb).expect("Qwen2Decoder2Encoder must construct");
 
-        // Input shape: (batch, channels, h, w) — after flatten_from(2) + transpose(1,2)
-        // we get (batch, h*w, channels).  Here h*w = 4 (2×2), which is not 144 or 256.
         let bad_input =
             Tensor::zeros((1usize, 896usize, 2usize, 2usize), DType::F32, &dev).expect("bad input allocation");
 

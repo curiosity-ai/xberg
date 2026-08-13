@@ -1,4 +1,4 @@
-//! Registry-routing and `parse_options` tests for the five Candle VLM-OCR backends.
+//! Registry-routing and `parse_options` tests for the Candle VLM-OCR backends.
 //!
 //! These tests verify that:
 //! - `OcrBackendRegistry::new` seeds each backend under its canonical name.
@@ -27,29 +27,21 @@
 //! Run e2e tests with local-weight models (supply via environment):
 //! ```
 //! XBERG_REQUIRE_MODELS=1 \
-//! XBERG_HUNYUAN_OCR_MODEL_PATH=/models/hunyuan \
 //! XBERG_DEEPSEEK_OCR_MODEL_PATH=/models/deepseek \
 //! XBERG_PADDLEOCR_VL_MODEL_PATH=/models/paddleocr-vl \
 //! cargo test -p xberg --features candle-vlm-ocr --test candle_backends -- --ignored --nocapture
 //! ```
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "candle-ocr")]
 
 use xberg::core::config::OcrConfig;
 use xberg::plugins::registry::OcrBackendRegistry;
 
-// ---------------------------------------------------------------------------
-// Helper: build a fresh registry with defaults and return the registered names.
-// ---------------------------------------------------------------------------
-
 fn new_registry_names() -> Vec<String> {
     let registry = OcrBackendRegistry::new();
     registry.list()
 }
-
-// ---------------------------------------------------------------------------
-// Helper: gating logic for e2e tests based on XBERG_REQUIRE_MODELS env var.
-// ---------------------------------------------------------------------------
 
 /// Determine whether missing required weights should cause a panic or a skip.
 ///
@@ -71,11 +63,7 @@ fn require_models() -> bool {
 ///
 /// Only the local-weight models call this; gate it so single-model feature
 /// builds (e.g. the per-model GPU matrix) don't see it as dead code.
-#[cfg(any(
-    feature = "candle-hunyuan-ocr",
-    feature = "candle-deepseek-ocr",
-    feature = "candle-paddleocr-vl"
-))]
+#[cfg(any(feature = "candle-deepseek-ocr", feature = "candle-paddleocr-vl"))]
 fn check_local_model_path(env_var: &str, model_name: &str) -> Option<String> {
     match std::env::var(env_var) {
         Ok(p) => Some(p),
@@ -93,15 +81,6 @@ fn check_local_model_path(env_var: &str, model_name: &str) -> Option<String> {
     }
 }
 
-// Auto-download models (GLM-OCR, TrOCR) need no local path: they fetch weights
-// from HuggingFace Hub on first use. Under `XBERG_REQUIRE_MODELS`, a download or
-// inference failure fails the test; otherwise it is skipped gracefully (handled
-// inline in each test via `require_models()`).
-
-// ---------------------------------------------------------------------------
-// Registry / selection tests — no network, no model weights.
-// ---------------------------------------------------------------------------
-
 /// The global registry seeds a "candle-glm-ocr" backend when the feature is on.
 #[cfg(feature = "candle-glm-ocr")]
 #[test]
@@ -110,18 +89,6 @@ fn registry_resolves_candle_glm_ocr_backend() {
     assert!(
         names.contains(&"candle-glm-ocr".to_string()),
         "Expected 'candle-glm-ocr' in registry; got: {:?}",
-        names,
-    );
-}
-
-/// The global registry seeds a "candle-hunyuan-ocr" backend when the feature is on.
-#[cfg(all(feature = "candle-hunyuan-ocr", not(target_arch = "wasm32")))]
-#[test]
-fn registry_resolves_candle_hunyuan_ocr_backend() {
-    let names = new_registry_names();
-    assert!(
-        names.contains(&"candle-hunyuan-ocr".to_string()),
-        "Expected 'candle-hunyuan-ocr' in registry; got: {:?}",
         names,
     );
 }
@@ -161,10 +128,6 @@ fn registry_returns_none_for_unknown_candle_backend() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// parse_options — non-object JSON produces defaults (no panic, no error).
-// ---------------------------------------------------------------------------
-
 /// GLM-OCR: non-object backend_options (array) leaves parse_options returning defaults.
 ///
 /// The `parse_options` implementation calls `opts.get("key")` which is only valid
@@ -179,17 +142,14 @@ fn parse_options_glm_ocr_rejects_non_object_json_by_returning_defaults() {
 
     let backend = GlmOcrBackend::new(GlmOcrTask::default(), LayoutMode::default());
 
-    // Array value: parse_options must not panic and the backend struct is valid.
     let _config = OcrConfig {
         backend_options: Some(serde_json::json!([1, 2, 3])),
         ..Default::default()
     };
 
-    // Verify the backend is still functional (name/version accessible — no panic).
     use xberg::plugins::Plugin as _;
     assert_eq!(backend.name(), "candle-glm-ocr");
 
-    // Scalar value.
     let _config2 = OcrConfig {
         backend_options: Some(serde_json::json!("ocr")),
         ..Default::default()
@@ -199,23 +159,6 @@ fn parse_options_glm_ocr_rejects_non_object_json_by_returning_defaults() {
         "candle-glm-ocr",
         "backend remains coherent after scalar options"
     );
-}
-
-/// Hunyuan-OCR: non-object backend_options yields defaults without panicking.
-#[cfg(all(feature = "candle-hunyuan-ocr", not(target_arch = "wasm32")))]
-#[test]
-fn parse_options_hunyuan_ocr_rejects_non_object_json_by_returning_defaults() {
-    use xberg::candle_ocr::HunyuanOcrBackend;
-    use xberg::plugins::Plugin as _;
-
-    let backend = HunyuanOcrBackend::new();
-    assert_eq!(backend.name(), "candle-hunyuan-ocr");
-
-    // Non-object options must not cause a panic or alter backend identity.
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!(42));
-    let _ = config; // parse_options is private; prove backend stays coherent.
-    assert_eq!(backend.name(), "candle-hunyuan-ocr");
 }
 
 /// DeepSeek-OCR: non-object backend_options yields defaults without panicking.
@@ -228,8 +171,10 @@ fn parse_options_deepseek_ocr_rejects_non_object_json_by_returning_defaults() {
     let backend = DeepseekOcrBackend::new();
     assert_eq!(backend.name(), "candle-deepseek-ocr");
 
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!(null));
+    let config = OcrConfig {
+        backend_options: Some(serde_json::json!(null)),
+        ..Default::default()
+    };
     let _ = config;
     assert_eq!(backend.name(), "candle-deepseek-ocr");
 }
@@ -245,15 +190,13 @@ fn parse_options_paddleocr_vl_rejects_non_object_json_by_returning_defaults() {
     let backend = PaddleOcrVlBackend::new(PaddleOcrVlTask::default());
     assert_eq!(backend.name(), "candle-paddleocr-vl");
 
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!(false));
+    let config = OcrConfig {
+        backend_options: Some(serde_json::json!(false)),
+        ..Default::default()
+    };
     let _ = config;
     assert_eq!(backend.name(), "candle-paddleocr-vl");
 }
-
-// ---------------------------------------------------------------------------
-// parse_options — empty object `{}` is accepted and returns defaults.
-// ---------------------------------------------------------------------------
 
 /// GLM-OCR: empty object backend_options is silently accepted; defaults apply.
 #[cfg(feature = "candle-glm-ocr")]
@@ -271,23 +214,7 @@ fn parse_options_glm_ocr_accepts_empty_object_and_returns_defaults() {
         ..Default::default()
     };
 
-    // Backend remains properly identified after empty-object options.
     assert_eq!(backend.name(), "candle-glm-ocr");
-    assert_eq!(backend.version(), "0.1.0");
-}
-
-/// Hunyuan-OCR: empty object backend_options is accepted; model_path stays None.
-#[cfg(all(feature = "candle-hunyuan-ocr", not(target_arch = "wasm32")))]
-#[test]
-fn parse_options_hunyuan_ocr_accepts_empty_object_and_returns_defaults() {
-    use xberg::candle_ocr::HunyuanOcrBackend;
-    use xberg::plugins::Plugin as _;
-
-    let backend = HunyuanOcrBackend::new();
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!({}));
-
-    assert_eq!(backend.name(), "candle-hunyuan-ocr");
     assert_eq!(backend.version(), "0.1.0");
 }
 
@@ -299,8 +226,10 @@ fn parse_options_deepseek_ocr_accepts_empty_object_and_returns_defaults() {
     use xberg::plugins::Plugin as _;
 
     let backend = DeepseekOcrBackend::new();
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!({}));
+    let _config = OcrConfig {
+        backend_options: Some(serde_json::json!({})),
+        ..Default::default()
+    };
 
     assert_eq!(backend.name(), "candle-deepseek-ocr");
     assert_eq!(backend.version(), "0.1.0");
@@ -315,63 +244,16 @@ fn parse_options_paddleocr_vl_accepts_empty_object_and_returns_defaults() {
     use xberg_candle_ocr::models::PaddleOcrVlTask;
 
     let backend = PaddleOcrVlBackend::new(PaddleOcrVlTask::default());
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!({}));
+    let _config = OcrConfig {
+        backend_options: Some(serde_json::json!({})),
+        ..Default::default()
+    };
 
     assert_eq!(backend.name(), "candle-paddleocr-vl");
     assert_eq!(backend.version(), "0.1.0");
 }
 
-// ---------------------------------------------------------------------------
 // Network-gated e2e tests — #[ignore] until env vars are set.
-// ---------------------------------------------------------------------------
-
-/// End-to-end Hunyuan-OCR extraction through `OcrBackend::process_image`.
-///
-/// Requires `XBERG_HUNYUAN_OCR_MODEL_PATH` to point to a local model directory.
-/// Uses device=auto to respect GPU acceleration when built with `candle-cuda`.
-/// Skip cleanly when the variable is absent (unless XBERG_REQUIRE_MODELS=1).
-#[cfg(all(feature = "candle-hunyuan-ocr", not(target_arch = "wasm32")))]
-#[tokio::test]
-#[ignore = "requires XBERG_HUNYUAN_OCR_MODEL_PATH env var pointing to local model weights"]
-async fn candle_hunyuan_ocr_e2e_extraction() {
-    let model_path = match check_local_model_path("XBERG_HUNYUAN_OCR_MODEL_PATH", "Hunyuan-OCR") {
-        Some(p) => p,
-        None => return,
-    };
-
-    use xberg::candle_ocr::HunyuanOcrBackend;
-    use xberg::plugins::OcrBackend as _;
-
-    let image_bytes = include_bytes!("../../../fixtures/images/test_hello_world.png");
-
-    let backend = HunyuanOcrBackend::new();
-
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!({"model_path": model_path}));
-    // Device preference defaults to Auto -> CUDA when built with candle-cuda, else CPU.
-
-    let result = backend
-        .process_image(image_bytes, &config)
-        .await
-        .expect("HunyuanOcrBackend::process_image should succeed");
-
-    assert!(
-        !result.content.is_empty(),
-        "Hunyuan-OCR extraction returned empty content"
-    );
-    assert_eq!(
-        result.mime_type.as_ref(),
-        "text/markdown",
-        "Hunyuan-OCR must emit text/markdown"
-    );
-
-    println!(
-        "Hunyuan-OCR result ({} chars): {}",
-        result.content.len(),
-        result.content
-    );
-}
 
 /// End-to-end DeepSeek-OCR extraction through `OcrBackend::process_image`.
 ///
@@ -394,9 +276,10 @@ async fn candle_deepseek_ocr_e2e_extraction() {
 
     let backend = DeepseekOcrBackend::new();
 
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!({"model_path": model_path}));
-    // Device preference defaults to Auto -> CUDA when built with candle-cuda, else CPU.
+    let config = OcrConfig {
+        backend_options: Some(serde_json::json!({"model_path": model_path})),
+        ..Default::default()
+    };
 
     let result = backend
         .process_image(image_bytes, &config)
@@ -442,9 +325,10 @@ async fn candle_paddleocr_vl_e2e_extraction() {
 
     let backend = PaddleOcrVlBackend::new(PaddleOcrVlTask::default());
 
-    let mut config = OcrConfig::default();
-    config.backend_options = Some(serde_json::json!({"model_path": model_path}));
-    // Device preference defaults to Auto -> CUDA when built with candle-cuda, else CPU.
+    let config = OcrConfig {
+        backend_options: Some(serde_json::json!({"model_path": model_path})),
+        ..Default::default()
+    };
 
     let result = backend
         .process_image(image_bytes, &config)
@@ -454,6 +338,11 @@ async fn candle_paddleocr_vl_e2e_extraction() {
     assert!(
         !result.content.is_empty(),
         "PaddleOCR-VL extraction returned empty content"
+    );
+    assert!(
+        result.content.to_lowercase().contains("hello world"),
+        "PaddleOCR-VL should read the fixture text, got: {}",
+        result.content
     );
     assert_eq!(
         result.mime_type.as_ref(),
@@ -487,8 +376,6 @@ async fn candle_glm_ocr_e2e_extraction() {
 
     let backend = GlmOcrBackend::new(GlmOcrTask::default(), LayoutMode::default());
 
-    // Device preference defaults to Auto -> CUDA when built with candle-cuda, else CPU.
-    // GLM-OCR auto-downloads (~3 GB) from HF Hub; no local model path needed.
     let config = OcrConfig::default();
 
     let result = match backend.process_image(image_bytes, &config).await {
@@ -531,8 +418,6 @@ async fn candle_trocr_e2e_extraction() {
 
     let backend = TrocrBackend::new(TrocrVariant::default());
 
-    // Device preference defaults to Auto -> CUDA when built with candle-cuda, else CPU.
-    // TrOCR auto-downloads (~1.5 GB) from HF Hub; no local model path needed.
     let config = OcrConfig::default();
 
     let result = match backend.process_image(image_bytes, &config).await {

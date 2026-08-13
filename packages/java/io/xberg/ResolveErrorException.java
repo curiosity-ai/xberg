@@ -5,14 +5,12 @@ package io.xberg;
  * Errors produced while resolving a preset against caller overrides.
  */
 public class ResolveErrorException extends Exception {
-    private static final long serialVersionUID = 1L;
-    /** Creates a new ResolveErrorException with the given message. */
-    public ResolveErrorException(final String message) {
-        super(message);
-    }
+  private static final long serialVersionUID = 1L;
+  /** Creates a new ResolveErrorException with the given message. */
+  public ResolveErrorException(final String message) { super(message); }
 
-    /** Creates a new ResolveErrorException with the given message and cause. */
-    public ResolveErrorException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new ResolveErrorException with the given message and cause. */
+  public ResolveErrorException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

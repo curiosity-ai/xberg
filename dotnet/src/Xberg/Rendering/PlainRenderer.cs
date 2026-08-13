@@ -87,9 +87,13 @@ public static class PlainRenderer
                         if (ti >= 0 && ti < doc.Tables.Count)
                         {
                             var table = doc.Tables[ti];
-                            string tableStr = table.Cells.Count > 0
-                                ? RenderCommon.RenderTablePlain(table.Cells)
-                                : table.Markdown;
+                            // An extractor that already rendered canonical plain text for this
+                            // table stores it on the element; prefer it over re-rendering cells.
+                            string tableStr = elem.Text.Length > 0
+                                ? elem.Text
+                                : table.Cells.Count > 0
+                                    ? RenderCommon.RenderTablePlain(table.Cells)
+                                    : table.Markdown;
                             if (tableStr.Trim().Length > 0)
                             {
                                 sb.Append(tableStr);

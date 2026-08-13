@@ -46,7 +46,6 @@ pub fn summarize(text: &str, language: Option<&str>, max_tokens: Option<u32>) ->
         return Some(sentences.into_iter().next().unwrap().to_string());
     }
 
-    // Limit to MAX_SENTENCES for tractability.
     let working = if sentences.len() > MAX_SENTENCES {
         &sentences[..MAX_SENTENCES]
     } else {
@@ -86,13 +85,11 @@ fn split_sentences(text: &str) -> Vec<&str> {
     while i < bytes.len() {
         let c = bytes[i] as char;
         if matches!(c, '.' | '!' | '?' | '\n') {
-            // Include the punctuation in the slice.
             let end = i + 1;
             let candidate = text[start..end].trim();
             if !candidate.is_empty() {
                 sentences.push(candidate);
             }
-            // Advance past any run of terminal punctuation / whitespace.
             i = end;
             while i < bytes.len() && matches!(bytes[i] as char, '.' | '!' | '?' | '\n' | ' ' | '\t' | '\r') {
                 i += 1;
@@ -124,7 +121,6 @@ fn tokenize(sentence: &str, stopwords: Option<&AHashSet<String>>) -> Vec<String>
             {
                 return None;
             }
-            // Drop single-character tokens — they rarely carry signal.
             if lowered.chars().count() < 2 {
                 return None;
             }
@@ -140,7 +136,6 @@ fn pagerank_scores(token_lists: &[Vec<String>]) -> Vec<f32> {
         return Vec::new();
     }
 
-    // Document frequency.
     let mut df: AHashMap<&str, usize> = AHashMap::new();
     for tokens in token_lists {
         let mut seen: AHashSet<&str> = AHashSet::new();
@@ -151,7 +146,6 @@ fn pagerank_scores(token_lists: &[Vec<String>]) -> Vec<f32> {
         }
     }
 
-    // TF-IDF vectors per sentence.
     let vectors: Vec<AHashMap<&str, f32>> = token_lists
         .iter()
         .map(|tokens| {
@@ -171,14 +165,11 @@ fn pagerank_scores(token_lists: &[Vec<String>]) -> Vec<f32> {
         })
         .collect();
 
-    // Pre-compute vector norms once per sentence so the cosine loop is O(N²)
-    // dot products rather than O(N²) dot products + O(N²) norm walks.
     let norms: Vec<f32> = vectors
         .iter()
         .map(|v| v.values().map(|x| x * x).sum::<f32>().sqrt())
         .collect();
 
-    // Cosine similarity adjacency matrix (no self-edges).
     let mut adjacency = vec![vec![0.0f32; n]; n];
     for i in 0..n {
         for j in (i + 1)..n {
@@ -190,7 +181,6 @@ fn pagerank_scores(token_lists: &[Vec<String>]) -> Vec<f32> {
         }
     }
 
-    // Column-normalise so each column sums to 1 (row-stochastic in transpose).
     let mut transition = vec![vec![0.0f32; n]; n];
     let mut dangling = Vec::with_capacity(n);
     for j in 0..n {
@@ -204,7 +194,6 @@ fn pagerank_scores(token_lists: &[Vec<String>]) -> Vec<f32> {
         }
     }
 
-    // Iterate PageRank.
     let mut scores = vec![1.0f32 / n as f32; n];
     let teleport = (1.0 - PAGERANK_DAMPING) / n as f32;
     for _ in 0..PAGERANK_MAX_ITERATIONS {
@@ -231,7 +220,6 @@ fn cosine_similarity(a: &AHashMap<&str, f32>, b: &AHashMap<&str, f32>, norm_a: f
     if a.is_empty() || b.is_empty() || norm_a <= MIN_EDGE_SIMILARITY || norm_b <= MIN_EDGE_SIMILARITY {
         return 0.0;
     }
-    // Walk the smaller map for the dot product.
     let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     let mut dot = 0.0f32;
     for (term, av) in small {
@@ -269,16 +257,14 @@ fn select_top_sentences<'a>(sentences: &'a [&'a str], scores: &[f32], budget_tok
         }
     }
 
-    if chosen_indices.is_empty() {
-        // Fall back to the single highest-scoring sentence even if it busts the budget.
-        if let Some((idx, _)) = scores
+    if chosen_indices.is_empty()
+        && let Some((idx, _)) = scores
             .iter()
             .copied()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            chosen_indices.push(idx);
-        }
+    {
+        chosen_indices.push(idx);
     }
 
     chosen_indices.sort_unstable();
@@ -313,8 +299,6 @@ mod tests {
     #[test]
     fn summarize_picks_relevant_sentences() {
         let summary = summarize(PARAGRAPH, Some("en"), Some(40)).expect("summary produced");
-        // The ML-related sentences share vocabulary; the cat / weather sentences are outliers.
-        // High-score sentences must include something about machine or deep learning.
         let lower = summary.to_lowercase();
         assert!(
             lower.contains("machine learning") || lower.contains("deep learning") || lower.contains("neural"),
@@ -357,9 +341,7 @@ mod tests {
 
     #[test]
     fn summarize_respects_budget() {
-        // Use a very tight budget; the summary must not blow past it by more than a sentence.
         let summary = summarize(PARAGRAPH, Some("en"), Some(8)).expect("summary produced");
-        // Single sentence may exceed budget but should still be a valid sentence from the text.
         assert!(PARAGRAPH.contains(summary.split('.').next().unwrap_or(&summary).trim()));
     }
 }

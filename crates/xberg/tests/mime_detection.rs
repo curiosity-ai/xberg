@@ -210,8 +210,6 @@ async fn test_unknown_mime_type() {
         "application/x-unknown-format",
         "application/octet-stream",
         "text/x-unsupported",
-        // Note: video/mp4 and audio/mp3 are now declared supported formats (transcription feature
-        // gates actual extraction; validate_mime_type succeeds for declared formats).
     ];
 
     for mime_type in unsupported {
@@ -327,7 +325,6 @@ async fn test_mime_detection_nonexistent_file() {
     assert!(result.is_err(), "Should fail for nonexistent file");
 
     let error = result.unwrap_err();
-    // File existence check returns Io error (NotFound), not Validation error
     assert!(
         matches!(error, xberg::XbergError::Io(_)),
         "Should return Io error for nonexistent file"

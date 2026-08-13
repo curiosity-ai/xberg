@@ -1,11 +1,4 @@
 # =============================================================================
-# Alpine-based builder for musl-linked FFI shared library.
-#
-# Usage:
-#   docker build -f docker/Dockerfile.musl-ffi \
-#     --output type=local,dest=./dist .
-#
-# Produces libxberg_ffi.so at dist/libxberg_ffi.so
 # =============================================================================
 FROM alpine:3.21 AS builder
 
@@ -13,8 +6,13 @@ ARG RUST_TOOLCHAIN=nightly-2026-03-10
 
 WORKDIR /build
 
-# Install build dependencies — Alpine's g++ and libstdc++ are musl-native,
-# so tesseract C++ compilation works without glibc conflicts.
+# Alpine's /bin/sh is busybox ash, which supports `-o pipefail`. Without it the
+# `curl ... | sh` rustup bootstrap below reports only sh's status, so a failed or
+# truncated download silently installs nothing, and the `ldd ... | awk | grep`
+# vendoring pipeline reports success even when `ldd` itself fails -- which would
+# ship the FFI library with an empty bundled closure (xberg #1280). (DL4006)
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+
 RUN apk add --no-cache \
     curl musl-dev cmake make pkgconf \
     perl linux-headers git file && \
@@ -24,55 +22,62 @@ RUN apk add --no-cache \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
 
-# Install Rust via rustup (Alpine's packaged Rust may be too old / not nightly)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --component rust-src && \
     echo "Rust host: $(~/.cargo/bin/rustc -vV | grep host)" && \
     echo "Default target: $(~/.cargo/bin/rustc --print cfg | grep target)"
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Point ort-sys to Alpine's system ORT library instead of downloading prebuilt binaries.
 ENV ORT_LIB_LOCATION=/usr/lib
 ENV ORT_PREFER_DYNAMIC_LINK=1
 ENV ORT_SKIP_DOWNLOAD=1
 ENV ORT_STRATEGY=system
-# Allow cdylib output on musl targets (default is +crt-static which blocks shared libs)
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Copy workspace manifests and crates
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
+COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-ffi/ crates/xberg-ffi/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
+COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 
-# Remove workspace members that aren't included
 RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-cli/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
 
-# Build the FFI shared library.
-#
-# Neither --offline nor --locked: the `sed -i Cargo.toml` above removes
-# workspace members without touching Cargo.lock, so --locked would refuse to
-# update the lock to match. --offline was tried previously but requires a
-# pre-populated registry cache — the Docker layers above never run `cargo
-# fetch`, so every package resolves to "no matching package named X found"
-# (observed on rc.13 + rc.14 + rc.15 Publish runs). Drop both flags: cargo
-# will use Cargo.lock as a resolution hint, download missing crates from the
-# network, and rewrite the in-image lock to match the slimmed manifest.
 RUN cargo build --release --package xberg-ffi && \
     cp target/release/libxberg_ffi.so /build/libxberg_ffi.so && \
     strip /build/libxberg_ffi.so
 
-# Verify the library
+# Bundle the vendored shared-lib closure (ONNX Runtime + image codecs) that the
+# runtime Alpine .NET base image does not provide, and point every bundled
+# library's RUNPATH at its own directory so the musl loader resolves them beside
+# libxberg_ffi.so. Without this the NuGet package ships the FFI library alone and
+# .NET raises DllNotFoundException on its unresolved libonnxruntime (xberg #1280).
+# Best-effort: the allowlist skips base-image-provided libs (musl libc, libstdc++,
+# libgcc); an unmatched dep is left out rather than failing the build. ~keep
+RUN apk add --no-cache patchelf && \
+    ldd /build/libxberg_ffi.so | awk '{print $3}' | grep -E '^/' | while read -r lib; do \
+        base="$(basename "$lib")"; \
+        case "$base" in \
+            libonnxruntime.so*|libheif.so*|libde265.so*|libaom.so*|libx265.so*|libdav1d.so*|libSvtAv1*) \
+                cp -Ln "$lib" "/build/$base" && echo "bundled $base" ;; \
+        esac; \
+    done && \
+    for f in /build/*.so; do patchelf --set-rpath '$ORIGIN' "$f"; done
+
 RUN file /build/libxberg_ffi.so && \
     echo "=== Dynamic dependencies ===" && \
-    readelf -d /build/libxberg_ffi.so 2>/dev/null | grep NEEDED || echo "No dynamic dependencies (fully static)"
+    readelf -d /build/libxberg_ffi.so 2>/dev/null | grep NEEDED || echo "No dynamic dependencies (fully static)" && \
+    echo "=== Bundled libraries ===" && \
+    ls -la /build/*.so*
 
-# =============================================================================
-# Output stage — just the shared library
-# =============================================================================
+# `*.so*` (not `*.so`) is deliberate: Alpine's onnxruntime/libheif packages ship
+# versioned sonames (libonnxruntime.so.1, libheif.so.1) that do not end in the
+# literal ".so" suffix, so a plain `*.so` glob silently drops them from both the
+# diagnostic listing above and this COPY — leaving the NuGet/Java native package
+# with libxberg_ffi.so alone and no ORT (xberg #1280 recurrence). ~keep
 FROM scratch
-COPY --from=builder /build/libxberg_ffi.so /libxberg_ffi.so
+COPY --from=builder /build/*.so* /

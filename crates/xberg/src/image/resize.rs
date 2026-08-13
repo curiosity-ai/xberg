@@ -1,18 +1,19 @@
 use crate::error::{Result, XbergError};
-use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as FirImage};
-use image::{DynamicImage, ImageBuffer, Rgb};
+use fast_image_resize::{
+    FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
+    images::{Image as FirImage, ImageRef as FirImageRef},
+};
 
-/// Resize an image using fast_image_resize with appropriate algorithm based on scale factor
-pub(crate) fn resize_image(
-    image: &DynamicImage,
+/// Resize RGB pixels using `fast_image_resize` without copying the source buffer.
+pub(crate) fn resize_rgb(
+    rgb_data: &[u8],
+    width: u32,
+    height: u32,
     new_width: u32,
     new_height: u32,
     scale_factor: f64,
-) -> Result<DynamicImage> {
-    let rgb_image = image.to_rgb8();
-    let (width, height) = rgb_image.dimensions();
-
-    let src_image = FirImage::from_vec_u8(width, height, rgb_image.into_raw(), PixelType::U8x3)
+) -> Result<Vec<u8>> {
+    let src_image = FirImageRef::new(width, height, rgb_data, PixelType::U8x3)
         .map_err(|e| XbergError::parsing(format!("Failed to create source image: {e:?}")))?;
 
     let mut dst_image = FirImage::new(new_width, new_height, PixelType::U8x3);
@@ -28,67 +29,116 @@ pub(crate) fn resize_image(
         .resize(&src_image, &mut dst_image, &ResizeOptions::new().resize_alg(algorithm))
         .map_err(|e| XbergError::parsing(format!("Resize failed: {e:?}")))?;
 
-    let buffer = dst_image.into_vec();
-    let img_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(new_width, new_height, buffer)
-        .ok_or_else(|| XbergError::parsing("Failed to create image buffer".to_string()))?;
-
-    Ok(DynamicImage::ImageRgb8(img_buffer))
+    Ok(dst_image.into_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgb;
+    use image::{DynamicImage, ImageBuffer, Rgb};
 
-    fn create_test_image() -> DynamicImage {
-        let mut img = ImageBuffer::new(100, 100);
-        for y in 0..100 {
-            for x in 0..100 {
-                img.put_pixel(x, y, Rgb([255u8, 0u8, 0u8]));
+    fn create_test_rgb_data(width: u32, height: u32) -> Vec<u8> {
+        let mut image = ImageBuffer::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                image.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        ((x * 31 + y * 17) % 256) as u8,
+                        ((x * 13 + y * 47) % 256) as u8,
+                        ((x * 73 + y * 7) % 256) as u8,
+                    ]),
+                );
             }
         }
-        DynamicImage::ImageRgb8(img)
+        image.into_raw()
+    }
+
+    fn reference_resize(
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        new_width: u32,
+        new_height: u32,
+        scale_factor: f64,
+    ) -> Vec<u8> {
+        let image_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width, height, rgb_data.to_vec())
+            .expect("reference input dimensions must match its buffer");
+        let image = DynamicImage::ImageRgb8(image_buffer);
+        let rgb_image = image.to_rgb8();
+        let source = FirImage::from_vec_u8(width, height, rgb_image.into_raw(), PixelType::U8x3)
+            .expect("reference source image must be valid");
+        let mut destination = FirImage::new(new_width, new_height, PixelType::U8x3);
+        let algorithm = if scale_factor < 1.0 {
+            ResizeAlg::Convolution(FilterType::Lanczos3)
+        } else {
+            ResizeAlg::Convolution(FilterType::CatmullRom)
+        };
+        Resizer::new()
+            .resize(&source, &mut destination, &ResizeOptions::new().resize_alg(algorithm))
+            .expect("reference resize must succeed");
+        let resized_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(new_width, new_height, destination.into_vec())
+            .expect("reference destination dimensions must match its buffer");
+        DynamicImage::ImageRgb8(resized_buffer).to_rgb8().into_raw()
     }
 
     #[test]
-    fn test_resize_image_downscale() {
-        let img = create_test_image();
-        let result = resize_image(&img, 50, 50, 0.5);
-        assert!(result.is_ok());
-        let resized = result.unwrap();
-        assert_eq!(resized.width(), 50);
-        assert_eq!(resized.height(), 50);
+    fn should_match_reference_pixels_when_downscaling() {
+        let width = 17;
+        let height = 11;
+        let rgb_data = create_test_rgb_data(width, height);
+        let expected = reference_resize(&rgb_data, width, height, 7, 5, 0.45);
+
+        let actual = resize_rgb(&rgb_data, width, height, 7, 5, 0.45).expect("optimized downscale should succeed");
+
+        assert_eq!(actual, expected, "optimized downscale changed output pixels");
     }
 
     #[test]
-    fn test_resize_image_upscale() {
-        let img = create_test_image();
-        let result = resize_image(&img, 200, 200, 2.0);
-        assert!(result.is_ok());
-        let resized = result.unwrap();
-        assert_eq!(resized.width(), 200);
-        assert_eq!(resized.height(), 200);
+    fn should_match_reference_pixels_when_upscaling() {
+        let width = 9;
+        let height = 6;
+        let rgb_data = create_test_rgb_data(width, height);
+        let expected = reference_resize(&rgb_data, width, height, 23, 15, 2.5);
+
+        let actual = resize_rgb(&rgb_data, width, height, 23, 15, 2.5).expect("optimized upscale should succeed");
+
+        assert_eq!(actual, expected, "optimized upscale changed output pixels");
     }
 
     #[test]
-    fn test_resize_image_no_scale() {
-        let img = create_test_image();
-        let result = resize_image(&img, 100, 100, 1.0);
-        assert!(result.is_ok());
-        let resized = result.unwrap();
-        assert_eq!(resized.width(), 100);
-        assert_eq!(resized.height(), 100);
+    fn should_match_reference_pixels_at_unit_scale() {
+        let width = 8;
+        let height = 5;
+        let rgb_data = create_test_rgb_data(width, height);
+        let expected = reference_resize(&rgb_data, width, height, width, height, 1.0);
+
+        let actual =
+            resize_rgb(&rgb_data, width, height, width, height, 1.0).expect("unit-scale resize should succeed");
+
+        assert_eq!(actual, expected, "optimized unit-scale resize changed output pixels");
     }
 
     #[test]
-    fn test_resize_preserves_aspect_ratio() {
-        let img = create_test_image();
-        let result = resize_image(&img, 50, 50, 0.5);
-        assert!(result.is_ok());
-        let resized = result.unwrap();
+    fn should_not_modify_source_pixels() {
+        let rgb_data = create_test_rgb_data(11, 7);
+        let original = rgb_data.clone();
 
-        let original_aspect = img.width() as f64 / img.height() as f64;
-        let resized_aspect = resized.width() as f64 / resized.height() as f64;
-        assert!((original_aspect - resized_aspect).abs() < 0.01);
+        let _ = resize_rgb(&rgb_data, 11, 7, 19, 12, 1.75).expect("resize should succeed");
+
+        assert_eq!(rgb_data, original, "borrowed source buffer was modified");
+    }
+
+    #[test]
+    fn should_reject_source_buffer_with_invalid_size() {
+        let rgb_data = vec![0; 11];
+
+        let error = resize_rgb(&rgb_data, 2, 2, 4, 4, 2.0).expect_err("invalid source buffer must fail");
+
+        assert!(
+            error.to_string().contains("Failed to create source image"),
+            "unexpected error: {error}"
+        );
     }
 }

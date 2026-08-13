@@ -37,7 +37,6 @@ pub(crate) fn extract_braced(text: &str, command: &str) -> Option<String> {
 ///
 /// Handles nested braces correctly and maintains proper depth tracking.
 pub(crate) fn read_braced_from_chars(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
-    // Skip whitespace before opening brace
     while let Some(&c) = chars.peek() {
         if c.is_whitespace() {
             chars.next();
@@ -46,11 +45,10 @@ pub(crate) fn read_braced_from_chars(chars: &mut std::iter::Peekable<std::str::C
         }
     }
 
-    // Check for opening brace
     if chars.peek() != Some(&'{') {
         return None;
     }
-    chars.next(); // Consume '{'
+    chars.next();
 
     let mut content = String::new();
     let mut depth = 1;
@@ -80,7 +78,6 @@ pub(crate) fn read_braced_from_chars(chars: &mut std::iter::Peekable<std::str::C
 /// Example: `\begin{itemize}` returns "itemize"
 /// Also handles `\begin {itemize}` (with space).
 pub(crate) fn extract_env_name(line: &str) -> Option<String> {
-    // Try without space first, then with space
     let start = line.find("\\begin{").or_else(|| line.find("\\begin {"))?;
     let brace_pos = line[start..].find('{')?;
     let after = &line[start + brace_pos + 1..];
@@ -104,6 +101,30 @@ pub(crate) fn clean_text(text: &str) -> String {
         .to_string()
 }
 
+/// Returns true if a line inside a table-like environment (`tabular`,
+/// `longtable`, `tabularx`, `tabulary`) is structural row/column markup
+/// rather than literal cell content.
+///
+/// Covers `\hline`/booktabs rules, `longtable` page-break markers
+/// (`\endhead`, `\endfirsthead`, `\endfoot`, `\endlastfoot`), `\caption{}`
+/// and `\label{}` (handled separately by callers that want them), and any
+/// nested `\begin{...}`/`\end{...}` boundary line.
+pub(crate) fn is_table_structural_line(trimmed: &str) -> bool {
+    trimmed.is_empty()
+        || trimmed.starts_with("\\hline")
+        || trimmed.starts_with("\\toprule")
+        || trimmed.starts_with("\\midrule")
+        || trimmed.starts_with("\\bottomrule")
+        || trimmed.starts_with("\\endhead")
+        || trimmed.starts_with("\\endfirsthead")
+        || trimmed.starts_with("\\endfoot")
+        || trimmed.starts_with("\\endlastfoot")
+        || trimmed.starts_with("\\caption")
+        || trimmed.starts_with("\\label")
+        || trimmed.starts_with("\\begin{")
+        || trimmed.starts_with("\\end{")
+}
+
 /// Collects content of an environment from begin to end.
 ///
 /// Returns the content and the index of the line after \end{environment}.
@@ -112,7 +133,6 @@ pub(crate) fn collect_environment(lines: &[&str], start_idx: usize, env_name: &s
     let end_marker = format!("\\end{{{}}}", env_name);
     let begin_marker = format!("\\begin{{{}}}", env_name);
 
-    // Handle single-line environment: \begin{X}...\end{X} on same line
     let start_line = lines[start_idx];
     if let Some(begin_pos) = start_line.find(&begin_marker) {
         let after_begin = &start_line[begin_pos + begin_marker.len()..];
@@ -133,7 +153,6 @@ pub(crate) fn collect_environment(lines: &[&str], start_idx: usize, env_name: &s
         let line = lines[i];
         let trimmed = line.trim();
 
-        // Track nesting depth for same-named environments (both space variants)
         depth += trimmed.matches(&begin_marker).count() as isize;
         depth += trimmed.matches(&begin_marker_space).count() as isize;
         depth -= trimmed.matches(&end_marker).count() as isize;
@@ -159,7 +178,6 @@ pub(crate) fn extract_heading_title(line: &str, command: &str) -> Option<String>
     let start = line.find(&prefix)?;
     let after = &line[start + prefix.len()..];
 
-    // Skip optional argument [...]
     let rest = if after.starts_with('[') {
         let bracket_end = after.find(']')?;
         &after[bracket_end + 1..]

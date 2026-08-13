@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Xberg.Core;
@@ -63,6 +64,7 @@ public sealed class DocxExtractor : IExtractor
                 {
                     var para = el.Paragraph!;
                     string text = CollectText(para.Runs);
+                    var annotations = CollectRunAnnotations(para.Runs);
                     var mathFormulas = CollectMathFormulas(para.Runs);
                     if (text.Length == 0 && mathFormulas.Count == 0) { CloseLists(); continue; }
 
@@ -74,7 +76,8 @@ public sealed class DocxExtractor : IExtractor
                         // Headings do not emit standalone math formulas (matches Rust).
                         CloseLists();
                         string headingText = text.Length == 0 ? RunsToMarkdown(para.Runs) : text;
-                        b.PushHeading(level, headingText, null, null);
+                        uint headingIdx = b.PushHeading(level, headingText, null, null);
+                        if (annotations.Count > 0) b.SetAnnotations(headingIdx, annotations);
                     }
                     else if (isQuote)
                     {
@@ -83,7 +86,7 @@ public sealed class DocxExtractor : IExtractor
                         if (text.Length != 0)
                         {
                             b.PushQuoteStart();
-                            b.PushParagraph(text, new(), null, null);
+                            b.PushParagraph(text, annotations, null, null);
                             b.PushQuoteEnd();
                         }
                     }
@@ -114,14 +117,14 @@ public sealed class DocxExtractor : IExtractor
                                 for (long i = 0; i < currentNesting - nlvl; i++) { b.EndList(); openListCount = Math.Max(0, openListCount - 1); }
                                 currentNesting = nlvl;
                             }
-                            b.PushListItem(text, currentListOrdered, new(), null, null);
+                            b.PushListItem(text, currentListOrdered, annotations, null, null);
                         }
                     }
                     else
                     {
                         CloseLists();
                         foreach (var f in mathFormulas) b.PushFormula(f, null, null);
-                        if (text.Length != 0) b.PushParagraph(text, new(), null, null);
+                        if (text.Length != 0) b.PushParagraph(text, annotations, null, null);
                     }
                     break;
                 }
@@ -319,6 +322,125 @@ public sealed class DocxExtractor : IExtractor
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Collect byte-offset-based formatting annotations for the plain text produced by
+    /// <see cref="CollectText"/>. Ports Rust <c>collect_run_annotations</c>; offsets are UTF-8
+    /// byte offsets, matching the Rust <c>String::len()</c> the renderers expect.
+    /// </summary>
+    private static List<TextAnnotation> CollectRunAnnotations(List<DocxRun> runs)
+    {
+        var annotations = new List<TextAnnotation>();
+        uint offset = 0;
+
+        foreach (var run in runs)
+        {
+            if (run.MathLatex is not null) continue;
+            if (run.Text.Length == 0) continue;
+
+            uint start = offset;
+            offset += (uint)Encoding.UTF8.GetByteCount(run.Text);
+            uint end = offset;
+
+            void Add(AnnotationKind kind) =>
+                annotations.Add(new TextAnnotation { Start = start, End = end, Kind = kind });
+
+            if (run.Bold) Add(new AnnotationKind { Which = AnnotationKind.Tag.Bold });
+            if (run.Italic) Add(new AnnotationKind { Which = AnnotationKind.Tag.Italic });
+            if (run.Underline) Add(new AnnotationKind { Which = AnnotationKind.Tag.Underline });
+            if (run.Strike) Add(new AnnotationKind { Which = AnnotationKind.Tag.Strikethrough });
+            if (run.Subscript) Add(new AnnotationKind { Which = AnnotationKind.Tag.Subscript });
+            if (run.Superscript) Add(new AnnotationKind { Which = AnnotationKind.Tag.Superscript });
+            if (run.FontSize is { } sz)
+            {
+                double pts = sz / 2.0;
+                string value = pts == Math.Floor(pts)
+                    ? $"{(uint)pts}pt"
+                    : pts.ToString("0.0", CultureInfo.InvariantCulture) + "pt";
+                Add(new AnnotationKind { Which = AnnotationKind.Tag.FontSize, Value = value });
+            }
+            if (run.FontColor is { } color)
+                Add(new AnnotationKind { Which = AnnotationKind.Tag.Color, Value = "#" + color });
+            if (run.Highlight) Add(new AnnotationKind { Which = AnnotationKind.Tag.Highlight });
+            if (run.HyperlinkUrl is { } url)
+                Add(new AnnotationKind { Which = AnnotationKind.Tag.Link, Url = url, Title = null });
+        }
+
+        MergeAdjacentAnnotations(annotations);
+        return annotations;
+    }
+
+    /// <summary>
+    /// Merge adjacent or overlapping annotations of the same kind. Consecutive runs with the
+    /// same formatting each produce their own annotation; without merging the markdown renderer
+    /// would close and immediately reopen markers (<c>**a****b**</c> instead of <c>**ab**</c>).
+    /// </summary>
+    private static void MergeAdjacentAnnotations(List<TextAnnotation> annotations)
+    {
+        if (annotations.Count < 2) return;
+
+        static int KindKey(AnnotationKind k) => k.Which switch
+        {
+            AnnotationKind.Tag.Bold => 0,
+            AnnotationKind.Tag.Italic => 1,
+            AnnotationKind.Tag.Underline => 2,
+            AnnotationKind.Tag.Strikethrough => 3,
+            AnnotationKind.Tag.Subscript => 4,
+            AnnotationKind.Tag.Superscript => 5,
+            AnnotationKind.Tag.Highlight => 6,
+            AnnotationKind.Tag.Code => 7,
+            AnnotationKind.Tag.Link => 8,
+            _ => 255,
+        };
+
+        // Simple kinds match by discriminant; links match only on identical url + title.
+        static bool SameKindForMerge(AnnotationKind a, AnnotationKind b) => a.Which == b.Which && a.Which switch
+        {
+            AnnotationKind.Tag.Bold or AnnotationKind.Tag.Italic or AnnotationKind.Tag.Underline
+                or AnnotationKind.Tag.Strikethrough or AnnotationKind.Tag.Subscript
+                or AnnotationKind.Tag.Superscript or AnnotationKind.Tag.Highlight
+                or AnnotationKind.Tag.Code => true,
+            AnnotationKind.Tag.Link => a.Url == b.Url && a.Title == b.Title,
+            _ => false,
+        };
+
+        static bool IsMergeable(AnnotationKind k) => KindKey(k) != 255;
+
+        // Stable sort by (kind, start) so same-kind runs land next to each other in text order.
+        var sorted = annotations
+            .Select((a, i) => (a, i))
+            .OrderBy(t => KindKey(t.a.Kind))
+            .ThenBy(t => t.a.Start)
+            .ThenBy(t => t.i)
+            .Select(t => t.a)
+            .ToList();
+
+        var merged = new List<TextAnnotation>(sorted.Count);
+        int p = 0;
+        while (p < sorted.Count)
+        {
+            var ann = sorted[p];
+            if (IsMergeable(ann.Kind))
+            {
+                int q = p + 1;
+                while (q < sorted.Count && SameKindForMerge(sorted[q].Kind, ann.Kind) && sorted[q].Start <= ann.End)
+                {
+                    ann.End = Math.Max(ann.End, sorted[q].End);
+                    q++;
+                }
+                merged.Add(ann);
+                p = q;
+            }
+            else
+            {
+                merged.Add(ann);
+                p++;
+            }
+        }
+
+        annotations.Clear();
+        annotations.AddRange(merged);
+    }
+
     /// <summary>Non-empty LaTeX strings from math runs, emitted as standalone Formula nodes
     /// (matches Rust `collect_run_annotations` math_formulas).</summary>
     private static List<string> CollectMathFormulas(List<DocxRun> runs)
@@ -442,6 +564,15 @@ public sealed class DocxExtractor : IExtractor
         AddStr("category", core.Category);
         AddStr("content_status", core.ContentStatus);
         AddStr("description", core.Description);
+        // #230: surface both the raw DocSecurity value and the decoded ECMA-376 flags so a
+        // consumer can tell a read-only-recommended or password-protected document apart
+        // without knowing the bit layout.
+        if (app.DocSecurity is { } docSecurity)
+        {
+            additional[OfficeMetadata.DocSecurityKey] = JsonNumber(docSecurity);
+            foreach (var (key, value) in OfficeMetadata.DecodeDocSecurityFlags(docSecurity))
+                additional[key] = JsonBool(value);
+        }
         // Custom properties also surface as `custom_<name>` entries in `additional`.
         foreach (var (k, v) in custom) additional["custom_" + k] = v;
 
@@ -520,4 +651,7 @@ public sealed class DocxExtractor : IExtractor
 
     private static JsonElement JsonNumber(int n) =>
         JsonDocument.Parse(n.ToString(System.Globalization.CultureInfo.InvariantCulture)).RootElement.Clone();
+
+    private static JsonElement JsonBool(bool b) =>
+        JsonDocument.Parse(b ? "true" : "false").RootElement.Clone();
 }

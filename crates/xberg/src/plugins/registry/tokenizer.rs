@@ -60,13 +60,9 @@ impl TokenizerBackendRegistry {
             });
         }
 
-        // Run initialize() first so that backends which lazy-load their
-        // vocabulary can produce real counts from the probe below.
         backend.initialize()?;
 
         if backend.count_tokens("a") == 0 {
-            // initialize() already ran; give the backend a chance to release
-            // resources before we reject it.
             let _ = backend.shutdown();
             return Err(XbergError::Validation {
                 message: format!("Tokenizer backend '{name}' must report a non-zero token count for non-empty text"),

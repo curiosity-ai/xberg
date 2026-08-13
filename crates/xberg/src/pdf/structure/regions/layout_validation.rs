@@ -7,7 +7,7 @@
 
 /// Result of validating a single layout region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants used when layout-detection feature is enabled
+#[allow(dead_code)]
 pub(in crate::pdf::structure) enum RegionValidation {
     /// Region contains text-like connected components; suppress normally.
     HasContent,
@@ -41,13 +41,10 @@ pub(in crate::pdf::structure) fn validate_region_has_text(
     region_w: u32,
     region_h: u32,
 ) -> RegionValidation {
-    // Skip tiny regions
     if region_w < 5 || region_h < 5 {
         return RegionValidation::Empty;
     }
 
-    // Build a Pix from just the cropped region (avoid building full-page Pix)
-    // Extract the RGB sub-rectangle manually
     let mut crop_data = Vec::with_capacity((region_w * region_h * 3) as usize);
     for row in region_y..(region_y + region_h).min(page_height) {
         let row_start = (row * page_width + region_x) as usize * 3;
@@ -63,13 +60,11 @@ pub(in crate::pdf::structure) fn validate_region_has_text(
         return RegionValidation::Skipped;
     }
 
-    // Build Pix from cropped RGB data
     let pix = match xberg_tesseract::Pix::from_raw_rgb(&crop_data, actual_w, actual_h) {
         Ok(p) => p,
         Err(_) => return RegionValidation::Skipped,
     };
 
-    // Grayscale → binarize → count CCs
     let gray = match pix.to_grayscale() {
         Ok(g) => g,
         Err(_) => return RegionValidation::Skipped,
@@ -130,19 +125,16 @@ pub(in crate::pdf::structure) fn validate_page_regions(
     let img_h = page_image.height();
     let rgb_data = page_image.as_raw();
 
-    // Scale factors: PDF points → rendered image pixels
     let sx = img_w as f32 / page_result.page_width_pts;
     let sy = img_h as f32 / page_result.page_height_pts;
 
     hints
         .iter()
         .map(|hint| {
-            // Only validate Table and Picture (suppressible classes)
             if !matches!(hint.class_name, LayoutHintClass::Table | LayoutHintClass::Picture) {
                 return RegionValidation::Skipped;
             }
 
-            // Convert PDF coords to pixel coords (same as table_recognition.rs)
             let px_left = (hint.left * sx).round().max(0.0) as u32;
             let px_top = ((page_result.page_height_pts - hint.top) * sy).round().max(0.0) as u32;
             let px_right = (hint.right * sx).round().min(img_w as f32) as u32;
@@ -153,7 +145,6 @@ pub(in crate::pdf::structure) fn validate_page_regions(
             let crop_w = px_right.saturating_sub(px_left);
             let crop_h = px_bottom.saturating_sub(px_top);
 
-            // Skip very large regions (>50% page area) — likely intentional
             if (crop_w as f32 * crop_h as f32) > (img_w as f32 * img_h as f32 * 0.5) {
                 return RegionValidation::Skipped;
             }

@@ -5,15 +5,13 @@ package io.xberg;
  * The preset's declared `id` does not match its file-system location.
  */
 public class IdMismatchException extends LoadErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new IdMismatchException with the given message. */
-    public IdMismatchException(final String message) {
-        super(message);
-    }
+  /** Creates a new IdMismatchException with the given message. */
+  public IdMismatchException(final String message) { super(message); }
 
-    /** Creates a new IdMismatchException with the given message and cause. */
-    public IdMismatchException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new IdMismatchException with the given message and cause. */
+  public IdMismatchException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

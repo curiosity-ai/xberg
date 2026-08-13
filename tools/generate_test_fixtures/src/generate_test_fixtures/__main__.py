@@ -12,9 +12,6 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-# Each generator exposes ``generate(output_root: Path, repo_root: Path) -> list[Path]``
-# returning the list of files (binary + sidecars) it wrote. This keeps the
-# dispatch table trivial and the smoke test predictable.
 GeneratorFn = Callable[[Path, Path], list[Path]]
 
 
@@ -93,7 +90,6 @@ def main(argv: list[str] | None = None) -> int:
     if "all" in args.commands:
         selected = ["docx", "odt", "xlsx", "pptx", "pdf", "diff-pairs", "security"]
     else:
-        # Preserve user ordering, drop duplicates.
         seen: set[str] = set()
         selected = [c for c in args.commands if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
 

@@ -10,6 +10,8 @@
 //! Each test notebook is extracted and compared against Pandoc's markdown output
 //! to ensure correct content extraction and transformation.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+
 use std::{fs, path::PathBuf};
 use xberg::core::config::ExtractionConfig;
 
@@ -80,8 +82,10 @@ async fn test_jupyter_simple_notebook_extraction() {
     );
 
     assert!(
-        extraction.content.contains("execution_count"),
-        "Should preserve execution_count from code cells"
+        serde_json::to_string(&extraction.metadata.additional)
+            .expect("metadata should serialize")
+            .contains("execution_count"),
+        "Should preserve execution_count as structured metadata"
     );
 
     assert!(
@@ -100,8 +104,10 @@ async fn test_jupyter_simple_notebook_extraction() {
     );
 
     assert!(
-        extraction.content.contains("foo") || extraction.content.contains("bar") || extraction.content.contains("tags"),
-        "Should preserve or reference cell metadata tags"
+        serde_json::to_string(&extraction.metadata.additional)
+            .expect("metadata should serialize")
+            .contains("tags"),
+        "Should preserve cell tags as structured metadata"
     );
 
     println!(
@@ -170,11 +176,11 @@ async fn test_jupyter_mime_notebook_extraction() {
         "Should extract code cell with imports"
     );
 
+    let metadata_json =
+        serde_json::to_string(&extraction.metadata.additional).expect("notebook metadata should serialize");
     assert!(
-        extraction.content.contains(".stream")
-            || extraction.content.contains("stdout")
-            || extraction.content.contains("output"),
-        "Should preserve stream output type information"
+        metadata_json.contains("stream"),
+        "Should preserve stream output metadata"
     );
 
     let mime_types = vec![
@@ -190,10 +196,7 @@ async fn test_jupyter_mime_notebook_extraction() {
         "application/javascript",
     ];
 
-    let mime_count = mime_types
-        .iter()
-        .filter(|&&mime| extraction.content.contains(mime))
-        .count();
+    let mime_count = mime_types.iter().filter(|&&mime| metadata_json.contains(mime)).count();
     assert!(
         mime_count >= 3,
         "Should extract at least 3 MIME type references (found {})",
@@ -211,8 +214,8 @@ async fn test_jupyter_mime_notebook_extraction() {
     );
 
     assert!(
-        extraction.content.contains("execution_count"),
-        "Should preserve execution_count metadata from code outputs"
+        metadata_json.contains("execution_count"),
+        "Should preserve execution_count as structured metadata"
     );
 
     println!(
@@ -360,6 +363,13 @@ async fn test_jupyter_rank_notebook_extraction() {
 
     assert!(!extraction.content.is_empty(), "Extracted content should not be empty");
 
+    // The extractor renders raw cell content (code + text outputs) and routes
+    // diagnostics to metadata / images rather than inline `[output_type: ..]`
+    // markers (see fix(notebook) 6dbaac0a69), so classification and kernel
+    // assertions read `metadata.additional`, and image outputs read
+    // `extraction.images`. ~keep
+    let rank_metadata = serde_json::to_string(&extraction.metadata.additional).unwrap_or_default();
+
     assert!(
         extraction.content.contains("matplotlib")
             || extraction.content.contains("pyplot")
@@ -376,8 +386,8 @@ async fn test_jupyter_rank_notebook_extraction() {
     );
 
     assert!(
-        extraction.content.contains("display") || extraction.content.contains("output"),
-        "Should preserve output type markers"
+        rank_metadata.contains("display_data") || rank_metadata.contains("execute_result"),
+        "Should preserve output type classifications in metadata"
     );
 
     assert!(
@@ -390,15 +400,13 @@ async fn test_jupyter_rank_notebook_extraction() {
     assert!(
         extraction.content.contains("html")
             || extraction.content.contains("text")
-            || extraction.content.contains("see"),
-        "Should extract alternative text representation"
+            || extraction.content.contains("Figure"),
+        "Should extract alternative text representation of the figure output"
     );
 
     assert!(
-        extraction.content.contains("ipykernel")
-            || extraction.content.contains("python")
-            || extraction.content.contains("Python"),
-        "Should preserve kernel or language information"
+        rank_metadata.contains("ipykernel") || rank_metadata.contains("python") || rank_metadata.contains("Python"),
+        "Should preserve kernel or language information in metadata"
     );
 
     println!(
@@ -449,8 +457,8 @@ async fn test_jupyter_metadata_aggregation() {
         );
 
         assert!(
-            extraction.metadata.additional.is_empty() || !extraction.metadata.additional.is_empty(),
-            "{}: Metadata structure should be consistent",
+            extraction.metadata.additional.contains_key("cells"),
+            "{}: Cell metadata should be structured",
             name
         );
 
@@ -566,21 +574,21 @@ async fn test_jupyter_mime_output_handling() {
     let extraction = result.expect("Operation failed");
 
     assert!(
-        extraction.content.contains("image")
-            || extraction.content.contains("png")
-            || extraction.content.contains("jpg"),
-        "Should handle image MIME types"
+        extraction.images.as_ref().is_some_and(|images| !images.is_empty()),
+        "Should extract image MIME outputs into the images collection"
     );
 
     assert!(
-        extraction.content.contains("html") || extraction.content.contains("text"),
+        extraction.content.contains("html")
+            || extraction.content.contains("text")
+            || extraction.content.contains("Figure"),
         "Should preserve HTML and text representations"
     );
 
-    let output_type_markers = ["display_data", "execute_result", "stream", "output"];
-    let has_output_types = output_type_markers
-        .iter()
-        .any(|&marker| extraction.content.contains(marker));
+    let metadata_json =
+        serde_json::to_string(&extraction.metadata.additional).expect("notebook metadata should serialize");
+    let output_type_markers = ["display_data", "execute_result", "stream"];
+    let has_output_types = output_type_markers.iter().any(|&marker| metadata_json.contains(marker));
     assert!(has_output_types, "Should preserve output type classifications");
 
     assert!(
@@ -621,22 +629,19 @@ async fn test_jupyter_notebook_structure_preservation() {
     }
 
     let extraction = result.expect("Operation failed");
+    let metadata_json =
+        serde_json::to_string(&extraction.metadata.additional).expect("notebook metadata should serialize");
 
     let cell_id_patterns = ["uid1", "uid2", "uid3", "uid4", "uid6"];
     let id_count = cell_id_patterns
         .iter()
-        .filter(|&&id| extraction.content.contains(id))
+        .filter(|&&id| metadata_json.contains(id))
         .count();
     assert!(id_count >= 1, "Should preserve cell IDs (found {} IDs)", id_count);
 
     assert!(
-        extraction.content.contains("uid") || extraction.content.contains("cell"),
-        "Should contain cell identity markers"
-    );
-
-    assert!(
-        extraction.content.contains("execution_count") || extraction.content.contains("count"),
-        "Should preserve execution count metadata"
+        metadata_json.contains("execution_count"),
+        "Should preserve execution count as structured metadata"
     );
 
     println!("✓ Structure preservation: Cell IDs and ordering maintained");
@@ -675,11 +680,9 @@ async fn test_jupyter_pandoc_baseline_alignment() {
         let extraction = result.expect("Operation failed");
 
         assert!(
-            extraction.content.contains("cell")
-                || extraction.content.contains("code")
-                || extraction.content.contains("markdown")
-                || extraction.content.contains("output"),
-            "{}: Should contain cell/output structure markers that match Pandoc format",
+            !extraction.content.trim().is_empty()
+                || extraction.images.as_ref().is_some_and(|images| !images.is_empty()),
+            "{}: Should extract cell content or outputs",
             notebook_name
         );
 
@@ -699,6 +702,171 @@ async fn test_jupyter_pandoc_baseline_alignment() {
             "✓ {}: Baseline alignment verified ({} chars extracted)",
             notebook_name,
             extraction.content.len()
+        );
+    }
+}
+
+/// Configurable code-source vs output rendering (issue #1204).
+///
+/// These run only with the `notebook` feature, which registers the Jupyter
+/// extractor. A code cell carries a distinctive source token (`compute_answer`)
+/// and a distinctive output token (`42`) so each rendering mode is unambiguous.
+#[cfg(feature = "notebook")]
+mod rendering_modes {
+    use xberg::core::config::{ExtractionConfig, JupyterCellRendering};
+
+    use super::helpers::extract_bytes_document;
+
+    const NOTEBOOK: &[u8] = br#"{
+        "cells": [
+            {
+                "cell_type": "code",
+                "id": "diagnostic-cell",
+                "source": ["compute_answer()"],
+                "execution_count": 1,
+                "outputs": [
+                    {"output_type": "stream", "name": "stdout", "text": ["42\n"]},
+                    {
+                        "output_type": "display_data",
+                        "data": {"text/plain": ["formatted output"]},
+                        "metadata": {}
+                    }
+                ],
+                "metadata": {"tags": ["diagnostic-tag"]}
+            }
+        ],
+        "metadata": {"kernelspec": {"name": "python3", "language": "python"}},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }"#;
+
+    async fn extract_with(rendering: JupyterCellRendering) -> String {
+        let config = ExtractionConfig {
+            jupyter_cell_rendering: rendering,
+            ..Default::default()
+        };
+        extract_bytes_document(NOTEBOOK, "application/x-ipynb+json", &config)
+            .await
+            .expect("notebook extraction should succeed")
+            .content
+    }
+
+    #[tokio::test]
+    async fn source_mode_renders_code_without_outputs() {
+        let content = extract_with(JupyterCellRendering::Source).await;
+        assert!(content.contains("compute_answer"), "source is rendered");
+        assert!(!content.contains("[output_type"), "output markers are suppressed");
+        assert!(!content.contains("42"), "output text is suppressed");
+    }
+
+    #[tokio::test]
+    async fn outputs_mode_renders_outputs_without_code() {
+        let content = extract_with(JupyterCellRendering::Outputs).await;
+        assert!(content.contains("42"), "output text is rendered");
+        assert!(
+            !content.contains("[output_type:"),
+            "diagnostic output markers are hidden"
+        );
+        assert!(!content.contains("compute_answer"), "code source is suppressed");
+    }
+
+    #[tokio::test]
+    async fn both_mode_renders_code_and_outputs() {
+        let content = extract_with(JupyterCellRendering::Both).await;
+        assert!(content.contains("compute_answer"), "source is rendered");
+        assert!(content.contains("42"), "output text is rendered");
+    }
+
+    #[tokio::test]
+    async fn default_config_matches_both() {
+        let default_content = extract_with(JupyterCellRendering::default()).await;
+        let both_content = extract_with(JupyterCellRendering::Both).await;
+        assert_eq!(
+            default_content, both_content,
+            "default rendering is Both (no behavior change)"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_output_hides_diagnostics_and_preserves_structured_metadata() {
+        let result = extract_bytes_document(NOTEBOOK, "application/x-ipynb+json", &ExtractionConfig::default())
+            .await
+            .expect("notebook extraction should succeed");
+
+        for diagnostic in [
+            "[kernel_language:",
+            "[cell_id:",
+            "[tags:",
+            "execution_count:",
+            "[output_type:",
+            "[mime:",
+        ] {
+            assert!(!result.content.contains(diagnostic), "content leaked {diagnostic}");
+        }
+        for metadata_value in ["diagnostic-cell", "diagnostic-tag", "text/plain", "stream"] {
+            assert!(
+                !result.content.contains(metadata_value),
+                "content leaked structured metadata value {metadata_value}"
+            );
+        }
+        let cells = result.metadata.additional["cells"]
+            .as_array()
+            .expect("cells metadata should be an array");
+        assert_eq!(cells[0]["execution_count"], 1);
+        assert_eq!(cells[0]["outputs"][0]["output_type"], "stream");
+        assert_eq!(cells[0]["id"], "diagnostic-cell");
+        assert_eq!(cells[0]["tags"], serde_json::json!(["diagnostic-tag"]));
+        assert_eq!(cells[0]["outputs"][1]["mime_types"], serde_json::json!(["text/plain"]));
+    }
+
+    const NOTEBOOK_WITH_IMAGE: &[u8] = br#"{
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["render_plot()"],
+                "execution_count": 1,
+                "outputs": [
+                    {
+                        "output_type": "display_data",
+                        "data": {"image/png": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="},
+                        "metadata": {}
+                    }
+                ],
+                "metadata": {}
+            }
+        ],
+        "metadata": {"kernelspec": {"name": "python3", "language": "python"}},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }"#;
+
+    async fn image_count(rendering: JupyterCellRendering) -> usize {
+        let config = ExtractionConfig {
+            jupyter_cell_rendering: rendering,
+            ..Default::default()
+        };
+        extract_bytes_document(NOTEBOOK_WITH_IMAGE, "application/x-ipynb+json", &config)
+            .await
+            .expect("notebook extraction should succeed")
+            .images
+            .map(|imgs| imgs.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn source_mode_suppresses_output_images() {
+        assert_eq!(
+            image_count(JupyterCellRendering::Source).await,
+            0,
+            "source mode drops output images"
+        );
+        assert!(
+            image_count(JupyterCellRendering::Outputs).await >= 1,
+            "outputs mode retains output images"
+        );
+        assert!(
+            image_count(JupyterCellRendering::Both).await >= 1,
+            "both mode retains output images"
         );
     }
 }

@@ -15,7 +15,14 @@ package io.xberg
 import com.fasterxml.jackson.core.type.TypeReference
 
 @Suppress("TooManyFunctions")
-class MetaSchema internal constructor(internal val handle: Long) : AutoCloseable {
+class MetaSchema internal constructor(handle: Long) : AutoCloseable {
+    private val handleLock = Any()
+    private var nativeHandle: Long = handle
+
+    private inline fun <T> withHandle(block: (Long) -> T): T = synchronized(handleLock) {
+        check(nativeHandle != 0L) { "MetaSchema is closed" }
+        block(nativeHandle)
+    }
     companion object {
         private val MAPPER = com.fasterxml.jackson.databind.ObjectMapper()
         .registerModule(com.fasterxml.jackson.datatype.jdk8.Jdk8Module())
@@ -26,14 +33,27 @@ class MetaSchema internal constructor(internal val handle: Long) : AutoCloseable
     // Validate `raw` against the meta-schema and deserialize into a [`Preset`],
     // stamping the fingerprint over the canonical file bytes.
     fun parsePreset(path: String, raw: ByteArray): Preset {
-        val responseJson = XbergBridge.nativeMetaSchemaParsePreset(handle, MAPPER.writeValueAsString(mapOf("path" to path, "raw" to raw)))
+        val responseJson = withHandle { handle -> XbergBridge.nativeMetaSchemaParsePreset(handle, MAPPER.writeValueAsString(mapOf("path" to path, "raw" to raw))) }
         return MAPPER.readValue(responseJson, Preset::class.java)
     }
 
-    override fun close() { XbergBridge.nativeFreeMetaSchema(handle) }
+    override fun close() = synchronized(handleLock) {
+        if (nativeHandle != 0L) {
+            val handle = nativeHandle
+            nativeHandle = 0L
+            XbergBridge.nativeFreeMetaSchema(handle)
+        }
+    }
 }
 @Suppress("TooManyFunctions")
-class Registry internal constructor(internal val handle: Long) : AutoCloseable {
+class Registry internal constructor(handle: Long) : AutoCloseable {
+    private val handleLock = Any()
+    private var nativeHandle: Long = handle
+
+    private inline fun <T> withHandle(block: (Long) -> T): T = synchronized(handleLock) {
+        check(nativeHandle != 0L) { "Registry is closed" }
+        block(nativeHandle)
+    }
     companion object {
         private val MAPPER = com.fasterxml.jackson.databind.ObjectMapper()
         .registerModule(com.fasterxml.jackson.datatype.jdk8.Jdk8Module())
@@ -43,30 +63,30 @@ class Registry internal constructor(internal val handle: Long) : AutoCloseable {
 
     // Look up a preset by its identifier.
     fun get(id: String): Preset? {
-        val responseJson = XbergBridge.nativeRegistryGet(handle, MAPPER.writeValueAsString(id))
+        val responseJson = withHandle { handle -> XbergBridge.nativeRegistryGet(handle, MAPPER.writeValueAsString(id)) }
         return MAPPER.readValue(responseJson, Preset::class.java)
     }
 
     // Materialize a [`PresetSummary`] list for the public registry endpoint.
     fun summaries(): List<PresetSummary> {
-        val responseJson = XbergBridge.nativeRegistrySummaries(handle)
+        val responseJson = withHandle { handle -> XbergBridge.nativeRegistrySummaries(handle) }
         return MAPPER.readValue(responseJson, object : TypeReference<List<PresetSummary>>() {})
     }
 
     // Number of presets currently loaded.
     fun len(): Long {
-        return XbergBridge.nativeRegistryLen(handle)
+        return withHandle { handle -> XbergBridge.nativeRegistryLen(handle) }
     }
 
     // Whether the registry contains zero presets.
     fun isEmpty(): Boolean {
-        return XbergBridge.nativeRegistryIsEmpty(handle)
+        return withHandle { handle -> XbergBridge.nativeRegistryIsEmpty(handle) }
     }
 
     // Read raw sample bytes for `<preset_id>` from
     // `library/<id>/samples/<name>`. Returns `None` when the file is absent.
     fun sampleBytes(presetId: String, name: String): ByteArray? {
-        return XbergBridge.nativeRegistrySampleBytes(handle, MAPPER.writeValueAsString(mapOf("presetId" to presetId, "name" to name)))
+        return withHandle { handle -> XbergBridge.nativeRegistrySampleBytes(handle, MAPPER.writeValueAsString(mapOf("presetId" to presetId, "name" to name))) }
     }
 
     // Load additional preset files from a runtime directory and insert them
@@ -85,8 +105,14 @@ class Registry internal constructor(internal val handle: Long) : AutoCloseable {
     // This is the injection point for downstream catalogs that add curated
     // presets on top of the single embedded OSS preset.
     fun extendFromDir(dir: String): Long {
-        return XbergBridge.nativeRegistryExtendFromDir(handle, MAPPER.writeValueAsString(dir))
+        return withHandle { handle -> XbergBridge.nativeRegistryExtendFromDir(handle, MAPPER.writeValueAsString(dir)) }
     }
 
-    override fun close() { XbergBridge.nativeFreeRegistry(handle) }
+    override fun close() = synchronized(handleLock) {
+        if (nativeHandle != 0L) {
+            val handle = nativeHandle
+            nativeHandle = 0L
+            XbergBridge.nativeFreeRegistry(handle)
+        }
+    }
 }

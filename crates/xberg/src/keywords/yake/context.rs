@@ -1,6 +1,3 @@
-// Vendored from yake-rust 1.0.3 (MIT) — https://github.com/quesurifn/yake-rust
-// Replaced hashbrown::HashMap with ahash::AHashMap.
-
 use ahash::AHashMap;
 
 use super::counter::Counter;

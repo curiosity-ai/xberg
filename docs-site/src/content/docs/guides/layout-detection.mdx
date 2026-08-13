@@ -1,0 +1,315 @@
+---
+title: "Layout Detection"
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Detect document layout regions (tables, figures, headers, text blocks, etc.) in PDFs using ONNX-based deep learning models. Enables table extraction, figure isolation, reading-order reconstruction, and selective OCR.
+
+See the [LayoutDetectionConfig reference](/reference/configuration/#layoutdetectionconfig) for all configuration options.
+
+:::note[Feature gate]
+Requires the `layout-detection` Cargo feature. Not included in the default feature set.
+:::
+
+## Model
+
+Layout detection uses the **RT-DETR v2** model, an ONNX-based deep learning model that detects document layout regions. Regions are labeled with one of 18 `LayoutClass` categories: text blocks, tables, figures, charts, headers, footers, captions, code, lists, sections, formulas, footnotes, page headers/footers, titles, checkboxes, key-value regions, and document indices.
+
+Layout detection now populates `ExtractedDocument.formulas` for formula regions and supports chart understanding via
+`enable_chart_understanding`.
+
+### When to Enable
+
+**Recommended for:** complex multi-column PDFs, scanned documents, academic papers, business forms, and any document where layout understanding improves extraction accuracy.
+
+**Less beneficial for:** simple single-column text documents, high-throughput pipelines where latency is critical (consider GPU acceleration), or documents already well-handled by PDF structure trees.
+
+### Performance Impact
+
+| Pipeline | Structure F1 | Text F1 | Avg time/doc |
+| -------- | ------------ | ------- | ------------ |
+| Baseline | 33.9%        | 87.4%   | 447 ms       |
+| Layout   | 41.1%        | 90.1%   | 1500 ms      |
+
+_171-document PDF corpus, CPU only. GPU acceleration significantly reduces the time penalty._
+
+:::note[Layout Detection Model]
+Xberg uses only the RT-DETR v2 model for layout detection. The `preset` field is not available in `LayoutDetectionConfig`. Configure table structure recognition separately via `table_model` — see "Table Structure Models" below.
+:::
+
+:::note[Pure-Rust inference engine]
+RT-DETR also runs through xberg's pure-Rust `tract` engine (no native ONNX Runtime library, CPU-only), matching ONNX Runtime within 5e-3 on its outputs. This brings layout detection to targets that cannot link native ONNX Runtime: it is enabled on WASM and the Android x86_64 emulator via the `layout-tract` feature (on WASM, weights are streamed in through the `detectLayout` export). PP-DocLayout-V3, TATR, and SLANeXT table structure models remain ONNX Runtime-only.
+:::
+
+## Configuration
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+
+```python
+from xberg import ExtractInput, ExtractionConfig, LayoutDetectionConfig, extract
+
+config = ExtractionConfig(
+    layout=LayoutDetectionConfig(
+        confidence_threshold=0.5,
+        apply_heuristics=True,
+        table_model="tatr",
+    )
+)
+output = await extract(ExtractInput(kind="uri", uri="document.pdf"), config=config)
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```typescript
+import { ExtractInputKind, extract } from "@xberg-io/xberg";
+
+const output = await extract({
+  kind: ExtractInputKind.Uri,
+  uri: "document.pdf",
+}, {
+  layout: {
+    confidenceThreshold: 0.5,
+    applyHeuristics: true,
+    tableModel: "tatr",
+  },
+});
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+use xberg::core::{ExtractionConfig, LayoutDetectionConfig};
+
+let config = ExtractionConfig {
+    layout: Some(LayoutDetectionConfig {
+        confidence_threshold: Some(0.5),
+        apply_heuristics: true,
+        table_model: Some("tatr".to_string()),
+        ..Default::default()
+    }),
+    ..Default::default()
+};
+```
+
+</TabItem>
+<TabItem label="TOML">
+
+```toml title="xberg.toml"
+[layout]
+apply_heuristics = true
+# table_model = "tatr"
+```
+
+</TabItem>
+<TabItem label="CLI">
+
+```bash title="Terminal"
+# Enable layout detection with default settings
+xberg extract document.pdf --layout --content-format markdown
+
+# Custom confidence threshold
+xberg extract document.pdf --layout-confidence 0.5 --content-format markdown
+
+# Specific table model
+xberg extract document.pdf --layout --layout-table-model slanet_wired
+
+# Adaptive page selection: run the model only on pages that can benefit
+xberg extract document.pdf --layout --layout-strategy auto
+
+# Combined with GPU acceleration
+xberg extract document.pdf --layout --acceleration coreml
+```
+
+</TabItem>
+</Tabs>
+
+See [LayoutDetectionConfig](/reference/configuration/#layoutdetectionconfig) for all fields.
+
+### Layout-Informed Markdown
+
+`use_layout_for_markdown` feeds detected regions into the non-OCR PDF markdown pipeline to drive heading, table, list, and figure detection that would otherwise rely on font-clustering heuristics alone. It is a top-level `ExtractionConfig` field — set it alongside `layout`, not inside `LayoutDetectionConfig`.
+
+Enabling it improves structural F1 at the cost of inference latency (~150-300 ms/page CPU, ~20-50 ms/page GPU). Default: `false`. Requires the `layout-detection` feature and a set `layout` config; it is skipped when `force_ocr` is enabled. On the CLI, pass `--use-layout-for-markdown`.
+
+## Page Selection Strategy
+
+`LayoutDetectionConfig.strategy` controls which pages the layout model runs on:
+
+- `always` (default): every page is rendered and inferred, the historical behavior.
+- `auto`: a cheap per-page pre-screen runs first, and the model only processes pages likely to benefit: multi-column text, table geometry, ruled grids, heavy graphics, form widgets, sparse or absent text layers, or pages whose signals could not be gathered.
+
+The pre-screen reads geometry the PDF already carries (text-span boxes, straight lines, image and path bounding boxes, annotations) without decoding any pixels, so it costs a small fraction of one model pass. It is recall-biased: an ambiguous page always runs the model. A skipped page is processed exactly like a page where the model ran and found no regions, and on plain single-column prose that output is identical at a fraction of the cost.
+
+Two behaviors to know:
+
+- On the OCR path the pre-screen skips inference only; page rasters are still produced because OCR consumes them.
+- Skipped pages are auditable: `metadata.format.layout_gated_pages` lists them (1-indexed), and `metadata.format.layout_gate_reasons` records each page's decision reason (`multi_column`, `table_grid`, `plain_text`, and so on). The `format` object is tagged `format_type: "pdf"`.
+
+Note that `auto` trades the model's per-paragraph refinements on skipped pages (heading promotion, code and formula tagging) for throughput; content and reading order are unchanged. Keep `always` when you need the model's classification on every page.
+
+## Table Structure Models
+
+When layout detection identifies a table region, a table structure model analyzes rows, columns, headers, and spanning cells. Set `LayoutDetectionConfig.table_model` to one of:
+
+| Value             | Notes                                                       |
+| ----------------- | ----------------------------------------------------------- |
+| `tatr`            | Default. Fast (~30 MB). General-purpose.                    |
+| `slanet_wired`    | Higher accuracy for bordered/gridlined tables (~365 MB).    |
+| `slanet_wireless` | Higher accuracy for borderless tables (~365 MB).            |
+| `slanet_auto`     | Auto-classifies per page (~737 MB). Slowest.                |
+| `slanet_plus`     | Smallest (~7.78 MB). For resource-constrained environments. |
+| `disabled`        | Skip table structure recognition.                           |
+
+:::note[Model Download]
+SLANeXT models are not downloaded by default. Use `cache warm --all-table-models` to pre-download, or they download automatically on first use.
+:::
+
+## GPU Acceleration
+
+Layout detection uses ONNX Runtime with automatic provider selection:
+
+| Provider | Platform       | Notes                         |
+| -------- | -------------- | ----------------------------- |
+| CPU      | All            | Default, no setup needed      |
+| CUDA     | Linux, Windows | Requires CUDA toolkit + cuDNN |
+| CoreML   | macOS          | Automatic on Apple Silicon    |
+| TensorRT | Linux          | Requires TensorRT             |
+
+To override:
+
+```python
+config = ExtractionConfig(
+    layout=LayoutDetectionConfig(),
+    acceleration=AccelerationConfig(provider="cuda", device_id=0)
+)
+```
+
+See [AccelerationConfig reference](/reference/configuration/#accelerationconfig) for details.
+
+## Layout Classes
+
+The `LayoutClass` taxonomy defines 18 classes. Each `LayoutRegion.class_name` is one of:
+
+`caption`, `chart`, `footnote`, `formula`, `list_item`, `page_footer`, `page_header`, `picture`, `section_header`, `table`, `text`, `title`, `document_index`, `code`, `checkbox_selected`, `checkbox_unselected`, `form`, `key_value_region`.
+
+See [`LayoutRegion`](/reference/types/) in the types reference for the full field shape.
+
+## Accessing Layout Regions
+
+When layout detection is enabled AND page extraction is enabled, each page in the result includes `layout_regions` — a list of detected regions with class, confidence score, bounding box, and area fraction. This enables programmatic filtering and analysis of specific layout elements.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+
+```python
+from xberg import ExtractInput, extract, ExtractionConfig, LayoutDetectionConfig, PagesConfig
+
+output = await extract(
+    ExtractInput(kind="uri", uri="document.pdf"),
+    config=ExtractionConfig(
+        layout=LayoutDetectionConfig(),
+        pages=PagesConfig(extract_pages=True),
+    ),
+)
+result = output.results[0]
+
+for page in result.pages:
+    if page.layout_regions:
+        for region in page.layout_regions:
+            if region.class_name == "picture" and region.confidence > 0.9:
+                print(f"Page {page.page_number}: diagram detected "
+                      f"(confidence={region.confidence:.2f}, "
+                      f"area={region.area_fraction:.0%})")
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```typescript
+import { ExtractInputKind, extract } from "@xberg-io/xberg";
+
+const output = await extract({
+  kind: ExtractInputKind.Uri,
+  uri: "document.pdf",
+}, {
+  layout: {},
+  pages: { extractPages: true },
+});
+const result = output.results[0];
+
+for (const page of result.pages ?? []) {
+  if (page.layoutRegions) {
+    for (const region of page.layoutRegions) {
+      if (region.className === "picture" && region.confidence > 0.9) {
+        console.log(
+          `Page ${page.pageNumber}: diagram detected ` +
+          `(confidence=${region.confidence.toFixed(2)}, ` +
+          `area=${(region.areaFraction * 100).toFixed(0)}%)`
+        );
+      }
+    }
+  }
+}
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+use xberg::{extract, ExtractInput, ExtractionConfig, LayoutDetectionConfig, PagesConfig};
+
+let config = ExtractionConfig {
+    layout: Some(LayoutDetectionConfig::default()),
+    pages: Some(PagesConfig {
+        extract_pages: true,
+        ..Default::default()
+    }),
+    ..Default::default()
+};
+
+let output = extract(
+    ExtractInput::from_uri("document.pdf"),
+    &config,
+).await?;
+let result = &output.results[0];
+
+for page in &result.pages {
+    if let Some(regions) = &page.layout_regions {
+        for region in regions {
+            if region.class_name == "picture" && region.confidence > 0.9 {
+                println!(
+                    "Page {}: diagram detected (confidence={:.2}, area={:.0}%)",
+                    page.page_number,
+                    region.confidence,
+                    region.area_fraction * 100.0
+                );
+            }
+        }
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+### Tips
+
+- Use `confidence` to filter low-confidence detections — typically ≥ 0.8–0.9 for downstream operations
+- Use `area_fraction` to distinguish between inline images and full-page diagrams (e.g., `area_fraction > 0.1` for significant figures)
+- Regions are independent of page extraction — enable both to access both content and layout structure
+- Available across all bindings (Python, TypeScript, Rust, Ruby, Java, Go, Elixir, C#, PHP)
+
+## Acknowledgments
+
+- **[Docling](https://github.com/DS4SD/docling)** — RT-DETR v2 model and layout classification approach
+- **[TATR](https://github.com/microsoft/table-transformer)** — Table structure recognition with ONNX
+- **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)** — SLANeXT table structure and PP-LCNet classifier models
+
+## Related
+
+- [Configuration Reference](/reference/configuration/#layoutdetectionconfig) — full field reference
+- [Element-Based Output](/guides/output-formats/#element-based-output) — using layout-aware results

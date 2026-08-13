@@ -13,8 +13,13 @@ mod content;
 mod elements;
 mod types;
 
-// Re-export public API
 pub use types::{ListItemMetadata, ListType};
+
+/// Re-exported for extractors that build an `InternalDocument` themselves and so never
+/// reach this module's paragraph splitter — they still have to normalize line endings
+/// before splitting on `"\n\n"`, and must use this exact algorithm to stay consistent
+/// with the transform path (#227).
+pub(crate) use elements::normalize_line_endings;
 
 use crate::types::internal::{ElementKind, InternalDocument};
 use crate::types::{Element, ExtractedDocument};
@@ -47,7 +52,6 @@ pub fn convert_internal_elements_to_elements(doc: &InternalDocument, filename: &
     let mut elements: Vec<Element> = Vec::with_capacity(doc.elements.len());
 
     for internal_elem in &doc.elements {
-        // Skip container-marker elements — they have no displayable content.
         if internal_elem.kind.is_container_start() || internal_elem.kind.is_container_end() {
             continue;
         }
@@ -145,35 +149,24 @@ pub fn convert_internal_elements_to_elements(doc: &InternalDocument, filename: &
 /// A vector of Elements with proper semantic types and metadata.
 #[cfg_attr(alef, alef(skip))]
 pub fn transform_extraction_result_to_elements(result: &ExtractedDocument) -> Vec<Element> {
-    // When the pipeline stored the original InternalDocument before derivation, use it
-    // directly to preserve the extractor's native reading order. This is the primary
-    // fix for DOCX (#1112): DOCX has no native page boundaries, so per-page
-    // reconstruction scrambles element order. The InternalDocument element list is
-    // always in reading order as the extractor produced it.
     if let Some(ref doc) = result.internal_document {
         return convert_internal_elements_to_elements(doc, &result.metadata.title);
     }
 
     let mut elements = Vec::new();
 
-    // If pages are available, process per-page with hierarchy, tables, images
     if let Some(ref pages) = result.pages {
         for page in pages {
             let page_number = page.page_number;
 
-            // 1. Process hierarchy blocks (headings + body text with coordinates).
-            // Returns true when body blocks with bounding boxes were emitted, in
-            // which case step 4 is skipped to avoid coordinate-less duplicates.
             let hierarchy_covered_body = if let Some(ref hierarchy) = page.hierarchy {
                 process_hierarchy(&mut elements, hierarchy, page_number, &result.metadata.title)
             } else {
                 false
             };
 
-            // 2. Process tables on this page
             process_tables(&mut elements, &page.tables, page_number, &result.metadata.title);
 
-            // 3. Process images on this page
             let all_images = result.images.as_deref().unwrap_or(&[]);
             process_images(
                 &mut elements,
@@ -183,23 +176,17 @@ pub fn transform_extraction_result_to_elements(result: &ExtractedDocument) -> Ve
                 &result.metadata.title,
             );
 
-            // 4. Process page content (body text, list items, paragraphs).
-            // Skipped when hierarchy already emitted body elements with coordinates
-            // to prevent producing duplicate coordinate-less elements.
             if !hierarchy_covered_body {
                 process_content(&mut elements, &page.content, page_number, &result.metadata.title);
             }
 
-            // 5. Add PageBreak after each page (except the last)
             if page_number < pages.len() as u32 {
                 add_page_break(&mut elements, page_number, page_number + 1, &result.metadata.title);
             }
         }
     } else {
-        // Fallback: No pages, process unified content with page 1
         process_content(&mut elements, &result.content, 1, &result.metadata.title);
 
-        // Process global tables (if any)
         for table in &result.tables {
             let table_text = format_table_as_text(table);
             let element_id = elements::generate_element_id(&table_text, crate::types::ElementType::Table, Some(1));
@@ -217,7 +204,6 @@ pub fn transform_extraction_result_to_elements(result: &ExtractedDocument) -> Ve
             });
         }
 
-        // Process global images (if any)
         if let Some(ref images) = result.images {
             for image in images {
                 let image_text = format!(
@@ -313,14 +299,11 @@ mod tests {
 
     #[test]
     fn test_page_break_interleaving_reverse_order() {
-        // Test that page breaks are processed in reverse byte order
         let page_breaks = vec![(100, "page_break_1"), (50, "page_break_2"), (75, "page_break_3")];
 
-        // Sort in descending order by byte offset
         let mut sorted = page_breaks.clone();
         sorted.sort_by(|(offset_a, _), (offset_b, _)| offset_b.cmp(offset_a));
 
-        // Verify reverse order: 100, 75, 50
         assert_eq!(sorted[0].0, 100);
         assert_eq!(sorted[1].0, 75);
         assert_eq!(sorted[2].0, 50);
@@ -330,7 +313,6 @@ mod tests {
     fn test_bounds_checking() {
         let text = "Hello world";
 
-        // Valid range
         let valid_item = ListItemMetadata {
             list_type: ListType::Bullet,
             byte_start: 0,
@@ -341,7 +323,6 @@ mod tests {
         assert!(valid_item.byte_end <= text.len());
         assert!(valid_item.byte_start <= valid_item.byte_end);
 
-        // Invalid: end beyond string
         let invalid_item = ListItemMetadata {
             list_type: ListType::Bullet,
             byte_start: 0,
@@ -359,7 +340,6 @@ mod tests {
         assert!(items[0].indent_level >= 1);
     }
 
-    // Helper to create minimal Metadata for tests
     fn test_metadata(title: Option<String>) -> crate::types::Metadata {
         crate::types::Metadata {
             title,
@@ -367,12 +347,10 @@ mod tests {
         }
     }
 
-    // Integration tests for full transformation
     #[test]
     fn test_transform_with_pages_and_hierarchy() {
         use crate::types::{ElementType, ExtractedDocument, HierarchicalBlock, PageContent, PageHierarchy};
 
-        // Create a mock result with pages and hierarchy
         let result = ExtractedDocument {
             content: "Full document content".to_string(),
             mime_type: Cow::Borrowed("application/pdf"),
@@ -424,10 +402,8 @@ mod tests {
 
         let elements = transform_extraction_result_to_elements(&result);
 
-        // Verify we have elements
         assert!(!elements.is_empty());
 
-        // h1 → Title, h2..h6 → Heading (#782)
         let titles: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::Title)
@@ -441,15 +417,12 @@ mod tests {
         assert_eq!(titles[0].text, "Main Title");
         assert_eq!(headings[0].text, "Subtitle");
 
-        // Verify page numbers
         assert_eq!(titles[0].metadata.page_number, Some(1));
         assert_eq!(headings[0].metadata.page_number, Some(1));
 
-        // Verify coordinates were extracted
         assert!(titles[0].metadata.coordinates.is_some());
         assert!(headings[0].metadata.coordinates.is_some());
 
-        // Find list items
         let list_items: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::ListItem)
@@ -458,7 +431,6 @@ mod tests {
         assert_eq!(list_items[0].metadata.page_number, Some(2));
         assert_eq!(list_items[1].metadata.page_number, Some(2));
 
-        // Find PageBreak
         let page_breaks: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::PageBreak)
@@ -479,6 +451,7 @@ mod tests {
             markdown: "| Header1 | Header2 |\n| Cell1 | Cell2 |".to_string(),
             page_number: 1,
             bounding_box: None,
+            ..Default::default()
         };
 
         let image = ExtractedImage {
@@ -525,7 +498,6 @@ mod tests {
 
         let elements = transform_extraction_result_to_elements(&result);
 
-        // Find table elements
         use crate::types::ElementType;
         let tables: Vec<_> = elements
             .iter()
@@ -535,7 +507,6 @@ mod tests {
         assert!(tables[0].text.contains("Header1"));
         assert!(tables[0].text.contains("Cell2"));
 
-        // Find image elements
         let images: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::Image)
@@ -551,7 +522,6 @@ mod tests {
     fn test_transform_fallback_no_pages() {
         use crate::types::{ElementType, ExtractedDocument};
 
-        // Create a result without pages
         let result = ExtractedDocument {
             content: "Simple text content\n\nSecond paragraph".to_string(),
             mime_type: Cow::Borrowed("text/plain"),
@@ -561,14 +531,12 @@ mod tests {
 
         let elements = transform_extraction_result_to_elements(&result);
 
-        // Should have narrative text elements
         let narratives: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::NarrativeText)
             .collect();
         assert!(!narratives.is_empty(), "Should have narrative text elements");
 
-        // All elements should have page_number = 1 (fallback)
         for element in &elements {
             assert_eq!(element.metadata.page_number, Some(1));
         }
@@ -576,18 +544,15 @@ mod tests {
 
     #[test]
     fn test_detect_list_items_with_crlf() {
-        // CRLF line endings must not cause byte offset drift
         let text = "- First item\r\n- Second item\r\n- Third item";
         let items = detect_list_items(text);
         assert_eq!(items.len(), 3);
-        // Verify byte offsets are valid char boundaries
         assert!(text.is_char_boundary(items[0].byte_start));
         assert!(text.is_char_boundary(items[0].byte_end));
         assert!(text.is_char_boundary(items[1].byte_start));
         assert!(text.is_char_boundary(items[1].byte_end));
         assert!(text.is_char_boundary(items[2].byte_start));
         assert!(text.is_char_boundary(items[2].byte_end));
-        // Verify actual content via slicing (should not panic)
         assert_eq!(&text[items[0].byte_start..items[0].byte_end], "- First item");
         assert_eq!(&text[items[1].byte_start..items[1].byte_end], "- Second item");
         assert_eq!(&text[items[2].byte_start..items[2].byte_end], "- Third item");
@@ -595,8 +560,6 @@ mod tests {
 
     #[test]
     fn test_detect_list_items_with_multibyte_utf8() {
-        // Multi-byte UTF-8 characters (right single quote U+2019, en-dash U+2013)
-        // must not cause panics when used with byte offsets
         let text = "Some text with \u{2019}quotes\u{2019}\n- First item\n1. Second \u{2013} item";
         let items = detect_list_items(text);
         assert_eq!(items.len(), 2);
@@ -611,14 +574,12 @@ mod tests {
                 "byte_end {} is not a char boundary",
                 item.byte_end
             );
-            // Slicing should not panic
             let _ = &text[item.byte_start..item.byte_end];
         }
     }
 
     #[test]
     fn test_detect_list_items_crlf_with_multibyte() {
-        // Combination of CRLF and multi-byte characters
         let text = "Policy \u{2019}Administration\u{2019}\r\n- Item one\r\nSome \u{2013} text\r\n1. Item two";
         let items = detect_list_items(text);
         assert_eq!(items.len(), 2);
@@ -634,13 +595,10 @@ mod tests {
     fn test_process_content_multibyte_no_panic() {
         use crate::types::ElementType;
 
-        // Simulate the scenario from issue #398: text with multi-byte chars and list items
         let content = "Number 1.0 \u{2013} POLICY MANUAL\r\n\r\nRevised: August 4, 2008\r\nThe State\u{2019}s policy:\r\n- First item\r\n- Second item";
         let mut elements = Vec::new();
-        // This should not panic
         process_content(&mut elements, content, 1, &None);
 
-        // Verify we got some elements
         assert!(!elements.is_empty());
         let list_items: Vec<_> = elements
             .iter()
@@ -651,10 +609,8 @@ mod tests {
 
     #[test]
     fn test_process_content_pure_multibyte_text() {
-        // Text with CJK characters and bullet points
         let content = "\u{4f60}\u{597d}\u{4e16}\u{754c}\n- \u{7b2c}\u{4e00}\u{9879}\n- \u{7b2c}\u{4e8c}\u{9879}";
         let mut elements = Vec::new();
-        // Must not panic
         process_content(&mut elements, content, 1, &None);
         assert!(!elements.is_empty());
     }
@@ -677,7 +633,6 @@ mod tests {
             .filter(|e| e.element_type == ElementType::NarrativeText)
             .collect();
 
-        // Should split into 3 separate paragraphs
         assert_eq!(narratives.len(), 3, "Should split into 3 paragraphs");
         assert_eq!(narratives[0].text, "First paragraph.");
         assert_eq!(narratives[1].text, "Second paragraph.");
@@ -727,7 +682,6 @@ mod tests {
 
         let elements = transform_extraction_result_to_elements(&result);
 
-        // Title element must have coordinates
         let titles: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::Title)
@@ -738,7 +692,6 @@ mod tests {
             "Title should have coordinates"
         );
 
-        // Body text must be emitted as NarrativeText with coordinates
         let narratives: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::NarrativeText)
@@ -780,7 +733,7 @@ mod tests {
                         text: "Paragraph one.\n\nParagraph two.".to_string(),
                         font_size: 12.0,
                         level: "body".to_string(),
-                        bbox: None, // no bbox — include_bbox was false
+                        bbox: None,
                     }],
                 }),
                 is_blank: None,
@@ -794,8 +747,6 @@ mod tests {
 
         let elements = transform_extraction_result_to_elements(&result);
 
-        // process_hierarchy emits the body block as NarrativeText (no bbox → no coords).
-        // Because a body block was emitted, process_content is skipped entirely — no duplicates.
         let narratives: Vec<_> = elements
             .iter()
             .filter(|e| e.element_type == ElementType::NarrativeText)

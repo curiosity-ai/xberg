@@ -1,40 +1,6 @@
 version: "3"
 
 # ============================================================================
-# xberg — Root Taskfile
-# ============================================================================
-# Primary development interface. Rust core tasks delegate to .task/languages/rust.yml.
-# All binding language operations (setup, build, test, lint, format, clean,
-# update, upgrade, publish) are handled by alef v0.15.48.
-#
-# Command patterns:
-#   task setup         -> install all dependencies
-#   task build         -> build Rust core only (debug)
-#   task build:all     -> build core + bindings (debug)
-#   task build:release -> build Rust core only (release)
-#   task test          -> run all tests
-#   task e2e:all       -> generate + build + run e2e tests for all bindings
-#   task test:cov      -> tests with coverage
-#   task format        -> format Rust code
-#   task alef:format   -> format Alef-managed generated output
-#   task lint          -> lint via poly
-#   task update        -> compatible dependency updates (minor versions only)
-#   task upgrade       -> breaking dependency upgrades (latest versions)
-#   task clean         -> remove all build artifacts
-#   task publish:*     -> alef publish validate/prepare/build/package
-#   task rust:*        -> Rust-specific tasks
-#   task python:*      -> Python-specific tasks
-#   task node:*        -> Node/TypeScript-specific tasks
-#   task ruby:*        -> Ruby-specific tasks
-#   task php:*         -> PHP-specific tasks
-#   task go:*          -> Go-specific tasks
-#   task java:*        -> Java-specific tasks
-#   task csharp:*      -> C#-specific tasks
-#   task elixir:*      -> Elixir-specific tasks
-#   task dart:*        -> Dart-specific tasks
-#   task swift:*       -> Swift-specific tasks
-#   task kotlin-android:* -> Kotlin/Android-specific tasks
-#   task zig:*         -> Zig-specific tasks
 # ============================================================================
 
 includes:
@@ -66,6 +32,10 @@ includes:
     taskfile: ./.task/languages/zig.yml
   version:
     taskfile: ./.task/tools/version-sync.yml
+  integrations:
+    taskfile: ./.task/tools/integrations.yml
+  plugin:
+    taskfile: ./.task/tools/plugin.yml
   benchmark:
     taskfile: ./.task/workflows/benchmark.yml
   docs:
@@ -81,21 +51,20 @@ includes:
     flatten: true
 
 tasks:
-  # === Default ===
   default:
     desc: "List available tasks"
     cmds:
       - task --list
 
-  # === Setup ===
   setup:
     desc: "Install all dependencies and setup development environment"
     cmds:
       - task: rust:install
       - alef setup
+      - task: integrations:sync
+      - command -v poly >/dev/null 2>&1 || brew install goldziher/tap/poly
       - poly hooks install
 
-  # === Build ===
   build:
     desc: "Build Rust core library only (debug)"
     cmds:
@@ -132,7 +101,6 @@ tasks:
     cmds:
       - task: rust:cli:build
 
-  # === Test ===
   test:
     desc: "Run Rust core tests"
     cmds:
@@ -160,14 +128,15 @@ tasks:
     cmds:
       - task: test:cov
 
-  # === Lint & Format ===
   lint:
     desc: "Lint all code via poly"
     cmds:
       - poly lint .
 
   lint:check:
-    desc: "Lint all code WITHOUT auto-fix (check-only)"
+    # `poly lint` never writes -- there is no autofix mode to opt out of, so
+    # this is a plain alias of `lint`, not a stricter check-only variant. ~keep
+    desc: "Lint all code via poly (alias of lint; poly lint never auto-fixes)"
     cmds:
       - poly lint .
 
@@ -202,7 +171,6 @@ tasks:
     cmds:
       - task: rust:check:mobile
 
-  # === Update / Upgrade ===
   update:
     desc: "Update all dependencies within major versions (minor patches only)"
     cmds:
@@ -219,6 +187,7 @@ tasks:
       - task: swift:update
       - task: kotlin-android:update
       - task: zig:update
+      - task: integrations:update
       - alef update
 
   upgrade:
@@ -238,11 +207,11 @@ tasks:
       - task: swift:upgrade
       - task: kotlin-android:upgrade
       - task: zig:upgrade
+      - task: integrations:upgrade
       - cmd: alef update --latest
         ignore_error: true
       - gau --update .
 
-  # === Coverage ===
   cov:rust:
     desc: "Generate Rust coverage report"
     cmds:
@@ -254,13 +223,11 @@ tasks:
       - task: rust:test:ci
       - alef test --coverage
 
-  # === Version ===
   versions:sync:
     desc: "Synchronize version from Cargo.toml to all package manifests"
     cmds:
       - task: version:sync
 
-  # === Alef lifecycle ===
   alef:generate:
     desc: "Regenerate all Alef-managed outputs (formatting via poly, no build)"
     cmds:
@@ -276,11 +243,6 @@ tasks:
     cmds:
       - alef build
 
-  alef:format:
-    desc: "Format Alef-managed generated output"
-    cmds:
-      - alef fmt
-
   alef:sync:
     desc: "Sync version from Cargo.toml to all manifests"
     cmds:
@@ -289,9 +251,23 @@ tasks:
   alef:docs:
     desc: "Generate API reference documentation"
     cmds:
-      - alef docs --output docs/reference/
+      - alef docs
 
-  # === E2E tests ===
+  alef:verify:readme-paths:
+    desc: "Check every alef.toml readme/docs path (templates, snippets) resolves on disk"
+    cmds:
+      - python3 scripts/ci/check-alef-readme-paths.py alef.toml
+
+  alef:verify:ffi-formats:
+    desc: "Check the native FFI build still selects every document format (GH#1387)"
+    cmds:
+      - python3 scripts/ci/check-ffi-format-features.py alef.toml
+
+  docs:verify:changelog:
+    desc: "Check the docs-site changelog carries every release section from CHANGELOG.md"
+    cmds:
+      - python3 scripts/ci/check-changelog-sync.py
+
   e2e:generate:
     desc: "Generate E2E tests for all languages from fixtures"
     cmds:
@@ -331,9 +307,11 @@ tasks:
       - git diff --exit-code e2e/
 
   e2e:lang:
-    desc: "Run e2e tests for a specific language via LANG variable (e.g., task e2e:lang LANG=python)"
+    desc: "Run e2e tests for a specific language via E2E_LANG variable (e.g., task e2e:lang E2E_LANG=python)"
+    vars:
+      E2E_LANG: '{{.E2E_LANG | default "rust"}}'
     cmds:
-      - task: ${LANG:-rust}:e2e
+      - task: "{{.E2E_LANG}}:e2e"
 
   rust:e2e:
     desc: "Run Rust e2e tests via alef"
@@ -410,11 +388,6 @@ tasks:
 
   swift:e2e:
     desc: "Run Swift e2e tests"
-    # Delegate to alef (like every other language) rather than hand-orchestrating the build.
-    # The old flow ran `alef e2e generate --lang swift` at test time, which recomputes alef's
-    # input-sources hash — that stats the sibling-repo crawlberg sources declared in alef.toml
-    # (`../crawlberg/...`), which exist locally but not in CI, breaking the swift job. alef.toml
-    # [crates.test.swift] already defines the build (`before`) and mock-server e2e command.
     cmds:
       - alef test --e2e --lang swift
 
@@ -423,7 +396,6 @@ tasks:
     cmds:
       - alef test --e2e --lang zig
 
-  # === Publish ===
   publish:validate:
     desc: "Validate publish manifests are consistent"
     cmds:
@@ -444,40 +416,10 @@ tasks:
     cmds:
       - alef publish package -o dist/
 
-  # === Language binding lint/format ===
-  go:lint:
-    desc: "Lint Go binding with golangci-lint"
-    cmds:
-      - golangci-lint run ./...
-    dir: packages/go
-
-  ruby:format:
-    desc: "Format Ruby binding with rubocop"
-    cmds:
-      - export PATH="$HOME/.rbenv/shims:$HOME/.asdf/shims:$PATH" && ruby -S bundle exec rubocop --autocorrect
-    dir: packages/ruby
-
-  ruby:lint:
-    desc: "Lint Ruby binding with rubocop and steep"
-    cmds:
-      - export PATH="$HOME/.rbenv/shims:$HOME/.asdf/shims:$PATH" && ruby -S bundle exec rubocop
-      - export PATH="$HOME/.rbenv/shims:$HOME/.asdf/shims:$PATH" && ruby -S bundle exec steep check
-    dir: packages/ruby
-
   php:build:
     desc: "Build the xberg-php native extension (cdylib)"
     cmds:
       - cargo build --locked --release -p xberg-php
-
-  php:format:
-    desc: "Format PHP binding with poly (mago)"
-    cmds:
-      - poly fmt --fix packages/php
-
-  php:lint:
-    desc: "Lint PHP binding with poly (mago)"
-    cmds:
-      - poly lint packages/php
 
   python:build:sdist:publish:
     desc: "Build the Python sdist using maturin"
@@ -528,12 +470,6 @@ tasks:
       - gradle ktlintFormat --no-daemon
     dir: packages/kotlin-android
 
-  kotlin-android:lint:
-    desc: "Lint Kotlin/Android binding with ktlint via gradle"
-    cmds:
-      - gradle ktlintCheck --no-daemon
-    dir: packages/kotlin-android
-
   kotlin-android:test:
     desc: "Run Kotlin/Android binding tests"
     cmds:
@@ -566,12 +502,6 @@ tasks:
       - dart format .
     dir: packages/dart
 
-  dart:lint:
-    desc: "Lint Dart binding with dart analyze"
-    cmds:
-      - dart analyze
-    dir: packages/dart
-
   dart:test:
     desc: "Run Dart binding tests"
     cmds:
@@ -599,7 +529,6 @@ tasks:
       - zig build test
     dir: packages/zig
 
-  # === Clean ===
   clean:
     desc: "Remove build artifacts across all languages"
     cmds:

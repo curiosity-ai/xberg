@@ -6,20 +6,27 @@ includes:
 
 vars:
   ALEF: "alef"
+  AI_RULEZ: "ai-rulez"
 
 tasks:
   sync:
     desc: "Synchronize version across all package manifests (no regeneration)"
-    # Version propagation only. Regeneration is a separate, explicit step:
-    # run `task alef:generate` (alef all --clean) after bumping the version.
     cmds:
       - "{{.ALEF}} sync-versions"
+      # Integrations are versioned + published in lockstep with core (including rc);
+      # alef only syncs the alef-managed binding manifests, so sync integrations too.
+      # This also writes plugin/.ai-rulez/config.toml [plugin].version. ~keep
+      - "python3 scripts/sync_integration_versions.py"
+      # Regenerate the coding-agent plugin bundles from the just-synced config so the
+      # per-runtime manifests under plugin/ carry the new version. ~keep
+      - "{{.AI_RULEZ}} generate --plugin"
 
   check:
     desc: "Check if versions are synchronized (dry-run)"
     cmds:
       - cmd: grep -m 1 'version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/'
         silent: false
+      - "python3 scripts/sync_integration_versions.py --check"
 
   bump:major:
     desc: "Bump major version (X.0.0) and sync"

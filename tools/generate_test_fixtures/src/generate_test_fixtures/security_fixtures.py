@@ -31,21 +31,12 @@ from .gt_schema import security_expectation, write_ground_truth
 
 ZIP_MTIME = (2024, 1, 1, 0, 0, 0)
 
-# A 100 MiB synthetic payload used by docx_oversized_embedded. We avoid
-# materialising 100 MiB in memory by writing zeros in chunks during the
-# zip write.
 ONE_MIB = 1024 * 1024
 OVERSIZED_BYTES = 100 * ONE_MIB
 
-# Compression ratios for the two zip-bomb fixtures. The guard threshold
-# we're targeting is documented at >= 100:1 in the cloud security model;
-# 50:1 must pass, 200:1 must fail.
 SAFE_COMPRESSION_RATIO = 50
 PATHOLOGICAL_COMPRESSION_RATIO = 200
 
-# Compressed entry size used as the "input" side of the ratio. 64 KiB is
-# small enough that the corresponding uncompressed-zero payload at the
-# pathological ratio fits in well under 16 MiB.
 COMPRESSED_ENTRY_BYTES = 64 * 1024
 
 
@@ -70,9 +61,6 @@ def _rewrite_zip(src_bytes: bytes, additions: dict[str, bytes], replacements: di
     return buf.getvalue()
 
 
-# ── DDE / HYPERLINK formulas ──────────────────────────────────────────────────
-
-
 def _emit_xlsx_dde(output_dir: Path, repo_root: Path) -> list[Path]:
     """Workbook with one HYPERLINK and one DDE formula cell."""
     wb = Workbook()
@@ -80,8 +68,6 @@ def _emit_xlsx_dde(output_dir: Path, repo_root: Path) -> list[Path]:
     ws.title = "danger"
     ws["A1"] = "label"
     ws["A2"] = "ok"
-    # openpyxl writes formulas verbatim — the resulting <f>=HYPERLINK(...)</f>
-    # is exactly what the OOXML extractor flags.
     ws["B1"] = '=HYPERLINK("https://example.com/evil", "click me")'
     ws["B2"] = '=DDE("cmd","/c calc.exe","_")'
     buf = io.BytesIO()
@@ -143,9 +129,6 @@ def _emit_xlsx_safe(output_dir: Path, repo_root: Path) -> list[Path]:
     return [fixture_path, sidecar_path]
 
 
-# ── Oversized embedded binary inside a DOCX ──────────────────────────────────
-
-
 def _emit_docx_oversized_embedded(output_dir: Path, repo_root: Path) -> list[Path]:
     """DOCX whose ``word/embeddings/oversized.bin`` is a 100 MiB zero stream."""
     from docx import Document  # type: ignore[import-untyped, import-not-found, unused-ignore]
@@ -156,14 +139,8 @@ def _emit_docx_oversized_embedded(output_dir: Path, repo_root: Path) -> list[Pat
     doc.save(base_buf)
     base_bytes = base_buf.getvalue()
 
-    # The 100 MiB zero payload is highly compressible — the resulting docx
-    # is ~100 KiB on disk even though the embedded part is huge once
-    # decompressed.
     oversized_payload = b"\x00" * OVERSIZED_BYTES
 
-    # The extractor enforces ``max_embedded_file_bytes`` against the
-    # decompressed size. We patch [Content_Types] + word/_rels with an
-    # entry that the extractor would walk into.
     with zipfile.ZipFile(io.BytesIO(base_bytes), "r") as zf:
         content_types = zf.read("[Content_Types].xml")
         document_rels = zf.read("word/_rels/document.xml.rels")
@@ -210,9 +187,6 @@ def _emit_docx_oversized_embedded(output_dir: Path, repo_root: Path) -> list[Pat
         generator="security_fixtures",
     )
     return [fixture_path, sidecar_path]
-
-
-# ── Zip-bomb fixtures ────────────────────────────────────────────────────────
 
 
 def _build_zip_bomb_xlsx(compression_ratio: int) -> bytes:

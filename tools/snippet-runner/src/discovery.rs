@@ -20,9 +20,6 @@ pub fn discover_snippets(dirs: &[PathBuf], language_filter: Option<&[Language]>)
             .filter(|e| e.file_type().is_file())
         {
             let path = entry.path();
-            // Skip alef-generated API reference docs — code blocks in these are
-            // language signature declarations (not runnable), so syntax-validating
-            // them as standalone programs would always fail.
             if path
                 .file_name()
                 .and_then(|f| f.to_str())
@@ -46,12 +43,10 @@ pub fn discover_snippets(dirs: &[PathBuf], language_filter: Option<&[Language]>)
     snippets.sort_by(|a, b| a.path.cmp(&b.path).then(a.block_index.cmp(&b.block_index)));
     Ok(snippets)
 }
-
 fn extract_snippets_from_file(path: &Path, base_dir: &Path) -> Result<Vec<Snippet>> {
     let blocks = parser::parse_code_blocks(path)?;
     let mut snippets = Vec::new();
 
-    // Try to infer language from directory structure (e.g., docs/snippets/rust/...)
     let dir_language = infer_language_from_path(path, base_dir);
 
     for (idx, block) in blocks.into_iter().enumerate() {

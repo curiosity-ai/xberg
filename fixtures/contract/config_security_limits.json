@@ -1,6 +1,12 @@
 {
 	"id": "config_security_limits",
 	"description": "Tests archive extraction with custom security limits",
+	"docs": {
+		"topic": "contract",
+		"title": "Tests archive extraction with custom security limits",
+		"description": "Tests archive extraction with custom security limits",
+		"side_effects": "server"
+	},
 	"tags": ["contract", "config", "security"],
 	"call": "extract",
 	"input": {
@@ -31,10 +37,6 @@
 			"value": 10
 		}
 	],
-	"skip": {
-		"languages": ["wasm"],
-		"reason": "WASM cannot access filesystem; use bytes input with file content instead"
-	},
 	"config": {
 		"security_limits": {
 			"max_archive_size": 104857600,

@@ -1,30 +1,24 @@
 name: Publish pub.dev
 
-# pub.dev OIDC trusted publishing rejects tokens originating from `release`
-# events; only `push` and `workflow_dispatch` are accepted.
-#
-# Because the xberg Dart package embeds platform-specific native binaries
-# (Android JNI, iOS XCFramework, server libs for linux/macos/windows), we
-# cannot just rebuild here — those artifacts are produced by the main
-# `publish.yaml` workflow. Instead, the main workflow's `trigger-pubdev` job
-# dispatches this workflow with the run_id of the main workflow, and this
-# workflow downloads the `dart-package-assembled` artifact from that run.
-#
-# One-time setup: on pub.dev → xberg package → Admin → Automated publishing,
-# set the workflow path to `.github/workflows/publish-pubdev.yaml`.
-
 on:
+  # Dispatch this on the TAG, not a branch: pub.dev's OIDC gate only accepts a
+  # token minted from a 'tag' refType (dispatching on main fails with "publishing
+  # is only allowed from 'tag' refType, this token has 'branch' refType"). Run it
+  # LAST, after the main publish has uploaded the native libs to the GitHub release
+  # (download_libs fetches them at runtime), e.g.
+  #   gh workflow run publish-pubdev.yaml --ref v1.0.0-rc.NN
+  # The checkout ref defaults to the dispatched tag; override only to publish the
+  # same tag's tree from a different commit. ~keep
   workflow_dispatch:
     inputs:
-      run_id:
-        description: "GitHub Actions run ID of publish.yaml that produced the dart-package-assembled artifact"
-        required: true
+      ref:
+        description: "Optional checkout override; defaults to the dispatched tag. The run MUST be dispatched with --ref <tag>."
+        required: false
         type: string
 
 permissions:
   contents: read
   id-token: write
-  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -34,12 +28,27 @@ jobs:
     name: Publish pub.dev
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      # Fail fast on a branch dispatch: pub.dev refuses a 'branch' refType OIDC
+      # token, so without this the run wastes ~1min building the archive only to
+      # die at auth with a cryptic message. ~keep
+      - name: Require a tag ref
+        if: ${{ github.ref_type != 'tag' }}
+        run: |
+          echo "::error::Dispatch this workflow on a release tag: gh workflow run publish-pubdev.yaml --ref <tag>. pub.dev's OIDC gate only accepts a 'tag' refType; got ref_type='${{ github.ref_type }}' ref='${{ github.ref }}'." >&2
+          exit 1
+
+      # Publish the thin, source-only package straight from git. The native
+      # libraries are NOT bundled (they exceed pub.dev's 100MB cap); the package
+      # ships bin/download_libs.dart + lib/src/native_loader.dart, which fetch the
+      # platform library from the GitHub release into the versioned user cache on
+      # first use. Publishing from a git checkout guarantees only tracked source
+      # is uploaded (~300KB), never stray build output. ~keep
+      - uses: actions/checkout@v6
         with:
-          name: dart-package-assembled
-          path: packages/dart
-          run-id: ${{ inputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ inputs.ref || github.ref_name }}
+          submodules: recursive
+
+      - uses: dart-lang/setup-dart@v1
 
       - uses: xberg-io/actions/publish-pub@v1
         with:

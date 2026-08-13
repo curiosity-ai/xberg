@@ -427,6 +427,15 @@ public static class PptxReader
         if (app.Company is not null) m["organization"] = app.Company;
         if (app.Application is not null) m["application"] = app.Application;
         if (app.AppVersion is not null) m["application_version"] = app.AppVersion;
+        // #230: surface the raw DocSecurity integer plus its decoded ECMA-376 flags —
+        // PptxAppProperties never reaches the format metadata, so without this the
+        // presentation's protection state is discarded entirely.
+        if (app.DocSecurity is { } docSecurity)
+        {
+            m[OfficeMetadata.DocSecurityKey] = docSecurity.ToString(CultureInfo.InvariantCulture);
+            foreach (var (key, value) in OfficeMetadata.DecodeDocSecurityFlags(docSecurity))
+                m[key] = value ? "true" : "false";
+        }
 
         foreach (var (k, v) in OfficeMetadata.ExtractCustom(pkg))
             m["custom_" + k] = v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : v.GetRawText();

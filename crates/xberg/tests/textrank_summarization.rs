@@ -41,8 +41,6 @@ fn textrank_summarize_is_deterministic() {
 
 #[test]
 fn textrank_summarize_prefers_thematically_central_sentences() {
-    // The chef / weather sentences are off-topic outliers — they should NOT
-    // dominate the summary when the budget is tight.
     let summary = textrank::summarize(ML_PARAGRAPH, Some("en"), Some(40)).expect("summary");
     let lower = summary.to_lowercase();
 
@@ -82,9 +80,6 @@ fn textrank_summarize_falls_back_to_english_for_unknown_language() {
 
 #[test]
 fn textrank_summarize_handles_german_with_native_stopwords() {
-    // German paragraph mixing machine-learning content with off-topic sentences.
-    // The German stopword set should keep ML-related vocabulary signal high enough
-    // for the central sentences to outrank the outliers.
     let de_paragraph = "Maschinelles Lernen ist ein Teilgebiet der künstlichen Intelligenz. \
         Es konzentriert sich auf den Bau von Systemen, die aus Daten lernen können. \
         Tiefes Lernen ist eine Untergruppe des maschinellen Lernens. \
@@ -112,12 +107,8 @@ fn textrank_summarize_handles_german_with_native_stopwords() {
 
 #[test]
 fn textrank_summarize_handles_cjk_without_panicking() {
-    // CJK scripts have no whitespace-delimited tokens. The algorithm must
-    // degrade gracefully — at worst it returns the input back, but it must
-    // never panic and the result must be non-empty for non-empty input.
     let zh = "机器学习是人工智能的一个分支。深度学习是机器学习的子集。神经网络受人脑启发。";
     let summary = textrank::summarize(zh, Some("zh"), Some(40));
-    // Either Some (segmented somehow) or None (no usable tokens) — neither panics.
     if let Some(s) = summary {
         assert!(!s.is_empty());
     }
@@ -171,7 +162,6 @@ async fn extractive_processor_uses_english_when_no_language_detected() {
     let mut result = ExtractedDocument::default();
     result.content = ML_PARAGRAPH.to_string();
     result.mime_type = Cow::Borrowed("text/plain");
-    // detected_languages intentionally left as None.
 
     processor.process(&mut result, &config).await.unwrap();
     assert!(result.summary.is_some());

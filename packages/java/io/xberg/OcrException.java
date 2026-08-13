@@ -5,15 +5,13 @@ package io.xberg;
  * An OCR engine returned an error or produced unusable output.
  */
 public class OcrException extends XbergErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new OcrException with the given message. */
-    public OcrException(final String message) {
-        super(message);
-    }
+  /** Creates a new OcrException with the given message. */
+  public OcrException(final String message) { super(message); }
 
-    /** Creates a new OcrException with the given message and cause. */
-    public OcrException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /** Creates a new OcrException with the given message and cause. */
+  public OcrException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

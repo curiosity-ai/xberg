@@ -1,3 +1,6 @@
+//! Unit tests for the `classification` feature's public types: `ClassificationLabel`,
+//! `PageClassification`, and `PageClassificationConfig` construction.
+
 #![cfg(feature = "classification")]
 
 use xberg::ClassificationLabel;

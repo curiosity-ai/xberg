@@ -3,6 +3,8 @@
 //! Tests for CSV and TSV extraction.
 //! Validates data extraction, custom delimiters, quoted fields, and edge cases.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
+
 use xberg::core::config::ExtractionConfig;
 
 mod helpers;

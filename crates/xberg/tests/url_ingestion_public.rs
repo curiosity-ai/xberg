@@ -1,6 +1,6 @@
-#![cfg(feature = "url-ingestion")]
-
 //! Public URL ingestion integration tests with local HTTP fixtures.
+
+#![cfg(feature = "url-ingestion")]
 
 use crawlberg::CrawlConfig;
 use serde_json::Value;

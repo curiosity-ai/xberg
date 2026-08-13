@@ -27,25 +27,21 @@ x64) ort_arch="x86_64" ;;
 esac
 echo "Using macOS ONNX Runtime arch: $ort_arch"
 
+# Last Microsoft x86_64 macOS release (1.24 dropped the arch). Self-contained
+# with a macOS 13.4 floor; ort built with api-18 accepts any runtime >= 1.18. ~keep
+if [ "$ort_arch" = "x86_64" ]; then
+  ort_version="1.23.2"
+fi
+
 ort_root="$extract_dir/onnxruntime-osx-${ort_arch}-${ort_version}"
 
 if [ ! -d "$ort_root" ]; then
-  if [ "$ort_arch" = "x86_64" ]; then
-    # Microsoft dropped onnxruntime-osx-x86_64 after 1.23, below the 1.24+ ort
-    # needs; use Homebrew's x86_64 build instead of a download that would 404.
-    echo "Installing x86_64 macOS ONNX Runtime via Homebrew"
-    export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
-    brew install --bottle-tag=sonoma onnxruntime || brew install onnxruntime
-    mkdir -p "$ort_root/lib"
-    cp -f "$(brew --prefix onnxruntime)/lib"/libonnxruntime*.dylib "$ort_root/lib/"
-  else
-    echo "Cache miss: Downloading ONNX Runtime ${ort_version} for macOS ${ort_arch}"
-    archive="onnxruntime-osx-${ort_arch}-${ort_version}.tgz"
-    mkdir -p "$extract_dir"
-    curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$RUNNER_TEMP/$archive" \
-      "https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/$archive"
-    tar -xzf "$RUNNER_TEMP/$archive" -C "$extract_dir"
-  fi
+  echo "Cache miss: Downloading ONNX Runtime ${ort_version} for macOS ${ort_arch}"
+  archive="onnxruntime-osx-${ort_arch}-${ort_version}.tgz"
+  mkdir -p "$extract_dir"
+  curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$RUNNER_TEMP/$archive" \
+    "https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/$archive"
+  tar -xzf "$RUNNER_TEMP/$archive" -C "$extract_dir"
 else
   echo "Cache hit: Using cached ONNX Runtime ${ort_version}"
 fi
@@ -68,13 +64,6 @@ dest="$GITHUB_WORKSPACE/$dest_dir"
 mkdir -p "$dest"
 cp -f "$ort_root/lib/"libonnxruntime*.dylib "$dest/"
 
-# `-L` lets the linker find libonnxruntime at build time. The ORT dylib's
-# install_name is `@rpath/libonnxruntime.<ver>.dylib`, so the consuming binary
-# must carry an LC_RPATH for that lookup to resolve at load time. The dylib is
-# bundled next to the .node file in the npm package, so add an `@loader_path`
-# rpath: dlopen then resolves @rpath relative to the directory holding the
-# .node binary. Without this the published binary has no LC_RPATH and fails
-# with ERR_DLOPEN_FAILED at require() time.
 rpath_flag="-C link-arg=-Wl,-rpath,@loader_path"
 if [ -n "${RUSTFLAGS:-}" ]; then
   rustflags="$RUSTFLAGS -L $ort_root/lib $rpath_flag"

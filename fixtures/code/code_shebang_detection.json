@@ -2,6 +2,12 @@
 	"id": "code_shebang_detection",
 	"category": "code",
 	"description": "Test language detection from shebang line via bytes input",
+	"docs": {
+		"topic": "code",
+		"title": "Test language detection from shebang line via bytes input",
+		"description": "Test language detection from shebang line via bytes input",
+		"side_effects": "server"
+	},
 	"tags": ["code", "shebang", "tree-sitter"],
 	"call": "extract",
 	"input": {
@@ -37,25 +43,5 @@
 			"field": "results[0].content",
 			"values": ["build", "clean"]
 		}
-	],
-	"skip": {
-		"languages": [
-			"java",
-			"typescript",
-			"python",
-			"ruby",
-			"php",
-			"go",
-			"csharp",
-			"elixir",
-			"r",
-			"dart",
-			"kotlin_android",
-			"swift",
-			"zig",
-			"c",
-			"wasm"
-		],
-		"reason": "Code metadata variant is excluded from all language bindings (tree-sitter-specific; not part of polyglot API)"
-	}
+	]
 }

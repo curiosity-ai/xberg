@@ -2,6 +2,15 @@
 	"id": "error_extract_input_conflicting_ocr",
 	"category": "error",
 	"description": "extract force+disable OCR",
+	"docs": {
+		"topic": "error",
+		"title": "extract force+disable OCR",
+		"description": "extract force+disable OCR",
+		"presentation": {
+			"files": [{ "field": "/bytes", "path": "test_documents/text/fake_text.txt" }]
+		},
+		"side_effects": "safe"
+	},
 	"tags": ["error", "validation"],
 	"call": "extract",
 	"input": {

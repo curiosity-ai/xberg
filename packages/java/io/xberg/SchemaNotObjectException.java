@@ -5,15 +5,15 @@ package io.xberg;
  * A custom schema override was supplied but is not a JSON object.
  */
 public class SchemaNotObjectException extends ResolveErrorException {
-    private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 1L;
 
-    /** Creates a new SchemaNotObjectException with the given message. */
-    public SchemaNotObjectException(final String message) {
-        super(message);
-    }
+  /** Creates a new SchemaNotObjectException with the given message. */
+  public SchemaNotObjectException(final String message) { super(message); }
 
-    /** Creates a new SchemaNotObjectException with the given message and cause. */
-    public SchemaNotObjectException(final String message, final Throwable cause) {
-        super(message, cause);
-    }
+  /**
+   * Creates a new SchemaNotObjectException with the given message and cause.
+   */
+  public SchemaNotObjectException(final String message, final Throwable cause) {
+    super(message, cause);
+  }
 }

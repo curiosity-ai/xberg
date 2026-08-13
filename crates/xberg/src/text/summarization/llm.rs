@@ -92,13 +92,10 @@ mod tests {
 
     #[test]
     fn truncate_input_respects_utf8_boundaries() {
-        // Multi-byte chars must not be split.
-        let s = "äöü".repeat(100); // each char is 2 bytes
+        let s = "äöü".repeat(100);
         let truncated = truncate_input(&s, 5);
-        // 5 bytes lands inside a 2-byte char, so we expect 4 bytes (2 full chars).
         assert!(truncated.len() <= 5);
         assert!(s.starts_with(truncated));
-        // No partial char.
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 }

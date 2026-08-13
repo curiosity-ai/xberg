@@ -67,25 +67,21 @@ pub(crate) fn remove_stopwords(text: &str, stopwords: &AHashSet<String>, preserv
             continue;
         }
 
-        // Check preserve patterns first
         if should_preserve_word(word, preserve_patterns) {
             filtered_words.push(word);
             continue;
         }
 
-        // Preserve all-uppercase words (acronyms like API, SDK, HTTP)
         if word.len() > 1 && word.bytes().all(|b| b.is_ascii_uppercase() || !b.is_ascii_alphabetic()) {
             filtered_words.push(word);
             continue;
         }
 
-        // Preserve words containing digits (version numbers, counts, etc.)
         if word.bytes().any(|b| b.is_ascii_digit()) {
             filtered_words.push(word);
             continue;
         }
 
-        // Extract the alphabetic core of the word for stopword matching
         let clean_word = if word.is_ascii() {
             let clean_bytes: Vec<u8> = word
                 .bytes()
@@ -105,19 +101,16 @@ pub(crate) fn remove_stopwords(text: &str, stopwords: &AHashSet<String>, preserv
                 .to_lowercase()
         };
 
-        // If the clean word is empty (word was all punctuation), preserve it
         if clean_word.is_empty() {
             filtered_words.push(word);
             continue;
         }
 
-        // Preserve single-letter words
         if clean_word.len() <= 1 {
             filtered_words.push(word);
             continue;
         }
 
-        // Check if the clean word is a stopword
         if !stopwords.contains(&clean_word) {
             filtered_words.push(word);
         }
@@ -137,39 +130,6 @@ pub(crate) fn remove_stopwords(text: &str, stopwords: &AHashSet<String>, preserv
 #[inline]
 pub(crate) fn should_preserve_word(word: &str, preserve_patterns: &[Regex]) -> bool {
     preserve_patterns.iter().any(|pattern| pattern.is_match(word))
-}
-
-/// Splits a word into prefix (non-alphanumeric), core (alphanumeric), and suffix (non-alphanumeric).
-///
-/// This is useful for handling punctuation-wrapped words like "(hello)" or "world!".
-/// Currently used in tests; reserved for future word boundary-aware filtering.
-///
-/// # Arguments
-/// * `word` - The word to split
-///
-/// # Returns
-/// A tuple of (prefix, core, suffix) strings
-#[cfg(test)]
-pub fn split_word_boundaries(word: &str) -> (String, String, String) {
-    let chars: Vec<char> = word.chars().collect();
-    let mut start = 0;
-    let mut end = chars.len();
-
-    // Find the start of alphanumeric content
-    while start < chars.len() && !chars[start].is_alphanumeric() {
-        start += 1;
-    }
-
-    // Find the end of alphanumeric content
-    while end > start && !chars[end - 1].is_alphanumeric() {
-        end -= 1;
-    }
-
-    let prefix: String = chars[..start].iter().collect();
-    let core: String = chars[start..end].iter().collect();
-    let suffix: String = chars[end..].iter().collect();
-
-    (prefix, core, suffix)
 }
 
 #[cfg(all(test, feature = "stopwords"))]
@@ -317,57 +277,6 @@ mod tests {
         assert!(should_preserve_word("NASA", &patterns));
         assert!(should_preserve_word("HTTP", &patterns));
         assert!(!should_preserve_word("hello", &patterns));
-    }
-
-    #[test]
-    fn test_split_word_boundaries() {
-        let (prefix, core, suffix) = split_word_boundaries("(hello)");
-        assert_eq!(prefix, "(");
-        assert_eq!(core, "hello");
-        assert_eq!(suffix, ")");
-
-        let (prefix2, core2, suffix2) = split_word_boundaries("world!");
-        assert_eq!(prefix2, "");
-        assert_eq!(core2, "world");
-        assert_eq!(suffix2, "!");
-
-        let (prefix3, core3, suffix3) = split_word_boundaries("'test");
-        assert_eq!(prefix3, "'");
-        assert_eq!(core3, "test");
-        assert_eq!(suffix3, "");
-
-        let (prefix4, core4, suffix4) = split_word_boundaries("simple");
-        assert_eq!(prefix4, "");
-        assert_eq!(core4, "simple");
-        assert_eq!(suffix4, "");
-
-        let (prefix5, core5, suffix5) = split_word_boundaries("\"example!!!\"");
-        assert_eq!(prefix5, "\"");
-        assert_eq!(core5, "example");
-        assert_eq!(suffix5, "!!!\"");
-    }
-
-    #[test]
-    fn test_split_word_boundaries_edge_cases() {
-        let (prefix, core, suffix) = split_word_boundaries("!!!");
-        assert_eq!(prefix, "!!!");
-        assert_eq!(core, "");
-        assert_eq!(suffix, "");
-
-        let (prefix2, core2, suffix2) = split_word_boundaries("");
-        assert_eq!(prefix2, "");
-        assert_eq!(core2, "");
-        assert_eq!(suffix2, "");
-
-        let (prefix3, core3, suffix3) = split_word_boundaries("a");
-        assert_eq!(prefix3, "");
-        assert_eq!(core3, "a");
-        assert_eq!(suffix3, "");
-
-        let (prefix4, core4, suffix4) = split_word_boundaries("(café)");
-        assert_eq!(prefix4, "(");
-        assert_eq!(core4, "café");
-        assert_eq!(suffix4, ")");
     }
 
     #[test]

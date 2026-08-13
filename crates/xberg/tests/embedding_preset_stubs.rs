@@ -1,7 +1,3 @@
-// Tests that the no-feature stubs compile and return empty/None.
-// Only active when `embedding-presets` is absent; run with:
-//   cargo test -p xberg --test embedding_preset_stubs --no-default-features
-
 #[cfg(not(feature = "embedding-presets"))]
 mod tests {
     #[test]

@@ -16,6 +16,7 @@
 //! (`--features full`) and the minimal combo (`--features pdf,image-encode`)
 //! both satisfy this guard.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "image-encode")]
 
 mod helpers;
@@ -24,14 +25,12 @@ use helpers::extract_uri_document_blocking;
 use xberg::core::config::extraction::ImageOutputFormat;
 use xberg::core::config::{ExtractionConfig, ImageExtractionConfig, OutputFormat};
 
-// ── Magic-byte helpers ───────────────────────────────────────────────────────
-
 /// PNG magic bytes: `\x89PNG\r\n\x1a\n`
 #[cfg(any(feature = "pdf", feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// JPEG SOI marker: `\xFF\xD8\xFF`
-#[cfg(feature = "pdf")]
+#[cfg(any(feature = "pdf", all(feature = "ocr", feature = "image-encode")))]
 const JPEG_MAGIC: &[u8] = b"\xFF\xD8\xFF";
 
 /// WebP container: `RIFF` at offset 0, `WEBP` at offset 8
@@ -39,8 +38,6 @@ const JPEG_MAGIC: &[u8] = b"\xFF\xD8\xFF";
 fn is_webp(data: &[u8]) -> bool {
     data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP"
 }
-
-// ── Fixture helpers ──────────────────────────────────────────────────────────
 
 fn test_documents_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -70,8 +67,6 @@ fn config_with_output_format(output_format: ImageOutputFormat) -> ExtractionConf
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 /// Native passthrough: without specifying an output format (or by explicitly
 /// choosing `Native`), the images returned reflect whatever format the extractor
 /// produced from the PDF. No re-encode pass is applied, so the format field must
@@ -91,7 +86,6 @@ fn pdf_native_passthrough() {
 
     let config_explicit_native = config_with_output_format(ImageOutputFormat::Native);
 
-    // Also extract with the absolute default — no images config at all.
     let config_default = ExtractionConfig {
         output_format: OutputFormat::Markdown,
         images: Some(ImageExtractionConfig {
@@ -126,7 +120,6 @@ fn pdf_native_passthrough() {
         "Native explicit and Default must extract the same number of images"
     );
 
-    // Format strings must match between explicit Native and default config.
     let formats_native: Vec<&str> = images_native.iter().map(|i| i.format.as_ref()).collect();
     let formats_default: Vec<&str> = images_default.iter().map(|i| i.format.as_ref()).collect();
     assert_eq!(
@@ -286,9 +279,6 @@ fn office_mixed_to_png() {
     };
 
     for img in images {
-        // Skip images whose source format cannot be re-encoded (e.g. EMF/WMF
-        // vector metafiles). These arrive with a ProcessingWarning and their
-        // format is left unchanged by re_encode.
         let undecodable = result
             .processing_warnings
             .iter()
@@ -337,7 +327,6 @@ fn image_extractor_jpeg_to_png() {
         return;
     }
 
-    // First, extract natively to get the source dimensions.
     let native_config = ExtractionConfig {
         images: Some(ImageExtractionConfig {
             extract_images: true,
@@ -350,7 +339,6 @@ fn image_extractor_jpeg_to_png() {
     let native_result =
         extract_uri_document_blocking(&path, None, &native_config).expect("native JPEG extraction must succeed");
 
-    // Extract with PNG re-encode.
     let png_config = config_with_output_format(ImageOutputFormat::Png);
     let png_result = extract_uri_document_blocking(&path, None, &png_config).expect("PNG JPEG extraction must succeed");
 
@@ -377,7 +365,6 @@ fn image_extractor_jpeg_to_png() {
         &img.data[..8.min(img.data.len())]
     );
 
-    // Dimensions must be preserved (modulo lossless re-encode).
     if let Some(native_images) = native_result.images.as_ref()
         && !native_images.is_empty()
     {
@@ -449,7 +436,6 @@ fn ocr_runs_before_reencode() {
         "test_hello_world.png must yield at least one image entry"
     );
 
-    // At least one image must have been re-encoded to JPEG.
     let jpeg_images: Vec<_> = images.iter().filter(|i| i.format.as_ref() == "jpeg").collect();
     assert!(
         !jpeg_images.is_empty(),
@@ -510,7 +496,6 @@ fn quality_change_alters_byte_size() {
         "high-quality and low-quality runs must extract the same number of images"
     );
 
-    // At least one image must be strictly smaller at quality=30 than quality=95.
     let any_smaller = images_high
         .iter()
         .zip(images_low.iter())
@@ -546,7 +531,6 @@ fn unsupported_source_format_warns_and_preserves() {
     let config = config_with_output_format(ImageOutputFormat::Png);
     let result = extract_uri_document_blocking(&path, None, &config).expect("DOCX extraction must not error out");
 
-    // We only check the warning structure if the fixture actually has undecodable images.
     let encoder_warnings: Vec<_> = result
         .processing_warnings
         .iter()
@@ -562,7 +546,6 @@ fn unsupported_source_format_warns_and_preserves() {
         return;
     }
 
-    // Every warning must have a non-empty message.
     for warning in &encoder_warnings {
         assert!(
             !warning.message.is_empty(),
@@ -571,13 +554,8 @@ fn unsupported_source_format_warns_and_preserves() {
         );
     }
 
-    // The images that triggered warnings must still have non-empty bytes
-    // (untouched original data preserved).
     if let Some(images) = result.images.as_ref() {
         for img in images {
-            // We cannot easily correlate warning → image_index without parsing the
-            // warning message, so just assert no image has an empty data buffer,
-            // which would indicate the re-encode pass cleared it.
             assert!(
                 !img.data.is_empty(),
                 "image at index {} must retain non-empty data even when re-encode was skipped",
@@ -629,7 +607,6 @@ fn heif_output() {
             img.image_index
         );
 
-        // Round-trip: decode with xberg_libheif to prove bytes are valid HEIF.
         let parse_result = xberg_libheif::HeifContext::read_from_bytes(&img.data);
         assert!(
             parse_result.is_ok(),

@@ -13,7 +13,7 @@ use std::path::Path;
 /// mmap overhead (open, fstat, mmap syscalls + TLB pressure) outweighs the
 /// benefit for small allocations.
 #[cfg(not(target_arch = "wasm32"))]
-const MMAP_THRESHOLD_BYTES: u64 = 1_048_576; // 1 MiB
+const MMAP_THRESHOLD_BYTES: u64 = 1_048_576;
 
 /// An owned buffer of file bytes.
 ///
@@ -73,20 +73,12 @@ pub(crate) fn open_file_bytes(path: &Path) -> Result<FileBytes> {
         let metadata = std::fs::metadata(path).map_err(crate::XbergError::from)?;
         if metadata.len() > MMAP_THRESHOLD_BYTES {
             let file = std::fs::File::open(path).map_err(crate::XbergError::from)?;
-            // SAFETY: The file is opened read-only and we do not write to the
-            // mapped region.  The `FileBytes` value owns the `Mmap` handle and
-            // the mapping is live for exactly as long as the bytes are accessed.
-            // External modification of the file while mapped is a documented
-            // TOCTOU risk inherent to mmap on all platforms; it is acceptable
-            // here because xberg only reads user-supplied documents and
-            // makes no correctness guarantees about files modified concurrently.
             let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(crate::XbergError::from)?;
             return Ok(FileBytes {
                 inner: FileBytesInner::Mapped(mmap),
             });
         }
     }
-    // Small file or WASM: regular heap read.
     let bytes = std::fs::read(path).map_err(crate::XbergError::from)?;
     Ok(FileBytes {
         inner: FileBytesInner::Heap(bytes),
@@ -94,6 +86,16 @@ pub(crate) fn open_file_bytes(path: &Path) -> Result<FileBytes> {
 }
 
 /// Read a file asynchronously.
+///
+/// On native targets with the async runtime this performs a non-blocking
+/// `tokio::fs::read`. On wasm32 (where tokio refuses to build its `fs` feature)
+/// or when the `tokio-runtime` feature is off, it falls back to the
+/// platform-aware synchronous reader ([`open_file_bytes`]) — there is no async
+/// runtime to block in those configurations, so the read stays correct.
+///
+/// This helper is always present regardless of features so that async extractor
+/// paths can call one reader on every target rather than branching at each call
+/// site.
 ///
 /// # Arguments
 ///
@@ -106,9 +108,22 @@ pub(crate) fn open_file_bytes(path: &Path) -> Result<FileBytes> {
 /// # Errors
 ///
 /// Returns `XbergError::Io` for I/O errors (these always bubble up).
-#[cfg(feature = "tokio-runtime")]
+// Shared file-read helper for the html/email/structured/pdf/jats/ocr/candle extractors;
+// unused only in the degenerate `no-default-features` build where every caller feature is
+// off. A cfg-gate on the caller-feature union is brittle across single-feature CI combos, so
+// the helper is simply allowed to be unused there. ~keep
+#[allow(dead_code)]
 pub(crate) async fn read_file_async(path: impl AsRef<Path>) -> Result<Vec<u8>> {
-    tokio::fs::read(path.as_ref()).await.map_err(crate::XbergError::from)
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    {
+        tokio::fs::read(path.as_ref()).await.map_err(crate::XbergError::from)
+    }
+    // wasm32, or native without the async runtime: no runtime to block, so the sync reader
+    // is the correct choice (and `tokio::fs` is unavailable on wasm32 regardless). ~keep
+    #[cfg(not(all(feature = "tokio-runtime", not(target_arch = "wasm32"))))]
+    {
+        std::fs::read(path.as_ref()).map_err(crate::XbergError::from)
+    }
 }
 
 /// Read a file synchronously.

@@ -9,7 +9,6 @@ use lofty::probe::Probe;
 use std::io::Cursor;
 
 /// Tag and audio-property data extracted from an audio/video file.
-// Fields are consumed by the inference path in the follow-up PR.
 #[allow(dead_code)]
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Default)]
@@ -40,8 +39,6 @@ pub struct AudioTags {
 #[cfg_attr(alef, alef(skip))]
 pub fn read_audio_tags(bytes: &[u8]) -> AudioTags {
     let cursor = Cursor::new(bytes);
-    // guess_file_type() → Result<_, io::Error>; read() → Result<_, LoftyError>.
-    // Both error types differ, so chain via .ok() and fall back gracefully.
     let Some(tagged_file) = Probe::new(cursor).guess_file_type().ok().and_then(|p| {
         p.read()
             .map_err(|e| tracing::debug!("lofty read failed (non-fatal): {e}"))
@@ -56,7 +53,6 @@ pub fn read_audio_tags(bytes: &[u8]) -> AudioTags {
 
     let title = primary.and_then(|t| t.title()).map(|s| s.into_owned());
     let artist = primary.and_then(|t| t.artist()).map(|s| s.into_owned());
-    // `year()` was dropped from lofty 0.24's Accessor; use get_string with ItemKey::Year.
     let year = primary.and_then(|t| t.get_string(ItemKey::Year)).map(|s| s.to_string());
     let language = primary
         .and_then(|t| t.get_string(ItemKey::Language))

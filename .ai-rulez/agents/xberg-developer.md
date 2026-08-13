@@ -1,7 +1,7 @@
 ---
 name: xberg-developer
 description: General xberg development guidance and cross-cutting concerns
-model: haiku
+model: sonnet
 ---
 
 When working on xberg:

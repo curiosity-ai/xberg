@@ -371,6 +371,20 @@ public sealed class FootnoteCollector
                 }
             }
         }
+
+        // A definition that no reference points at is still authored content. `_definitions` is
+        // populated only from inside the FootnoteRef loop above, so an unreferenced definition
+        // never reaches any renderer. Append the orphans after the referenced ones, in document
+        // order, continuing the same numbering. (Rust GH#68.)
+        foreach (var elem in doc.Elements)
+        {
+            if (elem.Kind.Tag != ElementKindTag.FootnoteDefinition) continue;
+            if (elem.Anchor is not { } anchor) continue;
+            if (anchorToNumber.ContainsKey(anchor)) continue;
+            uint number = nextNumber++;
+            anchorToNumber[anchor] = number;
+            _definitions.Add(new FootnoteEntry { Text = elem.Text, Number = number });
+        }
     }
 
     public uint? RefNumber(uint elemIndex) => _refNumbers.TryGetValue(elemIndex, out var n) ? n : null;

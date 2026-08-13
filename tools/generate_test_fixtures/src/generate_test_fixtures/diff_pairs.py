@@ -29,7 +29,6 @@ from .gt_schema import diff_expectation, write_ground_truth
 
 ZIP_MTIME = (2024, 1, 1, 0, 0, 0)
 
-# DOCX content. Each entry is a single paragraph.
 DOCX_V1 = [
     "Subject: Q2 planning meeting.",
     "Date: 2024-04-15.",
@@ -42,14 +41,12 @@ DOCX_V1 = [
 DOCX_V2 = [
     "Subject: Q2 planning meeting.",
     "Date: 2024-04-15.",
-    # "Attendees" line dropped in v2.
-    "Agenda item one: review last quarter's revenue and margin.",  # rewritten
+    "Agenda item one: review last quarter's revenue and margin.",
     "Agenda item two: discuss Q2 product launches.",
-    "Agenda item three: hiring plan for engineering.",  # new
+    "Agenda item three: hiring plan for engineering.",
     "Action items will be circulated by Friday.",
 ]
 
-# XLSX content. v2 changes B2 from 100 to 150.
 XLSX_HEADER = ["Department", "Q1 Budget", "Q2 Budget"]
 XLSX_V1_ROWS = [
     ["Engineering", 100, 120],
@@ -57,7 +54,7 @@ XLSX_V1_ROWS = [
     ["Operations", 80, 90],
 ]
 XLSX_V2_ROWS = [
-    ["Engineering", 150, 120],  # B2: 100 -> 150
+    ["Engineering", 150, 120],
     ["Marketing", 50, 60],
     ["Operations", 80, 90],
 ]
@@ -94,8 +91,6 @@ def _emit_docx_pair(output_dir: Path, repo_root: Path) -> list[Path]:
     v1_path.write_bytes(_save_docx(DOCX_V1))
     v2_path.write_bytes(_save_docx(DOCX_V2))
 
-    # Relative paths for the sidecar — both halves of the pair are needed
-    # by the integration test.
     repo_root_resolved = repo_root.resolve()
 
     def _rel(path: Path) -> str:
@@ -114,12 +109,10 @@ def _emit_docx_pair(output_dir: Path, repo_root: Path) -> list[Path]:
             before_path=_rel(v1_path),
             after_path=_rel(v2_path),
             content_changed=True,
-            # Substrings that MUST appear in some DiffLine::Added entry.
             expected_added_lines=[
                 "review last quarter's revenue and margin.",
                 "Agenda item three: hiring plan for engineering.",
             ],
-            # Substrings that MUST appear in some DiffLine::Removed entry.
             expected_removed_lines=[
                 "Attendees: Alice, Bob, Carol.",
                 "review last quarter's revenue.",
@@ -164,7 +157,6 @@ def _emit_xlsx_pair(output_dir: Path, repo_root: Path) -> list[Path]:
             expected_added_lines=["150"],
             expected_removed_lines=["100"],
             table_cell_changes=[
-                # Row 1 = Engineering row (header is row 0), col 1 = Q1 Budget.
                 {"row": 1, "col": 1, "from": "100", "to": "150"},
             ],
             notes=(

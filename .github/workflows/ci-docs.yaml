@@ -1,24 +1,17 @@
 name: CI Docs
 
 on:
-  pull_request:
-    paths:
-      - "docs/**"
-      - "packages/**"
-      - "crates/*/README.md"
-      - "zensical.toml"
-      - "mkdocs.yml"
-      - "alef.toml"
-      - ".github/workflows/ci-docs.yaml"
   push:
     branches: [main]
     paths:
-      - "docs/**"
-      - "packages/**"
-      - "crates/*/README.md"
-      - "zensical.toml"
+      - "docs-site/**"
       - "alef.toml"
-      - "CHANGELOG.md"
+      - ".github/workflows/ci-docs.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs-site/**"
+      - "alef.toml"
       - ".github/workflows/ci-docs.yaml"
   workflow_dispatch:
 
@@ -28,64 +21,11 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ci-docs-${{ github.event.pull_request.number || github.ref }}
+  group: ci-docs-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Lint documentation + validate snippets
-        uses: xberg-io/actions/lint-docs@v1
-        with:
-          working-directory: .
-          strict: "true"
-          validate-snippets: "true"
-          alef-ref: v0.19.5
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Build documentation
-        uses: xberg-io/actions/build-docs@v1
-        with:
-          working-directory: .
-          strict: "true"
-
-      - name: Upload site artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: docs-site
-          path: site/
-          retention-days: 1
-
-  deploy:
-    name: Deploy
-    needs: [build, lint]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download site artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: docs-site
-          path: site/
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: site
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
+  docs:
+    uses: xberg-io/actions/.github/workflows/reusable-docs-deploy.yml@v1
+    with:
+      deploy: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}

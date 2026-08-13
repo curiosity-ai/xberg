@@ -189,6 +189,31 @@ pub struct ChunkingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingConfig>,
 
+    /// Optional sparse (SPLADE) embedding configuration for chunk embeddings.
+    ///
+    /// When set, sparse vectors are generated for each chunk's content and attached
+    /// via [`crate::types::Chunk::sparse_embedding`]. Requires the `sparse-embeddings`
+    /// feature; without it, a warning is emitted and no sparse vectors are attached.
+    ///
+    /// Config-file only: like [`super::reranker::RerankerConfig`] and the local-ONNX branch of
+    /// `embedding`, this has no CLI flag and no environment variable. Only the secret/identity
+    /// fields of LLM-routed configs (model, API key, base URL) get that reach. ~keep
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub sparse_embedding: Option<super::sparse_embedding::SparseEmbeddingConfig>,
+
+    /// Optional late-interaction (ColBERT) embedding configuration for chunk embeddings.
+    ///
+    /// When set, multi-vector embeddings are generated for each chunk's content and
+    /// attached via [`crate::types::Chunk::late_interaction`]. Requires the
+    /// `late-interaction` feature; without it, a warning is emitted and no
+    /// late-interaction vectors are attached.
+    ///
+    /// Config-file only, for the same reason as `sparse_embedding` above. ~keep
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub late_interaction: Option<super::late_interaction::LateInteractionConfig>,
+
     /// Use a preset configuration (overrides individual settings if provided).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
@@ -200,11 +225,24 @@ pub struct ChunkingConfig {
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub sizing: ChunkSizing,
 
-    /// When `true` and `chunker_type` is `Markdown`, prepend the heading hierarchy
-    /// path (e.g. `"# Title > ## Section\n\n"`) to each chunk's content string.
+    /// **Deprecated and inert** (#1393): no longer prepends anything into
+    /// `content`. Setting this field has no observable effect on chunking output
+    /// any more.
     ///
-    /// This is useful for RAG pipelines where each chunk needs self-contained
-    /// context about its position in the document structure.
+    /// Previously, when `true` and `chunker_type` was `Markdown`, this prepended
+    /// the heading hierarchy path (e.g. `"# Title > ## Section\n\n"`) directly
+    /// into each chunk's `content` string. `content` now always equals the exact
+    /// `[byte_start, byte_end)` source span regardless of this flag — see
+    /// [`BreadcrumbTarget`](crate::core::config::extraction::BreadcrumbTarget) for
+    /// the full rationale. `heading_context`/`heading_path` on `ChunkMetadata` are
+    /// populated independently of this flag, so callers lose no information —
+    /// only the in-place mutation is gone.
+    ///
+    /// Call [`render_heading_breadcrumb`](crate::chunking::render_heading_breadcrumb)
+    /// explicitly at index time instead, for the retrieval consumer that wants the
+    /// breadcrumb inline.
+    ///
+    /// Kept only so existing callers keep compiling.
     ///
     /// Default: `false`
     #[serde(default)]
@@ -232,6 +270,18 @@ pub struct ChunkingConfig {
     /// Default: `Split`
     #[serde(default)]
     pub table_chunking: TableChunkingMode,
+
+    /// **Deprecated and inert** (#1393): see
+    /// [`BreadcrumbTarget`](crate::core::config::extraction::BreadcrumbTarget) for
+    /// the full explanation. Neither variant has any effect on `content` any
+    /// more — call
+    /// [`render_heading_breadcrumb`](crate::chunking::render_heading_breadcrumb)
+    /// explicitly at index time instead. Kept only for backward compatibility.
+    ///
+    /// Default: `Content`.
+    #[serde(default)]
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    pub breadcrumb_target: crate::core::config::extraction::BreadcrumbTarget,
 }
 
 impl ChunkingConfig {
@@ -280,16 +330,14 @@ impl ChunkingConfig {
             }
         };
 
-        // Preserve the caller's embedding choice, including None.
-        // Presets configure chunking parameters only; users must explicitly
-        // provide an EmbeddingConfig to opt into embedding generation.
         let embedding = self.embedding.clone();
 
         Self {
             max_characters: preset.chunk_size,
             overlap: preset.overlap,
             embedding,
-            // Preserve caller's other settings
+            sparse_embedding: self.sparse_embedding.clone(),
+            late_interaction: self.late_interaction.clone(),
             trim: self.trim,
             chunker_type: self.chunker_type,
             preset: self.preset.clone(),
@@ -297,6 +345,7 @@ impl ChunkingConfig {
             prepend_heading_context: self.prepend_heading_context,
             topic_threshold: self.topic_threshold,
             table_chunking: self.table_chunking,
+            breadcrumb_target: self.breadcrumb_target,
         }
     }
 
@@ -318,11 +367,14 @@ impl Default for ChunkingConfig {
             trim: true,
             chunker_type: ChunkerType::Text,
             embedding: None,
+            sparse_embedding: None,
+            late_interaction: None,
             preset: None,
             sizing: ChunkSizing::default(),
             prepend_heading_context: false,
             topic_threshold: None,
             table_chunking: TableChunkingMode::Split,
+            breadcrumb_target: crate::core::config::extraction::BreadcrumbTarget::Content,
         }
     }
 }
@@ -333,7 +385,7 @@ impl Default for ChunkingConfig {
 /// Requires the `embeddings` feature to be enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
-    /// The embedding model to use (defaults to "balanced" preset if not specified)
+    /// The embedding model to use (defaults to "gte-modernbert-base" preset if not specified)
     #[serde(default = "default_model", deserialize_with = "deserialize_null_model")]
     pub model: EmbeddingModelType,
 
@@ -345,14 +397,21 @@ pub struct EmbeddingConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 
-    /// Show model download progress
+    /// Show model download progress.
+    ///
+    /// When enabled, transfer progress for the model, tokenizer and config files is reported at
+    /// `info` level on the `xberg::model_download` target while they download (#279). Covers both
+    /// local backends (ONNX and static/model2vec). A warm Hugging Face cache transfers nothing and
+    /// so reports nothing. Ignored by [`EmbeddingModelType::Llm`] and
+    /// [`EmbeddingModelType::Plugin`], which download no model.
     #[serde(default)]
     pub show_download_progress: bool,
 
-    /// Custom cache directory for model files
+    /// Optional alternate Hugging Face cache root for model files.
     ///
-    /// Defaults to `~/.cache/xberg/embeddings/` if not specified.
-    /// Allows full customization of model download location.
+    /// When unset, hf-hub follows `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`,
+    /// `HF_HOME`, XDG, and platform defaults. Prefer those environment variables
+    /// when configuring the cache process-wide.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
 
@@ -376,6 +435,21 @@ pub struct EmbeddingConfig {
     /// hardware.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_embed_duration_secs: Option<u64>,
+
+    /// Maximum number of tokens fed to the tokenizer before truncation when
+    /// embedding a chunk with a local ONNX model (Preset/Custom).
+    ///
+    /// A chunk longer than this many tokens has its tail dropped before
+    /// inference, so only the prefix contributes to the stored vector. `None`
+    /// falls back to 512 (the historical default). The effective value is
+    /// always capped at the model's own `model_max_length`, so raising it past
+    /// what the model supports has no effect — set it to match a long-context
+    /// model (e.g. 8192 for Jina/Nomic) so long chunks embed in full.
+    ///
+    /// Ignored by the `Llm` and `Plugin` model types, which own their own
+    /// tokenization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sequence_length: Option<usize>,
 }
 
 impl Default for EmbeddingConfig {
@@ -390,6 +464,7 @@ impl Default for EmbeddingConfig {
             cache_dir: None,
             acceleration: None,
             max_embed_duration_secs: Some(60),
+            max_sequence_length: None,
         }
     }
 }
@@ -418,7 +493,11 @@ pub enum EmbeddingModelType {
     /// `"openai/text-embedding-3-small"`).
     Llm {
         /// LLM provider configuration specifying the model and API credentials.
-        llm: super::llm::LlmConfig,
+        ///
+        /// Boxed because `LlmConfig` carries liter-llm's full configuration surface and is
+        /// an order of magnitude larger than the other variants, which would otherwise make
+        /// every `Preset`/`Custom` value pay for it. ~keep
+        llm: Box<super::llm::LlmConfig>,
     },
 
     /// In-process embedding backend registered via the plugin system.
@@ -433,7 +512,7 @@ pub enum EmbeddingModelType {
     /// apply: `normalize` (post-call L2 normalization) and `max_embed_duration_secs`
     /// (dispatcher timeout). Model-loading fields (`batch_size`, `cache_dir`,
     /// `show_download_progress`, `acceleration`) are ignored — the host owns the
-    /// model lifecycle.
+    /// model lifecycle, so there is no download to report progress for.
     ///
     /// Semantic chunking falls back to [`ChunkingConfig::max_characters`] when this variant
     /// is used, since there is no preset to look a chunk-size ceiling up against — size your
@@ -447,16 +526,18 @@ pub enum EmbeddingModelType {
 }
 
 impl Default for EmbeddingModelType {
-    /// Returns the "balanced" preset as the default model.
+    /// Returns the "gte-modernbert-base" preset as the default model.
     ///
-    /// Previously returned `Preset { name: "" }` (empty string) which caused
+    /// The default is a valid, non-empty preset name: an empty string caused
     /// "Unknown embedding preset: " errors in every language binding that calls
     /// `EmbeddingModelType::default()` — including generated bindings that
     /// use struct-level `#[serde(default)]` instead of `default_model()`.
-    /// All defaults across the codebase converge on "balanced".
+    /// All defaults across the codebase converge on "gte-modernbert-base"
+    /// (2026-gen, 768 dims / CLS pooling — a drop-in for the prior "balanced"
+    /// default, which remains available as a named preset).
     fn default() -> Self {
         Self::Preset {
-            name: "balanced".to_string(),
+            name: "gte-modernbert-base".to_string(),
         }
     }
 }
@@ -476,7 +557,7 @@ fn default_chunk_size() -> usize {
 /// only covers the *missing* case. Polyglot bindings frequently emit explicit
 /// `"field": null` from zero-valued mirror structs, so this helper accepts either
 /// `null` or a present value and falls back to `T::default()` for null.
-fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Default + serde::Deserialize<'de>,
@@ -507,13 +588,13 @@ fn default_batch_size() -> usize {
 
 fn default_model() -> EmbeddingModelType {
     EmbeddingModelType::Preset {
-        name: "balanced".to_string(),
+        name: "gte-modernbert-base".to_string(),
     }
 }
 
 /// `deserialize_with` companion for `EmbeddingModelType` fields that may be
 /// explicitly `null` in polyglot binding payloads. Treats null as the configured
-/// `default_model()` (the "balanced" preset) rather than the trait `Default` impl
+/// `default_model()` (the "gte-modernbert-base" preset) rather than the trait `Default` impl
 /// (which is an empty-name placeholder unsuitable for live use).
 fn deserialize_null_model<'de, D>(deserializer: D) -> Result<EmbeddingModelType, D::Error>
 where
@@ -571,16 +652,19 @@ mod tests {
         assert!(config.cache_dir.is_none());
     }
 
-    /// Tests that `EmbeddingModelType::default()` returns the "balanced" preset.
+    /// Tests that `EmbeddingModelType::default()` returns the "gte-modernbert-base" preset.
     ///
     /// Language bindings that use struct-level `#[serde(default)]` resolve absent
     /// `model` fields via this impl. An empty-string name caused "Unknown embedding
     /// preset: " panics in `get_preset()`; the default must be a valid preset.
     #[test]
-    fn test_embedding_model_type_default_is_balanced() {
+    fn test_embedding_model_type_default_is_gte_modernbert() {
         match EmbeddingModelType::default() {
             EmbeddingModelType::Preset { name } => {
-                assert_eq!(name, "balanced", "Default model should be the balanced preset");
+                assert_eq!(
+                    name, "gte-modernbert-base",
+                    "Default model should be the gte-modernbert-base preset"
+                );
             }
             other => panic!("Expected Preset variant, got {:?}", other),
         }
@@ -596,11 +680,9 @@ mod tests {
         };
         let json = serde_json::to_string(&model).unwrap();
 
-        // Should use internally-tagged format with "type" discriminator
         assert!(json.contains(r#""type":"preset""#), "Should contain type:preset field");
         assert!(json.contains(r#""name":"fast""#), "Should contain name:fast field");
 
-        // Should NOT use adjacently-tagged format
         assert!(
             !json.contains(r#"{"preset":"#),
             "Should NOT use adjacently-tagged format"
@@ -611,7 +693,6 @@ mod tests {
     /// API documentation shows: `{"type": "preset", "name": "fast"}`
     #[test]
     fn test_embedding_model_type_preset_deserialization() {
-        // This is the documented API format that users should send
         let json = r#"{"type": "preset", "name": "fast"}"#;
         let model: EmbeddingModelType = serde_json::from_str(json).unwrap();
 
@@ -627,11 +708,9 @@ mod tests {
     /// This ensures the API doesn't accept the old/wrong documentation format.
     #[test]
     fn test_embedding_model_type_rejects_wrong_format() {
-        // This is the WRONG format that was in the old documentation
         let wrong_json = r#"{"preset": {"name": "fast"}}"#;
         let result: Result<EmbeddingModelType, _> = serde_json::from_str(wrong_json);
 
-        // Should fail to parse - the wrong format should be rejected
         assert!(result.is_err(), "Should reject adjacently-tagged format");
     }
 
@@ -648,6 +727,7 @@ mod tests {
             cache_dir: None,
             acceleration: None,
             max_embed_duration_secs: Some(60),
+            max_sequence_length: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -687,8 +767,6 @@ mod tests {
         let resolved = config.resolve_preset();
         assert_eq!(resolved.max_characters, 1024);
         assert_eq!(resolved.overlap, 100);
-        // Preset configures chunking parameters only; embedding stays None unless
-        // the caller explicitly provided one (#797).
         assert!(resolved.embedding.is_none());
     }
 
@@ -711,7 +789,6 @@ mod tests {
         let resolved = config.resolve_preset();
         assert_eq!(resolved.max_characters, 512);
         assert_eq!(resolved.overlap, 50);
-        // Explicit embedding config preserved
         match &resolved.embedding.unwrap().model {
             EmbeddingModelType::Custom { model_id, .. } => assert_eq!(model_id, "custom/model"),
             _ => panic!("Expected Custom model type to be preserved"),
@@ -747,15 +824,10 @@ mod tests {
     #[test]
     fn test_embedding_model_type_llm_roundtrip() {
         let model_type = EmbeddingModelType::Llm {
-            llm: crate::core::config::llm::LlmConfig {
+            llm: Box::new(crate::core::config::llm::LlmConfig {
                 model: "openai/text-embedding-3-small".to_string(),
-                api_key: None,
-                base_url: None,
-                timeout_secs: None,
-                max_retries: None,
-                temperature: None,
-                max_tokens: None,
-            },
+                ..Default::default()
+            }),
         };
         let json = serde_json::to_string(&model_type).unwrap();
         assert!(json.contains("\"type\":\"llm\""));
@@ -832,8 +904,6 @@ mod tests {
         }
     }
 
-    // --- Issue #797 regression tests ---
-
     /// Preset with no explicit embedding: embedding must remain None.
     ///
     /// Before the fix, `resolve_preset()` would silently inject an
@@ -902,5 +972,61 @@ mod tests {
     fn table_chunking_mode_defaults_to_split_when_field_absent() {
         let c: ChunkingConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(c.table_chunking, TableChunkingMode::Split);
+    }
+
+    /// Regression guard for #268: a `ChunkingConfig` JSON payload written before
+    /// `sparse_embedding`/`late_interaction` existed (i.e. missing both keys) must still
+    /// deserialize, with both fields defaulting to `None`. `ChunkingConfig` is nested inside
+    /// `ExtractionConfig`, which is `#[serde(deny_unknown_fields)]` — this guards the other
+    /// direction of that contract: old payloads must not become invalid just because the
+    /// schema grew new optional fields.
+    #[test]
+    fn sparse_and_late_interaction_configs_default_to_none_when_absent_from_json() {
+        let c: ChunkingConfig = serde_json::from_str("{}").unwrap();
+        assert!(c.sparse_embedding.is_none());
+        assert!(c.late_interaction.is_none());
+    }
+
+    /// `ChunkingConfig::default()` must leave both new vector configs unset (#268) — no
+    /// behaviour change for existing callers who never opt in.
+    #[test]
+    fn chunking_config_default_has_no_sparse_or_late_interaction_config() {
+        let config = ChunkingConfig::default();
+        assert!(config.sparse_embedding.is_none());
+        assert!(config.late_interaction.is_none());
+    }
+
+    /// `resolve_preset()` must carry an explicitly-set `sparse_embedding`/`late_interaction`
+    /// config through unchanged (#268), the same way it already preserves `embedding`.
+    #[cfg(any(feature = "embeddings", feature = "chunking"))]
+    #[test]
+    fn resolve_preset_preserves_explicit_sparse_and_late_interaction_configs() {
+        let config = ChunkingConfig {
+            preset: Some("balanced".to_string()),
+            sparse_embedding: Some(crate::core::config::SparseEmbeddingConfig {
+                batch_size: 4,
+                ..Default::default()
+            }),
+            late_interaction: Some(crate::core::config::LateInteractionConfig {
+                batch_size: 8,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = config.resolve_preset();
+        assert_eq!(
+            resolved
+                .sparse_embedding
+                .expect("sparse_embedding must survive resolve_preset")
+                .batch_size,
+            4
+        );
+        assert_eq!(
+            resolved
+                .late_interaction
+                .expect("late_interaction must survive resolve_preset")
+                .batch_size,
+            8
+        );
     }
 }

@@ -18,10 +18,6 @@ use serde::{Deserialize, Serialize};
 
 use super::extraction::BoundingBox;
 
-// ============================================================================
-// Index and ID Types
-// ============================================================================
-
 /// Newtype for node indices into the `DocumentStructure::nodes` array.
 ///
 /// Uses `u32` for cross-platform consistency (WASM is 32-bit) and to avoid
@@ -35,12 +31,13 @@ pub struct NodeIndex(pub u32);
 ///
 /// Generated from a hash of `node_type + text + page`. The same document
 /// always produces the same IDs, making them useful for diffing, caching,
-/// and external references.
-#[cfg_attr(alef, alef(skip))]
+/// and external references. Wraps a `String` (public field, mirroring
+/// [`NodeIndex`]'s wrapper pattern) so bindings can treat it as a plain
+/// newtype rather than requiring a lossy fallback conversion.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "api", schema(value_type = String))]
-pub struct NodeId(String);
+pub struct NodeId(pub String);
 
 impl NodeId {
     /// Generate a deterministic `NodeId` from node content.
@@ -64,7 +61,6 @@ impl NodeId {
             .bytes()
             .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
 
-        // Use u64::MAX as sentinel for None to distinguish from Some(0)
         let page_hash = page.map(|p| p as u64).unwrap_or(u64::MAX);
 
         let combined = type_hash
@@ -90,10 +86,6 @@ impl std::fmt::Display for NodeId {
         write!(f, "{}", self.0)
     }
 }
-
-// ============================================================================
-// Document Structure
-// ============================================================================
 
 /// Top-level structured document representation.
 ///
@@ -147,11 +139,11 @@ impl DocumentStructure {
     /// # Examples
     ///
     /// ```rust
-    /// use xberg::types::document_structure::{DocumentStructure, DocumentNode, NodeContent, NodeId};
+    /// use xberg::types::document_structure::{DocumentStructure, DocumentNode, NodeContent};
     ///
     /// let mut structure = DocumentStructure {
     ///     nodes: vec![DocumentNode {
-    ///         id: NodeId::from("n1"),
+    ///         id: String::new(),
     ///         content: NodeContent::Paragraph { text: "Hello".into() },
     ///         parent: None,
     ///         children: vec![],
@@ -174,6 +166,45 @@ impl DocumentStructure {
         types.sort_unstable();
         types.dedup();
         self.node_types = types.into_iter().map(|s| s.to_string()).collect();
+    }
+
+    /// Maps a document node to its byte-offset span within a document's
+    /// rendered text content (the string that chunking operates on, e.g.
+    /// Markdown or plain-text output).
+    ///
+    /// # Status: not yet implemented
+    ///
+    /// Nodes carry position information for the *source* document (`page`,
+    /// `bbox`) but not offsets into *rendered* output — rendering is a
+    /// separate step (format-specific renderers under `core/pipeline`) that
+    /// does not currently track which byte ranges of its output came from
+    /// which `NodeIndex`. Always returns `None`.
+    ///
+    /// This is the seam `ChunkMetadata::node_ids` population (tracked under #1296) is expected
+    /// to build on; implementing it requires either threading node provenance through the
+    /// renderers, or re-deriving node spans by re-scanning rendered output for node text with
+    /// page/order disambiguation.
+    ///
+    /// `ChunkMetadata::page_spans` (#1295) does not depend on this method: it derives its page
+    /// numbers from the existing byte-range-to-page boundary mapping (the same one used for
+    /// `first_page`/`last_page`, see `chunking::boundaries::calculate_page_spans`) and fills in
+    /// bounding boxes via a page-scoped textual containment check against node text (see
+    /// `chunking::page_spans::populate_page_span_bboxes`), without requiring an exact node ->
+    /// byte-offset mapping.
+    ///
+    /// # Parameters
+    ///
+    /// - `node_index`: index into [`DocumentStructure::nodes`].
+    ///
+    /// Not bound to language bindings (`alef(skip)`): the tuple return type
+    /// is not FFI-friendly, and the method is a placeholder with no behavior
+    /// to expose yet. A binding-facing surface can be added once #1296
+    /// implements real offset resolution.
+    #[cfg_attr(alef, alef(skip))]
+    #[must_use]
+    pub fn node_rendered_offset(&self, _node_index: NodeIndex) -> Option<(usize, usize)> {
+        // TODO(#1296): implement real node -> rendered-offset mapping.
+        None
     }
 }
 
@@ -217,10 +248,18 @@ pub enum RelationshipKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct DocumentNode {
-    /// Deterministic identifier (hash of content + position).
-    #[cfg_attr(alef, alef(skip))]
-    #[serde(skip)]
-    pub id: NodeId,
+    /// Deterministic identifier (hash of node type + text + page + position).
+    ///
+    /// Stable and unique within a single extraction response: every internal
+    /// construction path threads the node's position (its index in
+    /// `DocumentStructure::nodes`) into the hash, so identical
+    /// `(node_type, text, page)` tuples at different positions never collide.
+    /// Always serialised — `ChunkMetadata::node_ids` references it to join
+    /// chunks back to the nodes they were derived from.
+    /// `#[serde(default)]` covers the missing-field case on inbound JSON
+    /// (e.g. documents serialised before this field existed).
+    #[serde(default)]
+    pub id: String,
 
     /// Node content — tagged enum, type-specific data only.
     pub content: NodeContent,
@@ -268,10 +307,6 @@ pub struct DocumentNode {
     pub attributes: Option<HashMap<String, String>>,
 }
 
-// ============================================================================
-// Content Layer
-// ============================================================================
-
 /// Content layer classification for document nodes.
 ///
 /// Replaces separate body/furniture arrays with per-node granularity.
@@ -289,10 +324,6 @@ pub enum ContentLayer {
     /// Footnote content.
     Footnote,
 }
-
-// ============================================================================
-// Node Content (Tagged Enum)
-// ============================================================================
 
 /// Tagged enum for node content. Each variant carries only type-specific data.
 ///
@@ -374,6 +405,17 @@ pub enum NodeContent {
     /// Footnote reference content.
     Footnote {
         /// The footnote body text.
+        text: String,
+    },
+
+    /// Reviewer/editor comment content (e.g. DOCX comments).
+    ///
+    /// Distinct from [`NodeContent::Footnote`] (xberg-io/xberg#300): comments and
+    /// footnotes both reach the internal document via a marker/definition pair, but
+    /// a consumer needs to tell a reviewer comment apart from an authored footnote.
+    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
+    Comment {
+        /// The comment body text.
         text: String,
     },
 
@@ -472,6 +514,7 @@ impl NodeContent {
             Self::Quote => "quote",
             Self::Formula { .. } => "formula",
             Self::Footnote { .. } => "footnote",
+            Self::Comment { .. } => "comment",
             Self::Group { .. } => "group",
             Self::PageBreak => "page_break",
             Self::Slide { .. } => "slide",
@@ -484,10 +527,6 @@ impl NodeContent {
         }
     }
 }
-
-// ============================================================================
-// Table Grid
-// ============================================================================
 
 /// Structured table grid with cell-level metadata.
 ///
@@ -530,10 +569,6 @@ pub struct GridCell {
 fn default_span() -> u32 {
     1
 }
-
-// ============================================================================
-// Text Annotations
-// ============================================================================
 
 /// Inline text annotation — byte-range based formatting and links.
 ///
@@ -600,10 +635,6 @@ pub enum AnnotationKind {
     },
 }
 
-// ============================================================================
-// BoundingBox Conversions
-// ============================================================================
-
 /// Convert PDF hierarchy's `(f32, f32, f32, f32)` bounding box to canonical `BoundingBox`.
 ///
 /// The tuple order is `(left, top, right, bottom)` matching the PDF coordinate convention.
@@ -624,16 +655,12 @@ impl Default for NodeContent {
     }
 }
 
-// ============================================================================
-// NodeContent Helpers
-// ============================================================================
-
 impl NodeContent {
     /// Get the primary text content of this node, if it carries text.
     ///
     /// Text-carrying nodes: `Title`, `Heading`, `Paragraph`, `ListItem`, `Code`,
-    /// `Formula`, `Footnote`, `Citation` (returns text), `RawBlock` (returns content),
-    /// `DefinitionItem` (returns term only, not definition).
+    /// `Formula`, `Footnote`, `Comment`, `Citation` (returns text), `RawBlock` (returns
+    /// content), `DefinitionItem` (returns term only, not definition).
     ///
     /// Container/marker nodes return `None`: `List`, `Quote`, `Group`, `PageBreak`,
     /// `Slide`, `DefinitionList`, `Admonition`, `MetadataBlock`.
@@ -646,6 +673,7 @@ impl NodeContent {
             | NodeContent::Code { text, .. }
             | NodeContent::Formula { text }
             | NodeContent::Footnote { text }
+            | NodeContent::Comment { text }
             | NodeContent::Citation { text, .. }
             | NodeContent::RawBlock { content: text, .. } => Some(text),
             NodeContent::DefinitionItem { term, .. } => Some(term),
@@ -659,6 +687,74 @@ impl NodeContent {
             | NodeContent::DefinitionList
             | NodeContent::Admonition { .. }
             | NodeContent::MetadataBlock { .. } => None,
+        }
+    }
+
+    /// Invoke `redact` on every text-bearing field of this variant, in place.
+    ///
+    /// A `&mut` companion to [`Self::text`], but exhaustive rather than
+    /// primary-field-only: it also covers secondary text fields `text()` does not
+    /// surface (`Group::heading_text`, `Slide::title`, `Image::description`,
+    /// `DefinitionItem::definition`, `Admonition::title`), plus per-cell table text
+    /// and metadata-block values. Without this, a redaction pass over
+    /// [`super::extraction::ExtractedDocument::content`] leaves the structured
+    /// `document` tree holding the original text verbatim (xberg-io/xberg#298).
+    ///
+    /// Container/marker nodes with no text of their own — `List`, `Quote`,
+    /// `PageBreak`, `DefinitionList` — are no-ops.
+    /// Gated to match its callers (`text::redaction` and `text::translation::fields`,
+    /// each gated on its own feature) — without this, a build with both off trips
+    /// `dead_code`, which CI escalates via `-D warnings`. Any new caller must add its
+    /// feature here, or the walker silently compiles out and that caller becomes a
+    /// no-op rather than failing to build (#254).
+    #[cfg(any(feature = "redaction", feature = "translation"))]
+    pub(crate) fn for_each_text_field_mut(&mut self, mut redact: impl FnMut(&mut String)) {
+        match self {
+            NodeContent::Title { text }
+            | NodeContent::Heading { text, .. }
+            | NodeContent::Paragraph { text }
+            | NodeContent::ListItem { text }
+            | NodeContent::Code { text, .. }
+            | NodeContent::Formula { text }
+            | NodeContent::Footnote { text }
+            | NodeContent::Comment { text }
+            | NodeContent::Citation { text, .. }
+            | NodeContent::RawBlock { content: text, .. } => redact(text),
+            NodeContent::DefinitionItem { term, definition } => {
+                redact(term);
+                redact(definition);
+            }
+            NodeContent::Group { heading_text, .. } => {
+                if let Some(text) = heading_text.as_mut() {
+                    redact(text);
+                }
+            }
+            NodeContent::Slide { title, .. } => {
+                if let Some(text) = title.as_mut() {
+                    redact(text);
+                }
+            }
+            NodeContent::Image { description, .. } => {
+                if let Some(text) = description.as_mut() {
+                    redact(text);
+                }
+            }
+            NodeContent::Admonition { title, .. } => {
+                if let Some(text) = title.as_mut() {
+                    redact(text);
+                }
+            }
+            NodeContent::Table { grid } => {
+                for cell in grid.cells.iter_mut() {
+                    redact(&mut cell.content);
+                }
+            }
+            NodeContent::MetadataBlock { entries } => {
+                for (_key, value) in entries.iter_mut() {
+                    redact(value);
+                }
+            }
+            NodeContent::List { .. } | NodeContent::Quote | NodeContent::PageBreak | NodeContent::DefinitionList => {}
         }
     }
 
@@ -676,6 +772,7 @@ impl NodeContent {
             NodeContent::Quote => "quote",
             NodeContent::Formula { .. } => "formula",
             NodeContent::Footnote { .. } => "footnote",
+            NodeContent::Comment { .. } => "comment",
             NodeContent::Group { .. } => "group",
             NodeContent::PageBreak => "page_break",
             NodeContent::Slide { .. } => "slide",
@@ -688,10 +785,6 @@ impl NodeContent {
         }
     }
 }
-
-// ============================================================================
-// DocumentStructure Methods
-// ============================================================================
 
 impl DocumentStructure {
     /// Create an empty `DocumentStructure`.
@@ -745,7 +838,6 @@ impl DocumentStructure {
         for (i, node) in self.nodes.iter().enumerate() {
             let idx = i as u32;
 
-            // Validate parent reference
             if let Some(parent) = node.parent {
                 if parent.0 >= len {
                     return Err(format!(
@@ -761,7 +853,6 @@ impl DocumentStructure {
                 }
             }
 
-            // Validate child references
             for child in &node.children {
                 if child.0 >= len {
                     return Err(format!(
@@ -824,10 +915,6 @@ impl Default for DocumentStructure {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,7 +922,7 @@ mod tests {
     fn make_paragraph(text: &str, page: Option<u32>, index: u32) -> DocumentNode {
         let content = NodeContent::Paragraph { text: text.to_string() };
         DocumentNode {
-            id: NodeId::generate(content.node_type_str(), text, page, index),
+            id: NodeId::generate(content.node_type_str(), text, page, index).to_string(),
             content,
             parent: None,
             children: vec![],
@@ -874,7 +961,7 @@ mod tests {
             heading_text: Some("Section 1".to_string()),
         };
         let group = DocumentNode {
-            id: NodeId::generate("group", "Section 1", Some(1), 0),
+            id: NodeId::generate("group", "Section 1", Some(1), 0).to_string(),
             content: group_content,
             parent: None,
             children: vec![],
@@ -901,7 +988,7 @@ mod tests {
     fn test_validation_catches_bad_parent() {
         let mut doc = DocumentStructure::new();
         let mut node = make_paragraph("Bad parent", Some(1), 0);
-        node.parent = Some(NodeIndex(99)); // Out of bounds
+        node.parent = Some(NodeIndex(99));
         doc.push_node(node);
 
         assert!(doc.validate().is_err());
@@ -911,16 +998,15 @@ mod tests {
     fn test_validation_catches_inconsistent_parent_child() {
         let mut doc = DocumentStructure::new();
 
-        // Parent node with no children listed
         let parent = DocumentNode {
-            id: NodeId::generate("group", "", Some(1), 0),
+            id: NodeId::generate("group", "", Some(1), 0).to_string(),
             content: NodeContent::Group {
                 label: None,
                 heading_level: None,
                 heading_text: None,
             },
             parent: None,
-            children: vec![], // No children listed
+            children: vec![],
             content_layer: ContentLayer::Body,
             page: Some(1),
             page_end: None,
@@ -930,7 +1016,6 @@ mod tests {
         };
         doc.push_node(parent);
 
-        // Child claims parent, but parent doesn't list it
         let mut child = make_paragraph("Orphan child", Some(1), 1);
         child.parent = Some(NodeIndex(0));
         doc.push_node(child);
@@ -943,14 +1028,14 @@ mod tests {
         let mut doc = DocumentStructure::new();
 
         let parent = DocumentNode {
-            id: NodeId::generate("group", "", Some(1), 0),
+            id: NodeId::generate("group", "", Some(1), 0).to_string(),
             content: NodeContent::Group {
                 label: None,
                 heading_level: None,
                 heading_text: None,
             },
             parent: None,
-            children: vec![NodeIndex(99)], // Out of bounds child
+            children: vec![NodeIndex(99)],
             content_layer: ContentLayer::Body,
             page: Some(1),
             page_end: None,
@@ -967,15 +1052,12 @@ mod tests {
     fn test_body_and_furniture_roots() {
         let mut doc = DocumentStructure::new();
 
-        // Body node
         doc.push_node(make_paragraph("Body content", Some(1), 0));
 
-        // Header node
         let mut header = make_paragraph("Page header", Some(1), 1);
         header.content_layer = ContentLayer::Header;
         doc.push_node(header);
 
-        // Footer node
         let mut footer = make_paragraph("Page footer", Some(1), 2);
         footer.content_layer = ContentLayer::Footer;
         doc.push_node(footer);
@@ -1004,11 +1086,9 @@ mod tests {
         let id5 = NodeId::generate("heading", "Hello world", Some(1), 0);
         assert_ne!(id1, id5);
 
-        // Same content, different index → different ID (ensures uniqueness)
         let id6 = NodeId::generate("paragraph", "Hello world", Some(1), 1);
         assert_ne!(id1, id6);
 
-        // None vs Some(0) should produce different IDs (sentinel value)
         let id_none = NodeId::generate("paragraph", "Hello world", None, 0);
         let id_some_0 = NodeId::generate("paragraph", "Hello world", Some(0), 0);
         assert_ne!(id_none, id_some_0);
@@ -1050,7 +1130,6 @@ mod tests {
             None
         );
 
-        // New variants
         assert_eq!(
             NodeContent::Slide {
                 number: 1,
@@ -1145,7 +1224,6 @@ mod tests {
 
     #[test]
     fn test_new_annotation_serde_roundtrip() {
-        // Highlight
         let ann = TextAnnotation {
             start: 0,
             end: 5,
@@ -1155,7 +1233,6 @@ mod tests {
         let de: TextAnnotation = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(de.kind, AnnotationKind::Highlight);
 
-        // Color
         let ann = TextAnnotation {
             start: 0,
             end: 5,
@@ -1170,7 +1247,6 @@ mod tests {
             _ => panic!("Expected Color"),
         }
 
-        // FontSize
         let ann = TextAnnotation {
             start: 0,
             end: 5,
@@ -1185,7 +1261,6 @@ mod tests {
             _ => panic!("Expected FontSize"),
         }
 
-        // Custom
         let ann = TextAnnotation {
             start: 0,
             end: 5,
@@ -1207,7 +1282,6 @@ mod tests {
 
     #[test]
     fn test_new_node_content_serde_roundtrip() {
-        // Slide
         let content = NodeContent::Slide {
             number: 3,
             title: Some("My Slide".to_string()),
@@ -1217,7 +1291,6 @@ mod tests {
         assert_eq!(json.get("number").unwrap(), 3);
         assert_eq!(json.get("title").unwrap(), "My Slide");
 
-        // Citation
         let content = NodeContent::Citation {
             key: "doe2024".to_string(),
             text: "Doe (2024)".to_string(),
@@ -1226,7 +1299,6 @@ mod tests {
         assert_eq!(json.get("node_type").unwrap(), "citation");
         assert_eq!(json.get("key").unwrap(), "doe2024");
 
-        // MetadataBlock
         let content = NodeContent::MetadataBlock {
             entries: vec![
                 ("From".to_string(), "alice@example.com".to_string()),
@@ -1249,7 +1321,7 @@ mod tests {
             heading_text: Some("Introduction".to_string()),
         };
         let group = DocumentNode {
-            id: NodeId::generate("group", "Introduction", Some(1), 0),
+            id: NodeId::generate("group", "Introduction", Some(1), 0).to_string(),
             content: group_content,
             parent: None,
             children: vec![],
@@ -1271,7 +1343,7 @@ mod tests {
             text: "Hello world".to_string(),
         };
         let para = DocumentNode {
-            id: NodeId::generate("paragraph", "Hello world", Some(1), 1),
+            id: NodeId::generate("paragraph", "Hello world", Some(1), 1).to_string(),
             content: para_content,
             parent: None,
             children: vec![],
@@ -1395,7 +1467,6 @@ mod tests {
         let node = make_paragraph("Simple", Some(1), 0);
         let json = serde_json::to_value(&node).expect("serialize");
 
-        // These should be skipped when empty/None
         assert!(json.get("parent").is_none());
         assert!(json.get("children").is_none());
         assert!(json.get("page_end").is_none());
@@ -1403,12 +1474,75 @@ mod tests {
         assert!(json.get("annotations").is_none());
         assert!(json.get("attributes").is_none());
 
-        // id is intentionally excluded from the wire format (#[serde(skip)]):
-        // it is a computed internal handle, never transmitted over FFI/network.
-        assert!(json.get("id").is_none());
+        assert!(json.get("id").is_some());
+        assert_eq!(json.get("id").unwrap(), &serde_json::Value::String(node.id.to_string()));
 
-        // These should be present
         assert!(json.get("content").is_some());
         assert!(json.get("page").is_some());
+    }
+
+    #[test]
+    fn test_node_rendered_offset_is_unimplemented_stub() {
+        let mut doc = DocumentStructure::new();
+        doc.push_node(make_paragraph("Hello", Some(1), 0));
+        assert_eq!(
+            doc.node_rendered_offset(NodeIndex(0)),
+            None,
+            "node_rendered_offset is a documented stub (#1294/#1295) and must always return None"
+        );
+    }
+
+    #[test]
+    fn test_node_id_serializes_as_plain_string() {
+        let id = NodeId::generate("paragraph", "Hello", Some(1), 0);
+        let json = serde_json::to_value(&id).expect("serialize");
+        assert!(
+            json.is_string(),
+            "NodeId must serialize as a bare string, got: {json:?}"
+        );
+    }
+
+    #[test]
+    fn test_node_id_stable_across_generations() {
+        let id_a = NodeId::generate("paragraph", "Hello world", Some(3), 5);
+        let id_b = NodeId::generate("paragraph", "Hello world", Some(3), 5);
+        assert_eq!(id_a, id_b);
+        assert_eq!(id_a.to_string(), id_b.to_string());
+    }
+
+    #[test]
+    fn test_node_id_unique_for_duplicate_content_at_different_positions() {
+        let id_0 = NodeId::generate("paragraph", "Repeated", Some(1), 0);
+        let id_1 = NodeId::generate("paragraph", "Repeated", Some(1), 1);
+        assert_ne!(
+            id_0, id_1,
+            "duplicate content at different indices must have distinct ids"
+        );
+    }
+
+    #[test]
+    fn test_node_id_present_in_full_document_json() {
+        let mut doc = DocumentStructure::new();
+        doc.push_node(make_paragraph("First", Some(1), 0));
+        doc.push_node(make_paragraph("Repeated", Some(1), 1));
+        doc.push_node(make_paragraph("Repeated", Some(1), 2));
+
+        let json = serde_json::to_value(&doc).expect("serialize");
+        let ids: Vec<String> = json["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .map(|n| n["id"].as_str().expect("id present as string").to_string())
+            .collect();
+
+        assert_eq!(ids.len(), 3);
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            3,
+            "all node ids in one document must be unique, got: {ids:?}"
+        );
     }
 }

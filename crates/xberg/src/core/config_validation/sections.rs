@@ -7,14 +7,13 @@
 use crate::{Result, XbergError};
 
 /// Valid binarization methods for image preprocessing.
-#[cfg(test)]
 const VALID_BINARIZATION_METHODS: &[&str] = &["otsu", "adaptive", "sauvola"];
 
 /// Valid token reduction levels.
 const VALID_TOKEN_REDUCTION_LEVELS: &[&str] = &["off", "light", "moderate", "aggressive", "maximum"];
 
 /// Valid OCR backends.
-const VALID_OCR_BACKENDS: &[&str] = &["tesseract", "paddleocr", "paddle-ocr", "vlm"];
+const VALID_OCR_BACKENDS: &[&str] = &["tesseract", "paddleocr", "paddle-ocr", "sceptre", "vlm"];
 
 /// Common ISO 639-1 language codes (extended list).
 /// Covers most major languages and variants used in document processing.
@@ -61,6 +60,7 @@ const VALID_LANGUAGE_CODES: &[&str] = &[
     "rus",
     "zho",
     "jpn",
+    "jpn_vert",
     "kor",
     "ces",
     "dan",
@@ -75,26 +75,134 @@ const VALID_LANGUAGE_CODES: &[&str] = &[
     "slv",
     "swe",
     "tur",
-    // PaddleOCR-specific language codes (non-ISO but widely used)
     "ch",
     "chinese_cht",
     "latin",
     "cyrillic",
+    "english",
+    "japanese",
+    "korean",
+    "telugu",
+    "kannada",
+    "chinese-simplified",
+    "simplified-chinese",
     "devanagari",
     "arabic",
+    // ISO codes and established aliases accepted by the Sceptre backend that are
+    // not already covered above. Keep this feature-independent for config parsing. ~keep
+    "af",
+    "afr",
+    "az",
+    "aze",
+    "bel",
+    "be",
+    "bul",
+    "bs",
+    "bos",
+    "ca",
+    "cat",
+    "cy",
+    "cym",
+    "cze",
+    "wel",
+    "ger",
+    "fre",
+    "ga",
+    "fil",
+    "gle",
+    "hr",
+    "hrv",
+    "id",
+    "ind",
+    "is",
+    "isl",
+    "ice",
+    "kk",
+    "kaz",
+    "ky",
+    "kir",
+    "mk",
+    "mkd",
+    "mac",
+    "mn",
+    "mon",
+    "mi",
+    "mri",
+    "mao",
+    "ms",
+    "msa",
+    "may",
+    "mt",
+    "mlt",
+    "dut",
+    "no",
+    "nor",
+    "rum",
+    "slo",
+    "sq",
+    "sqi",
+    "alb",
+    "sr",
+    "srp",
+    "sw",
+    "swa",
+    "tl",
+    "tg",
+    "tgk",
+    "ukr",
+    "uz",
+    "uzb",
+    "vie",
+    "ku",
+    "kur",
+    "la",
+    "lat",
+    "oc",
+    "oci",
+    "pi",
+    "pli",
+    "te",
+    "tel",
+    "kn",
+    "kan",
+    "abq",
+    "ady",
+    "kbd",
+    "ava",
+    "dar",
+    "inh",
+    "che",
+    "lbe",
+    "lez",
+    "tab",
+    "tjk",
+    "ch_sim",
+    "ch-sim",
+    "rs_latin",
+    "rs-latin",
+    "rs_cyrillic",
+    "rs-cyrillic",
+    "jpn-vert",
+    "sr-latn",
+    "srp-latn",
+    "sr-cyrl",
+    "srp-cyrl",
+    "zh-cn",
+    "zh-hans",
+    "chi",
+    "chs",
 ];
 
 /// Valid tesseract PSM (Page Segmentation Mode) values.
-#[cfg(test)]
 const VALID_TESSERACT_PSM: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 /// Valid tesseract OEM (OCR Engine Mode) values.
-#[cfg(test)]
 const VALID_TESSERACT_OEM: &[i32] = &[0, 1, 2, 3];
 
 /// Valid output formats for document extraction.
-/// Supports plain text, markdown, djot, HTML, and structured (JSON) output formats.
-/// Also accepts aliases: "text" for "plain", "md" for "markdown", "json" for "structured".
+/// Supports plain text, markdown, djot, HTML, JSON, and structured output formats.
+/// "json" and "structured" are distinct formats, not aliases of each other.
+/// Also accepts aliases: "text" for "plain", "md" for "markdown", "structured-ocr" for "structured".
 #[cfg(test)]
 const VALID_OUTPUT_FORMATS: &[&str] = &["plain", "text", "markdown", "md", "djot", "html", "structured", "json"];
 
@@ -110,14 +218,15 @@ const VALID_OUTPUT_FORMATS: &[&str] = &["plain", "text", "markdown", "md", "djot
 ///
 /// # Examples
 ///
-/// ```rust
+/// Not run as a doctest: `pub(crate)`, so it is unreachable from a downstream crate.
+///
+/// ```ignore
 /// use xberg::core::config_validation::validate_binarization_method;
 ///
 /// assert!(validate_binarization_method("otsu").is_ok());
 /// assert!(validate_binarization_method("adaptive").is_ok());
 /// assert!(validate_binarization_method("invalid").is_err());
 /// ```
-#[cfg(test)]
 pub(crate) fn validate_binarization_method(method: &str) -> Result<()> {
     let method = method.to_lowercase();
     if VALID_BINARIZATION_METHODS.contains(&method.as_str()) {
@@ -231,13 +340,13 @@ pub(crate) fn validate_ocr_backend(backend: &str) -> Result<()> {
 #[cfg_attr(alef, alef(skip))]
 pub(crate) fn validate_language_code(code: &str) -> Result<()> {
     let code_lower = code.to_lowercase();
+    let code_normalized = code_lower.replace('_', "-");
 
-    // Accept "all" and "*" as special values to auto-detect installed languages
     if code_lower == "all" || code_lower == "*" {
         return Ok(());
     }
 
-    if VALID_LANGUAGE_CODES.contains(&code_lower.as_str()) {
+    if VALID_LANGUAGE_CODES.contains(&code_lower.as_str()) || VALID_LANGUAGE_CODES.contains(&code_normalized.as_str()) {
         return Ok(());
     }
 
@@ -264,14 +373,15 @@ pub(crate) fn validate_language_code(code: &str) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// Not run as a doctest: `pub(crate)`, so it is unreachable from a downstream crate.
+///
+/// ```ignore
 /// use xberg::core::config_validation::validate_tesseract_psm;
 ///
 /// assert!(validate_tesseract_psm(3).is_ok());  // Fully automatic
 /// assert!(validate_tesseract_psm(6).is_ok());  // Single block of text
 /// assert!(validate_tesseract_psm(14).is_err()); // Out of range
 /// ```
-#[cfg(test)]
 pub(crate) fn validate_tesseract_psm(psm: i32) -> Result<()> {
     if VALID_TESSERACT_PSM.contains(&psm) {
         Ok(())
@@ -299,14 +409,15 @@ pub(crate) fn validate_tesseract_psm(psm: i32) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// Not run as a doctest: `pub(crate)`, so it is unreachable from a downstream crate.
+///
+/// ```ignore
 /// use xberg::core::config_validation::validate_tesseract_oem;
 ///
 /// assert!(validate_tesseract_oem(1).is_ok());  // Neural nets (LSTM)
 /// assert!(validate_tesseract_oem(2).is_ok());  // Legacy + LSTM
 /// assert!(validate_tesseract_oem(4).is_err()); // Out of range
 /// ```
-#[cfg(test)]
 pub(crate) fn validate_tesseract_oem(oem: i32) -> Result<()> {
     if VALID_TESSERACT_OEM.contains(&oem) {
         Ok(())
@@ -340,7 +451,9 @@ pub(crate) fn validate_tesseract_oem(oem: i32) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// Not run as a doctest: `pub(crate)`, so it is unreachable from a downstream crate.
+///
+/// ```ignore
 /// use xberg::core::config_validation::validate_output_format;
 ///
 /// assert!(validate_output_format("text").is_ok());
@@ -382,7 +495,7 @@ pub(crate) fn validate_output_format(format: &str) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// use xberg::core::config_validation::validate_confidence;
 ///
 /// assert!(validate_confidence(0.5).is_ok());
@@ -391,7 +504,6 @@ pub(crate) fn validate_output_format(format: &str) -> Result<()> {
 /// assert!(validate_confidence(1.5).is_err());
 /// assert!(validate_confidence(-0.1).is_err());
 /// ```
-#[cfg(test)]
 pub(crate) fn validate_confidence(confidence: f64) -> Result<()> {
     if (0.0..=1.0).contains(&confidence) {
         Ok(())
@@ -420,7 +532,7 @@ pub(crate) fn validate_confidence(confidence: f64) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// use xberg::core::config_validation::validate_dpi;
 ///
 /// assert!(validate_dpi(96).is_ok());
@@ -428,7 +540,6 @@ pub(crate) fn validate_confidence(confidence: f64) -> Result<()> {
 /// assert!(validate_dpi(0).is_err());
 /// assert!(validate_dpi(-1).is_err());
 /// ```
-#[cfg(test)]
 pub(crate) fn validate_dpi(dpi: i32) -> Result<()> {
     if dpi > 0 && dpi <= 2400 {
         Ok(())
@@ -446,6 +557,12 @@ pub(crate) fn validate_dpi(dpi: i32) -> Result<()> {
 /// Validate chunk size parameters.
 ///
 /// Checks that max_chars > 0 and max_overlap < max_chars.
+///
+/// Note: `ChunkingConfig::breadcrumb_target` (`BreadcrumbTarget`) needs no runtime
+/// validation function alongside this one — it is a genuine Rust enum
+/// (`content`/`metadata`/`both`), so an invalid value already fails config
+/// deserialization with a clear serde "unknown variant" error before `validate()`
+/// ever runs (#337).
 ///
 /// # Arguments
 ///
@@ -499,13 +616,12 @@ pub(crate) fn validate_chunking_params(max_chars: usize, max_overlap: usize) -> 
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// use xberg::core::config_validation::validate_llm_config_model;
 ///
 /// assert!(validate_llm_config_model("openai/gpt-4o").is_ok());
 /// assert!(validate_llm_config_model("").is_err());
 /// ```
-#[cfg(test)]
 pub(crate) fn validate_llm_config_model(model: &str) -> Result<()> {
     if model.trim().is_empty() {
         return Err(XbergError::Validation {
@@ -515,6 +631,44 @@ pub(crate) fn validate_llm_config_model(model: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Validate a CSV delimiter string.
+///
+/// The delimiter must be exactly one ASCII byte (e.g. `","`, `";"`, `"\t"`,
+/// `"|"`). An empty string or a value containing a multi-byte UTF-8
+/// character (e.g. `"é"` or a multi-character string) is rejected.
+///
+/// # Arguments
+///
+/// * `delimiter` - The delimiter string to validate
+///
+/// # Returns
+///
+/// `Ok(())` if the delimiter is a single ASCII byte, or a `ValidationError` otherwise.
+///
+/// # Examples
+///
+/// ```ignore
+/// use xberg::core::config_validation::validate_csv_delimiter;
+///
+/// assert!(validate_csv_delimiter(";").is_ok());
+/// assert!(validate_csv_delimiter("").is_err());
+/// assert!(validate_csv_delimiter(",,").is_err());
+/// assert!(validate_csv_delimiter("é").is_err());
+/// ```
+pub(crate) fn validate_csv_delimiter(delimiter: &str) -> Result<()> {
+    if delimiter.len() == 1 && delimiter.is_ascii() {
+        Ok(())
+    } else {
+        Err(XbergError::Validation {
+            message: format!(
+                "Invalid CSV delimiter '{}'. Must be exactly one ASCII character (e.g. ',', ';', '\\t', '|').",
+                delimiter
+            ),
+            source: None,
+        })
+    }
 }
 
 /// Validate that a VLM OCR backend has the required `vlm_config`.
@@ -534,7 +688,7 @@ pub(crate) fn validate_llm_config_model(model: &str) -> Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// use xberg::core::config_validation::validate_vlm_backend_config;
 /// use xberg::core::config::LlmConfig;
 ///
@@ -551,7 +705,6 @@ pub(crate) fn validate_llm_config_model(model: &str) -> Result<()> {
 /// assert!(validate_vlm_backend_config("vlm", Some(&config)).is_ok());
 /// assert!(validate_vlm_backend_config("vlm", None).is_err());
 /// ```
-#[cfg(test)]
 pub(crate) fn validate_vlm_backend_config(
     backend: &str,
     vlm_config: Option<&crate::core::config::LlmConfig>,

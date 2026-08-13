@@ -182,6 +182,14 @@ pub struct BenchmarkConfig {
     /// Maximum number of concurrent extractions
     pub max_concurrent: usize,
 
+    /// Xberg's configured extraction thread budget.
+    ///
+    /// When unset, single-file extraction keeps Xberg's automatic budget and
+    /// native batch extraction uses [`Self::max_concurrent`]. This setting
+    /// does not affect other frameworks.
+    #[serde(default)]
+    pub xberg_max_threads: Option<usize>,
+
     /// Output directory for results
     pub output_dir: PathBuf,
 
@@ -211,6 +219,7 @@ impl Default for BenchmarkConfig {
             file_types: None,
             timeout: Duration::from_secs(1800),
             max_concurrent: num_cpus::get(),
+            xberg_max_threads: None,
             output_dir: PathBuf::from("results"),
             measure_quality: false,
             benchmark_mode: BenchmarkMode::Batch,
@@ -247,6 +256,7 @@ impl BenchmarkConfig {
             file_types: None,
             timeout,
             max_concurrent,
+            xberg_max_threads: None,
             output_dir,
             measure_quality: false,
             benchmark_mode,
@@ -271,6 +281,10 @@ impl BenchmarkConfig {
 
         if self.max_concurrent == 0 {
             return Err(crate::Error::Config("max_concurrent must be > 0".to_string()));
+        }
+
+        if self.xberg_max_threads == Some(0) {
+            return Err(crate::Error::Config("xberg_max_threads must be > 0".to_string()));
         }
 
         if self.benchmark_iterations == 0 {
@@ -302,8 +316,6 @@ pub fn load_framework_sizes(config_path: &Path) -> Result<HashMap<String, DiskSi
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- BenchmarkConfig::validate tests --
 
     #[test]
     fn test_valid_batch_config() {
@@ -358,6 +370,34 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_xberg_max_threads_rejected() {
+        let config = BenchmarkConfig {
+            xberg_max_threads: Some(0),
+            ..Default::default()
+        };
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("xberg_max_threads must be > 0"));
+    }
+
+    #[test]
+    fn test_xberg_max_threads_defaults_to_legacy_behavior() {
+        let config = BenchmarkConfig::default();
+        assert_eq!(config.xberg_max_threads, None);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_legacy_config_deserializes_without_xberg_max_threads() {
+        let mut legacy = serde_json::to_value(BenchmarkConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("xberg_max_threads");
+
+        let config: BenchmarkConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(config.xberg_max_threads, None);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_zero_iterations_rejected() {
         let config = BenchmarkConfig::new(
             PathBuf::from("/tmp/results"),
@@ -375,7 +415,7 @@ mod tests {
     fn test_single_file_mode_requires_max_concurrent_one() {
         let config = BenchmarkConfig::new(
             PathBuf::from("/tmp/results"),
-            4, // not 1
+            4,
             3,
             Duration::from_secs(180),
             BenchmarkMode::SingleFile,
@@ -388,12 +428,8 @@ mod tests {
     #[test]
     fn test_default_config_validates() {
         let config = BenchmarkConfig::default();
-        // Default is Batch mode with max_concurrent = num_cpus which is >= 1.
-        // This should pass unless running on a system with 0 CPUs.
         assert!(config.validate().is_ok());
     }
-
-    // -- ProfilingConfig::validate tests --
 
     #[test]
     fn test_valid_profiling_config() {
@@ -435,33 +471,27 @@ mod tests {
 
     #[test]
     fn test_profiling_boundary_frequencies() {
-        // Minimum valid frequency
         assert!(ProfilingConfig::new(100, 1, 1).is_ok());
-        // Maximum valid frequency
         assert!(ProfilingConfig::new(10000, 1, 1).is_ok());
-        // Just below minimum
         assert!(ProfilingConfig::new(99, 1, 1).is_err());
-        // Just above maximum
         assert!(ProfilingConfig::new(10001, 1, 1).is_err());
     }
 
     #[test]
     fn test_optimal_frequency_zero_duration() {
         let freq = ProfilingConfig::calculate_optimal_frequency(0);
-        assert_eq!(freq, 500); // REALISTIC_MAX_HZ
+        assert_eq!(freq, 500);
     }
 
     #[test]
     fn test_optimal_frequency_short_task() {
         let freq = ProfilingConfig::calculate_optimal_frequency(100);
-        // 500 * 1000 / 100 = 5000, clamped to 500
         assert_eq!(freq, 500);
     }
 
     #[test]
     fn test_optimal_frequency_long_task() {
         let freq = ProfilingConfig::calculate_optimal_frequency(10_000);
-        // 500 * 1000 / 10000 = 50, clamped to 100
         assert_eq!(freq, 100);
     }
 

@@ -105,9 +105,14 @@ pub struct TesseractConfig {
 
     /// Enable automatic page rotation based on orientation detection.
     ///
-    /// When enabled, uses Tesseract's `DetectOrientationScript()` to detect
-    /// page orientation (0/90/180/270 degrees) before OCR. If the page is
-    /// rotated with high confidence, the image is corrected before recognition.
+    /// When enabled (and the `auto-rotate` build feature is compiled in), page
+    /// orientation (0/90/180/270 degrees) is detected with an ONNX PP-LCNet
+    /// document-orientation classifier — NOT Tesseract's own
+    /// `DetectOrientationScript()`/OSD, which this crate does not call. The
+    /// classifier reports only a rotation angle and confidence; it has no
+    /// script-detection capability, so no script name is produced. If the page
+    /// is rotated with high confidence, the image is corrected before
+    /// recognition.
     pub auto_rotate: bool,
 
     /// Highest-priority override for the tessdata directory.
@@ -121,8 +126,6 @@ impl Default for TesseractConfig {
     fn default() -> Self {
         Self {
             language: "eng".to_string(),
-            // PSM_AUTO (3) triggers full layout analysis which hangs 60-90s on sparse/no-text
-            // images in WASM (issue #855). PSM_SINGLE_BLOCK (6) skips layout analysis entirely.
             #[cfg(target_arch = "wasm32")]
             psm: 6,
             #[cfg(not(target_arch = "wasm32"))]
@@ -296,7 +299,6 @@ mod tests {
         assert_eq!(config.table_row_threshold_ratio, 0.5);
         assert!(config.use_cache);
 
-        // PSM default is target-specific: WASM avoids layout-analysis hang (issue #855)
         #[cfg(target_arch = "wasm32")]
         assert_eq!(config.psm, 6, "WASM default must be PSM_SINGLE_BLOCK (6)");
         #[cfg(not(target_arch = "wasm32"))]
@@ -417,7 +419,7 @@ mod tests {
     #[test]
     fn test_tesseract_config_from_public_api() {
         let public_config = crate::types::TesseractConfig {
-            language: vec!["deu".to_string()], // public API uses Vec<String>
+            language: vec!["deu".to_string()],
             psm: 6,
             output_format: "text".to_string(),
             oem: 1,

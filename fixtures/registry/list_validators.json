@@ -2,6 +2,12 @@
 	"id": "list_validators",
 	"category": "registry",
 	"description": "List validators",
+	"docs": {
+		"topic": "registry",
+		"title": "List validators",
+		"description": "List validators",
+		"side_effects": "safe"
+	},
 	"tags": ["registry"],
 	"call": "list_validators",
 	"input": {},

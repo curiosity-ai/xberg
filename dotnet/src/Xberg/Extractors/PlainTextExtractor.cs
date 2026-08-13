@@ -23,7 +23,9 @@ public sealed class PlainTextExtractor : IExtractor
 
         uint lineCount = (uint)CountLines(text);
         uint wordCount = (uint)text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
-        uint characterCount = (uint)Encoding.UTF8.GetByteCount(text);
+        // Rust counts `text.chars()` — Unicode scalar values, not UTF-8 bytes and not UTF-16
+        // code units, so a non-BMP character counts once.
+        uint characterCount = (uint)text.EnumerateRunes().Count();
 
         var doc = BuildInternalDocument(text);
         doc.Metadata = new Metadata

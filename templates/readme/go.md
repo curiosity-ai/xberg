@@ -49,6 +49,10 @@ go get {{ package_name }}@latest
 go get {{ package_name }}@v{{ version }}
 ```
 
+> ⚠️ Do not run `go get github.com/xberg-io/xberg` — the repository root is not a Go module.
+> Always target the `/packages/go` subdirectory as shown above; the bare-root path resolves
+> against a stale Go module-proxy cache entry and fails.
+
 You'll need to provide the static library at build time. See [Building with Static Libraries](#building-with-static-libraries) below.
 
 ### Building with Static Libraries
@@ -279,7 +283,7 @@ Need help? Join the [Discord](https://discord.gg/xt9WY3GnKR) or open an issue wi
 
 - [crawlberg](https://github.com/xberg-io/crawlberg) — web crawling and scraping with HTML→Markdown and headless-Chrome fallback.
 - [html-to-markdown](https://github.com/xberg-io/html-to-markdown) — fast, lossless HTML→Markdown engine.
-- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 143 providers.
+- [liter-llm](https://github.com/xberg-io/liter-llm) — universal LLM API client with native bindings for 14 languages and 165 providers.
 - [tree-sitter-language-pack](https://github.com/xberg-io/tree-sitter-language-pack) — tree-sitter grammars and code-intelligence primitives.
 - [alef](https://github.com/xberg-io/alef) — the polyglot binding generator that produces this README and all per-language bindings.
 - [Discord](https://discord.gg/xt9WY3GnKR) — community, roadmap, announcements.

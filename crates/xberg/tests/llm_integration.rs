@@ -16,6 +16,7 @@
 //! `ExtractionConfig`), matching how downstream callers (xberg-enterprise,
 //! xberg-py) invoke the engine.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "liter-llm")]
 
 mod helpers;
@@ -68,10 +69,6 @@ fn memo_schema() -> serde_json::Value {
     })
 }
 
-// ----------------------------------------------------------------------------
-// VLM OCR — via public extract_uri_document with `OcrConfig { backend: "vlm", ... }`.
-// ----------------------------------------------------------------------------
-
 async fn run_vlm_ocr(model: &str, api_key: String) {
     let config = ExtractionConfig {
         ocr: Some(OcrConfig {
@@ -113,11 +110,6 @@ async fn test_vlm_ocr_gemini() {
     let api_key = require_env!("GEMINI_API_KEY");
     run_vlm_ocr("gemini/gemini-2.5-flash", api_key).await;
 }
-
-// ----------------------------------------------------------------------------
-// Structured extraction — via public extract with
-// `ExtractionConfig { structured_extraction: Some(..), .. }`.
-// ----------------------------------------------------------------------------
 
 async fn run_structured(model: &str, api_key: String, strict: bool) {
     let config = ExtractionConfig {
@@ -233,10 +225,6 @@ async fn test_structured_extraction_custom_prompt() {
     assert!(output.get("language").is_some(), "missing language");
 }
 
-// ----------------------------------------------------------------------------
-// VlmFallbackPolicy — Stage 1A.
-// ----------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_vlm_fallback_always_routes_to_vlm() {
     init();
@@ -250,7 +238,6 @@ async fn test_vlm_fallback_always_routes_to_vlm() {
             ..Default::default()
         }),
         force_ocr: true,
-        // Multi-page scanned PDFs sent to VLM require more than the default 60 s.
         extraction_timeout_secs: Some(300),
         ..Default::default()
     };
@@ -274,9 +261,6 @@ async fn test_vlm_fallback_always_routes_to_vlm() {
 #[tokio::test]
 async fn test_vlm_fallback_on_low_quality() {
     init();
-    // A very-permissive threshold (close to 1.0) forces the classical pass to
-    // be judged "low quality" almost always, exercising the fallback path on
-    // a scanned PDF that tesseract handles imperfectly.
     let api_key = require_env!("OPENAI_API_KEY");
     let config = ExtractionConfig {
         ocr: Some(OcrConfig {
@@ -289,7 +273,6 @@ async fn test_vlm_fallback_on_low_quality() {
             ..Default::default()
         }),
         force_ocr: true,
-        // Multi-page scanned PDFs sent to VLM require more than the default 60 s.
         extraction_timeout_secs: Some(300),
         ..Default::default()
     };
@@ -300,10 +283,6 @@ async fn test_vlm_fallback_on_low_quality() {
         !result.content.trim().is_empty(),
         "OnLowQuality fallback produced empty content"
     );
-    // The fallback may or may not fire depending on tesseract's score; only
-    // assert that *some* LLM call ran when content materialised. If the
-    // classical pass cleared the threshold, no LLM ran — that's also valid
-    // behaviour for this configuration, so this check is best-effort.
     if let Some(usage) = result.llm_usage {
         assert!(
             usage.iter().any(|u| u.source == "vlm_ocr"),
@@ -316,8 +295,6 @@ async fn test_vlm_fallback_on_low_quality() {
 #[tokio::test]
 async fn test_vlm_fallback_disabled_does_not_call_llm() {
     init();
-    // Skip if Tesseract is not available in the current feature set (e.g. liter-llm
-    // only, without the full `ocr` feature which pulls in the Tesseract backend).
     {
         use xberg::plugins::registry::get_ocr_backend_registry;
         let registry = get_ocr_backend_registry();
@@ -327,7 +304,6 @@ async fn test_vlm_fallback_disabled_does_not_call_llm() {
             return;
         }
     }
-    // No API key required — Disabled must not contact any provider.
     let config = ExtractionConfig {
         ocr: Some(OcrConfig {
             backend: "tesseract".to_string(),
@@ -337,8 +313,6 @@ async fn test_vlm_fallback_disabled_does_not_call_llm() {
             ..Default::default()
         }),
         force_ocr: true,
-        // Tesseract OCR on the scanned-PDF fixture takes ~2 min on the slow Linux arm64 CI
-        // runner; the 60 s default introduced alongside vlm_fallback would always trip.
         extraction_timeout_secs: Some(300),
         ..Default::default()
     };

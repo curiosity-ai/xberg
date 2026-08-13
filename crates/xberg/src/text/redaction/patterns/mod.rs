@@ -63,7 +63,6 @@ pub fn scan_text(text: &str, categories: &[PiiCategory]) -> Vec<PatternMatch> {
             PiiCategory::IpAddress => all.extend(ip_address::find_all(text)),
             PiiCategory::Iban => all.extend(iban::find_all(text)),
             PiiCategory::SwiftBic => all.extend(swift_bic::find_all(text)),
-            // Pattern engine cannot identify free-form text categories.
             PiiCategory::Person
             | PiiCategory::Organization
             | PiiCategory::Location

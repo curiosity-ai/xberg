@@ -2,6 +2,12 @@
 	"id": "unregister_embedding_backend_after_register",
 	"category": "plugin_api",
 	"description": "unregister_embedding_backend",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "unregister_embedding_backend",
+		"description": "unregister_embedding_backend",
+		"side_effects": "safe"
+	},
 	"call": "unregister_embedding_backend",
 	"input": {
 		"name": "test-embedding-backend"

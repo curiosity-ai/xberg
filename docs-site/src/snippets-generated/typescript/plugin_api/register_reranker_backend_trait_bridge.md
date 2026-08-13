@@ -1,0 +1,27 @@
+---
+id: fixture_node_register_reranker_backend_trait_bridge
+language: typescript
+target: node
+level: typecheck
+requires: []
+side_effect: safe
+---
+
+register_reranker_backend: trait bridge
+
+```typescript title="TypeScript"
+import { registerRerankerBackend } from "@xberg-io/xberg";
+function main() {
+  class _TestStub_register_reranker_backend_trait_bridge {
+  name(): string { return "test-reranker-backend"; }
+  async rerank(_p0?: any, _p1?: any): Promise<string> { return []; }
+  async dispose(): Promise<void> { return undefined; }
+}
+
+  const _bridge_backend = new _TestStub_register_reranker_backend_trait_bridge();
+  const result = registerRerankerBackend(_bridge_backend);
+}
+
+void main();
+
+```

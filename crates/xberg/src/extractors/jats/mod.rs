@@ -28,14 +28,19 @@ use crate::types::internal_builder::InternalDocumentBuilder;
 use crate::types::metadata::{ContributorRole, FormatMetadata, JatsMetadata};
 use crate::types::uri::ExtractedUri;
 use async_trait::async_trait;
-use quick_xml::Reader;
 use quick_xml::events::Event;
 #[cfg(feature = "tokio-runtime")]
 use std::path::Path;
 
+use crate::utils::xml_utils::EntityReader;
+
 use elements::extract_jats_all_in_one;
 use parser::extract_citation_text as jats_extract_citation;
+use parser::extract_fig_content as jats_extract_fig;
 use parser::extract_text_content as jats_extract_text;
+
+/// `ProcessingWarning::source` for every warning this extractor emits (#171).
+const JATS_WARNING_SOURCE: &str = "jats";
 
 /// Extract text and inline annotations from a JATS `<p>` element.
 ///
@@ -47,7 +52,7 @@ use parser::extract_text_content as jats_extract_text;
 /// - `<sup>` → superscript
 /// - `<ext-link>` → link (with xlink:href)
 fn extract_para_with_annotations_jats(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut EntityReader<'_>,
     budget: &mut SecurityBudget,
 ) -> crate::Result<(String, Vec<crate::types::document_structure::TextAnnotation>)> {
     use crate::types::builder;
@@ -56,7 +61,6 @@ fn extract_para_with_annotations_jats(
     let mut annotations = Vec::new();
     let mut depth: u32 = 0;
 
-    // Stack of (kind, depth_at_open, start_byte_offset, optional_href).
     let mut inline_stack: Vec<(&'static str, u32, u32, Option<String>)> = Vec::new();
 
     loop {
@@ -106,12 +110,10 @@ fn extract_para_with_annotations_jats(
                     break;
                 }
 
-                // Check if this closes an inline element on our stack
                 if let Some(&(kind, open_depth, start, ref href)) = inline_stack.last()
                     && open_depth == depth
                 {
                     let end = text.len() as u32;
-                    // Skip any leading whitespace separator that was prepended
                     let actual_start = if (start as usize) < text.len() {
                         let span = &text[start as usize..end as usize];
                         let trimmed = span.trim_start();
@@ -131,7 +133,11 @@ fn extract_para_with_annotations_jats(
                                 let url = href_clone.as_deref().unwrap_or("");
                                 builder::link(actual_start, end, url, None)
                             }
-                            _ => unreachable!(),
+                            // `inline_stack` is only ever pushed to with "italic", "bold",
+                            // "underline", "subscript" (from "sub"), "superscript" (from
+                            // "sup"), or "link" (from "ext-link") — every one of those six
+                            // kinds is handled above, so no other value can appear.
+                            _ => unreachable!("inline_stack only ever holds the six kinds handled above"),
                         };
                         annotations.push(annotation);
                     }
@@ -175,7 +181,7 @@ fn extract_para_with_annotations_jats(
 
 /// Build an `InternalDocument` from JATS XML content.
 fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> crate::Result<InternalDocument> {
-    let mut reader = Reader::from_str(content);
+    let mut reader = EntityReader::from_str(content);
     let mut builder = InternalDocumentBuilder::new("jats");
 
     let mut in_article_meta = false;
@@ -189,11 +195,9 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
     let mut in_row = false;
     let mut current_table: Vec<Vec<String>> = Vec::new();
     let mut current_row: Vec<String> = Vec::new();
-    // Track section nesting depth for heading levels.
-    // Top-level <sec> in body -> level 2, nested <sec> -> level 3, etc.
     let mut sec_depth: u32 = 0;
-    // Track whether the ordered list container for references has been opened.
     let mut ref_list_opened = false;
+    let mut back_list_opened = false;
 
     loop {
         budget.step()?;
@@ -214,18 +218,14 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                         }
                         continue;
                     }
-                    // --- Abstract handling ---
                     "abstract" if in_article_meta => {
                         in_abstract = true;
                         builder.push_heading(2, "Abstract", None, None);
                     }
-                    "sec" if in_abstract => {
-                        // Nested sections inside abstract
-                    }
+                    "sec" if in_abstract => {}
                     "title" if in_abstract => {
                         let text = jats_extract_text(&mut reader, budget)?;
                         if !text.is_empty() {
-                            // Abstract sub-sections are rendered at level 3
                             builder.push_heading(3, &text, None, None);
                         }
                         continue;
@@ -237,7 +237,6 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                         }
                         continue;
                     }
-                    // --- Body handling ---
                     "body" => {
                         in_body = true;
                         sec_depth = 0;
@@ -248,7 +247,6 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                     "title" if in_body && !in_article_meta && !in_ref_list => {
                         let text = jats_extract_text(&mut reader, budget)?;
                         if !text.is_empty() {
-                            // Heading level: top-level sections = 2, nested = 3, etc.
                             let level = (sec_depth + 1).min(6) as u8;
                             builder.push_heading(level, &text, None, None);
                         }
@@ -257,7 +255,6 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                     "p" if in_body => {
                         let (text, annotations) = extract_para_with_annotations_jats(&mut reader, budget)?;
                         if !text.is_empty() {
-                            // Extract URIs from link annotations
                             for ann in &annotations {
                                 if let crate::types::document_structure::AnnotationKind::Link { url, .. } = &ann.kind
                                     && !url.is_empty()
@@ -271,8 +268,32 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                         continue;
                     }
                     "fig" if in_body => {
-                        // Skip figures in internal representation (no image data available)
-                        let _ = jats_extract_text(&mut reader, budget)?;
+                        let (label, caption, href) = jats_extract_fig(&mut reader, budget)?;
+                        let caption_full = match (&label, &caption) {
+                            (Some(l), Some(c)) => format!("{}: {}", l, c),
+                            (Some(l), None) => l.clone(),
+                            (None, Some(c)) => c.clone(),
+                            (None, None) => String::new(),
+                        };
+                        if !caption_full.is_empty() || href.is_some() {
+                            let display = match (&href, caption_full.is_empty()) {
+                                (Some(h), false) => format!("![{}]({})", caption_full, h),
+                                (Some(h), true) => format!("![]({})", h),
+                                (None, false) => caption_full.clone(),
+                                (None, true) => String::new(),
+                            };
+                            if !display.is_empty() {
+                                builder.push_paragraph(&display, Vec::new(), None, None);
+                            }
+                            if let Some(href) = &href {
+                                let label_opt = if caption_full.is_empty() {
+                                    None
+                                } else {
+                                    Some(caption_full.clone())
+                                };
+                                builder.push_uri(ExtractedUri::image(href, label_opt));
+                            }
+                        }
                         continue;
                     }
                     "disp-formula" | "inline-formula" if in_body => {
@@ -282,15 +303,11 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                         }
                         continue;
                     }
-                    // --- Back matter handling ---
                     "back" => {
                         in_back = true;
                     }
-                    "ack" if in_back => {
-                        // Acknowledgments section -- treat like a body section
-                    }
+                    "ack" if in_back => {}
                     "supplementary-material" if in_back => {
-                        // Skip supplementary material content
                         let _ = jats_extract_text(&mut reader, budget)?;
                         continue;
                     }
@@ -308,7 +325,24 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                         }
                         continue;
                     }
-                    // --- Table handling ---
+                    "term" if in_back && !in_ref_list => {
+                        let text = jats_extract_text(&mut reader, budget)?;
+                        if !text.is_empty() {
+                            builder.push_definition_term(&text, None);
+                        }
+                        continue;
+                    }
+                    "list-item" if in_back && !in_ref_list => {
+                        let (text, annotations) = extract_para_with_annotations_jats(&mut reader, budget)?;
+                        if !text.is_empty() {
+                            if !back_list_opened {
+                                builder.push_list(false);
+                                back_list_opened = true;
+                            }
+                            builder.push_list_item(&text, false, annotations, None, None);
+                        }
+                        continue;
+                    }
                     "table" => {
                         in_table = true;
                         current_table.clear();
@@ -329,7 +363,6 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                         current_row.push(text);
                         continue;
                     }
-                    // --- Reference list handling ---
                     "ref-list" => {
                         in_ref_list = true;
                     }
@@ -374,6 +407,10 @@ fn build_jats_internal_document(content: &str, budget: &mut SecurityBudget) -> c
                     }
                     "back" => {
                         in_back = false;
+                    }
+                    "list" if back_list_opened => {
+                        builder.end_list();
+                        back_list_opened = false;
                     }
                     "ref-list" => {
                         if ref_list_opened {
@@ -472,9 +509,12 @@ impl InternalDocumentExtractor for JatsExtractor {
         config: &ExtractionConfig,
     ) -> Result<InternalDocument> {
         tracing::debug!(format = "jats", size_bytes = content.len(), "extraction starting");
-        let jats_content = utf8_validation::from_utf8(content)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(content).to_string());
+        // Track the fallback: a non-UTF-8 article is decoded lossily and every byte the
+        // decoder could not read is already U+FFFD before parsing starts (#171).
+        let (jats_content, decoded_lossily) = match utf8_validation::from_utf8(content) {
+            Ok(valid) => (valid.to_string(), false),
+            Err(_) => (String::from_utf8_lossy(content).to_string(), true),
+        };
 
         let (jats_metadata, _extracted_content, _title, _tables) = extract_jats_all_in_one(&jats_content)?;
 
@@ -546,7 +586,6 @@ impl InternalDocumentExtractor for JatsExtractor {
             subject_parts.push(format!("Corresponding Author: {}", corresp_author));
         }
 
-        // History dates
         let mut history_dates = std::collections::BTreeMap::new();
         if !jats_metadata.history_dates.is_empty() {
             for (date_type, date_val) in &jats_metadata.history_dates {
@@ -559,7 +598,6 @@ impl InternalDocumentExtractor for JatsExtractor {
             }
         }
 
-        // Permissions
         let copyright = if let Some(copyright) = &jats_metadata.copyright_statement {
             subject_parts.push(format!("Copyright: {}", copyright));
             Some(copyright.clone())
@@ -569,7 +607,6 @@ impl InternalDocumentExtractor for JatsExtractor {
 
         let license = jats_metadata.license.clone();
 
-        // Contributor roles
         let contributor_roles: Vec<ContributorRole> = jats_metadata
             .contributor_roles
             .iter()
@@ -596,7 +633,14 @@ impl InternalDocumentExtractor for JatsExtractor {
         doc.mime_type = mime_type.to_string();
         doc.metadata = metadata;
 
-        // Add DOI as a citation URI
+        if decoded_lossily {
+            crate::core::diagnostics::push_lossy_decode_warning(
+                &mut doc.processing_warnings,
+                JATS_WARNING_SOURCE,
+                "JATS source",
+            );
+        }
+
         if let Some(doi) = &jats_metadata.doi {
             doc.push_uri(ExtractedUri::citation(
                 format!("https://doi.org/{}", doi),
@@ -623,7 +667,7 @@ impl InternalDocumentExtractor for JatsExtractor {
         )
     )]
     async fn extract_path(&self, path: &Path, mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
-        let bytes = tokio::fs::read(path).await?;
+        let bytes = crate::core::io::read_file_async(path).await?;
         self.extract_content(&bytes, mime_type, config).await
     }
 

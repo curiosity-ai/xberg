@@ -14,6 +14,9 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/ci-rust.yaml"
       - "scripts/ci/rust/**"
+      # The gitlink selects which corpus fixtures the include_bytes! tests compile against, so a
+      # pin bump changes what this workflow actually verifies. ~keep
+      - "test_documents"
   pull_request:
     branches: [main]
     paths:
@@ -27,6 +30,9 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/ci-rust.yaml"
       - "scripts/ci/rust/**"
+      # The gitlink selects which corpus fixtures the include_bytes! tests compile against, so a
+      # pin bump changes what this workflow actually verifies. ~keep
+      - "test_documents"
   workflow_dispatch:
 
 concurrency:
@@ -57,12 +63,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # x86_64 Linux is the primary distribution target (manylinux wheels, the
+          # linux-x64-gnu node binding, the CLI tarball, every Docker image) and it had
+          # no leg here at all -- the workspace unit suite ran only on Linux aarch64 and
+          # macOS. That also meant the `full` feature set was never unit-tested anywhere
+          # on x86_64 Linux: scripts/ci/rust/run-unit-tests.sh substitutes
+          # `full-no-heic,heic` on Linux aarch64 (candle's gemm-f16 needs fullfp16), so
+          # the candle backends' tests only ever ran on Apple Silicon. ~keep
+          - os: ubuntu-latest
           - os: ubuntu-24.04-arm
           - os: macos-latest
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+
+      # Broad workspace test surface (task rust:test:ci runs `cargo test --workspace
+      # --all-features`-equivalent across every crate) -- no single glob prefix is safe
+      # to drop, so fetch the full corpus. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
 
       - name: Free disk space
         if: runner.os == 'Linux'
@@ -94,10 +114,20 @@ jobs:
         uses: xberg-io/actions/install-task@v1
 
       - name: Run clippy
-        # Full workspace, all targets. sccache (wired by setup-rust above via
-        # use-sccache) wraps rustc for this step, so generated binding crates
-        # compile from cache on warm runs.
         run: cargo clippy --workspace --all-targets -- -D warnings
+        shell: bash
+
+      - name: Clippy full ORT surface (layout + OCR + ML)
+        run: cargo clippy --locked -p xberg --features full --all-targets -- -D warnings
+        shell: bash
+
+      - name: Clippy no-ORT tract engine
+        run: cargo clippy --locked -p xberg --no-default-features --features "ocr,auto-rotate-tract" --all-targets -- -D warnings
+        shell: bash
+
+      # actually exercises the `#[allow(dead_code)]` markers on hf_client /
+      - name: Clippy no-ORT tract layout
+        run: cargo clippy --locked -p xberg --no-default-features --features "layout-tract" --all-targets -- -D warnings
         shell: bash
 
       - name: Run tests
@@ -108,14 +138,270 @@ jobs:
           DYLD_LIBRARY_PATH: ${{ env.DYLD_LIBRARY_PATH || '' }}
           DYLD_FALLBACK_LIBRARY_PATH: ${{ env.DYLD_FALLBACK_LIBRARY_PATH || '' }}
 
+      # `task rust:test:ci` passes `--all-targets`, which runs --lib/--bins/--tests/
+      # --examples/--benches but deliberately EXCLUDES `--doc`. That left every rustdoc
+      # example in `-p xberg` with zero CI coverage, so they rotted into ~25 compile
+      # failures before anyone noticed (#313). This is the leg that catches that.
+      #
+      # Feature set matches the unit-test leg on purpose: (a) rustdoc forwards the crate's
+      # `--cfg feature="..."` flags to doctests, so a narrower set would silently *strip*
+      # the `# #[cfg(feature = "...")]`-guarded doctest bodies instead of checking them,
+      # and (b) reusing the same set means this step reuses that leg's warm build
+      # artifacts rather than rebuilding the dependency graph.
+      # The Linux-aarch64 substitution mirrors scripts/ci/rust/run-unit-tests.sh, which is
+      # the source of truth for why `full` is unbuildable there (candle -> gemm-f16 aarch64
+      # asm needs fullfp16). Keep the two in sync. ~keep
+      - name: Run doctests
+        run: |
+          features=full
+          if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
+            features=full-no-heic,heic
+          fi
+          echo "xberg doctest features: ${features}"
+          cargo test --locked -p xberg --features "${features}" --doc
+
+          # The sibling library crates, for the same reason. `-p xberg` alone left the
+          # other first-party crates with no doctest coverage at all, and xberg-tesseract
+          # had accumulated a failing example nobody could see: its module-level usage
+          # sample was a bare ```rust fence, so it *executed*, called into Tesseract and
+          # died with InitError on any machine without eng.traineddata installed.
+          # Most carry no examples yet; gating them now is what stops the next one from
+          # rotting the same way. xberg-cli is a binary with no lib target, and
+          # crates/ttf-parser-compat is a vendored ttf-parser fork whose doctests are
+          # upstream's, so neither belongs here. ~keep
+          cargo test --locked -p xberg-tesseract --doc
+          cargo test --locked -p xberg-gliner --doc
+          cargo test --locked -p xberg-candle-ocr --doc
+          cargo test --locked -p xberg-libheif --doc
+          cargo test --locked -p xberg-libwpd --doc
+          # Refuses to build without an inference backend selected.
+          cargo test --locked -p xberg-paddle-ocr --features ort --doc
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH || '' }}
+          DYLD_LIBRARY_PATH: ${{ env.DYLD_LIBRARY_PATH || '' }}
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ env.DYLD_FALLBACK_LIBRARY_PATH || '' }}
+
       - name: Check no-default-features
         run: cargo check --locked -p xberg --no-default-features
         shell: bash
 
-      # The WASM Tesseract backend is gated to `ocr-wasm` without `ocr`, a combo no other
-      # job builds; check it here so it can't bit-rot until release-time WASM publish.
       - name: Check ocr-wasm backend
         run: cargo check --locked -p xberg --no-default-features --features ocr-wasm --lib
+        shell: bash
+
+      # Regression coverage for #320: `layout-detection` compiles standalone (no `ocr`/
+      # `ocr-pipeline`), so the PDF OCR-coordinate-transform helpers it calls must not
+      # depend on the `ocr` module or on items gated behind `ocr`/`ocr-pipeline` alone.
+      - name: Check layout-detection without OCR
+        run: cargo check --locked -p xberg --no-default-features --features "tokio-runtime,pdf,layout-detection" --lib
+        shell: bash
+
+      # Cheap standalone check of the exact feature closure the `all` Docker images build
+      # (default features + `all`, not `--no-default-features`). Catches a feature-closure
+      # compile break in minutes instead of via the ~20-minute Docker build (#325).
+      - name: Check xberg-cli --features all
+        run: cargo check --locked -p xberg-cli --features all
+        shell: bash
+
+      - name: Check xberg-cli feature profiles
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy --locked -p xberg-cli -- -D warnings
+
+          for features in \
+            all \
+            pdf-heuristic \
+            pdf-ocr \
+            core-cli \
+            paddle-ocr \
+            candle-ocr \
+            liter-llm; do
+            echo "::group::xberg-cli features: ${features}"
+            cargo clippy --locked -p xberg-cli --no-default-features --features "${features}" -- -D warnings
+            echo "::endgroup::"
+          done
+
+          for features in pdf-heuristic pdf-ocr core-cli; do
+            echo "::group::xberg-cli profile tests: ${features}"
+            cargo test --locked -p xberg-cli --no-default-features --features "${features}" feature_profile_tests
+            echo "::endgroup::"
+          done
+        shell: bash
+
+  # GH#1389 regression guard: `cargo add xberg --features full` then `cargo build` on
+  # x86_64-pc-windows-msvc used to die at LINK with an LNK2038 RuntimeLibrary mismatch,
+  # 'MT_StaticRelease' (libesaxx_rs) against 'MD_DynamicRelease' (libxberg_tesseract
+  # capi.obj). That wording is reconstructed from the mechanism, not copied from a CI
+  # log -- do not grep past runs for it verbatim. This job is what will produce the real
+  # line if it ever regresses; it had never executed as of 2026-08-07, so treat it as
+  # unexercised rather than passing until a Windows run reports on it.
+  # The cause: model2vec-rs's tokenizers instance used to pull `tokenizers/esaxx_fast` (=
+  # `esaxx-rs/cpp`, whose build.rs forces `.static_crt(true)` i.e. /MT) while the Tesseract
+  # capi object links dynamically (/MD). The fix (crates/xberg/Cargo.toml, 2026-08-06) takes
+  # neither of model2vec-rs's regex features and instead hands its shared tokenizers 0.21
+  # instance `fancy-regex` via the `tokenizers-model2vec` alias dep, so esaxx_fast is never
+  # activated. That fix was previously verified only via `cargo tree` feature inspection and
+  # an isolated macOS compile probe -- nothing exercised the actual MSVC LINK step, so a
+  # future dependency bump silently re-enabling `esaxx_fast` would go undetected.
+  #
+  # `--features "ocr,static-embeddings"` (not `--no-default-features --features full`) is
+  # the minimal combination that genuinely reproduces both halves of the mismatch:
+  #   - `ocr` pulls `dep:xberg-tesseract`, whose native capi object is the /MD side.
+  #   - `static-embeddings` pulls `dep:model2vec-rs` + `dep:tokenizers-model2vec`, the path
+  #     that used to pull the /MT `esaxx-rs/cpp` object.
+  # Neither feature needs ONNX Runtime (static-embeddings's whole point is a pure-Rust,
+  # ORT-free embedder), so this leg skips the ORT setup step entirely and stays cheap
+  # relative to a `full` build.
+  #
+  # `cargo test --no-run` (not `cargo check`, which never invokes link.exe, and not plain
+  # `cargo build`, which only produces an rlib) builds the crate's test harness binary --
+  # a real MSVC link of every native object, including the two above -- without spending
+  # time actually running the (fixture-heavy) test suite. ~keep
+  windows-static-embeddings-link:
+    name: Rust (windows-latest, static-embeddings link)
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # `--lib` (not `--all-targets`) keeps the fixture surface to extraction::image's
+      # ocr-gated `#[cfg(test)]` modules, whose include_bytes! fixtures must exist at
+      # compile time even though the tests never run -- so `images/**` is sufficient.
+      # `static-embeddings`'s test fixtures are synthetic in-memory safetensors bytes. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+        with:
+          include: |
+            images/**
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          cache-key-prefix: rust-windows-static-embeddings
+          use-sccache: "true"
+
+      # Provisions Tesseract (for `ocr`'s xberg-tesseract capi object) on Windows. No ORT
+      # setup is needed here -- neither `ocr` nor `static-embeddings` links ONNX Runtime.
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Build xberg test harness (ocr + static-embeddings, real MSVC link)
+        run: cargo test --locked -p xberg --no-default-features --features "ocr,static-embeddings" --lib --no-run
+        shell: bash
+
+  # `cfg(target_os = "windows")` dependency blocks (ureq/tokenizers/liter-llm).
+  # Also the only job that builds/tests xberg-libwpd on Windows.
+  clippy-windows:
+    name: Rust (windows-latest)
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # `windows-target` enables `email`+`ocr` but excludes `heic`: --all-targets compiles
+      # the email.rs/image.rs test modules gated on those features, whose include_bytes!
+      # fixtures (email/*.msg, vendored/unstructured/msg/*.msg, images/*.jp2) must exist at
+      # compile time or the build fails outright. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+        with:
+          include: |
+            email/**
+            vendored/**
+            images/**
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          cache-key-prefix: rust-windows
+          use-sccache: "true"
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+          dest-dir: crates/xberg-ffi
+
+      - name: Clippy Windows ORT surface
+        run: cargo clippy --locked -p xberg --no-default-features --features windows-target --all-targets -- -D warnings
+        shell: bash
+
+      - name: Clippy + test xberg-libwpd (Windows)
+        run: |
+          cargo clippy --locked -p xberg-libwpd --all-targets -- -D warnings
+          cargo test --locked -p xberg-libwpd
+        shell: bash
+
+  # `--no-default-features --features "ocr,auto-rotate-tract,..."` cargo commands elsewhere in
+  # this file are clippy-only (`--all-targets` compiles test targets but never runs them), so
+  # tests gated on the tract-only cfg combination (e.g. `sceptre_ocr::tests::
+  # tract_only_build_should_select_tract_by_default`, gated `not(feature = "sceptre-ocr-ort")`)
+  # have never actually executed in CI. This job runs them for real, under a feature set that
+  # is asserted ORT-free below. Scoped to the modules the tract features touch (sceptre_ocr,
+  # doc_orientation, layout, paddle_ocr) instead of the whole `--lib` suite -- the ORT-enabled
+  # `rust` job above already runs that suite, so re-running it wholesale here would just double
+  # CI time for no new coverage. ~keep
+  rust-tract-no-ort:
+    name: Rust tract-only (no-ORT)
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      TRACT_FEATURES: "ocr,auto-rotate-tract,layout-tract,sceptre-ocr-tract,paddle-ocr-tract"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # `--lib` with TRACT_FEATURES ("ocr,...") compiles extraction::image's
+      # `#[cfg(test)]`/`#[cfg(all(test, feature = "ocr"))]` modules unconditionally --
+      # their include_bytes! jp2 fixtures must exist at compile time. `email`/`office`
+      # are not in TRACT_FEATURES, so no other corpus dirs are pulled in. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+        with:
+          include: |
+            images/**
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          cache-key-prefix: rust-tract-no-ort
+          use-sccache: "true"
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup Tesseract cache
+        uses: ./.github/actions/setup-tesseract-cache
+        with:
+          label: tract-no-ort
+
+      - name: Assert no ORT in the tract-only dependency graph
+        run: |
+          if cargo tree --locked -p xberg --no-default-features --features "${TRACT_FEATURES}" -e normal,build,dev \
+            | grep -qE '(^|[[:space:]])ort v[0-9]'; then
+            echo "::error::'ort' is present in the dependency graph for features [${TRACT_FEATURES}] -- this leg must stay ORT-free"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Run no-ORT tract tests
+        run: |
+          cargo test --locked -p xberg --no-default-features --features "${TRACT_FEATURES}" --lib \
+            -- sceptre_ocr:: doc_orientation:: layout:: paddle_ocr::
         shell: bash
 
   live-hf:
@@ -151,18 +437,80 @@ jobs:
       - name: Cache HuggingFace fastembed models
         uses: ./.github/actions/cache-hf-fastembed
         with:
-          cache-key-suffix: reranker
+          cache-key-suffix: retrieval-presets
 
-      - name: Run live HF reranker tests
+      - name: Run live HF retrieval preset tests
         run: |
-          cargo test --locked \
-            -p xberg \
-            --features "reranker,reranker-presets,tokio-runtime" \
-            --test reranker_live \
-            -- --nocapture
+          # Live tests download real ONNX models from HuggingFace. HF can be slow or briefly
+          # unreachable, tripping the model-download watchdog. Give the watchdog generous headroom
+          # (well within the 45-min job budget) and retry the whole run so a transient HF hiccup
+          # self-heals -- models already fetched persist in the runner's HF cache across attempts,
+          # so a retry only re-downloads whatever failed and re-runs the (fast) test logic.
+          # Same 3-attempt / exponential-backoff shape as the setup-*-models download actions.
+          for attempt in 1 2 3; do
+            if [ $attempt -gt 1 ]; then
+              backoff=$((15 * 3 ** (attempt - 2)))
+              echo "::warning::live HF preset tests failed; retry attempt $attempt/3 after ${backoff}s backoff..."
+              sleep $backoff
+            fi
+
+            if cargo test --locked \
+              -p xberg \
+              --features "reranker,reranker-presets,embeddings,sparse-embeddings,late-interaction,tokio-runtime" \
+              --test reranker_live \
+              --test embedding_preset_live \
+              --test sparse_embedding_preset_live \
+              --test late_interaction_preset_live \
+              -- --nocapture; then
+              exit 0
+            fi
+          done
+
+          echo "::error::live HF preset tests failed after 3 attempts"
+          exit 1
         shell: bash
         env:
           LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH || '' }}
           DYLD_LIBRARY_PATH: ${{ env.DYLD_LIBRARY_PATH || '' }}
           DYLD_FALLBACK_LIBRARY_PATH: ${{ env.DYLD_FALLBACK_LIBRARY_PATH || '' }}
           RUST_LOG: warn
+          # Cold downloads of large ONNX models on a slow HF day exceed the 300s production default;
+          # raise the watchdog for CI only (still bounded well under the 45-min job timeout). ~keep
+          XBERG_MODEL_DOWNLOAD_TIMEOUT_SECS: "900"
+
+      - name: Run tract/ORT parity tests
+        run: |
+          # The tract backend's whole point is bit-close parity with ONNX Runtime. These tests
+          # download the PP-LCNet classifiers and the RT-DETR layout detector and run them
+          # through BOTH engines, asserting each output matches within a tight tolerance.
+          # XBERG_REQUIRE_TRACT_PARITY=1 turns a missing model into a hard
+          # failure so the suite can never pass by comparing nothing (locally, absent the env
+          # var and weights, it self-skips). The `tract` feature is only compiled here — the
+          # main unit-test job builds `full`, which does not include it — so this is the sole
+          # CI enforcement of the branch's core correctness claim. Same 3-attempt retry as above.
+          for attempt in 1 2 3; do
+            if [ $attempt -gt 1 ]; then
+              backoff=$((15 * 3 ** (attempt - 2)))
+              echo "::warning::tract parity tests failed; retry attempt $attempt/3 after ${backoff}s backoff..."
+              sleep $backoff
+            fi
+
+            if cargo test --locked \
+              -p xberg \
+              --features "layout-detection,auto-rotate,tract" \
+              --lib inference::tract_backend \
+              -- --nocapture; then
+              exit 0
+            fi
+          done
+
+          echo "::error::tract parity tests failed after 3 attempts"
+          exit 1
+        shell: bash
+        env:
+          XBERG_REQUIRE_TRACT_PARITY: "1"
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH || '' }}
+          DYLD_LIBRARY_PATH: ${{ env.DYLD_LIBRARY_PATH || '' }}
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ env.DYLD_FALLBACK_LIBRARY_PATH || '' }}
+          RUST_LOG: warn
+          XBERG_MODEL_DOWNLOAD_TIMEOUT_SECS: "900"

@@ -30,11 +30,31 @@ pub struct OcrBackendRegistry {
     pub(super) backends: AHashMap<String, Arc<dyn OcrBackend>>,
 }
 
+#[cfg(all(test, sceptre_ocr, not(target_arch = "wasm32")))]
+mod sceptre_tests {
+    use std::sync::Arc;
+
+    use super::OcrBackendRegistry;
+
+    #[test]
+    fn registry_registers_sceptre_without_loading_models() {
+        let registry = OcrBackendRegistry::new();
+        let backend = registry.get("sceptre").expect("Sceptre backend should be registered");
+        let uppercase = registry
+            .get("SCEPTRE")
+            .expect("validated built-in backend names should be case-insensitive");
+
+        assert_eq!(backend.backend_type(), crate::plugins::OcrBackendType::Custom);
+        assert!(Arc::ptr_eq(&backend, &uppercase));
+    }
+}
+
 impl OcrBackendRegistry {
     /// Create a new OCR backend registry with default backends.
     ///
     /// Registers the Tesseract backend by default if the "ocr" feature is enabled,
-    /// and PaddleOCR if the "paddle-ocr" feature is enabled.
+    /// PaddleOCR if the "paddle-ocr" feature is enabled, and Sceptre if the
+    /// "sceptre-ocr" feature is enabled.
     ///
     /// If a backend fails to initialize or register it is skipped with a warning,
     /// allowing the process to continue with whichever backends are available.
@@ -50,10 +70,10 @@ impl OcrBackendRegistry {
     /// Register the built-in OCR backends into this registry.
     ///
     /// Registers whichever backends the active feature set enables — Tesseract
-    /// (`ocr`/`ocr-wasm`), PaddleOCR (`paddle-ocr`), and the VLM backend
-    /// (`liter-llm`). Each backend is registered independently: if one fails to
-    /// initialize it is skipped with a warning so the remaining backends still
-    /// register.
+    /// (`ocr`/`ocr-wasm`), PaddleOCR (`paddle-ocr`), Sceptre (`sceptre-ocr`),
+    /// and the VLM backend (`liter-llm`). Each backend is registered independently:
+    /// if one fails to initialize it is skipped with a warning so the remaining
+    /// backends still register.
     ///
     /// This is invoked by [`OcrBackendRegistry::new`] at construction and reused
     /// by the self-healing initialization path so a registry emptied via
@@ -87,7 +107,7 @@ impl OcrBackendRegistry {
             }
         }
 
-        #[cfg(feature = "paddle-ocr")]
+        #[cfg(paddle_ocr)]
         {
             use crate::paddle_ocr::PaddleOcrBackend;
             tracing::info!("Initializing PaddleOCR backend");
@@ -107,8 +127,20 @@ impl OcrBackendRegistry {
             }
         }
 
-        // TODO(wasm-llm): VLM OCR should be available on wasm once hosted LLM
-        // request handling is wired; the feature remains in wasm presets until then.
+        #[cfg(all(sceptre_ocr, not(target_arch = "wasm32")))]
+        {
+            use crate::sceptre_ocr::SceptreOcrBackend;
+            tracing::info!("Registering Sceptre OCR backend");
+            match SceptreOcrBackend::new() {
+                Ok(backend) => {
+                    self.register(Arc::new(backend)).unwrap_or_else(|error| {
+                        tracing::warn!("Failed to register Sceptre OCR backend: {error}");
+                    });
+                }
+                Err(error) => tracing::warn!("Failed to initialize Sceptre OCR backend: {error}"),
+            }
+        }
+
         #[cfg(all(feature = "liter-llm", not(target_arch = "wasm32")))]
         {
             use crate::llm::vlm_ocr::VlmOcrBackend;
@@ -118,9 +150,6 @@ impl OcrBackendRegistry {
             });
         }
 
-        // Candle-based VLM OCR backends. Per-model sub-features on
-        // `xberg-candle-ocr` (trocr / paddleocr-vl) gate the actual
-        // registrations.
         #[cfg(feature = "candle-trocr")]
         {
             use crate::candle_ocr::TrocrBackend;
@@ -156,17 +185,6 @@ impl OcrBackendRegistry {
                 tracing::warn!("Failed to register GLM-OCR backend: {e}");
             });
             tracing::info!("GLM-OCR backend registered successfully");
-        }
-
-        #[cfg(all(feature = "candle-hunyuan-ocr", not(target_arch = "wasm32")))]
-        {
-            use crate::candle_ocr::HunyuanOcrBackend;
-            tracing::info!("Initializing Hunyuan-OCR backend");
-            let backend = HunyuanOcrBackend::new();
-            self.register(Arc::new(backend)).unwrap_or_else(|e| {
-                tracing::warn!("Failed to register Hunyuan-OCR backend: {e}");
-            });
-            tracing::info!("Hunyuan-OCR backend registered successfully");
         }
 
         #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
@@ -237,10 +255,14 @@ impl OcrBackendRegistry {
     #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
     #[tracing::instrument(skip(self), fields(registered_backends = ?self.backends.keys().collect::<Vec<_>>()))]
     pub(crate) fn get(&self, name: &str) -> Result<Arc<dyn OcrBackend>> {
-        // Normalize common aliases: "paddleocr" → "paddle-ocr"
-        let canonical = match name {
+        if let Some(backend) = self.backends.get(name) {
+            return Ok(Arc::clone(backend));
+        }
+
+        let normalized = name.to_ascii_lowercase();
+        let canonical = match normalized.as_str() {
             "paddleocr" => "paddle-ocr",
-            _ => name,
+            _ => normalized.as_str(),
         };
         self.backends.get(canonical).cloned().ok_or_else(|| {
             tracing::error!(
@@ -309,6 +331,38 @@ impl OcrBackendRegistry {
     /// Drain the registry. Alias for `shutdown_all` used by alef trait-bridge codegen.
     pub fn clear(&mut self) -> Result<()> {
         self.shutdown_all()
+    }
+
+    /// True when the registry lacks a usable built-in default and should be
+    /// re-seeded.
+    ///
+    /// This is the case when the registry is completely empty, or — when a
+    /// Tesseract built-in is compiled in — when the built-in default backend
+    /// (`tesseract`, the fallback dispatch target) is absent. The latter can
+    /// happen after [`clear`](Self::clear) followed by registering a *different*
+    /// backend: the registry is non-empty, yet default-config OCR has no usable
+    /// backend.
+    #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
+    pub(crate) fn is_missing_default_backend(&self) -> bool {
+        #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
+        const DEFAULT: Option<&str> = Some("tesseract");
+        #[cfg(not(any(feature = "ocr", feature = "ocr-wasm")))]
+        const DEFAULT: Option<&str> = None;
+
+        self.backends.is_empty() || DEFAULT.is_some_and(|name| !self.backends.contains_key(name))
+    }
+
+    /// Non-destructively re-seed the built-in default backends when they are
+    /// missing.
+    ///
+    /// Keeps any user-registered backends; a no-op when the built-in default is
+    /// already present. Used by the self-healing dispatch path so a registry
+    /// left without a default (via clear + register-other) heals itself.
+    #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
+    pub(crate) fn ensure_defaults(&mut self) {
+        if self.is_missing_default_backend() {
+            self.register_defaults();
+        }
     }
 }
 
@@ -394,11 +448,39 @@ mod tests {
         assert_eq!(registry.list().len(), 0);
     }
 
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn ensure_defaults_reseeds_when_default_missing_but_registry_nonempty() {
+        let mut registry = OcrBackendRegistry::new_empty();
+        registry
+            .register(Arc::new(MockOcrBackend {
+                name: "custom-ocr".to_string(),
+                languages: vec!["eng".to_string()],
+            }))
+            .unwrap();
+        assert!(
+            !registry.list().iter().any(|n| n == "tesseract"),
+            "precondition: no built-in default present"
+        );
+        assert!(
+            registry.is_missing_default_backend(),
+            "a non-empty registry without the built-in default must report missing"
+        );
+
+        registry.ensure_defaults();
+
+        assert!(
+            registry.list().iter().any(|n| n == "tesseract"),
+            "ensure_defaults should re-seed the built-in default even when the registry is non-empty"
+        );
+        assert!(
+            registry.list().iter().any(|n| n == "custom-ocr"),
+            "ensure_defaults must be non-destructive: the user backend is kept"
+        );
+    }
+
     #[test]
     fn should_re_register_default_backends_after_clear() {
-        // `OcrBackendRegistry::new` seeds the built-in backends. Clearing the
-        // registry and calling `register_defaults` must restore them, so a
-        // registry emptied via `clear()` can be self-healed.
         let mut registry = OcrBackendRegistry::new();
         let seeded = registry.list();
         assert!(
@@ -422,8 +504,6 @@ mod tests {
 
     #[test]
     fn test_registry_construction_does_not_eagerly_allocate_tesseract() {
-        // Directly construct a TesseractBackend to verify deferred allocation.
-        // The processor should not be allocated until first use.
         use crate::ocr::tesseract_backend::TesseractBackend;
 
         let backend = TesseractBackend::new();
@@ -610,11 +690,9 @@ mod tests {
 
         registry.register(backend).unwrap();
 
-        // "paddleocr" (without hyphen) should resolve to "paddle-ocr"
         let retrieved = registry.get("paddleocr").unwrap();
         assert_eq!(retrieved.name(), "paddle-ocr");
 
-        // "paddle-ocr" (canonical) should also work
         let retrieved = registry.get("paddle-ocr").unwrap();
         assert_eq!(retrieved.name(), "paddle-ocr");
     }
@@ -630,11 +708,9 @@ mod tests {
 
         registry.register(backend).unwrap();
 
-        // Canonical name works
         let retrieved = registry.get("paddle-ocr").unwrap();
         assert_eq!(retrieved.name(), "paddle-ocr");
 
-        // Alias without hyphen also works
         let aliased = registry.get("paddleocr").unwrap();
         assert_eq!(aliased.name(), "paddle-ocr");
     }

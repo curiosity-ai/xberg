@@ -58,7 +58,6 @@ fn redacts_phone_number() {
 
 #[test]
 fn redacts_valid_us_ssn() {
-    // Valid SSN: area 123, group 45, serial 6789.
     let result = run("My SSN is 123-45-6789, please file it.", RedactionStrategy::Mask);
     assert!(result.content.contains("[REDACTED]"));
     assert!(!result.content.contains("123-45-6789"));
@@ -68,7 +67,6 @@ fn redacts_valid_us_ssn() {
 
 #[test]
 fn skips_invalid_us_ssn_in_excluded_areas() {
-    // 000 area is reserved → must not redact.
     let result = run("Reference 000-12-3456 is not a real SSN.", RedactionStrategy::Mask);
     assert!(!result.content.contains("[REDACTED]"));
     assert!(result.content.contains("000-12-3456"));
@@ -76,7 +74,6 @@ fn skips_invalid_us_ssn_in_excluded_areas() {
 
 #[test]
 fn redacts_visa_credit_card_with_luhn() {
-    // 4111 1111 1111 1111 is the classic Visa test number and Luhn-valid.
     let result = run("Card number: 4111 1111 1111 1111 on file.", RedactionStrategy::Mask);
     assert!(result.content.contains("[REDACTED]"));
     assert!(!result.content.contains("4111"));
@@ -86,8 +83,6 @@ fn redacts_visa_credit_card_with_luhn() {
 
 #[test]
 fn skips_invalid_luhn_credit_card() {
-    // Restrict to credit-card category so phone/postcode regexes do not fire on the
-    // 16-digit run. 1234-1234-1234-1234 fails Luhn → must not redact.
     let mut result = ExtractedDocument::default();
     result.content = "Card: 1234-1234-1234-1234.".to_string();
     result.mime_type = Cow::Borrowed("text/plain");
@@ -159,7 +154,6 @@ fn token_replace_reuses_token_for_same_value() {
         "alice@example.com is alice@example.com — confirmed.",
         RedactionStrategy::TokenReplace,
     );
-    // Both mentions should map to the same token (EMAIL_1).
     assert_eq!(result.content.matches("[EMAIL_1]").count(), 2);
     let report = result.redaction_report.expect("report");
     assert_eq!(report.total_redacted, 2);
@@ -168,7 +162,6 @@ fn token_replace_reuses_token_for_same_value() {
 #[test]
 fn hash_strategy_yields_deterministic_marker() {
     let result = run("Reach me at alice@example.com.", RedactionStrategy::Hash);
-    // Hash markers all start with [HASH: and end with ].
     assert!(result.content.contains("[HASH:"));
     assert!(!result.content.contains("alice@example.com"));
 }
@@ -179,8 +172,6 @@ fn drop_strategy_deletes_the_match() {
     assert!(!result.content.contains("[REDACTED]"));
     assert!(!result.content.contains("alice@example.com"));
 }
-
-// ---- User-supplied custom terms / patterns ----------------------------------
 
 fn run_with_config(content: &str, redaction: RedactionConfig) -> ExtractedDocument {
     let mut result = ExtractedDocument::default();
@@ -211,7 +202,6 @@ fn redacts_user_supplied_literal_term_case_insensitive() {
         ..RedactionConfig::default()
     };
     let result = run_with_config("Project apollo launches at noon. APOLLO is the codename.", redaction);
-    // Both lowercase + uppercase mentions should be redacted (case-insensitive default).
     assert!(!result.content.contains("apollo"));
     assert!(!result.content.contains("APOLLO"));
     let report = result.redaction_report.expect("report");
@@ -239,7 +229,6 @@ fn case_sensitive_literal_term_only_matches_exact() {
         ..RedactionConfig::default()
     };
     let result = run_with_config("Apollo, apollo, APOLLO.", redaction);
-    // Only the exactly-cased "Apollo" should be redacted.
     let report = result.redaction_report.expect("report");
     assert_eq!(report.total_redacted, 1);
     assert!(result.content.contains("apollo"));
@@ -257,7 +246,6 @@ fn redacts_user_supplied_regex_pattern() {
         ..RedactionConfig::default()
     };
     let result = run_with_config("Issue PROJECT-1234 is open; project-5678 too.", redaction);
-    // Case-insensitive by default; both mentions disappear.
     assert!(!result.content.contains("PROJECT-1234"));
     assert!(!result.content.contains("project-5678"));
     let report = result.redaction_report.expect("report");

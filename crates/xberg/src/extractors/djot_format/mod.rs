@@ -16,9 +16,7 @@
 pub mod attributes;
 pub mod conversion;
 pub mod extractor;
-pub mod parsing;
 pub mod rendering;
 
-// Re-export public API
 pub use conversion::{djot_content_to_djot, extraction_result_to_djot};
 pub use extractor::DjotExtractor;

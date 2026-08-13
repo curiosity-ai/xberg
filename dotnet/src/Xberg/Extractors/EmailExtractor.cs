@@ -98,12 +98,27 @@ public sealed class EmailExtractor : IExtractor
         var builder = new InternalDocumentBuilder("email");
 
         // Email headers → metadata block.
+        // Subject/From/To/CC/BCC/Date plus, when present, Reply-To, Message-ID, In-Reply-To,
+        // References, List-Id and List-Unsubscribe. Headers with no value are omitted rather
+        // than rendered as empty lines. Order matches Rust `build_email_text_output`.
         var headerEntries = new List<(string, string)>();
+        void AddMeta(string label, string key)
+        {
+            if (result.Metadata.TryGetValue(key, out var v)) headerEntries.Add((label, v));
+        }
+
         if (result.Subject is { } subject) headerEntries.Add(("Subject", subject));
         if (result.FromEmail is { } from) headerEntries.Add(("From", from));
         if (result.ToEmails.Count > 0) headerEntries.Add(("To", string.Join(", ", result.ToEmails)));
         if (result.CcEmails.Count > 0) headerEntries.Add(("CC", string.Join(", ", result.CcEmails)));
+        if (result.BccEmails.Count > 0) headerEntries.Add(("BCC", string.Join(", ", result.BccEmails)));
+        AddMeta("Reply-To", "reply_to");
         if (result.Date is { } date) headerEntries.Add(("Date", date));
+        if (result.MessageId is { } messageId) headerEntries.Add(("Message-ID", messageId));
+        AddMeta("In-Reply-To", "in_reply_to");
+        AddMeta("References", "references");
+        AddMeta("List-Id", "list_id");
+        AddMeta("List-Unsubscribe", "list_unsubscribe");
         if (headerEntries.Count > 0) builder.PushMetadataBlock(headerEntries, null);
 
         // Body: walk HTML structure if available, else split plain content into paragraphs.
@@ -118,7 +133,10 @@ public sealed class EmailExtractor : IExtractor
         }
         else
         {
-            foreach (string paragraph in result.Content.Split("\n\n"))
+            // RFC 5322 mandates CRLF line endings and the transfer decoders hand back the body
+            // verbatim, so without normalizing first "\r\n\r\n" never matches the paragraph
+            // boundary and every plain-text email collapses into one paragraph (Rust GH#316).
+            foreach (string paragraph in TextTransform.NormalizeLineEndings(result.Content).Split("\n\n"))
             {
                 string trimmed = paragraph.Trim();
                 if (trimmed.Length > 0)

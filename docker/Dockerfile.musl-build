@@ -1,25 +1,16 @@
 # =============================================================================
-# Alpine-based builder for musl CLI binaries.
-#
-# Usage:
-#   docker build -f docker/Dockerfile.musl-build \
-#     --output type=local,dest=./dist \
-#     --build-arg TARGETARCH=x86_64 .
-#
-# Produces: dist/xberg (binary) and dist/lib/ (runtime libraries)
-#
-# Runtime libraries (musl libc, libstdc++, libgcc) are bundled alongside
-# the binary for portability across Linux distros.
-# =============================================================================
 FROM alpine:3.21 AS builder
 
 ARG RUST_TOOLCHAIN=nightly-2026-03-10
 
 WORKDIR /build
 
-# Install build dependencies — Alpine's g++ and libstdc++ are musl-native,
-# so tesseract C++ compilation works without glibc conflicts.
-# onnxruntime-dev from edge provides musl-native ORT for linking.
+# Alpine's /bin/sh is busybox ash, which supports `-o pipefail`. Without it the
+# `curl ... | sh` rustup bootstrap below reports only sh's status, so a failed or
+# truncated download silently installs nothing, and the `readelf ... | grep`
+# linkage diagnostics report success on an empty pipe. (hadolint DL4006)
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+
 RUN apk add --no-cache \
     curl musl-dev cmake make pkgconf \
     perl linux-headers git file patchelf && \
@@ -29,85 +20,58 @@ RUN apk add --no-cache \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
 
-# Install Rust via rustup (Alpine's packaged Rust may be too old / not nightly)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --component rust-src && \
     echo "Rust host: $(~/.cargo/bin/rustc -vV | grep host)" && \
     echo "Default target: $(~/.cargo/bin/rustc --print cfg | grep target)"
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Disable crt-static so the binary can dlopen shared libraries at runtime.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# Point ort-sys to Alpine's system ORT library instead of downloading prebuilt binaries.
-# ort-sys checks ORT_LIB_LOCATION before attempting download (build/main.rs line 45).
 ENV ORT_LIB_LOCATION=/usr/lib
 ENV ORT_PREFER_DYNAMIC_LINK=1
 
-# Copy workspace manifests and crates
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
+COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-cli/ crates/xberg-cli/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
+COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 
-# Remove workspace members that aren't included
 RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
 
-# Neither --offline nor --locked. The `sed -i Cargo.toml` above removes
-# workspace members without touching Cargo.lock, so --locked would refuse to
-# update the lock to match. --offline was tried previously but requires a
-# pre-populated registry cache — the Docker layers above never run `cargo
-# fetch`, so every package resolves to "no matching package named X found"
-# (observed on rc.13 + rc.14 + rc.15 Publish runs). Drop both flags: cargo
-# will use Cargo.lock as a resolution hint, download missing crates from the
-# network, and rewrite the in-image lock to match the slimmed manifest.
 RUN cargo build --release --package xberg-cli --features all && \
     cp target/release/xberg /build/xberg && \
     strip /build/xberg
 
-# Set RPATH so the binary finds shared libs relative to itself
 RUN patchelf --set-rpath '$ORIGIN/lib' /build/xberg
 
-# Collect runtime libraries.
-#
-# The launcher (below) invokes the musl loader with `--library-path lib/`,
-# which REPLACES the loader's search path. The bundle must therefore be
-# self-contained: every transitive dependency of every shipped .so has to
-# live in /build/lib/ too, otherwise the loader prints "Error loading shared
-# library X: No such file or directory" at startup (issue #991).
-#
-# Strategy:
-#   1. Copy the well-known runtime bits (musl loader, libstdc++, libgcc, ORT).
-#   2. Recursively `ldd`-walk every .so in the bundle and copy any host lib
-#      they resolve to that isn't already present.
-#   3. Smoke-test the loader against each shipped .so so the build FAILS if
-#      anything is still missing — better to break the image than to ship a
-#      tarball that crashes on first invocation.
+# Transitively copy the shared-library closure into /build/lib until it stops
+# growing. The two `|| true` guards in the inner loop are deliberate under this
+# stage's `-o pipefail` SHELL: the loader exits non-zero for a library whose deps
+# have not been copied in yet (this loop is what copies them), and `grep -E '^/'`
+# exits 1 for a library with no absolute-path deps at all. Neither is an error --
+# the closure is complete when the file count stops growing, which the `while`
+# loop below is what actually decides. ~keep
 RUN set -eu; \
-    mkdir -p /build/lib; \
+    mkdir -p /build/lib/libheif; \
     cp /usr/lib/libstdc++.so.6 /build/lib/; \
     cp /usr/lib/libgcc_s.so.1 /build/lib/; \
-    # Bundle ONNX Runtime for embeddings/layout-detection at runtime.
     cp /usr/lib/libonnxruntime.so* /build/lib/ 2>/dev/null || true; \
-    # Copy the musl dynamic linker/libc.
     cp /lib/ld-musl-*.so.1 /build/lib/ 2>/dev/null || true; \
-    # Recursively resolve transitive deps of everything in /build/lib via ldd
-    # (alpine's musl ldd resolves against system paths). Re-walk until no new
-    # libraries are pulled in to handle multi-level chains (libonnxruntime →
-    # libprotobuf-lite → libabsl_* → ...).
+    cp -a /usr/lib/libheif/. /build/lib/libheif/; \
     LOADER="$(ls /build/lib/ld-musl-*.so.1 | head -n1)"; \
     while :; do \
         before=$(ls /build/lib | wc -l); \
-        for so in /build/lib/*.so*; do \
-            # Skip the loader itself; ldd against it is meaningless.
+        for so in /build/xberg /build/lib/*.so* /build/lib/libheif/*.so*; do \
             case "$so" in *ld-musl-*) continue ;; esac; \
-            "$LOADER" --list "$so" 2>/dev/null \
+            { "$LOADER" --list "$so" 2>/dev/null || true; } \
                 | awk '/=>/ { print $3 }' \
-                | grep -E '^/' \
+                | { grep -E '^/' || true; } \
                 | while read -r dep; do \
                     base="$(basename "$dep")"; \
                     if [ ! -e "/build/lib/$base" ]; then \
@@ -118,8 +82,7 @@ RUN set -eu; \
         after=$(ls /build/lib | wc -l); \
         [ "$before" = "$after" ] && break; \
     done; \
-    # Verify nothing in the bundle has unresolved deps when constrained to lib/.
-    for so in /build/lib/*.so*; do \
+    for so in /build/xberg /build/lib/*.so* /build/lib/libheif/*.so*; do \
         case "$so" in *ld-musl-*) continue ;; esac; \
         if "$LOADER" --library-path /build/lib --list "$so" 2>&1 | grep -q 'not found'; then \
             echo "FAIL: $so has unresolved dependencies inside the bundle:" >&2; \
@@ -127,27 +90,23 @@ RUN set -eu; \
             exit 1; \
         fi; \
     done; \
+    ls /build/lib/libheif.so* >/dev/null; \
+    ls /build/lib/libheif/*.so* >/dev/null; \
     echo "OK: every bundled library resolves inside /build/lib/"
 
-# Rename the actual binary and create a wrapper script that invokes it
-# via the bundled musl interpreter. This makes the binary work on ANY
-# Linux distro (glibc or musl) without system dependencies.
 RUN mv /build/xberg /build/xberg.bin && \
     INTERP_NAME=$(basename /lib/ld-musl-*.so.1) && \
-    printf '#!/bin/sh\nSCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\nexec "$SCRIPT_DIR/lib/%s" --library-path "$SCRIPT_DIR/lib" "$SCRIPT_DIR/xberg.bin" "$@"\n' \
+    printf '#!/bin/sh\nSCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\nexport LIBHEIF_PLUGIN_PATH="$SCRIPT_DIR/lib/libheif${LIBHEIF_PLUGIN_PATH:+:$LIBHEIF_PLUGIN_PATH}"\nexec "$SCRIPT_DIR/lib/%s" --library-path "$SCRIPT_DIR/lib" "$SCRIPT_DIR/xberg.bin" "$@"\n' \
         "$INTERP_NAME" > /build/xberg && \
     chmod +x /build/xberg
 
-# Verify the binary was built successfully
-RUN file /build/xberg && \
+RUN file /build/xberg /build/xberg.bin && \
     echo "=== Dynamic dependencies ===" && \
-    readelf -d /build/xberg 2>/dev/null | grep -E "NEEDED|RPATH|RUNPATH" || echo "No dependencies" && \
+    readelf -d /build/xberg.bin 2>/dev/null | grep -E "NEEDED|RPATH|RUNPATH" && \
     echo "=== Bundled libraries ===" && \
-    ls -la /build/lib/
+    find /build/lib -maxdepth 2 -type f -print && \
+    /build/xberg --version
 
-# =============================================================================
-# Output stage — binary + bundled runtime libraries
-# =============================================================================
 FROM scratch
 COPY --from=builder /build/xberg /xberg
 COPY --from=builder /build/xberg.bin /xberg.bin

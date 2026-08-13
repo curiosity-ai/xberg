@@ -310,11 +310,16 @@ public static class MarkdownParser
                 continue;
             }
 
-            // HTML block (dropped by the extractor, like pulldown-cmark block HTML).
+            // Block-level raw HTML. pulldown-cmark emits it as an Html event with no enclosing
+            // block open; the extractor records it as a raw block rather than dropping it.
             if (indent <= 3 && trimmedStart.StartsWith("<"))
             {
                 int newI = TryHtmlBlock(lines, i, hi);
-                if (newI > i) { i = newI; continue; }
+                if (newI > i)
+                {
+                    ev.Add(MdEvent.WithText(MdEventKind.Html, string.Join("\n", lines.GetRange(i, newI - i))));
+                    i = newI; continue;
+                }
             }
 
             // Blockquote
@@ -626,7 +631,7 @@ public static class MarkdownParser
 
     // ---- inline parsing (CommonMark delimiter-stack) --------------------
 
-    private enum NType { Text, Opaque, Delim, Open, Close }
+    private enum NType { Text, Opaque, Delim, Open, Close, SmartQuote }
 
     private sealed class Node
     {
@@ -641,9 +646,76 @@ public static class MarkdownParser
         public MdEventKind Mark;       // Open/Close marker
     }
 
+    /// <summary>
+    /// Render a run of <paramref name="count"/> hyphens as em/en dashes, matching
+    /// pulldown-cmark: 2 is an en dash, 3 an em dash, and longer runs split into the
+    /// em/en mix that divides the run evenly.
+    /// </summary>
+    private static string SmartDashes(int count)
+    {
+        if (count == 2) return "\u2013";
+        if (count == 3) return "\u2014";
+        int ems, ens;
+        switch (count % 6)
+        {
+            case 0:
+            case 3: ems = count / 3; ens = 0; break;
+            case 2:
+            case 4: ems = 0; ens = count / 2; break;
+            case 1: ems = count / 3 - 1; ens = 2; break;
+            default: ems = count / 3; ens = 1; break;
+        }
+        return new string('\u2014', ems) + new string('\u2013', ens);
+    }
+
+    /// <summary>
+    /// Turn each recorded quote delimiter into its curly form. A single quote defaults to the
+    /// closing form, and retroactively opens the last candidate when it can close; a double
+    /// quote closes only when one is open. Mirrors pulldown-cmark's MaybeSmartQuote pass.
+    /// </summary>
+    private static void ResolveSmartQuotes(LinkedList<Node> nodes)
+    {
+        Node? singleQuoteOpen = null;
+        bool doubleQuoteOpen = false;
+
+        for (var n = nodes.First; n is not null; n = n.Next)
+        {
+            var node = n.Value;
+            if (node.T != NType.SmartQuote) continue;
+
+            if (node.C == '\'')
+            {
+                if (singleQuoteOpen is not null && node.CanClose)
+                {
+                    singleQuoteOpen.S = "\u2018";
+                    singleQuoteOpen = null;
+                }
+                else if (node.CanOpen)
+                {
+                    singleQuoteOpen = node;
+                }
+                node.S = "\u2019";
+            }
+            else
+            {
+                if (node.CanClose && doubleQuoteOpen)
+                {
+                    doubleQuoteOpen = false;
+                    node.S = "\u201d";
+                }
+                else
+                {
+                    if (node.CanOpen && !doubleQuoteOpen) doubleQuoteOpen = true;
+                    node.S = "\u201c";
+                }
+            }
+        }
+    }
+
     private static void ParseInlines(string text, List<MdEvent> ev)
     {
         var nodes = Tokenize(text);
+        ResolveSmartQuotes(nodes);
         ProcessEmphasis(nodes);
         foreach (var node in nodes)
         {
@@ -652,6 +724,7 @@ public static class MarkdownParser
                 case NType.Text: if (node.S.Length > 0) ev.Add(MdEvent.WithText(MdEventKind.Text, node.S)); break;
                 case NType.Opaque: ev.AddRange(node.Ev!); break;
                 case NType.Delim: if (node.Count > 0) ev.Add(MdEvent.WithText(MdEventKind.Text, new string(node.C, node.Count))); break;
+                case NType.SmartQuote: ev.Add(MdEvent.WithText(MdEventKind.Text, node.S)); break;
                 case NType.Open:
                 case NType.Close: ev.Add(MdEvent.Simple(node.Mark)); break;
             }
@@ -788,6 +861,45 @@ public static class MarkdownParser
                 int htmlLen = ScanInlineHtml(text, i);
                 if (htmlLen > 0) { Flush(); i += htmlLen; continue; } // inline HTML dropped
                 buf.Append('<'); i++; continue;
+            }
+
+            // Smart punctuation (pulldown-cmark ENABLE_SMART_PUNCTUATION): "..." becomes an
+            // ellipsis and a run of two or more hyphens becomes em/en dashes.
+            if (c == '.' && i + 2 < n && text[i + 1] == '.' && text[i + 2] == '.')
+            {
+                buf.Append('\u2026'); i += 3; continue;
+            }
+            if (c == '-')
+            {
+                int dashes = 0;
+                while (i + dashes < n && text[i + dashes] == '-') dashes++;
+                if (dashes >= 2)
+                {
+                    buf.Append(SmartDashes(dashes));
+                    i += dashes; continue;
+                }
+            }
+            if (c == '\'' || c == '"')
+            {
+                char qBefore = i > 0 ? text[i - 1] : '\n';
+                char qAfter = (i + 1) < n ? text[i + 1] : '\n';
+                bool atStart = i == 0, atEnd = (i + 1) >= n;
+
+                // delim_run_can_open / delim_run_can_close for a single-character quote run.
+                bool canOpen;
+                if (atEnd || IsFlWhite(qAfter)) canOpen = false;
+                else if (atStart) canOpen = true;
+                else canOpen = IsFlWhite(qBefore)
+                    || (IsFlPunct(qBefore) && (c != '\'' || (qBefore != ']' && qBefore != ')')));
+
+                bool canClose;
+                if (atStart || IsFlWhite(qBefore)) canClose = false;
+                else if (atEnd) canClose = true;
+                else canClose = IsFlWhite(qAfter) || IsFlPunct(qAfter);
+
+                Flush();
+                nodes.AddLast(new Node { T = NType.SmartQuote, C = c, CanOpen = canOpen, CanClose = canClose });
+                i++; continue;
             }
 
             // Emphasis / strong / strikethrough delimiter run.
