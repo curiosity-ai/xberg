@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Numerics.Tensors;
 
 namespace Xberg.Internal.Onnx.Ops;
@@ -169,19 +170,32 @@ internal static class Convolution
         int outPerGroup = filters / groups;
         int patch = inPerGroup * kh * kw;
         int spatial = outH * outW;
-        var column = new float[patch * spatial];
 
-        for (int n = 0; n < batch; n++)
+        // The unrolled buffer is the largest allocation in the whole model — a 3x3 layer over
+        // 256 channels at 80x80 needs 59 MB — and every convolution would otherwise allocate
+        // and discard one. Renting keeps it off the heap's hot path entirely.
+        float[] column = ArrayPool<float>.Shared.Rent(patch * spatial);
+        try
         {
-            for (int g = 0; g < groups; g++)
+            for (int n = 0; n < batch; n++)
             {
-                Im2Col(x.Floats, column, n, channels, g * inPerGroup, inPerGroup,
-                    height, width, outH, outW, kh, kw, strideH, strideW, dilationH, dilationW, pad);
+                for (int g = 0; g < groups; g++)
+                {
+                    Im2Col(x.Floats, column, patch * spatial, n, channels, g * inPerGroup, inPerGroup,
+                        height, width, outH, outW, kh, kw, strideH, strideW, dilationH, dilationW, pad);
 
-                var weights = w.Floats.AsMemory(g * outPerGroup * patch, outPerGroup * patch);
-                var output = result.Floats.AsMemory((n * filters + g * outPerGroup) * spatial, outPerGroup * spatial);
-                Linear.MultiplyInto(weights, column, output, outPerGroup, patch, spatial);
+                    var weights = w.Floats.AsMemory(g * outPerGroup * patch, outPerGroup * patch);
+                    var output = result.Floats.AsMemory((n * filters + g * outPerGroup) * spatial, outPerGroup * spatial);
+                    // A rented array may be longer than requested; the product must see exactly
+                    // the logical extent or its row indexing is wrong.
+                    Linear.MultiplyInto(weights, column.AsMemory(0, patch * spatial), output,
+                        outPerGroup, patch, spatial);
+                }
             }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(column);
         }
     }
 
@@ -190,12 +204,14 @@ internal static class Convolution
     /// kernel tap contributes to each output pixel, in output-pixel order.
     /// </summary>
     private static void Im2Col(
-        float[] src, float[] column, int n, int channels, int channelStart, int channelCount,
+        float[] src, float[] column, int columnLength, int n, int channels, int channelStart, int channelCount,
         int height, int width, int outH, int outW, int kh, int kw,
         int strideH, int strideW, int dilationH, int dilationW, Padding pad)
     {
         int spatial = outH * outW;
-        Array.Clear(column);
+        // Only the logical extent: a rented buffer is often larger, and clearing the surplus
+        // would cost more than the convolution on small layers.
+        Array.Clear(column, 0, columnLength);
 
         for (int c = 0; c < channelCount; c++)
         {

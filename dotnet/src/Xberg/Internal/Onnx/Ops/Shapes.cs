@@ -535,18 +535,17 @@ internal static class Shapes
     public static Tensor ConstantOfShape(Tensor shapeTensor, Tensor? value)
     {
         var shape = shapeTensor.ToIntArray();
+        // Always fill: allocation does not zero, so a zero fill value still has to be written.
         if (value is null || value.IsFloat)
         {
             var result = Tensor.AllocateFloat(shape);
-            float fill = value is null ? 0f : value.Floats[0];
-            if (fill != 0f) result.Floats.AsSpan().Fill(fill);
+            result.Floats.AsSpan().Fill(value is null ? 0f : value.Floats[0]);
             return result;
         }
         else
         {
             var result = Tensor.AllocateLong(value.Type, shape);
-            long fill = value.Longs[0];
-            if (fill != 0) result.Longs.AsSpan().Fill(fill);
+            result.Longs.AsSpan().Fill(value.Longs[0]);
             return result;
         }
     }

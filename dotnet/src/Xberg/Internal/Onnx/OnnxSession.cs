@@ -55,7 +55,17 @@ internal sealed class OnnxSession
     /// </para>
     /// </summary>
     public Dictionary<string, Tensor> Run(
-        IReadOnlyDictionary<string, Tensor> feeds, Dictionary<string, Tensor>? capture)
+        IReadOnlyDictionary<string, Tensor> feeds, Dictionary<string, Tensor>? capture) =>
+        Run(feeds, capture, profile: null);
+
+    /// <summary>
+    /// Run the graph, optionally capturing intermediates and/or accumulating per-operator
+    /// timings into <paramref name="profile"/> (microseconds, keyed by op type).
+    /// </summary>
+    public Dictionary<string, Tensor> Run(
+        IReadOnlyDictionary<string, Tensor> feeds,
+        Dictionary<string, Tensor>? capture,
+        Dictionary<string, double>? profile)
     {
         var env = new Dictionary<string, Tensor>(StringComparer.Ordinal);
         foreach (var (name, tensor) in _model.Initializers) env[name] = tensor;
@@ -73,6 +83,7 @@ internal sealed class OnnxSession
         {
             var node = _model.Nodes[i];
             Tensor?[] outputs;
+            long startTicks = profile is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 outputs = Execute(node, env);
@@ -81,6 +92,13 @@ internal sealed class OnnxSession
             {
                 throw new InvalidOperationException(
                     $"onnx: node #{i} {node.OpType} ('{node.Name}') failed: {ex.Message}", ex);
+            }
+
+            if (profile is not null)
+            {
+                double microseconds = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks)
+                                      * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                profile[node.OpType] = profile.GetValueOrDefault(node.OpType) + microseconds;
             }
 
             for (int o = 0; o < node.Outputs.Length && o < outputs.Length; o++)

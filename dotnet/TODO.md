@@ -189,6 +189,13 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       above threshold agree in class, confidence and geometry.
 - [ ] **Model acquisition** — port `layout/model_manager.rs`: Hugging Face download, on-disk
       cache, SHA-256 verification, atomic publish with rollback.
+- [ ] **Inference performance.** 7.2 s per 640x640 page on 4 cores, against ONNX Runtime's
+      0.6 s on the same machine. Cache panelling and register blocking in the matrix multiply
+      took it there from 10.5 s and the GEMM now runs at 37–51 GFLOP/s, but the rest is
+      structural: every node materialises its output, so elementwise ops sit at memory
+      bandwidth and are now a third of the runtime. Closing it needs operator fusion
+      (Conv+BatchNorm+Relu in one pass) and pooled buffers with reference-counted lifetimes —
+      the latter must handle `Reshape` aliasing its source's storage.
 - [ ] **Page rasterisation.** The blocker for end-to-end use: layout detection needs a
       rendered page bitmap, and the C# port has no PDF renderer. Until one exists the model
       can only be driven from images supplied by the caller.

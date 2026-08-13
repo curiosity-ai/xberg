@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Numerics;
+using Xberg.Internal.Onnx.Ops;
 using System.Globalization;
 using System.Text.Json;
 using Xberg.Internal.Onnx;
@@ -22,6 +24,47 @@ internal static class Program
 
     private sealed record NodeInfo(int Index, string Name, string OpType, string[] Inputs, string[] Outputs);
 
+    /// <summary>
+    /// Time the matrix-multiply kernel on the shapes RT-DETR's convolutions actually lower
+    /// to, so its throughput can be judged directly rather than inferred from whole-model
+    /// timings that also include im2col, allocation and everything else.
+    /// </summary>
+    private static void BenchmarkGemm()
+    {
+        Console.WriteLine($"Vector<float>.Count = {Vector<float>.Count}, " +
+                          $"hardware accelerated = {Vector.IsHardwareAccelerated}, " +
+                          $"cores = {Environment.ProcessorCount}");
+
+        (string Label, int M, int K, int N)[] shapes =
+        [
+            ("1x1 conv  256->256 @160x160", 256, 256, 25600),
+            ("1x1 conv  512->512 @80x80  ", 512, 512, 6400),
+            ("3x3 conv  256->256 @80x80  ", 256, 2304, 6400),
+            ("3x3 conv   64->64  @160x160", 64, 576, 25600),
+            ("decoder projection         ", 256, 256, 300),
+        ];
+
+        foreach (var (label, m, k, n) in shapes)
+        {
+            var a = new float[m * k];
+            var b = new float[k * n];
+            var c = new float[m * n];
+            var random = new Random(1);
+            for (int i = 0; i < a.Length; i++) a[i] = (float)random.NextDouble();
+            for (int i = 0; i < b.Length; i++) b[i] = (float)random.NextDouble();
+
+            Linear.MultiplyInto(a, b, c, m, k, n);   // warm up
+
+            var stopwatch = Stopwatch.StartNew();
+            const int repeats = 5;
+            for (int r = 0; r < repeats; r++) Linear.MultiplyInto(a, b, c, m, k, n);
+            double seconds = stopwatch.Elapsed.TotalSeconds / repeats;
+
+            double gflops = 2.0 * m * k * n / seconds / 1e9;
+            Console.WriteLine($"  {label}  {seconds * 1000,8:F1} ms   {gflops,6:F1} GFLOP/s");
+        }
+    }
+
     private static int Main(string[] args)
     {
         string? modelPath = null;
@@ -32,6 +75,8 @@ internal static class Program
         bool listOps = false;
         string? isolateOp = null;
         float? detectionThreshold = null;
+        int benchmarkRuns = 0;
+        bool gemmBenchmark = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -43,12 +88,20 @@ internal static class Program
                 case "--rtol": relativeTolerance = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 case "--limit": reportLimit = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 case "--list-ops": listOps = true; break;
+                case "--benchmark": benchmarkRuns = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--gemm": gemmBenchmark = true; break;
                 case "--isolate": isolateOp = args[++i]; break;
                 case "--detections": detectionThreshold = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 default:
                     Console.Error.WriteLine($"unknown argument '{args[i]}'");
                     return 2;
             }
+        }
+
+        if (gemmBenchmark)
+        {
+            BenchmarkGemm();
+            return 0;
         }
 
         if (modelPath is null || referenceDir is null)
@@ -103,6 +156,32 @@ internal static class Program
         if (isolateOp is not null)
             return IsolateOperator(model, session, isolateOp, tensors, referenceDir,
                 absoluteTolerance, relativeTolerance, reportLimit);
+
+        if (benchmarkRuns > 0)
+        {
+            // Without capture, so intermediates are released as they die — the mode a real
+            // caller runs in, and the only one whose timing means anything.
+            session.Run(feeds);   // warm up: JIT, weight pages, thread pool
+            var timings = new List<long>(benchmarkRuns);
+            for (int run = 0; run < benchmarkRuns; run++)
+            {
+                stopwatch.Restart();
+                session.Run(feeds);
+                timings.Add(stopwatch.ElapsedMilliseconds);
+            }
+            timings.Sort();
+            Console.WriteLine(
+                $"inference over {benchmarkRuns} runs: median {timings[timings.Count / 2]} ms, " +
+                $"best {timings[0]} ms, worst {timings[^1]} ms");
+
+            var profile = new Dictionary<string, double>(StringComparer.Ordinal);
+            session.Run(feeds, capture: null, profile);
+            double total = profile.Values.Sum();
+            Console.WriteLine($"per-operator breakdown of one run ({total / 1000:F0} ms total):");
+            foreach (var (op, microseconds) in profile.OrderByDescending(p => p.Value).Take(12))
+                Console.WriteLine($"  {op,-20} {microseconds / 1000,8:F1} ms  {microseconds / total:P1}");
+            return 0;
+        }
 
         var capture = new Dictionary<string, Tensor>(StringComparer.Ordinal);
 

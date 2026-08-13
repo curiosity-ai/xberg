@@ -76,12 +76,21 @@ internal sealed class Tensor
         return new Tensor(type, shape, null, data);
     }
 
-    /// <summary>Allocate an uninitialised float tensor of the given shape.</summary>
-    public static Tensor AllocateFloat(params int[] shape) => FromFloats(new float[ElementCount(shape)], shape);
+    /// <summary>
+    /// Allocate a float tensor of the given shape, <strong>without</strong> zeroing it.
+    /// <para>
+    /// Every kernel writes its whole output, so pre-zeroing is a second full pass over memory
+    /// that is immediately overwritten — on a 26 MB activation that is pure waste, repeated
+    /// hundreds of times per inference. Callers that genuinely depend on a zero start must
+    /// clear explicitly.
+    /// </para>
+    /// </summary>
+    public static Tensor AllocateFloat(params int[] shape) =>
+        FromFloats(GC.AllocateUninitializedArray<float>(ElementCount(shape)), shape);
 
-    /// <summary>Allocate an uninitialised integral tensor of the given shape.</summary>
+    /// <inheritdoc cref="AllocateFloat"/>
     public static Tensor AllocateLong(ElementType type, params int[] shape) =>
-        FromLongs(new long[ElementCount(shape)], type, shape);
+        FromLongs(GC.AllocateUninitializedArray<long>(ElementCount(shape)), type, shape);
 
     public static Tensor Scalar(float value) => FromFloats([value]);
 
