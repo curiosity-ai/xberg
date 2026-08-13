@@ -10,7 +10,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
 > **2120 fixtures (72.1%) match on every hard dimension**; content-parity **76.7% identical,
 > 87.1% ≥95%-similar**; 138 fixtures (<80%) are genuine content misses; **22 catastrophes
-> (0.7%)**. 253 unit tests.
+> (0.7%)**. 267 unit tests.
 >
 > The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
 > they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
@@ -32,7 +32,7 @@ not a cosmetic difference.
       float spelling — an integral `f32` is `0.0`, not `0`, so `scanned_confidence` failed
       on every document that is *not* scanned. The remaining 64 are other field differences,
       not yet triaged.
-- [ ] **PDF content (389 fixtures, 77 fully matching; plain 114/388, markdown 32/388).**
+- [ ] **PDF content (389 fixtures, 77 fully matching; plain 114/388, markdown 49/388).**
       The largest remaining area, and upstream landed 127 PDF commits in this window. This is
       extraction *quality*, not a missing feature, and it does not decompose into a few
       systematic fixes — measured, not assumed:
@@ -81,8 +81,8 @@ not a cosmetic difference.
 - [x] Write `dotnet/Claude.md` (architecture + mapping).
 - [x] Create the `dotnet/` solution: `Xberg` (lib), `Xberg.Tests`, `Xberg.TestRunner` (CLI).
 - [x] Write the Rust golden-reference generator (`tools/xberg-reference-gen`).
-- [x] Run the generator over `../test_documents`; commit `*-results-rust.json` to the
-      `test_documents` companion repo.
+- [x] Run the generator over `../test_documents` to produce the `*-results-rust.json`
+      goldens (generated locally, not committed — see `Claude.md`).
 - [x] Wire `Xberg.TestRunner` to load fixtures + golden files and diff per format.
 
 ## Phase 1 — Core spine (foundational; everything depends on it)
