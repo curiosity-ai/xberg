@@ -277,3 +277,7 @@ clean and the whole job is re-deriving the C# port's behaviour. The loop that wo
 - Keep extractor logic close to the Rust source; cite the Rust file at the top of each C#
   extractor so re-syncing after upstream changes is mechanical.
 - No `unsafe`, no P/Invoke to native libs — pure managed so the NuGet package is portable.
+  This is why layout detection ships as a hand-written ONNX runtime (`Internal/Onnx`)
+  rather than a binding to ONNX Runtime: the Rust build links `ort` natively, which a
+  portable package cannot. See `tools/onnx-parity/README.md` for how that runtime is
+  validated against ONNX Runtime layer by layer.

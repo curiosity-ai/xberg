@@ -1,0 +1,457 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
+using Xberg.Internal.Onnx;
+
+namespace Xberg.OnnxParity;
+
+/// <summary>
+/// Compares the C# ONNX runtime against a reference dump produced by
+/// <c>tools/onnx-parity/dump_reference.py</c>, one graph value at a time.
+/// <para>
+/// The comparison is per node rather than per model on purpose. A single wrong kernel deep
+/// in a 2676-node graph produces a final output that is merely <em>different</em>, with
+/// nothing to say where it went wrong; walking values in topological order and reporting the
+/// first mismatch names the failing operator directly, and everything after it is
+/// downstream noise.
+/// </para>
+/// </summary>
+internal static class Program
+{
+    private sealed record ReferenceTensor(string File, string Dtype, int[] Shape);
+
+    private sealed record NodeInfo(int Index, string Name, string OpType, string[] Inputs, string[] Outputs);
+
+    private static int Main(string[] args)
+    {
+        string? modelPath = null;
+        string? referenceDir = null;
+        float absoluteTolerance = 2e-4f;
+        float relativeTolerance = 2e-3f;
+        int reportLimit = 10;
+        bool listOps = false;
+        string? isolateOp = null;
+        float? detectionThreshold = null;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--model": modelPath = args[++i]; break;
+                case "--reference": referenceDir = args[++i]; break;
+                case "--atol": absoluteTolerance = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--rtol": relativeTolerance = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--limit": reportLimit = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--list-ops": listOps = true; break;
+                case "--isolate": isolateOp = args[++i]; break;
+                case "--detections": detectionThreshold = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                default:
+                    Console.Error.WriteLine($"unknown argument '{args[i]}'");
+                    return 2;
+            }
+        }
+
+        if (modelPath is null || referenceDir is null)
+        {
+            Console.Error.WriteLine(
+                "usage: xberg-onnx-parity --model MODEL.onnx --reference REF_DIR [--atol A] [--rtol R] [--limit N] [--list-ops]");
+            return 2;
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var model = OnnxModel.Load(modelPath);
+        Console.WriteLine(
+            $"model: {Path.GetFileName(modelPath)}  opset {model.OpsetVersion}  " +
+            $"{model.Nodes.Length} nodes  {model.Initializers.Count} initializers  ({stopwatch.ElapsedMilliseconds} ms)");
+
+        if (listOps)
+        {
+            foreach (var group in model.Nodes.GroupBy(n => n.OpType).OrderByDescending(g => g.Count()))
+                Console.WriteLine($"  {group.Key,-24} {group.Count()}");
+            return 0;
+        }
+
+        using var manifestStream = File.OpenRead(Path.Combine(referenceDir, "manifest.json"));
+        using var manifest = JsonDocument.Parse(manifestStream);
+        var root = manifest.RootElement;
+
+        var tensors = new Dictionary<string, ReferenceTensor>(StringComparer.Ordinal);
+        foreach (var property in root.GetProperty("tensors").EnumerateObject())
+        {
+            var value = property.Value;
+            tensors[property.Name] = new ReferenceTensor(
+                value.GetProperty("file").GetString()!,
+                value.GetProperty("dtype").GetString()!,
+                value.GetProperty("shape").EnumerateArray().Select(d => d.GetInt32()).ToArray());
+        }
+
+        // Feed the exact inputs the reference ran with, so any divergence is the runtime's.
+        var feeds = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+        foreach (var input in root.GetProperty("graph_inputs").EnumerateArray())
+        {
+            string name = input.GetProperty("name").GetString()!;
+            if (!tensors.TryGetValue(name, out var reference))
+            {
+                Console.Error.WriteLine($"reference dump has no tensor for input '{name}'");
+                return 3;
+            }
+            feeds[name] = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+        }
+
+        var session = new OnnxSession(model);
+
+        if (isolateOp is not null)
+            return IsolateOperator(model, session, isolateOp, tensors, referenceDir,
+                absoluteTolerance, relativeTolerance, reportLimit);
+
+        var capture = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+
+        stopwatch.Restart();
+        try
+        {
+            session.Run(feeds, capture);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"execution failed: {ex.Message}");
+            // A partial capture still localises the failure, so report what did run.
+            Console.Error.WriteLine($"produced {capture.Count} values before failing");
+            ReportMismatches(model, capture, tensors, referenceDir, absoluteTolerance, relativeTolerance, reportLimit);
+            return 1;
+        }
+        long runMs = stopwatch.ElapsedMilliseconds;
+        Console.WriteLine($"executed {model.Nodes.Length} nodes in {runMs} ms, captured {capture.Count} values");
+
+        int failures = ReportMismatches(
+            model, capture, tensors, referenceDir, absoluteTolerance, relativeTolerance, reportLimit);
+
+        if (detectionThreshold is { } threshold)
+            return CompareDetections(model, capture, tensors, referenceDir, threshold) ? 0 : 1;
+
+        return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Test every instance of one operator in isolation: each node is executed against the
+    /// reference's own recorded inputs, so its output is judged on its own merits with no
+    /// upstream drift folded in. A failure here is unambiguously a kernel bug.
+    /// </summary>
+    private static int IsolateOperator(
+        OnnxModel model,
+        OnnxSession session,
+        string opType,
+        Dictionary<string, ReferenceTensor> tensors,
+        string referenceDir,
+        float absoluteTolerance,
+        float relativeTolerance,
+        int reportLimit)
+    {
+        int tested = 0, failures = 0, skipped = 0;
+        Console.WriteLine($"isolating '{opType}' nodes against reference inputs");
+
+        for (int i = 0; i < model.Nodes.Length; i++)
+        {
+            var node = model.Nodes[i];
+            if (!string.Equals(node.OpType, opType, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var env = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+            bool complete = true;
+            foreach (string input in node.Inputs)
+            {
+                if (input.Length == 0) continue;
+                if (model.Initializers.TryGetValue(input, out var initializer)) { env[input] = initializer; continue; }
+                if (tensors.TryGetValue(input, out var reference))
+                {
+                    env[input] = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+                    continue;
+                }
+                // Values the dump skipped as too large cannot be reconstructed here.
+                complete = false;
+                break;
+            }
+            if (!complete) { skipped++; continue; }
+
+            var outputs = session.ExecuteNode(node, env);
+            for (int o = 0; o < node.Outputs.Length && o < outputs.Length; o++)
+            {
+                string name = node.Outputs[o];
+                if (name.Length == 0 || outputs[o] is null) continue;
+                if (!tensors.TryGetValue(name, out var reference)) { skipped++; continue; }
+
+                var expected = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+                var diff = Compare(expected, outputs[o]!, absoluteTolerance, relativeTolerance);
+                tested++;
+                if (diff.Ok) continue;
+
+                failures++;
+                if (failures <= reportLimit)
+                {
+                    Console.WriteLine($"  FAIL #{i} '{node.Name}' -> {name}");
+                    Console.WriteLine($"       {diff.Summary}");
+                    foreach (var attribute in node.Attributes)
+                        Console.WriteLine($"       attr {attribute.Name}: {Describe(attribute)}");
+                }
+            }
+        }
+
+        Console.WriteLine($"{tested - failures}/{tested} '{opType}' outputs match with reference inputs" +
+                          (skipped > 0 ? $" ({skipped} skipped: inputs or outputs absent from the dump)" : ""));
+        return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Walk node outputs in topological order and report those that diverge, first one first.
+    /// Returns the number of diverging values.
+    /// </summary>
+    private static int ReportMismatches(
+        OnnxModel model,
+        Dictionary<string, Tensor> capture,
+        Dictionary<string, ReferenceTensor> tensors,
+        string referenceDir,
+        float absoluteTolerance,
+        float relativeTolerance,
+        int reportLimit)
+    {
+        int compared = 0, failures = 0, missing = 0;
+        double worstAbsolute = 0;
+        var byOpType = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        for (int i = 0; i < model.Nodes.Length; i++)
+        {
+            var node = model.Nodes[i];
+            foreach (string outputName in node.Outputs)
+            {
+                if (outputName.Length == 0) continue;
+                if (!capture.TryGetValue(outputName, out var actual)) continue;
+                if (!tensors.TryGetValue(outputName, out var reference)) { missing++; continue; }
+
+                var expected = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+                compared++;
+
+                var diff = Compare(expected, actual, absoluteTolerance, relativeTolerance);
+                worstAbsolute = Math.Max(worstAbsolute, diff.MaxAbsolute);
+
+                if (diff.Ok) continue;
+                failures++;
+                byOpType[node.OpType] = byOpType.GetValueOrDefault(node.OpType) + 1;
+                if (failures > reportLimit)
+                {
+                    // Past the detailed budget, one line each: enough to see whether the
+                    // divergence is one operator misbehaving or a single error propagating.
+                    Console.WriteLine($"  #{i,-5} {node.OpType,-18} {diff.Summary}");
+                    continue;
+                }
+                {
+                    Console.WriteLine();
+                    Console.WriteLine($"MISMATCH at node #{i} {node.OpType} '{node.Name}'");
+                    Console.WriteLine($"  output      : {outputName}");
+                    Console.WriteLine($"  expected    : {reference.Dtype}[{string.Join(",", reference.Shape)}]");
+                    Console.WriteLine($"  actual      : {actual}");
+                    Console.WriteLine($"  {diff.Summary}");
+                    Console.WriteLine($"  inputs      : {string.Join(", ", node.Inputs)}");
+                    foreach (var attribute in node.Attributes)
+                        Console.WriteLine($"  attr {attribute.Name,-12}: {Describe(attribute)}");
+                }
+            }
+        }
+
+        Console.WriteLine();
+        Console.WriteLine(
+            $"compared {compared} values: {compared - failures} match, {failures} diverge" +
+            (missing > 0 ? $", {missing} absent from the reference dump" : ""));
+        Console.WriteLine($"largest absolute difference across all values: {worstAbsolute:G6}");
+
+        if (byOpType.Count > 0)
+        {
+            Console.WriteLine("diverging values by operator:");
+            foreach (var (op, count) in byOpType.OrderByDescending(p => p.Value))
+                Console.WriteLine($"  {op,-20} {count}");
+        }
+
+        // The declared outputs are what callers actually consume, so they get reported
+        // whatever happened upstream — intermediate drift that damps out before the end is a
+        // very different situation from a wrong result.
+        Console.WriteLine();
+        Console.WriteLine("declared graph outputs:");
+        foreach (string name in model.Outputs.Select(o => o.Name))
+        {
+            if (!capture.TryGetValue(name, out var actual) || !tensors.TryGetValue(name, out var reference))
+            {
+                Console.WriteLine($"  {name}: not comparable");
+                continue;
+            }
+            var expected = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+            var diff = Compare(expected, actual, absoluteTolerance, relativeTolerance);
+            Console.WriteLine($"  {name}: {(diff.Ok ? "MATCH" : "DIVERGE")} — {diff.Summary}");
+        }
+        return failures;
+    }
+
+    /// <summary>
+    /// Decode both sides through RT-DETR's real postprocessing and compare the detections a
+    /// caller would actually receive.
+    /// <para>
+    /// This is the comparison that decides whether the runtime is usable. Raw tensor drift
+    /// is not: the network's box head runs through an inverse sigmoid, so values pinned near
+    /// the clip bounds are amplified by four orders of magnitude before being squashed back
+    /// down, and a difference of one float ULP upstream shows up as a large intermediate
+    /// difference that never reaches the output. What matters is whether the same regions
+    /// come out, with the same classes, at the same places.
+    /// </para>
+    /// </summary>
+    private static bool CompareDetections(
+        OnnxModel model,
+        Dictionary<string, Tensor> capture,
+        Dictionary<string, ReferenceTensor> tensors,
+        string referenceDir,
+        float threshold)
+    {
+        var outputNames = model.Outputs.Select(o => o.Name).ToArray();
+        var actual = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+        var expected = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+        foreach (string name in outputNames)
+        {
+            if (!capture.TryGetValue(name, out var a) || !tensors.TryGetValue(name, out var reference))
+            {
+                Console.Error.WriteLine($"cannot decode detections: '{name}' is unavailable");
+                return false;
+            }
+            actual[name] = a;
+            expected[name] = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+        }
+
+        var mine = Decode(actual, outputNames, threshold);
+        var theirs = Decode(expected, outputNames, threshold);
+
+        Console.WriteLine();
+        Console.WriteLine($"detections at threshold {threshold:F2}: reference {theirs.Count}, C# {mine.Count}");
+
+        int matched = 0;
+        int rows = Math.Max(mine.Count, theirs.Count);
+        for (int i = 0; i < rows; i++)
+        {
+            string left = i < theirs.Count ? Format(theirs[i]) : "—";
+            string right = i < mine.Count ? Format(mine[i]) : "—";
+            bool same = i < theirs.Count && i < mine.Count && Same(theirs[i], mine[i]);
+            if (same) matched++;
+            Console.WriteLine($"  {(same ? " " : "!")} {left,-52} | {right}");
+        }
+
+        bool ok = matched == rows && rows > 0;
+        Console.WriteLine(ok
+            ? $"all {rows} detections agree in class, confidence and geometry"
+            : $"{matched}/{rows} detections agree");
+        return ok;
+    }
+
+    /// <summary>Apply the confidence filter, class mapping and clamp, then sort by confidence.</summary>
+    private static List<(long Label, float Score, float[] Box)> Decode(
+        Dictionary<string, Tensor> outputs, string[] names, float threshold)
+    {
+        Tensor? labels = null, boxes = null, scores = null;
+        foreach (string name in names)
+        {
+            var tensor = outputs[name];
+            if (!tensor.IsFloat) labels ??= tensor;
+            else if (tensor.Rank >= 3 || tensor.Shape[^1] == 4) boxes ??= tensor;
+            else scores ??= tensor;
+        }
+        if (labels is null || boxes is null || scores is null) return [];
+
+        var result = new List<(long, float, float[])>();
+        for (int i = 0; i < scores.Count; i++)
+        {
+            float score = scores.GetFloat(i);
+            if (score < threshold) continue;
+            result.Add((labels.GetLong(i), score,
+                [boxes.GetFloat(i * 4), boxes.GetFloat(i * 4 + 1), boxes.GetFloat(i * 4 + 2), boxes.GetFloat(i * 4 + 3)]));
+        }
+        result.Sort((a, b) => b.Item2.CompareTo(a.Item2));
+        return result;
+    }
+
+    /// <summary>
+    /// Two detections agree when they name the same class and their geometry lands within a
+    /// pixel — sub-pixel box differences are below what any downstream consumer resolves.
+    /// </summary>
+    private static bool Same((long Label, float Score, float[] Box) a, (long Label, float Score, float[] Box) b)
+    {
+        if (a.Label != b.Label) return false;
+        if (Math.Abs(a.Score - b.Score) > 0.01f) return false;
+        for (int i = 0; i < 4; i++) if (Math.Abs(a.Box[i] - b.Box[i]) > 1.0f) return false;
+        return true;
+    }
+
+    private static string Format((long Label, float Score, float[] Box) d) => string.Create(
+        CultureInfo.InvariantCulture,
+        $"label {d.Label,2} conf {d.Score:F4} [{d.Box[0]:F1}, {d.Box[1]:F1}, {d.Box[2]:F1}, {d.Box[3]:F1}]");
+
+    private readonly record struct Difference(bool Ok, double MaxAbsolute, string Summary);
+
+    /// <summary>
+    /// Element-wise comparison with a combined absolute/relative tolerance.
+    /// <para>
+    /// Both bounds are needed. Activations deep in the network reach magnitudes in the
+    /// hundreds, where float32 rounding alone exceeds any fixed absolute bound; logits near
+    /// zero would pass any relative bound no matter how wrong. A value is accepted when it
+    /// is within <em>either</em>.
+    /// </para>
+    /// </summary>
+    private static Difference Compare(Tensor expected, Tensor actual, float absoluteTolerance, float relativeTolerance)
+    {
+        if (expected.Count != actual.Count)
+            return new Difference(false, double.PositiveInfinity,
+                $"element count differs: expected {expected.Count}, got {actual.Count}");
+
+        if (!expected.Shape.AsSpan().SequenceEqual(actual.Shape))
+            return new Difference(false, double.PositiveInfinity,
+                $"shape differs: expected [{string.Join(",", expected.Shape)}], got [{string.Join(",", actual.Shape)}]");
+
+        double maxAbsolute = 0, maxRelative = 0;
+        int worstIndex = -1, offending = 0;
+
+        for (int i = 0; i < expected.Count; i++)
+        {
+            double e = expected.GetFloat(i);
+            double a = actual.GetFloat(i);
+
+            if (double.IsNaN(e) && double.IsNaN(a)) continue;
+            if (double.IsNaN(e) != double.IsNaN(a) || double.IsInfinity(e) != double.IsInfinity(a))
+            {
+                offending++;
+                if (worstIndex < 0) worstIndex = i;
+                maxAbsolute = double.PositiveInfinity;
+                continue;
+            }
+
+            double absolute = Math.Abs(e - a);
+            double relative = Math.Abs(e) > 0 ? absolute / Math.Abs(e) : (absolute > 0 ? double.PositiveInfinity : 0);
+
+            if (absolute > maxAbsolute) { maxAbsolute = absolute; worstIndex = i; }
+            maxRelative = Math.Max(maxRelative, double.IsInfinity(relative) ? maxRelative : relative);
+
+            if (absolute > absoluteTolerance && relative > relativeTolerance) offending++;
+        }
+
+        bool ok = offending == 0;
+        string summary = ok
+            ? $"max |diff| {maxAbsolute:G4}"
+            : $"{offending}/{expected.Count} elements outside tolerance; max |diff| {maxAbsolute:G4} " +
+              $"(max relative {maxRelative:G4})" +
+              (worstIndex >= 0
+                  ? $"; worst at [{worstIndex}]: expected {expected.GetFloat(worstIndex):G8}, got {actual.GetFloat(worstIndex):G8}"
+                  : "");
+        return new Difference(ok, maxAbsolute, summary);
+    }
+
+    private static string Describe(OnnxAttribute attribute) => attribute.Type switch
+    {
+        AttributeType.Int => attribute.Int.ToString(CultureInfo.InvariantCulture),
+        AttributeType.Float => attribute.Float.ToString("G6", CultureInfo.InvariantCulture),
+        AttributeType.String => attribute.String,
+        AttributeType.Ints => "[" + string.Join(",", attribute.Ints) + "]",
+        AttributeType.Floats => "[" + string.Join(",", attribute.Floats) + "]",
+        AttributeType.Tensor => attribute.Tensor?.ToString() ?? "<tensor>",
+        _ => attribute.Type.ToString(),
+    };
+}

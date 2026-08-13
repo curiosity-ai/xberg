@@ -8,9 +8,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 
 > **Status (after the August upstream merge, 1821 Rust commits):** measured against goldens
 > regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
-> **2120 fixtures (72.1%) match on every hard dimension**; content-parity **76.7% identical,
-> 87.1% ≥95%-similar**; 138 fixtures (<80%) are genuine content misses; **22 catastrophes
-> (0.7%)**. 267 unit tests.
+> **2122 fixtures (72.1%) match on every hard dimension**; content-parity **77.0% identical,
+> 87.6% ≥95%-similar**; 125 fixtures (<80%) are genuine content misses; **22 catastrophes
+> (0.7%)**. 327 unit tests.
 >
 > The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
 > they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
@@ -164,6 +164,41 @@ not a cosmetic difference.
       **Only after all of Phases 1–5 are ported and green.** Evaluate a managed tree-sitter
       binding vs. a lighter language-detection + fenced-block approach.
 
+## Phase 7 — Layout detection (ML)
+
+Brought into scope after the merge. The Rust build reaches ONNX Runtime through `ort`,
+a native library; a portable managed NuGet package cannot, so the model runs on a
+hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md`.
+
+- [x] **ONNX model parser.** Hand-written protobuf wire reader plus
+      ModelProto/GraphProto/NodeProto/TensorProto/AttributeProto decoding
+      (`Internal/Onnx/ProtoReader.cs`, `OnnxModel.cs`). No dependency, no codegen; tensor
+      payloads are slices over the model bytes rather than copies.
+- [x] **Operator kernels** (`Internal/Onnx/Ops/`) covering both pinned graphs — the 40
+      operators RT-DETR uses and the table classifier's set. Vectorised through
+      `System.Numerics.Tensors`; convolution lowers to GEMM via im2col with dedicated
+      pointwise and depthwise paths, and MatMul uses an axpy-ordered kernel so the inner
+      loop is a contiguous fused multiply-add.
+- [x] **Graph execution** (`OnnxSession.cs`) with liveness-based release of intermediates,
+      which is what keeps RT-DETR's working set bounded.
+- [x] **RT-DETR wrapper** (`Internal/Layout/RtDetrModel.cs`) and the layout types ported
+      from `layout/types.rs`, including the exact preprocessing contract: bilinear resize to
+      an exact 640x640 (aspect ratio *not* preserved), `/255`, no ImageNet normalisation.
+- [x] **Layer-by-layer validation** against ONNX Runtime via `tools/onnx-parity` and
+      `tools/Xberg.OnnxParity`. Every operator instance matches in isolation; all detections
+      above threshold agree in class, confidence and geometry.
+- [ ] **Model acquisition** — port `layout/model_manager.rs`: Hugging Face download, on-disk
+      cache, SHA-256 verification, atomic publish with rollback.
+- [ ] **Page rasterisation.** The blocker for end-to-end use: layout detection needs a
+      rendered page bitmap, and the C# port has no PDF renderer. Until one exists the model
+      can only be driven from images supplied by the caller.
+- [ ] **Remaining models**: PP-DocLayout-V3, TATR, SLANeXt wired/wireless, PP-LCNet table
+      classifier. The runtime already executes the classifier; the others need their own
+      pre/postprocessing ported.
+- [ ] **Layout-aware reading order** (`extractors/pdf/reading_order.rs`). Note this is
+      entirely `#[cfg(feature = "layout-detection")]`, so it is absent from the goldens —
+      measuring it needs `xberg-reference-gen` rebuilt with that feature enabled.
+
 ## Cross-cutting
 
 - [ ] `Metadata` extraction parity (office core/app props, EXIF, PDF info dict).
@@ -180,7 +215,7 @@ not a cosmetic difference.
 
 ## Excluded (dropped per requirements)
 
-- [-] OCR (Tesseract/Paddle/candle), doc orientation, layout detection.
+- [-] OCR (Tesseract/Paddle/candle), doc orientation.
 - [-] Audio/video transcription.
 - [-] Embeddings, reranking, NER/GLiNER, keyword extraction, chunking-for-RAG.
 - [-] LLM / structured LLM extraction, captioning.
