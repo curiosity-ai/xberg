@@ -62,6 +62,11 @@ public static class PdfStructure
     private const float MAX_HEADING_DISTANCE_MULTIPLIER = 2.0f;
     private const float MIN_HEADING_FONT_RATIO = 1.15f;
     private const float MIN_HEADING_FONT_GAP = 1.5f;
+
+    /// <summary>A document with fewer blocks than this has too little evidence for the
+    /// first-paragraph H1 rescue: its one paragraph is not "the biggest text on a page of
+    /// body copy", it is the whole document (Rust `MIN_BLOCKS_FOR_FONT_HEADING`).</summary>
+    private const int MIN_BLOCKS_FOR_FONT_HEADING = 5;
     private const int MAX_BOLD_HEADING_WORD_COUNT = 12;
     private const float PARAGRAPH_GAP_HEIGHT_FACTOR = 1.5f;
 
@@ -201,13 +206,29 @@ public static class PdfStructure
         if (blockFonts.Count == 0) return new();
 
         int paragraphCount = blockFonts.Count;
+
+        // Sparsity gate: too few text blocks to establish a reliable body-font baseline. Return
+        // a body-only map and skip both k-means heading promotion and the fallback title
+        // promotion, so a lone larger line on a cover, title or one-line document is not
+        // over-promoted to a heading — the bold pass will still call it an H2 if it looks like
+        // one. (Rust `build_heading_map`; the sparse repeated-tier branch is not ported.)
+        if (paragraphCount < MIN_BLOCKS_FOR_FONT_HEADING)
+        {
+            var bodyOnly = ClusterFontSizes(blockFonts, 1);
+            return bodyOnly.Select(c => (c.Centroid, (byte?)null)).ToList();
+        }
+
         int effectiveK = paragraphCount < 20 ? Math.Min(kClusters, Math.Max(2, paragraphCount / 4)) : kClusters;
 
         var clusters = ClusterFontSizes(blockFonts, effectiveK);
         var map = AssignHeadingLevelsSmart(clusters, MIN_HEADING_FONT_RATIO, MIN_HEADING_FONT_GAP);
 
+        // Rust has no cluster-level H1 fallback: its equivalent is the paragraph-level rescue in
+        // RefineHeadingHierarchy, which is gated on the document having enough blocks to judge.
+        // Without the same gate a one-paragraph document promotes its only text to H1, where
+        // Rust leaves the cluster path empty and the bold pass calls it H2.
         bool hasAnyHeading = map.Any(m => m.level.HasValue);
-        if (!hasAnyHeading && allPageSegments.Count > 0)
+        if (!hasAnyHeading && allPageSegments.Count > 0 && blockFonts.Count >= MIN_BLOCKS_FOR_FONT_HEADING)
         {
             float? firstSegFont = null;
             foreach (var s in allPageSegments[0])
@@ -671,11 +692,23 @@ public static class PdfStructure
             if (stillNoH1 && allPages.Count > 0 && allPages[0].Count > 0)
             {
                 var page0 = allPages[0];
+                int totalParagraphs = allPages.Sum(p => p.Count);
                 float maxFont = page0.Max(p => p.DominantFontSize);
                 var firstP = page0[0];
                 string firstText = ParagraphPlainText(firstP);
                 int firstWc = WordCount(firstText);
-                if (firstP.DominantFontSize >= maxFont && firstWc <= 10 && firstWc > 0
+
+                // The first paragraph must also stand out from the rest of the document, not
+                // merely be the largest thing on its own page.
+                float? restFont = OtherParagraphsFontSize(allPages, 0, 0);
+                bool clearsFontGate = restFont is not { } bodyFont
+                    || bodyFont <= 0f
+                    || (firstP.DominantFontSize >= bodyFont * MIN_HEADING_FONT_RATIO
+                        && firstP.DominantFontSize >= bodyFont + MIN_HEADING_FONT_GAP);
+
+                if (totalParagraphs >= MIN_BLOCKS_FOR_FONT_HEADING
+                    && clearsFontGate
+                    && firstP.DominantFontSize >= maxFont && firstWc <= 10 && firstWc > 0
                     && !firstP.IsPageFurniture && !LooksLikeBareUrl(firstText))
                     page0[0].HeadingLevel = 1;
             }
@@ -697,6 +730,27 @@ public static class PdfStructure
                     if (!foundFirst) { foundFirst = true; continue; }
                     if (StartsWithSectionNumber(ParagraphPlainText(para))) para.HeadingLevel = 2;
                 }
+    }
+
+    /// <summary>Character-weighted mean font size of every paragraph except the excluded one —
+    /// the document's body size, used to judge whether the first paragraph really stands out.</summary>
+    private static float? OtherParagraphsFontSize(List<List<PdfParagraph>> allPages, int excludePage, int excludeIndex)
+    {
+        double weightedSum = 0;
+        long totalChars = 0;
+        for (int pageIdx = 0; pageIdx < allPages.Count; pageIdx++)
+        {
+            var page = allPages[pageIdx];
+            for (int paraIdx = 0; paraIdx < page.Count; paraIdx++)
+            {
+                if (pageIdx == excludePage && paraIdx == excludeIndex) continue;
+                int charCount = ParagraphPlainText(page[paraIdx]).Length;
+                if (charCount == 0) continue;
+                weightedSum += (double)page[paraIdx].DominantFontSize * charCount;
+                totalChars += charCount;
+            }
+        }
+        return totalChars == 0 ? null : (float)(weightedSum / totalChars);
     }
 
     private static void PromoteTitleHeading(List<List<PdfParagraph>> allPages)
