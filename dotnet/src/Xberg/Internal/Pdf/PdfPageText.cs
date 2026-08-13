@@ -17,6 +17,24 @@ public static class PdfPageText
     private const int MinDisorderCount = 3;
     private const double CoalesceThreshold = 5.0;
 
+    /// <summary>How far left of the previous span's start a span must begin before it counts
+    /// as a new row rather than a continuation (Rust <c>ROW_RESET_MIN_BACKTRACK_EMS</c>).</summary>
+    private const double RowResetMinBacktrackEms = 4.0;
+
+    /// <summary>Right-to-left or explicit bidi content, for which left-to-right row and column
+    /// heuristics do not hold.</summary>
+    internal static bool HasRtlOrBidiContent(string text)
+    {
+        foreach (char c in text)
+        {
+            // Hebrew, Arabic, Syriac, Thaana; the explicit bidi controls; presentation forms.
+            if (c is >= '\u0590' and <= '\u08FF') return true;
+            if (c is >= '\u200E' and <= '\u200F' or >= '\u202A' and <= '\u202E') return true;
+            if (c is >= '\uFB1D' and <= '\uFDFF' or >= '\uFE70' and <= '\uFEFC') return true;
+        }
+        return false;
+    }
+
     /// <summary>Sort spans into ColumnAware reading order and assemble into text.
     /// <paramref name="pageWidth"/> enables the two-column repair; pass 0 when unknown.</summary>
     public static string Assemble(List<TextSpan> spans, double pageWidth = 0)
@@ -46,6 +64,10 @@ public static class PdfPageText
         double medianHeight = heights.Count == 0 ? 1.0 : heights[heights.Count / 2];
         double paragraphGap = medianHeight * 1.5;
 
+        // Row resets are only meaningful for a purely left-to-right page: in mixed or RTL
+        // text a span legitimately starts left of its predecessor.
+        bool allowRowResets = !ordered.Any(s => HasRtlOrBidiContent(s.Text));
+
         var sb = new StringBuilder();
         TextSpan? prev = null;
         foreach (var span in ordered)
@@ -55,6 +77,21 @@ public static class PdfPageText
                 double prevEndX = prev.X + prev.Width;
                 double yGap = Math.Abs(prev.Y - span.Y);
                 double effHeight = Math.Max(Math.Max(span.Height, prev.Height), span.FontSize * 0.5);
+
+                // Row reset: a span starting far enough left of where the previous one started
+                // has carriage-returned to a new row, even when the two share a baseline within
+                // tolerance. Checked before the same-line test, which would otherwise weld two
+                // rows of a grid into one line.
+                double resetThreshold = Math.Max(prev.FontSize, span.FontSize) * RowResetMinBacktrackEms;
+                bool isLtrPair = !HasRtlOrBidiContent(prev.Text) && !HasRtlOrBidiContent(span.Text);
+                if (allowRowResets && isLtrPair && span.X < prev.X - resetThreshold)
+                {
+                    sb.Append(yGap > paragraphGap ? "\n\n" : "\n");
+                    sb.Append(span.Text);
+                    prev = span;
+                    continue;
+                }
+
                 bool sameLine = yGap < effHeight * 0.5;
                 if (sameLine)
                 {

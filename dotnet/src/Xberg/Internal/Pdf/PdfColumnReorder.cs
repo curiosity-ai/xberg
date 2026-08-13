@@ -86,23 +86,11 @@ internal static class PdfColumnReorder
 
         return geometryIsValid
             && !s.IsMonospace
-            && !HasRtlOrBidiContent(s.Text)
+            && !PdfPageText.HasRtlOrBidiContent(s.Text)
             && !s.Text.Contains(':')
             && words >= MinSparseWords
             && alpha >= MinSparseAlphaChars
             && (double)alpha / Math.Max(nonWs, 1) >= MinSparseAlphaRatio;
-    }
-
-    private static bool HasRtlOrBidiContent(string text)
-    {
-        foreach (char c in text)
-        {
-            // Hebrew, Arabic, Syriac, Thaana and the explicit bidi controls.
-            if (c is >= '֐' and <= 'ࣿ') return true;
-            if (c is >= '‎' and <= '‏' or >= '‪' and <= '‮') return true;
-            if (c is >= 'יִ' and <= '﷿' or >= 'ﹰ' and <= 'ﻼ') return true;
-        }
-        return false;
     }
 
     private static bool SparseColumnsOverlap(List<TextSpan> left, List<TextSpan> right)
