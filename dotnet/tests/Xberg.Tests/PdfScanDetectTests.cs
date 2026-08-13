@@ -152,3 +152,49 @@ public class PdfTextRepairTests
         Assert.Equal("Hello! World", PdfTextRepair.RepairContextualLigatures("Hello! World"));
     }
 }
+
+/// <summary>
+/// Heading-level inference from Rust <c>pdf/structure/classify.rs</c>. These pin the rule the
+/// port previously hardcoded to level 2 for every bold or section-numbered heading.
+/// </summary>
+public class PdfHeadingLevelTests
+{
+    [Theory]
+    // Numbering depth sets the level, and a trailing dot is not a nesting level.
+    [InlineData("1 Introduction", 2)]
+    [InlineData("1. Introduction", 2)]
+    [InlineData("1.1 Details", 3)]
+    [InlineData("1.1. Details", 3)]
+    [InlineData("1.1.1 Deep", 4)]
+    [InlineData("2.3.4.5 Deeper still", 4)]
+    // Roman and alphabetic prefixes are top-level sections.
+    [InlineData("I. INTRO", 2)]
+    [InlineData("IV. Results", 2)]
+    [InlineData("A. Proofs", 2)]
+    // No numbering at all falls back to a top-level section.
+    [InlineData("Introduction", 2)]
+    public void SectionLevel_FollowsNumberingDepth(string text, int expected) =>
+        Assert.Equal((byte)expected, PdfStructure.InferSectionLevel(text));
+
+    [Fact]
+    public void BoldHeadingLevel_UsesTheRiseAboveBodyText()
+    {
+        // Comfortably above body size is a section heading; barely above is a sub-heading.
+        Assert.Equal((byte)2, PdfStructure.InferBoldHeadingLevel(14f, 10f, "Results"));
+        Assert.Equal((byte)3, PdfStructure.InferBoldHeadingLevel(11f, 10f, "Results"));
+    }
+
+    [Fact]
+    public void BoldHeadingLevel_WithoutABodyBaseline_IsASectionNotATitle()
+    {
+        // A document with no body font to compare against must not mint an H1.
+        Assert.Equal((byte)2, PdfStructure.InferBoldHeadingLevel(22f, 0f, "Dummy PDF file"));
+    }
+
+    [Fact]
+    public void BoldHeadingLevel_SectionNumberingWinsOverFontSize()
+    {
+        // Numbering is stronger evidence of depth than the font rise.
+        Assert.Equal((byte)3, PdfStructure.InferBoldHeadingLevel(30f, 10f, "1.1 Details"));
+    }
+}

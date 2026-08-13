@@ -488,6 +488,13 @@ public static class PdfStructure
         return gaps.Sum() / gaps.Count;
     }
 
+    /// <summary>Centroid of the body cluster — the one the heading map left unlevelled.</summary>
+    private static float BodyFontSize(List<(float centroid, byte? level)> headingMap)
+    {
+        foreach (var (c, l) in headingMap) if (l is null) return c;
+        return 0f;
+    }
+
     private static byte? FindHeadingLevel(float fontSize, List<(float centroid, byte? level)> headingMap, float avgGap)
     {
         if (headingMap.Count == 0) return null;
@@ -563,13 +570,12 @@ public static class PdfStructure
             && !trimmed.Contains('@') && !trimmed.Contains('(') && !trimmed.Contains(',')
             && (char.IsUpper(trimmed[0]) || char.IsAsciiDigit(trimmed[0]))
             && !IsSeparatorText(trimmed) && !LooksLikeFigureLabel(trimmed))
-            headingLevel = 2;
+            headingLevel = InferBoldHeadingLevel(first.FontSize, BodyFontSize(headingMap), trimmed);
 
         // Pass 3: font-above-body for short section-pattern paragraphs.
         if (headingLevel is null)
         {
-            float bodyFont = 0f;
-            foreach (var (c, l) in headingMap) if (l is null) { bodyFont = c; break; }
+            float bodyFont = BodyFontSize(headingMap);
             float minThreshold = bodyFont * MIN_HEADING_FONT_RATIO;
             if (bodyFont > 0f && first.FontSize >= minThreshold && first.FontSize > bodyFont + 0.5f
                 && wordCount <= MAX_BOLD_HEADING_WORD_COUNT && lines.Count <= 2
@@ -577,7 +583,9 @@ public static class PdfStructure
                 && (IsSectionPattern(trimmed) || IsStructuralHeadingWord(trimmed))
                 && !IsSeparatorText(trimmed) && !LooksLikeFigureLabel(trimmed)
                 && !LooksLikeListItem(trimmed) && !pageNumberLike)
-                headingLevel = 2;
+                headingLevel = IsSectionPattern(trimmed) && StartsWithSectionNumber(trimmed)
+                    ? InferSectionLevel(trimmed)
+                    : (byte)2;
         }
 
         bool isListItem = headingLevel is null && LooksLikeListItem(trimmed);
@@ -1220,6 +1228,64 @@ public static class PdfStructure
         if (idx < t.Length && (t[idx] == '.' || t[idx] == ')')) idx++;
         string remainder = idx < t.Length ? t.Substring(idx).TrimStart() : "";
         return remainder.Any(char.IsLetter) && remainder.Where(char.IsLetter).All(char.IsUpper);
+    }
+
+    /// <summary>
+    /// Infer a heading level for a bold/large paragraph. Section numbering wins; otherwise the
+    /// level comes from how far the font rises above body text, and a document with no body
+    /// baseline at all gets H2 rather than H1 (Rust <c>infer_bold_heading_level</c>).
+    /// </summary>
+    internal static byte InferBoldHeadingLevel(float fontSize, float bodyFontSize, string text)
+    {
+        if (StartsWithSectionNumber(text)) return InferSectionLevel(text);
+        if (bodyFontSize > 0f) return fontSize / bodyFontSize > 1.2f ? (byte)2 : (byte)3;
+        return 2;
+    }
+
+    /// <summary>
+    /// Infer heading level from section numbering depth: "1 Introduction" / "I. INTRO" /
+    /// "A. Proofs" are H2, "1.1 Details" is H3, "1.1.1 Deep" is H4
+    /// (Rust <c>infer_section_level</c>).
+    /// </summary>
+    internal static byte InferSectionLevel(string text)
+    {
+        string trimmed = text.Trim();
+        if (trimmed.Length == 0) return 2;
+
+        char firstChar = trimmed[0];
+        bool isAlphaPrefix = char.IsAsciiLetter(firstChar) && trimmed.Length >= 2
+            && trimmed[1] is '.' or ')' or ' ';
+
+        int numberingEnd;
+        if (isAlphaPrefix)
+        {
+            string afterLetter = trimmed[1..];
+            int restEnd = 0;
+            while (restEnd < afterLetter.Length
+                   && (char.IsAsciiDigit(afterLetter[restEnd]) || afterLetter[restEnd] == '.')) restEnd++;
+            if (restEnd == afterLetter.Length) restEnd = 0;
+            numberingEnd = 1 + restEnd;
+        }
+        else
+        {
+            int romanEnd = 0;
+            while (romanEnd < trimmed.Length && "IVXLCDM".IndexOf(trimmed[romanEnd]) >= 0) romanEnd++;
+            if (romanEnd > 0 && romanEnd <= 5 && romanEnd < trimmed.Length)
+            {
+                char next = trimmed[romanEnd];
+                if ((next is '.' or ' ' or ')') && IsValidRoman(trimmed[..romanEnd])) return 2;
+            }
+            int end = 0;
+            while (end < trimmed.Length && (char.IsAsciiDigit(trimmed[end]) || trimmed[end] == '.')) end++;
+            numberingEnd = end == trimmed.Length ? 0 : end;
+        }
+
+        if (numberingEnd == 0) return 2;
+
+        string numbering = trimmed[..numberingEnd];
+        int dotCount = numbering.Count(c => c == '.');
+        int effectiveDots = numbering.EndsWith('.') ? Math.Max(0, dotCount - 1) : dotCount;
+        return effectiveDots switch { 0 => (byte)2, 1 => (byte)3, _ => (byte)4 };
     }
 
     private static bool StartsWithSectionNumber(string text)
