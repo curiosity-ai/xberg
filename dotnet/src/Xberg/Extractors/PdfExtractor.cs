@@ -83,6 +83,19 @@ public sealed class PdfExtractor : IExtractor
                     doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, trimmed, 0));
             }
         }
+        // Text repair belongs to the structure pipeline (Rust `pdf/structure/pipeline.rs`
+        // runs it over the elements that pipeline assembles), not to the flat native-text
+        // split: applying it there over-corrects text whose ligatures the Rust plain path
+        // keeps, and measurably loses fixtures.
+        if (structured is not null && ReferenceEquals(doc, structured))
+        {
+            foreach (var elem in doc.Elements)
+            {
+                if (elem.Text.Length == 0) continue;
+                elem.Text = PdfTextRepair.Repair(elem.Text);
+            }
+        }
+
         doc.MimeType = mimeType;
         doc.Tables = tables;
 
