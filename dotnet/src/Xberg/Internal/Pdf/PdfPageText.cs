@@ -17,14 +17,16 @@ public static class PdfPageText
     private const int MinDisorderCount = 3;
     private const double CoalesceThreshold = 5.0;
 
-    /// <summary>Sort spans into ColumnAware reading order and assemble into text.</summary>
-    public static string Assemble(List<TextSpan> spans) => AssembleOrdered(OrderViaRuns(spans));
+    /// <summary>Sort spans into ColumnAware reading order and assemble into text.
+    /// <paramref name="pageWidth"/> enables the two-column repair; pass 0 when unknown.</summary>
+    public static string Assemble(List<TextSpan> spans, double pageWidth = 0)
+        => AssembleOrdered(OrderViaRuns(spans, pageWidth));
 
     /// <summary>Assemble + line segments from ONE ordering pass (the ordering —
-    /// presort, run merge, XY-cut — dominates cost on large documents).</summary>
-    public static (string text, List<LineSeg> lines) AssembleWithLines(List<TextSpan> spans)
+    /// presort, run merge, XY-cut, column repair — dominates cost on large documents).</summary>
+    public static (string text, List<LineSeg> lines) AssembleWithLines(List<TextSpan> spans, double pageWidth = 0)
     {
-        var ordering = OrderViaRuns(spans);
+        var ordering = OrderViaRuns(spans, pageWidth);
         return (AssembleOrdered(ordering), BuildLineSegmentsOrdered(ordering));
     }
 
@@ -73,7 +75,7 @@ public static class PdfPageText
     // extractors/text.rs), order the runs with XY-cut, then flatten back to the original
     // spans in run order. Runs are used ONLY for reading-order geometry; assembly still
     // walks the original spans so spacing/line-break decisions are unchanged.
-    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(List<TextSpan> spans)
+    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(List<TextSpan> spans, double pageWidth = 0)
     {
         // pdf_oxide sorts spans into reading order (rounded-Y descending, X
         // ascending, column-aware) BEFORE merge_adjacent_spans (extractors/
@@ -138,6 +140,13 @@ public static class PdfPageText
         for (int r = 0; r < runs.Count; r++) memberOf[runs[r]] = members[r];
 
         var orderedRuns = PdfReadingOrder.Order(runs);
+
+        // Two-column repair runs on the merged runs, after the XY-cut and before assembly —
+        // the position Rust applies it in `extract_page_text_column_aware`. The XY-cut does
+        // not split every dense two-column body, and once the assembler has interleaved the
+        // columns no downstream pass can separate them again.
+        PdfColumnReorder.Apply(orderedRuns, pageWidth);
+
         var result = new List<TextSpan>(spans.Count);
         foreach (var run in orderedRuns)
         {
@@ -155,10 +164,10 @@ public static class PdfPageText
 
     /// <summary>Return spans in ColumnAware (XY-cut) reading order — the ordering the
     /// structure/heading pipeline consumes (mirrors pdf_oxide ReadingOrder::ColumnAware).</summary>
-    public static List<TextSpan> OrderColumnAware(List<TextSpan> spans)
+    public static List<TextSpan> OrderColumnAware(List<TextSpan> spans, double pageWidth = 0)
     {
         if (spans.Count == 0) return new List<TextSpan>();
-        var (ordered, _) = OrderViaRuns(spans);
+        var (ordered, _) = OrderViaRuns(spans, pageWidth);
         return ordered;
     }
 

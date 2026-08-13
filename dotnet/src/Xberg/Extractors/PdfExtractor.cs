@@ -164,7 +164,8 @@ public sealed class PdfExtractor : IExtractor
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
-                    (pageText, var lines) = PdfPageText.AssembleWithLines(spans);
+                    var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
+                    (pageText, var lines) = PdfPageText.AssembleWithLines(spans, Math.Abs(mbUrx - mbLlx));
                     segs = PdfStructure.SegmentsFromLines(lines);
                 }
                 // AcroForm: interactive text-field values are stored as the widget's /V and are
