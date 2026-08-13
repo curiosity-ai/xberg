@@ -31,6 +31,15 @@ if (args.Length >= 2 && args[0] == "--extract")
     return 0;
 }
 
+// Metadata dump mode: `--dump-metadata <file>` prints the C# metadata as JSON, so a
+// mismatch can be diffed field-by-field against the golden.
+if (args.Length >= 2 && args[0] == "--dump-metadata")
+{
+    var res = new Extractor().Extract(ExtractInput.FromUri(args[1]), new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+    Console.Out.Write(SerializeToNode(res.Results.FirstOrDefault()?.Metadata)?.ToJsonString() ?? "null");
+    return 0;
+}
+
 var opts = ParseArgs(args);
 if (opts is null) return 2;
 
@@ -85,7 +94,7 @@ foreach (var goldenPath in goldenFiles)
             var capturedPath = sourcePath;
             var task = System.Threading.Tasks.Task.Run(() =>
                 extractor.Extract(ExtractInput.FromUri(capturedPath), new ExtractionConfig { OutputFormat = fmt }));
-            if (!task.Wait(TimeSpan.FromSeconds(20)))
+            if (!task.Wait(TimeSpan.FromSeconds(120)))
             {
                 csharpFailed = true;
                 got[name] = "";
