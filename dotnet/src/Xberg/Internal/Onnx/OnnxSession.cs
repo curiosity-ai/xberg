@@ -24,10 +24,16 @@ internal sealed class OnnxSession
     /// <summary>For each node index, the values whose last use is that node.</summary>
     private readonly List<string>[] _lastUse;
 
-    public OnnxSession(OnnxModel model)
+    /// <param name="optimize">
+    /// Rewrite the graph before executing it (see <see cref="GraphOptimizer"/>). Fusing
+    /// removes intermediate values, so the parity harness turns this off when it needs to
+    /// compare every node against a reference dump; whole-graph outputs are unaffected either
+    /// way.
+    /// </param>
+    public OnnxSession(OnnxModel model, bool optimize = true)
     {
-        _model = model;
-        _lastUse = ComputeLastUse(model);
+        _model = optimize ? GraphOptimizer.Optimize(model) : model;
+        _lastUse = ComputeLastUse(_model);
     }
 
     public static OnnxSession Load(string path) => new(OnnxModel.Load(path));
@@ -59,13 +65,25 @@ internal sealed class OnnxSession
         Run(feeds, capture, profile: null);
 
     /// <summary>
-    /// Run the graph, optionally capturing intermediates and/or accumulating per-operator
-    /// timings into <paramref name="profile"/> (microseconds, keyed by op type).
+    /// Per-node timings from one execution, for attributing runtime to individual nodes
+    /// rather than to operator types. An aggregate says <c>Conv</c> is expensive; only the
+    /// per-node view says <em>which</em> convolution, at what shape, and therefore what to do
+    /// about it.
+    /// </summary>
+    public sealed class ExecutionProfile
+    {
+        public required double[] NodeMicroseconds { get; init; }
+        /// <summary>First output's shape per node, for reading the cost alongside the size.</summary>
+        public required string[] NodeOutputShapes { get; init; }
+    }
+
+    /// <summary>
+    /// Run the graph, optionally capturing intermediates and/or recording per-node timings.
     /// </summary>
     public Dictionary<string, Tensor> Run(
         IReadOnlyDictionary<string, Tensor> feeds,
         Dictionary<string, Tensor>? capture,
-        Dictionary<string, double>? profile)
+        ExecutionProfile? profile)
     {
         var env = new Dictionary<string, Tensor>(StringComparer.Ordinal);
         foreach (var (name, tensor) in _model.Initializers) env[name] = tensor;
@@ -96,9 +114,11 @@ internal sealed class OnnxSession
 
             if (profile is not null)
             {
-                double microseconds = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks)
-                                      * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
-                profile[node.OpType] = profile.GetValueOrDefault(node.OpType) + microseconds;
+                profile.NodeMicroseconds[i] = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks)
+                                              * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                profile.NodeOutputShapes[i] = outputs.Length > 0 && outputs[0] is { } first
+                    ? $"[{string.Join(",", first.Shape)}]"
+                    : "";
             }
 
             for (int o = 0; o < node.Outputs.Length && o < outputs.Length; o++)
@@ -345,7 +365,7 @@ internal sealed class OnnxSession
                 return [Convolution.Conv(
                     Required(node, env, 0), Required(node, env, 1), Optional(node, env, 2),
                     node.AttrInts("strides"), node.AttrInts("pads"), node.AttrInts("dilations"),
-                    node.AttrInt("group", 1), node.AttrString("auto_pad", "NOTSET"))];
+                    node.AttrInt("group", 1), node.AttrString("auto_pad", "NOTSET"), node.Activation)];
 
             case "BatchNormalization":
                 return [Convolution.BatchNormalization(

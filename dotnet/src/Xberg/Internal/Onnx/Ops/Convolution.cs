@@ -23,7 +23,8 @@ internal static class Convolution
 
     public static Tensor Conv(
         Tensor x, Tensor weight, Tensor? bias,
-        long[]? strides, long[]? pads, long[]? dilations, long group, string autoPad)
+        long[]? strides, long[]? pads, long[]? dilations, long group, string autoPad,
+        FusedActivation activation = FusedActivation.None)
     {
         var fx = x.AsFloat();
         var fw = weight.AsFloat();
@@ -64,7 +65,7 @@ internal static class Convolution
             ConvIm2Col(fx, fw, result, batch, channels, height, width, outH, outW,
                 kh, kw, strideH, strideW, dilationH, dilationW, pad, filters, inPerGroup, g);
 
-        if (bias is not null) AddBiasPerChannel(result, bias.AsFloat(), batch, filters, outH * outW);
+        ApplyBiasAndActivation(result, bias?.AsFloat(), activation, batch, filters, outH * outW);
         return result;
     }
 
@@ -171,48 +172,77 @@ internal static class Convolution
         int patch = inPerGroup * kh * kw;
         int spatial = outH * outW;
 
-        // The unrolled buffer is the largest allocation in the whole model — a 3x3 layer over
-        // 256 channels at 80x80 needs 59 MB — and every convolution would otherwise allocate
-        // and discard one. Renting keeps it off the heap's hot path entirely.
-        float[] column = ArrayPool<float>.Shared.Rent(patch * spatial);
-        try
-        {
-            for (int n = 0; n < batch; n++)
-            {
-                for (int g = 0; g < groups; g++)
-                {
-                    Im2Col(x.Floats, column, patch * spatial, n, channels, g * inPerGroup, inPerGroup,
-                        height, width, outH, outW, kh, kw, strideH, strideW, dilationH, dilationW, pad);
+        // Unrolling the whole layer at once would be the largest allocation in the model — a
+        // 3x3 layer over 32 channels at 320x320 output needs 118 MB — and every byte of it
+        // would be written to memory and read straight back. Unrolling a tile of output
+        // pixels instead keeps the buffer inside L2, so it never reaches the memory bus. The
+        // tile is also the unit of parallelism: tiles write disjoint output columns.
+        int tile = Math.Clamp(TargetTileBytes / (patch * sizeof(float)), MinTile, spatial);
+        tile = Math.Min(tile, spatial);
+        int tiles = (spatial + tile - 1) / tile;
 
-                    var weights = w.Floats.AsMemory(g * outPerGroup * patch, outPerGroup * patch);
-                    var output = result.Floats.AsMemory((n * filters + g * outPerGroup) * spatial, outPerGroup * spatial);
-                    // A rented array may be longer than requested; the product must see exactly
-                    // the logical extent or its row indexing is wrong.
-                    Linear.MultiplyInto(weights, column.AsMemory(0, patch * spatial), output,
-                        outPerGroup, patch, spatial);
-                }
+        for (int n = 0; n < batch; n++)
+        {
+            for (int g = 0; g < groups; g++)
+            {
+                var weights = w.Floats.AsMemory(g * outPerGroup * patch, outPerGroup * patch);
+                int outputBase = (n * filters + g * outPerGroup) * spatial;
+                int capturedN = n, capturedG = g;
+
+                Parallel.For(0, tiles, t =>
+                {
+                    int start = t * tile;
+                    int length = Math.Min(tile, spatial - start);
+                    float[] column = ArrayPool<float>.Shared.Rent(patch * length);
+                    try
+                    {
+                        Im2ColTile(x.Floats, column, capturedN, channels, capturedG * inPerGroup, inPerGroup,
+                            height, width, outH, outW, kh, kw, strideH, strideW, dilationH, dilationW, pad,
+                            start, length);
+
+                        // Rows of this tile's result are `spatial` apart in the full output,
+                        // and the tile loop is already parallel, so the multiply runs serially.
+                        Linear.MultiplyInto(
+                            weights, column.AsMemory(0, patch * length),
+                            result.Floats.AsMemory(outputBase + start, (outPerGroup - 1) * spatial + length),
+                            outPerGroup, patch, length, spatial, parallel: false);
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(column);
+                    }
+                });
             }
         }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(column);
-        }
     }
+
+    /// <summary>Bytes of unrolled receptive field to hold in cache at once, per tile.</summary>
+    private const int TargetTileBytes = 512 * 1024;
+
+    /// <summary>Smallest worthwhile tile, so a very deep patch does not degenerate to one
+    /// output pixel per multiply.</summary>
+    private const int MinTile = 128;
 
     /// <summary>
     /// Fill <paramref name="column"/> so that row <c>(c,ky,kx)</c> holds the input value that
     /// kernel tap contributes to each output pixel, in output-pixel order.
     /// </summary>
-    private static void Im2Col(
-        float[] src, float[] column, int columnLength, int n, int channels, int channelStart, int channelCount,
+    /// <summary>
+    /// Unroll the receptive fields of output pixels <c>[start, start+length)</c> into
+    /// <paramref name="column"/>, laid out as <c>[patch, length]</c>.
+    /// <para>
+    /// Every element is written — either a source value or an explicit zero for a tap that
+    /// falls in the padding — so the buffer needs no pre-clearing. That matters: clearing was
+    /// a second full pass over a buffer that is, for the early layers, larger than the layer's
+    /// own input.
+    /// </para>
+    /// </summary>
+    private static void Im2ColTile(
+        float[] src, float[] column, int n, int channels, int channelStart, int channelCount,
         int height, int width, int outH, int outW, int kh, int kw,
-        int strideH, int strideW, int dilationH, int dilationW, Padding pad)
+        int strideH, int strideW, int dilationH, int dilationW, Padding pad,
+        int start, int length)
     {
-        int spatial = outH * outW;
-        // Only the logical extent: a rented buffer is often larger, and clearing the surplus
-        // would cost more than the convolution on small layers.
-        Array.Clear(column, 0, columnLength);
-
         for (int c = 0; c < channelCount; c++)
         {
             int srcPlane = (n * channels + channelStart + c) * height * width;
@@ -220,42 +250,98 @@ internal static class Convolution
             {
                 for (int kx = 0; kx < kw; kx++)
                 {
-                    int row = ((c * kh + ky) * kw + kx) * spatial;
-                    for (int oy = 0; oy < outH; oy++)
-                    {
-                        int iy = oy * strideH - pad.Top + ky * dilationH;
-                        if ((uint)iy >= (uint)height) continue;
-                        int srcRow = srcPlane + iy * width;
-                        int dstRow = row + oy * outW;
+                    int row = ((c * kh + ky) * kw + kx) * length;
+                    int ixStart = -pad.Left + kx * dilationW;
 
-                        // Unit stride and no horizontal clipping: the whole row copies at once.
-                        int ixStart = -pad.Left + kx * dilationW;
-                        if (strideW == 1 && ixStart >= 0 && ixStart + outW <= width)
+                    int position = 0;
+                    while (position < length)
+                    {
+                        int pixel = start + position;
+                        int oy = pixel / outW;
+                        int ox = pixel - oy * outW;
+                        // How much of this output row is still inside the tile.
+                        int run = Math.Min(outW - ox, length - position);
+
+                        int iy = oy * strideH - pad.Top + ky * dilationH;
+                        if ((uint)iy >= (uint)height)
                         {
-                            src.AsSpan(srcRow + ixStart, outW).CopyTo(column.AsSpan(dstRow, outW));
+                            column.AsSpan(row + position, run).Clear();
+                            position += run;
                             continue;
                         }
-                        for (int ox = 0; ox < outW; ox++)
+
+                        int srcRow = srcPlane + iy * width;
+                        int firstIx = ox * strideW + ixStart;
+                        int lastIx = (ox + run - 1) * strideW + ixStart;
+
+                        // Unit stride with the whole run inside the image: one contiguous copy.
+                        if (strideW == 1 && firstIx >= 0 && lastIx < width)
                         {
-                            int ix = ox * strideW + ixStart;
-                            if ((uint)ix < (uint)width) column[dstRow + ox] = src[srcRow + ix];
+                            src.AsSpan(srcRow + firstIx, run).CopyTo(column.AsSpan(row + position, run));
                         }
+                        else
+                        {
+                            for (int i = 0; i < run; i++)
+                            {
+                                int ix = (ox + i) * strideW + ixStart;
+                                column[row + position + i] = (uint)ix < (uint)width ? src[srcRow + ix] : 0f;
+                            }
+                        }
+                        position += run;
                     }
                 }
             }
         }
     }
 
-    /// <summary>Add a per-channel bias across every spatial plane.</summary>
-    private static void AddBiasPerChannel(Tensor result, Tensor bias, int batch, int channels, int spatial)
+    /// <summary>
+    /// Apply the per-channel bias and any fused activation in a single pass over each plane.
+    /// <para>
+    /// Keeping these together is the point of fusing them. As separate graph nodes the bias
+    /// and the activation each stream the whole activation tensor through memory and write a
+    /// fresh one back; done here, the plane is already in cache from the multiply that
+    /// produced it, and no intermediate is materialised at all.
+    /// </para>
+    /// </summary>
+    private static void ApplyBiasAndActivation(
+        Tensor result, Tensor? bias, FusedActivation activation, int batch, int channels, int spatial)
     {
-        for (int n = 0; n < batch; n++)
+        if (bias is null && activation == FusedActivation.None) return;
+
+        Parallel.For(0, batch * channels, plane =>
         {
-            for (int c = 0; c < channels; c++)
+            var span = result.Floats.AsSpan(plane * spatial, spatial);
+            if (bias is not null) TensorPrimitives.Add(span, bias.Floats[plane % channels], span);
+
+            switch (activation)
             {
-                var plane = result.Floats.AsSpan((n * channels + c) * spatial, spatial);
-                TensorPrimitives.Add(plane, bias.Floats[c], plane);
+                case FusedActivation.Relu:
+                    TensorPrimitives.Max(span, 0f, span);
+                    break;
+                case FusedActivation.Sigmoid:
+                    TensorPrimitives.Sigmoid(span, span);
+                    break;
+                case FusedActivation.SiLU:
+                    SiLUInPlace(span);
+                    break;
             }
+        });
+    }
+
+    /// <summary>
+    /// <c>x * sigmoid(x)</c> in place, using a stack buffer for the sigmoid so the whole
+    /// activation is never duplicated.
+    /// </summary>
+    private static void SiLUInPlace(Span<float> span)
+    {
+        const int ChunkSize = 1024;
+        Span<float> scratch = stackalloc float[ChunkSize];
+        for (int offset = 0; offset < span.Length; offset += ChunkSize)
+        {
+            var chunk = span.Slice(offset, Math.Min(ChunkSize, span.Length - offset));
+            var buffer = scratch[..chunk.Length];
+            TensorPrimitives.Sigmoid(chunk, buffer);
+            TensorPrimitives.Multiply(chunk, buffer, chunk);
         }
     }
 

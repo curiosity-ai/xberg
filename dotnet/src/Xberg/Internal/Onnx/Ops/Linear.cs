@@ -1,5 +1,7 @@
 using System.Numerics.Tensors;
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Xberg.Internal.Onnx.Ops;
 
@@ -131,10 +133,29 @@ internal static class Linear
     /// One <c>[m,k] x [k,n] -> [m,n]</c> product, accumulating into a zeroed destination.
     /// </summary>
     public static void MultiplyInto(
-        ReadOnlyMemory<float> a, ReadOnlyMemory<float> b, Memory<float> c, int m, int k, int n)
+        ReadOnlyMemory<float> a, ReadOnlyMemory<float> b, Memory<float> c, int m, int k, int n) =>
+        MultiplyInto(a, b, c, m, k, n, n, parallel: true);
+
+    /// <summary>
+    /// As <see cref="MultiplyInto(ReadOnlyMemory{float}, ReadOnlyMemory{float}, Memory{float}, int, int, int)"/>,
+    /// but writing into a destination whose rows are <paramref name="destinationStride"/>
+    /// apart rather than packed.
+    /// <para>
+    /// Tiled convolution needs this: it computes a slice of output <em>columns</em> at a time
+    /// and scatters each into the full-width result, so the destination rows are strided by
+    /// the whole spatial extent. <paramref name="parallel"/> is turned off when the caller is
+    /// already running one tile per thread, so the two levels do not oversubscribe.
+    /// </para>
+    /// </summary>
+    public static void MultiplyInto(
+        ReadOnlyMemory<float> a, ReadOnlyMemory<float> b, Memory<float> c,
+        int m, int k, int n, int destinationStride, bool parallel)
     {
-        c.Span.Clear();
         if (m == 0 || n == 0 || k == 0) return;
+
+        var destination = c.Span;
+        if (destinationStride == n) destination.Clear();
+        else for (int i = 0; i < m; i++) destination.Slice(i * destinationStride, n).Clear();
 
         long work = (long)m * n * k;
         int width = Vector<float>.Count;
@@ -147,11 +168,13 @@ internal static class Linear
             (n + 2 * Environment.ProcessorCount - 1) / (2 * Environment.ProcessorCount), width)));
         int panels = (n + panel - 1) / panel;
 
-        if (work >= ParallelThreshold && panels > 1)
-            Parallel.For(0, panels, index => ComputeColumnPanel(a.Span, b.Span, c.Span, m, k, n, index * panel, Math.Min(panel, n - index * panel)));
+        if (parallel && work >= ParallelThreshold && panels > 1)
+            Parallel.For(0, panels, index => ComputeColumnPanel(
+                a.Span, b.Span, c.Span, m, k, n, destinationStride, index * panel, Math.Min(panel, n - index * panel)));
         else
             for (int index = 0; index < panels; index++)
-                ComputeColumnPanel(a.Span, b.Span, c.Span, m, k, n, index * panel, Math.Min(panel, n - index * panel));
+                ComputeColumnPanel(
+                    a.Span, b.Span, c.Span, m, k, n, destinationStride, index * panel, Math.Min(panel, n - index * panel));
     }
 
     private static int RoundUp(int value, int multiple) => (value + multiple - 1) / multiple * multiple;
@@ -162,14 +185,15 @@ internal static class Linear
     /// operand slab stays resident while all the rows consume it.
     /// </summary>
     private static void ComputeColumnPanel(
-        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n, int jc, int columns)
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+        int m, int k, int n, int ldc, int jc, int columns)
     {
         int blocks = (m + RowBlock - 1) / RowBlock;
         for (int pc = 0; pc < k; pc += DepthPanel)
         {
             int depth = Math.Min(DepthPanel, k - pc);
             for (int block = 0; block < blocks; block++)
-                ComputePanel(a, b, c, m, k, n, block * RowBlock, pc, depth, jc, columns);
+                ComputePanel(a, b, c, m, k, n, ldc, block * RowBlock, pc, depth, jc, columns);
         }
     }
 
@@ -179,11 +203,11 @@ internal static class Linear
     /// </summary>
     private static void ComputePanel(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
-        int m, int k, int n, int i0, int pc, int depth, int jc, int columns)
+        int m, int k, int n, int ldc, int i0, int pc, int depth, int jc, int columns)
     {
         int rows = Math.Min(RowBlock, m - i0);
-        if (rows == RowBlock) ComputeFourRows(a, b, c, k, n, i0, pc, depth, jc, columns);
-        else for (int i = i0; i < i0 + rows; i++) AccumulateRow(a, b, c, i, k, n, pc, depth, jc, columns);
+        if (rows == RowBlock) ComputeFourRows(a, b, c, k, n, ldc, i0, pc, depth, jc, columns);
+        else for (int i = i0; i < i0 + rows; i++) AccumulateRow(a, b, c, i, k, n, ldc, pc, depth, jc, columns);
     }
 
     /// <summary>
@@ -197,69 +221,92 @@ internal static class Linear
     /// </summary>
     private static void ComputeFourRows(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
-        int k, int n, int i0, int pc, int depth, int jc, int columns)
+        int k, int n, int ldc, int i0, int pc, int depth, int jc, int columns)
     {
         int width = Vector<float>.Count;
         int a0 = i0 * k + pc, a1 = a0 + k, a2 = a1 + k, a3 = a2 + k;
-        int c0 = i0 * n, c1 = c0 + n, c2 = c1 + n, c3 = c2 + n;
+        int c0 = i0 * ldc, c1 = c0 + ldc, c2 = c1 + ldc, c3 = c2 + ldc;
         int end = jc + columns;
         int j = jc;
+
+        // Reference-based addressing rather than span slicing. Every `Slice` in the inner
+        // loop is a bounds check and a span construction, and at eight loads per iteration
+        // that overhead — not the arithmetic — was what held the kernel to a third of the
+        // machine's measured fused-multiply-add ceiling. The offsets are all derived from
+        // panel bounds the caller has already clamped.
+        ref float aRef = ref MemoryMarshal.GetReference(a);
+        ref float bRef = ref MemoryMarshal.GetReference(b);
+        ref float cRef = ref MemoryMarshal.GetReference(c);
 
         for (; j + 2 * width <= end; j += 2 * width)
         {
             // Accumulators start from C, not zero: a panel adds its share of the reduction to
             // whatever earlier depth panels already contributed.
-            var acc00 = new Vector<float>(c.Slice(c0 + j, width));
-            var acc01 = new Vector<float>(c.Slice(c0 + j + width, width));
-            var acc10 = new Vector<float>(c.Slice(c1 + j, width));
-            var acc11 = new Vector<float>(c.Slice(c1 + j + width, width));
-            var acc20 = new Vector<float>(c.Slice(c2 + j, width));
-            var acc21 = new Vector<float>(c.Slice(c2 + j + width, width));
-            var acc30 = new Vector<float>(c.Slice(c3 + j, width));
-            var acc31 = new Vector<float>(c.Slice(c3 + j + width, width));
+            var acc00 = Vector.LoadUnsafe(ref cRef, (nuint)(c0 + j));
+            var acc01 = Vector.LoadUnsafe(ref cRef, (nuint)(c0 + j + width));
+            var acc10 = Vector.LoadUnsafe(ref cRef, (nuint)(c1 + j));
+            var acc11 = Vector.LoadUnsafe(ref cRef, (nuint)(c1 + j + width));
+            var acc20 = Vector.LoadUnsafe(ref cRef, (nuint)(c2 + j));
+            var acc21 = Vector.LoadUnsafe(ref cRef, (nuint)(c2 + j + width));
+            var acc30 = Vector.LoadUnsafe(ref cRef, (nuint)(c3 + j));
+            var acc31 = Vector.LoadUnsafe(ref cRef, (nuint)(c3 + j + width));
 
-            for (int p = 0; p < depth; p++)
+            int bRow = pc * n + j;
+            for (int p = 0; p < depth; p++, bRow += n)
             {
-                int bRow = (pc + p) * n + j;
-                var b0 = new Vector<float>(b.Slice(bRow, width));
-                var b1 = new Vector<float>(b.Slice(bRow + width, width));
+                var b0 = Vector.LoadUnsafe(ref bRef, (nuint)bRow);
+                var b1 = Vector.LoadUnsafe(ref bRef, (nuint)(bRow + width));
 
-                var s0 = new Vector<float>(a[a0 + p]);
-                var s1 = new Vector<float>(a[a1 + p]);
-                var s2 = new Vector<float>(a[a2 + p]);
-                var s3 = new Vector<float>(a[a3 + p]);
+                var s0 = new Vector<float>(Unsafe.Add(ref aRef, a0 + p));
+                var s1 = new Vector<float>(Unsafe.Add(ref aRef, a1 + p));
+                var s2 = new Vector<float>(Unsafe.Add(ref aRef, a2 + p));
+                var s3 = new Vector<float>(Unsafe.Add(ref aRef, a3 + p));
 
-                acc00 += s0 * b0; acc01 += s0 * b1;
-                acc10 += s1 * b0; acc11 += s1 * b1;
-                acc20 += s2 * b0; acc21 += s2 * b1;
-                acc30 += s3 * b0; acc31 += s3 * b1;
+                // Explicitly fused, not `acc += s * b`. The JIT will not contract a multiply
+                // and an add into an FMA on its own — doing so would change the rounding —
+                // and measured on this hardware the fused form is several times the
+                // throughput of the separate pair. It is also what ONNX Runtime's kernels
+                // emit, so the single-rounding result is the closer match, not the looser one.
+                acc00 = Vector.FusedMultiplyAdd(s0, b0, acc00);
+                acc01 = Vector.FusedMultiplyAdd(s0, b1, acc01);
+                acc10 = Vector.FusedMultiplyAdd(s1, b0, acc10);
+                acc11 = Vector.FusedMultiplyAdd(s1, b1, acc11);
+                acc20 = Vector.FusedMultiplyAdd(s2, b0, acc20);
+                acc21 = Vector.FusedMultiplyAdd(s2, b1, acc21);
+                acc30 = Vector.FusedMultiplyAdd(s3, b0, acc30);
+                acc31 = Vector.FusedMultiplyAdd(s3, b1, acc31);
             }
 
-            acc00.CopyTo(c.Slice(c0 + j, width)); acc01.CopyTo(c.Slice(c0 + j + width, width));
-            acc10.CopyTo(c.Slice(c1 + j, width)); acc11.CopyTo(c.Slice(c1 + j + width, width));
-            acc20.CopyTo(c.Slice(c2 + j, width)); acc21.CopyTo(c.Slice(c2 + j + width, width));
-            acc30.CopyTo(c.Slice(c3 + j, width)); acc31.CopyTo(c.Slice(c3 + j + width, width));
+            acc00.StoreUnsafe(ref cRef, (nuint)(c0 + j));
+            acc01.StoreUnsafe(ref cRef, (nuint)(c0 + j + width));
+            acc10.StoreUnsafe(ref cRef, (nuint)(c1 + j));
+            acc11.StoreUnsafe(ref cRef, (nuint)(c1 + j + width));
+            acc20.StoreUnsafe(ref cRef, (nuint)(c2 + j));
+            acc21.StoreUnsafe(ref cRef, (nuint)(c2 + j + width));
+            acc30.StoreUnsafe(ref cRef, (nuint)(c3 + j));
+            acc31.StoreUnsafe(ref cRef, (nuint)(c3 + j + width));
         }
 
         // One vector-wide strip, then whatever scalar tail is left.
         for (; j + width <= end; j += width)
         {
-            var acc0 = new Vector<float>(c.Slice(c0 + j, width));
-            var acc1 = new Vector<float>(c.Slice(c1 + j, width));
-            var acc2 = new Vector<float>(c.Slice(c2 + j, width));
-            var acc3 = new Vector<float>(c.Slice(c3 + j, width));
-            for (int p = 0; p < depth; p++)
+            var acc0 = Vector.LoadUnsafe(ref cRef, (nuint)(c0 + j));
+            var acc1 = Vector.LoadUnsafe(ref cRef, (nuint)(c1 + j));
+            var acc2 = Vector.LoadUnsafe(ref cRef, (nuint)(c2 + j));
+            var acc3 = Vector.LoadUnsafe(ref cRef, (nuint)(c3 + j));
+            int bRow = pc * n + j;
+            for (int p = 0; p < depth; p++, bRow += n)
             {
-                var bv = new Vector<float>(b.Slice((pc + p) * n + j, width));
-                acc0 += new Vector<float>(a[a0 + p]) * bv;
-                acc1 += new Vector<float>(a[a1 + p]) * bv;
-                acc2 += new Vector<float>(a[a2 + p]) * bv;
-                acc3 += new Vector<float>(a[a3 + p]) * bv;
+                var bv = Vector.LoadUnsafe(ref bRef, (nuint)bRow);
+                acc0 = Vector.FusedMultiplyAdd(new Vector<float>(Unsafe.Add(ref aRef, a0 + p)), bv, acc0);
+                acc1 = Vector.FusedMultiplyAdd(new Vector<float>(Unsafe.Add(ref aRef, a1 + p)), bv, acc1);
+                acc2 = Vector.FusedMultiplyAdd(new Vector<float>(Unsafe.Add(ref aRef, a2 + p)), bv, acc2);
+                acc3 = Vector.FusedMultiplyAdd(new Vector<float>(Unsafe.Add(ref aRef, a3 + p)), bv, acc3);
             }
-            acc0.CopyTo(c.Slice(c0 + j, width));
-            acc1.CopyTo(c.Slice(c1 + j, width));
-            acc2.CopyTo(c.Slice(c2 + j, width));
-            acc3.CopyTo(c.Slice(c3 + j, width));
+            acc0.StoreUnsafe(ref cRef, (nuint)(c0 + j));
+            acc1.StoreUnsafe(ref cRef, (nuint)(c1 + j));
+            acc2.StoreUnsafe(ref cRef, (nuint)(c2 + j));
+            acc3.StoreUnsafe(ref cRef, (nuint)(c3 + j));
         }
 
         for (; j < end; j++)
@@ -284,9 +331,9 @@ internal static class Linear
     /// <see cref="RowBlock"/>.</summary>
     private static void AccumulateRow(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
-        int i, int k, int n, int pc, int depth, int jc, int columns)
+        int i, int k, int n, int ldc, int pc, int depth, int jc, int columns)
     {
-        var row = c.Slice(i * n + jc, columns);
+        var row = c.Slice(i * ldc + jc, columns);
         int aBase = i * k + pc;
         for (int p = 0; p < depth; p++)
         {

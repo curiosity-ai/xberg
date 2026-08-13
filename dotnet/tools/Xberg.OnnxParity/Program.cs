@@ -24,6 +24,85 @@ internal static class Program
 
     private sealed record NodeInfo(int Index, string Name, string OpType, string[] Inputs, string[] Outputs);
 
+    /// <summary>Warm-up executions discarded before timing anything.</summary>
+    /// <remarks>
+    /// .NET starts methods in a quick-JIT tier and only promotes them to optimised code after
+    /// roughly thirty invocations, and a graph this size also has to fault in 169 MB of
+    /// weights and spin up the thread pool. Timing before that settles measures the compiler,
+    /// not the runtime. Three full passes put every kernel well past the promotion threshold,
+    /// since each pass invokes them dozens to hundreds of times.
+    /// </remarks>
+    private const int WarmupRuns = 3;
+
+    /// <summary>
+    /// Time whole-model inference and attribute the result to individual nodes.
+    /// </summary>
+    private static void BenchmarkModel(OnnxModel rawModel, Dictionary<string, Tensor> feeds, int runs)
+    {
+        // Benchmarking measures the path a real caller takes, which is the optimised graph.
+        var optimized = GraphOptimizer.Optimize(rawModel);
+        var session = new OnnxSession(optimized, optimize: false);
+        var model = optimized;
+        Console.WriteLine($"graph optimisation: {rawModel.Nodes.Length} nodes -> {model.Nodes.Length} " +
+                          $"({rawModel.Nodes.Length - model.Nodes.Length} fused away)");
+
+        for (int i = 0; i < WarmupRuns; i++) session.Run(feeds);
+
+        var stopwatch = new Stopwatch();
+        var timings = new List<double>(runs);
+        for (int run = 0; run < runs; run++)
+        {
+            stopwatch.Restart();
+            session.Run(feeds);
+            timings.Add(stopwatch.Elapsed.TotalMilliseconds);
+        }
+        timings.Sort();
+        Console.WriteLine();
+        Console.WriteLine(
+            $"inference over {runs} runs (after {WarmupRuns} warm-up runs): " +
+            $"median {timings[timings.Count / 2]:F0} ms, best {timings[0]:F0} ms, worst {timings[^1]:F0} ms");
+
+        var profile = new OnnxSession.ExecutionProfile
+        {
+            NodeMicroseconds = new double[model.Nodes.Length],
+            NodeOutputShapes = new string[model.Nodes.Length],
+        };
+        session.Run(feeds, capture: null, profile);
+
+        double total = profile.NodeMicroseconds.Sum();
+        Console.WriteLine();
+        Console.WriteLine($"by operator ({total / 1000:F0} ms attributed):");
+        var byOperator = new Dictionary<string, (double Time, int Count)>(StringComparer.Ordinal);
+        for (int i = 0; i < model.Nodes.Length; i++)
+        {
+            var entry = byOperator.GetValueOrDefault(model.Nodes[i].OpType);
+            byOperator[model.Nodes[i].OpType] = (entry.Time + profile.NodeMicroseconds[i], entry.Count + 1);
+        }
+        foreach (var (op, entry) in byOperator.OrderByDescending(p => p.Value.Time).Take(10))
+            Console.WriteLine($"  {op,-20} {entry.Time / 1000,8:F1} ms  {entry.Time / total,6:P1}  " +
+                              $"over {entry.Count} nodes");
+
+        Console.WriteLine();
+        Console.WriteLine("hottest individual nodes:");
+        var hottest = Enumerable.Range(0, model.Nodes.Length)
+            .OrderByDescending(i => profile.NodeMicroseconds[i])
+            .Take(15);
+        foreach (int i in hottest)
+        {
+            var node = model.Nodes[i];
+            Console.WriteLine($"  #{i,-5} {node.OpType,-16} {profile.NodeMicroseconds[i] / 1000,7:F1} ms  " +
+                              $"out {profile.NodeOutputShapes[i],-22} {node.Name}");
+        }
+
+        // How much of the graph is doing nothing measurable: shape arithmetic and other
+        // scalar bookkeeping that could be folded away entirely rather than made faster.
+        int trivial = profile.NodeMicroseconds.Count(t => t < 10);
+        double trivialTime = profile.NodeMicroseconds.Where(t => t < 10).Sum();
+        Console.WriteLine();
+        Console.WriteLine($"{trivial} of {model.Nodes.Length} nodes take under 10 us each " +
+                          $"({trivialTime / 1000:F1} ms, {trivialTime / total:P1} of runtime)");
+    }
+
     /// <summary>
     /// Time the matrix-multiply kernel on the shapes RT-DETR's convolutions actually lower
     /// to, so its throughput can be judged directly rather than inferred from whole-model
@@ -31,10 +110,6 @@ internal static class Program
     /// </summary>
     private static void BenchmarkGemm()
     {
-        Console.WriteLine($"Vector<float>.Count = {Vector<float>.Count}, " +
-                          $"hardware accelerated = {Vector.IsHardwareAccelerated}, " +
-                          $"cores = {Environment.ProcessorCount}");
-
         (string Label, int M, int K, int N)[] shapes =
         [
             ("1x1 conv  256->256 @160x160", 256, 256, 25600),
@@ -53,7 +128,7 @@ internal static class Program
             for (int i = 0; i < a.Length; i++) a[i] = (float)random.NextDouble();
             for (int i = 0; i < b.Length; i++) b[i] = (float)random.NextDouble();
 
-            Linear.MultiplyInto(a, b, c, m, k, n);   // warm up
+            for (int i = 0; i < WarmupRuns; i++) Linear.MultiplyInto(a, b, c, m, k, n);
 
             var stopwatch = Stopwatch.StartNew();
             const int repeats = 5;
@@ -96,6 +171,17 @@ internal static class Program
                     Console.Error.WriteLine($"unknown argument '{args[i]}'");
                     return 2;
             }
+        }
+
+        // Any timing at all is preceded by the machine description and a fresh calibration:
+        // these runs happen on a VM whose host can change underneath us, and without a
+        // re-measured hardware ceiling a slower host is indistinguishable from a regression.
+        if (gemmBenchmark || benchmarkRuns > 0)
+        {
+            MachineProbe.PrintMachine();
+            Console.WriteLine();
+            MachineProbe.Calibrate();
+            Console.WriteLine();
         }
 
         if (gemmBenchmark)
@@ -151,7 +237,9 @@ internal static class Program
             feeds[name] = NpyFile.Load(Path.Combine(referenceDir, reference.File));
         }
 
-        var session = new OnnxSession(model);
+        // Fusion removes the intermediate values the per-node comparison is built on, so the
+        // harness executes the graph verbatim.
+        var session = new OnnxSession(model, optimize: false);
 
         if (isolateOp is not null)
             return IsolateOperator(model, session, isolateOp, tensors, referenceDir,
@@ -159,27 +247,7 @@ internal static class Program
 
         if (benchmarkRuns > 0)
         {
-            // Without capture, so intermediates are released as they die — the mode a real
-            // caller runs in, and the only one whose timing means anything.
-            session.Run(feeds);   // warm up: JIT, weight pages, thread pool
-            var timings = new List<long>(benchmarkRuns);
-            for (int run = 0; run < benchmarkRuns; run++)
-            {
-                stopwatch.Restart();
-                session.Run(feeds);
-                timings.Add(stopwatch.ElapsedMilliseconds);
-            }
-            timings.Sort();
-            Console.WriteLine(
-                $"inference over {benchmarkRuns} runs: median {timings[timings.Count / 2]} ms, " +
-                $"best {timings[0]} ms, worst {timings[^1]} ms");
-
-            var profile = new Dictionary<string, double>(StringComparer.Ordinal);
-            session.Run(feeds, capture: null, profile);
-            double total = profile.Values.Sum();
-            Console.WriteLine($"per-operator breakdown of one run ({total / 1000:F0} ms total):");
-            foreach (var (op, microseconds) in profile.OrderByDescending(p => p.Value).Take(12))
-                Console.WriteLine($"  {op,-20} {microseconds / 1000,8:F1} ms  {microseconds / total:P1}");
+            BenchmarkModel(model, feeds, benchmarkRuns);
             return 0;
         }
 
@@ -205,7 +273,20 @@ internal static class Program
             model, capture, tensors, referenceDir, absoluteTolerance, relativeTolerance, reportLimit);
 
         if (detectionThreshold is { } threshold)
-            return CompareDetections(model, capture, tensors, referenceDir, threshold) ? 0 : 1;
+        {
+            bool unfusedOk = CompareDetections(model, capture, tensors, referenceDir, threshold, "unfused");
+
+            // Fusion rewrites the graph, so it has to be checked on its own terms: the
+            // intermediate values it removes no longer exist to compare, but the declared
+            // outputs do, and those are what a caller actually receives.
+            Console.WriteLine();
+            var fused = GraphOptimizer.Optimize(model);
+            Console.WriteLine($"fused graph: {model.Nodes.Length} nodes -> {fused.Nodes.Length}");
+            var fusedOutputs = new OnnxSession(fused, optimize: false).Run(feeds);
+            bool fusedOk = CompareDetections(model, fusedOutputs, tensors, referenceDir, threshold, "fused");
+
+            return unfusedOk && fusedOk ? 0 : 1;
+        }
 
         return failures == 0 ? 0 : 1;
     }
@@ -383,7 +464,8 @@ internal static class Program
         Dictionary<string, Tensor> capture,
         Dictionary<string, ReferenceTensor> tensors,
         string referenceDir,
-        float threshold)
+        float threshold,
+        string label)
     {
         var outputNames = model.Outputs.Select(o => o.Name).ToArray();
         var actual = new Dictionary<string, Tensor>(StringComparer.Ordinal);
@@ -403,7 +485,8 @@ internal static class Program
         var theirs = Decode(expected, outputNames, threshold);
 
         Console.WriteLine();
-        Console.WriteLine($"detections at threshold {threshold:F2}: reference {theirs.Count}, C# {mine.Count}");
+        Console.WriteLine($"detections at threshold {threshold:F2} ({label}): " +
+                          $"reference {theirs.Count}, C# {mine.Count}");
 
         int matched = 0;
         int rows = Math.Max(mine.Count, theirs.Count);
@@ -418,8 +501,8 @@ internal static class Program
 
         bool ok = matched == rows && rows > 0;
         Console.WriteLine(ok
-            ? $"all {rows} detections agree in class, confidence and geometry"
-            : $"{matched}/{rows} detections agree");
+            ? $"all {rows} detections agree in class, confidence and geometry ({label})"
+            : $"{matched}/{rows} detections agree ({label})");
         return ok;
     }
 

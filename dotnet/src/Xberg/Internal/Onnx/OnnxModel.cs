@@ -32,6 +32,17 @@ internal sealed class OnnxAttribute
     public Tensor? Tensor;
 }
 
+/// <summary>An activation folded into the producing node, applied as part of its output pass.</summary>
+internal enum FusedActivation
+{
+    None,
+    Relu,
+    Sigmoid,
+    /// <summary>SiLU / swish: <c>x * sigmoid(x)</c>, which these graphs spell as a
+    /// <c>Sigmoid</c> and a <c>Mul</c> sharing one producer.</summary>
+    SiLU,
+}
+
 /// <summary>One graph node: an operator instance with named inputs and outputs.</summary>
 internal sealed class OnnxNode
 {
@@ -41,6 +52,20 @@ internal sealed class OnnxNode
     public string[] Inputs = [];
     public string[] Outputs = [];
     public OnnxAttribute[] Attributes = [];
+
+    /// <summary>Activation fused into this node by <see cref="GraphOptimizer"/>, if any.</summary>
+    public FusedActivation Activation = FusedActivation.None;
+
+    public OnnxNode Clone() => new()
+    {
+        Name = Name,
+        OpType = OpType,
+        Domain = Domain,
+        Inputs = (string[])Inputs.Clone(),
+        Outputs = (string[])Outputs.Clone(),
+        Attributes = Attributes,
+        Activation = Activation,
+    };
 
     public OnnxAttribute? Attr(string name)
     {
