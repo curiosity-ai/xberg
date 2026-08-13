@@ -46,6 +46,8 @@ public sealed class PdfExtractor : IExtractor
 
         // --- Metadata ---
         var meta = PdfMetadataExtractor.Extract(pdf);
+        // Advisory: a document we cannot grade reports no scan evidence.
+        var scanDetection = PdfScanDetect.Detect(pdf);
 
         // --- Tables (text-layer heuristic tier) ---
         // Mirrors the Rust three-tier detector, minus pdf_oxide's native/bordered
@@ -105,6 +107,8 @@ public sealed class PdfExtractor : IExtractor
                     Width = meta.Width,
                     Height = meta.Height,
                     PageCount = meta.PageCount,
+                    ScannedConfidence = (float)scanDetection.Confidence,
+                    ScannedPages = scanDetection.ScannedPageNumbers(PdfScanDetect.DefaultScannedMinConfidence),
                 },
             },
         };

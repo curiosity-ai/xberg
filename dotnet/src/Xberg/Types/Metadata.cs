@@ -254,6 +254,12 @@ public sealed class PdfMetadata
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public long? Width { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public long? Height { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? PageCount { get; set; }
+
+    /// <summary>Highest per-page scanned-page confidence in the document, in [0, 1].</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public float? ScannedConfidence { get; set; }
+
+    /// <summary>One-based page numbers graded at or above the configured confidence.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<uint>? ScannedPages { get; set; }
 }
 
 /// <summary>Year range for bibliographic metadata (Rust `YearRange`).</summary>
