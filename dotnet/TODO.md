@@ -10,7 +10,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
 > **2122 fixtures (72.1%) match on every hard dimension**; content-parity **77.0% identical,
 > 87.6% ≥95%-similar**; 125 fixtures (<80%) are genuine content misses; **22 catastrophes
-> (0.7%)**. 327 unit tests.
+> (0.7%)**. 340 unit tests.
 >
 > The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
 > they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
@@ -189,13 +189,17 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       above threshold agree in class, confidence and geometry.
 - [ ] **Model acquisition** — port `layout/model_manager.rs`: Hugging Face download, on-disk
       cache, SHA-256 verification, atomic publish with rollback.
-- [ ] **Inference performance.** 7.2 s per 640x640 page on 4 cores, against ONNX Runtime's
-      0.6 s on the same machine. Cache panelling and register blocking in the matrix multiply
-      took it there from 10.5 s and the GEMM now runs at 37–51 GFLOP/s, but the rest is
-      structural: every node materialises its output, so elementwise ops sit at memory
-      bandwidth and are now a third of the runtime. Closing it needs operator fusion
-      (Conv+BatchNorm+Relu in one pass) and pooled buffers with reference-counted lifetimes —
-      the latter must handle `Reshape` aliasing its source's storage.
+- [x] **Graph optimisation and buffer reuse.** Decomposed batch-norm folded into convolution
+      weights, activations fused into the convolution's output pass, and activation storage
+      recycled through a pool with reference counts on the buffer (so `Reshape` views and
+      `Identity` aliases keep their memory alive). Both verified to produce byte-identical
+      detections.
+- [ ] **Inference performance.** ~2.1 s per 640x640 page on 4 cores against ONNX Runtime's
+      ~0.69 s measured in the same session — roughly 3x, down from 16x. What moved it is
+      recorded in `tools/onnx-parity/README.md`, along with what was measured and rejected.
+      Convolution is ~58% of runtime and now runs at about the same rate as the bare matrix
+      multiply, so the microkernel is the limit: closing the rest means packing both operands
+      into kernel-order panels and per-CPU kernel selection, which is what MLAS does.
 - [ ] **Page rasterisation.** The blocker for end-to-end use: layout detection needs a
       rendered page bitmap, and the C# port has no PDF renderer. Until one exists the model
       can only be driven from images supplied by the caller.

@@ -163,7 +163,77 @@ internal static class Shapes
         }
         if (run == 0) run = 1;
 
+        // The permutation swapped the last two axes: the innermost output dimension strides
+        // through the source while the one before it is contiguous. Walking that element by
+        // element touches a fresh cache line per value and uses one float of each, which is
+        // how a copy of a few megabytes ends up costing tens of milliseconds. Blocking it
+        // makes both sides read and write in cache-line-sized runs.
+        if (run == 1 && rank >= 2 && strides[rank - 2] == 1 && strides[rank - 1] > 1)
+            return TransposeInnerPair(x, shape, strides, rank);
+
         return Gathered(x, shape, strides, run);
+    }
+
+    /// <summary>Square block edge for the tiled transpose, in elements. At 32 floats a row of
+    /// a block is two cache lines, so a whole block stays comfortably in L1.</summary>
+    private const int TransposeBlock = 32;
+
+    /// <summary>
+    /// Materialise a permutation whose innermost two output axes are a matrix transpose,
+    /// tiling so neither side strides through memory a line at a time.
+    /// </summary>
+    private static Tensor TransposeInnerPair(Tensor x, int[] shape, int[] strides, int rank)
+    {
+        int rows = shape[rank - 2];          // contiguous in the source
+        int columns = shape[rank - 1];       // strided in the source
+        int columnStride = strides[rank - 1];
+
+        int outer = 1;
+        for (int i = 0; i < rank - 2; i++) outer *= shape[i];
+        int plane = rows * columns;
+
+        var result = x.IsFloat ? Tensor.AllocateFloat(shape) : Tensor.AllocateLong(x.Type, shape);
+        var outerIndex = new int[Math.Max(rank - 2, 1)];
+        int sourceBase = 0;
+
+        for (int o = 0; o < outer; o++)
+        {
+            int destinationBase = o * plane;
+            for (int i0 = 0; i0 < rows; i0 += TransposeBlock)
+            {
+                int iEnd = Math.Min(i0 + TransposeBlock, rows);
+                for (int j0 = 0; j0 < columns; j0 += TransposeBlock)
+                {
+                    int jEnd = Math.Min(j0 + TransposeBlock, columns);
+                    for (int i = i0; i < iEnd; i++)
+                    {
+                        int destination = destinationBase + i * columns + j0;
+                        int source = sourceBase + i + j0 * columnStride;
+                        if (x.IsFloat)
+                        {
+                            for (int j = j0; j < jEnd; j++, destination++, source += columnStride)
+                                result.Floats[destination] = x.Floats[source];
+                        }
+                        else
+                        {
+                            for (int j = j0; j < jEnd; j++, destination++, source += columnStride)
+                                result.Longs[destination] = x.Longs[source];
+                        }
+                    }
+                }
+            }
+
+            // Advance the outer coordinates, which may themselves be permuted.
+            for (int d = rank - 3; d >= 0; d--)
+            {
+                outerIndex[d]++;
+                sourceBase += strides[d];
+                if (outerIndex[d] < shape[d]) break;
+                sourceBase -= strides[d] * outerIndex[d];
+                outerIndex[d] = 0;
+            }
+        }
+        return result;
     }
 
     /// <summary>

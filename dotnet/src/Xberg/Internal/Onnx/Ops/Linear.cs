@@ -2,6 +2,8 @@ using System.Numerics.Tensors;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace Xberg.Internal.Onnx.Ops;
 
@@ -95,27 +97,52 @@ internal static class Linear
         var result = Tensor.AllocateFloat(outShape);
 
         int sizeA = m * k, sizeB = k * n, sizeC = m * n;
-        var index = new int[Math.Max(batchRank, 1)];
-        int offsetA = 0, offsetB = 0;
 
-        for (int batch = 0; batch < batches; batch++)
+        // Resolve each batch's operand offsets up front so the batches can be dispatched in
+        // any order.
+        var offsetsA = new int[batches];
+        var offsetsB = new int[batches];
+        {
+            var index = new int[Math.Max(batchRank, 1)];
+            int offsetA = 0, offsetB = 0;
+            for (int batch = 0; batch < batches; batch++)
+            {
+                offsetsA[batch] = offsetA;
+                offsetsB[batch] = offsetB;
+                for (int d = batchRank - 1; d >= 0; d--)
+                {
+                    index[d]++;
+                    offsetA += strideA[d];
+                    offsetB += strideB[d];
+                    if (index[d] < batchShape[d]) break;
+                    offsetA -= strideA[d] * index[d];
+                    offsetB -= strideB[d] * index[d];
+                    index[d] = 0;
+                }
+            }
+        }
+
+        // Attention layers issue many small batched products — eight heads of a few hundred
+        // rows each. Parallelising inside every one of those pays the thread-pool handshake
+        // per batch on a few milliseconds of work, which is why the decoder's multiplies
+        // measured an order of magnitude below the backbone's. Spreading the batches instead
+        // gives one dispatch for the whole node and leaves each product running straight
+        // through.
+        if (batches > 1)
+        {
+            Parallel.For(0, batches, batch => MultiplyInto(
+                fa.Floats.AsMemory(offsetsA[batch] * sizeA, sizeA),
+                fb.Floats.AsMemory(offsetsB[batch] * sizeB, sizeB),
+                result.Floats.AsMemory(batch * sizeC, sizeC),
+                m, k, n, n, parallel: false));
+        }
+        else
         {
             MultiplyInto(
-                fa.Floats.AsMemory(offsetA * sizeA, sizeA),
-                fb.Floats.AsMemory(offsetB * sizeB, sizeB),
-                result.Floats.AsMemory(batch * sizeC, sizeC),
+                fa.Floats.AsMemory(offsetsA[0] * sizeA, sizeA),
+                fb.Floats.AsMemory(offsetsB[0] * sizeB, sizeB),
+                result.Floats.AsMemory(0, sizeC),
                 m, k, n);
-
-            for (int d = batchRank - 1; d >= 0; d--)
-            {
-                index[d]++;
-                offsetA += strideA[d];
-                offsetB += strideB[d];
-                if (index[d] < batchShape[d]) break;
-                offsetA -= strideA[d] * index[d];
-                offsetB -= strideB[d] * index[d];
-                index[d] = 0;
-            }
         }
 
         // Undo the 1-D promotions on the result.
@@ -162,10 +189,13 @@ internal static class Linear
 
         // Column panels are the unit of parallelism: they partition the destination, so
         // threads never touch the same output, and each operand slab is streamed by exactly
-        // one thread. Narrow the panel when the matrix is small so there is still enough of
-        // it to go around, keeping the width a whole number of vectors.
-        int panel = Math.Min(ColumnPanel, Math.Max(width, RoundUp(
-            (n + 2 * Environment.ProcessorCount - 1) / (2 * Environment.ProcessorCount), width)));
+        // one thread. Narrowing them buys parallelism at the cost of re-reading the left
+        // operand once per panel, so it is only worth doing when this call is what provides
+        // the parallelism — a caller running one tile per thread already has enough.
+        int panel = parallel
+            ? Math.Min(ColumnPanel, Math.Max(width, RoundUp(
+                (n + 2 * Environment.ProcessorCount - 1) / (2 * Environment.ProcessorCount), width)))
+            : ColumnPanel;
         int panels = (n + panel - 1) / panel;
 
         if (parallel && work >= ParallelThreshold && panels > 1)
@@ -205,10 +235,14 @@ internal static class Linear
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int m, int k, int n, int ldc, int i0, int pc, int depth, int jc, int columns)
     {
-        int rows = Math.Min(RowBlock, m - i0);
-        if (rows == RowBlock) ComputeFourRows(a, b, c, k, n, ldc, i0, pc, depth, jc, columns);
-        else for (int i = i0; i < i0 + rows; i++) AccumulateRow(a, b, c, i, k, n, ldc, pc, depth, jc, columns);
+        int rows = Math.Min(RowBlockSize, m - i0);
+        int end = jc + columns;
+
+        int full = i0;
+        for (; full + 4 <= i0 + rows; full += 4) ComputeFourRows(a, b, c, k, n, ldc, full, pc, depth, jc, end);
+        for (int i = full; i < i0 + rows; i++) AccumulateRow(a, b, c, i, k, n, ldc, pc, depth, jc, columns);
     }
+
 
     /// <summary>
     /// The register-blocked kernel: four output rows across two vector-wide column strips.
@@ -221,13 +255,16 @@ internal static class Linear
     /// </summary>
     private static void ComputeFourRows(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
-        int k, int n, int ldc, int i0, int pc, int depth, int jc, int columns)
+        int k, int n, int ldc, int i0, int pc, int depth, int jStart, int end)
     {
         int width = Vector<float>.Count;
         int a0 = i0 * k + pc, a1 = a0 + k, a2 = a1 + k, a3 = a2 + k;
         int c0 = i0 * ldc, c1 = c0 + ldc, c2 = c1 + ldc, c3 = c2 + ldc;
-        int end = jc + columns;
-        int j = jc;
+        int j = jStart;
+
+        // Take the widest strips first where the hardware has 512-bit vectors, then let the
+        // portable loops below finish whatever is left.
+        if (Use512BitVectors) j = ComputeFourRows512(a, b, c, n, a0, a1, a2, a3, c0, c1, c2, c3, pc, depth, j, end);
 
         // Reference-based addressing rather than span slicing. Every `Slice` in the inner
         // loop is a bounds check and a span construction, and at eight loads per iteration
@@ -325,6 +362,113 @@ internal static class Linear
             c[c2 + j] = sum2;
             c[c3 + j] = sum3;
         }
+    }
+
+    /// <summary>
+    /// Whether to run the 512-bit kernel.
+    /// <para>
+    /// Gated on the instruction set rather than on <c>Vector512.IsHardwareAccelerated</c>,
+    /// which reports <c>false</c> here: .NET keeps the portable <c>Vector&lt;T&gt;</c> at 256
+    /// bits by default on these parts, but explicit <see cref="Vector512{T}"/> code still
+    /// compiles down to real AVX-512. Measured on this hardware the difference is not
+    /// marginal — a pure fused-multiply-add loop runs at 577 GFLOP/s against 161 — so the
+    /// flag would cost most of the machine's capability if it were believed.
+    /// </para>
+    /// </summary>
+    private static bool Use512BitVectors { get; } = Avx512F.IsSupported;
+
+    /// <summary>
+    /// Output rows the panel loop advances by.
+    /// <para>
+    /// Four, even where AVX-512's thirty-two registers would nominally hold more. Widening to
+    /// eight rows — sixteen accumulators, two operand vectors and eight broadcasts — was
+    /// measured and made the multiply markedly <em>slower</em> (116 down to 74 GFLOP/s), so
+    /// the register file is evidently not the binding constraint at that width and the extra
+    /// live values cost more than the halved operand re-reads save.
+    /// </para>
+    /// </summary>
+    private static int RowBlockSize { get; } = RowBlock;
+
+    /// <summary>
+    /// The 512-bit register-blocked kernel: four output rows across two 16-float column
+    /// strips. Identical in structure to the portable version, but AVX-512's 32 registers
+    /// leave the eight accumulators, two operand vectors and four broadcasts comfortably in
+    /// place where the 16-register 256-bit target has no room to spare.
+    /// </summary>
+    /// <returns>The first column not covered, for the portable loops to continue from.</returns>
+    private static int ComputeFourRows512(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int n,
+        int a0, int a1, int a2, int a3, int c0, int c1, int c2, int c3,
+        int pc, int depth, int j, int end)
+    {
+        const int Width = 16;
+        ref float aRef = ref MemoryMarshal.GetReference(a);
+        ref float bRef = ref MemoryMarshal.GetReference(b);
+        ref float cRef = ref MemoryMarshal.GetReference(c);
+
+        for (; j + 2 * Width <= end; j += 2 * Width)
+        {
+            var acc00 = Vector512.LoadUnsafe(ref cRef, (nuint)(c0 + j));
+            var acc01 = Vector512.LoadUnsafe(ref cRef, (nuint)(c0 + j + Width));
+            var acc10 = Vector512.LoadUnsafe(ref cRef, (nuint)(c1 + j));
+            var acc11 = Vector512.LoadUnsafe(ref cRef, (nuint)(c1 + j + Width));
+            var acc20 = Vector512.LoadUnsafe(ref cRef, (nuint)(c2 + j));
+            var acc21 = Vector512.LoadUnsafe(ref cRef, (nuint)(c2 + j + Width));
+            var acc30 = Vector512.LoadUnsafe(ref cRef, (nuint)(c3 + j));
+            var acc31 = Vector512.LoadUnsafe(ref cRef, (nuint)(c3 + j + Width));
+
+            int bRow = pc * n + j;
+            for (int p = 0; p < depth; p++, bRow += n)
+            {
+                var b0 = Vector512.LoadUnsafe(ref bRef, (nuint)bRow);
+                var b1 = Vector512.LoadUnsafe(ref bRef, (nuint)(bRow + Width));
+
+                var s0 = Vector512.Create(Unsafe.Add(ref aRef, a0 + p));
+                var s1 = Vector512.Create(Unsafe.Add(ref aRef, a1 + p));
+                var s2 = Vector512.Create(Unsafe.Add(ref aRef, a2 + p));
+                var s3 = Vector512.Create(Unsafe.Add(ref aRef, a3 + p));
+
+                acc00 = Vector512.FusedMultiplyAdd(s0, b0, acc00);
+                acc01 = Vector512.FusedMultiplyAdd(s0, b1, acc01);
+                acc10 = Vector512.FusedMultiplyAdd(s1, b0, acc10);
+                acc11 = Vector512.FusedMultiplyAdd(s1, b1, acc11);
+                acc20 = Vector512.FusedMultiplyAdd(s2, b0, acc20);
+                acc21 = Vector512.FusedMultiplyAdd(s2, b1, acc21);
+                acc30 = Vector512.FusedMultiplyAdd(s3, b0, acc30);
+                acc31 = Vector512.FusedMultiplyAdd(s3, b1, acc31);
+            }
+
+            acc00.StoreUnsafe(ref cRef, (nuint)(c0 + j));
+            acc01.StoreUnsafe(ref cRef, (nuint)(c0 + j + Width));
+            acc10.StoreUnsafe(ref cRef, (nuint)(c1 + j));
+            acc11.StoreUnsafe(ref cRef, (nuint)(c1 + j + Width));
+            acc20.StoreUnsafe(ref cRef, (nuint)(c2 + j));
+            acc21.StoreUnsafe(ref cRef, (nuint)(c2 + j + Width));
+            acc30.StoreUnsafe(ref cRef, (nuint)(c3 + j));
+            acc31.StoreUnsafe(ref cRef, (nuint)(c3 + j + Width));
+        }
+
+        for (; j + Width <= end; j += Width)
+        {
+            var acc0 = Vector512.LoadUnsafe(ref cRef, (nuint)(c0 + j));
+            var acc1 = Vector512.LoadUnsafe(ref cRef, (nuint)(c1 + j));
+            var acc2 = Vector512.LoadUnsafe(ref cRef, (nuint)(c2 + j));
+            var acc3 = Vector512.LoadUnsafe(ref cRef, (nuint)(c3 + j));
+            int bRow = pc * n + j;
+            for (int p = 0; p < depth; p++, bRow += n)
+            {
+                var bv = Vector512.LoadUnsafe(ref bRef, (nuint)bRow);
+                acc0 = Vector512.FusedMultiplyAdd(Vector512.Create(Unsafe.Add(ref aRef, a0 + p)), bv, acc0);
+                acc1 = Vector512.FusedMultiplyAdd(Vector512.Create(Unsafe.Add(ref aRef, a1 + p)), bv, acc1);
+                acc2 = Vector512.FusedMultiplyAdd(Vector512.Create(Unsafe.Add(ref aRef, a2 + p)), bv, acc2);
+                acc3 = Vector512.FusedMultiplyAdd(Vector512.Create(Unsafe.Add(ref aRef, a3 + p)), bv, acc3);
+            }
+            acc0.StoreUnsafe(ref cRef, (nuint)(c0 + j));
+            acc1.StoreUnsafe(ref cRef, (nuint)(c1 + j));
+            acc2.StoreUnsafe(ref cRef, (nuint)(c2 + j));
+            acc3.StoreUnsafe(ref cRef, (nuint)(c3 + j));
+        }
+        return j;
     }
 
     /// <summary>Single-row fallback for the rows left over when <c>m</c> is not a multiple of

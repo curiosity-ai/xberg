@@ -23,6 +23,8 @@ internal sealed class OnnxSession
     private readonly OnnxModel _model;
     /// <summary>For each node index, the values whose last use is that node.</summary>
     private readonly List<string>[] _lastUse;
+    /// <summary>Recycled activation storage, reused across runs of this session.</summary>
+    private readonly TensorPool _pool = new();
 
     /// <param name="optimize">
     /// Rewrite the graph before executing it (see <see cref="GraphOptimizer"/>). Fusing
@@ -85,9 +87,13 @@ internal sealed class OnnxSession
         Dictionary<string, Tensor>? capture,
         ExecutionProfile? profile)
     {
+        // Buffers are recycled across runs, so the steady state allocates almost nothing;
+        // capture mode keeps everything alive, so it opts out.
+        using var pooling = capture is null ? _pool.Activate() : default;
+
         var env = new Dictionary<string, Tensor>(StringComparer.Ordinal);
-        foreach (var (name, tensor) in _model.Initializers) env[name] = tensor;
-        foreach (var (name, tensor) in feeds) env[name] = tensor;
+        foreach (var (name, tensor) in _model.Initializers) Bind(env, name, tensor);
+        foreach (var (name, tensor) in feeds) Bind(env, name, tensor);
 
         foreach (var input in _model.FeedInputs)
         {
@@ -124,14 +130,14 @@ internal sealed class OnnxSession
             for (int o = 0; o < node.Outputs.Length && o < outputs.Length; o++)
             {
                 if (node.Outputs[o].Length == 0 || outputs[o] is null) continue;
-                env[node.Outputs[o]] = outputs[o]!;
+                Bind(env, node.Outputs[o], outputs[o]!);
                 capture?[node.Outputs[o]] = outputs[o]!;
             }
 
             if (capture is null)
             {
                 foreach (string dead in _lastUse[i])
-                    if (!declaredOutputs.Contains(dead)) env.Remove(dead);
+                    if (!declaredOutputs.Contains(dead)) Unbind(env, dead);
             }
         }
 
@@ -142,6 +148,29 @@ internal sealed class OnnxSession
             else throw new InvalidOperationException($"onnx: graph output '{name}' was never produced");
         }
         return result;
+    }
+
+    /// <summary>
+    /// Bind a value to a name, taking one reference on its storage.
+    /// <para>
+    /// The reference belongs to the <em>name</em>, not the tensor, which is what keeps views
+    /// safe: <c>Identity</c> binds the same tensor under a second name and <c>Reshape</c>
+    /// binds a different tensor over the same array, and in both cases the storage now has
+    /// two holders and must survive the first of them dying.
+    /// </para>
+    /// </summary>
+    private static void Bind(Dictionary<string, Tensor> env, string name, Tensor tensor)
+    {
+        if (env.TryGetValue(name, out var existing)) existing.Buffer?.Release();
+        tensor.Buffer?.AddReference();
+        env[name] = tensor;
+    }
+
+    /// <summary>Drop a name and the reference it held.</summary>
+    private static void Unbind(Dictionary<string, Tensor> env, string name)
+    {
+        if (!env.Remove(name, out var tensor)) return;
+        tensor.Buffer?.Release();
     }
 
     /// <summary>

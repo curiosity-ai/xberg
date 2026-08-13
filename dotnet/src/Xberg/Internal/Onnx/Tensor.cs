@@ -38,8 +38,13 @@ internal sealed class Tensor
     /// <summary>Dimensions, outermost first. A zero-length shape is a scalar.</summary>
     public int[] Shape { get; }
 
-    /// <summary>Float payload; non-null exactly when <see cref="IsFloat"/>.</summary>
-    public float[] Floats { get; }
+    private readonly TensorBuffer? _buffer;
+
+    /// <summary>Float payload; valid exactly when <see cref="IsFloat"/>.</summary>
+    public float[] Floats => _buffer!.Array;
+
+    /// <summary>The reference-counted storage behind <see cref="Floats"/>, for the pool.</summary>
+    internal TensorBuffer? Buffer => _buffer;
 
     /// <summary>Integral payload widened to 64 bits; non-null exactly when <see cref="IsFloat"/> is false.</summary>
     public long[] Longs { get; }
@@ -51,12 +56,12 @@ internal sealed class Tensor
 
     public int Rank => Shape.Length;
 
-    private Tensor(ElementType type, int[] shape, float[]? floats, long[]? longs)
+    private Tensor(ElementType type, int[] shape, TensorBuffer? floats, long[]? longs)
     {
         Type = type;
         Shape = shape;
         Count = ElementCount(shape);
-        Floats = floats!;
+        _buffer = floats;
         Longs = longs!;
     }
 
@@ -65,7 +70,7 @@ internal sealed class Tensor
         int n = ElementCount(shape);
         if (data.Length != n)
             throw new InvalidDataException($"tensor data length {data.Length} does not match shape [{string.Join(",", shape)}] ({n})");
-        return new Tensor(ElementType.Float, shape, data, null);
+        return new Tensor(ElementType.Float, shape, TensorBuffer.Wrap(data), null);
     }
 
     public static Tensor FromLongs(long[] data, ElementType type, params int[] shape)
@@ -86,7 +91,7 @@ internal sealed class Tensor
     /// </para>
     /// </summary>
     public static Tensor AllocateFloat(params int[] shape) =>
-        FromFloats(GC.AllocateUninitializedArray<float>(ElementCount(shape)), shape);
+        new(ElementType.Float, shape, TensorBuffer.Allocate(ElementCount(shape)), null);
 
     /// <inheritdoc cref="AllocateFloat"/>
     public static Tensor AllocateLong(ElementType type, params int[] shape) =>
@@ -112,7 +117,8 @@ internal sealed class Tensor
     {
         if (ElementCount(shape) != Count)
             throw new InvalidDataException($"cannot reshape {Count} elements into [{string.Join(",", shape)}]");
-        return IsFloat ? new Tensor(Type, shape, Floats, null) : new Tensor(Type, shape, null, Longs);
+        // Shares storage: the view and its source both count against the same buffer.
+        return IsFloat ? new Tensor(Type, shape, _buffer, null) : new Tensor(Type, shape, null, Longs);
     }
 
     /// <summary>Row-major strides for this shape, in elements.</summary>

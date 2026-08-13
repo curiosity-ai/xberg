@@ -98,36 +98,91 @@ largest absolute difference 9.8e-6 — it has no inverse sigmoid to amplify anyt
 
 ## Performance
 
-`--gemm` times the matrix-multiply kernel on the shapes RT-DETR's convolutions lower to;
-`--benchmark N` times whole-model inference and prints a per-operator breakdown.
+### Measuring at all
 
-On 4 cores with AVX2 (`Vector<float>.Count == 8`), one 640x640 page:
+Timing on this VM is unreliable in two specific ways, and both are handled before any number
+is reported.
+
+**The host changes underneath you.** Re-measuring the machine's peak fused-multiply-add
+throughput between consecutive runs of the same binary has produced 100 and 218 GFLOP/s.
+A 2x swing in the ceiling dwarfs most of what optimisation buys, so every timing run starts
+by printing the CPU, core count and memory, then re-measuring peak FMA throughput (256- and
+512-bit) and streaming memory bandwidth. If those numbers move between runs, the model
+numbers from those runs are not comparable. For the same reason `compare_speed.py` runs ONNX
+Runtime and this runtime back to back rather than comparing against a figure recorded
+earlier.
+
+**Cold code measures the compiler.** .NET starts methods in a quick-JIT tier and promotes
+them only after roughly thirty calls, and this graph also has to fault in 169 MB of weights
+and spin up the thread pool. Every benchmark discards three full inference passes first.
+
+### Where it stands
+
+One 640x640 page, 4 cores, both sides measured in the same session:
 
 | | median |
 | --- | --- |
-| ONNX Runtime (optimised) | 0.70 s |
-| ONNX Runtime (fusion disabled) | 0.60 s |
-| this runtime | 7.2 s |
+| ONNX Runtime | ~0.69 s |
+| this runtime | ~2.1 s |
+| *ratio* | *~3x* |
 
-Two changes got there from an initial 10.5 s, both in the matrix multiply that convolution
-lowers onto:
+Down from 10.5 s when this work started. The model is 118 GFLOP of convolution, so ORT runs
+at roughly 170 GFLOP/s and this runtime at roughly 110, against a measured 512-bit ceiling
+of 470-570 GFLOP/s.
 
-- **Cache panelling.** The kernel was memory-bound, not compute-bound: with the row loop
-  outermost, every block of output rows re-streamed the entire right-hand operand. A
-  256x256x25600 layer pulled 26 MB across the bus 64 times. Iterating depth and column
-  panels on the outside instead keeps a slab resident in L2 while all rows consume it.
-  12 → 45 GFLOP/s on that shape.
-- **Register blocking.** Four output rows against two vector-wide column strips, so eight
-  accumulators stay in registers for the whole reduction and each cache line of the operand
-  is consumed whole.
+### What actually moved it
 
-The remaining ~12x gap is structural, not a missing micro-optimisation. `Conv` is down to
-42% of runtime and elementwise `Add`/`Mul` are now 34% — and those are already running at
-memory bandwidth, because every node materialises its output as a fresh tensor. ORT avoids
-that by fusing (Conv+BatchNorm+Relu into one pass) and by reusing buffers across the graph,
-and its GEMM is hand-written assembly. Closing the gap means an operator-fusion pass and
-pooled buffers with reference-counted lifetimes — a real project, not a tweak, and one that
-needs the aliasing between `Reshape` outputs and their sources handled correctly.
+Ordered by effect, and none of it was guessed — each came from the per-node profile:
+
+- **Folding the decomposed batch normalisation** (36% → nothing). The export spells every
+  batch norm as a per-channel `Mul` then a per-channel `Add`, each a full streaming pass over
+  a multi-megabyte activation to apply a constant affine map. `GraphOptimizer` folds the
+  chain into the convolution's weights and bias, and the following activation — `Relu`,
+  `Sigmoid`, or the `Sigmoid`/`Mul` pair that spells SiLU — into the same output pass.
+  193 nodes disappear.
+- **Explicit `FusedMultiplyAdd`** (~1.5x on the multiply). The JIT does not contract
+  `a * b + c` into an FMA, because that would change the rounding. A kernel written the
+  natural way silently runs at a fraction of peak; the calibration reports both rates side by
+  side so the gap stays visible.
+- **Explicit `Vector512`** (~1.3x overall). `Vector512.IsHardwareAccelerated` reports
+  `false` here and `Vector<float>.Count` stays at 8, but explicit `Vector512<float>` code
+  still compiles to real AVX-512: 577 GFLOP/s against 161 in a pure FMA loop. Believing the
+  flag would leave most of the machine unused.
+- **Reference-based loads in the inner loop.** Eight `Span.Slice` calls per iteration were
+  eight bounds checks; `Vector.LoadUnsafe` over a `ref float` removed them.
+- **Cache panelling.** With the row loop outermost every row block re-streamed the whole
+  right-hand operand — 26 MB pulled 64 times for one layer. Panels of depth and columns keep
+  a slab resident while all rows consume it.
+- **Pooled buffers.** Activations are recycled through a free list keyed by exact length,
+  with reference counts on the storage rather than the tensor so that `Reshape` views and
+  `Identity` aliases keep their memory alive. A standalone `Relu` over a 26 MB tensor fell
+  from 163 ms to 44 ms.
+- **Blocked transpose** (270 ms → 51 ms). A permutation of the last two axes was walking the
+  source a cache line per element.
+- **Vectorised `erf`** (50 ms → negligible). One GELU node was evaluating a 24-term Chebyshev
+  fit in double precision, per element.
+
+### What was tried and rejected
+
+Recorded because the measurements are the useful part:
+
+- **Constant folding of the shape arithmetic.** 1683 of 2676 nodes are scalar bookkeeping —
+  and all of them together account for 2.3 ms of 8081 ms. It would shrink the node count and
+  change nothing.
+- **An eight-row register block.** AVX-512's 32 registers nominally hold sixteen
+  accumulators plus operands, but the multiply got *slower*, 116 → 74 GFLOP/s.
+- **Bigger convolution tiles.** Larger tiles re-read the weight matrix fewer times, but
+  streaming a multi-megabyte unrolled buffer per tile cost more than the reuse saved.
+- **`DOTNET_PreferredVectorBitWidth=512`.** Does not widen `Vector<T>` on this runtime;
+  only explicit `Vector512` does.
+
+### The remaining gap
+
+Convolution is ~58% of runtime and runs at roughly the same rate as the bare multiply, so
+im2col overhead is no longer material — the microkernel is the limit. Closing the rest means
+what MLAS does: packing both operands into panels laid out exactly as the kernel walks them,
+and per-CPU kernel selection. That is a substantial project against decades of tuning, not a
+missing flag.
 
 ## Two bugs this caught
 

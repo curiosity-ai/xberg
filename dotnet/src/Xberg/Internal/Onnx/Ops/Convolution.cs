@@ -174,9 +174,17 @@ internal static class Convolution
 
         // Unrolling the whole layer at once would be the largest allocation in the model — a
         // 3x3 layer over 32 channels at 320x320 output needs 118 MB — and every byte of it
-        // would be written to memory and read straight back. Unrolling a tile of output
-        // pixels instead keeps the buffer inside L2, so it never reaches the memory bus. The
-        // tile is also the unit of parallelism: tiles write disjoint output columns.
+        // would be written to memory and read straight back. A tile of output pixels is
+        // unrolled instead, and is also the unit of parallelism since tiles write disjoint
+        // output columns.
+        //
+        // Sizing the tile is a genuine trade and both directions were measured. Larger tiles
+        // re-read the weight matrix fewer times; smaller tiles keep the unrolled buffer near
+        // cache. Growing the tile to one per core made the model slower — the extra weight
+        // reuse did not pay for streaming a multi-megabyte buffer per tile — so the buffer
+        // stays the thing that is sized, and weight reuse is recovered instead by letting the
+        // multiply use full-width column panels when the tile loop already supplies the
+        // parallelism.
         int tile = Math.Clamp(TargetTileBytes / (patch * sizeof(float)), MinTile, spatial);
         tile = Math.Min(tile, spatial);
         int tiles = (spatial + tile - 1) / tile;
@@ -216,7 +224,7 @@ internal static class Convolution
         }
     }
 
-    /// <summary>Bytes of unrolled receptive field to hold in cache at once, per tile.</summary>
+    /// <summary>Unrolled receptive field to hold per tile.</summary>
     private const int TargetTileBytes = 512 * 1024;
 
     /// <summary>Smallest worthwhile tile, so a very deep patch does not degenerate to one

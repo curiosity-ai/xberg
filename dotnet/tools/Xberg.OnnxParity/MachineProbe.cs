@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace Xberg.OnnxParity;
 
@@ -53,15 +55,20 @@ internal static class MachineProbe
         double single = MeasureFlops(threads: 1, fused: true);
         double multi = MeasureFlops(threads: Environment.ProcessorCount, fused: true);
         double mulAdd = MeasureFlops(threads: Environment.ProcessorCount, fused: false);
+        double wide = Avx512F.IsSupported ? Measure512Flops(Environment.ProcessorCount) : 0;
         double bandwidth = MeasureBandwidth();
 
+        int cores = Environment.ProcessorCount;
         Console.WriteLine("calibration (re-measured each run; compare across runs to detect a changed host)");
-        Console.WriteLine($"  fma      1 thread  : {single,7:F1} GFLOP/s");
-        Console.WriteLine($"  fma     {Environment.ProcessorCount,2} threads: {multi,7:F1} GFLOP/s   <- the ceiling kernels are judged against");
-        Console.WriteLine($"  mul+add {Environment.ProcessorCount,2} threads: {mulAdd,7:F1} GFLOP/s   " +
+        Console.WriteLine($"  fma 256-bit  1 thread  : {single,7:F1} GFLOP/s");
+        Console.WriteLine($"  fma 256-bit {cores,2} threads: {multi,7:F1} GFLOP/s");
+        Console.WriteLine($"  mul+add     {cores,2} threads: {mulAdd,7:F1} GFLOP/s   " +
                           $"({multi / Math.Max(mulAdd, 1e-9):F1}x slower; the JIT will not contract these into an FMA)");
-        Console.WriteLine($"  triad bandwidth    : {bandwidth,7:F1} GB/s");
-        return new Calibration(single, multi, mulAdd, bandwidth);
+        if (wide > 0)
+            Console.WriteLine($"  fma 512-bit {cores,2} threads: {wide,7:F1} GFLOP/s   " +
+                              $"<- the real ceiling ({wide / Math.Max(multi, 1e-9):F1}x the 256-bit path)");
+        Console.WriteLine($"  triad bandwidth        : {bandwidth,7:F1} GB/s");
+        return new Calibration(single, Math.Max(multi, wide), mulAdd, bandwidth);
     }
 
     /// <summary>
@@ -84,6 +91,46 @@ internal static class MachineProbe
         // Eight vector FMAs per iteration, each worth 2 * Vector<float>.Count flops.
         double flops = (double)IterationsPerThread * threads * 8 * 2 * Vector<float>.Count;
         return flops / seconds / 1e9;
+    }
+
+    /// <summary>
+    /// Peak with explicit 512-bit vectors.
+    /// <para>
+    /// Measured separately because the portable <c>Vector&lt;T&gt;</c> stays 256 bits wide on
+    /// these parts, so a ceiling derived from it understates the machine by roughly a factor
+    /// of three and would make a kernel running at a fifth of the hardware's capability look
+    /// nearly optimal.
+    /// </para>
+    /// </summary>
+    private static double Measure512Flops(int threads)
+    {
+        const long IterationsPerThread = 20_000_000;
+        Fma512Loop(1000);
+
+        var stopwatch = Stopwatch.StartNew();
+        Parallel.For(0, threads, _ => Fma512Loop(IterationsPerThread));
+        double seconds = stopwatch.Elapsed.TotalSeconds;
+
+        return (double)IterationsPerThread * threads * 8 * 2 * 16 / seconds / 1e9;
+    }
+
+    private static float Fma512Loop(long iterations)
+    {
+        Vector512<float> a0 = Vector512.Create(1.0000001f), a1 = Vector512.Create(1.0000002f);
+        Vector512<float> a2 = Vector512.Create(1.0000003f), a3 = Vector512.Create(1.0000004f);
+        Vector512<float> a4 = Vector512.Create(1.0000005f), a5 = Vector512.Create(1.0000006f);
+        Vector512<float> a6 = Vector512.Create(1.0000007f), a7 = Vector512.Create(1.0000008f);
+        var m = Vector512.Create(0.9999999f);
+        var b = Vector512.Create(0.0000001f);
+
+        for (long i = 0; i < iterations; i++)
+        {
+            a0 = Vector512.FusedMultiplyAdd(a0, m, b); a1 = Vector512.FusedMultiplyAdd(a1, m, b);
+            a2 = Vector512.FusedMultiplyAdd(a2, m, b); a3 = Vector512.FusedMultiplyAdd(a3, m, b);
+            a4 = Vector512.FusedMultiplyAdd(a4, m, b); a5 = Vector512.FusedMultiplyAdd(a5, m, b);
+            a6 = Vector512.FusedMultiplyAdd(a6, m, b); a7 = Vector512.FusedMultiplyAdd(a7, m, b);
+        }
+        return (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7)[0];
     }
 
     /// <summary>Peak with explicitly fused multiply-adds — the real hardware ceiling.</summary>
