@@ -73,12 +73,25 @@ public sealed class MsgExtractor : IExtractor
     {
         var builder = new InternalDocumentBuilder("email");
 
+        // Same header set and order as the EML path (Rust `build_email_text_output`).
         var headerEntries = new List<(string, string)>();
+        void AddMeta(string label, string key)
+        {
+            if (result.Metadata.TryGetValue(key, out var v)) headerEntries.Add((label, v));
+        }
+
         if (result.Subject is { } subject) headerEntries.Add(("Subject", subject));
         if (result.FromEmail is { } from) headerEntries.Add(("From", from));
         if (result.ToEmails.Count > 0) headerEntries.Add(("To", string.Join(", ", result.ToEmails)));
         if (result.CcEmails.Count > 0) headerEntries.Add(("CC", string.Join(", ", result.CcEmails)));
+        if (result.BccEmails.Count > 0) headerEntries.Add(("BCC", string.Join(", ", result.BccEmails)));
+        AddMeta("Reply-To", "reply_to");
         if (result.Date is { } date) headerEntries.Add(("Date", date));
+        if (result.MessageId is { } messageId) headerEntries.Add(("Message-ID", messageId));
+        AddMeta("In-Reply-To", "in_reply_to");
+        AddMeta("References", "references");
+        AddMeta("List-Id", "list_id");
+        AddMeta("List-Unsubscribe", "list_unsubscribe");
         if (headerEntries.Count > 0) builder.PushMetadataBlock(headerEntries, null);
 
         if (result.HtmlContent is { } html)
@@ -90,7 +103,7 @@ public sealed class MsgExtractor : IExtractor
         }
         else
         {
-            foreach (string paragraph in result.Content.Split("\n\n"))
+            foreach (string paragraph in TextTransform.NormalizeLineEndings(result.Content).Split("\n\n"))
             {
                 string trimmed = paragraph.Trim();
                 if (trimmed.Length > 0) builder.PushParagraph(trimmed, new(), null, null);
@@ -236,7 +249,7 @@ public sealed class MsgExtractor : IExtractor
         if (senderEmail is { Length: 0 }) senderEmail = null;
         string? fromEmail = senderEmail;
         string? body = ReadStringProp(comp, "", 0x1000, codepage);
-        string? htmlBody = ReadStringProp(comp, "", 0x1013, codepage);
+        string? htmlBody = ReadHtmlBody(comp, "", codepage);
         string? messageId = ReadStringProp(comp, "", 0x1035, codepage);
         if (messageId is { Length: 0 }) messageId = null;
 
@@ -341,6 +354,32 @@ public sealed class MsgExtractor : IExtractor
     {
         byte[]? b = comp.TryReadStream(path);
         return b is { Length: > 0 } ? b : null;
+    }
+
+    /// <summary>
+    /// Read PR_HTML (0x1013). Outlook usually stores it as PT_BINARY (<c>…10130102</c>) rather
+    /// than as a string property, so the string form is tried first and the raw stream is
+    /// decoded as a fallback — otherwise an HTML-only message extracts its headers and no body.
+    /// </summary>
+    private static string? ReadHtmlBody(CompoundFile comp, string @base, uint? codepage)
+    {
+        if (ReadStringProp(comp, @base, 0x1013, codepage) is { Length: > 0 } s) return s;
+
+        byte[]? buf = MsgStream(comp, $"{@base}/__substg1.0_10130102");
+        if (buf is null) return null;
+
+        if (codepage is not null)
+            return EncodingForWindowsCodepage(codepage).GetString(buf).TrimEnd('\0');
+
+        try
+        {
+            var strict = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+            return strict.GetString(buf).TrimStart('﻿').TrimEnd('\0');
+        }
+        catch (DecoderFallbackException)
+        {
+            return Encoding.GetEncoding(1252).GetString(buf).TrimEnd('\0');
+        }
     }
 
     private static string? ReadStringProp(CompoundFile comp, string @base, ushort propId, uint? codepage)
