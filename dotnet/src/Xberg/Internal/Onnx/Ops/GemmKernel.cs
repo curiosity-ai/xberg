@@ -97,19 +97,7 @@ internal static class GemmKernel
     {
         if (m == 0 || n == 0 || k == 0) return;
 
-        // MLAS reshapes the panel when one dimension is small: a shallow reduction wants
-        // wider column panels, a narrow output wants deeper ones, so the panel stays a
-        // similar size either way.
-        int strideN = StrideN, strideK = StrideK;
-        if (n >= k)
-        {
-            while (strideK / 2 >= k && strideK > 16) { strideN *= 2; strideK /= 2; }
-        }
-        else
-        {
-            while (strideN > BlockWidth && strideN / 2 >= n) { strideK *= 2; strideN /= 2; }
-        }
-
+        var (strideN, strideK) = PanelExtents(k, n);
         int panels = (n + strideN - 1) / strideN;
         long work = (long)m * n * k;
 
@@ -126,6 +114,28 @@ internal static class GemmKernel
                     a.Span, packB, c.Span, m, k, ldc,
                     index * strideN, Math.Min(strideN, n - index * strideN), strideK);
         }
+    }
+
+    /// <summary>
+    /// The column and depth extents of one panel.
+    /// <para>
+    /// MLAS reshapes the panel when one dimension is small: a shallow reduction wants wider
+    /// column panels, a narrow output wants deeper ones, so the panel stays a similar size
+    /// either way.
+    /// </para>
+    /// </summary>
+    internal static (int StrideN, int StrideK) PanelExtents(int k, int n)
+    {
+        int strideN = StrideN, strideK = StrideK;
+        if (n >= k)
+        {
+            while (strideK / 2 >= k && strideK > 16) { strideN *= 2; strideK /= 2; }
+        }
+        else
+        {
+            while (strideN > BlockWidth && strideN / 2 >= n) { strideK *= 2; strideN /= 2; }
+        }
+        return (strideN, strideK);
     }
 
     /// <summary>
@@ -198,32 +208,74 @@ internal static class GemmKernel
     /// Copy <c>B[pc..pc+countK, jc..jc+countN]</c> into the packed layout
     /// <c>[block][k][16]</c>, zero-filling the final block when the panel is not a whole
     /// number of blocks wide — which lets the kernel run one uniform shape and ignore edges.
+    /// <para>
+    /// The loop runs depth-major, not block-major, even though the destination is laid out
+    /// block-major. Doing it the other way round reads each row of <c>B</c> once per column
+    /// block — eight separate sixteen-float reads scattered across a row stride that for a
+    /// 160x160 feature map is 100 KB, so the same pages are revisited eight times and nothing
+    /// prefetches. This way each row is read once, sequentially, and it is the writes that
+    /// scatter — across only eight destinations, which is what a write-combining buffer is for.
+    /// </para>
     /// </summary>
     internal static void PackB(
         float[] packed, int offset, ReadOnlySpan<float> b, int ldb, int pc, int countK, int jc, int countN)
     {
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
-        for (int block = 0; block < blocks; block++)
-        {
-            int column = jc + block * BlockWidth;
-            int width = Math.Min(BlockWidth, jc + countN - column);
-            int destination = offset + block * countK * BlockWidth;
+        int wholeBlocks = countN / BlockWidth;
+        int blockStride = countK * BlockWidth;
+        ref float source = ref MemoryMarshal.GetReference(b);
+        ref float destination = ref MemoryMarshal.GetArrayDataReference(packed);
 
-            if (width == BlockWidth)
+        for (int kk = 0; kk < countK; kk++)
+        {
+            int from = (pc + kk) * ldb + jc;
+            int to = offset + kk * BlockWidth;
+
+            for (int block = 0; block < wholeBlocks; block++)
+                CopyBlock(ref source, from + block * BlockWidth, ref destination, to + block * blockStride);
+
+            if (wholeBlocks < blocks)
             {
-                for (int kk = 0; kk < countK; kk++, destination += BlockWidth)
-                    b.Slice((pc + kk) * ldb + column, BlockWidth)
-                     .CopyTo(packed.AsSpan(destination, BlockWidth));
+                int column = wholeBlocks * BlockWidth;
+                int width = countN - column;
+                var target = packed.AsSpan(to + wholeBlocks * blockStride, BlockWidth);
+                b.Slice(from + column, width).CopyTo(target);
+                target[width..].Clear();
             }
-            else
-            {
-                for (int kk = 0; kk < countK; kk++, destination += BlockWidth)
-                {
-                    var target = packed.AsSpan(destination, BlockWidth);
-                    b.Slice((pc + kk) * ldb + column, width).CopyTo(target);
-                    target[width..].Clear();
-                }
-            }
+        }
+    }
+
+    /// <summary>
+    /// Move one packed block — sixteen floats, exactly one cache line — as a single vector
+    /// operation.
+    /// <para>
+    /// At this size the copy itself is the cost: a general-purpose <see cref="Span{T}.CopyTo"/>
+    /// dispatches on length and calls out to <c>Buffer.Memmove</c>, which for one cache line is
+    /// mostly overhead. The width tests below are JIT intrinsics folded to constants, so only
+    /// one arm survives in the compiled code.
+    /// </para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void CopyBlock(ref float source, int from, ref float destination, int to)
+    {
+        // Vector512.IsHardwareAccelerated reports false on this runtime even where AVX-512 is
+        // present, so the capability is asked of the instruction set directly.
+        if (Avx512F.IsSupported)
+        {
+            Vector512.LoadUnsafe(ref source, (nuint)from)
+                     .StoreUnsafe(ref destination, (nuint)to);
+        }
+        else if (Vector256.IsHardwareAccelerated)
+        {
+            Vector256.LoadUnsafe(ref source, (nuint)from)
+                     .StoreUnsafe(ref destination, (nuint)to);
+            Vector256.LoadUnsafe(ref source, (nuint)(from + 8))
+                     .StoreUnsafe(ref destination, (nuint)(to + 8));
+        }
+        else
+        {
+            for (int i = 0; i < BlockWidth; i++)
+                Unsafe.Add(ref destination, to + i) = Unsafe.Add(ref source, from + i);
         }
     }
 

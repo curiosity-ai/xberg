@@ -107,6 +107,13 @@ internal static class Program
     /// Time the matrix-multiply kernel on the shapes RT-DETR's convolutions actually lower
     /// to, so its throughput can be judged directly rather than inferred from whole-model
     /// timings that also include im2col, allocation and everything else.
+    /// <para>
+    /// Each shape is also measured with the packing done alone, over the same panels in the
+    /// same order but with no arithmetic. Packing and multiplying are the only two things the
+    /// kernel does, so that one extra number says which of them a slow shape is spending its
+    /// time in — a distinction the total cannot make, and one that has already been guessed
+    /// wrong once here.
+    /// </para>
     /// </summary>
     private static void BenchmarkGemm()
     {
@@ -114,11 +121,13 @@ internal static class Program
         [
             ("1x1 conv  256->256 @160x160", 256, 256, 25600),
             ("1x1 conv  512->512 @80x80  ", 512, 512, 6400),
+            ("1x1 conv  512->1024 @40x40 ", 1024, 512, 1600),
             ("3x3 conv  256->256 @80x80  ", 256, 2304, 6400),
             ("3x3 conv   64->64  @160x160", 64, 576, 25600),
             ("decoder projection         ", 256, 256, 300),
         ];
 
+        Console.WriteLine("  shape                            total            of which packing");
         foreach (var (label, m, k, n) in shapes)
         {
             var a = new float[m * k];
@@ -135,9 +144,36 @@ internal static class Program
             for (int r = 0; r < repeats; r++) Linear.MultiplyInto(a, b, c, m, k, n);
             double seconds = stopwatch.Elapsed.TotalSeconds / repeats;
 
+            double packSeconds = TimePackingOnly(b, k, n, repeats);
+
             double gflops = 2.0 * m * k * n / seconds / 1e9;
-            Console.WriteLine($"  {label}  {seconds * 1000,8:F1} ms   {gflops,6:F1} GFLOP/s");
+            Console.WriteLine(
+                $"  {label}  {seconds * 1000,8:F1} ms   {gflops,6:F1} GFLOP/s   " +
+                $"{packSeconds * 1000,7:F1} ms  {packSeconds / seconds,5:P0}");
         }
+    }
+
+    /// <summary>
+    /// Walk exactly the panels the multiply would, packing each and doing nothing else.
+    /// </summary>
+    private static double TimePackingOnly(float[] b, int k, int n, int repeats)
+    {
+        var (strideN, strideK) = GemmKernel.PanelExtents(k, n);
+        int panels = (n + strideN - 1) / strideN;
+
+        var stopwatch = Stopwatch.StartNew();
+        for (int r = 0; r < repeats; r++)
+        {
+            Parallel.For(0, panels, index =>
+            {
+                int jc = index * strideN;
+                int countN = Math.Min(strideN, n - jc);
+                var scratch = new float[((countN + 15) / 16) * strideK * 16];
+                for (int pc = 0; pc < k; pc += strideK)
+                    GemmKernel.PackB(scratch, 0, b, n, pc, Math.Min(strideK, k - pc), jc, countN);
+            });
+        }
+        return stopwatch.Elapsed.TotalSeconds / repeats;
     }
 
     private static int Main(string[] args)

@@ -1,5 +1,9 @@
 using System.Buffers;
 using System.Numerics.Tensors;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace Xberg.Internal.Onnx.Ops;
 
@@ -214,8 +218,16 @@ internal static class Convolution
     /// into channel and kernel offset costs three integer divisions, and doing that per block
     /// per tap dominated the gather; it is now computed once per panel into a small table.
     /// The output pixel's row and column likewise cost one division per block rather than one
-    /// per tap. What remains in the common case — a block that stays inside one output row and
-    /// inside the image, at unit horizontal stride — is a single sixteen-float copy.
+    /// per tap.
+    /// </para>
+    /// <para>
+    /// What is left is a stream of sixteen-float copies, and at that size the copy itself is
+    /// the cost: sixteen floats are exactly one cache line, so a general-purpose
+    /// <see cref="Span{T}.CopyTo"/> spends most of its time in call and length-dispatch
+    /// overhead rather than moving data. The interior of the panel — every block that stays
+    /// within one output row, reads contiguously, and has no tap leaving the image — therefore
+    /// runs a dedicated loop whose body is one vector load and one vector store, with the
+    /// edge conditions hoisted to a single test per block.
     /// </para>
     /// </summary>
     private static void PackReceptiveFields(
@@ -233,19 +245,83 @@ internal static class Convolution
         Span<int> tapPlane = countK <= 256 ? stackalloc int[countK] : new int[countK];
         Span<int> tapRow = countK <= 256 ? stackalloc int[countK] : new int[countK];
         Span<int> tapColumn = countK <= 256 ? stackalloc int[countK] : new int[countK];
+
+        // The extreme offsets over this depth slice decide, in one test per block, whether any
+        // tap can leave the image — so the interior loop needs no bounds check at all.
+        int minRow = int.MaxValue, maxRow = int.MinValue;
+        int minColumn = int.MaxValue, maxColumn = int.MinValue;
+
         for (int kk = 0; kk < countK; kk++)
         {
             int tap = pc + kk;
             int kx = tap % kw;
             int ky = tap / kw % kh;
             int c = tap / (kw * kh);
+            int row = ky * dilationH - pad.Top;
+            int column = kx * dilationW - pad.Left;
             tapPlane[kk] = planeBase + c * plane;
-            tapRow[kk] = ky * dilationH - pad.Top;
-            tapColumn[kk] = kx * dilationW - pad.Left;
+            tapRow[kk] = row;
+            tapColumn[kk] = column;
+            if (row < minRow) minRow = row;
+            if (row > maxRow) maxRow = row;
+            if (column < minColumn) minColumn = column;
+            if (column > maxColumn) maxColumn = column;
         }
+
+        ref float sourceRef = ref MemoryMarshal.GetArrayDataReference(source);
+        ref float destinationRef = ref MemoryMarshal.GetArrayDataReference(destination);
+        int blockStride = countK * BlockWidth;
+
+        // Classify the blocks once. Interior means: a whole block, staying inside one output
+        // row, reading contiguously, with no tap in this depth slice leaving the image — so
+        // the gather for it is one aligned vector move and needs no test of its own.
+        Span<int> interiorBase = blocks <= 128 ? stackalloc int[blocks] : new int[blocks];
+        bool anyInterior = false, anyEdge = false;
+        for (int block = 0; block < blocks; block++)
+        {
+            int firstPixel = jc + block * BlockWidth;
+            int pixels = Math.Min(BlockWidth, jc + countN - firstPixel);
+            int oy0 = firstPixel / outW;
+            int ox0 = firstPixel - oy0 * outW;
+            int iy0 = oy0 * strideH;
+
+            bool interior = pixels == BlockWidth && strideW == 1 && ox0 + BlockWidth <= outW
+                && iy0 + minRow >= 0 && iy0 + maxRow < height
+                && ox0 + minColumn >= 0 && ox0 + BlockWidth - 1 + maxColumn < width;
+
+            interiorBase[block] = interior ? iy0 * width + ox0 : -1;
+            anyInterior |= interior;
+            anyEdge |= !interior;
+        }
+
+        // The interior runs depth-major even though the destination is laid out block-major.
+        // Block-major would read each tap's source row once per block — eight scattered
+        // sixteen-float reads across a row stride that for a 160x160 feature map is 100 KB, so
+        // the same pages are revisited eight times and nothing prefetches. Depth-major reads
+        // each tap's row once, straight through, and scatters only the writes.
+        if (anyInterior)
+        {
+            for (int kk = 0; kk < countK; kk++)
+            {
+                int tapOffset = tapPlane[kk] + tapRow[kk] * width + tapColumn[kk];
+                int to = offset + kk * BlockWidth;
+                for (int block = 0; block < blocks; block++)
+                {
+                    int rowBase = interiorBase[block];
+                    if (rowBase < 0) continue;
+                    GemmKernel.CopyBlock(
+                        ref sourceRef, rowBase + tapOffset,
+                        ref destinationRef, to + block * blockStride);
+                }
+            }
+        }
+
+        if (!anyEdge) return;
 
         for (int block = 0; block < blocks; block++)
         {
+            if (interiorBase[block] >= 0) continue;
+
             int firstPixel = jc + block * BlockWidth;
             int pixels = Math.Min(BlockWidth, jc + countN - firstPixel);
             int blockBase = offset + block * countK * BlockWidth;
