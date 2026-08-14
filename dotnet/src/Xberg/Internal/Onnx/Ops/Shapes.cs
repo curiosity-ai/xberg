@@ -413,13 +413,20 @@ internal static class Shapes
             baseOffset += begin[i] * srcStrides[i];
         }
 
-        // Trailing dimensions taken whole with step 1 still read contiguously.
-        int run = 1, expected = 1;
+        // How many elements are contiguous in the source, so the copy moves runs rather than
+        // elements. An axis taken with step 1 contributes its own count whether or not it is
+        // taken whole — a sub-range of the innermost axis is still contiguous — but only an
+        // axis taken *whole* lets the run extend outward into the next one.
+        //
+        // Requiring whole axes throughout, as this did, made the common case of slicing the
+        // innermost axis degenerate to one copy per element: the decoder's per-level slices of
+        // the attention values took 11.5 ms each to move 6.5 MB.
+        int run = 1;
         for (int i = rank - 1; i >= 0; i--)
         {
-            if (strides[i] != expected || count[i] != x.Shape[i]) break;
+            if (step[i] != 1) break;
             run *= count[i];
-            expected = run;
+            if (count[i] != x.Shape[i]) break;
         }
         if (run == 0) run = 1;
 
