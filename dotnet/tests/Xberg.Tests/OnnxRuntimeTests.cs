@@ -135,6 +135,51 @@ public class OnnxRuntimeTests
         Assert.Equal(new float[] { 7, 7, 7, 8, 8, 8 }, result.Floats);
     }
 
+    [Theory]
+    // kernel, stride, pad, dilation — covering the padded stride-2 window the backbone uses,
+    // plus configurations that clip a tap's column range at one edge, both edges, or entirely.
+    [InlineData(3, 2, 1, 1)]
+    [InlineData(3, 1, 0, 1)]
+    [InlineData(2, 2, 0, 1)]
+    [InlineData(3, 2, 0, 1)]
+    [InlineData(3, 1, 1, 1)]
+    [InlineData(2, 3, 1, 1)]
+    [InlineData(3, 1, 2, 2)]
+    [InlineData(1, 1, 0, 1)]
+    public void MaxPool_MatchesTheWindowDefinitionUnderPaddingAndDilation(int k, int stride, int pad, int dilation)
+    {
+        const int H = 9, W = 11;
+        var x = MakeRamp(H * W, 1, 1, H, W);
+        // Break monotonicity, or a maximum could be right for the wrong reason.
+        for (int i = 0; i < H * W; i++) x.Floats[i] = (i * 37 % 91) - 45f;
+
+        var result = Pooling.MaxPool(x, [k, k], [stride, stride], [pad, pad, pad, pad], [dilation, dilation], "", ceilMode: false);
+
+        int effK = (k - 1) * dilation + 1;
+        int outH = (H + 2 * pad - effK) / stride + 1;
+        int outW = (W + 2 * pad - effK) / stride + 1;
+        Assert.Equal([1, 1, outH, outW], result.Shape);
+
+        for (int oy = 0; oy < outH; oy++)
+        {
+            for (int ox = 0; ox < outW; ox++)
+            {
+                float expected = float.NegativeInfinity;
+                for (int ky = 0; ky < k; ky++)
+                {
+                    for (int kx = 0; kx < k; kx++)
+                    {
+                        int iy = oy * stride - pad + ky * dilation;
+                        int ix = ox * stride - pad + kx * dilation;
+                        if ((uint)iy < (uint)H && (uint)ix < (uint)W)
+                            expected = MathF.Max(expected, x.Floats[iy * W + ix]);
+                    }
+                }
+                Assert.Equal(expected, result.Floats[oy * outW + ox]);
+            }
+        }
+    }
+
     [Fact]
     public void Binary_IntegerOperandsStayIntegral()
     {
