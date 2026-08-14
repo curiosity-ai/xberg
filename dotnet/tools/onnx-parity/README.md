@@ -68,6 +68,16 @@ cd ../../ && dotnet run --project tools/Xberg.OnnxParity -c Release -- \
 | `--limit N` | detailed reports for the first `N` mismatches, one line each after |
 | `--atol` / `--rtol` | tolerances; a value passes if within *either* |
 | `--list-ops` | operator histogram for the model, no reference needed |
+| `--benchmark N` | time `N` runs, then per-operator and per-node cost, throughput and pool hit rate |
+| `--gemm` | time the kernel on the shapes these models lower to; add it to `--benchmark` to get both in one process, where the two are comparable |
+
+Reading the JIT's own output is worth doing directly rather than reasoning about it — the
+largest single win in the multiply was visible only there:
+
+```bash
+DOTNET_TieredCompilation=0 DOTNET_JitDisasm="TwelveRows512" \
+    dotnet run --project tools/Xberg.OnnxParity -c Release -- --gemm
+```
 
 ## Reading the results
 
@@ -100,21 +110,34 @@ largest absolute difference 9.8e-6 — it has no inverse sigmoid to amplify anyt
 
 ### Measuring at all
 
-Timing on this VM is unreliable in two specific ways, and both are handled before any number
-is reported.
+Timing on this VM is unreliable in three specific ways, and all three are handled before any
+number is reported.
 
 **The host changes underneath you.** Re-measuring the machine's peak fused-multiply-add
-throughput between consecutive runs of the same binary has produced 100 and 218 GFLOP/s.
-A 2x swing in the ceiling dwarfs most of what optimisation buys, so every timing run starts
-by printing the CPU, core count and memory, then re-measuring peak FMA throughput (256- and
-512-bit) and streaming memory bandwidth. If those numbers move between runs, the model
-numbers from those runs are not comparable. For the same reason `compare_speed.py` runs ONNX
-Runtime and this runtime back to back rather than comparing against a figure recorded
-earlier.
+throughput between consecutive runs of the same binary has produced 100 and 218 GFLOP/s, and
+one kernel shape has read 75.6, 32.6 and 40.4 ms across three runs of identical code. A swing
+that large dwarfs most of what optimisation buys. So every timing run starts by printing the
+CPU, core count and memory, then re-measuring peak FMA throughput (256- and 512-bit) and
+streaming memory bandwidth — and **every rate is also reported as a fraction of that ceiling**.
+Two consecutive runs agree on the fraction to within a point where their absolute figures
+differ by 30%. Absolute GFLOP/s across runs is not evidence; percent of peak is.
+
+For the same reason `--gemm` can run in the same process as `--benchmark`, so an in-model rate
+and a standalone rate for the same shape are comparable at all, and `compare_speed.py` runs
+ONNX Runtime and this runtime back to back rather than against a figure recorded earlier.
 
 **Cold code measures the compiler.** .NET starts methods in a quick-JIT tier and promotes
 them only after roughly thirty calls, and this graph also has to fault in 169 MB of weights
 and spin up the thread pool. Every benchmark discards three full inference passes first.
+
+**Small shapes measure the thread pool.** Kernel-shape timings repeat until each shape has had
+about 3 GFLOP of work. Before that, the smallest shape in the set read anywhere from 16 to 104
+GFLOP/s purely on wake-up and timer granularity.
+
+And the harness itself can be the thing being measured. The packing benchmark allocated its
+scratch buffer inside the parallel body, which made packing look like half the cost of some
+shapes; corrected, it is 3-20%, and a restructuring aimed at that phantom would have been
+wasted. Anything that looks like a large effect is worth reproducing before acting on it.
 
 ### Where it stands
 
@@ -123,23 +146,30 @@ One 640x640 page, 4 cores, both sides measured in the same session:
 | | median |
 | --- | --- |
 | ONNX Runtime | ~0.51 s |
-| this runtime | ~1.15 s |
-| *ratio* | *~2.3x* |
+| this runtime | ~0.95 s |
+| *ratio* | *~1.8x* |
 
-Down from 10.5 s, i.e. 16x, when this work started. The model is 118 GFLOP of
-convolution: ONNX Runtime runs it at roughly 230 GFLOP/s and this runtime at roughly 175,
-against a measured 512-bit ceiling of 500-620 GFLOP/s.
+Down from 10.5 s, i.e. 16x, when this work started. The whole graph is 132 GFLOP of
+multiply-accumulate; the arithmetic-bound nodes now run it at 185-190 GFLOP/s against a
+measured 512-bit ceiling that varies between 400 and 620.
 
 ### What actually moved it
 
-Ordered by effect, and none of it was guessed — each came from the per-node profile, and the
-matrix multiply's shape came from reading MLAS, ONNX Runtime's own kernel library.
+Ordered by effect, and none of it was guessed — each came from the per-node profile, from
+reading MLAS (ONNX Runtime's own kernel library), or from reading the JIT's assembly output.
 
 - **Folding the decomposed batch normalisation** (36% → nothing). The export spells every
   batch norm as a per-channel `Mul` then a per-channel `Add`, each a full streaming pass over
   a multi-megabyte activation to apply a constant affine map. `GraphOptimizer` folds the
   chain into the convolution's weights and bias, and the following activation — `Relu`,
   `Sigmoid`, or the `Sigmoid`/`Mul` pair that spells SiLU — into the same output pass.
+- **Keeping the kernel's accumulators in registers.** RyuJIT was writing every accumulator
+  through to the stack after every multiply-add — twenty-three 64-byte stores per iteration of
+  the innermost loop, maintaining a copy nothing ever read. A `Vector512` passed by value to a
+  real call is passed by hidden reference, so the local has to be materialised on the stack and
+  its address escapes; one partial-block branch in the store helper was enough, however cold.
+  The register kernels now see only whole blocks and the store is a single inlined
+  load-add-store. 3x3 256→256 went 235 → 287 GFLOP/s, 1x1 1024→2048 112 → 293.
 - **Packing the multiply's right-hand operand**, MLAS-style: a panel is copied into a buffer
   where each group of sixteen columns is physically contiguous, so the kernel walks it
   forwards instead of jumping a row stride per step. 100-116 → 180-196 GFLOP/s.
@@ -148,6 +178,11 @@ matrix multiply's shape came from reading MLAS, ONNX Runtime's own kernel librar
   and 48 across successive allocations. Since the panel's rows are exactly one line apart,
   that offset decides whether *every* 512-bit load is a split load or none are.
   180-196 → 230-246 GFLOP/s.
+- **Running leftover rows through the register block.** A row range that does not divide by
+  the block size used to send its remainder through a one-row kernel, which re-reads the whole
+  packed panel to produce one row. On a 64-channel layer the four leftover rows cost as much as
+  the other sixty: the shape measured 142 GFLOP/s where the same shape with 60 rows measured
+  228. The six-row kernel now takes a live-row count and serves partial groups.
 - **Explicit `Vector512`.** `Vector512.IsHardwareAccelerated` reports `false` here and
   `Vector<float>.Count` stays at 8, but explicit `Vector512<float>` still compiles to real
   AVX-512: 577 GFLOP/s against 161 in a pure FMA loop.
@@ -160,15 +195,38 @@ matrix multiply's shape came from reading MLAS, ONNX Runtime's own kernel librar
   multiply asks for its operand a packed panel at a time and convolution gathers those
   columns straight out of the image, so the expansion — nine times the input for a 3x3 layer
   — is written once into a cache-resident panel instead of spilled to a buffer and read back.
+- **Copying slices in runs.** `Slice` decided how much it could move contiguously by requiring
+  every axis to be taken *whole*, which is the wrong test for the innermost axis — a
+  contiguous sub-range of it is still contiguous. Slicing the last axis therefore fell back to
+  one block copy per element, and the decoder does that six times a layer: 11.5 ms per node to
+  move 6.5 MB. Slice went from 65 ms across 58 nodes to out of the profile's top ten.
+- **Broadcasting where one operand holds still.** The broadcast plan looked for trailing axes
+  over which *both* operands advance with the output. A per-row scale, `[N,D]` against `[N,1]`,
+  has no such run at all, so the block collapsed to one element and the tensor was walked one
+  element per delegate call — 11.5 ms to move 8.6 MB on one decoder node. A block now also
+  forms where one side advances and the other holds still, as a vector-scalar call.
+- **Packing depth-major.** Both packers walked block-major, reading each operand row once per
+  column block — eight scattered sixteen-float reads across a row stride that for a 160x160
+  feature map is 100 KB. Depth-major reads each row once and scatters only the writes.
+- **Moving packed blocks as vectors.** Sixteen floats is exactly one cache line, and at that
+  size `Span.CopyTo` is mostly call and length-dispatch overhead.
+- **Vectorising the strided gather.** A convolution that downsamples failed the gather's
+  `strideW == 1` test, so every block of every stride-2 layer — one at each ResNet stage
+  transition — went element by element. Stride two is now a pair of loads and a two-source
+  permute.
+- **Splitting rows when panels are scarce.** The decoder's projections are 256 columns over
+  8400 rows: two column panels, so two of four cores idle. Whole-model MatMul 169 → 118-135 ms.
 - **Fusing layer normalisation**, another nine nodes per encoder and decoder layer, each a
   full pass over an 8.6 MB activation.
 - **Pooled buffers**, recycled through a free list keyed by exact length, with reference
   counts on the storage rather than the tensor so `Reshape` views and `Identity` aliases keep
   their memory alive. A standalone `Relu` over a 26 MB tensor fell from 163 ms to 44 ms.
 - **Reference-based loads** in the inner loop, removing eight bounds checks per iteration;
-  a **blocked transpose** (270 → 51 ms); a **vectorised `erf`** (50 ms → negligible);
-  **`Pow` by a constant exponent** lowered to multiplies (20 ms on one node); and
-  **batched MatMul parallelised across batches** rather than inside each (396 → 160 ms).
+  **hoisted row cursors**, so a broadcast is one addressing mode rather than a `lea`, an `add`
+  and a sign extension per row per iteration; a **blocked transpose** (270 → 51 ms); a
+  **vectorised `erf`** (50 ms → negligible); **`Pow` by a constant exponent** lowered to
+  multiplies (20 ms on one node); and **batched MatMul parallelised across batches** rather
+  than inside each (396 → 160 ms).
 
 ### What was tried and rejected
 
@@ -181,19 +239,37 @@ Recorded because the measurements are the useful part:
   pressure, were the constraint. Twelve rows only became worthwhile once the panel was packed.
 - **Bigger convolution tiles**, back when convolution still tiled: the extra weight reuse did
   not pay for streaming a multi-megabyte buffer per tile.
-- **Splitting the row range across threads** when column panels are scarce. Measured neutral
-  on four cores; not kept.
 - **`DOTNET_PreferredVectorBitWidth=512`.** Does not widen `Vector<T>` on this runtime; only
   explicit `Vector512` does.
+- **Splitting rows *whenever* panels are below twice the core count.** Every extra row chunk
+  repacks the same operand panel; a 1024x2048 product over a 20x20 map fell from 166 to 97
+  GFLOP/s. Kept only where the panel count is below the core count outright.
+
+  This one is also a lesson in reading your own experiments. It was first recorded as rejected
+  outright — but the shape it had been tested on had four panels on four cores, so the guard
+  computed one chunk and the mechanism never engaged. What was recorded as its cost was the
+  host moving between runs. The percent-of-peak column exists because of this.
 
 ### The remaining gap
 
-Convolution is ~60% of runtime, at roughly 175 GFLOP/s against the multiply's own 230-246.
-That difference is the gather that feeds it, which has no arithmetic to amortise its memory
-traffic. Beyond that, the multiply sits at about 45% of the machine's measured ceiling where
-MLAS reaches roughly 55%; the rest is in things C# cannot express — software prefetch hints,
-and instruction scheduling done by hand in assembly. MLAS also carries per-CPU kernel
-variants selected at run time, where this has one AVX-512 path and one portable path.
+At ~1.8x, the arithmetic-bound nodes run at 185-190 GFLOP/s and the best single shapes reach
+270-300, so the spread across shapes is now the largest remaining term rather than the peak.
+Convolution is still ~60% of runtime.
+
+The known routes from here, in rough order of expected value:
+
+- **A direct convolution for small-channel layers.** For a 3x3 layer with 32 or 64 output
+  channels the packed panel holds each input pixel nine times, and each packed float is used
+  for only `2m` flops, so the expansion stops paying for itself. A kernel that reads a shifted
+  window of the image directly, the way oneDNN's do, would not write the expansion at all.
+- **In-place unary operators.** `Relu` and friends are ~35 ms; the session already knows which
+  values die at each node, so a unary op whose input is dead could write into it and avoid the
+  read-for-ownership of a fresh output buffer.
+- **A specialised max-pooling path.** One node, ~10 ms, still running the shared pooling walk
+  with a branch on max-versus-average inside the innermost loop.
+- Beyond that: software prefetch hints and hand-scheduled instruction order, which C# cannot
+  express, and MLAS's per-CPU kernel variants selected at run time, where this has one AVX-512
+  path and one portable path.
 
 ## Two bugs this caught
 
