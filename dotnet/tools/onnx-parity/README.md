@@ -210,6 +210,10 @@ reading MLAS (ONNX Runtime's own kernel library), or from reading the JIT's asse
   feature map is 100 KB. Depth-major reads each row once and scatters only the writes.
 - **Moving packed blocks as vectors.** Sixteen floats is exactly one cache line, and at that
   size `Span.CopyTo` is mostly call and length-dispatch overhead.
+- **Giving max pooling its own walk.** The shared pooling walk finished one output pixel at a
+  time, re-reading source rows per pixel and branching on max-versus-average in the innermost
+  loop. Taking the kernel on the outside makes each pass a running maximum of a contiguous
+  source row against a run of the output row. 11.3 → 7.8 ms on the backbone's one such node.
 - **Vectorising the strided gather.** A convolution that downsamples failed the gather's
   `strideW == 1` test, so every block of every stride-2 layer — one at each ResNet stage
   transition — went element by element. Stride two is now a pair of loads and a two-source
@@ -241,6 +245,14 @@ Recorded because the measurements are the useful part:
   not pay for streaming a multi-megabyte buffer per tile.
 - **`DOTNET_PreferredVectorBitWidth=512`.** Does not widen `Vector<T>` on this runtime; only
   explicit `Vector512` does.
+- **In-place unary operators.** The session knows which values die at each node, so a `Relu`
+  whose input is dead, pool-owned, held by one name and covering its whole array could write
+  over it — one fewer allocation, and a destination already in cache. Implemented and measured
+  the wrong way: the pool did visibly less work (629 buffers reused and 105 allocated per run
+  became 586 and 92) and `Relu` still went from 35-36 ms to 40-41. Reverted rather than kept
+  on the strength of the reasoning, since it also puts aliasing risk in the one place the
+  parity harness cannot check — capture mode has to retain every intermediate, so in-place is
+  disabled exactly when the per-node comparison runs.
 - **Splitting rows *whenever* panels are below twice the core count.** Every extra row chunk
   repacks the same operand panel; a 1024x2048 product over a 20x20 map fell from 166 to 97
   GFLOP/s. Kept only where the panel count is below the core count outright.
@@ -262,11 +274,6 @@ The known routes from here, in rough order of expected value:
   channels the packed panel holds each input pixel nine times, and each packed float is used
   for only `2m` flops, so the expansion stops paying for itself. A kernel that reads a shifted
   window of the image directly, the way oneDNN's do, would not write the expansion at all.
-- **In-place unary operators.** `Relu` and friends are ~35 ms; the session already knows which
-  values die at each node, so a unary op whose input is dead could write into it and avoid the
-  read-for-ownership of a fresh output buffer.
-- **A specialised max-pooling path.** One node, ~10 ms, still running the shared pooling walk
-  with a branch on max-versus-average inside the innermost loop.
 - Beyond that: software prefetch hints and hand-scheduled instruction order, which C# cannot
   express, and MLAS's per-CPU kernel variants selected at run time, where this has one AVX-512
   path and one portable path.
