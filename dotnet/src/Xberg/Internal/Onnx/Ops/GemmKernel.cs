@@ -106,17 +106,37 @@ internal static class GemmKernel
         strideN = Math.Min(strideN, RoundUp((n + panels - 1) / panels, BlockWidth));
 
         long work = (long)m * n * k;
+        bool spread = parallel && work >= parallelThreshold;
 
-        // The column panel stays the unit of parallel work. Splitting the rows as well, to fill
-        // the machine when a narrow output leaves too few panels, was tried and measured
-        // clearly worse — a 1024x2048 product over a 20x20 map fell from 166 to 97 GFLOP/s —
-        // because every row chunk has to pack the same operand panel again.
-        if (parallel && work >= parallelThreshold && panels > 1)
+        // The column panel is the natural unit of parallel work, but a narrow output does not
+        // have enough of them to fill the machine: the decoder's projections are 256 columns
+        // wide over 8400 rows, which is two panels and therefore two busy cores out of four.
+        // Where that happens the rows are split as well. It costs one repacking of the panel
+        // per extra chunk, which is only affordable because few panels means a small operand —
+        // so the split is confined to exactly that case.
+        int rowChunks = 1, rowsPerChunk = m;
+        int workers = Environment.ProcessorCount;
+        if (spread && panels < workers && m >= 2 * WideRowBlock)
         {
-            int capturedStrideN = strideN;
-            Parallel.For(0, panels, index => ColumnPanel(
-                a.Span, packB, c.Span, k, ldc, 0, m,
-                index * capturedStrideN, Math.Min(capturedStrideN, n - index * capturedStrideN), strideK));
+            int wanted = Math.Min((workers + panels - 1) / panels, m / WideRowBlock);
+            rowsPerChunk = RoundUp((m + wanted - 1) / wanted, WideRowBlock);
+            rowChunks = (m + rowsPerChunk - 1) / rowsPerChunk;
+        }
+
+        int tiles = panels * rowChunks;
+        if (spread && tiles > 1)
+        {
+            int capturedStrideN = strideN, capturedRows = rowsPerChunk, capturedChunks = rowChunks;
+            Parallel.For(0, tiles, tile =>
+            {
+                int index = tile / capturedChunks;
+                int jc = index * capturedStrideN;
+                int chunk = tile % capturedChunks;
+                ColumnPanel(
+                    a.Span, packB, c.Span, k, ldc,
+                    chunk * capturedRows, Math.Min(m, (chunk + 1) * capturedRows),
+                    jc, Math.Min(capturedStrideN, n - jc), strideK);
+            });
         }
         else
         {

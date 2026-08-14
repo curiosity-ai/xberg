@@ -224,6 +224,8 @@ internal static class Program
             ("3x3 conv  256->256 @80x80  ", 256, 2304, 6400),
             ("3x3 conv   64->64  @160x160", 64, 576, 25600),
             ("decoder projection         ", 256, 256, 300),
+            ("decoder value_proj         ", 8400, 256, 256),
+            ("decoder memory  proj       ", 8400, 256, 512),
         ];
 
         Console.WriteLine("  shape                            total                           of which packing");
@@ -238,8 +240,12 @@ internal static class Program
 
             for (int i = 0; i < WarmupRuns; i++) Linear.MultiplyInto(a, b, c, m, k, n);
 
+            // Small shapes finish in well under a millisecond, where thread-pool wake-up and
+            // timer granularity dominate — the 256x300 product has read anywhere from 16 to
+            // 104 GFLOP/s across runs. Repeat until each shape has had enough work to measure.
+            int repeats = Math.Clamp((int)(3e9 / (2.0 * m * k * n)), 5, 2000);
+
             var stopwatch = Stopwatch.StartNew();
-            const int repeats = 5;
             for (int r = 0; r < repeats; r++) Linear.MultiplyInto(a, b, c, m, k, n);
             double seconds = stopwatch.Elapsed.TotalSeconds / repeats;
 
