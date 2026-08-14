@@ -285,11 +285,12 @@ internal static class Convolution
             int ox0 = firstPixel - oy0 * outW;
             int iy0 = oy0 * strideH;
 
-            bool interior = pixels == BlockWidth && strideW == 1 && ox0 + BlockWidth <= outW
+            int ix0 = ox0 * strideW;
+            bool interior = pixels == BlockWidth && ox0 + BlockWidth <= outW
                 && iy0 + minRow >= 0 && iy0 + maxRow < height
-                && ox0 + minColumn >= 0 && ox0 + BlockWidth - 1 + maxColumn < width;
+                && ix0 + minColumn >= 0 && (ox0 + BlockWidth - 1) * strideW + maxColumn < width;
 
-            interiorBase[block] = interior ? iy0 * width + ox0 : -1;
+            interiorBase[block] = interior ? iy0 * width + ix0 : -1;
             anyInterior |= interior;
             anyEdge |= !interior;
         }
@@ -309,8 +310,8 @@ internal static class Convolution
                 {
                     int rowBase = interiorBase[block];
                     if (rowBase < 0) continue;
-                    GemmKernel.CopyBlock(
-                        ref sourceRef, rowBase + tapOffset,
+                    GemmKernel.GatherBlock(
+                        ref sourceRef, source.Length, rowBase + tapOffset, strideW,
                         ref destinationRef, to + block * blockStride);
                 }
             }

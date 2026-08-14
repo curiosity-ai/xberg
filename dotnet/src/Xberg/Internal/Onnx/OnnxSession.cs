@@ -26,6 +26,9 @@ internal sealed class OnnxSession
     /// <summary>Recycled activation storage, reused across runs of this session.</summary>
     private readonly TensorPool _pool = new();
 
+    /// <summary>The buffer pool, for tests and profiling to inspect its hit rate.</summary>
+    internal TensorPool Pool => _pool;
+
     /// <param name="optimize">
     /// Rewrite the graph before executing it (see <see cref="GraphOptimizer"/>). Fusing
     /// removes intermediate values, so the parity harness turns this off when it needs to

@@ -99,22 +99,35 @@ internal static class GemmKernel
 
         var (strideN, strideK) = PanelExtents(k, n);
         int panels = (n + strideN - 1) / strideN;
+
+        // Spread the columns evenly over the panel count rather than filling each panel and
+        // leaving a remainder: 400 columns is otherwise three panels of 128 and one of 16, and
+        // the run takes as long as the widest.
+        strideN = Math.Min(strideN, RoundUp((n + panels - 1) / panels, BlockWidth));
+
         long work = (long)m * n * k;
 
+        // The column panel stays the unit of parallel work. Splitting the rows as well, to fill
+        // the machine when a narrow output leaves too few panels, was tried and measured
+        // clearly worse — a 1024x2048 product over a 20x20 map fell from 166 to 97 GFLOP/s —
+        // because every row chunk has to pack the same operand panel again.
         if (parallel && work >= parallelThreshold && panels > 1)
         {
+            int capturedStrideN = strideN;
             Parallel.For(0, panels, index => ColumnPanel(
-                a.Span, packB, c.Span, m, k, ldc,
-                index * strideN, Math.Min(strideN, n - index * strideN), strideK));
+                a.Span, packB, c.Span, k, ldc, 0, m,
+                index * capturedStrideN, Math.Min(capturedStrideN, n - index * capturedStrideN), strideK));
         }
         else
         {
             for (int index = 0; index < panels; index++)
                 ColumnPanel(
-                    a.Span, packB, c.Span, m, k, ldc,
+                    a.Span, packB, c.Span, k, ldc, 0, m,
                     index * strideN, Math.Min(strideN, n - index * strideN), strideK);
         }
     }
+
+    private static int RoundUp(int value, int multiple) => (value + multiple - 1) / multiple * multiple;
 
     /// <summary>
     /// The column and depth extents of one panel.
@@ -146,12 +159,12 @@ internal static class GemmKernel
     internal delegate void PanelPacker(float[] destination, int offset, int pc, int countK, int jc, int countN);
 
     /// <summary>
-    /// Compute one column panel of the destination in full: pack each depth slice of the
-    /// operand once, then run every row block against it.
+    /// Compute one tile of the destination — a range of rows within one column panel — by
+    /// packing each depth slice of the operand once and running every row block against it.
     /// </summary>
     private static void ColumnPanel(
         ReadOnlySpan<float> a, PanelPacker packB, Span<float> c,
-        int m, int k, int ldc, int jc, int countN, int strideK)
+        int k, int ldc, int rowStart, int rowEnd, int jc, int countN, int strideK)
     {
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
         var (packed, packedOffset) = RentPacked(blocks * strideK * BlockWidth);
@@ -163,7 +176,7 @@ internal static class GemmKernel
 
             // The first depth slice establishes the destination; later ones add to it.
             bool first = pc == 0;
-            RowBlockKernel(a, packed, packedOffset, c, k, ldc, 0, m, pc, countK, jc, countN, first);
+            RowBlockKernel(a, packed, packedOffset, c, k, ldc, rowStart, rowEnd, pc, countK, jc, countN, first);
         }
     }
 
@@ -243,6 +256,43 @@ internal static class GemmKernel
                 target[width..].Clear();
             }
         }
+    }
+
+    /// <summary>Lane selector picking every other float from a pair of vectors.</summary>
+    private static readonly Vector512<int> EvenLanes =
+        Vector512.Create(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+
+    /// <summary>
+    /// Move one packed block whose source elements are <paramref name="step"/> apart.
+    /// <para>
+    /// A convolution that downsamples reads every <c>step</c>-th pixel, and there are enough of
+    /// those in a ResNet backbone — every stage transition — that they cannot go down the
+    /// element-at-a-time path. Stride two is the case that occurs, and it is exactly one pair
+    /// of loads and a two-source permute.
+    /// </para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void GatherBlock(
+        ref float source, int length, int from, int step, ref float destination, int to)
+    {
+        if (step == 1)
+        {
+            CopyBlock(ref source, from, ref destination, to);
+            return;
+        }
+
+        // The wide read consumes 2x16 floats to produce 16; near the end of the last plane
+        // that would run past the tensor, so the scalar form covers the final block.
+        if (Avx512F.IsSupported && step == 2 && from + 2 * BlockWidth <= length)
+        {
+            var lower = Vector512.LoadUnsafe(ref source, (nuint)from);
+            var upper = Vector512.LoadUnsafe(ref source, (nuint)(from + BlockWidth));
+            Avx512F.PermuteVar16x32x2(lower, EvenLanes, upper).StoreUnsafe(ref destination, (nuint)to);
+            return;
+        }
+
+        for (int i = 0; i < BlockWidth; i++)
+            Unsafe.Add(ref destination, to + i) = Unsafe.Add(ref source, from + i * step);
     }
 
     /// <summary>
