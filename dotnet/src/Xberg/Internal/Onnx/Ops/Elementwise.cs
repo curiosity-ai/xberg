@@ -56,17 +56,32 @@ internal static class Elementwise
             return result;
         }
 
-        // A run longer than one element only forms where *both* operands stride in lockstep
-        // with the output, so within a block both sides are contiguous; a run of one means
-        // both sides are pinned to a single element.
         int run = plan.BlockLength;
-        Broadcast.ForEachBlock(plan, (oa, ob, od) =>
+        switch (plan.Repeat)
         {
-            if (run > 1)
-                Apply(kind, dataA.AsSpan(oa, run), dataB.AsSpan(ob, run), dataOut.AsSpan(od, run));
-            else
-                dataOut[od] = Scalar(kind, dataA[oa], dataB[ob]);
-        });
+            // One operand holds still across the block: a vector against a repeated scalar.
+            case BroadcastRepeat.RepeatB:
+                Broadcast.ForEachBlock(plan, (oa, ob, od) =>
+                    ApplyScalarRight(kind, dataA.AsSpan(oa, run), dataB[ob], dataOut.AsSpan(od, run)));
+                break;
+
+            case BroadcastRepeat.RepeatA:
+                Broadcast.ForEachBlock(plan, (oa, ob, od) =>
+                    ApplyScalarLeft(kind, dataA[oa], dataB.AsSpan(ob, run), dataOut.AsSpan(od, run)));
+                break;
+
+            // Both operands stride in lockstep with the output, so within a block both sides
+            // are contiguous; a run of one means both sides are pinned to a single element.
+            default:
+                Broadcast.ForEachBlock(plan, (oa, ob, od) =>
+                {
+                    if (run > 1)
+                        Apply(kind, dataA.AsSpan(oa, run), dataB.AsSpan(ob, run), dataOut.AsSpan(od, run));
+                    else
+                        dataOut[od] = Scalar(kind, dataA[oa], dataB[ob]);
+                });
+                break;
+        }
         return result;
     }
 

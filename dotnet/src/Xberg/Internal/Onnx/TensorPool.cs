@@ -34,6 +34,13 @@ internal sealed class TensorPool
     public int Reused { get; private set; }
     public int Allocated { get; private set; }
 
+    /// <summary>
+    /// How many buffers of each length the pool has had to allocate. Only misses are recorded,
+    /// so this stays cheap, and in the steady state it should be empty — anything left in it
+    /// names a shape whose storage is not being recycled.
+    /// </summary>
+    public Dictionary<int, int> AllocationsByLength { get; } = [];
+
     /// <summary>The ambient pool for the execution on this thread, if any.</summary>
     /// <remarks>
     /// Thread-static rather than threaded through every kernel signature: graph execution is
@@ -69,6 +76,8 @@ internal sealed class TensorPool
             return buffer;
         }
         Allocated++;
+        if (length >= MinPooledLength)
+            AllocationsByLength[length] = AllocationsByLength.GetValueOrDefault(length) + 1;
         return GC.AllocateUninitializedArray<float>(length);
     }
 

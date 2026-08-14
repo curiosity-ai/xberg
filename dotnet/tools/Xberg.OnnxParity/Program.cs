@@ -35,6 +35,22 @@ internal static class Program
     private const int WarmupRuns = 3;
 
     /// <summary>
+    /// Peak fused-multiply-add throughput measured in this process, moments before the timings.
+    /// <para>
+    /// Every rate below is also reported as a fraction of it. On this VM the host's own
+    /// throughput has been observed to move by more than two to one between consecutive runs of
+    /// the same binary, which is larger than most of what optimisation buys — so an absolute
+    /// GFLOP/s is not comparable across runs, and a fraction of the ceiling measured alongside
+    /// it is.
+    /// </para>
+    /// </summary>
+    private static double _ceilingGflops;
+
+    /// <summary>Format a rate against the ceiling measured in this same process.</summary>
+    private static string OfCeiling(double gflops) =>
+        _ceilingGflops > 0 ? $"{gflops / _ceilingGflops,4:P0} of peak" : new string(' ', 12);
+
+    /// <summary>
     /// Time whole-model inference and attribute the result to individual nodes.
     /// </summary>
     private static void BenchmarkModel(OnnxModel rawModel, Dictionary<string, Tensor> feeds, int runs)
@@ -62,12 +78,25 @@ internal static class Program
             $"inference over {runs} runs (after {WarmupRuns} warm-up runs): " +
             $"median {timings[timings.Count / 2]:F0} ms, best {timings[0]:F0} ms, worst {timings[^1]:F0} ms");
 
+        // A pool miss in the steady state is not a small thing: the buffer is fresh pages, and
+        // first touch of each one traps into the kernel, which shows up as time charged to
+        // whichever node happened to allocate it.
+        int reusedBefore = session.Pool.Reused, allocatedBefore = session.Pool.Allocated;
+        session.Pool.AllocationsByLength.Clear();
+
         var profile = new OnnxSession.ExecutionProfile
         {
             NodeMicroseconds = new double[model.Nodes.Length],
             NodeOutputShapes = new string[model.Nodes.Length],
         };
         session.Run(feeds, capture: null, profile);
+
+        Console.WriteLine(
+            $"buffer pool over the profiled run: {session.Pool.Reused - reusedBefore} reused, " +
+            $"{session.Pool.Allocated - allocatedBefore} allocated, " +
+            $"{session.Pool.RetainedBytes / (1024.0 * 1024):F0} MiB retained");
+        foreach (var (length, count) in session.Pool.AllocationsByLength.OrderByDescending(p => (long)p.Key * p.Value).Take(8))
+            Console.WriteLine($"    {count,4} x {length,10} floats  ({(double)length * count * 4 / (1024 * 1024),6:F1} MiB)");
 
         double total = profile.NodeMicroseconds.Sum();
         Console.WriteLine();
@@ -86,13 +115,34 @@ internal static class Program
         Console.WriteLine("hottest individual nodes:");
         var hottest = Enumerable.Range(0, model.Nodes.Length)
             .OrderByDescending(i => profile.NodeMicroseconds[i])
-            .Take(15);
+            .Take(28);
         foreach (int i in hottest)
         {
             var node = model.Nodes[i];
+            double flops = FloatingPointOperations(model, node, profile.NodeOutputShapes[i]);
+            // Only the arithmetic-bound operators get a rate; for the rest it would be noise.
+            string rate = flops > 0
+                ? $"{flops / (profile.NodeMicroseconds[i] * 1e3),6:F0} GFLOP/s"
+                : new string(' ', 14);
             Console.WriteLine($"  #{i,-5} {node.OpType,-16} {profile.NodeMicroseconds[i] / 1000,7:F1} ms  " +
-                              $"out {profile.NodeOutputShapes[i],-22} {node.Name}");
+                              $"{rate}  out {profile.NodeOutputShapes[i],-22} {node.Name}");
         }
+
+        // The aggregate rate is what parity is measured against: the arithmetic is fixed, so
+        // this is the one number that says how much of the machine the runtime is using.
+        double totalFlops = 0, arithmeticMicroseconds = 0;
+        for (int i = 0; i < model.Nodes.Length; i++)
+        {
+            double flops = FloatingPointOperations(model, model.Nodes[i], profile.NodeOutputShapes[i]);
+            if (flops <= 0) continue;
+            totalFlops += flops;
+            arithmeticMicroseconds += profile.NodeMicroseconds[i];
+        }
+        Console.WriteLine();
+        Console.WriteLine(
+            $"arithmetic-bound nodes: {totalFlops / 1e9:F1} GFLOP in {arithmeticMicroseconds / 1000:F0} ms " +
+            $"= {totalFlops / (arithmeticMicroseconds * 1e3):F0} GFLOP/s, " +
+            $"{OfCeiling(totalFlops / (arithmeticMicroseconds * 1e3))}");
 
         // How much of the graph is doing nothing measurable: shape arithmetic and other
         // scalar bookkeeping that could be folded away entirely rather than made faster.
@@ -104,21 +154,83 @@ internal static class Program
     }
 
     /// <summary>
+    /// Multiply-accumulates a node performs, counted as two operations each, or zero for the
+    /// operators where the figure would not mean anything.
+    /// <para>
+    /// The point is to separate "this node is slow because it has a lot of arithmetic to do"
+    /// from "this node is slow", which the wall-clock column alone cannot do. Only the reduction
+    /// extent has to be recovered — the output shape is recorded during profiling, and for
+    /// these operators the other operand is a weight, whose shape is known from the graph.
+    /// </para>
+    /// </summary>
+    private static double FloatingPointOperations(OnnxModel model, OnnxNode node, string outputShape)
+    {
+        long elements = 1;
+        foreach (var part in outputShape.Trim('[', ']').Split(','))
+        {
+            if (!int.TryParse(part.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int dimension))
+                return 0;
+            elements *= dimension;
+        }
+        if (elements <= 0) return 0;
+
+        switch (node.OpType)
+        {
+            case "Conv" when node.Inputs.Length >= 2
+                             && model.Initializers.TryGetValue(node.Inputs[1], out var weight)
+                             && weight.Rank == 4:
+                // [filters, inputChannels/group, kh, kw] — the trailing three are the reduction.
+                return 2.0 * elements * weight.Shape[1] * weight.Shape[2] * weight.Shape[3];
+
+            case "MatMul" when node.Inputs.Length >= 2
+                               && model.Initializers.TryGetValue(node.Inputs[1], out var b)
+                               && b.Rank >= 2:
+                return 2.0 * elements * b.Shape[b.Rank - 2];
+
+            case "Gemm" when node.Inputs.Length >= 2
+                             && model.Initializers.TryGetValue(node.Inputs[1], out var g)
+                             && g.Rank == 2:
+                // transB decides which axis of the weight is the reduction.
+                return 2.0 * elements * (node.AttrInt("transB", 0) != 0 ? g.Shape[1] : g.Shape[0]);
+
+            default:
+                return 0;
+        }
+    }
+
+    /// <summary>
     /// Time the matrix-multiply kernel on the shapes RT-DETR's convolutions actually lower
     /// to, so its throughput can be judged directly rather than inferred from whole-model
     /// timings that also include im2col, allocation and everything else.
+    /// <para>
+    /// Each shape is also measured with the packing done alone, over the same panels in the
+    /// same order but with no arithmetic. Packing and multiplying are the only two things the
+    /// kernel does, so that one extra number says which of them a slow shape is spending its
+    /// time in — a distinction the total cannot make, and one that has already been guessed
+    /// wrong once here.
+    /// </para>
     /// </summary>
     private static void BenchmarkGemm()
     {
         (string Label, int M, int K, int N)[] shapes =
         [
             ("1x1 conv  256->256 @160x160", 256, 256, 25600),
+            ("1x1 conv  256->128 @160x160", 128, 256, 25600),
             ("1x1 conv  512->512 @80x80  ", 512, 512, 6400),
+            ("1x1 conv  256->512 @80x80  ", 512, 256, 6400),
+            ("1x1 conv  512->1024 @40x40 ", 1024, 512, 1600),
+            ("1x1 conv  256->1024 @40x40 ", 1024, 256, 1600),
+            ("1x1 conv 1024->2048 @20x20 ", 2048, 1024, 400),
             ("3x3 conv  256->256 @80x80  ", 256, 2304, 6400),
             ("3x3 conv   64->64  @160x160", 64, 576, 25600),
+            ("  same, m rounded to 60    ", 60, 576, 25600),
+            ("  same, m rounded to 48    ", 48, 576, 25600),
             ("decoder projection         ", 256, 256, 300),
+            ("decoder value_proj         ", 8400, 256, 256),
+            ("decoder memory  proj       ", 8400, 256, 512),
         ];
 
+        Console.WriteLine("  shape                            total                           of which packing");
         foreach (var (label, m, k, n) in shapes)
         {
             var a = new float[m * k];
@@ -130,14 +242,52 @@ internal static class Program
 
             for (int i = 0; i < WarmupRuns; i++) Linear.MultiplyInto(a, b, c, m, k, n);
 
+            // Small shapes finish in well under a millisecond, where thread-pool wake-up and
+            // timer granularity dominate — the 256x300 product has read anywhere from 16 to
+            // 104 GFLOP/s across runs. Repeat until each shape has had enough work to measure.
+            int repeats = Math.Clamp((int)(3e9 / (2.0 * m * k * n)), 5, 2000);
+
             var stopwatch = Stopwatch.StartNew();
-            const int repeats = 5;
             for (int r = 0; r < repeats; r++) Linear.MultiplyInto(a, b, c, m, k, n);
             double seconds = stopwatch.Elapsed.TotalSeconds / repeats;
 
+            double packSeconds = TimePackingOnly(b, k, n, repeats);
+
             double gflops = 2.0 * m * k * n / seconds / 1e9;
-            Console.WriteLine($"  {label}  {seconds * 1000,8:F1} ms   {gflops,6:F1} GFLOP/s");
+            Console.WriteLine(
+                $"  {label}  {seconds * 1000,8:F1} ms   {gflops,6:F1} GFLOP/s  {OfCeiling(gflops)}   " +
+                $"{packSeconds * 1000,7:F1} ms  {packSeconds / seconds,5:P0}");
         }
+    }
+
+    /// <summary>
+    /// Walk exactly the panels the multiply would, packing each and doing nothing else.
+    /// </summary>
+    private static double TimePackingOnly(float[] b, int k, int n, int repeats)
+    {
+        var (strideN, strideK) = GemmKernel.PanelExtents(k, n);
+        int panels = (n + strideN - 1) / strideN;
+
+        // The scratch buffer is per-thread and reused, exactly as the kernel's is. Allocating
+        // it inside the loop instead would have this measuring the allocator, and did.
+        int scratchLength = ((strideN + 15) / 16) * strideK * 16;
+        var stopwatch = Stopwatch.StartNew();
+        for (int r = 0; r < repeats; r++)
+        {
+            Parallel.For(
+                0, panels,
+                () => new float[scratchLength],
+                (index, _, scratch) =>
+                {
+                    int jc = index * strideN;
+                    int countN = Math.Min(strideN, n - jc);
+                    for (int pc = 0; pc < k; pc += strideK)
+                        GemmKernel.PackB(scratch, 0, b, n, pc, Math.Min(strideK, k - pc), jc, countN);
+                    return scratch;
+                },
+                _ => { });
+        }
+        return stopwatch.Elapsed.TotalSeconds / repeats;
     }
 
     private static int Main(string[] args)
@@ -180,11 +330,14 @@ internal static class Program
         {
             MachineProbe.PrintMachine();
             Console.WriteLine();
-            MachineProbe.Calibrate();
+            _ceilingGflops = MachineProbe.Calibrate().MultiThreadGflops;
             Console.WriteLine();
         }
 
-        if (gemmBenchmark)
+        // Given both, the kernel shapes are timed in the same process as the model, so an
+        // in-model rate and a standalone rate for the same shape can actually be compared —
+        // across processes the host moves enough to swamp the difference being looked for.
+        if (gemmBenchmark && modelPath is null)
         {
             BenchmarkGemm();
             return 0;
@@ -248,6 +401,11 @@ internal static class Program
         if (benchmarkRuns > 0)
         {
             BenchmarkModel(model, feeds, benchmarkRuns);
+            if (gemmBenchmark)
+            {
+                Console.WriteLine();
+                BenchmarkGemm();
+            }
             return 0;
         }
 

@@ -413,13 +413,20 @@ internal static class Shapes
             baseOffset += begin[i] * srcStrides[i];
         }
 
-        // Trailing dimensions taken whole with step 1 still read contiguously.
-        int run = 1, expected = 1;
+        // How many elements are contiguous in the source, so the copy moves runs rather than
+        // elements. An axis taken with step 1 contributes its own count whether or not it is
+        // taken whole — a sub-range of the innermost axis is still contiguous — but only an
+        // axis taken *whole* lets the run extend outward into the next one.
+        //
+        // Requiring whole axes throughout, as this did, made the common case of slicing the
+        // innermost axis degenerate to one copy per element: the decoder's per-level slices of
+        // the attention values took 11.5 ms each to move 6.5 MB.
+        int run = 1;
         for (int i = rank - 1; i >= 0; i--)
         {
-            if (strides[i] != expected || count[i] != x.Shape[i]) break;
+            if (step[i] != 1) break;
             run *= count[i];
-            expected = run;
+            if (count[i] != x.Shape[i]) break;
         }
         if (run == 0) run = 1;
 
@@ -555,16 +562,20 @@ internal static class Shapes
         var result = x.IsFloat ? Tensor.AllocateFloat(target) : Tensor.AllocateLong(x.Type, target);
         int run = plan.BlockLength;
 
+        // RepeatA means the source holds one element across the whole block — which for
+        // Expand is precisely a repeat, so the block is a fill rather than a copy.
+        bool repeating = plan.Repeat == BroadcastRepeat.RepeatA || x.Count == 1;
+
         Broadcast.ForEachBlock(plan, (oa, _, od) =>
         {
             if (x.IsFloat)
             {
-                if (x.Count == 1) result.Floats.AsSpan(od, run).Fill(x.Floats[0]);
+                if (repeating) result.Floats.AsSpan(od, run).Fill(x.Floats[x.Count == 1 ? 0 : oa]);
                 else x.Floats.AsSpan(oa, run).CopyTo(result.Floats.AsSpan(od, run));
             }
             else
             {
-                if (x.Count == 1) result.Longs.AsSpan(od, run).Fill(x.Longs[0]);
+                if (repeating) result.Longs.AsSpan(od, run).Fill(x.Longs[x.Count == 1 ? 0 : oa]);
                 else x.Longs.AsSpan(oa, run).CopyTo(result.Longs.AsSpan(od, run));
             }
         });

@@ -80,6 +80,107 @@ public class OnnxRuntimeTests
     }
 
     [Fact]
+    public void Binary_BroadcastsAPerRowScalarAcrossTheInnermostAxis()
+    {
+        // [N,D] against [N,1]. Neither operand strides in lockstep with the output on the
+        // innermost axis, so the plan has to recognise that one side simply holds still —
+        // otherwise the block collapses to a single element and the whole tensor is walked
+        // one element at a time, which cost 11.5 ms on a single node of the decoder.
+        var x = Tensor.FromFloats([1, 2, 3, 4, 5, 6], 2, 3);
+        var scale = Tensor.FromFloats([10, 100], 2, 1);
+
+        var result = Elementwise.Binary(x, scale, BinaryKind.Mul);
+
+        Assert.Equal([2, 3], result.Shape);
+        Assert.Equal(new float[] { 10, 20, 30, 400, 500, 600 }, result.Floats);
+    }
+
+    [Fact]
+    public void Binary_BroadcastsAPerRowScalarOnTheLeftToo()
+    {
+        var scale = Tensor.FromFloats([10, 100], 2, 1);
+        var x = Tensor.FromFloats([1, 2, 3, 4, 5, 6], 2, 3);
+
+        var result = Elementwise.Binary(scale, x, BinaryKind.Sub);
+
+        Assert.Equal([2, 3], result.Shape);
+        Assert.Equal(new float[] { 9, 8, 7, 96, 95, 94 }, result.Floats);
+    }
+
+    [Fact]
+    public void Binary_HeldOperandSpansSeveralTrailingAxes()
+    {
+        // The run extends outward through every axis the held side is constant over, so the
+        // block here is the whole 3x4 tail rather than just the innermost axis.
+        var x = MakeRamp(2 * 3 * 4, 2, 3, 4);
+        var scale = Tensor.FromFloats([2, 3], 2, 1, 1);
+
+        var result = Elementwise.Binary(x, scale, BinaryKind.Mul);
+
+        Assert.Equal([2, 3, 4], result.Shape);
+        for (int n = 0; n < 2; n++)
+            for (int i = 0; i < 12; i++)
+                Assert.Equal(x.Floats[n * 12 + i] * (n == 0 ? 2 : 3), result.Floats[n * 12 + i]);
+    }
+
+    [Fact]
+    public void Expand_RepeatsAlongTheInnermostAxis()
+    {
+        var x = Tensor.FromFloats([7, 8], 2, 1);
+        var shape = Tensor.FromLongs([2, 3], ElementType.Int64, 2);
+
+        var result = Shapes.Expand(x, shape);
+
+        Assert.Equal([2, 3], result.Shape);
+        Assert.Equal(new float[] { 7, 7, 7, 8, 8, 8 }, result.Floats);
+    }
+
+    [Theory]
+    // kernel, stride, pad, dilation — covering the padded stride-2 window the backbone uses,
+    // plus configurations that clip a tap's column range at one edge, both edges, or entirely.
+    [InlineData(3, 2, 1, 1)]
+    [InlineData(3, 1, 0, 1)]
+    [InlineData(2, 2, 0, 1)]
+    [InlineData(3, 2, 0, 1)]
+    [InlineData(3, 1, 1, 1)]
+    [InlineData(2, 3, 1, 1)]
+    [InlineData(3, 1, 2, 2)]
+    [InlineData(1, 1, 0, 1)]
+    public void MaxPool_MatchesTheWindowDefinitionUnderPaddingAndDilation(int k, int stride, int pad, int dilation)
+    {
+        const int H = 9, W = 11;
+        var x = MakeRamp(H * W, 1, 1, H, W);
+        // Break monotonicity, or a maximum could be right for the wrong reason.
+        for (int i = 0; i < H * W; i++) x.Floats[i] = (i * 37 % 91) - 45f;
+
+        var result = Pooling.MaxPool(x, [k, k], [stride, stride], [pad, pad, pad, pad], [dilation, dilation], "", ceilMode: false);
+
+        int effK = (k - 1) * dilation + 1;
+        int outH = (H + 2 * pad - effK) / stride + 1;
+        int outW = (W + 2 * pad - effK) / stride + 1;
+        Assert.Equal([1, 1, outH, outW], result.Shape);
+
+        for (int oy = 0; oy < outH; oy++)
+        {
+            for (int ox = 0; ox < outW; ox++)
+            {
+                float expected = float.NegativeInfinity;
+                for (int ky = 0; ky < k; ky++)
+                {
+                    for (int kx = 0; kx < k; kx++)
+                    {
+                        int iy = oy * stride - pad + ky * dilation;
+                        int ix = ox * stride - pad + kx * dilation;
+                        if ((uint)iy < (uint)H && (uint)ix < (uint)W)
+                            expected = MathF.Max(expected, x.Floats[iy * W + ix]);
+                    }
+                }
+                Assert.Equal(expected, result.Floats[oy * outW + ox]);
+            }
+        }
+    }
+
+    [Fact]
     public void Binary_IntegerOperandsStayIntegral()
     {
         // Shape arithmetic must not round-trip through float, where large dimensions lose

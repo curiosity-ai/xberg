@@ -12,6 +12,12 @@ namespace Xberg.Internal.Onnx;
 /// only once per block.
 /// </para>
 /// </summary>
+/// <summary>
+/// Which operand, if either, stays on one element for the whole of a block — so the block is
+/// a vector-scalar operation rather than a vector-vector one.
+/// </summary>
+internal enum BroadcastRepeat { None, RepeatA, RepeatB }
+
 internal static class Broadcast
 {
     /// <summary>The broadcast result shape, or throws when the shapes are incompatible.</summary>
@@ -61,13 +67,14 @@ internal static class Broadcast
     /// contiguous, unbroadcast block of <c>BlockLength</c> elements that a kernel can hand
     /// to a vectorised primitive in one call.
     /// </summary>
-    public readonly record struct Plan(int[] Shape, int[] StrideA, int[] StrideB, int InnerDims, int BlockLength)
+    public readonly record struct Plan(
+        int[] Shape, int[] StrideA, int[] StrideB, int InnerDims, int BlockLength, BroadcastRepeat Repeat)
     {
         public int Total => Tensor.ElementCount(Shape);
         public int BlockCount => BlockLength > 0 ? Total / BlockLength : 0;
         /// <summary>True when both operands already match the output exactly, element for
         /// element — the case worth a straight whole-array vector call.</summary>
-        public bool IsFlat => BlockLength == Total;
+        public bool IsFlat => Repeat == BroadcastRepeat.None && BlockLength == Total;
     }
 
     public static Plan MakePlan(ReadOnlySpan<int> shapeA, ReadOnlySpan<int> shapeB)
@@ -85,10 +92,50 @@ internal static class Broadcast
             block *= shape[i];
             innerDims++;
         }
+
+        var repeat = BroadcastRepeat.None;
+        if (innerDims == 0)
+        {
+            // Nothing advances in lockstep, but one side may be pinned to a single element
+            // across the run — which is still a vector call, just a vector-scalar one. This is
+            // what a per-row scale looks like, [N,D] against [N,1], and it is common enough
+            // that leaving it to the element-at-a-time path is not affordable: one such node
+            // spent 11.5 ms moving 8.6 MB.
+            (block, innerDims, repeat) = LongestConstantRun(shape, strideA, strideB, rank);
+        }
+
         // A rank-0 or fully broadcast operand leaves no run; one element per block still works.
         if (innerDims == 0) block = 1;
 
-        return new Plan(shape, strideA, strideB, innerDims, block);
+        return new Plan(shape, strideA, strideB, innerDims, block, repeat);
+    }
+
+    /// <summary>
+    /// The longer of the two runs over which one operand advances contiguously while the other
+    /// holds still.
+    /// </summary>
+    private static (int Block, int InnerDims, BroadcastRepeat Repeat) LongestConstantRun(
+        int[] shape, int[] strideA, int[] strideB, int rank)
+    {
+        var (blockB, dimsB) = ConstantRun(shape, moving: strideA, held: strideB, rank);
+        var (blockA, dimsA) = ConstantRun(shape, moving: strideB, held: strideA, rank);
+
+        if (dimsB > 0 && blockB >= blockA) return (blockB, dimsB, BroadcastRepeat.RepeatB);
+        if (dimsA > 0) return (blockA, dimsA, BroadcastRepeat.RepeatA);
+        return (1, 0, BroadcastRepeat.None);
+    }
+
+    private static (int Block, int InnerDims) ConstantRun(
+        int[] shape, int[] moving, int[] held, int rank)
+    {
+        int block = 1, dims = 0;
+        for (int i = rank - 1; i >= 0; i--)
+        {
+            if (moving[i] != block || held[i] != 0) break;
+            block *= shape[i];
+            dims++;
+        }
+        return (block, dims);
     }
 
     /// <summary>
