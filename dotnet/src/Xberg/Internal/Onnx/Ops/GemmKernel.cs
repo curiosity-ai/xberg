@@ -73,8 +73,8 @@ internal static class GemmKernel
     {
         var source = b;
         int ldb = n;
-        Multiply(a, (destination, pc, countK, jc, countN) =>
-            PackB(destination, source.Span, ldb, pc, countK, jc, countN),
+        Multiply(a, (destination, offset, pc, countK, jc, countN) =>
+            PackB(destination, offset, source.Span, ldb, pc, countK, jc, countN),
             c, m, k, n, ldc, parallel, parallelThreshold);
     }
 
@@ -130,7 +130,7 @@ internal static class GemmKernel
     /// <c>B[pc..pc+countK, jc..jc+countN]</c>, laid out as <c>[columnBlock][k][16]</c> with the
     /// trailing block zero-filled.
     /// </summary>
-    internal delegate void PanelPacker(float[] destination, int pc, int countK, int jc, int countN);
+    internal delegate void PanelPacker(float[] destination, int offset, int pc, int countK, int jc, int countN);
 
     /// <summary>
     /// Compute one column panel of the destination in full: pack each depth slice of the
@@ -141,28 +141,58 @@ internal static class GemmKernel
         int m, int k, int ldc, int jc, int countN, int strideK)
     {
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
-        var packed = RentPacked(blocks * strideK * BlockWidth);
+        var (packed, packedOffset) = RentPacked(blocks * strideK * BlockWidth);
 
         for (int pc = 0; pc < k; pc += strideK)
         {
             int countK = Math.Min(strideK, k - pc);
-            packB(packed, pc, countK, jc, countN);
+            packB(packed, packedOffset, pc, countK, jc, countN);
 
             // The first depth slice establishes the destination; later ones add to it.
             bool first = pc == 0;
             for (int i0 = 0; i0 < m; i0 += RowBlock)
             {
                 int rows = Math.Min(RowBlock, m - i0);
-                RowBlockKernel(a, packed, c, k, ldc, i0, rows, pc, countK, jc, countN, first);
+                RowBlockKernel(a, packed, packedOffset, c, k, ldc, i0, rows, pc, countK, jc, countN, first);
             }
         }
     }
 
-    private static float[] RentPacked(int elements)
+    /// <summary>Cache line the packed panel is aligned to.</summary>
+    private const int CacheLineBytes = 64;
+
+    private const int AlignmentSlack = CacheLineBytes / sizeof(float);
+
+    /// <summary>Offset into <see cref="_packed"/> at which the aligned data starts.</summary>
+    [ThreadStatic]
+    private static int _packedOffset;
+
+    /// <summary>
+    /// The packed panel, aligned to a cache line.
+    /// <para>
+    /// Alignment is worth arranging deliberately because .NET does not provide it: a
+    /// <c>float[]</c> lands at an essentially arbitrary offset within a cache line, and the
+    /// panel's rows are exactly one line apart, so the base offset decides whether
+    /// <em>every</em> 512-bit load in the kernel is a split load or none of them are. The
+    /// array is allocated pinned so its address cannot change after the offset is computed.
+    /// </para>
+    /// </summary>
+    private static (float[] Buffer, int Offset) RentPacked(int elements)
     {
         var buffer = _packed;
-        if (buffer is null || buffer.Length < elements) _packed = buffer = new float[elements];
-        return buffer;
+        if (buffer is null || buffer.Length < elements + AlignmentSlack)
+        {
+            _packed = buffer = GC.AllocateArray<float>(elements + AlignmentSlack, pinned: true);
+            _packedOffset = AlignmentOffset(buffer);
+        }
+        return (buffer, _packedOffset);
+    }
+
+    private static unsafe int AlignmentOffset(float[] pinned)
+    {
+        nuint address = (nuint)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(pinned));
+        nuint past = address % CacheLineBytes;
+        return past == 0 ? 0 : (int)((CacheLineBytes - past) / sizeof(float));
     }
 
     /// <summary>
@@ -171,14 +201,14 @@ internal static class GemmKernel
     /// number of blocks wide — which lets the kernel run one uniform shape and ignore edges.
     /// </summary>
     internal static void PackB(
-        float[] packed, ReadOnlySpan<float> b, int ldb, int pc, int countK, int jc, int countN)
+        float[] packed, int offset, ReadOnlySpan<float> b, int ldb, int pc, int countK, int jc, int countN)
     {
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
         for (int block = 0; block < blocks; block++)
         {
             int column = jc + block * BlockWidth;
             int width = Math.Min(BlockWidth, jc + countN - column);
-            int destination = block * countK * BlockWidth;
+            int destination = offset + block * countK * BlockWidth;
 
             if (width == BlockWidth)
             {
@@ -200,17 +230,17 @@ internal static class GemmKernel
 
     /// <summary>Dispatch one row block to the widest kernel that fits it.</summary>
     private static void RowBlockKernel(
-        ReadOnlySpan<float> a, float[] packed, Span<float> c,
+        ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
         int k, int ldc, int i0, int rows, int pc, int countK, int jc, int countN, bool first)
     {
         if (rows == RowBlock)
         {
-            if (Use512) SixRows512(a, packed, c, k, ldc, i0, pc, countK, jc, countN, first);
-            else SixRowsVector(a, packed, c, k, ldc, i0, pc, countK, jc, countN, first);
+            if (Use512) SixRows512(a, packed, packedOffset, c, k, ldc, i0, pc, countK, jc, countN, first);
+            else SixRowsVector(a, packed, packedOffset, c, k, ldc, i0, pc, countK, jc, countN, first);
             return;
         }
         for (int i = i0; i < i0 + rows; i++)
-            SingleRow(a, packed, c, k, ldc, i, pc, countK, jc, countN, first);
+            SingleRow(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
     }
 
     /// <summary>Flat offset of a packed block's first element.</summary>
@@ -221,11 +251,11 @@ internal static class GemmKernel
     /// Six output rows against two 16-float packed blocks, in 512-bit vectors.
     /// </summary>
     private static void SixRows512(
-        ReadOnlySpan<float> a, float[] packed, Span<float> c,
+        ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
         int k, int ldc, int i0, int pc, int countK, int jc, int countN, bool first)
     {
         ref float aRef = ref MemoryMarshal.GetReference(a);
-        ref float pRef = ref MemoryMarshal.GetArrayDataReference(packed);
+        ref float pRef = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(packed), packedOffset);
         ref float cRef = ref MemoryMarshal.GetReference(c);
 
         int a0 = i0 * k + pc;
@@ -344,13 +374,13 @@ internal static class GemmKernel
     /// accumulators.
     /// </summary>
     private static void SixRowsVector(
-        ReadOnlySpan<float> a, float[] packed, Span<float> c,
+        ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
         int k, int ldc, int i0, int pc, int countK, int jc, int countN, bool first)
     {
         int width = Vector<float>.Count;
         int halves = BlockWidth / width;          // 2 on AVX2, 1 where the vector is already 16 wide
         ref float aRef = ref MemoryMarshal.GetReference(a);
-        ref float pRef = ref MemoryMarshal.GetArrayDataReference(packed);
+        ref float pRef = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(packed), packedOffset);
         ref float cRef = ref MemoryMarshal.GetReference(c);
 
         int a0 = i0 * k + pc;
@@ -409,11 +439,11 @@ internal static class GemmKernel
 
     /// <summary>One output row, for the rows left over when the block does not divide evenly.</summary>
     private static void SingleRow(
-        ReadOnlySpan<float> a, float[] packed, Span<float> c,
+        ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
         int k, int ldc, int i, int pc, int countK, int jc, int countN, bool first)
     {
         ref float aRef = ref MemoryMarshal.GetReference(a);
-        ref float pRef = ref MemoryMarshal.GetArrayDataReference(packed);
+        ref float pRef = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(packed), packedOffset);
         ref float cRef = ref MemoryMarshal.GetReference(c);
 
         int width = Vector<float>.Count;

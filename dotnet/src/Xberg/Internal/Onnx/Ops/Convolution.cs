@@ -192,8 +192,8 @@ internal static class Convolution
 
                 GemmKernel.Multiply(
                     weights,
-                    (destination, pc, countK, jc, countN) => PackReceptiveFields(
-                        destination, source, planeBase, height, width, outW,
+                    (destination, offset, pc, countK, jc, countN) => PackReceptiveFields(
+                        destination, offset, source, planeBase, height, width, outW,
                         kh, kw, strideH, strideW, dilationH, dilationW, pad,
                         pc, countK, jc, countN),
                     output, outPerGroup, patch, spatial, spatial,
@@ -210,13 +210,17 @@ internal static class Convolution
     /// <c>[pc, pc+countK)</c> and each block of sixteen output pixels in
     /// <c>[jc, jc+countN)</c>, gather the sixteen input values that tap contributes.
     /// <para>
-    /// With unit horizontal stride a run of consecutive output pixels reads a run of
-    /// consecutive input pixels, so the gather is a block copy; the loop only falls back to
-    /// element-wise work where a run crosses an output row or leaves the image.
+    /// The arithmetic is arranged so the inner loop has none. Decomposing a flat tap index
+    /// into channel and kernel offset costs three integer divisions, and doing that per block
+    /// per tap dominated the gather; it is now computed once per panel into a small table.
+    /// The output pixel's row and column likewise cost one division per block rather than one
+    /// per tap. What remains in the common case — a block that stays inside one output row and
+    /// inside the image, at unit horizontal stride — is a single sixteen-float copy.
     /// </para>
     /// </summary>
     private static void PackReceptiveFields(
-        float[] destination, float[] source, int planeBase, int height, int width, int outW,
+        float[] destination, int offset, float[] source, int planeBase,
+        int height, int width, int outW,
         int kh, int kw, int strideH, int strideW, int dilationH, int dilationW, Padding pad,
         int pc, int countK, int jc, int countN)
     {
@@ -224,26 +228,59 @@ internal static class Convolution
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
         int plane = height * width;
 
+        // One entry per tap in this depth slice: the input plane it reads and the vertical and
+        // horizontal offsets it applies.
+        Span<int> tapPlane = countK <= 256 ? stackalloc int[countK] : new int[countK];
+        Span<int> tapRow = countK <= 256 ? stackalloc int[countK] : new int[countK];
+        Span<int> tapColumn = countK <= 256 ? stackalloc int[countK] : new int[countK];
+        for (int kk = 0; kk < countK; kk++)
+        {
+            int tap = pc + kk;
+            int kx = tap % kw;
+            int ky = tap / kw % kh;
+            int c = tap / (kw * kh);
+            tapPlane[kk] = planeBase + c * plane;
+            tapRow[kk] = ky * dilationH - pad.Top;
+            tapColumn[kk] = kx * dilationW - pad.Left;
+        }
+
         for (int block = 0; block < blocks; block++)
         {
             int firstPixel = jc + block * BlockWidth;
             int pixels = Math.Min(BlockWidth, jc + countN - firstPixel);
-            int blockBase = block * countK * BlockWidth;
+            int blockBase = offset + block * countK * BlockWidth;
+
+            int oy0 = firstPixel / outW;
+            int ox0 = firstPixel - oy0 * outW;
+            bool singleRow = ox0 + pixels <= outW;
 
             for (int kk = 0; kk < countK; kk++)
             {
-                // Decompose the flat tap index into channel and kernel offset.
-                int tap = pc + kk;
-                int kx = tap % kw;
-                int ky = tap / kw % kh;
-                int c = tap / (kw * kh);
-                int srcPlane = planeBase + c * plane;
-                int ixStart = -pad.Left + kx * dilationW;
-
                 var target = destination.AsSpan(blockBase + kk * BlockWidth, BlockWidth);
-                // Columns past the panel's real width are zero so the kernel can run one shape.
+                // Columns past the panel's real width are zero so the kernel runs one shape.
                 if (pixels < BlockWidth) target[pixels..].Clear();
 
+                if (singleRow)
+                {
+                    int iy = oy0 * strideH + tapRow[kk];
+                    if ((uint)iy >= (uint)height)
+                    {
+                        target[..pixels].Clear();
+                        continue;
+                    }
+
+                    int srcRow = tapPlane[kk] + iy * width;
+                    int firstIx = ox0 * strideW + tapColumn[kk];
+                    int lastIx = (ox0 + pixels - 1) * strideW + tapColumn[kk];
+
+                    if (strideW == 1 && firstIx >= 0 && lastIx < width)
+                        source.AsSpan(srcRow + firstIx, pixels).CopyTo(target);
+                    else
+                        GatherStrided(source, srcRow, target, pixels, ox0, strideW, tapColumn[kk], width);
+                    continue;
+                }
+
+                // The block straddles an output row; walk it in per-row runs.
                 int position = 0;
                 while (position < pixels)
                 {
@@ -252,7 +289,7 @@ internal static class Convolution
                     int ox = pixel - oy * outW;
                     int run = Math.Min(outW - ox, pixels - position);
 
-                    int iy = oy * strideH - pad.Top + ky * dilationH;
+                    int iy = oy * strideH + tapRow[kk];
                     if ((uint)iy >= (uint)height)
                     {
                         target.Slice(position, run).Clear();
@@ -260,25 +297,28 @@ internal static class Convolution
                         continue;
                     }
 
-                    int srcRow = srcPlane + iy * width;
-                    int firstIx = ox * strideW + ixStart;
-                    int lastIx = (ox + run - 1) * strideW + ixStart;
+                    int srcRow = tapPlane[kk] + iy * width;
+                    int firstIx = ox * strideW + tapColumn[kk];
+                    int lastIx = (ox + run - 1) * strideW + tapColumn[kk];
 
                     if (strideW == 1 && firstIx >= 0 && lastIx < width)
-                    {
                         source.AsSpan(srcRow + firstIx, run).CopyTo(target.Slice(position, run));
-                    }
                     else
-                    {
-                        for (int i = 0; i < run; i++)
-                        {
-                            int ix = (ox + i) * strideW + ixStart;
-                            target[position + i] = (uint)ix < (uint)width ? source[srcRow + ix] : 0f;
-                        }
-                    }
+                        GatherStrided(source, srcRow, target[position..], run, ox, strideW, tapColumn[kk], width);
                     position += run;
                 }
             }
+        }
+    }
+
+    /// <summary>Element-wise gather for the edges: a strided read, or one that leaves the image.</summary>
+    private static void GatherStrided(
+        float[] source, int srcRow, Span<float> target, int run, int ox, int strideW, int columnOffset, int width)
+    {
+        for (int i = 0; i < run; i++)
+        {
+            int ix = (ox + i) * strideW + columnOffset;
+            target[i] = (uint)ix < (uint)width ? source[srcRow + ix] : 0f;
         }
     }
 
