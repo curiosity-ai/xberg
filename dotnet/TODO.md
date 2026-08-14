@@ -194,12 +194,13 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       recycled through a pool with reference counts on the buffer (so `Reshape` views and
       `Identity` aliases keep their memory alive). Both verified to produce byte-identical
       detections.
-- [ ] **Inference performance.** ~2.1 s per 640x640 page on 4 cores against ONNX Runtime's
-      ~0.69 s measured in the same session — roughly 3x, down from 16x. What moved it is
-      recorded in `tools/onnx-parity/README.md`, along with what was measured and rejected.
-      Convolution is ~58% of runtime and now runs at about the same rate as the bare matrix
-      multiply, so the microkernel is the limit: closing the rest means packing both operands
-      into kernel-order panels and per-CPU kernel selection, which is what MLAS does.
+- [ ] **Inference performance.** ~1.15 s per 640x640 page on 4 cores against ONNX Runtime's
+      ~0.51 s measured in the same session — roughly 2.3x, down from 16x. The matrix multiply
+      is now structured after MLAS (packed cache-line-aligned operand panels, a twelve-row
+      AVX-512 register block) and convolution is an implicit GEMM that never materialises its
+      receptive fields. What moved it, and what was measured and rejected, is recorded in
+      `tools/onnx-parity/README.md`. The remainder is largely what C# cannot express —
+      prefetch hints and hand-scheduled assembly — plus MLAS's per-CPU kernel variants.
 - [ ] **Page rasterisation.** The blocker for end-to-end use: layout detection needs a
       rendered page bitmap, and the C# port has no PDF renderer. Until one exists the model
       can only be driven from images supplied by the caller.

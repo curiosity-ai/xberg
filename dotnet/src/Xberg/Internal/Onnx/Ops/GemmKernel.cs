@@ -44,6 +44,9 @@ internal static class GemmKernel
     /// <summary>Output rows per register block.</summary>
     private const int RowBlock = 6;
 
+    /// <summary>Output rows for the AVX-512 kernel, which has registers for twice as many.</summary>
+    private const int WideRowBlock = 12;
+
     /// <summary>
     /// Panel extents, matching MLAS's <c>MLAS_SGEMM_STRIDEN</c> and <c>STRIDEK</c>. A
     /// 128x128 float panel is 64 KB, which stays resident while every row block reads it.
@@ -150,11 +153,7 @@ internal static class GemmKernel
 
             // The first depth slice establishes the destination; later ones add to it.
             bool first = pc == 0;
-            for (int i0 = 0; i0 < m; i0 += RowBlock)
-            {
-                int rows = Math.Min(RowBlock, m - i0);
-                RowBlockKernel(a, packed, packedOffset, c, k, ldc, i0, rows, pc, countK, jc, countN, first);
-            }
+            RowBlockKernel(a, packed, packedOffset, c, k, ldc, 0, m, pc, countK, jc, countN, first);
         }
     }
 
@@ -228,24 +227,196 @@ internal static class GemmKernel
         }
     }
 
-    /// <summary>Dispatch one row block to the widest kernel that fits it.</summary>
+    /// <summary>Run a range of output rows, taking the widest kernel that fits at each step.</summary>
     private static void RowBlockKernel(
         ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
-        int k, int ldc, int i0, int rows, int pc, int countK, int jc, int countN, bool first)
+        int k, int ldc, int rowStart, int rowEnd, int pc, int countK, int jc, int countN, bool first)
     {
-        if (rows == RowBlock)
+        int i = rowStart;
+        if (Use512)
         {
-            if (Use512) SixRows512(a, packed, packedOffset, c, k, ldc, i0, pc, countK, jc, countN, first);
-            else SixRowsVector(a, packed, packedOffset, c, k, ldc, i0, pc, countK, jc, countN, first);
-            return;
+            for (; rowEnd - i >= WideRowBlock; i += WideRowBlock)
+                TwelveRows512(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
+            for (; rowEnd - i >= RowBlock; i += RowBlock)
+                SixRows512(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
         }
-        for (int i = i0; i < i0 + rows; i++)
+        else
+        {
+            for (; rowEnd - i >= RowBlock; i += RowBlock)
+                SixRowsVector(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
+        }
+        for (; i < rowEnd; i++)
             SingleRow(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
     }
 
     /// <summary>Flat offset of a packed block's first element.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int BlockOffset(int block, int countK) => block * countK * BlockWidth;
+
+
+    /// <summary>
+    /// Twelve output rows against two 16-float packed blocks — MLAS's own main kernel shape.
+    /// <para>
+    /// Twenty-four accumulators plus two operand vectors and one broadcast is twenty-seven of
+    /// AVX-512's thirty-two registers, and halves how often the packed panel is re-read
+    /// compared with six rows. This only became worthwhile once the panel was packed: an
+    /// earlier wide kernel over the unpacked operand measured slower, because the operand
+    /// reads, not the register pressure, were the constraint.
+    /// </para>
+    /// </summary>
+    private static void TwelveRows512(
+        ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
+        int k, int ldc, int i0, int pc, int countK, int jc, int countN, bool first)
+    {
+        ref float aRef = ref MemoryMarshal.GetReference(a);
+        ref float pRef = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(packed), packedOffset);
+        ref float cRef = ref MemoryMarshal.GetReference(c);
+
+        int a0 = i0 * k + pc;
+        int c0 = i0 * ldc + jc;
+        int blocks = (countN + BlockWidth - 1) / BlockWidth;
+
+        for (int block = 0; block + 2 <= blocks; block += 2)
+        {
+            int p0 = BlockOffset(block, countK);
+            int p1 = BlockOffset(block + 1, countK);
+            int column = block * BlockWidth;
+
+            Vector512<float> r00 = Vector512<float>.Zero, r01 = Vector512<float>.Zero;
+            Vector512<float> r10 = Vector512<float>.Zero, r11 = Vector512<float>.Zero;
+            Vector512<float> r20 = Vector512<float>.Zero, r21 = Vector512<float>.Zero;
+            Vector512<float> r30 = Vector512<float>.Zero, r31 = Vector512<float>.Zero;
+            Vector512<float> r40 = Vector512<float>.Zero, r41 = Vector512<float>.Zero;
+            Vector512<float> r50 = Vector512<float>.Zero, r51 = Vector512<float>.Zero;
+            Vector512<float> r60 = Vector512<float>.Zero, r61 = Vector512<float>.Zero;
+            Vector512<float> r70 = Vector512<float>.Zero, r71 = Vector512<float>.Zero;
+            Vector512<float> r80 = Vector512<float>.Zero, r81 = Vector512<float>.Zero;
+            Vector512<float> r90 = Vector512<float>.Zero, r91 = Vector512<float>.Zero;
+            Vector512<float> r100 = Vector512<float>.Zero, r101 = Vector512<float>.Zero;
+            Vector512<float> r110 = Vector512<float>.Zero, r111 = Vector512<float>.Zero;
+
+            for (int kk = 0; kk < countK; kk++)
+            {
+                var b0 = Vector512.LoadUnsafe(ref pRef, (nuint)(p0 + kk * BlockWidth));
+                var b1 = Vector512.LoadUnsafe(ref pRef, (nuint)(p1 + kk * BlockWidth));
+                Vector512<float> s;
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 0 * k + kk));
+                r00 = Vector512.FusedMultiplyAdd(s, b0, r00);
+                r01 = Vector512.FusedMultiplyAdd(s, b1, r01);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 1 * k + kk));
+                r10 = Vector512.FusedMultiplyAdd(s, b0, r10);
+                r11 = Vector512.FusedMultiplyAdd(s, b1, r11);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 2 * k + kk));
+                r20 = Vector512.FusedMultiplyAdd(s, b0, r20);
+                r21 = Vector512.FusedMultiplyAdd(s, b1, r21);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 3 * k + kk));
+                r30 = Vector512.FusedMultiplyAdd(s, b0, r30);
+                r31 = Vector512.FusedMultiplyAdd(s, b1, r31);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 4 * k + kk));
+                r40 = Vector512.FusedMultiplyAdd(s, b0, r40);
+                r41 = Vector512.FusedMultiplyAdd(s, b1, r41);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 5 * k + kk));
+                r50 = Vector512.FusedMultiplyAdd(s, b0, r50);
+                r51 = Vector512.FusedMultiplyAdd(s, b1, r51);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 6 * k + kk));
+                r60 = Vector512.FusedMultiplyAdd(s, b0, r60);
+                r61 = Vector512.FusedMultiplyAdd(s, b1, r61);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 7 * k + kk));
+                r70 = Vector512.FusedMultiplyAdd(s, b0, r70);
+                r71 = Vector512.FusedMultiplyAdd(s, b1, r71);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 8 * k + kk));
+                r80 = Vector512.FusedMultiplyAdd(s, b0, r80);
+                r81 = Vector512.FusedMultiplyAdd(s, b1, r81);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 9 * k + kk));
+                r90 = Vector512.FusedMultiplyAdd(s, b0, r90);
+                r91 = Vector512.FusedMultiplyAdd(s, b1, r91);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 10 * k + kk));
+                r100 = Vector512.FusedMultiplyAdd(s, b0, r100);
+                r101 = Vector512.FusedMultiplyAdd(s, b1, r101);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 11 * k + kk));
+                r110 = Vector512.FusedMultiplyAdd(s, b0, r110);
+                r111 = Vector512.FusedMultiplyAdd(s, b1, r111);
+            }
+
+            Store512(ref cRef, c0 + 0 * ldc + column, countN - column, r00, r01, first);
+            Store512(ref cRef, c0 + 1 * ldc + column, countN - column, r10, r11, first);
+            Store512(ref cRef, c0 + 2 * ldc + column, countN - column, r20, r21, first);
+            Store512(ref cRef, c0 + 3 * ldc + column, countN - column, r30, r31, first);
+            Store512(ref cRef, c0 + 4 * ldc + column, countN - column, r40, r41, first);
+            Store512(ref cRef, c0 + 5 * ldc + column, countN - column, r50, r51, first);
+            Store512(ref cRef, c0 + 6 * ldc + column, countN - column, r60, r61, first);
+            Store512(ref cRef, c0 + 7 * ldc + column, countN - column, r70, r71, first);
+            Store512(ref cRef, c0 + 8 * ldc + column, countN - column, r80, r81, first);
+            Store512(ref cRef, c0 + 9 * ldc + column, countN - column, r90, r91, first);
+            Store512(ref cRef, c0 + 10 * ldc + column, countN - column, r100, r101, first);
+            Store512(ref cRef, c0 + 11 * ldc + column, countN - column, r110, r111, first);
+        }
+
+        // An odd trailing block is handled here rather than delegated: the narrower kernels
+        // index packed blocks from zero, so handing them the last block would read the first.
+        if ((blocks & 1) != 0)
+        {
+            int lastBlock = blocks - 1;
+            int p0 = BlockOffset(lastBlock, countK);
+            int column = lastBlock * BlockWidth;
+
+            Vector512<float> t0 = Vector512<float>.Zero;
+            Vector512<float> t1 = Vector512<float>.Zero;
+            Vector512<float> t2 = Vector512<float>.Zero;
+            Vector512<float> t3 = Vector512<float>.Zero;
+            Vector512<float> t4 = Vector512<float>.Zero;
+            Vector512<float> t5 = Vector512<float>.Zero;
+            Vector512<float> t6 = Vector512<float>.Zero;
+            Vector512<float> t7 = Vector512<float>.Zero;
+            Vector512<float> t8 = Vector512<float>.Zero;
+            Vector512<float> t9 = Vector512<float>.Zero;
+            Vector512<float> t10 = Vector512<float>.Zero;
+            Vector512<float> t11 = Vector512<float>.Zero;
+
+            for (int kk = 0; kk < countK; kk++)
+            {
+                var b0 = Vector512.LoadUnsafe(ref pRef, (nuint)(p0 + kk * BlockWidth));
+                Vector512<float> s;
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 0 * k + kk));
+                t0 = Vector512.FusedMultiplyAdd(s, b0, t0);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 1 * k + kk));
+                t1 = Vector512.FusedMultiplyAdd(s, b0, t1);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 2 * k + kk));
+                t2 = Vector512.FusedMultiplyAdd(s, b0, t2);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 3 * k + kk));
+                t3 = Vector512.FusedMultiplyAdd(s, b0, t3);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 4 * k + kk));
+                t4 = Vector512.FusedMultiplyAdd(s, b0, t4);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 5 * k + kk));
+                t5 = Vector512.FusedMultiplyAdd(s, b0, t5);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 6 * k + kk));
+                t6 = Vector512.FusedMultiplyAdd(s, b0, t6);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 7 * k + kk));
+                t7 = Vector512.FusedMultiplyAdd(s, b0, t7);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 8 * k + kk));
+                t8 = Vector512.FusedMultiplyAdd(s, b0, t8);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 9 * k + kk));
+                t9 = Vector512.FusedMultiplyAdd(s, b0, t9);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 10 * k + kk));
+                t10 = Vector512.FusedMultiplyAdd(s, b0, t10);
+                s = Vector512.Create(Unsafe.Add(ref aRef, a0 + 11 * k + kk));
+                t11 = Vector512.FusedMultiplyAdd(s, b0, t11);
+            }
+
+            StoreOne512(ref cRef, c0 + 0 * ldc + column, countN - column, t0, first);
+            StoreOne512(ref cRef, c0 + 1 * ldc + column, countN - column, t1, first);
+            StoreOne512(ref cRef, c0 + 2 * ldc + column, countN - column, t2, first);
+            StoreOne512(ref cRef, c0 + 3 * ldc + column, countN - column, t3, first);
+            StoreOne512(ref cRef, c0 + 4 * ldc + column, countN - column, t4, first);
+            StoreOne512(ref cRef, c0 + 5 * ldc + column, countN - column, t5, first);
+            StoreOne512(ref cRef, c0 + 6 * ldc + column, countN - column, t6, first);
+            StoreOne512(ref cRef, c0 + 7 * ldc + column, countN - column, t7, first);
+            StoreOne512(ref cRef, c0 + 8 * ldc + column, countN - column, t8, first);
+            StoreOne512(ref cRef, c0 + 9 * ldc + column, countN - column, t9, first);
+            StoreOne512(ref cRef, c0 + 10 * ldc + column, countN - column, t10, first);
+            StoreOne512(ref cRef, c0 + 11 * ldc + column, countN - column, t11, first);
+        }
+    }
 
     /// <summary>
     /// Six output rows against two 16-float packed blocks, in 512-bit vectors.

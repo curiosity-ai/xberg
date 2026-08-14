@@ -122,67 +122,78 @@ One 640x640 page, 4 cores, both sides measured in the same session:
 
 | | median |
 | --- | --- |
-| ONNX Runtime | ~0.69 s |
-| this runtime | ~2.1 s |
-| *ratio* | *~3x* |
+| ONNX Runtime | ~0.51 s |
+| this runtime | ~1.15 s |
+| *ratio* | *~2.3x* |
 
-Down from 10.5 s when this work started. The model is 118 GFLOP of convolution, so ORT runs
-at roughly 170 GFLOP/s and this runtime at roughly 110, against a measured 512-bit ceiling
-of 470-570 GFLOP/s.
+Down from 10.5 s, i.e. 16x, when this work started. The model is 118 GFLOP of
+convolution: ONNX Runtime runs it at roughly 230 GFLOP/s and this runtime at roughly 175,
+against a measured 512-bit ceiling of 500-620 GFLOP/s.
 
 ### What actually moved it
 
-Ordered by effect, and none of it was guessed — each came from the per-node profile:
+Ordered by effect, and none of it was guessed — each came from the per-node profile, and the
+matrix multiply's shape came from reading MLAS, ONNX Runtime's own kernel library.
 
 - **Folding the decomposed batch normalisation** (36% → nothing). The export spells every
   batch norm as a per-channel `Mul` then a per-channel `Add`, each a full streaming pass over
   a multi-megabyte activation to apply a constant affine map. `GraphOptimizer` folds the
   chain into the convolution's weights and bias, and the following activation — `Relu`,
   `Sigmoid`, or the `Sigmoid`/`Mul` pair that spells SiLU — into the same output pass.
-  193 nodes disappear.
-- **Explicit `FusedMultiplyAdd`** (~1.5x on the multiply). The JIT does not contract
-  `a * b + c` into an FMA, because that would change the rounding. A kernel written the
-  natural way silently runs at a fraction of peak; the calibration reports both rates side by
-  side so the gap stays visible.
-- **Explicit `Vector512`** (~1.3x overall). `Vector512.IsHardwareAccelerated` reports
-  `false` here and `Vector<float>.Count` stays at 8, but explicit `Vector512<float>` code
-  still compiles to real AVX-512: 577 GFLOP/s against 161 in a pure FMA loop. Believing the
-  flag would leave most of the machine unused.
-- **Reference-based loads in the inner loop.** Eight `Span.Slice` calls per iteration were
-  eight bounds checks; `Vector.LoadUnsafe` over a `ref float` removed them.
-- **Cache panelling.** With the row loop outermost every row block re-streamed the whole
-  right-hand operand — 26 MB pulled 64 times for one layer. Panels of depth and columns keep
-  a slab resident while all rows consume it.
-- **Pooled buffers.** Activations are recycled through a free list keyed by exact length,
-  with reference counts on the storage rather than the tensor so that `Reshape` views and
-  `Identity` aliases keep their memory alive. A standalone `Relu` over a 26 MB tensor fell
-  from 163 ms to 44 ms.
-- **Blocked transpose** (270 ms → 51 ms). A permutation of the last two axes was walking the
-  source a cache line per element.
-- **Vectorised `erf`** (50 ms → negligible). One GELU node was evaluating a 24-term Chebyshev
-  fit in double precision, per element.
+- **Packing the multiply's right-hand operand**, MLAS-style: a panel is copied into a buffer
+  where each group of sixteen columns is physically contiguous, so the kernel walks it
+  forwards instead of jumping a row stride per step. 100-116 → 180-196 GFLOP/s.
+- **Aligning that panel to a cache line.** MLAS declares its panel 64-byte aligned; .NET
+  gives no such guarantee, and a `float[]` was observed landing at offsets 0, 8, 16, 24, 40
+  and 48 across successive allocations. Since the panel's rows are exactly one line apart,
+  that offset decides whether *every* 512-bit load is a split load or none are.
+  180-196 → 230-246 GFLOP/s.
+- **Explicit `Vector512`.** `Vector512.IsHardwareAccelerated` reports `false` here and
+  `Vector<float>.Count` stays at 8, but explicit `Vector512<float>` still compiles to real
+  AVX-512: 577 GFLOP/s against 161 in a pure FMA loop.
+- **Explicit `FusedMultiplyAdd`.** The JIT does not contract `a * b + c` into an FMA, because
+  that would change the rounding. A kernel written the natural way silently runs at a
+  fraction of peak; the calibration reports both rates side by side so the gap stays visible.
+- **MLAS's register block**: twelve rows by two vectors on AVX-512, six elsewhere — twenty-four
+  accumulators plus two operands and one reused broadcast.
+- **Implicit-GEMM convolution.** The unrolled receptive fields are never materialised: the
+  multiply asks for its operand a packed panel at a time and convolution gathers those
+  columns straight out of the image, so the expansion — nine times the input for a 3x3 layer
+  — is written once into a cache-resident panel instead of spilled to a buffer and read back.
+- **Fusing layer normalisation**, another nine nodes per encoder and decoder layer, each a
+  full pass over an 8.6 MB activation.
+- **Pooled buffers**, recycled through a free list keyed by exact length, with reference
+  counts on the storage rather than the tensor so `Reshape` views and `Identity` aliases keep
+  their memory alive. A standalone `Relu` over a 26 MB tensor fell from 163 ms to 44 ms.
+- **Reference-based loads** in the inner loop, removing eight bounds checks per iteration;
+  a **blocked transpose** (270 → 51 ms); a **vectorised `erf`** (50 ms → negligible);
+  **`Pow` by a constant exponent** lowered to multiplies (20 ms on one node); and
+  **batched MatMul parallelised across batches** rather than inside each (396 → 160 ms).
 
 ### What was tried and rejected
 
 Recorded because the measurements are the useful part:
 
 - **Constant folding of the shape arithmetic.** 1683 of 2676 nodes are scalar bookkeeping —
-  and all of them together account for 2.3 ms of 8081 ms. It would shrink the node count and
-  change nothing.
-- **An eight-row register block.** AVX-512's 32 registers nominally hold sixteen
-  accumulators plus operands, but the multiply got *slower*, 116 → 74 GFLOP/s.
-- **Bigger convolution tiles.** Larger tiles re-read the weight matrix fewer times, but
-  streaming a multi-megabyte unrolled buffer per tile cost more than the reuse saved.
-- **`DOTNET_PreferredVectorBitWidth=512`.** Does not widen `Vector<T>` on this runtime;
-  only explicit `Vector512` does.
+  and all of them together account for 2.3 ms of 8081 ms.
+- **An eight-row register block, before packing.** Measured markedly slower, 116 → 74
+  GFLOP/s. Reading MLAS explained why: with an unpacked operand the reads, not the register
+  pressure, were the constraint. Twelve rows only became worthwhile once the panel was packed.
+- **Bigger convolution tiles**, back when convolution still tiled: the extra weight reuse did
+  not pay for streaming a multi-megabyte buffer per tile.
+- **Splitting the row range across threads** when column panels are scarce. Measured neutral
+  on four cores; not kept.
+- **`DOTNET_PreferredVectorBitWidth=512`.** Does not widen `Vector<T>` on this runtime; only
+  explicit `Vector512` does.
 
 ### The remaining gap
 
-Convolution is ~58% of runtime and runs at roughly the same rate as the bare multiply, so
-im2col overhead is no longer material — the microkernel is the limit. Closing the rest means
-what MLAS does: packing both operands into panels laid out exactly as the kernel walks them,
-and per-CPU kernel selection. That is a substantial project against decades of tuning, not a
-missing flag.
+Convolution is ~60% of runtime, at roughly 175 GFLOP/s against the multiply's own 230-246.
+That difference is the gather that feeds it, which has no arithmetic to amortise its memory
+traffic. Beyond that, the multiply sits at about 45% of the machine's measured ceiling where
+MLAS reaches roughly 55%; the rest is in things C# cannot express — software prefetch hints,
+and instruction scheduling done by hand in assembly. MLAS also carries per-CPU kernel
+variants selected at run time, where this has one AVX-512 path and one portable path.
 
 ## Two bugs this caught
 
