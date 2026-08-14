@@ -223,6 +223,8 @@ internal static class Program
             ("1x1 conv 1024->2048 @20x20 ", 2048, 1024, 400),
             ("3x3 conv  256->256 @80x80  ", 256, 2304, 6400),
             ("3x3 conv   64->64  @160x160", 64, 576, 25600),
+            ("  same, m rounded to 60    ", 60, 576, 25600),
+            ("  same, m rounded to 48    ", 48, 576, 25600),
             ("decoder projection         ", 256, 256, 300),
             ("decoder value_proj         ", 8400, 256, 256),
             ("decoder memory  proj       ", 8400, 256, 512),

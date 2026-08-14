@@ -375,15 +375,17 @@ internal static class GemmKernel
             for (; rowEnd - i >= WideRowBlock; i += WideRowBlock)
                 TwelveRows512(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
             for (; rowEnd - i >= RowBlock; i += RowBlock)
-                SixRows512(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
+                SixRows512(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first, RowBlock);
+            if (i < rowEnd)
+                SixRows512(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first, rowEnd - i);
         }
         else
         {
             for (; rowEnd - i >= RowBlock; i += RowBlock)
-                SixRowsVector(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
+                SixRowsVector(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first, RowBlock);
+            if (i < rowEnd)
+                SixRowsVector(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first, rowEnd - i);
         }
-        for (; i < rowEnd; i++)
-            SingleRow(a, packed, packedOffset, c, k, ldc, i, pc, countK, jc, countN, first);
     }
 
     /// <summary>
@@ -621,11 +623,19 @@ internal static class GemmKernel
     }
 
     /// <summary>
-    /// Six output rows against two 16-float packed blocks, in 512-bit vectors.
+    /// Up to six output rows against two 16-float packed blocks, in 512-bit vectors.
+    /// <para>
+    /// <paramref name="liveRows"/> exists so the leftover rows of a range that does not divide
+    /// by the block size come through here rather than one at a time. A single-row kernel
+    /// re-reads the entire packed panel to produce one row, and does one multiply-add per
+    /// operand load; four such rows after a 64-row layer's five full blocks cost as much as
+    /// forty rows of this kernel, and dropped that shape from 228 to 142 GFLOP/s. Rows past
+    /// the live count read a repeat of the last live row and are simply not stored.
+    /// </para>
     /// </summary>
     private static void SixRows512(
         ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
-        int k, int ldc, int i0, int pc, int countK, int jc, int countN, bool first)
+        int k, int ldc, int i0, int pc, int countK, int jc, int countN, bool first, int liveRows)
     {
         ref float aRef = ref MemoryMarshal.GetReference(a);
         ref float pRef = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(packed), packedOffset);
@@ -636,13 +646,14 @@ internal static class GemmKernel
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
         int block = 0;
 
-        // One cursor per row; see the note in the twelve-row kernel.
+        // One cursor per row; see the note in the twelve-row kernel. A cursor past the live
+        // rows repeats the last live one, which keeps every read inside the operand.
         ref float aRow0 = ref Unsafe.Add(ref aRef, a0);
-        ref float aRow1 = ref Unsafe.Add(ref aRow0, k);
-        ref float aRow2 = ref Unsafe.Add(ref aRow1, k);
-        ref float aRow3 = ref Unsafe.Add(ref aRow2, k);
-        ref float aRow4 = ref Unsafe.Add(ref aRow3, k);
-        ref float aRow5 = ref Unsafe.Add(ref aRow4, k);
+        ref float aRow1 = ref Unsafe.Add(ref aRow0, liveRows > 1 ? k : 0);
+        ref float aRow2 = ref Unsafe.Add(ref aRow1, liveRows > 2 ? k : 0);
+        ref float aRow3 = ref Unsafe.Add(ref aRow2, liveRows > 3 ? k : 0);
+        ref float aRow4 = ref Unsafe.Add(ref aRow3, liveRows > 4 ? k : 0);
+        ref float aRow5 = ref Unsafe.Add(ref aRow4, liveRows > 5 ? k : 0);
 
         for (; block + 2 <= blocks; block += 2)
         {
@@ -685,11 +696,11 @@ internal static class GemmKernel
             }
 
             Store512(ref cRef, c0 + 0 * ldc + column, r00, r01, first);
-            Store512(ref cRef, c0 + 1 * ldc + column, r10, r11, first);
-            Store512(ref cRef, c0 + 2 * ldc + column, r20, r21, first);
-            Store512(ref cRef, c0 + 3 * ldc + column, r30, r31, first);
-            Store512(ref cRef, c0 + 4 * ldc + column, r40, r41, first);
-            Store512(ref cRef, c0 + 5 * ldc + column, r50, r51, first);
+            if (liveRows > 1) Store512(ref cRef, c0 + 1 * ldc + column, r10, r11, first);
+            if (liveRows > 2) Store512(ref cRef, c0 + 2 * ldc + column, r20, r21, first);
+            if (liveRows > 3) Store512(ref cRef, c0 + 3 * ldc + column, r30, r31, first);
+            if (liveRows > 4) Store512(ref cRef, c0 + 4 * ldc + column, r40, r41, first);
+            if (liveRows > 5) Store512(ref cRef, c0 + 5 * ldc + column, r50, r51, first);
         }
 
         for (; block < blocks; block++)
@@ -713,11 +724,11 @@ internal static class GemmKernel
             }
 
             StoreOne512(ref cRef, c0 + 0 * ldc + column, r0, first);
-            StoreOne512(ref cRef, c0 + 1 * ldc + column, r1, first);
-            StoreOne512(ref cRef, c0 + 2 * ldc + column, r2, first);
-            StoreOne512(ref cRef, c0 + 3 * ldc + column, r3, first);
-            StoreOne512(ref cRef, c0 + 4 * ldc + column, r4, first);
-            StoreOne512(ref cRef, c0 + 5 * ldc + column, r5, first);
+            if (liveRows > 1) StoreOne512(ref cRef, c0 + 1 * ldc + column, r1, first);
+            if (liveRows > 2) StoreOne512(ref cRef, c0 + 2 * ldc + column, r2, first);
+            if (liveRows > 3) StoreOne512(ref cRef, c0 + 3 * ldc + column, r3, first);
+            if (liveRows > 4) StoreOne512(ref cRef, c0 + 4 * ldc + column, r4, first);
+            if (liveRows > 5) StoreOne512(ref cRef, c0 + 5 * ldc + column, r5, first);
         }
     }
 
@@ -759,7 +770,7 @@ internal static class GemmKernel
     /// </summary>
     private static void SixRowsVector(
         ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
-        int k, int ldc, int i0, int pc, int countK, int jc, int countN, bool first)
+        int k, int ldc, int i0, int pc, int countK, int jc, int countN, bool first, int liveRows)
     {
         int width = Vector<float>.Count;
         int halves = BlockWidth / width;          // 2 on AVX2, 1 where the vector is already 16 wide
@@ -771,13 +782,13 @@ internal static class GemmKernel
         int c0 = i0 * ldc + jc;
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
 
-        // One cursor per row; see the note in the twelve-row kernel.
+        // One cursor per row, clamped past the live rows; see SixRows512.
         ref float aRow0 = ref Unsafe.Add(ref aRef, a0);
-        ref float aRow1 = ref Unsafe.Add(ref aRow0, k);
-        ref float aRow2 = ref Unsafe.Add(ref aRow1, k);
-        ref float aRow3 = ref Unsafe.Add(ref aRow2, k);
-        ref float aRow4 = ref Unsafe.Add(ref aRow3, k);
-        ref float aRow5 = ref Unsafe.Add(ref aRow4, k);
+        ref float aRow1 = ref Unsafe.Add(ref aRow0, liveRows > 1 ? k : 0);
+        ref float aRow2 = ref Unsafe.Add(ref aRow1, liveRows > 2 ? k : 0);
+        ref float aRow3 = ref Unsafe.Add(ref aRow2, liveRows > 3 ? k : 0);
+        ref float aRow4 = ref Unsafe.Add(ref aRow3, liveRows > 4 ? k : 0);
+        ref float aRow5 = ref Unsafe.Add(ref aRow4, liveRows > 5 ? k : 0);
 
         for (int block = 0; block < blocks; block++)
         {
@@ -803,11 +814,11 @@ internal static class GemmKernel
 
                 int at = column + lane;
                 StoreVector(ref cRef, c0 + 0 * ldc + at, r0, first);
-                StoreVector(ref cRef, c0 + 1 * ldc + at, r1, first);
-                StoreVector(ref cRef, c0 + 2 * ldc + at, r2, first);
-                StoreVector(ref cRef, c0 + 3 * ldc + at, r3, first);
-                StoreVector(ref cRef, c0 + 4 * ldc + at, r4, first);
-                StoreVector(ref cRef, c0 + 5 * ldc + at, r5, first);
+                if (liveRows > 1) StoreVector(ref cRef, c0 + 1 * ldc + at, r1, first);
+                if (liveRows > 2) StoreVector(ref cRef, c0 + 2 * ldc + at, r2, first);
+                if (liveRows > 3) StoreVector(ref cRef, c0 + 3 * ldc + at, r3, first);
+                if (liveRows > 4) StoreVector(ref cRef, c0 + 4 * ldc + at, r4, first);
+                if (liveRows > 5) StoreVector(ref cRef, c0 + 5 * ldc + at, r5, first);
             }
         }
     }
@@ -818,39 +829,5 @@ internal static class GemmKernel
     {
         if (!first) v += Vector.LoadUnsafe(ref cRef, (nuint)offset);
         v.StoreUnsafe(ref cRef, (nuint)offset);
-    }
-
-    /// <summary>One output row, for the rows left over when the block does not divide evenly.</summary>
-    private static void SingleRow(
-        ReadOnlySpan<float> a, float[] packed, int packedOffset, Span<float> c,
-        int k, int ldc, int i, int pc, int countK, int jc, int countN, bool first)
-    {
-        ref float aRef = ref MemoryMarshal.GetReference(a);
-        ref float pRef = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(packed), packedOffset);
-        ref float cRef = ref MemoryMarshal.GetReference(c);
-
-        int width = Vector<float>.Count;
-        int a0 = i * k + pc;
-        int c0 = i * ldc + jc;
-        int blocks = (countN + BlockWidth - 1) / BlockWidth;
-        ref float aRow0 = ref Unsafe.Add(ref aRef, a0);
-
-        for (int block = 0; block < blocks; block++)
-        {
-            int p0 = BlockOffset(block, countK);
-            int column = block * BlockWidth;
-
-            for (int lane = 0; lane < BlockWidth; lane += width)
-            {
-                Vector<float> acc = default;
-                for (int kk = 0; kk < countK; kk++)
-                {
-                    var bv = Vector.LoadUnsafe(ref pRef, (nuint)(p0 + kk * BlockWidth + lane));
-                    acc = Vector.FusedMultiplyAdd(new Vector<float>(Unsafe.Add(ref aRow0, kk)), bv, acc);
-                }
-                int at = column + lane;
-                StoreVector(ref cRef, c0 + at, acc, first);
-            }
-        }
     }
 }
