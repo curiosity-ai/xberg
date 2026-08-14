@@ -115,7 +115,7 @@ internal static class Program
         Console.WriteLine("hottest individual nodes:");
         var hottest = Enumerable.Range(0, model.Nodes.Length)
             .OrderByDescending(i => profile.NodeMicroseconds[i])
-            .Take(15);
+            .Take(28);
         foreach (int i in hottest)
         {
             var node = model.Nodes[i];

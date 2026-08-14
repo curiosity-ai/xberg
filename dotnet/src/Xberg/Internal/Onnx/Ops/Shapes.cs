@@ -562,16 +562,20 @@ internal static class Shapes
         var result = x.IsFloat ? Tensor.AllocateFloat(target) : Tensor.AllocateLong(x.Type, target);
         int run = plan.BlockLength;
 
+        // RepeatA means the source holds one element across the whole block — which for
+        // Expand is precisely a repeat, so the block is a fill rather than a copy.
+        bool repeating = plan.Repeat == BroadcastRepeat.RepeatA || x.Count == 1;
+
         Broadcast.ForEachBlock(plan, (oa, _, od) =>
         {
             if (x.IsFloat)
             {
-                if (x.Count == 1) result.Floats.AsSpan(od, run).Fill(x.Floats[0]);
+                if (repeating) result.Floats.AsSpan(od, run).Fill(x.Floats[x.Count == 1 ? 0 : oa]);
                 else x.Floats.AsSpan(oa, run).CopyTo(result.Floats.AsSpan(od, run));
             }
             else
             {
-                if (x.Count == 1) result.Longs.AsSpan(od, run).Fill(x.Longs[0]);
+                if (repeating) result.Longs.AsSpan(od, run).Fill(x.Longs[x.Count == 1 ? 0 : oa]);
                 else x.Longs.AsSpan(oa, run).CopyTo(result.Longs.AsSpan(od, run));
             }
         });
