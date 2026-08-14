@@ -97,13 +97,8 @@ internal static class GemmKernel
     {
         if (m == 0 || n == 0 || k == 0) return;
 
-        var (strideN, strideK) = PanelExtents(k, n);
-        int panels = (n + strideN - 1) / strideN;
-
-        // Spread the columns evenly over the panel count rather than filling each panel and
-        // leaving a remainder: 400 columns is otherwise three panels of 128 and one of 16, and
-        // the run takes as long as the widest.
-        strideN = Math.Min(strideN, RoundUp((n + panels - 1) / panels, BlockWidth));
+        var (baseStrideN, strideK) = PanelExtents(k, n);
+        var (strideN, panels) = ChoosePanels(n, baseStrideN, parallel);
 
         long work = (long)m * n * k;
         bool spread = parallel && work >= parallelThreshold;
@@ -148,6 +143,47 @@ internal static class GemmKernel
     }
 
     private static int RoundUp(int value, int multiple) => (value + multiple - 1) / multiple * multiple;
+
+    /// <summary>
+    /// How wide a column panel should be, and how many there are.
+    /// <para>
+    /// Filling each panel to the target width and leaving whatever remains is the wrong split
+    /// twice over: the last panel can be a sliver, and the panel count decides how many
+    /// parallel rounds there are. 1600 columns at the natural 128 is thirteen panels — four
+    /// rounds on four cores, the last of them one thread wide, with a 64-column runt. Twelve
+    /// panels of 144 is three full rounds.
+    /// </para>
+    /// <para>
+    /// So the panel count is chosen to minimise how long the slowest core works: the number of
+    /// rounds times the width of a panel. Widening a panel costs cache residency, hence the
+    /// cap at twice the natural width.
+    /// </para>
+    /// </summary>
+    private static (int StrideN, int Panels) ChoosePanels(int n, int baseStrideN, bool parallel)
+    {
+        int natural = (n + baseStrideN - 1) / baseStrideN;
+        int workers = parallel ? Environment.ProcessorCount : 1;
+
+        int bestPanels = natural;
+        int bestStride = Math.Min(baseStrideN, RoundUp((n + natural - 1) / natural, BlockWidth));
+        long bestCost = Makespan(bestPanels, bestStride, workers);
+
+        for (int panels = Math.Max(1, natural - workers); panels <= natural + workers; panels++)
+        {
+            int stride = RoundUp((n + panels - 1) / panels, BlockWidth);
+            if (stride > 2 * baseStrideN) continue;
+
+            // Rounding the width up can leave fewer panels than asked for; cost the real split.
+            int actual = (n + stride - 1) / stride;
+            long cost = Makespan(actual, stride, workers);
+            if (cost < bestCost) (bestCost, bestPanels, bestStride) = (cost, actual, stride);
+        }
+
+        return (bestStride, bestPanels);
+    }
+
+    private static long Makespan(int panels, int strideN, int workers) =>
+        (long)((panels + workers - 1) / workers) * strideN;
 
     /// <summary>
     /// The column and depth extents of one panel.
