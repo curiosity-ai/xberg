@@ -71,6 +71,27 @@ internal static class GemmKernel
         ReadOnlyMemory<float> a, ReadOnlyMemory<float> b, Memory<float> c,
         int m, int k, int n, int ldc, bool parallel, long parallelThreshold)
     {
+        var source = b;
+        int ldb = n;
+        Multiply(a, (destination, pc, countK, jc, countN) =>
+            PackB(destination, source.Span, ldb, pc, countK, jc, countN),
+            c, m, k, n, ldc, parallel, parallelThreshold);
+    }
+
+    /// <summary>
+    /// As <see cref="Multiply(ReadOnlyMemory{float}, ReadOnlyMemory{float}, Memory{float}, int, int, int, int, bool, long)"/>,
+    /// but with the caller supplying the right-hand operand a panel at a time.
+    /// <para>
+    /// This exists for convolution. Materialising the unrolled receptive fields into a buffer
+    /// and then packing that buffer moves the expanded data — nine times the input for a 3x3
+    /// layer — through memory twice. A caller that can produce the packed panel directly
+    /// writes it once, and the intermediate disappears entirely.
+    /// </para>
+    /// </summary>
+    public static void Multiply(
+        ReadOnlyMemory<float> a, PanelPacker packB, Memory<float> c,
+        int m, int k, int n, int ldc, bool parallel, long parallelThreshold)
+    {
         if (m == 0 || n == 0 || k == 0) return;
 
         // MLAS reshapes the panel when one dimension is small: a shallow reduction wants
@@ -92,25 +113,32 @@ internal static class GemmKernel
         if (parallel && work >= parallelThreshold && panels > 1)
         {
             Parallel.For(0, panels, index => ColumnPanel(
-                a.Span, b.Span, c.Span, m, k, n, ldc,
+                a.Span, packB, c.Span, m, k, ldc,
                 index * strideN, Math.Min(strideN, n - index * strideN), strideK));
         }
         else
         {
             for (int index = 0; index < panels; index++)
                 ColumnPanel(
-                    a.Span, b.Span, c.Span, m, k, n, ldc,
+                    a.Span, packB, c.Span, m, k, ldc,
                     index * strideN, Math.Min(strideN, n - index * strideN), strideK);
         }
     }
+
+    /// <summary>
+    /// Fills <paramref name="destination"/> with the packed form of
+    /// <c>B[pc..pc+countK, jc..jc+countN]</c>, laid out as <c>[columnBlock][k][16]</c> with the
+    /// trailing block zero-filled.
+    /// </summary>
+    internal delegate void PanelPacker(float[] destination, int pc, int countK, int jc, int countN);
 
     /// <summary>
     /// Compute one column panel of the destination in full: pack each depth slice of the
     /// operand once, then run every row block against it.
     /// </summary>
     private static void ColumnPanel(
-        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
-        int m, int k, int n, int ldc, int jc, int countN, int strideK)
+        ReadOnlySpan<float> a, PanelPacker packB, Span<float> c,
+        int m, int k, int ldc, int jc, int countN, int strideK)
     {
         int blocks = (countN + BlockWidth - 1) / BlockWidth;
         var packed = RentPacked(blocks * strideK * BlockWidth);
@@ -118,7 +146,7 @@ internal static class GemmKernel
         for (int pc = 0; pc < k; pc += strideK)
         {
             int countK = Math.Min(strideK, k - pc);
-            PackB(packed, b, n, pc, countK, jc, countN);
+            packB(packed, pc, countK, jc, countN);
 
             // The first depth slice establishes the destination; later ones add to it.
             bool first = pc == 0;
@@ -142,7 +170,7 @@ internal static class GemmKernel
     /// <c>[block][k][16]</c>, zero-filling the final block when the panel is not a whole
     /// number of blocks wide — which lets the kernel run one uniform shape and ignore edges.
     /// </summary>
-    private static void PackB(
+    internal static void PackB(
         float[] packed, ReadOnlySpan<float> b, int ldb, int pc, int countK, int jc, int countN)
     {
         int blocks = (countN + BlockWidth - 1) / BlockWidth;

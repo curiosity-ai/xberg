@@ -42,6 +42,11 @@ internal static class Elementwise
         // A scalar operand has a dedicated primitive overload that avoids walking the plan.
         if (fb.Count == 1 && fa.Count == plan.Total)
         {
+            // A constant small-integer exponent is worth recognising rather than calling a
+            // general power: exported graphs spell the squaring inside a variance as
+            // `Pow(x, 2)`, and evaluating that as an exponential and a logarithm per element
+            // measured 20 ms on a single node.
+            if (kind == BinaryKind.Pow && TryApplyIntegerPower(dataA, dataB[0], dataOut)) return result;
             ApplyScalarRight(kind, dataA, dataB[0], dataOut);
             return result;
         }
@@ -139,6 +144,30 @@ internal static class Elementwise
                 break;
             default: throw new NotSupportedException($"binary kind {kind}");
         }
+    }
+
+    /// <summary>
+    /// Evaluate <c>x ^ e</c> for a constant exponent worth special-casing, or report that the
+    /// general path is needed. Each case here is exact, not an approximation: squaring is a
+    /// multiply, and a half power is the square root the general routine would converge to.
+    /// </summary>
+    private static bool TryApplyIntegerPower(ReadOnlySpan<float> x, float exponent, Span<float> dst)
+    {
+        if (exponent == 2f) { TensorPrimitives.Multiply(x, x, dst); return true; }
+        if (exponent == 1f) { x.CopyTo(dst); return true; }
+        if (exponent == 0.5f) { TensorPrimitives.Sqrt(x, dst); return true; }
+        if (exponent == 3f)
+        {
+            TensorPrimitives.Multiply(x, x, dst);
+            TensorPrimitives.Multiply(dst, x, dst);
+            return true;
+        }
+        if (exponent == -1f)
+        {
+            TensorPrimitives.Divide(1f, x, dst);
+            return true;
+        }
+        return false;
     }
 
     private static float Scalar(BinaryKind kind, float x, float y) => kind switch

@@ -33,11 +33,26 @@ internal static class GraphOptimizer
         var removed = new bool[nodes.Count];
         var consumers = BuildConsumerMap(nodes);
 
+        // Constant nodes carry values the folding passes need to inspect (epsilons,
+        // exponents), and they live outside the initializer table.
+        var constants = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+        foreach (var node in nodes)
+        {
+            if (node.OpType == "Constant" && node.Attr("value")?.Tensor is { } value && node.Outputs.Length > 0)
+                constants[node.Outputs[0]] = value;
+        }
+
         for (int i = 0; i < nodes.Count; i++)
         {
             if (removed[i] || nodes[i].OpType != "Conv") continue;
             FoldAffineIntoConv(nodes, removed, consumers, initializers, protectedValues, i);
             FuseActivationIntoConv(nodes, removed, consumers, protectedValues, i);
+        }
+
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            if (removed[i] || nodes[i].OpType != "ReduceMean") continue;
+            FuseLayerNormalization(nodes, removed, consumers, initializers, constants, protectedValues, i);
         }
 
         var kept = new List<OnnxNode>(nodes.Count);
@@ -232,6 +247,132 @@ internal static class GraphOptimizer
         conv.Outputs = [mul.Outputs[0]];
         removed[live[sigmoidIndex]] = true;
         removed[live[mulIndex]] = true;
+    }
+
+    /// <summary>
+    /// Collapse the nine-node chain an exporter emits for layer normalisation into a single
+    /// node.
+    /// <para>
+    /// <c>ReduceMean, Sub, Pow, ReduceMean, Add, Sqrt, Div, Mul, Add</c> — each one a full
+    /// streaming pass over the activation, nine of them to compute something a single pass
+    /// can. On this graph that activation is 8.6 MB and the chain appears in every encoder
+    /// and decoder layer.
+    /// </para>
+    /// <para>
+    /// The match is deliberately strict. Every intermediate must have exactly the consumers
+    /// the pattern implies — the centred value has precisely two, the numerator and the
+    /// squaring — so a graph that reuses any of them for something else is left alone rather
+    /// than silently rewritten.
+    /// </para>
+    /// </summary>
+    private static void FuseLayerNormalization(
+        List<OnnxNode> nodes,
+        bool[] removed,
+        Dictionary<string, List<int>> consumers,
+        Dictionary<string, Tensor> initializers,
+        Dictionary<string, Tensor> constants,
+        HashSet<string> protectedValues,
+        int meanIndex)
+    {
+        var meanNode = nodes[meanIndex];
+        if (!ReducesLastAxisKeepingRank(meanNode)) return;
+
+        string input = meanNode.Inputs[0];
+        string mean = meanNode.Outputs[0];
+
+        if (SoleConsumer(nodes, removed, consumers, protectedValues, mean) is not { } subIndex) return;
+        var sub = nodes[subIndex];
+        if (sub.OpType != "Sub" || sub.Inputs.Length != 2) return;
+        if (sub.Inputs[0] != input || sub.Inputs[1] != mean) return;
+
+        string centred = sub.Outputs[0];
+        if (protectedValues.Contains(centred)) return;
+        var centredUsers = LiveConsumers(consumers, removed, centred);
+        if (centredUsers.Count != 2) return;
+
+        int powIndex = -1, divIndex = -1;
+        foreach (int index in centredUsers)
+        {
+            if (nodes[index].OpType == "Pow") powIndex = index;
+            else if (nodes[index].OpType == "Div") divIndex = index;
+        }
+        if (powIndex < 0 || divIndex < 0) return;
+
+        var pow = nodes[powIndex];
+        if (pow.Inputs.Length != 2 || pow.Inputs[0] != centred) return;
+        if (!TryReadScalar(pow.Inputs[1], initializers, constants, out float exponent) || exponent != 2f) return;
+
+        if (SoleConsumer(nodes, removed, consumers, protectedValues, pow.Outputs[0]) is not { } varianceIndex) return;
+        var varianceNode = nodes[varianceIndex];
+        if (varianceNode.OpType != "ReduceMean" || !ReducesLastAxisKeepingRank(varianceNode)) return;
+
+        if (SoleConsumer(nodes, removed, consumers, protectedValues, varianceNode.Outputs[0]) is not { } epsIndex) return;
+        var epsAdd = nodes[epsIndex];
+        if (epsAdd.OpType != "Add" || epsAdd.Inputs.Length != 2) return;
+        if (!TryReadScalar(epsAdd.Inputs[1], initializers, constants, out float epsilon)) return;
+
+        if (SoleConsumer(nodes, removed, consumers, protectedValues, epsAdd.Outputs[0]) is not { } sqrtIndex) return;
+        var sqrt = nodes[sqrtIndex];
+        if (sqrt.OpType != "Sqrt") return;
+
+        var div = nodes[divIndex];
+        if (div.OpType != "Div" || div.Inputs.Length != 2) return;
+        if (div.Inputs[0] != centred || div.Inputs[1] != sqrt.Outputs[0]) return;
+        // The square root must feed only this division.
+        if (SoleConsumer(nodes, removed, consumers, protectedValues, sqrt.Outputs[0]) != divIndex) return;
+
+        if (SoleConsumer(nodes, removed, consumers, protectedValues, div.Outputs[0]) is not { } scaleIndex) return;
+        var scale = nodes[scaleIndex];
+        if (scale.OpType != "Mul" || scale.Inputs.Length != 2 || scale.Inputs[0] != div.Outputs[0]) return;
+        if (!initializers.ContainsKey(scale.Inputs[1])) return;
+
+        if (SoleConsumer(nodes, removed, consumers, protectedValues, scale.Outputs[0]) is not { } shiftIndex) return;
+        var shift = nodes[shiftIndex];
+        if (shift.OpType != "Add" || shift.Inputs.Length != 2 || shift.Inputs[0] != scale.Outputs[0]) return;
+        if (!initializers.ContainsKey(shift.Inputs[1])) return;
+
+        // Rewrite the leading ReduceMean into the fused node and drop the rest of the chain.
+        meanNode.OpType = "LayerNormalization";
+        meanNode.Inputs = [input, scale.Inputs[1], shift.Inputs[1]];
+        meanNode.Outputs = [shift.Outputs[0]];
+        meanNode.Attributes =
+        [
+            new OnnxAttribute { Name = "axis", Type = AttributeType.Int, Int = -1 },
+            new OnnxAttribute { Name = "epsilon", Type = AttributeType.Float, Float = epsilon },
+        ];
+
+        foreach (int index in new[] { subIndex, powIndex, varianceIndex, epsIndex, sqrtIndex, divIndex, scaleIndex, shiftIndex })
+            removed[index] = true;
+    }
+
+    /// <summary>A mean over the final axis that keeps the rank, as layer normalisation needs.</summary>
+    private static bool ReducesLastAxisKeepingRank(OnnxNode node)
+    {
+        if (node.Inputs.Length != 1) return false;
+        if (node.AttrInt("keepdims", 1) == 0) return false;
+        var axes = node.AttrInts("axes");
+        return axes is { Length: 1 } && axes[0] == -1;
+    }
+
+    /// <summary>The single live consumer of a value, or null if it has any other number.</summary>
+    private static int? SoleConsumer(
+        List<OnnxNode> nodes, bool[] removed, Dictionary<string, List<int>> consumers,
+        HashSet<string> protectedValues, string value)
+    {
+        if (protectedValues.Contains(value)) return null;
+        var live = LiveConsumers(consumers, removed, value);
+        return live.Count == 1 ? live[0] : null;
+    }
+
+    /// <summary>Read a scalar operand from either the initializer table or a Constant node.</summary>
+    private static bool TryReadScalar(
+        string name, Dictionary<string, Tensor> initializers, Dictionary<string, Tensor> constants, out float value)
+    {
+        value = 0f;
+        if (!initializers.TryGetValue(name, out var tensor) && !constants.TryGetValue(name, out tensor)) return false;
+        if (tensor.Count != 1 || !tensor.IsFloat) return false;
+        value = tensor.Floats[0];
+        return true;
     }
 
     /// <summary>

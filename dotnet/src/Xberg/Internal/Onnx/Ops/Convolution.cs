@@ -62,7 +62,7 @@ internal static class Convolution
         else if (pointwise)
             ConvPointwise(fx, fw, result, batch, channels, height * width, filters, g);
         else
-            ConvIm2Col(fx, fw, result, batch, channels, height, width, outH, outW,
+            ConvImplicitGemm(fx, fw, result, batch, channels, height, width, outH, outW,
                 kh, kw, strideH, strideW, dilationH, dilationW, pad, filters, inPerGroup, g);
 
         ApplyBiasAndActivation(result, bias?.AsFloat(), activation, batch, filters, outH * outW);
@@ -162,8 +162,17 @@ internal static class Convolution
         });
     }
 
-    /// <summary>General convolution: unroll receptive fields into columns, then one GEMM per group.</summary>
-    private static void ConvIm2Col(
+    /// <summary>
+    /// General convolution, as an implicit matrix multiply.
+    /// <para>
+    /// The receptive fields are never materialised. The multiply asks for its right-hand
+    /// operand one packed panel at a time, and the packer gathers those columns straight out
+    /// of the input image — so the expanded data, which for a 3x3 layer is nine times the
+    /// input, is written once into a cache-resident panel instead of being spilled to a
+    /// multi-megabyte buffer and read back.
+    /// </para>
+    /// </summary>
+    private static void ConvImplicitGemm(
         Tensor x, Tensor w, Tensor result, int batch, int channels, int height, int width,
         int outH, int outW, int kh, int kw, int strideH, int strideW,
         int dilationH, int dilationW, Padding pad, int filters, int inPerGroup, int groups)
@@ -172,131 +181,102 @@ internal static class Convolution
         int patch = inPerGroup * kh * kw;
         int spatial = outH * outW;
 
-        // Unrolling the whole layer at once would be the largest allocation in the model — a
-        // 3x3 layer over 32 channels at 320x320 output needs 118 MB — and every byte of it
-        // would be written to memory and read straight back. A tile of output pixels is
-        // unrolled instead, and is also the unit of parallelism since tiles write disjoint
-        // output columns.
-        //
-        // Sizing the tile is a genuine trade and both directions were measured. Larger tiles
-        // re-read the weight matrix fewer times; smaller tiles keep the unrolled buffer near
-        // cache. Growing the tile to one per core made the model slower — the extra weight
-        // reuse did not pay for streaming a multi-megabyte buffer per tile — so the buffer
-        // stays the thing that is sized, and weight reuse is recovered instead by letting the
-        // multiply use full-width column panels when the tile loop already supplies the
-        // parallelism.
-        int tile = Math.Clamp(TargetTileBytes / (patch * sizeof(float)), MinTile, spatial);
-        tile = Math.Min(tile, spatial);
-        int tiles = (spatial + tile - 1) / tile;
-
         for (int n = 0; n < batch; n++)
         {
             for (int g = 0; g < groups; g++)
             {
+                int planeBase = (n * channels + g * inPerGroup) * height * width;
                 var weights = w.Floats.AsMemory(g * outPerGroup * patch, outPerGroup * patch);
-                int outputBase = (n * filters + g * outPerGroup) * spatial;
-                int capturedN = n, capturedG = g;
+                var output = result.Floats.AsMemory((n * filters + g * outPerGroup) * spatial, outPerGroup * spatial);
+                var source = x.Floats;
 
-                Parallel.For(0, tiles, t =>
-                {
-                    int start = t * tile;
-                    int length = Math.Min(tile, spatial - start);
-                    float[] column = ArrayPool<float>.Shared.Rent(patch * length);
-                    try
-                    {
-                        Im2ColTile(x.Floats, column, capturedN, channels, capturedG * inPerGroup, inPerGroup,
-                            height, width, outH, outW, kh, kw, strideH, strideW, dilationH, dilationW, pad,
-                            start, length);
-
-                        // Rows of this tile's result are `spatial` apart in the full output,
-                        // and the tile loop is already parallel, so the multiply runs serially.
-                        Linear.MultiplyInto(
-                            weights, column.AsMemory(0, patch * length),
-                            result.Floats.AsMemory(outputBase + start, (outPerGroup - 1) * spatial + length),
-                            outPerGroup, patch, length, spatial, parallel: false);
-                    }
-                    finally
-                    {
-                        ArrayPool<float>.Shared.Return(column);
-                    }
-                });
+                GemmKernel.Multiply(
+                    weights,
+                    (destination, pc, countK, jc, countN) => PackReceptiveFields(
+                        destination, source, planeBase, height, width, outW,
+                        kh, kw, strideH, strideW, dilationH, dilationW, pad,
+                        pc, countK, jc, countN),
+                    output, outPerGroup, patch, spatial, spatial,
+                    parallel: true, ParallelThreshold);
             }
         }
     }
 
-    /// <summary>Unrolled receptive field to hold per tile.</summary>
-    private const int TargetTileBytes = 512 * 1024;
-
-    /// <summary>Smallest worthwhile tile, so a very deep patch does not degenerate to one
-    /// output pixel per multiply.</summary>
-    private const int MinTile = 128;
+    /// <summary>Multiply-accumulates above which convolution spreads across cores.</summary>
+    private const long ParallelThreshold = 1L << 16;
 
     /// <summary>
-    /// Fill <paramref name="column"/> so that row <c>(c,ky,kx)</c> holds the input value that
-    /// kernel tap contributes to each output pixel, in output-pixel order.
-    /// </summary>
-    /// <summary>
-    /// Unroll the receptive fields of output pixels <c>[start, start+length)</c> into
-    /// <paramref name="column"/>, laid out as <c>[patch, length]</c>.
+    /// Fill one packed panel directly from the image: for each kernel tap in
+    /// <c>[pc, pc+countK)</c> and each block of sixteen output pixels in
+    /// <c>[jc, jc+countN)</c>, gather the sixteen input values that tap contributes.
     /// <para>
-    /// Every element is written — either a source value or an explicit zero for a tap that
-    /// falls in the padding — so the buffer needs no pre-clearing. That matters: clearing was
-    /// a second full pass over a buffer that is, for the early layers, larger than the layer's
-    /// own input.
+    /// With unit horizontal stride a run of consecutive output pixels reads a run of
+    /// consecutive input pixels, so the gather is a block copy; the loop only falls back to
+    /// element-wise work where a run crosses an output row or leaves the image.
     /// </para>
     /// </summary>
-    private static void Im2ColTile(
-        float[] src, float[] column, int n, int channels, int channelStart, int channelCount,
-        int height, int width, int outH, int outW, int kh, int kw,
-        int strideH, int strideW, int dilationH, int dilationW, Padding pad,
-        int start, int length)
+    private static void PackReceptiveFields(
+        float[] destination, float[] source, int planeBase, int height, int width, int outW,
+        int kh, int kw, int strideH, int strideW, int dilationH, int dilationW, Padding pad,
+        int pc, int countK, int jc, int countN)
     {
-        for (int c = 0; c < channelCount; c++)
+        const int BlockWidth = 16;
+        int blocks = (countN + BlockWidth - 1) / BlockWidth;
+        int plane = height * width;
+
+        for (int block = 0; block < blocks; block++)
         {
-            int srcPlane = (n * channels + channelStart + c) * height * width;
-            for (int ky = 0; ky < kh; ky++)
+            int firstPixel = jc + block * BlockWidth;
+            int pixels = Math.Min(BlockWidth, jc + countN - firstPixel);
+            int blockBase = block * countK * BlockWidth;
+
+            for (int kk = 0; kk < countK; kk++)
             {
-                for (int kx = 0; kx < kw; kx++)
+                // Decompose the flat tap index into channel and kernel offset.
+                int tap = pc + kk;
+                int kx = tap % kw;
+                int ky = tap / kw % kh;
+                int c = tap / (kw * kh);
+                int srcPlane = planeBase + c * plane;
+                int ixStart = -pad.Left + kx * dilationW;
+
+                var target = destination.AsSpan(blockBase + kk * BlockWidth, BlockWidth);
+                // Columns past the panel's real width are zero so the kernel can run one shape.
+                if (pixels < BlockWidth) target[pixels..].Clear();
+
+                int position = 0;
+                while (position < pixels)
                 {
-                    int row = ((c * kh + ky) * kw + kx) * length;
-                    int ixStart = -pad.Left + kx * dilationW;
+                    int pixel = firstPixel + position;
+                    int oy = pixel / outW;
+                    int ox = pixel - oy * outW;
+                    int run = Math.Min(outW - ox, pixels - position);
 
-                    int position = 0;
-                    while (position < length)
+                    int iy = oy * strideH - pad.Top + ky * dilationH;
+                    if ((uint)iy >= (uint)height)
                     {
-                        int pixel = start + position;
-                        int oy = pixel / outW;
-                        int ox = pixel - oy * outW;
-                        // How much of this output row is still inside the tile.
-                        int run = Math.Min(outW - ox, length - position);
-
-                        int iy = oy * strideH - pad.Top + ky * dilationH;
-                        if ((uint)iy >= (uint)height)
-                        {
-                            column.AsSpan(row + position, run).Clear();
-                            position += run;
-                            continue;
-                        }
-
-                        int srcRow = srcPlane + iy * width;
-                        int firstIx = ox * strideW + ixStart;
-                        int lastIx = (ox + run - 1) * strideW + ixStart;
-
-                        // Unit stride with the whole run inside the image: one contiguous copy.
-                        if (strideW == 1 && firstIx >= 0 && lastIx < width)
-                        {
-                            src.AsSpan(srcRow + firstIx, run).CopyTo(column.AsSpan(row + position, run));
-                        }
-                        else
-                        {
-                            for (int i = 0; i < run; i++)
-                            {
-                                int ix = (ox + i) * strideW + ixStart;
-                                column[row + position + i] = (uint)ix < (uint)width ? src[srcRow + ix] : 0f;
-                            }
-                        }
+                        target.Slice(position, run).Clear();
                         position += run;
+                        continue;
                     }
+
+                    int srcRow = srcPlane + iy * width;
+                    int firstIx = ox * strideW + ixStart;
+                    int lastIx = (ox + run - 1) * strideW + ixStart;
+
+                    if (strideW == 1 && firstIx >= 0 && lastIx < width)
+                    {
+                        source.AsSpan(srcRow + firstIx, run).CopyTo(target.Slice(position, run));
+                    }
+                    else
+                    {
+                        for (int i = 0; i < run; i++)
+                        {
+                            int ix = (ox + i) * strideW + ixStart;
+                            target[position + i] = (uint)ix < (uint)width ? source[srcRow + ix] : 0f;
+                        }
+                    }
+                    position += run;
                 }
             }
         }
