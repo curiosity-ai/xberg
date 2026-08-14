@@ -165,7 +165,14 @@ foreach (var goldenPath in goldenFiles)
     {
         string rustPlain = golden["content"]?["plain"]?.GetValue<string>() ?? "";
         string csPlain = got["plain"];
-        if (opts.Cluster && rustPlain != csPlain) RecordCluster(clusters, rel, rustPlain, csPlain);
+        if (opts.Cluster)
+        {
+            // --cluster-format picks which rendered format the clusters are computed over,
+            // so a defect that only shows up in markdown or html can be isolated too.
+            string cw = golden["content"]?[opts.ClusterFormat]?.GetValue<string>() ?? "";
+            string cg = got.TryGetValue(opts.ClusterFormat, out var cgv) ? cgv : "";
+            if (cw != cg) RecordCluster(clusters, rel, cw, cg);
+        }
         if (rustPlain == csPlain) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
         else if (NormalizeText(rustPlain) == NormalizeText(csPlain)) { es.ContentExact++; stats.ContentExact++; stats.ContentClose++; }
         else if (NormalizeSorted(rustPlain) == NormalizeSorted(csPlain)) { stats.ContentOrder++; stats.ContentClose++; }
@@ -459,6 +466,7 @@ static Options? ParseArgs(string[] args)
             case "--show": o.Show = int.Parse(args[++i]); break;
             case "--diff": o.Diff = true; break;
             case "--cluster": o.Cluster = true; break;
+            case "--cluster-format": o.ClusterFormat = args[++i]; break;
             case "--strict-md": o.StrictMd = true; break;
             case "--list-ok": o.ListOk = true; break;
             case "--dump": o.Dump = args[++i]; break;
@@ -476,6 +484,7 @@ sealed class Options
     public int Show = 5;
     public bool Diff;
     public bool Cluster;
+    public string ClusterFormat = "plain";
     public bool StrictMd;
     public bool ListOk;
     public string? Dump;

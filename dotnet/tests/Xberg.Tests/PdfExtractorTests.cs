@@ -299,8 +299,30 @@ public class PdfExtractorTests
     [Fact]
     public void Structure_DetectsHeadingFromLargerFont()
     {
-        // One large-font title line above several uniform body lines: clustering should
-        // classify the large line as a heading and the rest as body paragraphs.
+        // One large-font title line above enough uniform body lines to establish a body-font
+        // baseline: clustering should classify the large line as a heading and the rest as
+        // body paragraphs.
+        var page = new List<SegmentData>
+        {
+            Seg("Document Title Here", 700, 22f),
+            Seg("This is the first body sentence of the document.", 660, 10f),
+            Seg("This is the second body sentence, continuing on.", 646, 10f),
+            Seg("A third body sentence rounds out the paragraph text.", 632, 10f),
+            Seg("A fourth body sentence keeps the baseline honest.", 618, 10f),
+            Seg("A fifth body sentence completes the sample text.", 604, 10f),
+        };
+        var doc = PdfStructure.Build(new List<List<SegmentData>> { page });
+        Assert.NotNull(doc);
+        Assert.Contains(doc!.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text.Contains("Document Title"));
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+    }
+
+    [Fact]
+    public void Structure_SparseDocument_DoesNotPromoteALoneLargerLine()
+    {
+        // Below the block threshold there is no reliable body-font baseline, so font-size
+        // clustering must not promote anything: a cover page or one-line document would
+        // otherwise turn its only text into an H1. Matches Rust's sparsity gate.
         var page = new List<SegmentData>
         {
             Seg("Document Title Here", 700, 22f),
@@ -310,8 +332,7 @@ public class PdfExtractorTests
         };
         var doc = PdfStructure.Build(new List<List<SegmentData>> { page });
         Assert.NotNull(doc);
-        Assert.Contains(doc!.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text.Contains("Document Title"));
-        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.DoesNotContain(doc!.Elements, e => e.Kind.Tag == ElementKindTag.Heading);
     }
 
     [Fact]

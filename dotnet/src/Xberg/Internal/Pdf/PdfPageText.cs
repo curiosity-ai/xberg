@@ -17,14 +17,34 @@ public static class PdfPageText
     private const int MinDisorderCount = 3;
     private const double CoalesceThreshold = 5.0;
 
-    /// <summary>Sort spans into ColumnAware reading order and assemble into text.</summary>
-    public static string Assemble(List<TextSpan> spans) => AssembleOrdered(OrderViaRuns(spans));
+    /// <summary>How far left of the previous span's start a span must begin before it counts
+    /// as a new row rather than a continuation (Rust <c>ROW_RESET_MIN_BACKTRACK_EMS</c>).</summary>
+    private const double RowResetMinBacktrackEms = 4.0;
+
+    /// <summary>Right-to-left or explicit bidi content, for which left-to-right row and column
+    /// heuristics do not hold.</summary>
+    internal static bool HasRtlOrBidiContent(string text)
+    {
+        foreach (char c in text)
+        {
+            // Hebrew, Arabic, Syriac, Thaana; the explicit bidi controls; presentation forms.
+            if (c is >= '\u0590' and <= '\u08FF') return true;
+            if (c is >= '\u200E' and <= '\u200F' or >= '\u202A' and <= '\u202E') return true;
+            if (c is >= '\uFB1D' and <= '\uFDFF' or >= '\uFE70' and <= '\uFEFC') return true;
+        }
+        return false;
+    }
+
+    /// <summary>Sort spans into ColumnAware reading order and assemble into text.
+    /// <paramref name="pageWidth"/> enables the two-column repair; pass 0 when unknown.</summary>
+    public static string Assemble(List<TextSpan> spans, double pageWidth = 0)
+        => AssembleOrdered(OrderViaRuns(spans, pageWidth));
 
     /// <summary>Assemble + line segments from ONE ordering pass (the ordering —
-    /// presort, run merge, XY-cut — dominates cost on large documents).</summary>
-    public static (string text, List<LineSeg> lines) AssembleWithLines(List<TextSpan> spans)
+    /// presort, run merge, XY-cut, column repair — dominates cost on large documents).</summary>
+    public static (string text, List<LineSeg> lines) AssembleWithLines(List<TextSpan> spans, double pageWidth = 0)
     {
-        var ordering = OrderViaRuns(spans);
+        var ordering = OrderViaRuns(spans, pageWidth);
         return (AssembleOrdered(ordering), BuildLineSegmentsOrdered(ordering));
     }
 
@@ -32,6 +52,11 @@ public static class PdfPageText
     {
         var (ordered, orderedRuns) = t;
         if (ordered.Count == 0) return "";
+
+        // A page whose text is drawn sideways is reassembled in its own reading frame; an
+        // upright page returns null here and is never rewritten. Ahead of the fragmentation
+        // check, matching Rust `extract_page_text_column_aware`.
+        if (PdfRotationRepair.RepairRotatedPageText(ordered) is { } rotated) return rotated;
 
         // Issue #962: glyph-fragmented span lists are rebuilt from positions.
         // Detected on the MERGED runs (word-level), matching pdf_oxide which runs
@@ -44,6 +69,10 @@ public static class PdfPageText
         double medianHeight = heights.Count == 0 ? 1.0 : heights[heights.Count / 2];
         double paragraphGap = medianHeight * 1.5;
 
+        // Row resets are only meaningful for a purely left-to-right page: in mixed or RTL
+        // text a span legitimately starts left of its predecessor.
+        bool allowRowResets = !ordered.Any(s => HasRtlOrBidiContent(s.Text));
+
         var sb = new StringBuilder();
         TextSpan? prev = null;
         foreach (var span in ordered)
@@ -53,6 +82,21 @@ public static class PdfPageText
                 double prevEndX = prev.X + prev.Width;
                 double yGap = Math.Abs(prev.Y - span.Y);
                 double effHeight = Math.Max(Math.Max(span.Height, prev.Height), span.FontSize * 0.5);
+
+                // Row reset: a span starting far enough left of where the previous one started
+                // has carriage-returned to a new row, even when the two share a baseline within
+                // tolerance. Checked before the same-line test, which would otherwise weld two
+                // rows of a grid into one line.
+                double resetThreshold = Math.Max(prev.FontSize, span.FontSize) * RowResetMinBacktrackEms;
+                bool isLtrPair = !HasRtlOrBidiContent(prev.Text) && !HasRtlOrBidiContent(span.Text);
+                if (allowRowResets && isLtrPair && span.X < prev.X - resetThreshold)
+                {
+                    sb.Append(yGap > paragraphGap ? "\n\n" : "\n");
+                    sb.Append(span.Text);
+                    prev = span;
+                    continue;
+                }
+
                 bool sameLine = yGap < effHeight * 0.5;
                 if (sameLine)
                 {
@@ -73,7 +117,7 @@ public static class PdfPageText
     // extractors/text.rs), order the runs with XY-cut, then flatten back to the original
     // spans in run order. Runs are used ONLY for reading-order geometry; assembly still
     // walks the original spans so spacing/line-break decisions are unchanged.
-    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(List<TextSpan> spans)
+    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(List<TextSpan> spans, double pageWidth = 0)
     {
         // pdf_oxide sorts spans into reading order (rounded-Y descending, X
         // ascending, column-aware) BEFORE merge_adjacent_spans (extractors/
@@ -138,6 +182,13 @@ public static class PdfPageText
         for (int r = 0; r < runs.Count; r++) memberOf[runs[r]] = members[r];
 
         var orderedRuns = PdfReadingOrder.Order(runs);
+
+        // Two-column repair runs on the merged runs, after the XY-cut and before assembly —
+        // the position Rust applies it in `extract_page_text_column_aware`. The XY-cut does
+        // not split every dense two-column body, and once the assembler has interleaved the
+        // columns no downstream pass can separate them again.
+        PdfColumnReorder.Apply(orderedRuns, pageWidth);
+
         var result = new List<TextSpan>(spans.Count);
         foreach (var run in orderedRuns)
         {
@@ -155,10 +206,10 @@ public static class PdfPageText
 
     /// <summary>Return spans in ColumnAware (XY-cut) reading order — the ordering the
     /// structure/heading pipeline consumes (mirrors pdf_oxide ReadingOrder::ColumnAware).</summary>
-    public static List<TextSpan> OrderColumnAware(List<TextSpan> spans)
+    public static List<TextSpan> OrderColumnAware(List<TextSpan> spans, double pageWidth = 0)
     {
         if (spans.Count == 0) return new List<TextSpan>();
-        var (ordered, _) = OrderViaRuns(spans);
+        var (ordered, _) = OrderViaRuns(spans, pageWidth);
         return ordered;
     }
 

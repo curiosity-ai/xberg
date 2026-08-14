@@ -46,6 +46,8 @@ public sealed class PdfExtractor : IExtractor
 
         // --- Metadata ---
         var meta = PdfMetadataExtractor.Extract(pdf);
+        // Advisory: a document we cannot grade reports no scan evidence.
+        var scanDetection = PdfScanDetect.Detect(pdf);
 
         // --- Tables (text-layer heuristic tier) ---
         // Mirrors the Rust three-tier detector, minus pdf_oxide's native/bordered
@@ -81,6 +83,19 @@ public sealed class PdfExtractor : IExtractor
                     doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, trimmed, 0));
             }
         }
+        // Text repair belongs to the structure pipeline (Rust `pdf/structure/pipeline.rs`
+        // runs it over the elements that pipeline assembles), not to the flat native-text
+        // split: applying it there over-corrects text whose ligatures the Rust plain path
+        // keeps, and measurably loses fixtures.
+        if (structured is not null && ReferenceEquals(doc, structured))
+        {
+            foreach (var elem in doc.Elements)
+            {
+                if (elem.Text.Length == 0) continue;
+                elem.Text = PdfTextRepair.Repair(elem.Text);
+            }
+        }
+
         doc.MimeType = mimeType;
         doc.Tables = tables;
 
@@ -105,6 +120,8 @@ public sealed class PdfExtractor : IExtractor
                     Width = meta.Width,
                     Height = meta.Height,
                     PageCount = meta.PageCount,
+                    ScannedConfidence = (float)scanDetection.Confidence,
+                    ScannedPages = scanDetection.ScannedPageNumbers(PdfScanDetect.DefaultScannedMinConfidence),
                 },
             },
         };
@@ -147,7 +164,8 @@ public sealed class PdfExtractor : IExtractor
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
-                    (pageText, var lines) = PdfPageText.AssembleWithLines(spans);
+                    var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
+                    (pageText, var lines) = PdfPageText.AssembleWithLines(spans, Math.Abs(mbUrx - mbLlx));
                     segs = PdfStructure.SegmentsFromLines(lines);
                 }
                 // AcroForm: interactive text-field values are stored as the widget's /V and are

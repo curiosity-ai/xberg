@@ -22,6 +22,9 @@ public static class Json
             Encoder = SerdeJsonEncoder.Shared,
         };
         o.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
+        // serde always writes a fractional part, so an integral float is `0.0`, not `0`.
+        o.Converters.Add(new SerdeDoubleConverter());
+        o.Converters.Add(new SerdeSingleConverter());
         // The tagged-union converters are applied via [JsonConverter] attributes on their types.
         return o;
     }
