@@ -70,6 +70,58 @@ public static class Mime
         return null;
     }
 
+    /// <summary>
+    /// Resolve the type of a file whose extension is already known, letting content overrule the
+    /// extension when the two disagree.
+    /// <para>
+    /// An extension is a claim, not evidence, and the corpus is full of files where it is simply
+    /// wrong — DocTags streams named <c>.doctags.txt</c>, markup saved as <c>.txt</c>. Where the
+    /// content carries a recognisable signature, it decides.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// Three cases keep the extension despite disagreement, because the content signature is
+    /// strictly less informative than the extension rather than in conflict with it: plain text
+    /// says nothing at all; generic XML cannot tell FictionBook from DocBook; generic JSON cannot
+    /// tell a notebook from line-delimited JSON.
+    /// </remarks>
+    public static string ResolveWithContent(string? extensionMime, ReadOnlySpan<byte> content)
+    {
+        if (extensionMime is null)
+            return DetectMimeTypeFromBytes(content) ?? OctetStream;
+
+        // Upstream reads a 4 KiB header rather than the whole file, which is visible behaviour:
+        // the JSON check parses what it was given, so a large JSON body in a mis-named file does
+        // not validate and does not override.
+        var header = content.Length > MagicHeaderBytes ? content[..MagicHeaderBytes] : content;
+        if (header.IsEmpty) return extensionMime;
+
+        string? fromMagic = DetectMimeTypeFromBytes(header);
+        if (fromMagic is null || fromMagic == extensionMime) return extensionMime;
+
+        if (fromMagic == "text/plain") return extensionMime;
+        if (IsGenericXmlMime(fromMagic) && IsSpecificXmlMime(extensionMime)) return extensionMime;
+        if (fromMagic == "application/json" && IsSpecificJsonMime(extensionMime)) return extensionMime;
+
+        return SupportedMimeTypes.Contains(fromMagic) || fromMagic.StartsWith("image/", StringComparison.Ordinal)
+            ? fromMagic
+            : extensionMime;
+    }
+
+    /// <summary>How much of a file upstream reads when checking content against the extension.</summary>
+    private const int MagicHeaderBytes = 4096;
+
+    private static bool IsGenericXmlMime(string mime) => mime is "application/xml" or "text/xml";
+
+    private static bool IsSpecificXmlMime(string mime) =>
+        mime != "application/xml"
+        && (mime.EndsWith("+xml", StringComparison.Ordinal) || mime.Contains("xml+", StringComparison.Ordinal));
+
+    private static bool IsSpecificJsonMime(string mime) =>
+        mime != "application/json"
+        && (mime.EndsWith("+json", StringComparison.Ordinal)
+            || mime is "application/x-ndjson" or "application/jsonl" or "application/x-jsonlines");
+
     private static string? SniffMagic(ReadOnlySpan<byte> b)
     {
         if (b.Length >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return "image/jpeg";
