@@ -104,6 +104,111 @@ public class OoxmlTests
             "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
         ("ppt/slides/slide1.xml", SlideXml("My Title", "Body text")));
 
+    /// <summary>
+    /// `TitlesOfParts` is one flat vector concatenating several groups; `HeadingPairs` says how
+    /// many entries each group owns. Taking the vector whole puts font and theme names into the
+    /// slide titles.
+    /// </summary>
+    [Fact]
+    public void Pptx_SlideTitlesAreSlicedOutOfTitlesOfParts()
+    {
+        var pptx = Zip(
+            ("ppt/_rels/presentation.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
+            ("ppt/slides/slide1.xml", SlideXml("My Title", "Body text")),
+            ("docProps/app.xml",
+                "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" " +
+                "xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">" +
+                "<HeadingPairs><vt:vector size=\"6\" baseType=\"variant\">" +
+                "<vt:variant><vt:lpstr>Fonts Used</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant>" +
+                "<vt:variant><vt:lpstr>Theme</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant>" +
+                "<vt:variant><vt:lpstr>Slide Titles</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant>" +
+                "</vt:vector></HeadingPairs>" +
+                "<TitlesOfParts><vt:vector size=\"5\" baseType=\"lpstr\">" +
+                "<vt:lpstr>Calibri</vt:lpstr><vt:lpstr>Arial</vt:lpstr><vt:lpstr>Office Theme</vt:lpstr>" +
+                "<vt:lpstr>First Slide</vt:lpstr><vt:lpstr>Second Slide</vt:lpstr>" +
+                "</vt:vector></TitlesOfParts></Properties>"));
+
+        var doc = new PptxExtractor().Extract(pptx, PptxMime, new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        Assert.Equal("First Slide, Second Slide", doc.Metadata.Additional["slide_titles"].GetString());
+        Assert.Equal(new List<string> { "First Slide", "Second Slide" }, SlideNamesOf(doc));
+    }
+
+    /// <summary>With no heading pairs there is nothing to slice by, so the vector stands as-is.</summary>
+    [Fact]
+    public void Pptx_SlideTitlesFallBackToTheWholeVectorWithoutHeadingPairs()
+    {
+        var pptx = Zip(
+            ("ppt/_rels/presentation.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
+            ("ppt/slides/slide1.xml", SlideXml("My Title", "Body text")),
+            ("docProps/app.xml",
+                "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" " +
+                "xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">" +
+                "<TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\">" +
+                "<vt:lpstr>Only Slide</vt:lpstr><vt:lpstr></vt:lpstr></vt:vector></TitlesOfParts></Properties>"));
+
+        var doc = new PptxExtractor().Extract(pptx, PptxMime, new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        // The trailing empty entry is dropped, but only after slicing.
+        Assert.Equal(new List<string> { "Only Slide" }, SlideNamesOf(doc));
+    }
+
+    private static List<string> SlideNamesOf(InternalDocument doc) =>
+        Assert.IsType<PptxMetadata>(doc.Metadata.Format?.Payload).SlideNames;
+
+    /// <summary>
+    /// A chart or SmartArt frame carries only a relationship id; its text lives in another part
+    /// of the package and is lost entirely unless that part is followed and read.
+    /// </summary>
+    [Fact]
+    public void Pptx_ChartAndSmartArtTextIsResolvedFromTheirOwnParts()
+    {
+        const string slide =
+            "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" " +
+            "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" " +
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><p:cSld><p:spTree>" +
+            "<p:graphicFrame><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">" +
+            "<c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId2\"/>" +
+            "</a:graphicData></a:graphic></p:graphicFrame>" +
+            "<p:graphicFrame><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/diagram\">" +
+            "<dgm:relIds xmlns:dgm=\"http://schemas.openxmlformats.org/drawingml/2006/diagram\" r:dm=\"rId3\"/>" +
+            "</a:graphicData></a:graphic></p:graphicFrame>" +
+            "</p:spTree></p:cSld></p:sld>";
+
+        var pptx = Zip(
+            ("ppt/_rels/presentation.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
+            ("ppt/slides/slide1.xml", slide),
+            ("ppt/slides/_rels/slide1.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart1.xml\"/>" +
+                "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData\" Target=\"../diagrams/data1.xml\"/></Relationships>"),
+            ("ppt/charts/chart1.xml",
+                "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><c:chart>" +
+                "<c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue by Quarter</a:t></a:r></a:p></c:rich></c:tx></c:title>" +
+                "<c:plotArea><c:barChart><c:ser>" +
+                "<c:cat><c:strRef><c:strCache><c:pt idx=\"0\"><c:v>Q1</c:v></c:pt></c:strCache></c:strRef></c:cat>" +
+                "<c:val><c:numRef><c:numCache><c:pt idx=\"0\"><c:v>42</c:v></c:pt></c:numCache></c:numRef></c:val>" +
+                "</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"),
+            ("ppt/diagrams/data1.xml",
+                "<dgm:dataModel xmlns:dgm=\"http://schemas.openxmlformats.org/drawingml/2006/diagram\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><dgm:ptLst>" +
+                "<dgm:pt modelId=\"1\" type=\"node\"><dgm:t><a:p><a:r><a:t>Step One</a:t></a:r></a:p></dgm:t></dgm:pt>" +
+                "<dgm:pt modelId=\"2\" type=\"node\"><dgm:t><a:p><a:r><a:t>Step Two</a:t></a:r></a:p></dgm:t></dgm:pt>" +
+                "</dgm:ptLst></dgm:dataModel>"));
+
+        var doc = new PptxExtractor().Extract(pptx, PptxMime, new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        var plain = Render(doc, OutputFormat.Plain);
+        Assert.Contains("Revenue by Quarter", plain);
+        Assert.Contains("Q1, 42", plain);
+        Assert.Contains("Step One", plain);
+        Assert.Contains("Step Two", plain);
+    }
+
     [Fact]
     public void Pptx_TitleBecomesHeadingAndBodyParagraph_InJson()
     {

@@ -18,7 +18,51 @@ public sealed class AppProperties
     public int? TotalTime, Pages, Words, Characters, CharactersWithSpaces, Lines, Paragraphs,
         DocSecurity, Slides, Notes, HiddenSlides, MultimediaClips;
     public bool? ScaleCrop, LinksUpToDate, SharedDoc, HyperlinksChanged;
+
+    /// <summary>
+    /// Every <c>vt:lpstr</c> under <c>TitlesOfParts</c>'s vector, in document order, empties
+    /// included.
+    /// <para>
+    /// This is one flat vector concatenating several logical groups — fonts used, the theme,
+    /// and the slide or worksheet names — so on its own it is not a list of anything in
+    /// particular. <see cref="HeadingPairs"/> says where each group starts and ends, and empty
+    /// entries are dropped only <em>after</em> slicing, since removing them earlier would shift
+    /// every later group's offset.
+    /// </para>
+    /// </summary>
     public List<string> TitlesOfParts { get; } = new();
+
+    /// <summary>
+    /// The <c>HeadingPairs</c> vector as (group name, entry count), in document order. Each
+    /// pair claims that many consecutive entries of <see cref="TitlesOfParts"/>.
+    /// </summary>
+    public List<(string Name, int Count)> HeadingPairs { get; } = new();
+
+    /// <summary>
+    /// The <see cref="TitlesOfParts"/> entries belonging to the first heading group whose name
+    /// contains <paramref name="needle"/>, compared case-insensitively.
+    /// </summary>
+    /// <remarks>
+    /// With no heading pairs at all there is nothing to slice by, so the whole vector is
+    /// returned; with heading pairs present but none matching, the group genuinely is not there
+    /// and the answer is empty rather than everything.
+    /// </remarks>
+    public List<string> TitlesForHeading(string needle)
+    {
+        if (HeadingPairs.Count == 0)
+            return TitlesOfParts.Where(t => t.Length > 0).ToList();
+
+        int offset = 0;
+        foreach (var (name, count) in HeadingPairs)
+        {
+            int start = Math.Min(offset, TitlesOfParts.Count);
+            int end = Math.Min(offset + count, TitlesOfParts.Count);
+            if (name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                return TitlesOfParts.GetRange(start, end - start).Where(t => t.Length > 0).ToList();
+            offset = end;
+        }
+        return new List<string>();
+    }
 }
 
 /// <summary>
@@ -109,17 +153,29 @@ public static class OfficeMetadata
         props.LinksUpToDate = Bool(r, "LinksUpToDate");
         props.SharedDoc = Bool(r, "SharedDoc");
         props.HyperlinksChanged = Bool(r, "HyperlinksChanged");
-        // TitlesOfParts/vector/lpstr
+        // TitlesOfParts/vector/lpstr — kept raw, empties and all; see AppProperties.TitlesOfParts.
         var titles = r.Descendants().FirstOrDefault(e => e.Name.LocalName == "TitlesOfParts");
         if (titles is not null)
         {
             var vector = titles.Descendants().FirstOrDefault(e => e.Name.LocalName == "vector");
             if (vector is not null)
-                foreach (var lp in vector.Descendants().Where(e => e.Name.LocalName == "lpstr"))
-                {
-                    var t = (lp.Value ?? "").Trim();
-                    if (t.Length > 0) props.TitlesOfParts.Add(t);
-                }
+                foreach (var lp in vector.Elements().Where(e => e.Name.LocalName == "lpstr"))
+                    props.TitlesOfParts.Add((lp.Value ?? "").Trim());
+        }
+
+        // HeadingPairs/vector/variant — alternating name (lpstr) and count (i4).
+        var headings = r.Descendants().FirstOrDefault(e => e.Name.LocalName == "HeadingPairs");
+        var headingVector = headings?.Descendants().FirstOrDefault(e => e.Name.LocalName == "vector");
+        if (headingVector is not null)
+        {
+            var variants = headingVector.Elements().Where(e => e.Name.LocalName == "variant").ToList();
+            for (int i = 0; i + 1 < variants.Count; i += 2)
+            {
+                string? name = variants[i].Elements().FirstOrDefault(e => e.Name.LocalName == "lpstr")?.Value?.Trim();
+                string? countText = variants[i + 1].Elements().FirstOrDefault(e => e.Name.LocalName == "i4")?.Value?.Trim();
+                if (name is not null && int.TryParse(countText, NumberStyles.Integer, CultureInfo.InvariantCulture, out int count))
+                    props.HeadingPairs.Add((name, count));
+            }
         }
         return props;
     }

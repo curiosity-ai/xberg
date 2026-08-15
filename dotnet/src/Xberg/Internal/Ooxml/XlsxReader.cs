@@ -308,7 +308,8 @@ public static class XlsxReader
         if (core.Language is not null) wb.Metadata["language"] = core.Language;
 
         var app = OfficeMetadata.ExtractApp(pkg);
-        if (app.TitlesOfParts.Count > 0) wb.Metadata["worksheet_names"] = string.Join(", ", app.TitlesOfParts);
+        var worksheetNames = app.TitlesForHeading("worksheet");
+        if (worksheetNames.Count > 0) wb.Metadata["worksheet_names"] = string.Join(", ", worksheetNames);
         if (app.Company is not null) wb.Metadata["organization"] = app.Company;
         if (app.Application is not null) wb.Metadata["application"] = app.Application;
         if (app.AppVersion is not null) wb.Metadata["application_version"] = app.AppVersion;

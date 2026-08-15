@@ -190,11 +190,36 @@ public static class PptxReader
         return (level, ordered, hasBullet);
     }
 
+    private const string TableNamespace = "http://schemas.openxmlformats.org/drawingml/2006/table";
+    private const string ChartNamespace = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+    private const string DiagramNamespace = "http://schemas.openxmlformats.org/drawingml/2006/diagram";
+    private const string DrawingMlNamespace = "http://schemas.openxmlformats.org/drawingml/2006/main";
+    private const string RelationshipsNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
     private static SlideElement? ParseGraphicFrame(XElement node)
     {
-        var gd = node.Descendants().FirstOrDefault(n =>
-            n.Name.LocalName == "graphicData" &&
-            n.Attribute("uri")?.Value == "http://schemas.openxmlformats.org/drawingml/2006/table");
+        // A graphic frame's payload is identified by its graphicData uri. A table is inline;
+        // a chart or a SmartArt diagram is only a relationship id pointing at another part.
+        var graphicData = node.Descendants().FirstOrDefault(n => n.Name.LocalName == "graphicData");
+        string uri = graphicData?.Attribute("uri")?.Value ?? "";
+
+        if (uri == ChartNamespace)
+        {
+            string? relId = graphicData!.Elements()
+                .FirstOrDefault(n => n.Name.LocalName == "chart" && n.Name.NamespaceName == ChartNamespace)
+                ?.Attribute(XName.Get("id", RelationshipsNamespace))?.Value;
+            return relId is null ? null : new SlideElement { Kind = SlideKind.Chart, RelId = relId };
+        }
+
+        if (uri == DiagramNamespace)
+        {
+            string? relId = graphicData!.Elements()
+                .FirstOrDefault(n => n.Name.LocalName == "relIds" && n.Name.NamespaceName == DiagramNamespace)
+                ?.Attribute(XName.Get("dm", RelationshipsNamespace))?.Value;
+            return relId is null ? null : new SlideElement { Kind = SlideKind.SmartArt, RelId = relId };
+        }
+
+        var gd = uri == TableNamespace ? graphicData : null;
         var tbl = gd?.Elements().FirstOrDefault(n => n.Name.LocalName == "tbl");
         if (tbl is null) return null;
 
@@ -346,6 +371,10 @@ public static class PptxReader
                 case SlideKind.Image:
                     if (injectPlaceholders) builder.AddImageWithDesc(e.Description, e.Target ?? "");
                     break;
+                case SlideKind.Chart:
+                case SlideKind.SmartArt:
+                    if (e.ResolvedText is not null) builder.AddText(e.ResolvedText);
+                    break;
             }
         }
         return builder.Build();
@@ -370,23 +399,98 @@ public static class PptxReader
 
     private static void ResolveImageTargets(OoxmlPackage pkg, string slidePath, List<SlideElement> elements)
     {
-        if (!elements.Any(e => e.Kind == SlideKind.Image)) return;
+        bool wantsImages = elements.Any(e => e.Kind == SlideKind.Image);
+        bool wantsParts = elements.Any(e => e.Kind is SlideKind.Chart or SlideKind.SmartArt);
+        if (!wantsImages && !wantsParts) return;
+
         int slash = slidePath.LastIndexOf('/');
         string dir = slash >= 0 ? slidePath[..(slash + 1)] : "";
         string file = slash >= 0 ? slidePath[(slash + 1)..] : slidePath;
         var relsXml = pkg.ReadXml($"{dir}_rels/{file}.rels");
         if (relsXml?.Root is null) return;
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        var images = new Dictionary<string, string>(StringComparer.Ordinal);
+        // Charts and diagrams are looked up by id alone, without filtering on relationship type:
+        // the diagram frame points at `diagramData`, which shares no substring with either name.
+        var anyTarget = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var r in relsXml.Root.Descendants().Where(e => e.Name.LocalName == "Relationship"))
         {
             var type = r.Attribute("Type")?.Value ?? "";
             var id = r.Attribute("Id")?.Value;
             var target = r.Attribute("Target")?.Value;
-            if (id is not null && target is not null && type.Contains("image")) map[id] = target;
+            if (id is null || target is null) continue;
+            anyTarget[id] = target;
+            if (type.Contains("image")) images[id] = target;
         }
+
         foreach (var e in elements)
-            if (e.Kind == SlideKind.Image && e.ImageId is not null && map.TryGetValue(e.ImageId, out var t))
+        {
+            if (e.Kind == SlideKind.Image && e.ImageId is not null && images.TryGetValue(e.ImageId, out var t))
                 e.Target = t;
+            else if (e.Kind is SlideKind.Chart or SlideKind.SmartArt
+                && e.RelId is not null && anyTarget.TryGetValue(e.RelId, out var partTarget))
+            {
+                var partXml = pkg.ReadXml(ResolvePartPath(slidePath, partTarget));
+                if (partXml is null) continue;
+                // A part that will not read or parse costs its text and nothing else; the rest of
+                // the slide is unaffected, so there is nothing to abort.
+                e.ResolvedText = e.Kind == SlideKind.Chart ? ParseChartText(partXml) : ParseDiagramText(partXml);
+            }
+        }
+    }
+
+    /// <summary>Resolve a relationship target against the part that declared it.</summary>
+    private static string ResolvePartPath(string slidePath, string target)
+    {
+        if (target.StartsWith("..", StringComparison.Ordinal))
+        {
+            // Up one level from the slide's own directory: ppt/slides/x.xml + ../charts/c.xml.
+            int lastSlash = slidePath.LastIndexOf('/');
+            int parentSlash = lastSlash > 0 ? slidePath.LastIndexOf('/', lastSlash - 1) : -1;
+            return parentSlash >= 0
+                ? string.Concat(slidePath.AsSpan(0, parentSlash), "/", target.AsSpan(3))
+                : "ppt/" + target[3..];
+        }
+        int slash = slidePath.LastIndexOf('/');
+        return slash >= 0 ? string.Concat(slidePath.AsSpan(0, slash), "/", target) : "ppt/slides/" + target;
+    }
+
+    /// <summary>
+    /// A chart part's title followed by every cached value, which together are the only text a
+    /// chart carries — the plotted geometry itself is not text.
+    /// </summary>
+    private static string? ParseChartText(XDocument chart)
+    {
+        var parts = new List<string>();
+
+        var titleNode = chart.Descendants().FirstOrDefault(n => n.Name.LocalName == "title" && n.Name.NamespaceName == ChartNamespace);
+        if (titleNode is not null)
+        {
+            string title = string.Concat(titleNode.Descendants()
+                .Where(n => n.Name.LocalName == "t" && n.Name.NamespaceName == DrawingMlNamespace)
+                .Select(n => n.Value));
+            if (title.Trim().Length != 0) parts.Add(title);
+        }
+
+        var values = chart.Descendants()
+            .Where(n => n.Name.LocalName == "v" && n.Name.NamespaceName == ChartNamespace)
+            .Select(n => n.Value.Trim())
+            .Where(v => v.Length != 0)
+            .ToList();
+        if (values.Count != 0) parts.Add(string.Join(", ", values));
+
+        return parts.Count == 0 ? null : string.Join("\n", parts);
+    }
+
+    /// <summary>Every diagram node's text; each lives in a normal DrawingML run body.</summary>
+    private static string? ParseDiagramText(XDocument diagram)
+    {
+        var texts = diagram.Descendants()
+            .Where(n => n.Name.LocalName == "t" && n.Name.NamespaceName == DrawingMlNamespace)
+            .Select(n => n.Value.Trim())
+            .Where(t => t.Length != 0)
+            .ToList();
+        return texts.Count == 0 ? null : string.Join("\n", texts);
     }
 
     // ── notes ──────────────────────────────────────────────────────────────────
@@ -422,7 +526,8 @@ public static class PptxReader
         if (app.Slides is not null) { m["slide_count"] = app.Slides.Value.ToString(CultureInfo.InvariantCulture); result.AppSlideCount = (uint)Math.Max(0, app.Slides.Value); }
         if (app.Notes is not null) m["notes_count"] = app.Notes.Value.ToString(CultureInfo.InvariantCulture);
         if (app.HiddenSlides is not null) m["hidden_slides"] = app.HiddenSlides.Value.ToString(CultureInfo.InvariantCulture);
-        if (app.TitlesOfParts.Count > 0) { result.SlideNames = new List<string>(app.TitlesOfParts); m["slide_titles"] = string.Join(", ", app.TitlesOfParts); }
+        var slideTitles = app.TitlesForHeading("slide");
+        if (slideTitles.Count > 0) { result.SlideNames = slideTitles; m["slide_titles"] = string.Join(", ", slideTitles); }
         if (app.PresentationFormat is not null) m["presentation_format"] = app.PresentationFormat;
         if (app.Company is not null) m["organization"] = app.Company;
         if (app.Application is not null) m["application"] = app.Application;
@@ -554,7 +659,7 @@ public static class PptxReader
 
     private struct Position { public long X, Y, Cx, Cy; }
 
-    private enum SlideKind { Text, Table, Image, List, Unknown }
+    private enum SlideKind { Text, Table, Image, List, Chart, SmartArt, Unknown }
 
     private sealed class Run
     {
@@ -589,5 +694,11 @@ public static class PptxReader
         public string? ImageId;
         public string? Target;
         public string? Description;
+
+        /// <summary>Relationship id of a chart or diagram part, which lives in its own ZIP entry.</summary>
+        public string? RelId;
+
+        /// <summary>Text recovered from that part once it has been read.</summary>
+        public string? ResolvedText;
     }
 }
