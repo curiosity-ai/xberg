@@ -16,7 +16,8 @@ public sealed partial class TypstExtractor : IExtractor
     public IEnumerable<string> SupportedMimeTypes => new[] { "application/x-typst", "text/x-typst" };
     public int Priority => 50;
 
-    [GeneratedRegex(@"#image\(""([^""]*)""")] private static partial Regex ImageRe();
+    // The hash is optional: inside `#figure(...)` the call is written bare, as `image("…")`.
+    [GeneratedRegex(@"#?image\(""([^""]*)""")] private static partial Regex ImageRe();
     [GeneratedRegex(@"columns:\s*(\d+)")] private static partial Regex ColumnsRe();
     [GeneratedRegex(@"^#link\(""([^""]*)""\)\[([^\]]*)\]")] private static partial Regex LinkRe();
     [GeneratedRegex(@"keywords:\s*(?:""([^""]*)""|(\([^)]*\)))")] private static partial Regex KeywordsRe();
@@ -82,6 +83,8 @@ public sealed partial class TypstExtractor : IExtractor
         int tableParen = 0, tableBracket = 0;
         int footnoteCounter = 0;
         bool? activeList = null;
+        bool inDisplayMath = false;
+        var mathBuf = new StringBuilder();
 
         var lines = MarkupHelpers.Lines(content);
         int lineIdx = 0;
@@ -108,6 +111,32 @@ public sealed partial class TypstExtractor : IExtractor
             {
                 foreach (char ch in trimmed) { if (ch == '(') parenDepth++; else if (ch == ')') parenDepth--; }
                 if (parenDepth <= 0) { inSetDocument = false; parenDepth = 0; }
+                continue;
+            }
+
+            // A `$` that opens a block runs until the next one, however many lines later, so the
+            // body has to be accumulated rather than matched on a single line.
+            if (inDisplayMath)
+            {
+                int closeIdx = trimmed.IndexOf('$');
+                if (closeIdx >= 0)
+                {
+                    string beforeClose = trimmed.Substring(0, closeIdx).Trim();
+                    if (beforeClose.Length != 0)
+                    {
+                        if (mathBuf.Length != 0) mathBuf.Append('\n');
+                        mathBuf.Append(beforeClose);
+                    }
+                    inDisplayMath = false;
+                    string mathText = mathBuf.ToString().Trim();
+                    mathBuf.Clear();
+                    if (mathText.Length != 0) builder.PushFormula(mathText, null, null);
+                }
+                else
+                {
+                    if (mathBuf.Length != 0) mathBuf.Append('\n');
+                    mathBuf.Append(trimmed);
+                }
                 continue;
             }
 
@@ -152,8 +181,26 @@ public sealed partial class TypstExtractor : IExtractor
 
             if (trimmed.StartsWith("#set ") || trimmed.StartsWith("#let ") || trimmed.StartsWith("#import ")
                 || trimmed.StartsWith("#include ") || trimmed.StartsWith("#pagebreak") || trimmed.StartsWith("#colbreak")
-                || trimmed.StartsWith("#v(") || trimmed.StartsWith("#h("))
+                || trimmed.StartsWith("#v(") || trimmed.StartsWith("#h(") || trimmed.StartsWith("#bibliography("))
                 continue;
+
+            if (trimmed.StartsWith("/ "))
+            {
+                FlushParagraph(paragraphBuf, builder);
+                string rest = trimmed.Substring(2).Trim();
+                int colonIdx = rest.IndexOf(':');
+                if (colonIdx >= 0)
+                {
+                    string term = rest.Substring(0, colonIdx).Trim();
+                    string definition = rest.Substring(colonIdx + 1).Trim();
+                    if (term.Length != 0)
+                    {
+                        builder.PushDefinitionTerm(term, null);
+                        builder.PushDefinitionDescription(definition, null);
+                    }
+                }
+                continue;
+            }
 
             if ((trimmed.StartsWith('+') || trimmed.StartsWith('-')) && trimmed.Length > 1
                 && !char.IsLetterOrDigit(trimmed[1]))
@@ -179,9 +226,18 @@ public sealed partial class TypstExtractor : IExtractor
                 if (headingText.Length != 0)
                 {
                     FlushParagraph(paragraphBuf, builder);
-                    string markers = new string('=', level);
-                    builder.PushHeading((byte)level, $"{markers} {headingText}", null, null);
+                    // The marker run is the level and nothing else; it must not survive into the
+                    // heading's text, or every renderer repeats it after its own marker.
+                    builder.PushHeading((byte)level, headingText, null, null);
                 }
+                continue;
+            }
+
+            if (trimmed == "$")
+            {
+                FlushParagraph(paragraphBuf, builder);
+                inDisplayMath = true;
+                mathBuf.Clear();
                 continue;
             }
 
@@ -190,6 +246,16 @@ public sealed partial class TypstExtractor : IExtractor
                 FlushParagraph(paragraphBuf, builder);
                 string math = trimmed.Trim('$').Trim();
                 if (math.Length != 0) builder.PushFormula(math, null, null);
+                continue;
+            }
+
+            if (trimmed.StartsWith('$') && trimmed.Length > 1)
+            {
+                FlushParagraph(paragraphBuf, builder);
+                inDisplayMath = true;
+                mathBuf.Clear();
+                string openingContent = trimmed.Substring(1).Trim();
+                if (openingContent.Length != 0) mathBuf.Append(openingContent);
                 continue;
             }
 
@@ -204,6 +270,49 @@ public sealed partial class TypstExtractor : IExtractor
                 foreach (char ch in trimmed) CountBrackets(ch, ref tableParen, ref tableBracket);
                 if (tableParen > 0 || tableBracket > 0) inTable = true;
                 else { EmitTable(tableBuf.ToString(), builder); tableBuf.Clear(); }
+                continue;
+            }
+
+            if (trimmed.StartsWith("#quote["))
+            {
+                FlushParagraph(paragraphBuf, builder);
+                string? quoted = ExtractBracketContent(trimmed, "#quote[");
+                if (quoted is not null)
+                {
+                    builder.PushQuoteStart();
+                    builder.PushParagraph(quoted, new(), null, null);
+                    builder.PushQuoteEnd();
+                }
+                continue;
+            }
+
+            // A figure's arguments run until its parentheses balance, which is usually several
+            // lines below. Consuming only the first line leaves the rest to be read as prose.
+            if (trimmed.StartsWith("#figure("))
+            {
+                FlushParagraph(paragraphBuf, builder);
+                var figureBuf = new StringBuilder(trimmed);
+                int figureParen = 0;
+                foreach (char ch in trimmed) { if (ch == '(') figureParen++; else if (ch == ')') figureParen--; }
+                while (figureParen > 0 && lineIdx < lines.Count)
+                {
+                    string nextLine = lines[lineIdx].Trim();
+                    lineIdx++;
+                    figureBuf.Append('\n').Append(nextLine);
+                    foreach (char ch in nextLine) { if (ch == '(') figureParen++; else if (ch == ')') figureParen--; }
+                }
+
+                string figureSource = figureBuf.ToString();
+                var fm = ImageRe().Match(figureSource);
+                string? imagePath = fm.Success ? fm.Groups[1].Value : null;
+                string? caption = ExtractFigureCaption(figureSource);
+
+                if (imagePath is not null)
+                {
+                    builder.PushUri(MarkupHelpers.Image(imagePath, caption));
+                    builder.PushParagraph($"[Image: {imagePath}]", new(), null, null);
+                }
+                if (caption is not null) builder.PushParagraph(caption, new(), null, null);
                 continue;
             }
 
@@ -234,9 +343,39 @@ public sealed partial class TypstExtractor : IExtractor
             paragraphBuf.Append(trimmed);
         }
 
+        // An unterminated block still carries its content; drop the delimiter, not the formula.
+        if (inDisplayMath)
+        {
+            string trailingMath = mathBuf.ToString().Trim();
+            if (trailingMath.Length != 0) builder.PushFormula(trailingMath, null, null);
+        }
+
         if (activeList is not null) builder.EndList();
         FlushParagraph(paragraphBuf, builder);
         return builder.Build();
+    }
+
+    /// <summary>The bracketed argument of a figure's <c>caption:</c>, if it has one.</summary>
+    private static string? ExtractFigureCaption(string figureSource)
+    {
+        int idx = figureSource.IndexOf("caption:", StringComparison.Ordinal);
+        if (idx < 0) return null;
+        string after = figureSource.Substring(idx + "caption:".Length);
+        int start = after.IndexOf('[');
+        if (start < 0) return null;
+
+        int depth = 0;
+        for (int i = start; i < after.Length; i++)
+        {
+            char ch = after[i];
+            if (ch == '[') depth++;
+            else if (ch == ']')
+            {
+                depth--;
+                if (depth == 0) return after.Substring(start + 1, i - start - 1).Trim();
+            }
+        }
+        return null;
     }
 
     private static void CountBrackets(char ch, ref int paren, ref int bracket)
