@@ -39,7 +39,7 @@ public sealed class MsgExtractor : IExtractor
             if (!EmailStructKeys.Contains(key))
                 additional[key] = JsonSerializer.SerializeToElement(value);
 
-        InternalDocument doc = BuildInternalDocument(result);
+        InternalDocument doc = BuildInternalDocument(result, config);
         doc.MimeType = mimeType;
 
         string? fromName = result.Metadata.TryGetValue("from_name", out var fn) ? fn : null;
@@ -69,7 +69,7 @@ public sealed class MsgExtractor : IExtractor
     }
 
     // ── shared email document build (extractors/email.rs) ────────────────────────
-    private static InternalDocument BuildInternalDocument(EmailExtractionResult result)
+    private static InternalDocument BuildInternalDocument(EmailExtractionResult result, ExtractionConfig config)
     {
         var builder = new InternalDocumentBuilder("email");
 
@@ -81,7 +81,7 @@ public sealed class MsgExtractor : IExtractor
         }
 
         if (result.Subject is { } subject) headerEntries.Add(("Subject", subject));
-        if (result.FromEmail is { } from) headerEntries.Add(("From", from));
+        if (EmailExtractor.FormatSender(result) is { } from) headerEntries.Add(("From", from));
         if (result.ToEmails.Count > 0) headerEntries.Add(("To", string.Join(", ", result.ToEmails)));
         if (result.CcEmails.Count > 0) headerEntries.Add(("CC", string.Join(", ", result.CcEmails)));
         if (result.BccEmails.Count > 0) headerEntries.Add(("BCC", string.Join(", ", result.BccEmails)));
@@ -120,6 +120,9 @@ public sealed class MsgExtractor : IExtractor
                 builder.PushParagraph($"  {name} ({size}B)", new(), null, null);
             }
         }
+
+        AttachmentInlining.Append(builder, result.Attachments, config);
+
         return builder.Build();
     }
 

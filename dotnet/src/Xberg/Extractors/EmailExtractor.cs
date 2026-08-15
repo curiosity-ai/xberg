@@ -53,7 +53,7 @@ public sealed class EmailExtractor : IExtractor
                 additional[key] = JsonSerializer.SerializeToElement(value);
         }
 
-        InternalDocument doc = BuildInternalDocument(result);
+        InternalDocument doc = BuildInternalDocument(result, config);
         doc.MimeType = mimeType;
 
         string? subject = result.Subject;
@@ -93,7 +93,7 @@ public sealed class EmailExtractor : IExtractor
     }
 
     /// <summary>Port of Rust `EmailExtractor::build_internal_document`.</summary>
-    private static InternalDocument BuildInternalDocument(EmailExtractionResult result)
+    private static InternalDocument BuildInternalDocument(EmailExtractionResult result, ExtractionConfig config)
     {
         var builder = new InternalDocumentBuilder("email");
 
@@ -108,7 +108,7 @@ public sealed class EmailExtractor : IExtractor
         }
 
         if (result.Subject is { } subject) headerEntries.Add(("Subject", subject));
-        if (result.FromEmail is { } from) headerEntries.Add(("From", from));
+        if (FormatSender(result) is { } from) headerEntries.Add(("From", from));
         if (result.ToEmails.Count > 0) headerEntries.Add(("To", string.Join(", ", result.ToEmails)));
         if (result.CcEmails.Count > 0) headerEntries.Add(("CC", string.Join(", ", result.CcEmails)));
         if (result.BccEmails.Count > 0) headerEntries.Add(("BCC", string.Join(", ", result.BccEmails)));
@@ -156,7 +156,23 @@ public sealed class EmailExtractor : IExtractor
             }
         }
 
+        AttachmentInlining.Append(builder, result.Attachments, config);
+
         return builder.Build();
+    }
+
+    /// <summary>
+    /// The sender as a header line: both halves of the mailbox when it has a display name, but
+    /// never <c>address &lt;address&gt;</c> when the "name" is just the address repeated.
+    /// </summary>
+    internal static string? FormatSender(EmailExtractionResult result)
+    {
+        string? name = result.Metadata.TryGetValue("from_name", out var n) && n.Trim().Length != 0 ? n : null;
+        string? address = result.FromEmail;
+
+        if (name is not null && address is not null && !name.Equals(address, StringComparison.OrdinalIgnoreCase))
+            return $"{name} <{address}>";
+        return address ?? name;
     }
 
     /// <summary>Port of Rust `process_node` — flatten a DocumentStructure node into the builder.</summary>

@@ -22,8 +22,12 @@ internal static class MimeParser
 
         string? subject = DecodeHeaderOpt(root.GetHeader("Subject"));
 
-        var fromAddrs = AddressList(root.GetHeader("From"));
+        string? fromHeader = root.GetHeader("From");
+        var fromAddrs = AddressList(fromHeader);
         string? fromEmail = fromAddrs.Count > 0 ? fromAddrs[0] : null;
+        string? fromName = fromHeader is null
+            ? null
+            : HeaderDecoder.ExtractFirstDisplayName(HeaderDecoder.DecodeEncodedWords(fromHeader));
 
         var toEmails = AddressList(root.GetHeader("To"));
         var ccEmails = AddressList(root.GetHeader("Cc"));
@@ -96,7 +100,7 @@ internal static class MimeParser
             });
         }
 
-        var metadata = BuildMetadata(subject, fromEmail, toEmails, ccEmails, bccEmails, date, messageId, attachments);
+        var metadata = BuildMetadata(subject, fromEmail, fromName, toEmails, ccEmails, bccEmails, date, messageId, attachments);
 
         if (replyTo.Count > 0) metadata["reply_to"] = string.Join(", ", replyTo);
         if (inReplyTo.Count > 0) metadata["in_reply_to"] = string.Join(", ", inReplyTo);
@@ -438,12 +442,13 @@ internal static class MimeParser
     // -----------------------------------------------------------------------
 
     private static Dictionary<string, string> BuildMetadata(
-        string? subject, string? fromEmail, List<string> to, List<string> cc, List<string> bcc,
+        string? subject, string? fromEmail, string? fromName, List<string> to, List<string> cc, List<string> bcc,
         string? date, string? messageId, List<EmailAttachment> attachments)
     {
         var metadata = new Dictionary<string, string>(StringComparer.Ordinal);
         if (subject is not null) metadata["subject"] = subject;
         if (fromEmail is not null) metadata["email_from"] = fromEmail;
+        if (fromName is not null) metadata["from_name"] = fromName;
         if (to.Count > 0) metadata["email_to"] = string.Join(", ", to);
         if (cc.Count > 0) metadata["email_cc"] = string.Join(", ", cc);
         if (bcc.Count > 0) metadata["email_bcc"] = string.Join(", ", bcc);
