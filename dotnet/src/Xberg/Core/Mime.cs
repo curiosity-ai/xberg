@@ -133,7 +133,7 @@ public static class Mime
     /// one, and so is a .jar.
     /// </para>
     /// </summary>
-    private static bool IsAmbiguousContainer(string mime) =>
+    public static bool IsAmbiguousContainer(string mime) =>
         mime is "application/msword" or "application/zip";
 
     private static bool IsSpecificJsonMime(string mime) =>

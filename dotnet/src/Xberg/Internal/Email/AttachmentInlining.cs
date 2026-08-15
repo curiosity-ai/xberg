@@ -85,19 +85,29 @@ internal static class AttachmentInlining
     }
 
     /// <summary>
-    /// The attachment's type, by content first, then by the name it was sent under, then by what
-    /// the sender declared. A generic octet-stream at any stage is not an answer, so it falls
-    /// through to the next; if nothing better emerges the attachment is left alone rather than
-    /// guessed at.
+    /// The attachment's type: what its bytes are, then the name it was sent under, then what the
+    /// sender declared. If nothing pins it down the attachment is left alone rather than guessed
+    /// at.
     /// </summary>
+    /// <remarks>
+    /// Content leads here — unlike a file on disk, where the extension leads and content only
+    /// overrules it. An attachment's name is frequently wrong about its contents: one fixture
+    /// sends undecoded base64 named `image.jpg`, which is text and which upstream extracts as
+    /// text. The one exception is a container signature: every OLE compound file looks alike, so
+    /// content alone answers "Word document" for an attached `.msg` too, and there the name is
+    /// the better evidence.
+    /// </remarks>
     private static string? ResolveMime(string filename, byte[] bytes, string? declared)
     {
         string? detected = Mime.DetectMimeTypeFromBytes(bytes);
-        if (detected is not null && detected != Mime.OctetStream) return detected;
-
         string? byName = Mime.DetectMimeType(filename, checkExists: false);
-        if (byName is not null && byName != Mime.OctetStream) return byName;
 
+        bool detectedIsUseful = detected is not null
+            && detected != Mime.OctetStream
+            && !Mime.IsAmbiguousContainer(detected);
+
+        if (!detectedIsUseful && byName is not null && byName != Mime.OctetStream) return byName;
+        if (detected is not null && detected != Mime.OctetStream) return detected;
         return declared is not null && declared != Mime.OctetStream ? declared : null;
     }
 }
