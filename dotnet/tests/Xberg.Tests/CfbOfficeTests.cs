@@ -140,16 +140,27 @@ public sealed class CfbOfficeTests
         Assert.Equal(new List<string> { "application/vnd.ms-outlook" }, mimes);
     }
 
-    // ── Hwp (Rust parity: both fixtures fail with "no BodyText sections") ─────────
+    // ── Hwp ───────────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Two silent-loss bugs, either of which emptied a genuine HWP 5.0 document: compound-file
+    /// paths are absolute and were matched against a relative prefix, so no BodyText section was
+    /// ever found; and the record tags took the specification's decimal offsets as hexadecimal,
+    /// so even once sections were found no paragraph record matched. Neither raised a warning.
+    /// The expected strings are cross-checked against the file's own PrvText preview stream.
+    /// </summary>
     [Fact]
-    public void HwpThrowsNoBodyTextLikeRust()
+    public void HwpRecoversParagraphText()
     {
         byte[]? bytes = Read("hwp/styled_document.hwp");
         if (bytes is null) return;
 
-        // Mirrors the Rust extractor, which never matches its BodyText streams and errors.
-        Assert.ThrowsAny<Exception>(() => new HwpExtractor().Extract(bytes, "application/x-hwp", new ExtractionConfig()));
+        var doc = new HwpExtractor().Extract(bytes, "application/x-hwp", new ExtractionConfig());
+        var text = string.Join("\n", doc.Elements.Select(e => e.Text));
+
+        Assert.Contains("스타일 문서 예제", text);
+        Assert.Contains("이것은 일반 단락입니다. 기본 스타일로 작성되었습니다.", text);
+        Assert.Contains("텍스트 스타일링", text);
     }
 
     // ── Registry dispatch: XLS wins over XLSX for application/vnd.ms-excel ────────
