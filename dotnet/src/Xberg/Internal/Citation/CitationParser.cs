@@ -94,10 +94,13 @@ internal static class CitationParser
             var m = Regex.Match(line, @"^([A-Z]{2,4})\s*-\s?(.*)$");
             if (!m.Success)
             {
-                if (line.StartsWith("      ") && cur is not null)
+                // MEDLINE folds any long value onto continuation lines indented under their tag,
+                // not just the title; an abstract is the field that most often needs it, and
+                // dropping the continuations truncated it at the first line break.
+                if (line.StartsWith("      ", StringComparison.Ordinal) && cur is not null)
                 {
                     string cont = line.Trim();
-                    if (lastTag == "TI" && cont.Length != 0) cur.Title += " " + cont;
+                    if (cont.Length != 0) AppendContinuation(cur, lastTag, cont);
                 }
                 continue;
             }
@@ -123,6 +126,21 @@ internal static class CitationParser
             }
         }
         return citations;
+    }
+
+    /// <summary>Continue the field the previous tag opened, joining with a single space.</summary>
+    private static void AppendContinuation(Citation citation, string lastTag, string text)
+    {
+        switch (lastTag)
+        {
+            case "TI": citation.Title = Join(citation.Title, text); break;
+            case "AB": citation.AbstractText = Join(citation.AbstractText, text); break;
+            case "TA":
+            case "JT": citation.Journal = Join(citation.Journal, text); break;
+        }
+
+        static string Join(string? existing, string addition) =>
+            string.IsNullOrEmpty(existing) ? addition : existing + " " + addition;
     }
 
     // ── EndNote XML ──────────────────────────────────────────────────────────

@@ -74,7 +74,10 @@ public sealed class CitationExtractor : IExtractor
         {
             string title = citations[i].Title;
             string key = title.Length == 0 ? $"citation_{i + 1}" : title;
-            builder.PushCitation(title, key, null);
+            // The element's text is the whole record, not just its title: everything the file
+            // says about the work — its authors, journal, identifiers and abstract — is content,
+            // and a citation reduced to its title loses all of it.
+            builder.PushCitation(FormatCitation(citations[i]), key, null);
         }
 
         var doc = builder.Build();
@@ -100,5 +103,40 @@ public sealed class CitationExtractor : IExtractor
         if (keywordsList.Count > 0) meta.Keywords = keywordsList;
         doc.Metadata = meta;
         return doc;
+    }
+
+    /// <summary>One citation as a labelled block, in the field order upstream emits.</summary>
+    private static string FormatCitation(Citation citation)
+    {
+        var sb = new StringBuilder();
+
+        if (citation.Title.Length != 0) sb.Append("Title: ").Append(citation.Title).Append('\n');
+
+        if (citation.Authors.Count != 0)
+        {
+            // Given name first, as a reader would write it, rather than the file's sort order.
+            var names = citation.Authors.Select(a => a.GivenName is not null ? $"{a.GivenName} {a.Name}" : a.Name);
+            sb.Append("Authors: ").AppendJoin(", ", names).Append('\n');
+        }
+
+        if (citation.Journal is { } journal) sb.Append("Journal: ").Append(journal).Append('\n');
+        if (citation.Year > 0) sb.Append("Year: ").Append(citation.Year).Append('\n');
+
+        if (citation.Volume is { } volume)
+        {
+            sb.Append("Volume: ").Append(volume);
+            if (citation.Issue is { } issue) sb.Append(", Issue: ").Append(issue);
+            if (citation.Pages is { } pages) sb.Append(", Pages: ").Append(pages);
+            sb.Append('\n');
+        }
+
+        if (citation.Doi is { } doi) sb.Append("DOI: ").Append(doi).Append('\n');
+        if (citation.Pmid is { } pmid) sb.Append("PMID: ").Append(pmid).Append('\n');
+        if (!string.IsNullOrEmpty(citation.AbstractText))
+            sb.Append("Abstract: ").Append(citation.AbstractText).Append('\n');
+        if (citation.Keywords.Count != 0)
+            sb.Append("Keywords: ").AppendJoin(", ", citation.Keywords).Append('\n');
+
+        return sb.ToString().Trim();
     }
 }

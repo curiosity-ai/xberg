@@ -41,80 +41,15 @@ public sealed class DjotExtractor : IExtractor
 
         var events = DjotParser.Parse(remaining);
 
-        var tables = ExtractTablesFromEvents(events);
-
+        // Tables are parsed in place, in the same pass as everything else, so each one keeps its
+        // position in the document and gets a Table *element*. Recording the table data alone —
+        // which is what a separate pass and a bare `PushTable` did — left every renderer with
+        // nothing to walk, and the table's content silently vanished from the output.
         var doc = BuildInternalDocument(events);
         doc.MimeType = mimeType;
         doc.Metadata = metadata;
 
-        // Tables live only in the document's table collection (not as elements), matching the
-        // Rust extractor's `for table in tables { doc.push_table(table); }`.
-        foreach (var table in tables) doc.PushTable(table);
-
         return doc;
-    }
-
-    // ------------------------------------------------------------------
-    // extract_tables_from_events (port of parsing/table_extraction.rs)
-    // ------------------------------------------------------------------
-
-    internal static List<Table> ExtractTablesFromEvents(List<DjotEvent> events)
-    {
-        var tables = new List<Table>();
-        List<List<string>>? currentTable = null;
-        var currentRow = new List<string>();
-        var currentCell = new StringBuilder();
-        bool inTableCell = false;
-        uint tableIndex = 0;
-
-        foreach (var e in events)
-        {
-            switch (e.Kind)
-            {
-                case DjotEventKind.StartTable:
-                    currentTable = new List<List<string>>();
-                    break;
-                case DjotEventKind.StartTableRow:
-                    currentRow = new List<string>();
-                    break;
-                case DjotEventKind.StartTableCell:
-                    currentCell.Clear();
-                    inTableCell = true;
-                    break;
-                case DjotEventKind.Str when inTableCell:
-                    currentCell.Append(e.Text);
-                    break;
-                case DjotEventKind.EndTableCell when inTableCell:
-                    currentRow.Add(currentCell.ToString().Trim());
-                    currentCell.Clear();
-                    inTableCell = false;
-                    break;
-                case DjotEventKind.EndTableRow:
-                    if (currentRow.Count > 0 && currentTable is not null)
-                    {
-                        currentTable.Add(currentRow);
-                        currentRow = new List<string>();
-                    }
-                    else currentRow = new List<string>();
-                    break;
-                case DjotEventKind.EndTable:
-                    if (currentTable is { Count: > 0 } cells)
-                    {
-                        string markdown = MarkdownExtractor.CellsToMarkdown(cells);
-                        tables.Add(new Table
-                        {
-                            Cells = cells,
-                            Markdown = markdown,
-                            PageNumber = tableIndex + 1,
-                        });
-                        tableIndex++;
-                    }
-                    currentTable = null;
-                    break;
-            }
-        }
-
-        return tables;
     }
 
     // ------------------------------------------------------------------
@@ -151,6 +86,10 @@ public sealed class DjotExtractor : IExtractor
         bool inFootnote = false;
         string footnoteLabel = "";
         var footnoteText = new StringBuilder();
+        List<List<string>>? tableRows = null;
+        var tableRow = new List<string>();
+        var tableCell = new StringBuilder();
+        bool inTableCell = false;
 
         // Annotation tracking: (kindTag 0=strong 1=emphasis 2=delete 4=link, byteStart, linkUrl).
         var annStarts = new List<(int kind, uint start, string? url)>();
@@ -416,6 +355,32 @@ public sealed class DjotExtractor : IExtractor
                     b.PushFootnoteRef(e.Text, e.Text, null);
                     break;
 
+                case DjotEventKind.StartTable:
+                    tableRows = new List<List<string>>();
+                    break;
+                case DjotEventKind.StartTableRow:
+                    tableRow = new List<string>();
+                    break;
+                case DjotEventKind.StartTableCell:
+                    tableCell.Clear();
+                    inTableCell = true;
+                    break;
+                case DjotEventKind.EndTableCell when inTableCell:
+                    tableRow.Add(tableCell.ToString().Trim());
+                    tableCell.Clear();
+                    inTableCell = false;
+                    break;
+                case DjotEventKind.EndTableRow:
+                    if (tableRow.Count > 0 && tableRows is not null) tableRows.Add(tableRow);
+                    tableRow = new List<string>();
+                    break;
+                case DjotEventKind.EndTable:
+                    if (tableRows is { Count: > 0 } rows) b.PushTableFromCells(rows, null, null);
+                    tableRows = null;
+                    break;
+                case DjotEventKind.Str when inTableCell:
+                    tableCell.Append(e.Text);
+                    break;
                 case DjotEventKind.Str:
                     if (inImage) imageAlt.Append(e.Text);
                     else if (inFootnote) footnoteText.Append(e.Text);

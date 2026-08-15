@@ -178,7 +178,10 @@ public class MarkupExtractorTests
         string ris = "TY  - JOUR\nTI  - Sample Title\nAU  - Smith, John\nAU  - Doe, Jane\nPY  - 2024\nER  -\n";
         var doc = Extract(new CitationExtractor(), ris, "application/x-research-info-systems");
         Assert.Equal(new List<string> { "Jane Doe", "John Smith" }, doc.Metadata.Authors);
-        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Citation && e.Text == "Sample Title");
+
+        // The element carries the whole record, not just its title.
+        var citation = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Citation);
+        Assert.Equal("Title: Sample Title\nAuthors: John Smith, Jane Doe\nYear: 2024", citation.Text);
     }
 
     [Fact]
