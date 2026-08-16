@@ -350,9 +350,13 @@ public static class DocxReader
         var docPr = drawing.Descendants().FirstOrDefault(e => e.Name.LocalName == "docPr");
         if (docPr is not null)
         {
+            // Word writes `descr` only when the author fills in the description field, but
+            // always writes `name`. Without the fallback, an image the author named but never
+            // described reaches the output carrying no alt text at all — and a document that is
+            // nothing but images extracts to nothing.
             var descr = docPr.Attribute("descr")?.Value;
-            if (string.IsNullOrEmpty(descr)) descr = null;
-            draw.Description = descr;
+            if (string.IsNullOrEmpty(descr)) descr = docPr.Attribute("name")?.Value;
+            draw.Description = string.IsNullOrEmpty(descr) ? null : descr;
         }
         return draw;
     }

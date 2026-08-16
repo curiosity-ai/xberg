@@ -160,6 +160,26 @@ internal static class HeaderDecoder
         return result;
     }
 
+    /// <summary>
+    /// The display name of the first mailbox in an address-list header, mirroring
+    /// <c>mail_parser</c>'s <c>Address::name()</c>: the text before the angle brackets, with any
+    /// surrounding quotes removed. Null when the mailbox is a bare address.
+    /// </summary>
+    internal static string? ExtractFirstDisplayName(string headerValue)
+    {
+        foreach (string token in SplitTopLevelCommas(headerValue))
+        {
+            string t = token.Trim();
+            if (t.Length == 0) continue;
+
+            int lt = t.IndexOf('<');
+            if (lt <= 0) return null;
+            string name = t.Substring(0, lt).Trim().Trim('"').Trim();
+            return name.Length == 0 ? null : name;
+        }
+        return null;
+    }
+
     private static IEnumerable<string> SplitTopLevelCommas(string s)
     {
         var current = new StringBuilder();

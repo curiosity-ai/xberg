@@ -128,8 +128,27 @@ public class DjotExtractorTests
         Assert.Equal(3, t.Cells.Count);
         Assert.Equal(new[] { "Right", "Left", "Center", "Default" }, t.Cells[0]);
         Assert.Equal(new[] { "12", "12", "12", "12" }, t.Cells[1]);
-        Assert.Equal((uint)1, t.PageNumber);
+        Assert.Equal((uint)0, t.PageNumber);
         Assert.Contains("| --- |", t.Markdown);
+
+        // The table must also exist as an element, or every renderer walks past it and the
+        // content never reaches the output.
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Table);
+    }
+
+    /// <summary>A table keeps its place in the document rather than being appended at the end.</summary>
+    [Fact]
+    public void TableIsEmittedWhereItAppears()
+    {
+        var doc = Extract("Intro paragraph.\n\n| Name | Age |\n|------|-----|\n| Alice | 30 |\n\nOutro paragraph.\n");
+
+        var kinds = doc.Elements.Select(e => e.Kind.Tag).ToList();
+        int intro = doc.Elements.FindIndex(e => e.Text.Contains("Intro", StringComparison.Ordinal));
+        int table = kinds.IndexOf(ElementKindTag.Table);
+        int outro = doc.Elements.FindIndex(e => e.Text.Contains("Outro", StringComparison.Ordinal));
+
+        Assert.True(intro >= 0 && table >= 0 && outro >= 0);
+        Assert.True(intro < table && table < outro);
     }
 
     [Fact]
@@ -156,15 +175,19 @@ public class DjotExtractorTests
         Assert.Equal("Heres one", doc.Tables[0].Cells[1][0]);
     }
 
+    /// <summary>
+    /// Djot has no pages, and upstream pushes every table without one. The old separate pass
+    /// numbered them 1, 2, 3… by position, which the goldens do not agree with.
+    /// </summary>
     [Fact]
-    public void MultipleTablesGetIncrementingPageNumbers()
+    public void EveryTableIsUnpaged()
     {
         var doc = Extract(
             "| A | B |\n|---|---|\n| 1 | 2 |\n\n" +
             "| C | D |\n|---|---|\n| 3 | 4 |\n");
         Assert.Equal(2, doc.Tables.Count);
-        Assert.Equal((uint)1, doc.Tables[0].PageNumber);
-        Assert.Equal((uint)2, doc.Tables[1].PageNumber);
+        Assert.All(doc.Tables, t => Assert.Equal((uint)0, t.PageNumber));
+        Assert.Equal(2, doc.Elements.Count(e => e.Kind.Tag == ElementKindTag.Table));
     }
 
     [Fact]

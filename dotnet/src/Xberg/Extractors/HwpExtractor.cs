@@ -20,8 +20,11 @@ public sealed class HwpExtractor : IExtractor
     private static readonly byte[] Signature = Encoding.ASCII.GetBytes("HWP Document File");
 
     private const int HwpTagBegin = 0x010;
-    private const int TagParaHeader = HwpTagBegin + 64;  // 0x50
-    private const int TagParaText = HwpTagBegin + 65;    // 0x51
+    // The offsets from HWPTAG_BEGIN are decimal, per the HWP 5.0 record specification. They had
+    // been written as though the spec's "+ 50" were hexadecimal, which put every body-text tag
+    // 14 records past where it belongs, so no paragraph record ever matched.
+    private const int TagParaHeader = HwpTagBegin + 50;  // 0x42
+    private const int TagParaText = HwpTagBegin + 51;    // 0x43
     private const int TagParaShape = HwpTagBegin + 66;   // 0x52
     private const int TagCharShape = HwpTagBegin + 67;   // 0x53
     private const int TagCharShapeInfo = HwpTagBegin + 30; // 0x2E
@@ -53,13 +56,13 @@ public sealed class HwpExtractor : IExtractor
             ParseDocInfo(docInfo, charShapes);
 
         var paragraphs = new List<Para>();
-        var streams = comp.Walk().Where(e => e.IsStream).Select(e => e.Path).ToList();
+        // Compound-file paths are absolute, so they have to be made relative before being matched
+        // against a relative prefix. Comparing them as-is matched nothing, and every HWP fell
+        // through to the "no BodyText sections" error — silently, without a warning.
+        var streams = comp.Walk().Where(e => e.IsStream).Select(e => e.Path.TrimStart('/')).ToList();
         streams.Sort(StringComparer.Ordinal);
         foreach (var path in streams)
         {
-            // Faithful to Rust extraction/hwp/mod.rs: it tests the cfb `path()` (which carries a
-            // leading '/') with `starts_with("BodyText/Section")`, so it never matches and every
-            // HWP falls through to the "no BodyText sections" error. Reproduced for parity.
             if (path.StartsWith("BodyText/Section", StringComparison.Ordinal))
             {
                 byte[]? sec = comp.TryReadStream(path);

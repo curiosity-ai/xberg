@@ -39,7 +39,7 @@ public sealed class MsgExtractor : IExtractor
             if (!EmailStructKeys.Contains(key))
                 additional[key] = JsonSerializer.SerializeToElement(value);
 
-        InternalDocument doc = BuildInternalDocument(result);
+        InternalDocument doc = BuildInternalDocument(result, config);
         doc.MimeType = mimeType;
 
         string? fromName = result.Metadata.TryGetValue("from_name", out var fn) ? fn : null;
@@ -69,7 +69,7 @@ public sealed class MsgExtractor : IExtractor
     }
 
     // ── shared email document build (extractors/email.rs) ────────────────────────
-    private static InternalDocument BuildInternalDocument(EmailExtractionResult result)
+    private static InternalDocument BuildInternalDocument(EmailExtractionResult result, ExtractionConfig config)
     {
         var builder = new InternalDocumentBuilder("email");
 
@@ -81,7 +81,7 @@ public sealed class MsgExtractor : IExtractor
         }
 
         if (result.Subject is { } subject) headerEntries.Add(("Subject", subject));
-        if (result.FromEmail is { } from) headerEntries.Add(("From", from));
+        if (EmailExtractor.FormatSender(result) is { } from) headerEntries.Add(("From", from));
         if (result.ToEmails.Count > 0) headerEntries.Add(("To", string.Join(", ", result.ToEmails)));
         if (result.CcEmails.Count > 0) headerEntries.Add(("CC", string.Join(", ", result.CcEmails)));
         if (result.BccEmails.Count > 0) headerEntries.Add(("BCC", string.Join(", ", result.BccEmails)));
@@ -120,6 +120,24 @@ public sealed class MsgExtractor : IExtractor
                 builder.PushParagraph($"  {name} ({size}B)", new(), null, null);
             }
         }
+
+        AttachmentInlining.Append(builder, result.Attachments, config);
+
+        // A message attached as a Message object is an attachment of this one, and its text
+        // belongs here for the same reason any other attachment's does. It is inlined under the
+        // same heading-plus-body shape, rendered in the format the caller asked for.
+        for (int idx = 0; idx < result.NestedEmbeddedMessages.Count; idx++)
+        {
+            var nested = BuildInternalDocument(result.NestedEmbeddedMessages[idx], config);
+            string content = Derive
+                .DeriveExtractionResult(nested, includeDocumentStructure: false, config.OutputFormat)
+                .Content.Trim();
+            if (content.Length == 0) continue;
+
+            builder.PushHeading(2, $"embedded_message_{idx}.msg", null, null);
+            builder.PushParagraph(content, new(), null, null);
+        }
+
         return builder.Build();
     }
 
@@ -239,34 +257,42 @@ public sealed class MsgExtractor : IExtractor
     };
 
     // ── MSG / CFB extraction (extraction/email.rs) ───────────────────────────────
-    private static EmailExtractionResult ExtractMsgFromCfb(CompoundFile comp)
-    {
-        uint? codepage = ReadIntProp(comp, "", 0x3FFD) ?? ReadIntProp(comp, "", 0x3FDE);
+    private static EmailExtractionResult ExtractMsgFromCfb(CompoundFile comp) =>
+        ExtractMsgFromCfb(comp, "", 0);
 
-        string? subject = ReadStringProp(comp, "", 0x0037, codepage);
-        string? senderName = ReadStringProp(comp, "", 0x0C1A, codepage);
-        string? senderEmail = (ReadStringProp(comp, "", 0x0C1F, codepage) ?? ReadStringProp(comp, "", 0x0065, codepage));
+    /// <summary>
+    /// Parse the message rooted at <paramref name="root"/> — the container itself, or the storage
+    /// of a message attached to one. <paramref name="depth"/> bounds how far attached messages
+    /// may nest.
+    /// </summary>
+    private static EmailExtractionResult ExtractMsgFromCfb(CompoundFile comp, string root, int depth)
+    {
+        uint? codepage = ReadIntProp(comp, root, 0x3FFD) ?? ReadIntProp(comp, root, 0x3FDE);
+
+        string? subject = ReadStringProp(comp, root, 0x0037, codepage);
+        string? senderName = ReadStringProp(comp, root, 0x0C1A, codepage);
+        string? senderEmail = (ReadStringProp(comp, root, 0x0C1F, codepage) ?? ReadStringProp(comp, root, 0x0065, codepage));
         if (senderEmail is { Length: 0 }) senderEmail = null;
         string? fromEmail = senderEmail;
-        string? body = ReadStringProp(comp, "", 0x1000, codepage);
-        string? htmlBody = ReadHtmlBody(comp, "", codepage);
-        string? messageId = ReadStringProp(comp, "", 0x1035, codepage);
+        string? body = ReadStringProp(comp, root, 0x1000, codepage);
+        string? htmlBody = ReadHtmlBody(comp, root, codepage);
+        string? messageId = ReadStringProp(comp, root, 0x1035, codepage);
         if (messageId is { Length: 0 }) messageId = null;
 
-        string? date = ReadFiletimeProp(comp, "", 0x0039) ?? ReadFiletimeProp(comp, "", 0x0E06);
+        string? date = ReadFiletimeProp(comp, root, 0x0039) ?? ReadFiletimeProp(comp, root, 0x0E06);
         if (date is null)
         {
-            string? headers = ReadStringProp(comp, "", 0x007D, codepage);
+            string? headers = ReadStringProp(comp, root, 0x007D, codepage);
             if (headers is not null)
                 foreach (var line in headers.Split('\n'))
                     if (line.StartsWith("Date:", StringComparison.Ordinal))
                     { date = line["Date:".Length..].Trim(); break; }
         }
 
-        var (toEmails, ccEmails, bccEmails) = ReadRecipients(comp, codepage);
+        var (toEmails, ccEmails, bccEmails) = ReadRecipients(comp, root, codepage);
 
         string? rtfBody = null;
-        if (MsgStream(comp, "/__substg1.0_10090102") is { } rtfComp)
+        if (MsgStream(comp, $"{root}/__substg1.0_10090102") is { } rtfComp)
         {
             byte[]? rtf = DecompressRtf(rtfComp);
             if (rtf is not null)
@@ -282,9 +308,9 @@ public sealed class MsgExtractor : IExtractor
         string contentStr = plainText ?? rtfBody ?? "";
 
         var attachments = new List<EmailAttachment>();
-        foreach (var e in comp.Walk().Where(e => e.IsStorage && e.Name.StartsWith("__attach_", StringComparison.Ordinal)))
+        var nestedEmbedded = new List<EmailExtractionResult>();
+        foreach (var path in DirectChildStorages(comp, root, "__attach_"))
         {
-            string path = e.Path;
             string? longName = ReadStringProp(comp, path, 0x3707, codepage);
             string? shortName = ReadStringProp(comp, path, 0x3704, codepage);
             string? displayName = ReadStringProp(comp, path, 0x3001, codepage);
@@ -292,6 +318,35 @@ public sealed class MsgExtractor : IExtractor
             string? mimeTag = ReadStringProp(comp, path, 0x370E, codepage);
 
             string? filename = longName ?? shortName ?? displayName ?? (extension is not null ? $"attachment{extension}" : null);
+
+            // An attachment whose method is "embedded message" has no binary stream at all: the
+            // message is a storage to descend into, which is why reading only the data stream
+            // produced an attachment of zero bytes and no text.
+            string embeddedRoot = $"{path}/__substg1.0_3701000D";
+            bool isEmbeddedMessage = ReadAttachIntProp(comp, path, PidTagAttachMethod) == AttachMethodEmbeddedMsg
+                && comp.Walk().Any(x => x.IsStorage && x.Path == embeddedRoot);
+
+            if (isEmbeddedMessage)
+            {
+                if (depth < MaxEmbeddedMessageDepth)
+                {
+                    var nested = ExtractMsgFromCfb(comp, embeddedRoot, depth + 1);
+                    filename ??= nested.Subject ?? "embedded_message";
+                    nestedEmbedded.Add(nested);
+                    nestedEmbedded.AddRange(nested.NestedEmbeddedMessages);
+                }
+                attachments.Add(new EmailAttachment
+                {
+                    Name = filename,
+                    Filename = filename,
+                    MimeType = "message/rfc822",
+                    Size = null,
+                    IsImage = false,
+                    Data = null,
+                });
+                continue;
+            }
+
             byte[]? binaryData = MsgStream(comp, $"{path}/__substg1.0_37010102");
             int? size = binaryData?.Length;
             string mimeType = mimeTag is { Length: > 0 } ? mimeTag : "application/octet-stream";
@@ -330,15 +385,38 @@ public sealed class MsgExtractor : IExtractor
             HtmlContent = htmlContent,
             Content = contentStr,
             Attachments = attachments,
+            NestedEmbeddedMessages = nestedEmbedded,
             Metadata = metadata,
         };
     }
 
-    private static uint? ReadIntProp(CompoundFile comp, string @base, ushort propId)
+    /// <summary>PidTagAttachMethod: how an attachment's data is stored.</summary>
+    private const ushort PidTagAttachMethod = 0x3705;
+
+    /// <summary>The attachment is itself a Message object, held as a storage.</summary>
+    private const uint AttachMethodEmbeddedMsg = 5;
+
+    /// <summary>How deeply attached messages may nest before the walk stops descending.</summary>
+    private const int MaxEmbeddedMessageDepth = 3;
+
+    /// <summary>
+    /// A 32-bit property of a <em>message</em>, whose property stream carries a 32-byte header at
+    /// the top level and a 24-byte one for a message embedded in an attachment.
+    /// </summary>
+    private static uint? ReadIntProp(CompoundFile comp, string messageRoot, ushort propId) =>
+        ReadIntPropAt(comp, messageRoot, propId, messageRoot.Length == 0 ? 32 : 24);
+
+    /// <summary>
+    /// A 32-bit property of an attachment or recipient storage, whose property stream has an
+    /// 8-byte header rather than a message's.
+    /// </summary>
+    private static uint? ReadAttachIntProp(CompoundFile comp, string @base, ushort propId) =>
+        ReadIntPropAt(comp, @base, propId, 8);
+
+    private static uint? ReadIntPropAt(CompoundFile comp, string @base, ushort propId, int headerSize)
     {
         byte[]? buf = comp.TryReadStream($"{@base}/__properties_version1.0");
         if (buf is null) return null;
-        int headerSize = @base.Length == 0 ? 32 : 8;
         for (int off = headerSize; off + 16 <= buf.Length; off += 16)
         {
             int ptype = OleUtil.U16(buf, off);
@@ -448,14 +526,33 @@ public sealed class MsgExtractor : IExtractor
             : $"{y:D4}-{m:D2}-{d:D2}T{hour:D2}:{min:D2}:{sec:D2}.{nanos / 1_000_000:D3}+00:00";
     }
 
-    private static (List<string> To, List<string> Cc, List<string> Bcc) ReadRecipients(CompoundFile comp, uint? codepage)
+    /// <summary>
+    /// Storages directly under <paramref name="root"/> whose name starts with <paramref name="prefix"/>.
+    /// <para>
+    /// Scoping to direct children is what keeps a message's own attachments and recipients apart
+    /// from those of a message attached to it: a whole-container walk finds both, so the outer
+    /// message would claim the inner one's recipients as its own.
+    /// </para>
+    /// </summary>
+    private static IEnumerable<string> DirectChildStorages(CompoundFile comp, string root, string prefix)
+    {
+        string parent = root + "/";
+        foreach (var e in comp.Walk())
+        {
+            if (!e.IsStorage || !e.Name.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            if (!e.Path.StartsWith(parent, StringComparison.Ordinal)) continue;
+            if (e.Path.IndexOf('/', parent.Length) >= 0) continue;
+            yield return e.Path;
+        }
+    }
+
+    private static (List<string> To, List<string> Cc, List<string> Bcc) ReadRecipients(CompoundFile comp, string root, uint? codepage)
     {
         var to = new List<string>();
         var cc = new List<string>();
         var bcc = new List<string>();
-        foreach (var e in comp.Walk().Where(e => e.IsStorage && e.Name.StartsWith("__recip_version1.0_", StringComparison.Ordinal)))
+        foreach (var path in DirectChildStorages(comp, root, "__recip_version1.0_"))
         {
-            string path = e.Path;
             string? displayName = ReadStringProp(comp, path, 0x3001, codepage);
             string? emailAddr = ReadStringProp(comp, path, 0x39FE, codepage) ?? ReadStringProp(comp, path, 0x3003, codepage);
             if (emailAddr is { Length: 0 }) emailAddr = null;

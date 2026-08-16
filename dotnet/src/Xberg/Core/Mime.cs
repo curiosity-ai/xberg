@@ -58,16 +58,124 @@ public static class Mime
             string trimmed = text.TrimStart();
             if ((trimmed.StartsWith('{') || trimmed.StartsWith('[')) && IsValidJson(text))
                 return "application/json";
-            if (trimmed.StartsWith("<?xml") || trimmed.StartsWith('<'))
-                return "application/xml";
-            if (trimmed.StartsWith("<!DOCTYPE html") || trimmed.StartsWith("<html"))
+            // The HTML test must precede the generic `<` fallback. Behind it, the fallback claims
+            // every tag first and the HTML test never runs — upstream's issue #235, which this
+            // port had inherited. It went unnoticed while the extension always won; once content
+            // can overrule the extension, every HTML file routes to the XML extractor.
+            if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(trimmed))
                 return "text/html";
-            if (trimmed.StartsWith("%PDF"))
+            if (trimmed.StartsWith("<?xml", StringComparison.Ordinal) || trimmed.StartsWith('<'))
+                return "application/xml";
+            if (trimmed.StartsWith("%PDF", StringComparison.Ordinal))
                 return "application/pdf";
             return "text/plain";
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Resolve the type of a file whose extension is already known, letting content overrule the
+    /// extension when the two disagree.
+    /// <para>
+    /// An extension is a claim, not evidence, and the corpus is full of files where it is simply
+    /// wrong — DocTags streams named <c>.doctags.txt</c>, markup saved as <c>.txt</c>. Where the
+    /// content carries a recognisable signature, it decides.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// Three cases keep the extension despite disagreement, because the content signature is
+    /// strictly less informative than the extension rather than in conflict with it: plain text
+    /// says nothing at all; generic XML cannot tell FictionBook from DocBook; generic JSON cannot
+    /// tell a notebook from line-delimited JSON.
+    /// </remarks>
+    public static string ResolveWithContent(string? extensionMime, ReadOnlySpan<byte> content)
+    {
+        if (extensionMime is null)
+            return DetectMimeTypeFromBytes(content) ?? OctetStream;
+
+        // Upstream reads a 4 KiB header rather than the whole file, which is visible behaviour:
+        // the JSON check parses what it was given, so a large JSON body in a mis-named file does
+        // not validate and does not override.
+        var header = content.Length > MagicHeaderBytes ? content[..MagicHeaderBytes] : content;
+        if (header.IsEmpty) return extensionMime;
+
+        string? fromMagic = DetectMimeTypeFromBytes(header);
+        if (fromMagic is null || fromMagic == extensionMime) return extensionMime;
+
+        if (fromMagic == "text/plain") return extensionMime;
+        if (IsGenericXmlMime(fromMagic) && IsSpecificXmlMime(extensionMime)) return extensionMime;
+        if (fromMagic == "application/json" && IsSpecificJsonMime(extensionMime)) return extensionMime;
+        if (IsAmbiguousContainer(fromMagic)) return extensionMime;
+
+        return SupportedMimeTypes.Contains(fromMagic) || fromMagic.StartsWith("image/", StringComparison.Ordinal)
+            ? fromMagic
+            : extensionMime;
+    }
+
+    /// <summary>How much of a file upstream reads when checking content against the extension.</summary>
+    private const int MagicHeaderBytes = 4096;
+
+    private static bool IsGenericXmlMime(string mime) => mime is "application/xml" or "text/xml";
+
+    private static bool IsSpecificXmlMime(string mime) =>
+        mime != "application/xml"
+        && (mime.EndsWith("+xml", StringComparison.Ordinal) || mime.Contains("xml+", StringComparison.Ordinal));
+
+    /// <summary>
+    /// Signatures that identify a container without identifying the format inside it, and so can
+    /// never overrule an extension that names one.
+    /// <para>
+    /// An OLE compound file is the container for .doc, .xls, .ppt, .msg and .hwp alike; telling
+    /// them apart needs the root storage's CLSID, which this port does not read, so the sniffer
+    /// answers <c>application/msword</c> as a placeholder rather than a finding. A ZIP that is
+    /// not recognised as one of the Office or ODF layouts is likewise just a ZIP — an .epub is
+    /// one, and so is a .jar.
+    /// </para>
+    /// </summary>
+    public static bool IsAmbiguousContainer(string mime) =>
+        mime is "application/msword" or "application/zip";
+
+    private static bool IsSpecificJsonMime(string mime) =>
+        mime != "application/json"
+        && (mime.EndsWith("+json", StringComparison.Ordinal)
+            || mime is "application/x-ndjson" or "application/jsonl" or "application/x-jsonlines");
+
+    /// <summary>
+    /// Elements common enough at the start of a bare HTML fragment to identify one. A whole
+    /// document announces itself with a doctype or an <c>&lt;html&gt;</c> tag; a fragment has
+    /// only its first element to go on.
+    /// </summary>
+    private static readonly HashSet<string> HtmlFragmentElements = new(StringComparer.Ordinal)
+    {
+        "a", "b", "blockquote", "body", "br", "button", "div", "em", "figcaption", "figure",
+        "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "i",
+        "iframe", "img", "input", "label", "li", "main", "meta", "nav", "ol", "option", "p",
+        "pre", "script", "select", "span", "strong", "style", "table", "tbody", "td", "textarea",
+        "tfoot", "th", "thead", "tr", "ul",
+    };
+
+    /// <summary>Whether markup opens as HTML rather than as some other XML vocabulary.</summary>
+    private static bool LooksLikeHtml(string trimmed)
+    {
+        string lowered = (trimmed.Length > 16 ? trimmed[..16] : trimmed).ToLowerInvariant();
+        if (lowered.StartsWith("<!doctype html", StringComparison.Ordinal)
+            || lowered.StartsWith("<html", StringComparison.Ordinal))
+            return true;
+
+        if (!trimmed.StartsWith('<')) return false;
+        string afterBracket = trimmed[1..];
+
+        int nameLength = 0;
+        while (nameLength < afterBracket.Length && char.IsAsciiLetterOrDigit(afterBracket[nameLength]))
+            nameLength++;
+
+        // The tag has to actually end here, so `<tr:foo>` — a namespace prefix that happens to
+        // collide with an HTML element name — stays XML.
+        if (nameLength >= afterBracket.Length) return false;
+        if (afterBracket[nameLength] is not ('>' or ' ' or '/' or '\t' or '\n' or '\r')) return false;
+
+        return HtmlFragmentElements.Contains(afterBracket[..nameLength].ToLowerInvariant());
     }
 
     private static string? SniffMagic(ReadOnlySpan<byte> b)

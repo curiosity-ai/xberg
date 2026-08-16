@@ -51,11 +51,62 @@ public class MarkupExtractorTests
     }
 
     [Fact]
-    public void Typst_HeadingKeepsMarkerAndMetadata()
+    public void Typst_HeadingDropsItsMarkerAndKeepsMetadata()
     {
         var doc = Extract(new TypstExtractor(), "#set document(title: \"T\")\n= Intro\nBody.\n", "application/x-typst");
         Assert.Equal("T", doc.Metadata.Title);
-        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text == "= Intro");
+        var heading = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Heading);
+        // The marker run carries the level and must not survive into the text, or each renderer
+        // repeats it after emitting its own.
+        Assert.Equal("Intro", heading.Text);
+        Assert.Equal(1, heading.Kind.Level);
+    }
+
+    [Fact]
+    public void Typst_DisplayMathSpansLinesUntilItCloses()
+    {
+        var doc = Extract(new TypstExtractor(), "Before\n\n$\nx^2 + y^2\n= r^2\n$\n\nAfter\n", "application/x-typst");
+        var formula = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Formula);
+        Assert.Equal("x^2 + y^2\n= r^2", formula.Text);
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph && e.Text == "After");
+    }
+
+    [Fact]
+    public void Typst_UnterminatedDisplayMathStillYieldsItsBody()
+    {
+        var doc = Extract(new TypstExtractor(), "$ a + b\nc + d\n", "application/x-typst");
+        var formula = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Formula);
+        Assert.Equal("a + b\nc + d", formula.Text);
+    }
+
+    [Fact]
+    public void Typst_FigureIsConsumedToItsClosingParenthesis()
+    {
+        var doc = Extract(
+            new TypstExtractor(),
+            "Intro.\n\n#figure(\n  image(\"chart.png\"),\n  caption: [A chart],\n)\n\nOutro.\n",
+            "application/x-typst");
+
+        // The whole call is swallowed: none of its source may reach the text.
+        Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("caption:", StringComparison.Ordinal));
+        Assert.Contains(doc.Elements, e => e.Text == "[Image: chart.png]");
+        Assert.Contains(doc.Elements, e => e.Text == "A chart");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph && e.Text == "Outro.");
+    }
+
+    [Fact]
+    public void Typst_QuoteAndTermDefinitionAndBibliography()
+    {
+        var doc = Extract(
+            new TypstExtractor(),
+            "#quote[Cited words]\n\n/ Term: its meaning\n\n#bibliography(\"refs.bib\")\n",
+            "application/x-typst");
+
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.QuoteStart);
+        Assert.Contains(doc.Elements, e => e.Text == "Cited words");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.DefinitionTerm && e.Text == "Term");
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.DefinitionDescription && e.Text == "its meaning");
+        Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("refs.bib", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -127,7 +178,10 @@ public class MarkupExtractorTests
         string ris = "TY  - JOUR\nTI  - Sample Title\nAU  - Smith, John\nAU  - Doe, Jane\nPY  - 2024\nER  -\n";
         var doc = Extract(new CitationExtractor(), ris, "application/x-research-info-systems");
         Assert.Equal(new List<string> { "Jane Doe", "John Smith" }, doc.Metadata.Authors);
-        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Citation && e.Text == "Sample Title");
+
+        // The element carries the whole record, not just its title.
+        var citation = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Citation);
+        Assert.Equal("Title: Sample Title\nAuthors: John Smith, Jane Doe\nYear: 2024", citation.Text);
     }
 
     [Fact]

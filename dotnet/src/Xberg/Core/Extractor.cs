@@ -83,10 +83,10 @@ public sealed class Extractor
         string uri = input.Uri ?? throw new InvalidOperationException("ExtractInput.Uri is null");
         string path = uri.StartsWith("file://", StringComparison.Ordinal) ? new Uri(uri).LocalPath : uri;
         byte[] fileBytes = File.ReadAllBytes(path);
+        // A caller-supplied type is taken at its word; otherwise the extension is only a starting
+        // point, and the file's own content overrules it where the two disagree.
         string mimeType = input.MimeType
-            ?? Mime.DetectMimeType(path, checkExists: false)
-            ?? Mime.DetectMimeTypeFromBytes(fileBytes)
-            ?? Mime.OctetStream;
+            ?? Mime.ResolveWithContent(Mime.DetectMimeType(path, checkExists: false), fileBytes);
         return (fileBytes, mimeType);
     }
 }

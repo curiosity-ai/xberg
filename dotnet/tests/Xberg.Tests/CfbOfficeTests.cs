@@ -140,16 +140,63 @@ public sealed class CfbOfficeTests
         Assert.Equal(new List<string> { "application/vnd.ms-outlook" }, mimes);
     }
 
-    // ── Hwp (Rust parity: both fixtures fail with "no BodyText sections") ─────────
-
+    /// <summary>
+    /// An attachment whose method is "embedded message" has no binary stream — the message is a
+    /// storage to descend into. Reading only the data stream gave a zero-byte attachment and no
+    /// text, losing 8.5 KB from this fixture.
+    /// </summary>
     [Fact]
-    public void HwpThrowsNoBodyTextLikeRust()
+    public void MsgInlinesMessagesAttachedAsMessageObjects()
+    {
+        byte[]? bytes = Read("email/test_email.msg");
+        if (bytes is null) return;
+
+        var doc = new MsgExtractor().Extract(bytes, "application/vnd.ms-outlook", new ExtractionConfig());
+        var text = string.Join("\n", doc.Elements.Select(e => e.Text));
+
+        Assert.Contains("1 Days Left", text);
+        // Body text that exists only inside the attached message.
+        Assert.Contains("Ransomware viruses are becoming more widespread", text);
+    }
+
+    /// <summary>
+    /// A message's own recipients must not be confused with those of a message attached to it.
+    /// Walking the whole container rather than the message's direct children found both, so the
+    /// outer message claimed the inner one's recipients as its own.
+    /// </summary>
+    [Fact]
+    public void MsgRecipientsExcludeThoseOfAnAttachedMessage()
+    {
+        byte[]? bytes = Read("email/test_email.msg");
+        if (bytes is null) return;
+
+        var doc = new MsgExtractor().Extract(bytes, "application/vnd.ms-outlook", new ExtractionConfig());
+        var email = Assert.IsType<EmailMetadata>(doc.Metadata.Format?.Payload);
+
+        Assert.Equal(new List<string> { "\"Sriram Govindan\" <marirs@gmail.com>" }, email.ToEmails);
+    }
+
+    // ── Hwp ───────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Two silent-loss bugs, either of which emptied a genuine HWP 5.0 document: compound-file
+    /// paths are absolute and were matched against a relative prefix, so no BodyText section was
+    /// ever found; and the record tags took the specification's decimal offsets as hexadecimal,
+    /// so even once sections were found no paragraph record matched. Neither raised a warning.
+    /// The expected strings are cross-checked against the file's own PrvText preview stream.
+    /// </summary>
+    [Fact]
+    public void HwpRecoversParagraphText()
     {
         byte[]? bytes = Read("hwp/styled_document.hwp");
         if (bytes is null) return;
 
-        // Mirrors the Rust extractor, which never matches its BodyText streams and errors.
-        Assert.ThrowsAny<Exception>(() => new HwpExtractor().Extract(bytes, "application/x-hwp", new ExtractionConfig()));
+        var doc = new HwpExtractor().Extract(bytes, "application/x-hwp", new ExtractionConfig());
+        var text = string.Join("\n", doc.Elements.Select(e => e.Text));
+
+        Assert.Contains("스타일 문서 예제", text);
+        Assert.Contains("이것은 일반 단락입니다. 기본 스타일로 작성되었습니다.", text);
+        Assert.Contains("텍스트 스타일링", text);
     }
 
     // ── Registry dispatch: XLS wins over XLSX for application/vnd.ms-excel ────────

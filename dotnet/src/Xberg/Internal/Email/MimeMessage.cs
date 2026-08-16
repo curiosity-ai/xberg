@@ -80,6 +80,13 @@ internal sealed class EmailExtractionResult
     public string Content { get; set; } = "";
     public List<EmailAttachment> Attachments { get; set; } = new();
 
+    /// <summary>
+    /// Messages attached as Message objects rather than as bytes, fully parsed, flattened across
+    /// every nesting depth. An `.msg` may carry another `.msg` inside it, and such an attachment
+    /// has no binary stream to extract — only a storage to descend into.
+    /// </summary>
+    public List<EmailExtractionResult> NestedEmbeddedMessages { get; set; } = new();
+
     /// <summary>Ordered raw string metadata (matches the Rust HashMap contents; order irrelevant).</summary>
     public Dictionary<string, string> Metadata { get; set; } = new(StringComparer.Ordinal);
 }

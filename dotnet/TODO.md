@@ -8,9 +8,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 
 > **Status (after the August upstream merge, 1821 Rust commits):** measured against goldens
 > regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
-> **2122 fixtures (72.1%) match on every hard dimension**; content-parity **77.0% identical,
-> 87.6% ≥95%-similar**; 125 fixtures (<80%) are genuine content misses; **22 catastrophes
-> (0.7%)**. 340 unit tests.
+> **2239 fixtures (76.1%) match on every hard dimension**; content-parity **80.9% identical,
+> 90.4% ≥95%-similar**; 56 fixtures (<80%) are genuine content misses; **2 catastrophes
+> (0.1%)**. 389 unit tests.
 >
 > The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
 > they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
@@ -20,6 +20,22 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > email header set with CRLF normalization, csv table elements, DocSecurity flags,
 > character counts as Unicode scalars rather than UTF-8 bytes, and — for PDF — scanned-page
 > detection plus serde-faithful float formatting.
+>
+> A later pass took 2122 → 2239 and catastrophes 22 → 2. Ordered by what they were worth:
+> a file's content now overrules its extension when the two disagree (txt 888/975 → 947,
+> which is where the DocTags fixtures lived); attachment text is extracted into the message
+> that carries it, embedded messages included (eml 20/43 → 39, msg 4/16 → 14); `app.xml`
+> titles are sliced by their heading pairs and pptx chart parts are followed (pptx 0/11 → 10);
+> typst's missing branches
+> (0/8 → 7); a drawing's name as alt text when it has no description (docx 34/46 → 40);
+> whole citation records rather than titles alone, and a Table *element* for djot tables
+> (nbib, ris, djot all to full parity); and HWP's record tags, whose decimal offsets had been
+> read as hexadecimal.
+>
+> Three of those were latent defects the extension/content change exposed rather than caused:
+> the HTML signature test sat behind the generic `<` fallback and was unreachable, and
+> container signatures (OLE compound files, bare ZIP) were allowed to displace an extension
+> that named the format inside them. Both are fixed; see the commits for what was measured.
 
 ## Known gaps after the merge
 
@@ -52,26 +68,47 @@ not a cosmetic difference.
       A caution learned the hard way: `pdf/structure/text_repair.rs` looks like a free win but
       belongs *only* to documents the structure pipeline assembled. Applying it to the flat
       native-text split as well cost 33 of the 114 matching plain fixtures.
-- [ ] **DocTags ingestion (12 of the 22 catastrophes).** Upstream added DocTags as an input
-      format, so `*.doctags.txt` fixtures parse into a structured tree; we read them as plain
-      text and emit the raw `<doctag><loc_60>…` markup. New format, not a bug fix.
+- [x] **DocTags ingestion.** Not a new format after all: upstream types these by content, and
+      `*.doctags.txt` reached the plain-text extractor only because the port let the extension
+      decide. Fixed by the extension/content change; the fixtures now route as markup.
 - [ ] **TOML key ordering (toml 1/5).** Rust's `toml::Value::Table` is a `BTreeMap`, so keys
       are emitted in sorted order; the C# parser preserves file order. Datetimes also need the
       `$__toml_private_datetime` wrapper that toml→serde_json produces, while the flattened
       view keeps them plain.
-- [ ] **pptx slide numbering (metadata 0/11).** Upstream GH#1413 reworked the extractor to
-      parse each archive-derived slide independently and carry its true slide number; we still
-      rebuild from the rendered string and only advance the number on a titled slide.
+- [x] **pptx metadata (was 0/11, now 11/11).** Not slide numbering: `app.xml`'s `TitlesOfParts`
+      is one flat vector concatenating fonts, theme and slide titles, and `HeadingPairs` says
+      how many entries each group owns. Taking it whole put the font list in every
+      presentation's slide titles. Chart and SmartArt frames are followed now too.
 - [ ] **Reviewer comments (`CommentRef` / `CommentDefinition`).** Upstream gave docx comments
       their own element kinds (GH#300). The C# `ElementKindTag` has no such variants, so the
       JSON renderer's comment arms could not be ported with the rest.
-- [ ] **Email attachment text (3 eml + 2 msg catastrophes).** Rust extracts each attachment
-      through the pipeline and appends its text under a level-2 heading; we list attachment
-      names and sizes only.
+- [x] **Email attachment text.** Attachments now go back through the pipeline and contribute a
+      level-2 heading plus their text (eml 20/43 → 39, msg 4/16 → 14). Images are deliberately
+      excluded: what this port recovers from one is EXIF, which belongs to the attachment's own
+      metadata rather than the message body.
+- [x] **Embedded message attachments (`afEmbeddedMessage`).** Such an attachment has no binary
+      stream — the message is a storage to descend into — so reading only the data stream gave a
+      zero-byte attachment and no text. Two further defects surfaced with it: a message's own
+      recipients and attachments were gathered by walking the whole container, so an outer
+      message claimed the inner one's as well; and the property-stream header is 24 bytes for an
+      embedded message where it is 32 at the top level and 8 for an attachment storage, three
+      sizes the port had collapsed into two. msg 4/16 → 14/16, the last failure being PDF text
+      quality inside an attachment rather than anything about email.
 - [ ] **Markdown math.** `$…$` / `$$…$$` should surface as content with the delimiters
       stripped (pulldown-cmark `ENABLE_MATH`); we pass the delimiters through as literal text.
-- [ ] **Citation formats (nbib, ris).** Severe under-extraction — both are catastrophes.
-- [ ] **html 10/41, typ 0/8, odp, ipynb, mdx.** Not yet triaged; use `--cluster`.
+- [x] **Citation formats (nbib, ris).** Both at full parity. The parsers were fine; the element
+      carried only the title, so everything else was parsed and then dropped.
+- [ ] **html 10/41.** Still the largest untriaged format. One concrete lead, measured: the
+      walker discards loose text that is not inside a `<p>`, so `<div>Hello</div>` extracts to
+      nothing — which is also why the two `ground_truth/fictionbook/*.md` fixtures (raw `<div>`
+      at the top, so HTML by content) are now empty. Emitting it unconditionally was tried and
+      is *not* the answer: it fixes those two and costs twelve others (plain 22/41 → 10/41).
+      Whatever the rule is, it is narrower than "always emit".
+- [ ] **odp, ipynb, mdx.** Not yet triaged; use `--cluster`. For ipynb the divergence is
+      visible immediately: we emit `[cell_id: …]` and `execution_count: …` as paragraphs and
+      skip cell outputs, neither of which upstream does.
+- [x] **typ 0/8 → 7/8.** Five separate missing branches; the last fixture needs `@label`
+      reference resolution, which is a feature rather than a fix.
 
 ---
 
