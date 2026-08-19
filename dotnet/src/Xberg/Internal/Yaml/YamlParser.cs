@@ -177,10 +177,45 @@ internal static class YamlParser
         if (s.Equals("true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
         if (s.Equals("false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
 
+        // A number keeps the lexeme it was written with. Two things depend on that: a count above
+        // long.MaxValue — a 64-bit hash, say — stays an integer instead of degrading to a double
+        // and printing as 1.4550011543526097e19; and "397.0" stays a float rather than becoming
+        // the integer 397. Both are what the value says it is, and the renderer decides integer
+        // from float by looking at the text.
+        if (LooksNumeric(s))
+        {
+            // LooksNumeric only says the characters are number-ish: a bare "-", "1.2.3" and
+            // "1e999" all reach here and are not JSON numbers, so a parse failure is expected
+            // and simply falls through to the looser handling below.
+            try
+            {
+                // JSON number syntax admits magnitudes a double cannot hold. "1e999" is a valid
+                // lexeme and no representable number, and letting it through reaches the text as
+                // "Infinity.0". Keeping the scalar as written at least says what the document
+                // said. An integer lexeme is exempt: it is exact however long it is, and that is
+                // the whole point of preserving it.
+                bool isFloatForm = s.IndexOfAny(new[] { '.', 'e', 'E' }) >= 0;
+                if (!isFloatForm
+                    || (double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out double magnitude)
+                        && double.IsFinite(magnitude)))
+                {
+                    if (JsonNode.Parse(s) is JsonValue parsed) return parsed;
+                }
+            }
+            catch (System.Text.Json.JsonException) { }
+            catch (OverflowException) { }
+        }
+
+        // JSON number syntax is narrower than YAML's — it has no leading `+`, no bare `.5`. Those
+        // are still numbers; they just cannot carry their lexeme through.
         if (long.TryParse(s, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long l))
             return JsonValue.Create(l);
+        // A magnitude past the range of a double parses as infinity, which is not a number any
+        // output format can print — it would reach the text as "Infinity.0". The scalar is kept
+        // as the text it was written as, which at least says what the document said.
         if (LooksNumeric(s) &&
-            double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out double d))
+            double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out double d)
+            && double.IsFinite(d))
             return JsonValue.Create(d);
 
         return JsonValue.Create(s);
