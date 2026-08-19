@@ -195,4 +195,26 @@ public class MarkdownExtractorTests
         Assert.Contains("$x$", para.Text);
         Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Formula);
     }
+
+    // ── raw inline HTML ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Markdown has no syntax for subscripts or superscripts, so documents reach for HTML. The
+    /// tags used to be scanned and thrown away, taking the text they wrapped with them.
+    /// </summary>
+    [Fact]
+    public void InlineHtmlPassesThroughVerbatim()
+    {
+        var doc = Extract("H<sub>2</sub>O is a liquid. 2<sup>10</sup> is 1024.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("H<sub>2</sub>O is a liquid. 2<sup>10</sup> is 1024.", para.Text);
+    }
+
+    /// <summary>An HTML comment is inline HTML too, and documents use it as a marker.</summary>
+    [Fact]
+    public void InlineHtmlCommentsAreKept()
+    {
+        var doc = Extract("<!-- image -->\nText and picture.\n");
+        Assert.Contains(doc.Elements, e => e.Text.Contains("<!-- image -->", StringComparison.Ordinal));
+    }
 }

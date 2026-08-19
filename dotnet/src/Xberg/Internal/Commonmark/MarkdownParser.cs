@@ -912,7 +912,21 @@ public static class MarkdownParser
                     }
                 }
                 int htmlLen = ScanInlineHtml(text, i);
-                if (htmlLen > 0) { Flush(); i += htmlLen; continue; } // inline HTML dropped
+                if (htmlLen > 0)
+                {
+                    // Raw inline HTML passes through verbatim. Dropping it silently lost the
+                    // markup a document uses where markdown has no syntax of its own — `<sub>`
+                    // and `<sup>` for chemistry and exponents, `<br>` inside a table cell — and
+                    // with it the text those tags wrap.
+                    Flush();
+                    nodes.AddLast(new Node
+                    {
+                        T = NType.Opaque,
+                        Ev = new List<MdEvent> { MdEvent.WithText(MdEventKind.Html, text.Substring(i, htmlLen)) },
+                    });
+                    i += htmlLen;
+                    continue;
+                }
                 buf.Append('<'); i++; continue;
             }
 

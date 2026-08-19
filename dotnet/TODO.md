@@ -8,9 +8,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 
 > **Status (after the August upstream merge, 1821 Rust commits):** measured against goldens
 > regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
-> **2276 fixtures (77.4%) match on every hard dimension**; content-parity **81.8% identical,
-> 90.5% ≥95%-similar**; 55 fixtures (<80%) are genuine content misses; **2 catastrophes
-> (0.1%)**. 396 unit tests.
+> **2287 fixtures (77.7%) match on every hard dimension**; content-parity **82.3% identical,
+> 90.6% ≥95%-similar**; 53 fixtures (<80%) are genuine content misses; **2 catastrophes
+> (0.1%)**. 398 unit tests.
 >
 > The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
 > they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
@@ -21,7 +21,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > character counts as Unicode scalars rather than UTF-8 bytes, and — for PDF — scanned-page
 > detection plus serde-faithful float formatting.
 >
-> A later pass took 2122 → 2276 and catastrophes 22 → 2. Ordered by what they were worth:
+> A later pass took 2122 → 2287 and catastrophes 22 → 2. Ordered by what they were worth:
 > a file's content now overrules its extension when the two disagree (txt 888/975 → 947,
 > which is where the DocTags fixtures lived); attachment text is extracted into the message
 > that carries it, embedded messages included (eml 20/43 → 39, msg 4/16 → 14); `app.xml`
@@ -32,7 +32,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > (nbib, ris, djot all to full parity); HWP's record tags, whose decimal offsets had been
 > read as hexadecimal; and — for html 10/41 → 27/41 — reserving the columns a rowspan covers,
 > plus dropping a second copy of every table that upstream had already removed; and markdown
-> math (md 671/775 → 691).
+> math and raw inline HTML (md 671/775 → 702).
 >
 > Three of those were latent defects the extension/content change exposed rather than caused:
 > the HTML signature test sat behind the generic `<` fallback and was unreachable, and
