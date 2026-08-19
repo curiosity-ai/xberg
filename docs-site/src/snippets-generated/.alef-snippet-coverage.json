@@ -39,6 +39,7 @@
     "c/extract/extract_bytes_input.md",
     "c/extract/extract_bytes_input_empty_mime.md",
     "c/extract/extract_bytes_input_invalid_mime.md",
+    "c/format_specific/format_docx_equations.md",
     "c/format_specific/format_docx_standalone.md",
     "c/format_specific/format_hwpx_standalone.md",
     "c/format_specific/format_pdf_text.md",
@@ -53,6 +54,12 @@
     "c/plugin_api/ocr_backends_unregister.md",
     "c/plugin_api/post_processors_clear.md",
     "c/plugin_api/post_processors_list.md",
+    "c/plugin_api/register_embedding_backend_trait_bridge.md",
+    "c/plugin_api/register_ocr_backend_trait_bridge.md",
+    "c/plugin_api/register_post_processor_trait_bridge.md",
+    "c/plugin_api/register_reranker_backend_trait_bridge.md",
+    "c/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "c/plugin_api/register_validator_trait_bridge.md",
     "c/plugin_api/renderers_clear.md",
     "c/plugin_api/renderers_list.md",
     "c/plugin_api/tokenizer_backends_clear.md",
@@ -122,6 +129,7 @@
     "csharp/extract/extract_bytes_input.md",
     "csharp/extract/extract_bytes_input_empty_mime.md",
     "csharp/extract/extract_bytes_input_invalid_mime.md",
+    "csharp/format_specific/format_docx_equations.md",
     "csharp/format_specific/format_docx_standalone.md",
     "csharp/format_specific/format_hwpx_standalone.md",
     "csharp/format_specific/format_pdf_text.md",
@@ -136,6 +144,12 @@
     "csharp/plugin_api/ocr_backends_unregister.md",
     "csharp/plugin_api/post_processors_clear.md",
     "csharp/plugin_api/post_processors_list.md",
+    "csharp/plugin_api/register_embedding_backend_trait_bridge.md",
+    "csharp/plugin_api/register_ocr_backend_trait_bridge.md",
+    "csharp/plugin_api/register_post_processor_trait_bridge.md",
+    "csharp/plugin_api/register_reranker_backend_trait_bridge.md",
+    "csharp/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "csharp/plugin_api/register_validator_trait_bridge.md",
     "csharp/plugin_api/renderers_clear.md",
     "csharp/plugin_api/renderers_list.md",
     "csharp/plugin_api/tokenizer_backends_clear.md",
@@ -205,6 +219,7 @@
     "dart/extract/extract_bytes_input.md",
     "dart/extract/extract_bytes_input_empty_mime.md",
     "dart/extract/extract_bytes_input_invalid_mime.md",
+    "dart/format_specific/format_docx_equations.md",
     "dart/format_specific/format_docx_standalone.md",
     "dart/format_specific/format_hwpx_standalone.md",
     "dart/format_specific/format_pdf_text.md",
@@ -219,6 +234,12 @@
     "dart/plugin_api/ocr_backends_unregister.md",
     "dart/plugin_api/post_processors_clear.md",
     "dart/plugin_api/post_processors_list.md",
+    "dart/plugin_api/register_embedding_backend_trait_bridge.md",
+    "dart/plugin_api/register_ocr_backend_trait_bridge.md",
+    "dart/plugin_api/register_post_processor_trait_bridge.md",
+    "dart/plugin_api/register_reranker_backend_trait_bridge.md",
+    "dart/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "dart/plugin_api/register_validator_trait_bridge.md",
     "dart/plugin_api/renderers_clear.md",
     "dart/plugin_api/renderers_list.md",
     "dart/plugin_api/tokenizer_backends_clear.md",
@@ -288,6 +309,7 @@
     "elixir/extract/extract_bytes_input.md",
     "elixir/extract/extract_bytes_input_empty_mime.md",
     "elixir/extract/extract_bytes_input_invalid_mime.md",
+    "elixir/format_specific/format_docx_equations.md",
     "elixir/format_specific/format_docx_standalone.md",
     "elixir/format_specific/format_hwpx_standalone.md",
     "elixir/format_specific/format_pdf_text.md",
@@ -302,6 +324,12 @@
     "elixir/plugin_api/ocr_backends_unregister.md",
     "elixir/plugin_api/post_processors_clear.md",
     "elixir/plugin_api/post_processors_list.md",
+    "elixir/plugin_api/register_embedding_backend_trait_bridge.md",
+    "elixir/plugin_api/register_ocr_backend_trait_bridge.md",
+    "elixir/plugin_api/register_post_processor_trait_bridge.md",
+    "elixir/plugin_api/register_reranker_backend_trait_bridge.md",
+    "elixir/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "elixir/plugin_api/register_validator_trait_bridge.md",
     "elixir/plugin_api/renderers_clear.md",
     "elixir/plugin_api/renderers_list.md",
     "elixir/plugin_api/tokenizer_backends_clear.md",
@@ -371,6 +399,7 @@
     "go/extract/extract_bytes_input.md",
     "go/extract/extract_bytes_input_empty_mime.md",
     "go/extract/extract_bytes_input_invalid_mime.md",
+    "go/format_specific/format_docx_equations.md",
     "go/format_specific/format_docx_standalone.md",
     "go/format_specific/format_hwpx_standalone.md",
     "go/format_specific/format_pdf_text.md",
@@ -385,6 +414,12 @@
     "go/plugin_api/ocr_backends_unregister.md",
     "go/plugin_api/post_processors_clear.md",
     "go/plugin_api/post_processors_list.md",
+    "go/plugin_api/register_embedding_backend_trait_bridge.md",
+    "go/plugin_api/register_ocr_backend_trait_bridge.md",
+    "go/plugin_api/register_post_processor_trait_bridge.md",
+    "go/plugin_api/register_reranker_backend_trait_bridge.md",
+    "go/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "go/plugin_api/register_validator_trait_bridge.md",
     "go/plugin_api/renderers_clear.md",
     "go/plugin_api/renderers_list.md",
     "go/plugin_api/tokenizer_backends_clear.md",
@@ -454,6 +489,7 @@
     "java/extract/extract_bytes_input.md",
     "java/extract/extract_bytes_input_empty_mime.md",
     "java/extract/extract_bytes_input_invalid_mime.md",
+    "java/format_specific/format_docx_equations.md",
     "java/format_specific/format_docx_standalone.md",
     "java/format_specific/format_hwpx_standalone.md",
     "java/format_specific/format_pdf_text.md",
@@ -468,6 +504,12 @@
     "java/plugin_api/ocr_backends_unregister.md",
     "java/plugin_api/post_processors_clear.md",
     "java/plugin_api/post_processors_list.md",
+    "java/plugin_api/register_embedding_backend_trait_bridge.md",
+    "java/plugin_api/register_ocr_backend_trait_bridge.md",
+    "java/plugin_api/register_post_processor_trait_bridge.md",
+    "java/plugin_api/register_reranker_backend_trait_bridge.md",
+    "java/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "java/plugin_api/register_validator_trait_bridge.md",
     "java/plugin_api/renderers_clear.md",
     "java/plugin_api/renderers_list.md",
     "java/plugin_api/tokenizer_backends_clear.md",
@@ -537,6 +579,7 @@
     "kotlin-android/extract/extract_bytes_input.md",
     "kotlin-android/extract/extract_bytes_input_empty_mime.md",
     "kotlin-android/extract/extract_bytes_input_invalid_mime.md",
+    "kotlin-android/format_specific/format_docx_equations.md",
     "kotlin-android/format_specific/format_docx_standalone.md",
     "kotlin-android/format_specific/format_hwpx_standalone.md",
     "kotlin-android/format_specific/format_pdf_text.md",
@@ -551,6 +594,12 @@
     "kotlin-android/plugin_api/ocr_backends_unregister.md",
     "kotlin-android/plugin_api/post_processors_clear.md",
     "kotlin-android/plugin_api/post_processors_list.md",
+    "kotlin-android/plugin_api/register_embedding_backend_trait_bridge.md",
+    "kotlin-android/plugin_api/register_ocr_backend_trait_bridge.md",
+    "kotlin-android/plugin_api/register_post_processor_trait_bridge.md",
+    "kotlin-android/plugin_api/register_reranker_backend_trait_bridge.md",
+    "kotlin-android/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "kotlin-android/plugin_api/register_validator_trait_bridge.md",
     "kotlin-android/plugin_api/renderers_clear.md",
     "kotlin-android/plugin_api/renderers_list.md",
     "kotlin-android/plugin_api/tokenizer_backends_clear.md",
@@ -620,6 +669,7 @@
     "php/extract/extract_bytes_input.md",
     "php/extract/extract_bytes_input_empty_mime.md",
     "php/extract/extract_bytes_input_invalid_mime.md",
+    "php/format_specific/format_docx_equations.md",
     "php/format_specific/format_docx_standalone.md",
     "php/format_specific/format_hwpx_standalone.md",
     "php/format_specific/format_pdf_text.md",
@@ -634,6 +684,12 @@
     "php/plugin_api/ocr_backends_unregister.md",
     "php/plugin_api/post_processors_clear.md",
     "php/plugin_api/post_processors_list.md",
+    "php/plugin_api/register_embedding_backend_trait_bridge.md",
+    "php/plugin_api/register_ocr_backend_trait_bridge.md",
+    "php/plugin_api/register_post_processor_trait_bridge.md",
+    "php/plugin_api/register_reranker_backend_trait_bridge.md",
+    "php/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "php/plugin_api/register_validator_trait_bridge.md",
     "php/plugin_api/renderers_clear.md",
     "php/plugin_api/renderers_list.md",
     "php/plugin_api/tokenizer_backends_clear.md",
@@ -703,6 +759,7 @@
     "python/extract/extract_bytes_input.md",
     "python/extract/extract_bytes_input_empty_mime.md",
     "python/extract/extract_bytes_input_invalid_mime.md",
+    "python/format_specific/format_docx_equations.md",
     "python/format_specific/format_docx_standalone.md",
     "python/format_specific/format_hwpx_standalone.md",
     "python/format_specific/format_pdf_text.md",
@@ -717,6 +774,12 @@
     "python/plugin_api/ocr_backends_unregister.md",
     "python/plugin_api/post_processors_clear.md",
     "python/plugin_api/post_processors_list.md",
+    "python/plugin_api/register_embedding_backend_trait_bridge.md",
+    "python/plugin_api/register_ocr_backend_trait_bridge.md",
+    "python/plugin_api/register_post_processor_trait_bridge.md",
+    "python/plugin_api/register_reranker_backend_trait_bridge.md",
+    "python/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "python/plugin_api/register_validator_trait_bridge.md",
     "python/plugin_api/renderers_clear.md",
     "python/plugin_api/renderers_list.md",
     "python/plugin_api/tokenizer_backends_clear.md",
@@ -786,6 +849,7 @@
     "ruby/extract/extract_bytes_input.md",
     "ruby/extract/extract_bytes_input_empty_mime.md",
     "ruby/extract/extract_bytes_input_invalid_mime.md",
+    "ruby/format_specific/format_docx_equations.md",
     "ruby/format_specific/format_docx_standalone.md",
     "ruby/format_specific/format_hwpx_standalone.md",
     "ruby/format_specific/format_pdf_text.md",
@@ -800,6 +864,12 @@
     "ruby/plugin_api/ocr_backends_unregister.md",
     "ruby/plugin_api/post_processors_clear.md",
     "ruby/plugin_api/post_processors_list.md",
+    "ruby/plugin_api/register_embedding_backend_trait_bridge.md",
+    "ruby/plugin_api/register_ocr_backend_trait_bridge.md",
+    "ruby/plugin_api/register_post_processor_trait_bridge.md",
+    "ruby/plugin_api/register_reranker_backend_trait_bridge.md",
+    "ruby/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "ruby/plugin_api/register_validator_trait_bridge.md",
     "ruby/plugin_api/renderers_clear.md",
     "ruby/plugin_api/renderers_list.md",
     "ruby/plugin_api/tokenizer_backends_clear.md",
@@ -869,6 +939,7 @@
     "rust/extract/extract_bytes_input.md",
     "rust/extract/extract_bytes_input_empty_mime.md",
     "rust/extract/extract_bytes_input_invalid_mime.md",
+    "rust/format_specific/format_docx_equations.md",
     "rust/format_specific/format_docx_standalone.md",
     "rust/format_specific/format_hwpx_standalone.md",
     "rust/format_specific/format_pdf_text.md",
@@ -883,6 +954,12 @@
     "rust/plugin_api/ocr_backends_unregister.md",
     "rust/plugin_api/post_processors_clear.md",
     "rust/plugin_api/post_processors_list.md",
+    "rust/plugin_api/register_embedding_backend_trait_bridge.md",
+    "rust/plugin_api/register_ocr_backend_trait_bridge.md",
+    "rust/plugin_api/register_post_processor_trait_bridge.md",
+    "rust/plugin_api/register_reranker_backend_trait_bridge.md",
+    "rust/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "rust/plugin_api/register_validator_trait_bridge.md",
     "rust/plugin_api/renderers_clear.md",
     "rust/plugin_api/renderers_list.md",
     "rust/plugin_api/tokenizer_backends_clear.md",
@@ -952,6 +1029,7 @@
     "swift/extract/extract_bytes_input.md",
     "swift/extract/extract_bytes_input_empty_mime.md",
     "swift/extract/extract_bytes_input_invalid_mime.md",
+    "swift/format_specific/format_docx_equations.md",
     "swift/format_specific/format_docx_standalone.md",
     "swift/format_specific/format_hwpx_standalone.md",
     "swift/format_specific/format_pdf_text.md",
@@ -966,6 +1044,12 @@
     "swift/plugin_api/ocr_backends_unregister.md",
     "swift/plugin_api/post_processors_clear.md",
     "swift/plugin_api/post_processors_list.md",
+    "swift/plugin_api/register_embedding_backend_trait_bridge.md",
+    "swift/plugin_api/register_ocr_backend_trait_bridge.md",
+    "swift/plugin_api/register_post_processor_trait_bridge.md",
+    "swift/plugin_api/register_reranker_backend_trait_bridge.md",
+    "swift/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "swift/plugin_api/register_validator_trait_bridge.md",
     "swift/plugin_api/renderers_clear.md",
     "swift/plugin_api/renderers_list.md",
     "swift/plugin_api/tokenizer_backends_clear.md",
@@ -1035,6 +1119,7 @@
     "typescript/extract/extract_bytes_input.md",
     "typescript/extract/extract_bytes_input_empty_mime.md",
     "typescript/extract/extract_bytes_input_invalid_mime.md",
+    "typescript/format_specific/format_docx_equations.md",
     "typescript/format_specific/format_docx_standalone.md",
     "typescript/format_specific/format_hwpx_standalone.md",
     "typescript/format_specific/format_pdf_text.md",
@@ -1049,6 +1134,12 @@
     "typescript/plugin_api/ocr_backends_unregister.md",
     "typescript/plugin_api/post_processors_clear.md",
     "typescript/plugin_api/post_processors_list.md",
+    "typescript/plugin_api/register_embedding_backend_trait_bridge.md",
+    "typescript/plugin_api/register_ocr_backend_trait_bridge.md",
+    "typescript/plugin_api/register_post_processor_trait_bridge.md",
+    "typescript/plugin_api/register_reranker_backend_trait_bridge.md",
+    "typescript/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "typescript/plugin_api/register_validator_trait_bridge.md",
     "typescript/plugin_api/renderers_clear.md",
     "typescript/plugin_api/renderers_list.md",
     "typescript/plugin_api/tokenizer_backends_clear.md",
@@ -1118,6 +1209,7 @@
     "wasm/extract/extract_bytes_input.md",
     "wasm/extract/extract_bytes_input_empty_mime.md",
     "wasm/extract/extract_bytes_input_invalid_mime.md",
+    "wasm/format_specific/format_docx_equations.md",
     "wasm/format_specific/format_docx_standalone.md",
     "wasm/format_specific/format_hwpx_standalone.md",
     "wasm/format_specific/format_pdf_text.md",
@@ -1132,6 +1224,12 @@
     "wasm/plugin_api/ocr_backends_unregister.md",
     "wasm/plugin_api/post_processors_clear.md",
     "wasm/plugin_api/post_processors_list.md",
+    "wasm/plugin_api/register_embedding_backend_trait_bridge.md",
+    "wasm/plugin_api/register_ocr_backend_trait_bridge.md",
+    "wasm/plugin_api/register_post_processor_trait_bridge.md",
+    "wasm/plugin_api/register_reranker_backend_trait_bridge.md",
+    "wasm/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "wasm/plugin_api/register_validator_trait_bridge.md",
     "wasm/plugin_api/renderers_clear.md",
     "wasm/plugin_api/renderers_list.md",
     "wasm/plugin_api/tokenizer_backends_clear.md",
@@ -1201,6 +1299,7 @@
     "zig/extract/extract_bytes_input.md",
     "zig/extract/extract_bytes_input_empty_mime.md",
     "zig/extract/extract_bytes_input_invalid_mime.md",
+    "zig/format_specific/format_docx_equations.md",
     "zig/format_specific/format_docx_standalone.md",
     "zig/format_specific/format_hwpx_standalone.md",
     "zig/format_specific/format_pdf_text.md",
@@ -1215,6 +1314,12 @@
     "zig/plugin_api/ocr_backends_unregister.md",
     "zig/plugin_api/post_processors_clear.md",
     "zig/plugin_api/post_processors_list.md",
+    "zig/plugin_api/register_embedding_backend_trait_bridge.md",
+    "zig/plugin_api/register_ocr_backend_trait_bridge.md",
+    "zig/plugin_api/register_post_processor_trait_bridge.md",
+    "zig/plugin_api/register_reranker_backend_trait_bridge.md",
+    "zig/plugin_api/register_tokenizer_backend_trait_bridge.md",
+    "zig/plugin_api/register_validator_trait_bridge.md",
     "zig/plugin_api/renderers_clear.md",
     "zig/plugin_api/renderers_list.md",
     "zig/plugin_api/tokenizer_backends_clear.md",
@@ -1706,6 +1811,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "c"
+      },
+      "path": "c/format_specific/format_docx_equations.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "c"
       },
@@ -1866,6 +1983,78 @@
         "language": "c"
       },
       "path": "c/plugin_api/post_processors_list.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "c"
+      },
+      "path": "c/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "c"
+      },
+      "path": "c/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "c"
+      },
+      "path": "c/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "c"
+      },
+      "path": "c/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "c"
+      },
+      "path": "c/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "c"
+      },
+      "path": "c/plugin_api/register_validator_trait_bridge.md",
       "language": "c",
       "target": "c",
       "session": "c",
@@ -2702,6 +2891,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "csharp"
+      },
+      "path": "csharp/format_specific/format_docx_equations.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "csharp"
       },
@@ -2862,6 +3063,78 @@
         "language": "csharp"
       },
       "path": "csharp/plugin_api/post_processors_list.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/register_validator_trait_bridge.md",
       "language": "csharp",
       "target": "csharp",
       "session": "csharp",
@@ -3698,6 +3971,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "dart"
+      },
+      "path": "dart/format_specific/format_docx_equations.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "dart"
       },
@@ -3858,6 +4143,78 @@
         "language": "dart"
       },
       "path": "dart/plugin_api/post_processors_list.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/register_validator_trait_bridge.md",
       "language": "dart",
       "target": "dart",
       "session": "dart",
@@ -4694,6 +5051,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "elixir"
+      },
+      "path": "elixir/format_specific/format_docx_equations.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "elixir"
       },
@@ -4854,6 +5223,78 @@
         "language": "elixir"
       },
       "path": "elixir/plugin_api/post_processors_list.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/register_validator_trait_bridge.md",
       "language": "elixir",
       "target": "elixir",
       "session": "elixir",
@@ -5690,6 +6131,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "go"
+      },
+      "path": "go/format_specific/format_docx_equations.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "go"
       },
@@ -5850,6 +6303,78 @@
         "language": "go"
       },
       "path": "go/plugin_api/post_processors_list.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "go"
+      },
+      "path": "go/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "go"
+      },
+      "path": "go/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "go"
+      },
+      "path": "go/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "go"
+      },
+      "path": "go/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "go"
+      },
+      "path": "go/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "go"
+      },
+      "path": "go/plugin_api/register_validator_trait_bridge.md",
       "language": "go",
       "target": "go",
       "session": "go",
@@ -6686,6 +7211,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "java"
+      },
+      "path": "java/format_specific/format_docx_equations.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "java"
       },
@@ -6846,6 +7383,78 @@
         "language": "java"
       },
       "path": "java/plugin_api/post_processors_list.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "java"
+      },
+      "path": "java/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "java"
+      },
+      "path": "java/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "java"
+      },
+      "path": "java/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "java"
+      },
+      "path": "java/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "java"
+      },
+      "path": "java/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "java"
+      },
+      "path": "java/plugin_api/register_validator_trait_bridge.md",
       "language": "java",
       "target": "java",
       "session": "java",
@@ -7682,6 +8291,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/format_specific/format_docx_equations.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "kotlin_android"
       },
@@ -7842,6 +8463,78 @@
         "language": "kotlin_android"
       },
       "path": "kotlin-android/plugin_api/post_processors_list.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/register_validator_trait_bridge.md",
       "language": "kotlin",
       "target": "kotlin_android",
       "session": "kotlin_android",
@@ -8678,6 +9371,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "php"
+      },
+      "path": "php/format_specific/format_docx_equations.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "php"
       },
@@ -8838,6 +9543,78 @@
         "language": "php"
       },
       "path": "php/plugin_api/post_processors_list.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "php"
+      },
+      "path": "php/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "php"
+      },
+      "path": "php/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "php"
+      },
+      "path": "php/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "php"
+      },
+      "path": "php/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "php"
+      },
+      "path": "php/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "php"
+      },
+      "path": "php/plugin_api/register_validator_trait_bridge.md",
       "language": "php",
       "target": "php",
       "session": "php",
@@ -9674,6 +10451,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "python"
+      },
+      "path": "python/format_specific/format_docx_equations.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "python"
       },
@@ -9834,6 +10623,78 @@
         "language": "python"
       },
       "path": "python/plugin_api/post_processors_list.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "python"
+      },
+      "path": "python/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "python"
+      },
+      "path": "python/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "python"
+      },
+      "path": "python/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "python"
+      },
+      "path": "python/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "python"
+      },
+      "path": "python/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "python"
+      },
+      "path": "python/plugin_api/register_validator_trait_bridge.md",
       "language": "python",
       "target": "python",
       "session": "python",
@@ -10670,6 +11531,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "ruby"
+      },
+      "path": "ruby/format_specific/format_docx_equations.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "ruby"
       },
@@ -10830,6 +11703,78 @@
         "language": "ruby"
       },
       "path": "ruby/plugin_api/post_processors_list.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/register_validator_trait_bridge.md",
       "language": "ruby",
       "target": "ruby",
       "session": "ruby",
@@ -11666,6 +12611,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "rust"
+      },
+      "path": "rust/format_specific/format_docx_equations.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "rust"
       },
@@ -11826,6 +12783,78 @@
         "language": "rust"
       },
       "path": "rust/plugin_api/post_processors_list.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/register_validator_trait_bridge.md",
       "language": "rust",
       "target": "rust",
       "session": "rust",
@@ -12662,6 +13691,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "swift"
+      },
+      "path": "swift/format_specific/format_docx_equations.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "swift"
       },
@@ -12822,6 +13863,78 @@
         "language": "swift"
       },
       "path": "swift/plugin_api/post_processors_list.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/register_validator_trait_bridge.md",
       "language": "swift",
       "target": "swift",
       "session": "swift",
@@ -13658,6 +14771,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "node"
+      },
+      "path": "typescript/format_specific/format_docx_equations.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "node"
       },
@@ -13818,6 +14943,78 @@
         "language": "node"
       },
       "path": "typescript/plugin_api/post_processors_list.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/register_validator_trait_bridge.md",
       "language": "typescript",
       "target": "node",
       "session": "node",
@@ -14654,6 +15851,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "wasm"
+      },
+      "path": "wasm/format_specific/format_docx_equations.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "wasm"
       },
@@ -14814,6 +16023,78 @@
         "language": "wasm"
       },
       "path": "wasm/plugin_api/post_processors_list.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/register_validator_trait_bridge.md",
       "language": "typescript",
       "target": "wasm",
       "session": "wasm",
@@ -15650,6 +16931,18 @@
     },
     {
       "key": {
+        "fixture_id": "format_docx_equations",
+        "language": "zig"
+      },
+      "path": "zig/format_specific/format_docx_equations.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "format_docx_standalone",
         "language": "zig"
       },
@@ -15810,6 +17103,78 @@
         "language": "zig"
       },
       "path": "zig/plugin_api/post_processors_list.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_embedding_backend_trait_bridge",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/register_embedding_backend_trait_bridge.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_ocr_backend_trait_bridge",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/register_ocr_backend_trait_bridge.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_post_processor_trait_bridge",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/register_post_processor_trait_bridge.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_reranker_backend_trait_bridge",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/register_reranker_backend_trait_bridge.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_tokenizer_backend_trait_bridge",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/register_tokenizer_backend_trait_bridge.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "register_validator_trait_bridge",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/register_validator_trait_bridge.md",
       "language": "zig",
       "target": "zig",
       "session": "zig",
@@ -18528,6 +19893,66 @@
     },
     {
       "fixture_id": "extract_bytes_input_invalid_mime",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "c"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "go"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "java"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "node"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "php"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "python"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "format_docx_equations",
       "language": "zig"
     },
     {
@@ -23873,6 +25298,66 @@
       "language": "zig"
     },
     {
+      "fixture_id": "format_docx_equations",
+      "language": "c"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "go"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "java"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "node"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "php"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "python"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "format_docx_equations",
+      "language": "zig"
+    },
+    {
       "fixture_id": "format_docx_standalone",
       "language": "c"
     },
@@ -25010,6 +26495,366 @@
     },
     {
       "fixture_id": "post_processors_list",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "c"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "go"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "java"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "node"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "php"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "python"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "register_embedding_backend_trait_bridge",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "c"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "go"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "java"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "node"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "php"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "python"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "register_ocr_backend_trait_bridge",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "c"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "go"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "java"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "node"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "php"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "python"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "register_post_processor_trait_bridge",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "c"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "go"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "java"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "node"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "php"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "python"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "register_reranker_backend_trait_bridge",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "c"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "go"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "java"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "node"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "php"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "python"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "register_tokenizer_backend_trait_bridge",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "c"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "go"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "java"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "node"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "php"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "python"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "register_validator_trait_bridge",
       "language": "zig"
     },
     {
@@ -26513,637 +28358,6 @@
       "language": "zig"
     }
   ],
-  "missing": [
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "c"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "csharp"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "dart"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "elixir"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "go"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "java"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "kotlin_android"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "node"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "php"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "python"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "ruby"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "rust"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "swift"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "wasm"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_embedding_backend_trait_bridge",
-        "language": "zig"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "c"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "csharp"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "dart"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "elixir"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "go"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "java"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "kotlin_android"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "node"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "php"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "python"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "ruby"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "rust"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "swift"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "wasm"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_ocr_backend_trait_bridge",
-        "language": "zig"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "c"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "csharp"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "dart"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "elixir"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "go"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "java"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "kotlin_android"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "node"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "php"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "python"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "ruby"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "rust"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "swift"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "wasm"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_post_processor_trait_bridge",
-        "language": "zig"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "c"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "csharp"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "dart"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "elixir"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "go"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "java"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "kotlin_android"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "node"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "php"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "python"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "ruby"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "rust"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "swift"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "wasm"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_reranker_backend_trait_bridge",
-        "language": "zig"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "c"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "csharp"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "dart"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "elixir"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "go"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "java"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "kotlin_android"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "node"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "php"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "python"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "ruby"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "rust"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "swift"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "wasm"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_tokenizer_backend_trait_bridge",
-        "language": "zig"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "c"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "csharp"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "dart"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "elixir"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "go"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "java"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "kotlin_android"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "node"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "php"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "python"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "ruby"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "rust"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "swift"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "wasm"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    },
-    {
-      "key": {
-        "fixture_id": "register_validator_trait_bridge",
-        "language": "zig"
-      },
-      "reason": "test-backend fixture requires an extension-owned documentation recipe"
-    }
-  ],
+  "missing": [],
   "documented_exceptions": []
 }

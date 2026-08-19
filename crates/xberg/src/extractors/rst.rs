@@ -55,6 +55,12 @@ const RST_WARNING_SOURCE: &str = "rst";
 #[cfg(feature = "office")]
 pub struct RstExtractor;
 
+/// Wrap a `.. math::` block that uses alignment columns in an `aligned`
+/// environment. Sphinx renders such blocks inside an align environment, so a
+/// bare `E &= mc^2 \\ F &= \pi E` is only valid LaTeX with the wrapper.
+#[cfg(feature = "office")]
+use crate::extraction::latex_shape::wrap_aligned_math;
+
 #[cfg(feature = "office")]
 impl RstExtractor {
     /// Create a new RST extractor.
@@ -229,19 +235,36 @@ impl RstExtractor {
                 }
 
                 if directive.starts_with("math::") {
-                    let math = directive.strip_prefix("math::").unwrap_or("").trim();
-                    if !math.is_empty() {
-                        output.push_str("math: ");
-                        output.push_str(math);
-                        output.push('\n');
+                    let mut math_content = String::new();
+                    let arg = directive.strip_prefix("math::").unwrap_or("").trim();
+                    if !arg.is_empty() {
+                        math_content.push_str(arg);
                     }
                     i += 1;
+                    // Directive options (`:label: eq1`, `:nowrap:`) sit
+                    // directly under the directive line, before the first
+                    // blank line or math line. Everything after is math.
+                    let mut in_option_region = true;
                     while i < lines.len() && (lines[i].starts_with("   ") || lines[i].is_empty()) {
-                        if !lines[i].is_empty() {
-                            output.push_str(lines[i].trim());
-                            output.push('\n');
+                        let body = lines[i].trim();
+                        if body.is_empty() {
+                            in_option_region = false;
+                        } else {
+                            let is_option = in_option_region && body.starts_with(':') && body[1..].contains(':');
+                            if !is_option {
+                                in_option_region = false;
+                                if !math_content.is_empty() {
+                                    math_content.push('\n');
+                                }
+                                math_content.push_str(body);
+                            }
                         }
                         i += 1;
+                    }
+                    if !math_content.is_empty() {
+                        output.push_str("$$\n");
+                        output.push_str(&wrap_aligned_math(&math_content));
+                        output.push_str("\n$$\n");
                     }
                     continue;
                 }
@@ -942,7 +965,7 @@ impl RstExtractor {
                 while i < lines.len() && (lines[i].starts_with("   ") || lines[i].is_empty()) {
                     if lines[i].is_empty() {
                         if !math_content.is_empty() {
-                            b.push_formula(&math_content, None, None);
+                            b.push_formula(&wrap_aligned_math(&math_content), None, None);
                             math_content = String::new();
                         }
                     } else {
@@ -954,7 +977,7 @@ impl RstExtractor {
                     i += 1;
                 }
                 if !math_content.is_empty() {
-                    b.push_formula(&math_content, None, None);
+                    b.push_formula(&wrap_aligned_math(&math_content), None, None);
                 }
                 continue;
             }
@@ -1556,6 +1579,73 @@ Another paragraph.
         assert!(output.contains("Title"));
         assert!(output.contains("This is a paragraph"));
         assert!(output.contains("Another paragraph"));
+    }
+
+    #[test]
+    fn test_math_block_with_alignment_wraps_in_aligned() {
+        // Sphinx renders `.. math::` blocks with alignment columns inside an
+        // align environment; a bare `&` is not valid LaTeX.
+        let content = "\n.. math::\n\n   E &= mc^2\\\\\n   F &= \\pi E\n\nAfter.\n";
+        let mut metadata = AHashMap::new();
+        let output = RstExtractor::extract_text_from_rst(content, &mut metadata);
+        assert!(
+            output.contains("\\begin{aligned}E &= mc^2\\\\\nF &= \\pi E\\end{aligned}"),
+            "aligned wrapper expected; got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_from_rst_math_directive_keeps_math_markup() {
+        let content = r#"
+Intro paragraph.
+
+.. math::
+
+   E = mc^2
+
+Closing paragraph.
+"#;
+
+        let mut metadata = AHashMap::new();
+        let output = RstExtractor::extract_text_from_rst(content, &mut metadata);
+        assert!(
+            output.contains("$$\nE = mc^2\n$$"),
+            "math directive must emit display-math delimiters; got: {output}"
+        );
+        assert!(!output.contains("math: "), "the old prose marker must be gone");
+    }
+
+    #[test]
+    fn test_extract_text_from_rst_math_inline_argument_and_options() {
+        let content = "\nBefore.\n\n.. math:: E = mc^2\n\nAfter.\n\n.. math::\n   :label: eq2\n\n   a + b\n";
+
+        let mut metadata = AHashMap::new();
+        let output = RstExtractor::extract_text_from_rst(content, &mut metadata);
+        assert!(
+            output.contains("$$\nE = mc^2\n$$"),
+            "inline-argument form must emit math; got: {output}"
+        );
+        assert!(
+            output.contains("$$\na + b\n$$"),
+            "block form must emit math without option lines; got: {output}"
+        );
+        assert!(
+            !output.contains(":label:"),
+            "directive options are not math; got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_from_rst_math_colon_line_after_options() {
+        let content = "\n.. math::\n   :label: eq3\n\n   :\\mathbb{R}: \\to \\mathbb{R}\n";
+
+        let mut metadata = AHashMap::new();
+        let output = RstExtractor::extract_text_from_rst(content, &mut metadata);
+        assert!(
+            output.contains(":\\mathbb{R}: \\to \\mathbb{R}"),
+            "math after the option region must survive; got: {output}"
+        );
+        assert!(!output.contains(":label:"), "options stay out; got: {output}");
     }
 
     #[test]

@@ -19,7 +19,7 @@ func main() {
 			MaxChars:   &maxChars,
 			MaxOverlap: &maxOverlap,
 			Embedding: &xberg.EmbeddingConfig{
-				Model:     xberg.EmbeddingModelType_Preset("all-mpnet-base-v2"),
+				Model:     xberg.EmbeddingModelTypePreset{Name: "quality"},
 				Normalize: &normalize,
 				BatchSize: &batchSize,
 			},

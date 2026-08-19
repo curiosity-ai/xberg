@@ -1403,16 +1403,70 @@ fn apply_fld_char(
     }
 }
 
+/// Page-break bookkeeping threaded through the `<w:br>` and `<w:lastRenderedPageBreak>`
+/// handlers.
+///
+/// These three fields are one piece of state: every handler that touches any of them
+/// touches all of them, and they are only meaningful relative to one another.
+#[derive(Debug, Default)]
+struct PageBreakState {
+    /// Breaks seen inside a table, flushed once the outermost `</w:tbl>` closes (#1419).
+    pending_table: u32,
+    /// Breaks seen after text in the current paragraph, flushed once its `</w:p>` closes.
+    pending_paragraph: u32,
+    /// Whether real text has been emitted since the last recorded break (#1416).
+    ///
+    /// Starts `true` so a break with nothing before it is still recorded.
+    text_since_break: bool,
+}
+
+/// Push a page-break marker, or defer it, depending on where it was encountered.
+///
+/// Inside a table it is always deferred to [`PageBreakState::pending_table`], flushed
+/// once the outermost `</w:tbl>` closes and the table element has been pushed (#1419),
+/// since a form feed cannot be written into the middle of a table that renders as a
+/// single markdown block.
+///
+/// Outside a table, `elements` only gains a `DocumentElement::Paragraph` entry for
+/// the paragraph currently being parsed once its `</w:p>` closes — so a break
+/// encountered before any text has been collected into that paragraph can be pushed
+/// immediately (it correctly precedes the not-yet-pushed paragraph), but a break
+/// encountered *after* text already collected in that same paragraph must not jump
+/// ahead of its own paragraph's entry. That case is deferred to
+/// [`PageBreakState::pending_paragraph`] and flushed right after the paragraph is
+/// pushed, mirroring the table deferral above.
+fn push_or_defer_page_break(
+    table_stack: &[TableContext],
+    current_run: Option<&Run>,
+    current_paragraph: &Option<Paragraph>,
+    elements: &mut Vec<DocumentElement>,
+    page_breaks: &mut PageBreakState,
+) {
+    if !table_stack.is_empty() {
+        page_breaks.pending_table += 1;
+        return;
+    }
+
+    let paragraph_has_content = current_run.is_some_and(|run| !run.text.is_empty())
+        || current_paragraph
+            .as_ref()
+            .is_some_and(|paragraph| !paragraph.runs.is_empty());
+
+    if paragraph_has_content {
+        page_breaks.pending_paragraph += 1;
+    } else {
+        elements.push(DocumentElement::PageBreak);
+    }
+}
+
 /// Handle a `<w:br>` event (`Event::Start` or `Event::Empty`).
 ///
 /// A `page`-type break outside a table records a `DocumentElement::PageBreak`; any
 /// other break type (`column`, `textWrapping`, or no `w:type` at all) inserts a
 /// newline into the current run instead (#224).
 ///
-/// A page break seen while inside a table is deferred rather than dropped: it is
-/// counted in `pending_table_page_breaks` and flushed once the outermost `</w:tbl>`
-/// closes and the table element has been pushed (#1419), since a form feed cannot be
-/// written into the middle of a table that is rendered as a single markdown block.
+/// See [`push_or_defer_page_break`] for how (and when) the marker is placed relative
+/// to its enclosing table or paragraph.
 ///
 /// This is the author's own explicit break, so it is always recorded — unlike
 /// `w:lastRenderedPageBreak` (see [`apply_last_rendered_page_break`]), it is never
@@ -1421,9 +1475,9 @@ fn apply_break(
     e: &BytesStart,
     table_stack: &[TableContext],
     current_run: &mut Option<Run>,
+    current_paragraph: &Option<Paragraph>,
     elements: &mut Vec<DocumentElement>,
-    pending_table_page_breaks: &mut u32,
-    text_since_page_break: &mut bool,
+    page_breaks: &mut PageBreakState,
 ) {
     let mut is_page_break = false;
     for attr in e.attributes().flatten() {
@@ -1434,12 +1488,14 @@ fn apply_break(
     }
 
     if is_page_break {
-        if table_stack.is_empty() {
-            elements.push(DocumentElement::PageBreak);
-        } else {
-            *pending_table_page_breaks += 1;
-        }
-        *text_since_page_break = false;
+        push_or_defer_page_break(
+            table_stack,
+            current_run.as_ref(),
+            current_paragraph,
+            elements,
+            page_breaks,
+        );
+        page_breaks.text_since_break = false;
     } else if let Some(run) = current_run {
         run.text.push('\n');
     }
@@ -1455,23 +1511,27 @@ fn apply_break(
 /// since the previous break, which is exactly the case where it is *not* a redundant
 /// echo of a break already counted.
 ///
-/// Like `w:br`, a break seen while inside a table is deferred rather than dropped
-/// (#1419); see `pending_table_page_breaks` at the `</w:tbl>` close handler.
+/// See [`push_or_defer_page_break`] for how (and when) the marker is placed relative
+/// to its enclosing table or paragraph, including the [`PageBreakState::pending_table`]
+/// deferral for a hint seen inside a table (#1419).
 fn apply_last_rendered_page_break(
     table_stack: &[TableContext],
+    current_run: &Option<Run>,
+    current_paragraph: &Option<Paragraph>,
     elements: &mut Vec<DocumentElement>,
-    pending_table_page_breaks: &mut u32,
-    text_since_page_break: &mut bool,
+    page_breaks: &mut PageBreakState,
 ) {
-    if !*text_since_page_break {
+    if !page_breaks.text_since_break {
         return;
     }
-    if table_stack.is_empty() {
-        elements.push(DocumentElement::PageBreak);
-    } else {
-        *pending_table_page_breaks += 1;
-    }
-    *text_since_page_break = false;
+    push_or_defer_page_break(
+        table_stack,
+        current_run.as_ref(),
+        current_paragraph,
+        elements,
+        page_breaks,
+    );
+    page_breaks.text_since_break = false;
 }
 
 /// Handle a `<w:sym w:font="…" w:char="…"/>` element (#224).
@@ -1821,10 +1881,12 @@ impl<R: Read + Seek> DocxParser<R> {
         let mut mc_fallback_depth: u32 = 0;
         let mut stop_depth: u32 = if stop_tag.is_some() { 1 } else { 0 };
         // Page-break bookkeeping shared by `w:br` and `w:lastRenderedPageBreak` (#1416, #1419).
-        // `text_since_page_break` starts `true` so a break with nothing before it (including the
+        // `text_since_break` starts `true` so a break with nothing before it (including the
         // very first one in the document) is never treated as a spurious duplicate.
-        let mut text_since_page_break = true;
-        let mut pending_table_page_breaks: u32 = 0;
+        let mut page_breaks = PageBreakState {
+            text_since_break: true,
+            ..PageBreakState::default()
+        };
 
         let mut revision_kind: Option<RevisionKind> = None;
         let mut revision_attrs: (Option<String>, Option<String>, Option<String>) = (None, None, None);
@@ -1910,7 +1972,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 let idx = out.drawings.len();
                                 out.drawings.push(drawing);
                                 out.elements.push(DocumentElement::Drawing(idx));
-                                text_since_page_break = true;
+                                page_breaks.text_since_break = true;
                             }
                         }
                         b"m:oMathPara" => {
@@ -1921,7 +1983,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                     ..Default::default()
                                 };
                                 push_run_to_current(&mut table_stack, &mut current_paragraph, run);
-                                text_since_page_break = true;
+                                page_breaks.text_since_break = true;
                             }
                         }
                         b"m:oMath" => {
@@ -1932,7 +1994,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                     ..Default::default()
                                 };
                                 push_run_to_current(&mut table_stack, &mut current_paragraph, run);
-                                text_since_page_break = true;
+                                page_breaks.text_since_break = true;
                             }
                         }
                         b"w:tbl" => {
@@ -2003,24 +2065,25 @@ impl<R: Read + Seek> DocxParser<R> {
                             let idx = out.drawings.len();
                             out.drawings.push(drawing);
                             out.elements.push(DocumentElement::Drawing(idx));
-                            text_since_page_break = true;
+                            page_breaks.text_since_break = true;
                         }
                         b"w:br" => {
                             apply_break(
                                 e,
                                 &table_stack,
                                 &mut current_run,
+                                &current_paragraph,
                                 &mut out.elements,
-                                &mut pending_table_page_breaks,
-                                &mut text_since_page_break,
+                                &mut page_breaks,
                             );
                         }
                         b"w:lastRenderedPageBreak" => {
                             apply_last_rendered_page_break(
                                 &table_stack,
+                                &current_run,
+                                &current_paragraph,
                                 &mut out.elements,
-                                &mut pending_table_page_breaks,
-                                &mut text_since_page_break,
+                                &mut page_breaks,
                             );
                         }
                         b"w:sectPr" => {
@@ -2080,33 +2143,34 @@ impl<R: Read + Seek> DocxParser<R> {
                                 e,
                                 &table_stack,
                                 &mut current_run,
+                                &current_paragraph,
                                 &mut out.elements,
-                                &mut pending_table_page_breaks,
-                                &mut text_since_page_break,
+                                &mut page_breaks,
                             );
                         }
                         b"w:tab" => {
                             if let Some(ref mut run) = current_run {
                                 run.text.push('\t');
-                                text_since_page_break = true;
+                                page_breaks.text_since_break = true;
                             }
                         }
                         b"w:noBreakHyphen" => {
                             if let Some(ref mut run) = current_run {
                                 run.text.push('\u{2011}');
-                                text_since_page_break = true;
+                                page_breaks.text_since_break = true;
                             }
                         }
                         b"w:sym" => {
                             apply_symbol(e, &mut current_run, warnings);
-                            text_since_page_break = true;
+                            page_breaks.text_since_break = true;
                         }
                         b"w:lastRenderedPageBreak" => {
                             apply_last_rendered_page_break(
                                 &table_stack,
+                                &current_run,
+                                &current_paragraph,
                                 &mut out.elements,
-                                &mut pending_table_page_breaks,
-                                &mut text_since_page_break,
+                                &mut page_breaks,
                             );
                         }
                         b"w:footnoteReference" | b"w:endnoteReference" => {
@@ -2118,7 +2182,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                         && id != "1"
                                     {
                                         run.text.push_str(&format!("[^{}]", id));
-                                        text_since_page_break = true;
+                                        page_breaks.text_since_break = true;
                                     }
                                 }
                             }
@@ -2177,7 +2241,7 @@ impl<R: Read + Seek> DocxParser<R> {
                         budget.account_text(text.len())?;
                         run.text.push_str(&text);
                         if !text.is_empty() {
-                            text_since_page_break = true;
+                            page_breaks.text_since_break = true;
                         }
                         if revision_kind == Some(RevisionKind::Insertion) {
                             revision_text.push_str(&text);
@@ -2195,7 +2259,7 @@ impl<R: Read + Seek> DocxParser<R> {
                         budget.account_text(text.len())?;
                         run.text.push_str(&text);
                         if !text.is_empty() {
-                            text_since_page_break = true;
+                            page_breaks.text_since_break = true;
                         }
                         if revision_kind == Some(RevisionKind::Insertion) {
                             revision_text.push_str(&text);
@@ -2268,6 +2332,9 @@ impl<R: Read + Seek> DocxParser<R> {
                                 let idx = out.paragraphs.len();
                                 out.paragraphs.push(para);
                                 out.elements.push(DocumentElement::Paragraph(idx));
+                                for _ in 0..std::mem::take(&mut page_breaks.pending_paragraph) {
+                                    out.elements.push(DocumentElement::PageBreak);
+                                }
                             }
                         }
                         b"w:tc" => {
@@ -2305,16 +2372,15 @@ impl<R: Read + Seek> DocxParser<R> {
                                     out.elements.push(DocumentElement::Table(idx));
                                     // The outermost table close is the only point that flushes
                                     // page breaks deferred while inside a table (#1419); a nested
-                                    // `</w:tbl>` takes the `if let Some(parent_ctx)` branch above
                                     // instead, so breaks in an inner table stay pending until the
                                     // outer one closes and only ever flush once.
-                                    text_since_page_break = true;
-                                    let deferred_breaks = std::mem::take(&mut pending_table_page_breaks);
+                                    page_breaks.text_since_break = true;
+                                    let deferred_breaks = std::mem::take(&mut page_breaks.pending_table);
                                     for _ in 0..deferred_breaks {
                                         out.elements.push(DocumentElement::PageBreak);
                                     }
                                     if deferred_breaks > 0 {
-                                        text_since_page_break = false;
+                                        page_breaks.text_since_break = false;
                                     }
                                 }
                             }

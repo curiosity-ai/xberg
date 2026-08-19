@@ -45,7 +45,12 @@ fn strip_namespace(tag: &str) -> &str {
     {
         return &tag[pos + 1..];
     }
-    tag
+    // DocBook 5 may bind its namespace to a prefix (`<db:para>`) instead of
+    // making it the default, so the prefix comes off here too.
+    match tag.split_once(':') {
+        Some((_, local)) => local,
+        None => tag,
+    }
 }
 
 /// State machine for tracking nested elements during extraction
@@ -109,6 +114,17 @@ fn ensure_root_element(content: &str) -> std::borrow::Cow<'_, str> {
     } else {
         body
     };
+    // A prefixed root (`<db:book>`) names the same element, so compare on the
+    // local name rather than on the raw text.
+    let body = match body.strip_prefix('<') {
+        Some(rest) => match rest.split_once(':') {
+            Some((prefix, _)) if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                &body[prefix.len() + 1..]
+            }
+            _ => body,
+        },
+        None => body,
+    };
     let has_root = body.starts_with("<article")
         || body.starts_with("<book")
         || body.starts_with("<chapter")
@@ -116,6 +132,7 @@ fn ensure_root_element(content: &str) -> std::borrow::Cow<'_, str> {
         || body.starts_with("<part")
         || body.starts_with("<set")
         || body.starts_with("<reference")
+        || body.starts_with("<refentry")
         || body.starts_with("<preface")
         || body.starts_with("<appendix")
         || body.starts_with("<glossary")
@@ -307,7 +324,11 @@ fn build_docbook_internal_document(
                         }
                     }
                     "para" | "simpara" => {
-                        let (text, annotations) = extract_para_with_annotations(&mut reader, budget, &xref_titles)?;
+                        let (text, annotations, formulas) =
+                            extract_para_with_annotations(&mut reader, budget, &xref_titles)?;
+                        for latex in &formulas {
+                            builder.push_formula(latex, None, None);
+                        }
                         if !text.is_empty() {
                             for ann in &annotations {
                                 if let crate::types::document_structure::AnnotationKind::Link { url, .. } = &ann.kind
@@ -318,6 +339,23 @@ fn build_docbook_internal_document(
                                 }
                             }
                             builder.push_paragraph(&text, annotations, None, None);
+                        }
+                    }
+                    "equation" | "informalequation" | "inlineequation" => {
+                        // DocBook writes an equation as MathML, as verbatim TeX
+                        // in `alt`, or as plain text. An `<equation>` also takes
+                        // a `<title>`, which is a caption rather than an
+                        // equation number, so it stays out of the LaTeX.
+                        let latex = crate::extraction::formula_xml::extract_formula_latex(
+                            &mut reader,
+                            budget,
+                            &crate::extraction::formula_xml::FormulaElements {
+                                tex: "alt",
+                                label: None,
+                            },
+                        )?;
+                        if !latex.trim().is_empty() {
+                            builder.push_formula(latex.trim(), None, None);
                         }
                     }
                     "programlisting" | "screen" => {
@@ -1077,11 +1115,12 @@ fn extract_para_with_annotations(
     reader: &mut EntityReader<'_>,
     budget: &mut SecurityBudget,
     xref_titles: &HashMap<String, String>,
-) -> Result<(String, Vec<crate::types::document_structure::TextAnnotation>)> {
+) -> Result<(String, Vec<crate::types::document_structure::TextAnnotation>, Vec<String>)> {
     use crate::types::builder;
 
     let mut text = String::new();
     let mut annotations = Vec::new();
+    let mut formulas: Vec<String> = Vec::new();
     let mut depth: u32 = 0;
 
     let mut inline_stack: Vec<(&'static str, u32, u32, Option<String>)> = Vec::new();
@@ -1098,6 +1137,25 @@ fn extract_para_with_annotations(
                 let tag = strip_namespace(&tag_cow);
 
                 match tag {
+                    // A paragraph carries its equations inline. The formula
+                    // belongs in the formula list, so it is captured here rather
+                    // than flattened into the sentence.
+                    "equation" | "informalequation" | "inlineequation" => {
+                        let latex = crate::extraction::formula_xml::extract_formula_latex(
+                            reader,
+                            budget,
+                            &crate::extraction::formula_xml::FormulaElements {
+                                tex: "alt",
+                                label: None,
+                            },
+                        )?;
+                        // `extract_formula_latex` already emits the `leave` that
+                        // balances the `enter` for this start tag.
+                        depth = depth.saturating_sub(1);
+                        if !latex.trim().is_empty() {
+                            formulas.push(latex.trim().to_string());
+                        }
+                    }
                     "emphasis" => {
                         let mut role = String::new();
                         for attr in e.attributes().flatten() {
@@ -1271,7 +1329,7 @@ fn extract_para_with_annotations(
         }
     }
 
-    Ok((text.trim().to_string(), annotations))
+    Ok((text.trim().to_string(), annotations, formulas))
 }
 
 /// Extract text content from a DocBook element and its children.
@@ -1610,6 +1668,113 @@ mod tests {
             content.contains("Architecture Diagram"),
             "expected figure caption, got: {content}"
         );
+    }
+
+    /// Collect the LaTeX of every formula element, in document order.
+    #[cfg(test)]
+    fn docbook_formulas(docbook: &str) -> Vec<String> {
+        use crate::types::internal::ElementKind;
+        let mut budget = SecurityBudget::with_defaults();
+        let doc = build_docbook_internal_document(docbook, false, &mut budget).expect("parse failed");
+        doc.elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Formula))
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_docbook_equation_mathml_becomes_a_formula() {
+        let docbook = r#"<?xml version="1.0" encoding="UTF-8"?>
+<article xmlns:mml="http://www.w3.org/1998/Math/MathML">
+  <title>Test</title>
+  <equation>
+    <title>Mass energy equivalence</title>
+    <mml:math><mml:mrow><mml:mi>E</mml:mi><mml:mo>=</mml:mo><mml:mi>m</mml:mi>
+    <mml:msup><mml:mi>c</mml:mi><mml:mn>2</mml:mn></mml:msup></mml:mrow></mml:math>
+  </equation>
+</article>"#;
+
+        assert_eq!(docbook_formulas(docbook), vec!["E=mc^{2}"]);
+    }
+
+    #[test]
+    fn test_docbook_informal_and_inline_equations_become_formulas() {
+        let docbook = r#"<?xml version="1.0" encoding="UTF-8"?>
+<article xmlns:mml="http://www.w3.org/1998/Math/MathML">
+  <title>Test</title>
+  <informalequation>
+    <mml:math><mml:mrow><mml:mi>a</mml:mi><mml:mo>+</mml:mo><mml:mi>b</mml:mi></mml:mrow></mml:math>
+  </informalequation>
+  <inlineequation>
+    <mml:math><mml:mi>x</mml:mi></mml:math>
+  </inlineequation>
+</article>"#;
+
+        assert_eq!(docbook_formulas(docbook), vec!["a+b", "x"]);
+    }
+
+    /// Real DocBook puts an inline equation inside the sentence that refers to
+    /// it, so the paragraph reader has to capture it (Khronos OpenGL refpages).
+    /// DocBook 5 may bind its namespace to a prefix, and the extractor has to
+    /// read those tags as the elements they name.
+    #[test]
+    fn test_docbook_reads_prefix_qualified_elements() {
+        let docbook = r#"<?xml version="1.0" encoding="UTF-8"?>
+<db:book xmlns:db="http://docbook.org/ns/docbook" version="5.0">
+  <db:chapter><db:title>Chapter</db:title>
+    <db:para>Prefixed text.</db:para>
+  </db:chapter>
+</db:book>"#;
+
+        let mut budget = SecurityBudget::with_defaults();
+        let internal = build_docbook_internal_document(docbook, false, &mut budget).expect("prefixed DocBook parses");
+
+        let text = internal.content();
+        assert!(text.contains("Prefixed text."), "prefixed elements must reach the text: {text}");
+    }
+
+    #[test]
+    fn test_docbook_inline_equation_inside_a_paragraph_becomes_a_formula() {
+        let docbook = r#"<?xml version="1.0" encoding="UTF-8"?>
+<refentry xmlns="http://docbook.org/ns/docbook" version="5.0" xml:id="exp">
+  <refsect1><title>Description</title>
+    <para>
+      <function>exp</function> returns the natural exponentiation, i.e.
+      <inlineequation><mml:math xmlns:mml="http://www.w3.org/1998/Math/MathML"><mml:msup><mml:mi>e</mml:mi><mml:mi>x</mml:mi></mml:msup></mml:math></inlineequation>.
+    </para>
+  </refsect1>
+</refentry>"#;
+
+        assert_eq!(docbook_formulas(docbook), vec!["e^{x}"]);
+    }
+
+    /// An `alt` child holds verbatim TeX, which beats reconstructing the MathML.
+    #[test]
+    fn test_docbook_alt_tex_wins_over_mathml() {
+        let docbook = r#"<?xml version="1.0" encoding="UTF-8"?>
+<article xmlns:mml="http://www.w3.org/1998/Math/MathML">
+  <title>Test</title>
+  <equation>
+    <alt role="tex">\int_0^1 x\,dx = \frac{1}{2}</alt>
+    <mml:math><mml:mi>wrong</mml:mi></mml:math>
+  </equation>
+</article>"#;
+
+        assert_eq!(docbook_formulas(docbook), vec!["\\int_0^1 x\\,dx = \\frac{1}{2}"]);
+    }
+
+    /// An equation with neither MathML nor TeX keeps its text rather than
+    /// vanishing.
+    #[test]
+    fn test_docbook_text_only_equation_keeps_its_text() {
+        let docbook = r#"<?xml version="1.0" encoding="UTF-8"?>
+<article>
+  <title>Test</title>
+  <informalequation>E = mc^2</informalequation>
+</article>"#;
+
+        assert_eq!(docbook_formulas(docbook), vec!["E = mc^2"]);
     }
 
     #[test]

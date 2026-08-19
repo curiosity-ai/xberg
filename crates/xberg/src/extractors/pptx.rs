@@ -55,13 +55,101 @@ impl PptxExtractor {
         }
     }
 
+    /// Build the delimited forms of a deck's math runs, longest first.
+    ///
+    /// A math run reaches markdown text as `$$latex$$` (display) or `$latex$`
+    /// (inline). Matching the exact strings the OMML converter produced keeps
+    /// author text that merely holds a `$` out of the formula list.
+    fn math_forms(formulas: &[(String, bool)]) -> Vec<(String, String)> {
+        let mut forms: Vec<(String, String)> = formulas
+            .iter()
+            .map(|(latex, is_display)| {
+                let delimiter = if *is_display { "$$" } else { "$" };
+                (format!("{delimiter}{latex}{delimiter}"), latex.clone())
+            })
+            .collect();
+        forms.sort_by_key(|form| std::cmp::Reverse(form.0.len()));
+        forms
+    }
+
+    /// Pull the math spans out of one line of extracted text.
+    ///
+    /// Returns the line without its math and the LaTeX of every span removed, in
+    /// the order the spans appeared.
+    ///
+    /// Plain text carries no delimiters, so there a line that is exactly one
+    /// formula's LaTeX becomes that formula. This covers the equation shape a
+    /// slide deck usually holds. Math mixed into a line of plain text stays in
+    /// the line, because the LaTeX and the words around it are the same
+    /// characters. Markdown text keeps its delimiters, so both shapes of math
+    /// come out of it.
+    fn split_line_math<'a>(
+        line: &'a str,
+        forms: &[(String, String)],
+        formulas: &[(String, bool)],
+        plain_output: bool,
+    ) -> (Cow<'a, str>, Vec<String>) {
+        if formulas.is_empty() {
+            return (Cow::Borrowed(line), Vec::new());
+        }
+        if plain_output {
+            let trimmed = line.trim();
+            return match formulas.iter().find(|(latex, _)| latex.as_str() == trimmed) {
+                Some((latex, _)) => (Cow::Borrowed(""), vec![latex.clone()]),
+                None => (Cow::Borrowed(line), Vec::new()),
+            };
+        }
+        if !line.contains('$') {
+            return (Cow::Borrowed(line), Vec::new());
+        }
+
+        let mut rest = line;
+        let mut text = String::new();
+        let mut found: Vec<String> = Vec::new();
+        loop {
+            let earliest = forms
+                .iter()
+                .filter_map(|form| rest.find(form.0.as_str()).map(|pos| (pos, form)))
+                .min_by_key(|(pos, _)| *pos);
+            let Some((pos, form)) = earliest else {
+                break;
+            };
+            text.push_str(&rest[..pos]);
+            found.push(form.1.clone());
+            rest = &rest[pos + form.0.len()..];
+        }
+        if found.is_empty() {
+            return (Cow::Borrowed(line), Vec::new());
+        }
+        text.push_str(rest);
+
+        (Cow::Owned(text.split_whitespace().collect::<Vec<_>>().join(" ")), found)
+    }
+
+    /// Emit a formula element per LaTeX string, in order.
+    fn push_line_formulas(
+        builder: &mut InternalDocumentBuilder,
+        formulas: &[String],
+        slide_num: u32,
+        budget: &mut SecurityBudget,
+    ) -> Result<()> {
+        for latex in formulas {
+            budget.account_text(latex.len())?;
+            builder.push_formula(latex, Some(slide_num), None);
+        }
+        Ok(())
+    }
+
     fn build_internal_document(
         slide_contents: &[(u32, String)],
         slide_count: u32,
+        formulas: &[(String, bool)],
+        plain_output: bool,
         budget: &mut SecurityBudget,
     ) -> Result<InternalDocument> {
         let mut builder = InternalDocumentBuilder::new("pptx");
         let mut saw_title = false;
+        let forms = Self::math_forms(formulas);
 
         for (slide_num, content) in slide_contents {
             let mut in_notes = false;
@@ -81,6 +169,8 @@ impl PptxExtractor {
                 if let Some(title_text) = trimmed.strip_prefix("# ") {
                     in_notes = false;
                     saw_title = true;
+                    let (title_text, title_formulas) = Self::split_line_math(title_text, &forms, formulas, plain_output);
+                    Self::push_line_formulas(&mut builder, &title_formulas, *slide_num, budget)?;
                     let title = title_text.trim();
                     if !title.is_empty() {
                         budget.account_text(title.len())?;
@@ -104,8 +194,9 @@ impl PptxExtractor {
                 let mut in_list: Option<bool> = None;
 
                 for line in trimmed.lines() {
-                    let lt = line.trim();
-                    if lt.is_empty() {
+                    let (line_text, line_formulas) = Self::split_line_math(line, &forms, formulas, plain_output);
+                    let lt = line_text.trim();
+                    if lt.is_empty() && line_formulas.is_empty() {
                         if in_list.is_some() {
                             builder.end_list();
                             in_list = None;
@@ -132,6 +223,9 @@ impl PptxExtractor {
                             }
                             _ => {}
                         }
+                        // A list item's math becomes its own element ahead of the
+                        // item, the order DOCX uses for math runs in a paragraph.
+                        Self::push_line_formulas(&mut builder, &line_formulas, *slide_num, budget)?;
                         budget.account_text(item_text.len())?;
                         builder.push_list_item(item_text, ordered, vec![], Some(*slide_num), None);
                     } else {
@@ -139,8 +233,11 @@ impl PptxExtractor {
                             builder.end_list();
                             in_list = None;
                         }
-                        budget.account_text(lt.len())?;
-                        builder.push_paragraph(lt, vec![], Some(*slide_num), None);
+                        Self::push_line_formulas(&mut builder, &line_formulas, *slide_num, budget)?;
+                        if !lt.is_empty() {
+                            budget.account_text(lt.len())?;
+                            builder.push_paragraph(lt, vec![], Some(*slide_num), None);
+                        }
                     }
                 }
 
@@ -192,6 +289,8 @@ impl PptxExtractor {
     fn build_document_from_result(
         pptx_result: crate::types::PptxExtractionResult,
         slide_contents: &[(u32, String)],
+        formulas: &[(String, bool)],
+        plain_output: bool,
         mime_type: &str,
         extract_images: bool,
         budget: &mut SecurityBudget,
@@ -235,7 +334,13 @@ impl PptxExtractor {
             }
         }
 
-        let mut doc = Self::build_internal_document(slide_contents, pptx_result.slide_count as u32, budget)?;
+        let mut doc = Self::build_internal_document(
+            slide_contents,
+            pptx_result.slide_count as u32,
+            formulas,
+            plain_output,
+            budget,
+        )?;
         doc.mime_type = mime_type.to_string();
 
         let mut metadata = Metadata {
@@ -379,6 +484,8 @@ impl InternalDocumentExtractor for PptxExtractor {
         let mut doc = Self::build_document_from_result(
             pptx_internal.result,
             &pptx_internal.slide_contents,
+            &pptx_internal.formulas,
+            pptx_internal.plain_output,
             mime_type,
             extract_images,
             &mut budget,
@@ -444,6 +551,8 @@ impl InternalDocumentExtractor for PptxExtractor {
         let mut doc = Self::build_document_from_result(
             pptx_internal.result,
             &pptx_internal.slide_contents,
+            &pptx_internal.formulas,
+            pptx_internal.plain_output,
             mime_type,
             extract_images,
             &mut budget,
@@ -470,6 +579,325 @@ impl InternalDocumentExtractor for PptxExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slide with math: the LaTeX must reach `ExtractedDocument.formulas`, not
+    /// only the text. The deck holds display math in its own shape, inline math
+    /// beside text, and a `$` amount that is not math at all.
+    #[tokio::test]
+    async fn test_slide_math_populates_formulas() {
+        use crate::core::config::ExtractionConfig;
+        use crate::extraction::derive::derive_extraction_result;
+        use crate::plugins::InternalDocumentExtractor;
+
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+       xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+       xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+    <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+            <a:p><a:r><a:t>Budget is $5 per unit</a:t></a:r></a:p>
+        </p:txBody></p:sp>
+        <p:sp><p:txBody>
+            <a:p>
+                <mc:AlternateContent>
+                    <mc:Choice Requires="a14"><a14:m>
+                        <m:oMathPara><m:oMath><m:sSup>
+                            <m:e><m:r><m:t>x</m:t></m:r></m:e>
+                            <m:sup><m:r><m:t>2</m:t></m:r></m:sup>
+                        </m:sSup></m:oMath></m:oMathPara>
+                    </a14:m></mc:Choice>
+                    <mc:Fallback><a:r><a:t>[equation]</a:t></a:r></mc:Fallback>
+                </mc:AlternateContent>
+            </a:p>
+            <a:p>
+                <a:r><a:t>Rate </a:t></a:r>
+                <mc:AlternateContent>
+                    <mc:Choice Requires="a14"><a14:m>
+                        <m:oMath><m:r><m:t>a</m:t></m:r></m:oMath>
+                    </a14:m></mc:Choice>
+                    <mc:Fallback><a:r><a:t>[a]</a:t></a:r></mc:Fallback>
+                </mc:AlternateContent>
+                <a:r><a:t> per hour</a:t></a:r>
+            </a:p>
+        </p:txBody></p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = crate::extraction::pptx::tests::build_single_slide_pptx(slide_xml, None, &[]);
+        let extractor = PptxExtractor::new();
+        let mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        let config = ExtractionConfig {
+            output_format: crate::core::config::OutputFormat::Markdown,
+            ..Default::default()
+        };
+        let internal_doc = extractor
+            .extract_content(&pptx, mime, &config)
+            .await
+            .expect("extraction failed");
+        let result = derive_extraction_result(internal_doc, false, crate::core::config::OutputFormat::Markdown);
+
+        let latex: Vec<&str> = result.formulas.iter().map(|f| f.latex.as_str()).collect();
+        assert_eq!(latex, vec!["x^{2}", "a"], "both math runs reach formulas");
+        assert!(
+            result.content.contains("Budget is $5 per unit"),
+            "a dollar amount stays text, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Rate per hour"),
+            "the text around inline math survives, got: {:?}",
+            result.content
+        );
+    }
+
+    /// A deck written by a tool other than PowerPoint puts the math straight
+    /// into the paragraph, with no `a14:m` wrapper and no `mc:AlternateContent`.
+    #[tokio::test]
+    async fn test_bare_omml_in_a_paragraph_populates_formulas() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+    <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+            <a:p>
+                <m:oMathPara><m:oMath><m:sSup>
+                    <m:e><m:r><m:t>y</m:t></m:r></m:e>
+                    <m:sup><m:r><m:t>3</m:t></m:r></m:sup>
+                </m:sSup></m:oMath></m:oMathPara>
+            </a:p>
+        </p:txBody></p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        assert_eq!(slide_formulas(slide_xml).await, vec!["y^{3}"]);
+    }
+
+    /// PowerPoint writes the equation as `a14:m` in its 2010 drawing namespace,
+    /// with no compatibility wrapper. A real deck extracted to nothing before.
+    #[tokio::test]
+    async fn test_drawing_extension_math_without_a_compatibility_wrapper() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+       xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+    <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+            <a:p><a14:m>
+                <m:oMathPara><m:oMath><m:sSup>
+                    <m:e><m:r><m:t>e</m:t></m:r></m:e>
+                    <m:sup><m:r><m:t>x</m:t></m:r></m:sup>
+                </m:sSup></m:oMath></m:oMathPara>
+            </a14:m></a:p>
+        </p:txBody></p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        assert_eq!(slide_formulas(slide_xml).await, vec!["e^{x}"]);
+    }
+
+    /// Bare inline math sits beside the words of its sentence. The equation
+    /// becomes a formula and the words keep their spacing.
+    #[tokio::test]
+    async fn test_bare_inline_omml_leaves_the_sentence_intact() {
+        use crate::core::config::ExtractionConfig;
+        use crate::extraction::derive::derive_extraction_result;
+        use crate::plugins::InternalDocumentExtractor;
+
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+    <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+            <a:p>
+                <a:r><a:t>Speed </a:t></a:r>
+                <m:oMath><m:r><m:t>v</m:t></m:r></m:oMath>
+                <a:r><a:t> in metres</a:t></a:r>
+            </a:p>
+        </p:txBody></p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = crate::extraction::pptx::tests::build_single_slide_pptx(slide_xml, None, &[]);
+        let extractor = PptxExtractor::new();
+        let mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        let config = ExtractionConfig {
+            output_format: crate::core::config::OutputFormat::Markdown,
+            ..Default::default()
+        };
+        let internal_doc = extractor
+            .extract_content(&pptx, mime, &config)
+            .await
+            .expect("extraction failed");
+        let result = derive_extraction_result(internal_doc, false, crate::core::config::OutputFormat::Markdown);
+
+        let latex: Vec<&str> = result.formulas.iter().map(|f| f.latex.as_str()).collect();
+        assert_eq!(latex, vec!["v"], "the inline equation becomes a formula");
+        assert!(
+            result.content.contains("Speed in metres"),
+            "the sentence keeps one space where the equation left it, got: {:?}",
+            result.content
+        );
+    }
+
+    /// Extract one slide and return the LaTeX of every formula it yields.
+    async fn slide_formulas(slide_xml: &str) -> Vec<String> {
+        use crate::core::config::ExtractionConfig;
+        use crate::extraction::derive::derive_extraction_result;
+        use crate::plugins::InternalDocumentExtractor;
+
+        let pptx = crate::extraction::pptx::tests::build_single_slide_pptx(slide_xml, None, &[]);
+        let extractor = PptxExtractor::new();
+        let mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        let config = ExtractionConfig {
+            output_format: crate::core::config::OutputFormat::Markdown,
+            ..Default::default()
+        };
+        let internal_doc = extractor
+            .extract_content(&pptx, mime, &config)
+            .await
+            .expect("extraction failed");
+        derive_extraction_result(internal_doc, false, crate::core::config::OutputFormat::Markdown)
+            .formulas
+            .iter()
+            .map(|f| f.latex.clone())
+            .collect()
+    }
+
+    /// Plain output carries no math delimiters, so a shape that holds nothing but
+    /// math is still recognized by its exact LaTeX. Math mixed into a line of text
+    /// stays in that line.
+    #[tokio::test]
+    async fn test_standalone_slide_math_populates_formulas_in_plain_output() {
+        use crate::core::config::ExtractionConfig;
+        use crate::extraction::derive::derive_extraction_result;
+        use crate::plugins::InternalDocumentExtractor;
+
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+       xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+       xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+    <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+            <a:p><a:r><a:t>Energy of a body at rest</a:t></a:r></a:p>
+        </p:txBody></p:sp>
+        <p:sp><p:txBody>
+            <a:p>
+                <mc:AlternateContent>
+                    <mc:Choice Requires="a14"><a14:m>
+                        <m:oMathPara><m:oMath><m:sSup>
+                            <m:e><m:r><m:t>x</m:t></m:r></m:e>
+                            <m:sup><m:r><m:t>2</m:t></m:r></m:sup>
+                        </m:sSup></m:oMath></m:oMathPara>
+                    </a14:m></mc:Choice>
+                    <mc:Fallback><a:r><a:t>[equation]</a:t></a:r></mc:Fallback>
+                </mc:AlternateContent>
+            </a:p>
+        </p:txBody></p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = crate::extraction::pptx::tests::build_single_slide_pptx(slide_xml, None, &[]);
+        let extractor = PptxExtractor::new();
+        let mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        let internal_doc = extractor
+            .extract_content(&pptx, mime, &ExtractionConfig::default())
+            .await
+            .expect("extraction failed");
+        let result = derive_extraction_result(internal_doc, false, crate::core::config::OutputFormat::Plain);
+
+        let latex: Vec<&str> = result.formulas.iter().map(|f| f.latex.as_str()).collect();
+        assert_eq!(latex, vec!["x^{2}"]);
+    }
+
+    #[test]
+    fn test_split_line_math_pulls_delimited_spans() {
+        let formulas = vec![("x^{2}".to_string(), true), ("a".to_string(), false)];
+        let forms = PptxExtractor::math_forms(&formulas);
+
+        let (text, found) = PptxExtractor::split_line_math("Rate $a$ per hour", &forms, &formulas, false);
+        assert_eq!(text, "Rate per hour");
+        assert_eq!(found, vec!["a".to_string()]);
+
+        let (text, found) = PptxExtractor::split_line_math("$$x^{2}$$", &forms, &formulas, false);
+        assert_eq!(text, "");
+        assert_eq!(found, vec!["x^{2}".to_string()]);
+    }
+
+    #[test]
+    fn test_split_line_math_keeps_plain_dollar_text() {
+        let formulas = vec![("a".to_string(), false)];
+        let forms = PptxExtractor::math_forms(&formulas);
+
+        let (text, found) = PptxExtractor::split_line_math("Budget is $5 per unit", &forms, &formulas, false);
+        assert_eq!(text, "Budget is $5 per unit");
+        assert!(found.is_empty(), "author text with a dollar sign is not math");
+    }
+
+    #[test]
+    fn test_split_line_math_matches_undelimited_plain_output() {
+        let formulas = vec![("x^{2}".to_string(), true)];
+        let forms = PptxExtractor::math_forms(&formulas);
+
+        let (text, found) = PptxExtractor::split_line_math("x^{2}", &forms, &formulas, true);
+        assert_eq!(text, "");
+        assert_eq!(found, vec!["x^{2}".to_string()], "plain output carries no delimiters");
+    }
+
+    /// Markdown text keeps its delimiters, so a line that merely repeats a
+    /// formula's characters is author text, not math.
+    #[test]
+    fn test_split_line_math_leaves_undelimited_line_in_markdown_text() {
+        let formulas = vec![("n".to_string(), false)];
+        let forms = PptxExtractor::math_forms(&formulas);
+
+        let (text, found) = PptxExtractor::split_line_math("n", &forms, &formulas, false);
+        assert_eq!(text, "n");
+        assert!(found.is_empty());
+    }
+
+    /// Math inside a bulleted line becomes its own element, and the bullet keeps
+    /// its words.
+    #[test]
+    fn test_build_internal_document_lifts_list_item_and_title_math() {
+        use crate::types::internal::ElementKind;
+
+        let content = "# Growth is $$g^{2}$$\n\n- Rate $r$ per year\n- Plain bullet\n";
+        let formulas = vec![("g^{2}".to_string(), true), ("r".to_string(), false)];
+        let mut budget = SecurityBudget::with_defaults();
+        let doc = PptxExtractor::build_internal_document(&[(1, content.to_string())], 1, &formulas, false, &mut budget)
+            .unwrap();
+
+        let math: Vec<&str> = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Formula))
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(math, vec!["g^{2}", "r"], "title and list-item math both emit");
+
+        let items: Vec<&str> = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::ListItem { .. }))
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(items, vec!["Rate per year", "Plain bullet"]);
+
+        let headings: Vec<&str> = doc
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Heading { .. }))
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(headings, vec!["Growth is"], "the heading keeps its words");
+    }
 
     #[test]
     fn test_pptx_extractor_plugin_interface() {
@@ -514,7 +942,7 @@ mod tests {
         ];
         let mut budget = SecurityBudget::with_defaults();
 
-        let document = PptxExtractor::build_internal_document(&slide_contents, 3, &mut budget)
+        let document = PptxExtractor::build_internal_document(&slide_contents, 3, &[], false, &mut budget)
             .expect("internal PPTX document should build");
 
         assert_eq!(document.tables.len(), 1);
@@ -553,7 +981,7 @@ mod tests {
         ];
         let mut budget = SecurityBudget::with_defaults();
 
-        let document = PptxExtractor::build_internal_document(&slide_contents, 2, &mut budget)
+        let document = PptxExtractor::build_internal_document(&slide_contents, 2, &[], false, &mut budget)
             .expect("marker-like user text should remain ordinary slide content");
 
         assert_eq!(document.tables.len(), 1);

@@ -14,6 +14,7 @@ from xberg import list_tokenizer_backends
 
 def main() -> None:
     _ = list_tokenizer_backends()
+    print(result)
 
 main()
 

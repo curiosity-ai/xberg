@@ -30,11 +30,16 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(.{ .cwd_relative = ffi_include });
     module.linkSystemLibrary("xberg_ffi", .{});
 
+    // Point the test target at the hand-written suite, not at `src/xberg.zig`. The generated
+    // binding carries no `test` blocks, so rooting the tests there builds an empty test binary
+    // and reports success — a green that proves nothing. The suite lives under `test/` so a
+    // regeneration of `src/` cannot remove it.
     const test_module = b.createModule(.{
-        .root_source_file = b.path("src/xberg.zig"),
+        .root_source_file = b.path("test/xberg_test.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{.{ .name = "xberg", .module = module }},
     });
     test_module.addLibraryPath(.{ .cwd_relative = ffi_path });
     test_module.addIncludePath(.{ .cwd_relative = ffi_include });

@@ -20,14 +20,6 @@ pub const DEFAULT_BATCH_SIZE: usize = 10;
 /// rate-limit failures on large documents.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 
-fn default_batch_size() -> usize {
-    DEFAULT_BATCH_SIZE
-}
-
-fn default_max_concurrency() -> usize {
-    DEFAULT_MAX_CONCURRENCY
-}
-
 /// A single labeled definition the chunk classifier may emit.
 ///
 /// Unlike `PageClassificationConfig::labels` (bare label names), chunk
@@ -72,12 +64,30 @@ pub struct ChunkClassificationConfig {
     /// Larger batches amortize the fixed prompt cost (definitions block) across
     /// more chunks, at the risk of exceeding the model's context window for
     /// very large taxonomies or chunk texts. Defaults to [`DEFAULT_BATCH_SIZE`].
-    #[serde(default = "default_batch_size")]
+    #[serde(default = "ChunkClassificationConfig::default_batch_size")]
     pub batch_size: usize,
     /// Maximum number of in-flight batch requests.
     ///
     /// Bounds concurrency against the configured LLM provider. Defaults to
     /// [`DEFAULT_MAX_CONCURRENCY`].
-    #[serde(default = "default_max_concurrency")]
+    #[serde(default = "ChunkClassificationConfig::default_max_concurrency")]
     pub max_concurrency: usize,
+}
+
+impl ChunkClassificationConfig {
+    /// Default [`Self::batch_size`]: [`DEFAULT_BATCH_SIZE`].
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_batch_size() -> usize {
+        DEFAULT_BATCH_SIZE
+    }
+
+    /// Default [`Self::max_concurrency`]: [`DEFAULT_MAX_CONCURRENCY`].
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_max_concurrency() -> usize {
+        DEFAULT_MAX_CONCURRENCY
+    }
 }

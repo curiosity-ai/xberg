@@ -14,6 +14,7 @@ import { ExtractInput, ExtractInputKind, extract } from "@xberg-io/xberg-wasm";
 async function main() {
   const input: WasmExtractInput = (() => { const _u0 = WasmExtractInput.default(); _u0.filename = "simple.hwpx"; _u0.kind = ExtractInputKind.Uri; _u0.mimeType = "application/haansofthwpx"; _u0.uri = "https://example.com/hwpx/simple.hwpx"; return _u0; })();
   const result = await extract(input, undefined);
+  console.log(result);
 }
 
 void main();

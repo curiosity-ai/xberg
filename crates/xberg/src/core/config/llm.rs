@@ -647,7 +647,7 @@ pub struct StructuredExtractionConfig {
     pub schema: serde_json::Value,
 
     /// Schema name passed to the LLM's structured output mode.
-    #[serde(default = "default_schema_name")]
+    #[serde(default = "StructuredExtractionConfig::default_schema_name")]
     pub schema_name: String,
 
     /// Optional schema description for the LLM.
@@ -672,8 +672,14 @@ pub struct StructuredExtractionConfig {
     pub llm: LlmConfig,
 }
 
-fn default_schema_name() -> String {
-    "extraction".to_string()
+impl StructuredExtractionConfig {
+    /// Default [`Self::schema_name`] passed to the LLM's structured-output mode.
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_schema_name() -> String {
+        "extraction".to_string()
+    }
 }
 
 /// How a structured-extraction preset is dispatched to the model.

@@ -20,10 +20,16 @@ pub struct CaptioningConfig {
     pub prompt: Option<String>,
     /// Skip images whose `width * height` is below this threshold (in pixels).
     /// Default `1_000` filters out icons and decorations.
-    #[serde(default = "default_min_image_area")]
+    #[serde(default = "CaptioningConfig::default_min_image_area")]
     pub min_image_area: u32,
 }
 
-fn default_min_image_area() -> u32 {
-    1_000
+impl CaptioningConfig {
+    /// Default [`Self::min_image_area`]: 1000 px.
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_min_image_area() -> u32 {
+        1_000
+    }
 }

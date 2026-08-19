@@ -59,12 +59,28 @@ pub mod doc;
 #[cfg(feature = "office")]
 pub mod docx;
 
-#[cfg(feature = "office")]
+#[cfg(any(feature = "office", feature = "xml"))]
 pub mod mathml;
+
+/// Formula capture shared by the XML formats (JATS, DocBook).
+#[cfg(feature = "xml")]
+pub(crate) mod formula_xml;
+
+/// Shaping helpers for LaTeX an extractor has produced.
+#[cfg(feature = "office")]
+pub(crate) mod latex_shape;
+
+/// Typst math to LaTeX.
+#[cfg(feature = "office")]
+pub(crate) mod typst_math;
+
+/// AsciiMath to LaTeX, through the shared MathML converter.
+#[cfg(feature = "office")]
+pub(crate) mod asciimath;
 
 /// Unicode-to-LaTeX symbol table shared by the OMML (`docx::math`) and MathML
 /// (`mathml`) converters.
-#[cfg(feature = "office")]
+#[cfg(any(feature = "office", feature = "xml"))]
 pub(crate) mod math_symbols;
 
 #[cfg(feature = "office")]

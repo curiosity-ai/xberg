@@ -224,6 +224,30 @@ impl fmt::Display for LayoutClass {
     }
 }
 
+impl BBox {
+    /// Clamp this box to an image of `width` x `height` pixels, returning the
+    /// integer crop rectangle `(x, y, w, h)`. `None` when the clamped region
+    /// is empty.
+    ///
+    /// The gate is the union of the callers' gates: `encode_layout_region`
+    /// (`layout-detection` + an OCR backend) and the image/PDF formula crop
+    /// paths (`formula-recognition`; the PDF one needs `pdf`). This module
+    /// also compiles under `layout-tract`, which has no caller.
+    #[cfg(any(
+        all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")),
+        all(feature = "formula-recognition", feature = "pdf")
+    ))]
+    pub(crate) fn clamp_to_image(&self, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+        let x1 = (self.x1.max(0.0) as u32).min(width.saturating_sub(1));
+        let y1 = (self.y1.max(0.0) as u32).min(height.saturating_sub(1));
+        let x2 = (self.x2.max(0.0).ceil() as u32).min(width);
+        let y2 = (self.y2.max(0.0).ceil() as u32).min(height);
+        let w = x2.saturating_sub(x1);
+        let h = y2.saturating_sub(y1);
+        if w == 0 || h == 0 { None } else { Some((x1, y1, w, h)) }
+    }
+}
+
 /// A single layout detection result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutDetection {
@@ -306,5 +330,36 @@ impl DetectionResult {
             page_height,
             detections,
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")),
+        all(feature = "formula-recognition", feature = "pdf")
+    )
+))]
+mod clamp_tests {
+    use super::BBox;
+
+    fn bbox(x1: f32, y1: f32, x2: f32, y2: f32) -> BBox {
+        BBox { x1, y1, x2, y2 }
+    }
+
+    #[test]
+    fn interior_box_rounds_to_pixels() {
+        assert_eq!(bbox(10.2, 5.7, 20.1, 15.3).clamp_to_image(100, 50), Some((10, 5, 11, 11)));
+    }
+
+    #[test]
+    fn negative_and_oversized_coordinates_clamp() {
+        assert_eq!(bbox(-8.0, -3.0, 400.0, 400.0).clamp_to_image(100, 50), Some((0, 0, 100, 50)));
+    }
+
+    #[test]
+    fn empty_regions_yield_none() {
+        assert_eq!(bbox(30.0, 20.0, 30.0, 40.0).clamp_to_image(100, 50), None);
+        assert_eq!(bbox(10.0, 40.0, 90.0, 40.0).clamp_to_image(100, 50), None);
     }
 }

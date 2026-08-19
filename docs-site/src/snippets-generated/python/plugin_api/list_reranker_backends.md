@@ -14,6 +14,7 @@ from xberg import list_reranker_backends
 
 def main() -> None:
     _ = list_reranker_backends()
+    print(result)
 
 main()
 

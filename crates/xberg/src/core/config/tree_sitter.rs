@@ -177,6 +177,11 @@ impl From<&TreeSitterProcessConfig> for tree_sitter_language_pack::ProcessConfig
             diagnostics: p.diagnostics,
             data_extraction: p.data_extraction,
             chunk_max_size: p.chunk_max_size,
+            // Added as required fields by tree-sitter-language-pack 1.15.0. `None` keeps the
+            // unbounded pre-1.15 behaviour; callers that cap untrusted source do so via
+            // `SecurityLimits` before reaching the parser.
+            max_source_bytes: None,
+            parse_timeout_ms: None,
         }
     }
 }

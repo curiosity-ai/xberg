@@ -19,77 +19,90 @@ namespace Xberg;
 /// bounding boxes or confidence scores.
 /// </summary>
 [JsonConverter(typeof(OutputFormatJsonConverter))]
-public enum OutputFormat {
-  /// <summary>
-  /// Plain text content only (default)
-  /// </summary>
-  [JsonPropertyName("plain")] Plain,
-  /// <summary>
-  /// Markdown format
-  /// </summary>
-  [JsonPropertyName("markdown")] Markdown,
-  /// <summary>
-  /// Djot markup format
-  /// </summary>
-  [JsonPropertyName("djot")] Djot,
-  /// <summary>
-  /// HTML format
-  /// </summary>
-  [JsonPropertyName("html")] Html,
-  /// <summary>
-  /// JSON tree format with heading-driven sections.
-  /// </summary>
-  [JsonPropertyName("json")] Json,
-  /// <summary>
-  /// Metadata-only label; content is identical to `OutputFormat.Plain`.
-  /// No dedicated renderer exists yet, so this attaches no OCR element
-  /// metadata. See the enum-level docs above.
-  /// </summary>
-  [JsonPropertyName("structured")] Structured,
-  /// <summary>
-  /// Docling DocTags format (tables rendered as OTSL).
-  /// </summary>
-  [JsonPropertyName("doctags")] DocTags,
-  /// <summary>
-  /// Custom renderer registered via the RendererRegistry.
-  /// The string is the renderer name (e.g., "docx", "latex").
-  /// </summary>
-  [JsonPropertyName("custom")] Custom,
+public enum OutputFormat
+{
+    /// <summary>
+    /// Plain text content only (default)
+    /// </summary>
+    [JsonPropertyName("plain")]
+    Plain,
+    /// <summary>
+    /// Markdown format
+    /// </summary>
+    [JsonPropertyName("markdown")]
+    Markdown,
+    /// <summary>
+    /// Djot markup format
+    /// </summary>
+    [JsonPropertyName("djot")]
+    Djot,
+    /// <summary>
+    /// HTML format
+    /// </summary>
+    [JsonPropertyName("html")]
+    Html,
+    /// <summary>
+    /// JSON tree format with heading-driven sections.
+    /// </summary>
+    [JsonPropertyName("json")]
+    Json,
+    /// <summary>
+    /// Metadata-only label; content is identical to `OutputFormat.Plain`.
+    /// No dedicated renderer exists yet, so this attaches no OCR element
+    /// metadata. See the enum-level docs above.
+    /// </summary>
+    [JsonPropertyName("structured")]
+    Structured,
+    /// <summary>
+    /// Docling DocTags format (tables rendered as OTSL).
+    /// </summary>
+    [JsonPropertyName("doctags")]
+    DocTags,
+    /// <summary>
+    /// Custom renderer registered via the RendererRegistry.
+    /// The string is the renderer name (e.g., "docx", "latex").
+    /// </summary>
+    [JsonPropertyName("custom")]
+    Custom,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="OutputFormat"/> that respects explicit
-/// variant names.
-/// </summary>
-internal sealed class OutputFormatJsonConverter : JsonConverter<OutputFormat> {
-  public override OutputFormat Read(ref Utf8JsonReader reader,
-                                    Type typeToConvert,
-                                    JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch { "plain" => OutputFormat.Plain,
-                          "markdown" => OutputFormat.Markdown,
-                          "djot" => OutputFormat.Djot,
-                          "html" => OutputFormat.Html,
-                          "json" => OutputFormat.Json,
-                          "structured" => OutputFormat.Structured,
-                          "doctags" => OutputFormat.DocTags,
-                          "custom" => OutputFormat.Custom,
-                          _ => throw new JsonException(
-                              $"Unknown OutputFormat value: {value}") };
-  }
 
-  public override void Write(Utf8JsonWriter writer, OutputFormat value,
-                             JsonSerializerOptions options) {
-    var str = value switch { OutputFormat.Plain => "plain",
-                             OutputFormat.Markdown => "markdown",
-                             OutputFormat.Djot => "djot",
-                             OutputFormat.Html => "html",
-                             OutputFormat.Json => "json",
-                             OutputFormat.Structured => "structured",
-                             OutputFormat.DocTags => "doctags",
-                             OutputFormat.Custom => "custom",
-                             _ => throw new JsonException(
-                                 $"Unknown OutputFormat value: {value}") };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="OutputFormat"/> that respects explicit variant names.
+/// </summary>
+internal sealed class OutputFormatJsonConverter : JsonConverter<OutputFormat>
+{
+    public override OutputFormat Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "plain" => OutputFormat.Plain,
+            "markdown" => OutputFormat.Markdown,
+            "djot" => OutputFormat.Djot,
+            "html" => OutputFormat.Html,
+            "json" => OutputFormat.Json,
+            "structured" => OutputFormat.Structured,
+            "doctags" => OutputFormat.DocTags,
+            "custom" => OutputFormat.Custom,
+            _ => throw new JsonException($"Unknown OutputFormat value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, OutputFormat value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            OutputFormat.Plain => "plain",
+            OutputFormat.Markdown => "markdown",
+            OutputFormat.Djot => "djot",
+            OutputFormat.Html => "html",
+            OutputFormat.Json => "json",
+            OutputFormat.Structured => "structured",
+            OutputFormat.DocTags => "doctags",
+            OutputFormat.Custom => "custom",
+            _ => throw new JsonException($"Unknown OutputFormat value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

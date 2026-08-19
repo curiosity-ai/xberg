@@ -264,7 +264,7 @@ impl Default for CaptioningConfig {
         Self {
             llm: LlmConfig::default(),
             prompt: None,
-            min_image_area: 0,
+            min_image_area: default_min_image_area(),
         }
     }
 }
@@ -291,7 +291,7 @@ impl CaptioningConfig {
             min_image_area: kwargs
                 .get(ruby.to_symbol("min_image_area"))
                 .and_then(|v| u32::try_convert(v).ok())
-                .unwrap_or(0),
+                .unwrap_or(default_min_image_area()),
         })
     }
 
@@ -414,8 +414,8 @@ impl Default for ChunkClassificationConfig {
             prompt_template: None,
             definitions: vec![],
             llm: LlmConfig::default(),
-            batch_size: 0,
-            max_concurrency: 0,
+            batch_size: default_batch_size(),
+            max_concurrency: default_max_concurrency(),
         }
     }
 }
@@ -446,11 +446,11 @@ impl ChunkClassificationConfig {
             batch_size: kwargs
                 .get(ruby.to_symbol("batch_size"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or(0),
+                .unwrap_or(default_batch_size()),
             max_concurrency: kwargs
                 .get(ruby.to_symbol("max_concurrency"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or(0),
+                .unwrap_or(default_max_concurrency()),
         })
     }
 
@@ -1015,7 +1015,7 @@ impl ExtractionConfig {
             max_archive_depth: kwargs
                 .get(ruby.to_symbol("max_archive_depth"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_archive_depth()),
             tree_sitter: kwargs
                 .get(ruby.to_symbol("tree_sitter"))
                 .and_then(|v| TreeSitterConfig::try_convert(v).ok()),
@@ -2362,7 +2362,12 @@ impl UrlExtractionConfig {
             crawl: kwargs
                 .get(ruby.to_symbol("crawl"))
                 .and_then(|v| CrawlConfig::try_convert(v).ok())
-                .unwrap_or_default(),
+                .ok_or_else(|| {
+                    magnus::Error::new(
+                        unsafe { magnus::Ruby::get_unchecked() }.exception_arg_error(),
+                        "missing required field: crawl",
+                    )
+                })?,
             document_url_pattern: kwargs
                 .get(ruby.to_symbol("document_url_pattern"))
                 .and_then(|v| String::try_convert(v).ok()),
@@ -2658,7 +2663,7 @@ impl TokenReductionOptions {
             mode: kwargs
                 .get(ruby.to_symbol("mode"))
                 .and_then(|v| String::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_reduction_mode()),
             preserve_important_words: kwargs
                 .get(ruby.to_symbol("preserve_important_words"))
                 .and_then(|v| bool::try_convert(v).ok())
@@ -2818,7 +2823,7 @@ impl HtmlOutputConfig {
             class_prefix: kwargs
                 .get(ruby.to_symbol("class_prefix"))
                 .and_then(|v| String::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_class_prefix()),
             embed_css: kwargs
                 .get(ruby.to_symbol("embed_css"))
                 .and_then(|v| bool::try_convert(v).ok())
@@ -2905,19 +2910,24 @@ impl LateInteractionConfig {
             model: kwargs
                 .get(ruby.to_symbol("model"))
                 .and_then(|v| LateInteractionModelType::try_convert(v).ok())
-                .unwrap_or_default(),
+                .ok_or_else(|| {
+                    magnus::Error::new(
+                        unsafe { magnus::Ruby::get_unchecked() }.exception_arg_error(),
+                        "missing required field: model",
+                    )
+                })?,
             batch_size: kwargs
                 .get(ruby.to_symbol("batch_size"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_batch_size()),
             max_length: kwargs
                 .get(ruby.to_symbol("max_length"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_max_length()),
             query_max_length: kwargs
                 .get(ruby.to_symbol("query_max_length"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_query_max_length()),
             show_download_progress: kwargs
                 .get(ruby.to_symbol("show_download_progress"))
                 .and_then(|v| bool::try_convert(v).ok())
@@ -3857,7 +3867,7 @@ impl Default for StructuredExtractionConfig {
     fn default() -> Self {
         Self {
             schema: String::new(),
-            schema_name: String::new(),
+            schema_name: default_schema_name(),
             schema_description: None,
             strict: false,
             prompt: None,
@@ -3880,7 +3890,7 @@ impl StructuredExtractionConfig {
             schema_name: kwargs
                 .get(ruby.to_symbol("schema_name"))
                 .and_then(|v| String::try_convert(v).ok())
-                .unwrap_or(String::new()),
+                .unwrap_or(default_schema_name()),
             schema_description: kwargs
                 .get(ruby.to_symbol("schema_description"))
                 .and_then(|v| String::try_convert(v).ok()),
@@ -4155,15 +4165,15 @@ impl OcrQualityThresholds {
             min_undecodable_ratio: kwargs
                 .get(ruby.to_symbol("min_undecodable_ratio"))
                 .and_then(|v| f64::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_min_undecodable_ratio()),
             enable_provenance_ocr_routing: kwargs
                 .get(ruby.to_symbol("enable_provenance_ocr_routing"))
                 .and_then(|v| bool::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_enable_provenance_ocr_routing()),
             min_provenance_fallback_ratio: kwargs
                 .get(ruby.to_symbol("min_provenance_fallback_ratio"))
                 .and_then(|v| f64::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_min_provenance_fallback_ratio()),
         })
     }
 
@@ -4288,7 +4298,7 @@ impl Default for OcrPipelineStage {
     fn default() -> Self {
         Self {
             backend: String::new(),
-            priority: 0,
+            priority: default_priority(),
             language: None,
             tesseract_config: None,
             paddle_ocr_config: None,
@@ -4312,7 +4322,7 @@ impl OcrPipelineStage {
             priority: kwargs
                 .get(ruby.to_symbol("priority"))
                 .and_then(|v| u32::try_convert(v).ok())
-                .unwrap_or(0),
+                .unwrap_or(default_priority()),
             language: kwargs
                 .get(ruby.to_symbol("language"))
                 .and_then(|v| <Vec<String>>::try_convert(v).ok()),
@@ -4507,7 +4517,7 @@ impl OcrConfig {
             backend: kwargs
                 .get(ruby.to_symbol("backend"))
                 .and_then(|v| String::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_tesseract_backend()),
             language: kwargs
                 .get(ruby.to_symbol("language"))
                 .and_then(|v| <Vec<String>>::try_convert(v).ok())
@@ -5491,7 +5501,7 @@ impl Default for RedactionTerm {
         Self {
             label: String::new(),
             value: String::new(),
-            case_sensitive: false,
+            case_sensitive: default_case_sensitive(),
         }
     }
 }
@@ -5514,7 +5524,7 @@ impl RedactionTerm {
             case_sensitive: kwargs
                 .get(ruby.to_symbol("case_sensitive"))
                 .and_then(|v| bool::try_convert(v).ok())
-                .unwrap_or(false),
+                .unwrap_or(default_case_sensitive()),
         })
     }
 
@@ -5572,7 +5582,7 @@ impl Default for RedactionPattern {
         Self {
             label: String::new(),
             pattern: String::new(),
-            case_sensitive: false,
+            case_sensitive: default_case_sensitive(),
         }
     }
 }
@@ -5595,7 +5605,7 @@ impl RedactionPattern {
             case_sensitive: kwargs
                 .get(ruby.to_symbol("case_sensitive"))
                 .and_then(|v| bool::try_convert(v).ok())
-                .unwrap_or(false),
+                .unwrap_or(default_case_sensitive()),
         })
     }
 
@@ -5779,15 +5789,20 @@ impl SparseEmbeddingConfig {
             model: kwargs
                 .get(ruby.to_symbol("model"))
                 .and_then(|v| SparseEmbeddingModelType::try_convert(v).ok())
-                .unwrap_or_default(),
+                .ok_or_else(|| {
+                    magnus::Error::new(
+                        unsafe { magnus::Ruby::get_unchecked() }.exception_arg_error(),
+                        "missing required field: model",
+                    )
+                })?,
             batch_size: kwargs
                 .get(ruby.to_symbol("batch_size"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_batch_size()),
             max_length: kwargs
                 .get(ruby.to_symbol("max_length"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_max_length()),
             show_download_progress: kwargs
                 .get(ruby.to_symbol("show_download_progress"))
                 .and_then(|v| bool::try_convert(v).ok())
@@ -6490,11 +6505,11 @@ impl ServerConfig {
             host: kwargs
                 .get(ruby.to_symbol("host"))
                 .and_then(|v| String::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_host()),
             port: kwargs
                 .get(ruby.to_symbol("port"))
                 .and_then(|v| u16::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_port()),
             cors_origins: kwargs
                 .get(ruby.to_symbol("cors_origins"))
                 .and_then(|v| <Vec<String>>::try_convert(v).ok())
@@ -6502,11 +6517,11 @@ impl ServerConfig {
             max_request_body_bytes: kwargs
                 .get(ruby.to_symbol("max_request_body_bytes"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_max_request_body_bytes()),
             max_multipart_field_bytes: kwargs
                 .get(ruby.to_symbol("max_multipart_field_bytes"))
                 .and_then(|v| usize::try_convert(v).ok())
-                .unwrap_or_default(),
+                .unwrap_or(default_max_multipart_field_bytes()),
         })
     }
 
@@ -9304,8 +9319,8 @@ impl Default for GridCell {
             content: String::new(),
             row: 0,
             col: 0,
-            row_span: 0,
-            col_span: 0,
+            row_span: default_span(),
+            col_span: default_span(),
             is_header: false,
             bbox: None,
         }
@@ -9334,11 +9349,11 @@ impl GridCell {
             row_span: kwargs
                 .get(ruby.to_symbol("row_span"))
                 .and_then(|v| u32::try_convert(v).ok())
-                .unwrap_or(0),
+                .unwrap_or(default_span()),
             col_span: kwargs
                 .get(ruby.to_symbol("col_span"))
                 .and_then(|v| u32::try_convert(v).ok())
-                .unwrap_or(0),
+                .unwrap_or(default_span()),
             is_header: kwargs
                 .get(ruby.to_symbol("is_header"))
                 .and_then(|v| bool::try_convert(v).ok())
@@ -23034,7 +23049,12 @@ impl CrawlConfig {
             ssrf: kwargs
                 .get(ruby.to_symbol("ssrf"))
                 .and_then(|v| SsrfPolicy::try_convert(v).ok())
-                .unwrap_or_default(),
+                .ok_or_else(|| {
+                    magnus::Error::new(
+                        unsafe { magnus::Ruby::get_unchecked() }.exception_arg_error(),
+                        "missing required field: ssrf",
+                    )
+                })?,
             ssrf_deny_private_explicit: kwargs
                 .get(ruby.to_symbol("ssrf_deny_private_explicit"))
                 .and_then(|v| bool::try_convert(v).ok()),
@@ -27285,7 +27305,7 @@ pub enum DiffLine {
 
 impl Default for DiffLine {
     fn default() -> Self {
-        Self::Context { _0: Default::default() }
+        Self::Context(Default::default())
     }
 }
 
@@ -27335,19 +27355,19 @@ unsafe impl TryConvertOwned for DiffLine {}
 impl DiffLine {
     pub fn context(&self) -> Option<&String> {
         match self {
-            Self::Context { _0 } => Some(_0),
+            Self::Context(_0) => Some(_0),
             _ => None,
         }
     }
     pub fn added(&self) -> Option<&String> {
         match self {
-            Self::Added { _0 } => Some(_0),
+            Self::Added(_0) => Some(_0),
             _ => None,
         }
     }
     pub fn removed(&self) -> Option<&String> {
         match self {
-            Self::Removed { _0 } => Some(_0),
+            Self::Removed(_0) => Some(_0),
             _ => None,
         }
     }
@@ -33873,23 +33893,6 @@ impl From<xberg::RedactionPattern> for RedactionPattern {
     }
 }
 
-#[allow(clippy::needless_update)]
-#[allow(clippy::useless_conversion)]
-impl From<RerankerConfig> for xberg::RerankerConfig {
-    fn from(val: RerankerConfig) -> Self {
-        Self {
-            model: val.model.into(),
-            top_k: val.top_k,
-            batch_size: val.batch_size,
-            show_download_progress: val.show_download_progress,
-            cache_dir: val.cache_dir.map(Into::into),
-            acceleration: val.acceleration.map(Into::into),
-            max_rerank_duration_secs: val.max_rerank_duration_secs,
-            ..Default::default()
-        }
-    }
-}
-
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::RerankerConfig> for RerankerConfig {
     fn from(val: xberg::RerankerConfig) -> Self {
@@ -34107,20 +34110,6 @@ impl From<xberg::SupportedFormat> for SupportedFormat {
     }
 }
 
-#[allow(clippy::needless_update)]
-impl From<ServerConfig> for xberg::ServerConfig {
-    fn from(val: ServerConfig) -> Self {
-        Self {
-            host: val.host,
-            port: val.port,
-            cors_origins: val.cors_origins.into_iter().collect(),
-            max_request_body_bytes: val.max_request_body_bytes,
-            max_multipart_field_bytes: val.max_multipart_field_bytes,
-            ..Default::default()
-        }
-    }
-}
-
 impl From<xberg::ServerConfig> for ServerConfig {
     fn from(val: xberg::ServerConfig) -> Self {
         Self {
@@ -34313,28 +34302,6 @@ impl From<xberg::SecurityLimits> for SecurityLimits {
             max_iterations: val.max_iterations,
             max_xml_depth: val.max_xml_depth,
             max_table_cells: val.max_table_cells,
-        }
-    }
-}
-
-#[allow(clippy::needless_update)]
-#[allow(clippy::redundant_closure, clippy::useless_conversion)]
-impl From<TokenReductionConfig> for xberg::TokenReductionConfig {
-    fn from(val: TokenReductionConfig) -> Self {
-        Self {
-            level: val.level.into(),
-            language_hint: val.language_hint,
-            preserve_markdown: val.preserve_markdown,
-            preserve_code: val.preserve_code,
-            semantic_threshold: val.semantic_threshold,
-            enable_parallel: val.enable_parallel,
-            use_simd: val.use_simd,
-            custom_stopwords: val.custom_stopwords.map(|m| m.into_iter().collect()),
-            preserve_patterns: val.preserve_patterns.into_iter().collect(),
-            target_reduction: val.target_reduction,
-            enable_semantic_clustering: val.enable_semantic_clustering,
-            preserve_important_words: val.preserve_important_words,
-            ..Default::default()
         }
     }
 }
@@ -37107,18 +37074,6 @@ impl From<xberg::api::DetectResponse> for DetectResponse {
     }
 }
 
-#[allow(clippy::needless_update)]
-impl From<DiffOptions> for xberg::DiffOptions {
-    fn from(val: DiffOptions) -> Self {
-        Self {
-            include_metadata: val.include_metadata,
-            include_embedded: val.include_embedded,
-            max_content_chars: val.max_content_chars,
-            ..Default::default()
-        }
-    }
-}
-
 impl From<xberg::DiffOptions> for DiffOptions {
     fn from(val: xberg::DiffOptions) -> Self {
         Self {
@@ -37424,26 +37379,6 @@ impl From<xberg::ExtractionConfidence> for ExtractionConfidence {
     }
 }
 
-#[allow(clippy::needless_update)]
-impl From<HeuristicsConfig> for xberg::HeuristicsConfig {
-    fn from(val: HeuristicsConfig) -> Self {
-        Self {
-            enable_pdf_text_heuristics: val.enable_pdf_text_heuristics,
-            text_layer_threshold: val.text_layer_threshold,
-            file_size_threshold_bytes: val.file_size_threshold_bytes,
-            page_count_threshold: val.page_count_threshold,
-            target_pages_per_chunk: val.target_pages_per_chunk,
-            max_pages_per_chunk: val.max_pages_per_chunk,
-            disk_processing_threshold_bytes: val.disk_processing_threshold_bytes,
-            min_chars_per_page: val.min_chars_per_page,
-            max_xlsx_sheet_count: val.max_xlsx_sheet_count,
-            max_xlsx_workbook_cells: val.max_xlsx_workbook_cells,
-            max_pptx_embedded_count: val.max_pptx_embedded_count,
-            ..Default::default()
-        }
-    }
-}
-
 impl From<xberg::HeuristicsConfig> for HeuristicsConfig {
     fn from(val: xberg::HeuristicsConfig) -> Self {
         Self {
@@ -37526,17 +37461,6 @@ impl From<xberg::DocumentBoundary> for DocumentBoundary {
             end_page: val.end_page,
             confidence: val.confidence,
             reason: val.reason.into(),
-        }
-    }
-}
-
-#[allow(clippy::needless_update)]
-impl From<MultidocThresholds> for xberg::MultidocThresholds {
-    fn from(val: MultidocThresholds) -> Self {
-        Self {
-            density_shift_threshold: val.density_shift_threshold,
-            bigram_overlap_min: val.bigram_overlap_min,
-            ..Default::default()
         }
     }
 }
@@ -38860,31 +38784,6 @@ impl From<xberg::RerankerHead> for RerankerHead {
     }
 }
 
-impl From<RerankerModelType> for xberg::RerankerModelType {
-    fn from(val: RerankerModelType) -> Self {
-        match val {
-            RerankerModelType::Preset { name } => Self::Preset { name: name },
-            RerankerModelType::Custom {
-                model_id,
-                model_file,
-                additional_files,
-                max_length,
-                head,
-            } => Self::Custom {
-                model_id: model_id,
-                model_file: model_file,
-                additional_files: additional_files.into_iter().collect(),
-                max_length: max_length,
-                head: head.into(),
-            },
-            RerankerModelType::Llm { llm } => Self::Llm {
-                llm: Box::new(llm.into()),
-            },
-            RerankerModelType::Plugin { name } => Self::Plugin { name: name },
-        }
-    }
-}
-
 impl From<xberg::RerankerModelType> for RerankerModelType {
     fn from(val: xberg::RerankerModelType) -> Self {
         match val {
@@ -39020,18 +38919,6 @@ impl From<xberg::ProcessingStage> for ProcessingStage {
             xberg::ProcessingStage::Early => Self::Early,
             xberg::ProcessingStage::Middle => Self::Middle,
             xberg::ProcessingStage::Late => Self::Late,
-        }
-    }
-}
-
-impl From<ReductionLevel> for xberg::ReductionLevel {
-    fn from(val: ReductionLevel) -> Self {
-        match val {
-            ReductionLevel::Off => Self::Off,
-            ReductionLevel::Light => Self::Light,
-            ReductionLevel::Moderate => Self::Moderate,
-            ReductionLevel::Aggressive => Self::Aggressive,
-            ReductionLevel::Maximum => Self::Maximum,
         }
     }
 }

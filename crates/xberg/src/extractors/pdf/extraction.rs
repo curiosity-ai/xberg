@@ -135,25 +135,51 @@ pub(crate) fn extract_all_from_oxide_document(
     let needs_structured = needs_structured_extraction(hierarchy_enabled, &config.output_format, ocr_inline_images);
     let retain_hierarchy_segments = needs_structured && !config.force_ocr;
 
+    let mut extraction_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
+
+    /// Report a table-extraction failure that took out a whole detector pass, not just one page.
+    ///
+    /// The per-page warnings in `pdf::oxide::table` cannot cover these: a stage that fails or
+    /// panics outright returns no pages at all, so its own warnings never reach the caller and
+    /// the document comes back with an empty `tables` list indistinguishable from a PDF that
+    /// genuinely has none. ~keep
+    fn table_stage_failure_warning(stage: &str, error: &impl std::fmt::Display) -> crate::types::ProcessingWarning {
+        crate::types::ProcessingWarning {
+            source: std::borrow::Cow::Borrowed("pdf_tables"),
+            message: std::borrow::Cow::Owned(format!(
+                "{stage} table extraction failed for the document: {error}; \
+                 tables from this pass were skipped"
+            )),
+        }
+    }
+
     let extract_tables_flag = config.pdf_options.as_ref().is_none_or(|opts| opts.extract_tables);
     let allow_single_column = config
         .pdf_options
         .as_ref()
         .is_some_and(|o| o.allow_single_column_tables);
-    let (tables, mut extracted_hierarchy_segments) = if extract_tables_flag {
+    let (tables, mut extracted_hierarchy_segments, table_warnings) = if extract_tables_flag {
         crate::pdf::oxide::guard_oxide_panic(
-            || -> Result<(Vec<Table>, Option<crate::pdf::oxide::table::ExtractedHierarchySegments>)> {
-                let mut combined = crate::pdf::oxide::table::extract_tables_native(&mut doc).unwrap_or_else(|e| {
-                    tracing::warn!("pdf_oxide native table extraction failed, skipping tables: {e}");
-                    Vec::new()
-                });
+            || -> Result<(
+                Vec<Table>,
+                Option<crate::pdf::oxide::table::ExtractedHierarchySegments>,
+                Vec<crate::types::ProcessingWarning>,
+            )> {
+                let mut warnings = Vec::new();
+                let (mut combined, native_warnings) =
+                    crate::pdf::oxide::table::extract_tables_native(&mut doc).unwrap_or_else(|e| {
+                        tracing::warn!("pdf_oxide native table extraction failed, skipping tables: {e}");
+                        (Vec::new(), vec![table_stage_failure_warning("native", &e)])
+                    });
+                warnings.extend(native_warnings);
                 let native_pages: std::collections::HashSet<u32> = combined.iter().map(|t| t.page_number).collect();
-                let bordered = crate::pdf::oxide::table::extract_tables_bordered(&mut doc, &native_pages)
-                    .unwrap_or_else(|e| {
+                let (bordered, bordered_warnings) =
+                    crate::pdf::oxide::table::extract_tables_bordered(&mut doc, &native_pages).unwrap_or_else(|e| {
                         tracing::warn!("pdf_oxide bordered table extraction failed, skipping tables: {e}");
-                        Vec::new()
+                        (Vec::new(), vec![table_stage_failure_warning("bordered", &e)])
                     });
                 combined.extend(bordered);
+                warnings.extend(bordered_warnings);
                 let covered_pages: std::collections::HashSet<u32> = combined.iter().map(|t| t.page_number).collect();
                 let hierarchy_segments = match crate::pdf::oxide::table::extract_tables_heuristic(
                     &mut doc,
@@ -166,6 +192,7 @@ pub(crate) fn extract_all_from_oxide_document(
                     }
                     Err(error) => {
                         tracing::warn!("pdf_oxide heuristic table extraction failed, skipping tables: {error}");
+                        warnings.push(table_stage_failure_warning("heuristic", &error));
                         None
                     }
                 };
@@ -177,7 +204,7 @@ pub(crate) fn extract_all_from_oxide_document(
                 if repaired_tables > 0 {
                     tracing::debug!(repaired_tables, "repaired collapsed PDF table columns");
                 }
-                Ok((combined, hierarchy_segments))
+                Ok((combined, hierarchy_segments, warnings))
             },
             |panic| crate::error::XbergError::Parsing {
                 message: format!("pdf_oxide panicked during table extraction: {panic}"),
@@ -186,13 +213,12 @@ pub(crate) fn extract_all_from_oxide_document(
         )
         .unwrap_or_else(|e| {
             tracing::warn!("pdf_oxide table extraction panicked, skipping tables: {e}");
-            (Vec::new(), None)
+            (Vec::new(), None, vec![table_stage_failure_warning("whole-document", &e)])
         })
     } else {
-        (Vec::new(), None)
+        (Vec::new(), None, Vec::new())
     };
-
-    let mut extraction_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
+    extraction_warnings.extend(table_warnings);
 
     let annotations = if config.pdf_options.as_ref().is_some_and(|opts| opts.extract_annotations) {
         let (extracted, annotation_warnings) = crate::pdf::oxide::annotations::extract_annotations(&mut doc);

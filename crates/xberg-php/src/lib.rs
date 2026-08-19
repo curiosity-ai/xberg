@@ -503,12 +503,6 @@ impl ContentFilterConfig {
     pub fn get_include_watermarks(&self) -> bool {
         self.include_watermarks.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> ContentFilterConfig {
-        xberg::ContentFilterConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1551,12 +1545,6 @@ impl ExtractionConfig {
         };
         core_self.needs_image_processing()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> ExtractionConfig {
-        xberg::ExtractionConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1961,12 +1949,6 @@ impl SvgOptions {
     pub fn get_render_dpi(&self) -> f32 {
         self.render_dpi.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> SvgOptions {
-        xberg::core::config::extraction::SvgOptions::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -2051,12 +2033,6 @@ impl ExtractInput {
 
     pub fn set_config(&mut self, value: Option<&FileExtractionConfig>) {
         self.config = value.map(|value| value.clone().into());
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> ExtractInput {
-        xberg::ExtractInput::default().into()
     }
 
     /// Build a bytes input with a MIME type and optional filename hint.
@@ -2384,12 +2360,6 @@ impl UrlExtractionConfig {
     pub fn get_allow_file_uris(&self) -> bool {
         self.allow_file_uris.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> UrlExtractionConfig {
-        xberg::UrlExtractionConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -2631,12 +2601,6 @@ impl ImageExtractionConfig {
     pub fn get_include_data_base64(&self) -> bool {
         self.include_data_base64.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> ImageExtractionConfig {
-        xberg::ImageExtractionConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -2681,12 +2645,6 @@ impl TokenReductionOptions {
 
     pub fn get_preserve_important_words(&self) -> bool {
         self.preserve_important_words.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> TokenReductionOptions {
-        xberg::TokenReductionOptions::default().into()
     }
 }
 
@@ -2743,12 +2701,6 @@ impl LanguageDetectionConfig {
 
     pub fn get_detect_multiple(&self) -> bool {
         self.detect_multiple.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> LanguageDetectionConfig {
-        xberg::LanguageDetectionConfig::default().into()
     }
 }
 
@@ -2836,12 +2788,6 @@ impl HtmlOutputConfig {
 
     pub fn get_embed_css(&self) -> bool {
         self.embed_css.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> HtmlOutputConfig {
-        xberg::HtmlOutputConfig::default().into()
     }
 }
 
@@ -2966,12 +2912,6 @@ impl LateInteractionConfig {
     pub fn get_max_embed_duration_secs(&self) -> Option<i64> {
         self.max_embed_duration_secs.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> LateInteractionConfig {
-        xberg::LateInteractionConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -3005,6 +2945,15 @@ pub struct LayoutDetectionConfig {
     #[serde(skip_serializing_if = "String::is_empty")]
     #[serde(alias = "tableModel")]
     pub table_model: String,
+    /// Formula recognition model for layout-detected formula regions.
+    ///
+    /// `None` (the default) keeps the plain OCR text of the region. Setting a
+    /// model converts each formula region crop to LaTeX. Requires the
+    /// `formula-recognition` feature; without it the setting is ignored.
+    #[php(prop, name = "formulaModel")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "formulaModel")]
+    pub formula_model: Option<String>,
     /// How to resolve overlapping native vs layout tables.
     ///
     /// When a native oxide table and a layout (TATR/SLANeXT) table overlap on the
@@ -3052,6 +3001,7 @@ impl LayoutDetectionConfig {
         confidenceThreshold: Option<f32>,
         applyHeuristics: bool,
         tableModel: String,
+        formulaModel: Option<String>,
         tableOverlapPreference: String,
         enableChartUnderstanding: bool,
     ) -> Self {
@@ -3060,6 +3010,7 @@ impl LayoutDetectionConfig {
             confidence_threshold: confidenceThreshold,
             apply_heuristics: applyHeuristics,
             table_model: tableModel,
+            formula_model: formulaModel,
             table_overlap_preference: tableOverlapPreference,
             acceleration: Default::default(),
             enable_chart_understanding: enableChartUnderstanding,
@@ -3082,6 +3033,10 @@ impl LayoutDetectionConfig {
         self.table_model.clone()
     }
 
+    pub fn get_formula_model(&self) -> Option<String> {
+        self.formula_model.clone().map(Into::into)
+    }
+
     pub fn get_table_overlap_preference(&self) -> String {
         self.table_overlap_preference.clone()
     }
@@ -3096,12 +3051,6 @@ impl LayoutDetectionConfig {
 
     pub fn get_enable_chart_understanding(&self) -> bool {
         self.enable_chart_understanding.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> LayoutDetectionConfig {
-        xberg::LayoutDetectionConfig::default().into()
     }
 }
 
@@ -4218,12 +4167,6 @@ impl OcrQualityThresholds {
     pub fn get_min_provenance_fallback_ratio(&self) -> f64 {
         self.min_provenance_fallback_ratio.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> OcrQualityThresholds {
-        xberg::OcrQualityThresholds::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -4655,12 +4598,6 @@ impl OcrConfig {
     pub fn get_tessdata_path(&self) -> Option<String> {
         self.tessdata_path.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> OcrConfig {
-        xberg::OcrConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -4718,12 +4655,6 @@ impl PageConfig {
 
     pub fn get_marker_format(&self) -> String {
         self.marker_format.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> PageConfig {
-        xberg::PageConfig::default().into()
     }
 }
 
@@ -4919,12 +4850,6 @@ impl PdfConfig {
     pub fn get_reading_order(&self) -> bool {
         self.reading_order.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> PdfConfig {
-        xberg::PdfConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -4983,12 +4908,6 @@ impl HierarchyConfig {
 
     pub fn get_include_bbox(&self) -> bool {
         self.include_bbox.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> HierarchyConfig {
-        xberg::HierarchyConfig::default().into()
     }
 }
 
@@ -5067,12 +4986,6 @@ impl PostProcessorConfig {
 
     pub fn get_disabled_set(&self) -> Option<Vec<String>> {
         self.disabled_set.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> PostProcessorConfig {
-        xberg::PostProcessorConfig::default().into()
     }
 }
 
@@ -5308,12 +5221,6 @@ impl ChunkingConfig {
     pub fn get_breadcrumb_target(&self) -> String {
         self.breadcrumb_target.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> ChunkingConfig {
-        xberg::ChunkingConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -5456,12 +5363,6 @@ impl EmbeddingConfig {
     pub fn get_max_sequence_length(&self) -> Option<i64> {
         self.max_sequence_length.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> EmbeddingConfig {
-        xberg::EmbeddingConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -5601,12 +5502,6 @@ impl RedactionConfig {
             .validate()
             .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()))?;
         Ok(result)
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> RedactionConfig {
-        xberg::RedactionConfig::default().into()
     }
 }
 
@@ -5838,12 +5733,6 @@ impl RerankerConfig {
     pub fn get_max_rerank_duration_secs(&self) -> Option<i64> {
         self.max_rerank_duration_secs.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> RerankerConfig {
-        xberg::RerankerConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -5952,12 +5841,6 @@ impl SparseEmbeddingConfig {
 
     pub fn get_max_embed_duration_secs(&self) -> Option<i64> {
         self.max_embed_duration_secs.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> SparseEmbeddingConfig {
-        xberg::SparseEmbeddingConfig::default().into()
     }
 }
 
@@ -6188,12 +6071,6 @@ impl TranscriptionConfig {
     pub fn get_verify_hash(&self) -> bool {
         self.verify_hash.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> TranscriptionConfig {
-        xberg::TranscriptionConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -6343,12 +6220,6 @@ impl TreeSitterConfig {
     pub fn get_process(&self) -> TreeSitterProcessConfig {
         self.process.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> TreeSitterConfig {
-        xberg::TreeSitterConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -6480,12 +6351,6 @@ impl TreeSitterProcessConfig {
 
     pub fn get_content_mode(&self) -> String {
         self.content_mode.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> TreeSitterProcessConfig {
-        xberg::TreeSitterProcessConfig::default().into()
     }
 }
 
@@ -6665,12 +6530,6 @@ impl ServerConfig {
             ..Default::default()
         };
         core_self.max_multipart_field_mb() as i64
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> ServerConfig {
-        xberg::ServerConfig::default().into()
     }
 }
 
@@ -7446,12 +7305,6 @@ impl SecurityLimits {
     pub fn get_max_table_cells(&self) -> i64 {
         self.max_table_cells.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> SecurityLimits {
-        xberg::SecurityLimits::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -7614,12 +7467,6 @@ impl TokenReductionConfig {
     pub fn get_preserve_important_words(&self) -> bool {
         self.preserve_important_words.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> TokenReductionConfig {
-        xberg::TokenReductionConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -7742,12 +7589,6 @@ impl FootnoteConfig {
             ..Default::default()
         };
         core_self.with_parse_citations(enabled).into()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> FootnoteConfig {
-        xberg::FootnoteConfig::default().into()
     }
 }
 
@@ -8430,12 +8271,6 @@ impl DocumentStructure {
             ..Default::default()
         };
         core_self.is_empty()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> DocumentStructure {
-        xberg::DocumentStructure::default().into()
     }
 }
 
@@ -9186,9 +9021,10 @@ pub struct ExtractedDocument {
     pub redaction_report: Option<RedactionReport>,
     /// Mathematical formulas recognized in the document.
     ///
-    /// Populated by the layout-guided formula pipeline when the
-    /// `layout-detection` feature is enabled and the document contains regions
-    /// classified as formulas. Empty otherwise.
+    /// Populated from every source that produces formulas: layout-guided OCR
+    /// (with geometry), VLM OCR (text only), and markup extraction (DOCX,
+    /// PPTX, ODT, EPUB, HTML, JATS, LaTeX, Markdown, and related formats,
+    /// without geometry). Empty when the document contains no formulas.
     pub formulas: Vec<Formula>,
     /// Form fields extracted from a PDF's AcroForm or XFA structure.
     ///
@@ -11359,12 +11195,6 @@ impl ImagePreprocessingConfig {
     pub fn get_invert_colors(&self) -> bool {
         self.invert_colors.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> ImagePreprocessingConfig {
-        xberg::ImagePreprocessingConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -11642,12 +11472,6 @@ impl TesseractConfig {
     pub fn get_thresholding_method(&self) -> bool {
         self.thresholding_method.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> TesseractConfig {
-        xberg::TesseractConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -11762,23 +11586,26 @@ impl ImagePreprocessingMetadata {
 #[php(name = "Xberg\\Formula")]
 #[serde(default)]
 pub struct Formula {
-    /// LaTeX source of the recognized formula, without surrounding `$$` delimiters.
+    /// LaTeX source of the formula, without surrounding `$$` delimiters.
     ///
-    /// This field contains the raw LaTeX code as produced by the OCR backend.
-    /// To render the formula in Markdown or other formats, wrap with `$$..$$` delimiters as needed.
+    /// Markup converters and formula OCR produce real LaTeX. The native PDF
+    /// layout path stores the plain text of a detected formula region, which
+    /// keeps the original Unicode math characters instead of LaTeX commands.
+    /// To render the formula in Markdown or other formats, wrap it in `$$..$$`.
     #[php(prop, name = "latex")]
     pub latex: String,
-    /// Bounding box of the formula region on its page, in rendered-image pixel coordinates.
+    /// Bounding box of the formula region on its page. `None` for markup sources.
     ///
-    /// The coordinates are in the space of the OCR-rendered page image at the OCR DPI
-    /// (typically 300 DPI). These coordinates are NOT comparable to bounding boxes from
-    /// native PDF text extraction, which use PDF point coordinates.
-    pub bbox: BoundingBox,
-    /// 1-indexed page number the formula appears on in the document.
-    ///
-    /// This is set by the extraction pipeline based on which page the formula was found on.
+    /// PDF OCR sources report PDF point coordinates with the origin at the
+    /// bottom-left of the page, comparable to native PDF geometry. Image
+    /// sources, and PDF pages whose geometry is unavailable, report pixels of
+    /// the image the OCR backend saw. The C FFI reports an absent bbox as a
+    /// null pointer.
+    pub bbox: Option<BoundingBox>,
+    /// 1-indexed page number the formula appears on. `None` when the source
+    /// format has no page concept. The C FFI reports an absent page as `0`.
     #[php(prop, name = "page")]
-    pub page: u32,
+    pub page: Option<u32>,
 }
 
 #[php_impl]
@@ -11789,7 +11616,7 @@ impl Formula {
     }
 
     #[php(constructor)]
-    pub fn new(latex: String, page: u32) -> Self {
+    pub fn new(latex: String, page: Option<u32>) -> Self {
         Self {
             latex,
             bbox: Default::default(),
@@ -11801,11 +11628,15 @@ impl Formula {
         self.latex.clone()
     }
 
-    pub fn get_bbox(&self) -> BoundingBox {
-        self.bbox.clone()
+    pub fn get_bbox(&self) -> Option<BoundingBox> {
+        self.bbox.clone().map(Into::into)
     }
 
-    pub fn get_page(&self) -> u32 {
+    pub fn set_bbox(&mut self, value: Option<&BoundingBox>) {
+        self.bbox = value.map(|value| value.clone().into());
+    }
+
+    pub fn get_page(&self) -> Option<u32> {
         self.page.clone()
     }
 }
@@ -15564,12 +15395,6 @@ impl DiffOptions {
     pub fn get_max_content_chars(&self) -> Option<i64> {
         self.max_content_chars.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> DiffOptions {
-        xberg::DiffOptions::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -16184,12 +16009,6 @@ impl YakeParams {
     pub fn get_window_size(&self) -> i64 {
         self.window_size.clone()
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> YakeParams {
-        xberg::YakeParams::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -16236,12 +16055,6 @@ impl RakeParams {
 
     pub fn get_max_words_per_phrase(&self) -> i64 {
         self.max_words_per_phrase.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> RakeParams {
-        xberg::RakeParams::default().into()
     }
 }
 
@@ -16335,12 +16148,6 @@ impl KeywordConfig {
 
     pub fn set_rake_params(&mut self, value: Option<&RakeParams>) {
         self.rake_params = value.map(|value| value.clone().into());
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> KeywordConfig {
-        xberg::KeywordConfig::default().into()
     }
 }
 
@@ -16788,12 +16595,6 @@ impl HeuristicsConfig {
             .map_err(|e| ext_php_rs::exception::PhpException::default(e.to_string()))?;
         Ok(result)
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> HeuristicsConfig {
-        xberg::HeuristicsConfig::default().into()
-    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -17114,12 +16915,6 @@ impl MultidocThresholds {
 
     pub fn get_bigram_overlap_min(&self) -> f32 {
         self.bigram_overlap_min.clone()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> MultidocThresholds {
-        xberg::MultidocThresholds::default().into()
     }
 }
 
@@ -18264,13 +18059,6 @@ impl PaddleOcrConfig {
             ..Default::default()
         };
         core_self.with_model_version(version).into()
-    }
-
-    /// Creates a default configuration with English language support.
-    #[allow(clippy::should_implement_trait)]
-    #[php(name = "default")]
-    pub fn default() -> PaddleOcrConfig {
-        xberg::PaddleOcrConfig::default().into()
     }
 }
 
@@ -20593,6 +20381,15 @@ impl LateInteractionModelType {
 }
 
 #[php_class]
+#[php(name = "Xberg\\FormulaModel")]
+pub struct FormulaModel {}
+
+#[php_impl]
+impl FormulaModel {
+    pub const LATEXOCR: &str = "LatexOcr";
+}
+
+#[php_class]
 #[php(name = "Xberg\\TableModel")]
 pub struct TableModel {}
 
@@ -21937,6 +21734,7 @@ impl ElementType {
     pub const IMAGE: &str = "Image";
     pub const PAGEBREAK: &str = "PageBreak";
     pub const CODEBLOCK: &str = "CodeBlock";
+    pub const FORMULA: &str = "Formula";
     pub const BLOCKQUOTE: &str = "BlockQuote";
     pub const FOOTER: &str = "Footer";
     pub const HEADER: &str = "Header";
@@ -27817,6 +27615,10 @@ impl From<LayoutDetectionConfig> for xberg::LayoutDetectionConfig {
                 "disabled" => xberg::TableModel::Disabled,
                 _ => Default::default(),
             },
+            formula_model: val.formula_model.as_deref().map(|s| match s {
+                "latex_ocr" => xberg::core::config::layout::FormulaModel::LatexOcr,
+                _ => xberg::core::config::layout::FormulaModel::LatexOcr,
+            }),
             table_overlap_preference: match val.table_overlap_preference.as_str() {
                 "content" => xberg::core::config::layout::TableOverlapPreference::Content,
                 "native" => xberg::core::config::layout::TableOverlapPreference::Native,
@@ -27844,6 +27646,12 @@ impl From<xberg::LayoutDetectionConfig> for LayoutDetectionConfig {
                 .ok()
                 .and_then(|s| s.as_str().map(String::from))
                 .unwrap_or_default(),
+            formula_model: val.formula_model.as_ref().map(|v| {
+                serde_json::to_value(v)
+                    .ok()
+                    .and_then(|s| s.as_str().map(String::from))
+                    .unwrap_or_default()
+            }),
             table_overlap_preference: serde_json::to_value(val.table_overlap_preference)
                 .ok()
                 .and_then(|s| s.as_str().map(String::from))
@@ -28644,23 +28452,6 @@ impl From<xberg::RedactionPattern> for RedactionPattern {
     }
 }
 
-#[allow(clippy::needless_update)]
-#[allow(clippy::useless_conversion)]
-impl From<RerankerConfig> for xberg::RerankerConfig {
-    fn from(val: RerankerConfig) -> Self {
-        Self {
-            model: val.model.into(),
-            top_k: val.top_k.map(|v| v as usize),
-            batch_size: val.batch_size as usize,
-            show_download_progress: val.show_download_progress,
-            cache_dir: val.cache_dir.map(Into::into),
-            acceleration: val.acceleration.map(Into::into),
-            max_rerank_duration_secs: val.max_rerank_duration_secs.map(|v| v as u64),
-            ..Default::default()
-        }
-    }
-}
-
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<xberg::RerankerConfig> for RerankerConfig {
     fn from(val: xberg::RerankerConfig) -> Self {
@@ -28903,20 +28694,6 @@ impl From<xberg::SupportedFormat> for SupportedFormat {
     }
 }
 
-#[allow(clippy::needless_update)]
-impl From<ServerConfig> for xberg::ServerConfig {
-    fn from(val: ServerConfig) -> Self {
-        Self {
-            host: val.host,
-            port: val.port,
-            cors_origins: val.cors_origins.into_iter().collect(),
-            max_request_body_bytes: val.max_request_body_bytes as usize,
-            max_multipart_field_bytes: val.max_multipart_field_bytes as usize,
-            ..Default::default()
-        }
-    }
-}
-
 impl From<xberg::ServerConfig> for ServerConfig {
     fn from(val: xberg::ServerConfig) -> Self {
         Self {
@@ -29109,35 +28886,6 @@ impl From<xberg::SecurityLimits> for SecurityLimits {
             max_iterations: val.max_iterations as i64,
             max_xml_depth: val.max_xml_depth as i64,
             max_table_cells: val.max_table_cells as i64,
-        }
-    }
-}
-
-#[allow(clippy::needless_update)]
-#[allow(clippy::useless_conversion)]
-impl From<TokenReductionConfig> for xberg::TokenReductionConfig {
-    fn from(val: TokenReductionConfig) -> Self {
-        Self {
-            level: match val.level.as_str() {
-                "Off" | "off" => xberg::ReductionLevel::Off,
-                "Light" | "light" => xberg::ReductionLevel::Light,
-                "Moderate" | "moderate" => xberg::ReductionLevel::Moderate,
-                "Aggressive" | "aggressive" => xberg::ReductionLevel::Aggressive,
-                "Maximum" | "maximum" => xberg::ReductionLevel::Maximum,
-                _ => Default::default(),
-            },
-            language_hint: val.language_hint,
-            preserve_markdown: val.preserve_markdown,
-            preserve_code: val.preserve_code,
-            semantic_threshold: val.semantic_threshold,
-            enable_parallel: val.enable_parallel,
-            use_simd: val.use_simd,
-            custom_stopwords: val.custom_stopwords.map(|m| m.into_iter().collect()),
-            preserve_patterns: val.preserve_patterns.into_iter().collect(),
-            target_reduction: val.target_reduction,
-            enable_semantic_clustering: val.enable_semantic_clustering,
-            preserve_important_words: val.preserve_important_words,
-            ..Default::default()
         }
     }
 }
@@ -30260,6 +30008,7 @@ impl From<Element> for xberg::Element {
                 "image" => xberg::ElementType::Image,
                 "page_break" => xberg::ElementType::PageBreak,
                 "code_block" => xberg::ElementType::CodeBlock,
+                "formula" => xberg::ElementType::Formula,
                 "block_quote" => xberg::ElementType::BlockQuote,
                 "footer" => xberg::ElementType::Footer,
                 "header" => xberg::ElementType::Header,
@@ -30605,7 +30354,7 @@ impl From<Formula> for xberg::Formula {
     fn from(val: Formula) -> Self {
         Self {
             latex: val.latex,
-            bbox: val.bbox.into(),
+            bbox: val.bbox.map(Into::into),
             page: val.page,
         }
     }
@@ -30616,7 +30365,7 @@ impl From<xberg::Formula> for Formula {
     fn from(val: xberg::Formula) -> Self {
         Self {
             latex: val.latex.to_string(),
-            bbox: val.bbox.into(),
+            bbox: val.bbox.map(Into::into),
             page: val.page,
         }
     }
@@ -32201,19 +31950,6 @@ impl From<xberg::api::DetectResponse> for DetectResponse {
     }
 }
 
-#[allow(clippy::needless_update)]
-#[allow(clippy::redundant_closure)]
-impl From<DiffOptions> for xberg::DiffOptions {
-    fn from(val: DiffOptions) -> Self {
-        Self {
-            include_metadata: val.include_metadata,
-            include_embedded: val.include_embedded,
-            max_content_chars: val.max_content_chars.map(|v| v as usize),
-            ..Default::default()
-        }
-    }
-}
-
 #[allow(clippy::redundant_closure)]
 impl From<xberg::DiffOptions> for DiffOptions {
     fn from(val: xberg::DiffOptions) -> Self {
@@ -32542,26 +32278,6 @@ impl From<xberg::ExtractionConfidence> for ExtractionConfidence {
     }
 }
 
-#[allow(clippy::needless_update)]
-impl From<HeuristicsConfig> for xberg::HeuristicsConfig {
-    fn from(val: HeuristicsConfig) -> Self {
-        Self {
-            enable_pdf_text_heuristics: val.enable_pdf_text_heuristics,
-            text_layer_threshold: val.text_layer_threshold,
-            file_size_threshold_bytes: val.file_size_threshold_bytes as u64,
-            page_count_threshold: val.page_count_threshold,
-            target_pages_per_chunk: val.target_pages_per_chunk,
-            max_pages_per_chunk: val.max_pages_per_chunk,
-            disk_processing_threshold_bytes: val.disk_processing_threshold_bytes as u64,
-            min_chars_per_page: val.min_chars_per_page,
-            max_xlsx_sheet_count: val.max_xlsx_sheet_count,
-            max_xlsx_workbook_cells: val.max_xlsx_workbook_cells as u64,
-            max_pptx_embedded_count: val.max_pptx_embedded_count,
-            ..Default::default()
-        }
-    }
-}
-
 impl From<xberg::HeuristicsConfig> for HeuristicsConfig {
     fn from(val: xberg::HeuristicsConfig) -> Self {
         Self {
@@ -32647,17 +32363,6 @@ impl From<xberg::DocumentBoundary> for DocumentBoundary {
                 .ok()
                 .and_then(|s| s.as_str().map(String::from))
                 .unwrap_or_default(),
-        }
-    }
-}
-
-#[allow(clippy::needless_update)]
-impl From<MultidocThresholds> for xberg::MultidocThresholds {
-    fn from(val: MultidocThresholds) -> Self {
-        Self {
-            density_shift_threshold: val.density_shift_threshold,
-            bigram_overlap_min: val.bigram_overlap_min,
-            ..Default::default()
         }
     }
 }
@@ -34824,6 +34529,37 @@ impl From<CacheStats> for xberg::CacheStats {
     }
 }
 
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<RerankerConfig> for xberg::RerankerConfig {
+    fn from(val: RerankerConfig) -> Self {
+        Self {
+            model: val.model.into(),
+            top_k: val.top_k.map(|v| v as usize),
+            batch_size: val.batch_size as usize,
+            show_download_progress: val.show_download_progress,
+            cache_dir: val.cache_dir.map(Into::into),
+            acceleration: val.acceleration.map(Into::into),
+            max_rerank_duration_secs: val.max_rerank_duration_secs.map(|v| v as u64),
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<ServerConfig> for xberg::ServerConfig {
+    fn from(val: ServerConfig) -> Self {
+        Self {
+            host: val.host,
+            port: val.port,
+            cors_origins: val.cors_origins.into_iter().collect(),
+            max_request_body_bytes: val.max_request_body_bytes as usize,
+            max_multipart_field_bytes: val.max_multipart_field_bytes as usize,
+            ..Default::default()
+        }
+    }
+}
+
 #[allow(clippy::redundant_closure, clippy::useless_conversion)]
 impl From<StructuredDataResult> for xberg::extraction::structured::StructuredDataResult {
     fn from(val: StructuredDataResult) -> Self {
@@ -34875,6 +34611,35 @@ impl From<PptxAppProperties> for xberg::extraction::office_metadata::app_propert
             multimedia_clips: val.multimedia_clips,
             presentation_format: val.presentation_format,
             slide_titles: val.slide_titles.into_iter().collect(),
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+#[allow(clippy::useless_conversion)]
+impl From<TokenReductionConfig> for xberg::TokenReductionConfig {
+    fn from(val: TokenReductionConfig) -> Self {
+        Self {
+            level: match val.level.as_str() {
+                "Off" | "off" => xberg::ReductionLevel::Off,
+                "Light" | "light" => xberg::ReductionLevel::Light,
+                "Moderate" | "moderate" => xberg::ReductionLevel::Moderate,
+                "Aggressive" | "aggressive" => xberg::ReductionLevel::Aggressive,
+                "Maximum" | "maximum" => xberg::ReductionLevel::Maximum,
+                _ => Default::default(),
+            },
+            language_hint: val.language_hint,
+            preserve_markdown: val.preserve_markdown,
+            preserve_code: val.preserve_code,
+            semantic_threshold: val.semantic_threshold,
+            enable_parallel: val.enable_parallel,
+            use_simd: val.use_simd,
+            custom_stopwords: val.custom_stopwords.map(|m| m.into_iter().collect()),
+            preserve_patterns: val.preserve_patterns.into_iter().collect(),
+            target_reduction: val.target_reduction,
+            enable_semantic_clustering: val.enable_semantic_clustering,
+            preserve_important_words: val.preserve_important_words,
             ..Default::default()
         }
     }
@@ -35104,6 +34869,19 @@ impl From<DetectResponse> for xberg::api::DetectResponse {
 }
 
 #[allow(clippy::needless_update)]
+#[allow(clippy::redundant_closure)]
+impl From<DiffOptions> for xberg::DiffOptions {
+    fn from(val: DiffOptions) -> Self {
+        Self {
+            include_metadata: val.include_metadata,
+            include_embedded: val.include_embedded,
+            max_content_chars: val.max_content_chars.map(|v| v as usize),
+            ..Default::default()
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
 #[allow(clippy::useless_conversion)]
 impl From<ExtractionDiff> for xberg::ExtractionDiff {
     fn from(val: ExtractionDiff) -> Self {
@@ -35232,6 +35010,26 @@ impl From<UserChunkConfig> for xberg::UserChunkConfig {
     }
 }
 
+#[allow(clippy::needless_update)]
+impl From<HeuristicsConfig> for xberg::HeuristicsConfig {
+    fn from(val: HeuristicsConfig) -> Self {
+        Self {
+            enable_pdf_text_heuristics: val.enable_pdf_text_heuristics,
+            text_layer_threshold: val.text_layer_threshold,
+            file_size_threshold_bytes: val.file_size_threshold_bytes as u64,
+            page_count_threshold: val.page_count_threshold,
+            target_pages_per_chunk: val.target_pages_per_chunk,
+            max_pages_per_chunk: val.max_pages_per_chunk,
+            disk_processing_threshold_bytes: val.disk_processing_threshold_bytes as u64,
+            min_chars_per_page: val.min_chars_per_page,
+            max_xlsx_sheet_count: val.max_xlsx_sheet_count,
+            max_xlsx_workbook_cells: val.max_xlsx_workbook_cells as u64,
+            max_pptx_embedded_count: val.max_pptx_embedded_count,
+            ..Default::default()
+        }
+    }
+}
+
 #[allow(clippy::useless_conversion)]
 impl From<ChunkInfo> for xberg::ChunkInfo {
     fn from(val: ChunkInfo) -> Self {
@@ -35277,6 +35075,17 @@ impl From<DocumentBoundary> for xberg::DocumentBoundary {
                 "end" => xberg::BoundaryReason::End,
                 _ => xberg::BoundaryReason::Start,
             },
+        }
+    }
+}
+
+#[allow(clippy::needless_update)]
+impl From<MultidocThresholds> for xberg::MultidocThresholds {
+    fn from(val: MultidocThresholds) -> Self {
+        Self {
+            density_shift_threshold: val.density_shift_threshold,
+            bigram_overlap_min: val.bigram_overlap_min,
+            ..Default::default()
         }
     }
 }
@@ -36420,6 +36229,7 @@ pub extern "C" fn get_module() -> *mut ::ext_php_rs::zend::ModuleEntry {
             .class::<JupyterCellRendering>()
             .class::<HtmlTheme>()
             .class::<LateInteractionModelType>()
+            .class::<FormulaModel>()
             .class::<TableModel>()
             .class::<TableOverlapPreference>()
             .class::<LayoutStrategy>()

@@ -222,6 +222,15 @@ const GRIDLINE_AXIS_EPSILON: f32 = 0.75;
 /// has to absorb rounding in the source file.
 const GRIDLINE_SPACING_TOLERANCE_RATIO: f32 = 0.15;
 
+/// Minimum number of shapes an axis-aligned stroke must lie flush against,
+/// each for more than a single point of contact, before it is read as a
+/// chart's own axis or frame line rather than a connector. See
+/// [`find_frame_lines`]. Shares [`GRIDLINE_MIN_COUNT`]'s value and rationale:
+/// three is the smallest count a coincidence cannot plausibly explain, and
+/// nothing a layout engine draws lines a connector up against the shared
+/// border of that many shapes it does not join.
+const FRAME_MIN_FLUSH_EDGES: usize = GRIDLINE_MIN_COUNT;
+
 /// Build a graph from recovered geometry, or `None` when the geometry is not a
 /// graph.
 ///
@@ -304,15 +313,18 @@ pub(crate) fn assemble(
 
     // Chart chrome, not connectors: a plotting library's gridlines are a
     // family of parallel, same-style strokes at a regular interval, each
-    // crossing the same span of the plot. Dropped here, before arrowhead
-    // detection and every distance test below, so a gridline can never be
-    // mistaken for either.
+    // crossing the same span of the plot; its axis and outer frame are drawn
+    // as a single stroke lying flush with the shared edge of the shapes it
+    // scales, with no peer of its own style to be caught by the family test.
+    // Both are dropped here, before arrowhead detection and every distance
+    // test below, so neither can be mistaken for a connector.
     let connectors: Vec<Connector> = connectors.into_iter().take(MAX_CONNECTORS).collect();
     let is_gridline = find_gridlines(&connectors, snap);
+    let is_frame = find_frame_lines(&kept, &connectors, snap);
     let connectors: Vec<Connector> = connectors
         .into_iter()
-        .zip(is_gridline)
-        .filter_map(|(connector, gridline)| (!gridline).then_some(connector))
+        .zip(is_gridline.into_iter().zip(is_frame))
+        .filter_map(|(connector, (gridline, frame_line))| (!gridline && !frame_line).then_some(connector))
         .collect();
     let arrowheads = find_arrowheads(&kept, &connectors, &owners, snap, canvas_max);
 
@@ -438,13 +450,41 @@ pub(crate) fn assemble(
     )
     .map(|median| median * UNLABELLED_DECORATION_RATIO);
 
+    // A renderer that writes a label onto an edge puts an opaque box behind the
+    // text so the line does not run through it. The box is the text's own
+    // background rather than a shape in the drawing, and it only reaches here
+    // from a PDF writer: mermaid states the same background as a CSS fill on an
+    // HTML label, which the SVG carries as no path at all and a PDF writer
+    // turns into a real filled rectangle.
+    //
+    // Two things together tell it from a node, and one alone would not. It is
+    // far smaller than the shapes that are nodes, which is the same measure
+    // decoration is judged by. And every word written in it sits on a
+    // connector, which is where an edge label goes and where a node's caption
+    // does not. Dropped here, the text returns to the free labels and reaches
+    // the edge it belongs to.
+    let edge_label_reach = snap * EDGE_LABEL_REACH;
+    let label_backgrounds: Vec<bool> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, outline)| {
+            !owned[i].is_empty()
+                && decoration_cutoff.is_some_and(|cutoff| outline.bbox.area() < cutoff)
+                && owned[i].iter().all(|label| {
+                    connectors
+                        .iter()
+                        .any(|c| (label.x - c.midpoint.0).hypot(label.y - c.midpoint.1) <= edge_label_reach)
+                })
+        })
+        .collect();
+
     // Arrowheads are geometry belonging to the connector that ends in them, not
     // shapes in their own right, so they never become nodes.
     let node_indices: Vec<usize> = (0..kept.len())
         .filter(|i| {
             let anonymous_decoration = owned[*i].is_empty()
                 && (overlapping[*i] || decoration_cutoff.is_some_and(|cutoff| kept[*i].bbox.area() < cutoff));
-            !arrowheads[*i] && !grids[*i] && !is_container[*i] && !anonymous_decoration
+            !arrowheads[*i] && !grids[*i] && !is_container[*i] && !anonymous_decoration && !label_backgrounds[*i]
         })
         .collect();
     if node_indices.is_empty() {
@@ -863,6 +903,79 @@ fn is_gridline_family(connectors: &[Connector], indices: &[usize], horizontal: b
         .all(|gap| (gap - average).abs() <= average * GRIDLINE_SPACING_TOLERANCE_RATIO)
 }
 
+/// Mark the connectors that are a chart's own axis or frame line rather than a
+/// diagram connector.
+///
+/// A gridline never travels alone; [`find_gridlines`] catches those by their
+/// peers sharing style, span and spacing. A plot's axis and outer frame do
+/// not need a peer to be chart furniture: a plotting library draws the
+/// x-axis as one stroke running the width of the plot, flush with every
+/// bar's baseline, and the y-axis as one stroke flush with the plot's left
+/// edge, and each is typically the only stroke drawn in its own colour and
+/// orientation, so the family test never sees three of them to group.
+///
+/// What gives such a stroke away instead is what it lies against: it is
+/// collinear with the same boundary edge of several shapes at once, and for
+/// a real stretch of each one's own span, not a single point where two
+/// unrelated things happen to meet. A real connector's endpoints touch at
+/// most the two shapes it joins, each at a point; nothing a layout engine
+/// draws lines a connector up flush against the shared edge of three or more
+/// shapes it does not connect. This is deliberately narrower than testing
+/// whether a stroke crosses a shape's interior — that was tried for GH#1420
+/// and rejected, since it costs real edges that legitimately pass near or
+/// through a third shape on their way between the two they join. Requiring
+/// the stroke to run *along a shared boundary*, not merely *near* several
+/// shapes, is what a real connector never does by coincidence.
+fn find_frame_lines(outlines: &[Outline], connectors: &[Connector], snap: f32) -> Vec<bool> {
+    connectors
+        .iter()
+        .map(|connector| is_frame_line(outlines, connector, snap))
+        .collect()
+}
+
+/// Whether a single axis-aligned connector lies flush with the same boundary
+/// edge of at least [`FRAME_MIN_FLUSH_EDGES`] shapes. See [`find_frame_lines`].
+fn is_frame_line(outlines: &[Outline], connector: &Connector, snap: f32) -> bool {
+    let horizontal = (connector.start.1 - connector.end.1).abs() <= GRIDLINE_AXIS_EPSILON;
+    let vertical = (connector.start.0 - connector.end.0).abs() <= GRIDLINE_AXIS_EPSILON;
+    if !horizontal && !vertical {
+        return false;
+    }
+
+    // A connector that is (near enough) both a point and axis-aligned in both
+    // senses is judged as horizontal; which axis a near-zero-length stroke is
+    // read against does not change the answer.
+    let (axis, run_min, run_max) = if horizontal {
+        (
+            (connector.start.1 + connector.end.1) / 2.0,
+            connector.start.0.min(connector.end.0),
+            connector.start.0.max(connector.end.0),
+        )
+    } else {
+        (
+            (connector.start.0 + connector.end.0) / 2.0,
+            connector.start.1.min(connector.end.1),
+            connector.start.1.max(connector.end.1),
+        )
+    };
+
+    let flush_edges = outlines
+        .iter()
+        .filter(|outline| {
+            let (near, far, span_min, span_max) = if horizontal {
+                (outline.bbox.y0, outline.bbox.y1, outline.bbox.x0, outline.bbox.x1)
+            } else {
+                (outline.bbox.x0, outline.bbox.x1, outline.bbox.y0, outline.bbox.y1)
+            };
+            let on_boundary = (near - axis).abs() <= snap || (far - axis).abs() <= snap;
+            let overlap = (span_max.min(run_max) - span_min.max(run_min)).max(0.0);
+            on_boundary && overlap > snap
+        })
+        .count();
+
+    flush_edges >= FRAME_MIN_FLUSH_EDGES
+}
+
 /// Distance between the smallest and largest value in a set of coordinates.
 /// Zero for an empty set, so an empty group never looks like a match by
 /// default.
@@ -1045,6 +1158,56 @@ mod tests {
     /// Landing points for a drawing whose connectors reach none of its shapes.
     fn nowhere(outlines: usize) -> Vec<Vec<(f32, f32)>> {
         vec![Vec::new(); outlines]
+    }
+
+    /// A box drawn behind an edge label so the line does not run through the
+    /// text is the label's background, not a node. Mermaid states it as a CSS
+    /// fill on an HTML label, which no SVG path carries and a PDF writer turns
+    /// into a real filled rectangle, so only the PDF side ever sees it.
+    #[test]
+    fn a_box_behind_an_edge_label_is_not_a_node() {
+        let mut background = outline(55.0, 115.0, 75.0, 135.0);
+        background.fill = Some("#e8e8e8".to_string());
+
+        let graph = assemble(
+            None,
+            (400.0, 400.0),
+            vec![outline(0.0, 0.0, 100.0, 50.0), background, outline(0.0, 200.0, 100.0, 250.0)],
+            vec![connector((50.0, 50.0), (50.0, 200.0))],
+            vec![label(50.0, 25.0, "Start"), label(65.0, 125.0, "yes"), label(50.0, 225.0, "End")],
+        )
+        .expect("graph");
+
+        let names: Vec<&str> = graph.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(names, ["Start", "End"]);
+        // The text the background held returns to the edge it was written on.
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].label.as_deref(), Some("yes"));
+    }
+
+    /// Only text sitting on a connector reads as an edge label. A small node
+    /// whose caption is nowhere near a connector keeps its own name.
+    #[test]
+    fn a_small_node_away_from_every_connector_keeps_its_label() {
+        let graph = assemble(
+            None,
+            (400.0, 400.0),
+            vec![
+                outline(0.0, 0.0, 100.0, 50.0),
+                outline(300.0, 300.0, 320.0, 320.0),
+                outline(0.0, 200.0, 100.0, 250.0),
+            ],
+            vec![connector((50.0, 50.0), (50.0, 200.0))],
+            vec![
+                label(50.0, 25.0, "Start"),
+                label(50.0, 225.0, "End"),
+                label(310.0, 310.0, "Aside"),
+            ],
+        )
+        .expect("graph");
+
+        let names: Vec<&str> = graph.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(names, ["Start", "End", "Aside"]);
     }
 
     /// A connector leaving a node and returning to it is a self-loop, and the

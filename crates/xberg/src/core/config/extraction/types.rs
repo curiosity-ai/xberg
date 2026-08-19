@@ -324,7 +324,7 @@ impl Default for UrlExtractionConfig {
         Self {
             mode: UrlExtractionMode::Auto,
             #[cfg(any(feature = "url-ingestion", feature = "url-config-types"))]
-            crawl: default_xberg_crawl_config(),
+            crawl: UrlExtractionConfig::default_xberg_crawl_config(),
             document_url_pattern: None,
             max_document_urls_per_result: Some(100),
             max_total_urls: Some(1_000),
@@ -335,17 +335,23 @@ impl Default for UrlExtractionConfig {
 }
 
 #[cfg(any(feature = "url-ingestion", feature = "url-config-types"))]
-fn default_xberg_crawl_config() -> crawlberg::CrawlConfig {
-    crawlberg::CrawlConfig {
-        max_depth: Some(1),
-        max_pages: Some(100),
-        max_concurrent: Some(10),
-        respect_robots_txt: true,
-        soft_http_errors: true,
-        stay_on_domain: true,
-        allow_subdomains: true,
-        document_url_depth: Some(1),
-        ..Default::default()
+impl UrlExtractionConfig {
+    /// Default [`Self::crawl`] policy.
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_xberg_crawl_config() -> crawlberg::CrawlConfig {
+        crawlberg::CrawlConfig {
+            max_depth: Some(1),
+            max_pages: Some(100),
+            max_concurrent: Some(10),
+            respect_robots_txt: true,
+            soft_http_errors: true,
+            stay_on_domain: true,
+            allow_subdomains: true,
+            document_url_depth: Some(1),
+            ..Default::default()
+        }
     }
 }
 

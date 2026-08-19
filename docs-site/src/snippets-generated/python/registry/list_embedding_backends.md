@@ -14,6 +14,7 @@ from xberg import list_embedding_backends, ExtractionConfig
 
 def main() -> None:
     _ = list_embedding_backends()
+    print(result)
 
 main()
 

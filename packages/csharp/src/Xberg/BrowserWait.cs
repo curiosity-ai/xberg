@@ -10,44 +10,52 @@ namespace Xberg;
 /// Wait strategy for browser page rendering.
 /// </summary>
 [JsonConverter(typeof(BrowserWaitJsonConverter))]
-public enum BrowserWait {
-  /// <summary>
-  /// Wait until network activity is idle.
-  /// </summary>
-  [JsonPropertyName("network_idle")] NetworkIdle,
-  /// <summary>
-  /// Wait for a specific CSS selector to appear in the DOM.
-  /// </summary>
-  [JsonPropertyName("selector")] Selector,
-  /// <summary>
-  /// Wait for a fixed duration after navigation.
-  /// </summary>
-  [JsonPropertyName("fixed")] Fixed,
+public enum BrowserWait
+{
+    /// <summary>
+    /// Wait until network activity is idle.
+    /// </summary>
+    [JsonPropertyName("network_idle")]
+    NetworkIdle,
+    /// <summary>
+    /// Wait for a specific CSS selector to appear in the DOM.
+    /// </summary>
+    [JsonPropertyName("selector")]
+    Selector,
+    /// <summary>
+    /// Wait for a fixed duration after navigation.
+    /// </summary>
+    [JsonPropertyName("fixed")]
+    Fixed,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="BrowserWait"/> that respects explicit
-/// variant names.
-/// </summary>
-internal sealed class BrowserWaitJsonConverter : JsonConverter<BrowserWait> {
-  public override BrowserWait Read(ref Utf8JsonReader reader,
-                                   Type typeToConvert,
-                                   JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch {
-      "network_idle" => BrowserWait.NetworkIdle,
-      "selector" => BrowserWait.Selector, "fixed" => BrowserWait.Fixed,
-      _ => throw new JsonException($"Unknown BrowserWait value: {value}")
-    };
-  }
 
-  public override void Write(Utf8JsonWriter writer, BrowserWait value,
-                             JsonSerializerOptions options) {
-    var str = value switch {
-      BrowserWait.NetworkIdle => "network_idle",
-      BrowserWait.Selector => "selector", BrowserWait.Fixed => "fixed",
-      _ => throw new JsonException($"Unknown BrowserWait value: {value}")
-    };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="BrowserWait"/> that respects explicit variant names.
+/// </summary>
+internal sealed class BrowserWaitJsonConverter : JsonConverter<BrowserWait>
+{
+    public override BrowserWait Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "network_idle" => BrowserWait.NetworkIdle,
+            "selector" => BrowserWait.Selector,
+            "fixed" => BrowserWait.Fixed,
+            _ => throw new JsonException($"Unknown BrowserWait value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, BrowserWait value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            BrowserWait.NetworkIdle => "network_idle",
+            BrowserWait.Selector => "selector",
+            BrowserWait.Fixed => "fixed",
+            _ => throw new JsonException($"Unknown BrowserWait value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

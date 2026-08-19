@@ -502,6 +502,12 @@ impl WasmContentFilterConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmContentFilterConfig {
+        <WasmContentFilterConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "includeHeaders")]
     pub fn include_headers(&self) -> bool {
         self.include_headers
@@ -550,12 +556,6 @@ impl WasmContentFilterConfig {
     #[wasm_bindgen(setter, js_name = "includeWatermarks")]
     pub fn set_include_watermarks(&mut self, value: bool) {
         self.include_watermarks = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmContentFilterConfig {
-        xberg::ContentFilterConfig::default().into()
     }
 }
 
@@ -813,7 +813,7 @@ impl WasmExtractionConfig {
             email: email,
             csv: csv,
             url: url.unwrap_or_default(),
-            max_archive_depth: maxArchiveDepth.unwrap_or_default(),
+            max_archive_depth: maxArchiveDepth.unwrap_or_else(|| xberg::ExtractionConfig::default().max_archive_depth),
             structured_extraction: structuredExtraction,
             ner: ner,
             redaction: redaction,
@@ -824,6 +824,12 @@ impl WasmExtractionConfig {
             captioning: captioning,
             qr_codes: qrCodes,
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmExtractionConfig {
+        <WasmExtractionConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter, js_name = "useCache")]
@@ -1294,12 +1300,6 @@ impl WasmExtractionConfig {
     #[wasm_bindgen(setter, js_name = "qrCodes")]
     pub fn set_qr_codes(&mut self, value: Option<bool>) {
         self.qr_codes = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmExtractionConfig {
-        xberg::ExtractionConfig::default().into()
     }
 
     /// Validate the configuration, returning an error if any settings are invalid.
@@ -1867,6 +1867,12 @@ impl WasmExtractInput {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmExtractInput {
+        <WasmExtractInput as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter)]
     pub fn kind(&self) -> String {
         self.kind.to_api_str().to_owned()
@@ -1925,12 +1931,6 @@ impl WasmExtractInput {
     #[wasm_bindgen(setter)]
     pub fn set_config(&mut self, value: Option<WasmFileExtractionConfig>) {
         self.config = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmExtractInput {
-        xberg::ExtractInput::default().into()
     }
 
     /// Build a bytes input with a MIME type and optional filename hint.
@@ -2284,13 +2284,19 @@ impl WasmUrlExtractionConfig {
     ) -> WasmUrlExtractionConfig {
         WasmUrlExtractionConfig {
             mode: mode.unwrap_or_default(),
-            crawl: crawl.unwrap_or_default(),
+            crawl: crawl.unwrap_or_else(|| xberg::UrlExtractionConfig::default().crawl.into()),
             document_url_pattern: documentUrlPattern,
             max_document_urls_per_result: maxDocumentUrlsPerResult,
             max_total_urls: maxTotalUrls,
             allow_local_file_inputs: allowLocalFileInputs.unwrap_or(true),
             allow_file_uris: allowFileUris.unwrap_or(true),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmUrlExtractionConfig {
+        <WasmUrlExtractionConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -2362,12 +2368,6 @@ impl WasmUrlExtractionConfig {
     pub fn set_allow_file_uris(&mut self, value: bool) {
         self.allow_file_uris = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmUrlExtractionConfig {
-        xberg::UrlExtractionConfig::default().into()
-    }
 }
 
 /// Image extraction configuration.
@@ -2436,6 +2436,12 @@ impl WasmImageExtractionConfig {
             output_format: outputFormat.unwrap_or_default(),
             include_data_base64: includeDataBase64.unwrap_or(false),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmImageExtractionConfig {
+        <WasmImageExtractionConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter, js_name = "extractImages")]
@@ -2587,12 +2593,6 @@ impl WasmImageExtractionConfig {
     pub fn set_include_data_base64(&mut self, value: bool) {
         self.include_data_base64 = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmImageExtractionConfig {
-        xberg::ImageExtractionConfig::default().into()
-    }
 }
 
 /// Token reduction configuration.
@@ -2615,9 +2615,15 @@ impl WasmTokenReductionOptions {
     #[wasm_bindgen(constructor)]
     pub fn new(mode: Option<String>, preserveImportantWords: Option<bool>) -> WasmTokenReductionOptions {
         WasmTokenReductionOptions {
-            mode: mode.unwrap_or_default(),
+            mode: mode.unwrap_or_else(|| xberg::TokenReductionOptions::default().mode),
             preserve_important_words: preserveImportantWords.unwrap_or(true),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmTokenReductionOptions {
+        <WasmTokenReductionOptions as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -2638,12 +2644,6 @@ impl WasmTokenReductionOptions {
     #[wasm_bindgen(setter, js_name = "preserveImportantWords")]
     pub fn set_preserve_important_words(&mut self, value: bool) {
         self.preserve_important_words = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmTokenReductionOptions {
-        xberg::TokenReductionOptions::default().into()
     }
 }
 
@@ -2678,6 +2678,12 @@ impl WasmLanguageDetectionConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmLanguageDetectionConfig {
+        <WasmLanguageDetectionConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter)]
     pub fn enabled(&self) -> bool {
         self.enabled
@@ -2706,12 +2712,6 @@ impl WasmLanguageDetectionConfig {
     #[wasm_bindgen(setter, js_name = "detectMultiple")]
     pub fn set_detect_multiple(&mut self, value: bool) {
         self.detect_multiple = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmLanguageDetectionConfig {
-        xberg::LanguageDetectionConfig::default().into()
     }
 }
 
@@ -2754,9 +2754,15 @@ impl WasmHtmlOutputConfig {
             css: css,
             css_file: cssFile,
             theme: theme.unwrap_or_default(),
-            class_prefix: classPrefix.unwrap_or_default(),
+            class_prefix: classPrefix.unwrap_or_else(|| xberg::HtmlOutputConfig::default().class_prefix),
             embed_css: embedCss.unwrap_or(true),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmHtmlOutputConfig {
+        <WasmHtmlOutputConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -2808,12 +2814,6 @@ impl WasmHtmlOutputConfig {
     pub fn set_embed_css(&mut self, value: bool) {
         self.embed_css = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmHtmlOutputConfig {
-        xberg::HtmlOutputConfig::default().into()
-    }
 }
 
 /// Configuration for the late-interaction (ColBERT) pipeline.
@@ -2857,15 +2857,21 @@ impl WasmLateInteractionConfig {
         maxEmbedDurationSecs: Option<u64>,
     ) -> WasmLateInteractionConfig {
         WasmLateInteractionConfig {
-            model: model.unwrap_or_default(),
-            batch_size: batchSize.unwrap_or_default(),
-            max_length: maxLength.unwrap_or_default(),
-            query_max_length: queryMaxLength.unwrap_or_default(),
+            model: model.unwrap_or_else(|| serde_wasm_bindgen::to_value(&xberg::LateInteractionConfig::default().model).unwrap_or(JsValue::NULL)),
+            batch_size: batchSize.unwrap_or_else(|| xberg::LateInteractionConfig::default().batch_size),
+            max_length: maxLength.unwrap_or_else(|| xberg::LateInteractionConfig::default().max_length),
+            query_max_length: queryMaxLength.unwrap_or_else(|| xberg::LateInteractionConfig::default().query_max_length),
             show_download_progress: showDownloadProgress.unwrap_or(false),
             cache_dir: cacheDir,
             acceleration: acceleration,
             max_embed_duration_secs: maxEmbedDurationSecs,
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmLateInteractionConfig {
+        <WasmLateInteractionConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -2947,12 +2953,6 @@ impl WasmLateInteractionConfig {
     pub fn set_max_embed_duration_secs(&mut self, value: Option<u64>) {
         self.max_embed_duration_secs = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmLateInteractionConfig {
-        xberg::LateInteractionConfig::default().into()
-    }
 }
 
 /// Layout detection configuration.
@@ -2967,6 +2967,7 @@ pub struct WasmLayoutDetectionConfig {
     confidence_threshold: Option<f32>,
     apply_heuristics: bool,
     table_model: WasmTableModel,
+    formula_model: Option<WasmFormulaModel>,
     table_overlap_preference: WasmTableOverlapPreference,
     acceleration: Option<WasmAccelerationConfig>,
     enable_chart_understanding: bool,
@@ -2980,6 +2981,7 @@ impl Default for WasmLayoutDetectionConfig {
 
 #[wasm_bindgen]
 impl WasmLayoutDetectionConfig {
+    #[allow(clippy::too_many_arguments)]
     #[allow(non_snake_case)]
     #[wasm_bindgen(constructor)]
     pub fn new(
@@ -2989,6 +2991,7 @@ impl WasmLayoutDetectionConfig {
         tableOverlapPreference: Option<WasmTableOverlapPreference>,
         enableChartUnderstanding: Option<bool>,
         confidenceThreshold: Option<f32>,
+        formulaModel: Option<WasmFormulaModel>,
         acceleration: Option<WasmAccelerationConfig>,
     ) -> WasmLayoutDetectionConfig {
         WasmLayoutDetectionConfig {
@@ -2996,10 +2999,17 @@ impl WasmLayoutDetectionConfig {
             confidence_threshold: confidenceThreshold,
             apply_heuristics: applyHeuristics.unwrap_or(true),
             table_model: tableModel.unwrap_or_default(),
+            formula_model: formulaModel,
             table_overlap_preference: tableOverlapPreference.unwrap_or_default(),
             acceleration: acceleration,
             enable_chart_understanding: enableChartUnderstanding.unwrap_or(false),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmLayoutDetectionConfig {
+        <WasmLayoutDetectionConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -3042,6 +3052,16 @@ impl WasmLayoutDetectionConfig {
         self.table_model = value;
     }
 
+    #[wasm_bindgen(getter, js_name = "formulaModel")]
+    pub fn formula_model(&self) -> Option<String> {
+        self.formula_model.map(|v| v.to_api_str().to_owned())
+    }
+
+    #[wasm_bindgen(setter, js_name = "formulaModel")]
+    pub fn set_formula_model(&mut self, value: Option<WasmFormulaModel>) {
+        self.formula_model = value;
+    }
+
     #[wasm_bindgen(getter, js_name = "tableOverlapPreference")]
     pub fn table_overlap_preference(&self) -> String {
         self.table_overlap_preference.to_api_str().to_owned()
@@ -3070,12 +3090,6 @@ impl WasmLayoutDetectionConfig {
     #[wasm_bindgen(setter, js_name = "enableChartUnderstanding")]
     pub fn set_enable_chart_understanding(&mut self, value: bool) {
         self.enable_chart_understanding = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmLayoutDetectionConfig {
-        xberg::LayoutDetectionConfig::default().into()
     }
 }
 
@@ -4201,10 +4215,18 @@ impl WasmOcrQualityThresholds {
             non_text_min_chars: nonTextMinChars.unwrap_or(20),
             alnum_ws_ratio_threshold: alnumWsRatioThreshold.unwrap_or(0.4),
             pipeline_min_quality: pipelineMinQuality.unwrap_or(0.5),
-            min_undecodable_ratio: minUndecodableRatio.unwrap_or_default(),
-            enable_provenance_ocr_routing: enableProvenanceOcrRouting.unwrap_or_default(),
-            min_provenance_fallback_ratio: minProvenanceFallbackRatio.unwrap_or_default(),
+            min_undecodable_ratio: minUndecodableRatio.unwrap_or_else(|| xberg::OcrQualityThresholds::default().min_undecodable_ratio),
+            enable_provenance_ocr_routing: enableProvenanceOcrRouting
+                .unwrap_or_else(|| xberg::OcrQualityThresholds::default().enable_provenance_ocr_routing),
+            min_provenance_fallback_ratio: minProvenanceFallbackRatio
+                .unwrap_or_else(|| xberg::OcrQualityThresholds::default().min_provenance_fallback_ratio),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmOcrQualityThresholds {
+        <WasmOcrQualityThresholds as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter, js_name = "minTotalNonWhitespace")]
@@ -4395,12 +4417,6 @@ impl WasmOcrQualityThresholds {
     #[wasm_bindgen(setter, js_name = "minProvenanceFallbackRatio")]
     pub fn set_min_provenance_fallback_ratio(&mut self, value: f64) {
         self.min_provenance_fallback_ratio = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmOcrQualityThresholds {
-        xberg::OcrQualityThresholds::default().into()
     }
 }
 
@@ -4629,7 +4645,7 @@ impl WasmOcrConfig {
     ) -> WasmOcrConfig {
         WasmOcrConfig {
             enabled: enabled.unwrap_or(true),
-            backend: backend.unwrap_or_default(),
+            backend: backend.unwrap_or_else(|| xberg::OcrConfig::default().backend),
             language: language.unwrap_or_default(),
             tesseract_config: tesseractConfig,
             output_format: outputFormat,
@@ -4646,6 +4662,12 @@ impl WasmOcrConfig {
             tessdata_bytes: tessdataBytes,
             tessdata_path: tessdataPath,
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmOcrConfig {
+        <WasmOcrConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -4817,12 +4839,6 @@ impl WasmOcrConfig {
     pub fn set_tessdata_path(&mut self, value: Option<String>) {
         self.tessdata_path = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmOcrConfig {
-        xberg::OcrConfig::default().into()
-    }
 }
 
 /// Page extraction and tracking configuration.
@@ -4862,6 +4878,12 @@ impl WasmPageConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmPageConfig {
+        <WasmPageConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "extractPages")]
     pub fn extract_pages(&self) -> bool {
         self.extract_pages
@@ -4890,12 +4912,6 @@ impl WasmPageConfig {
     #[wasm_bindgen(setter, js_name = "markerFormat")]
     pub fn set_marker_format(&mut self, value: String) {
         self.marker_format = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmPageConfig {
-        xberg::PageConfig::default().into()
     }
 }
 
@@ -4956,6 +4972,12 @@ impl WasmPdfConfig {
             extract_form_fields: extractFormFields.unwrap_or(true),
             reading_order: readingOrder.unwrap_or(false),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmPdfConfig {
+        <WasmPdfConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter, js_name = "extractImages")]
@@ -5077,12 +5099,6 @@ impl WasmPdfConfig {
     pub fn set_reading_order(&mut self, value: bool) {
         self.reading_order = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmPdfConfig {
-        xberg::PdfConfig::default().into()
-    }
 }
 
 /// Hierarchy extraction configuration for PDF text structure analysis.
@@ -5116,6 +5132,12 @@ impl WasmHierarchyConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmHierarchyConfig {
+        <WasmHierarchyConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter)]
     pub fn enabled(&self) -> bool {
         self.enabled
@@ -5144,12 +5166,6 @@ impl WasmHierarchyConfig {
     #[wasm_bindgen(setter, js_name = "includeBbox")]
     pub fn set_include_bbox(&mut self, value: bool) {
         self.include_bbox = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmHierarchyConfig {
-        xberg::HierarchyConfig::default().into()
     }
 }
 
@@ -5188,6 +5204,12 @@ impl WasmPostProcessorConfig {
             enabled_set: enabledSet,
             disabled_set: disabledSet,
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmPostProcessorConfig {
+        <WasmPostProcessorConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -5238,12 +5260,6 @@ impl WasmPostProcessorConfig {
     #[wasm_bindgen(setter, js_name = "disabledSet")]
     pub fn set_disabled_set(&mut self, value: Option<Vec<String>>) {
         self.disabled_set = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmPostProcessorConfig {
-        xberg::PostProcessorConfig::default().into()
     }
 }
 
@@ -5312,6 +5328,12 @@ impl WasmChunkingConfig {
             table_chunking: tableChunking.unwrap_or_default(),
             breadcrumb_target: breadcrumbTarget.unwrap_or_default(),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmChunkingConfig {
+        <WasmChunkingConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter, js_name = "maxCharacters")]
@@ -5443,12 +5465,6 @@ impl WasmChunkingConfig {
     pub fn set_breadcrumb_target(&mut self, value: WasmBreadcrumbTarget) {
         self.breadcrumb_target = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmChunkingConfig {
-        xberg::ChunkingConfig::default().into()
-    }
 }
 
 /// Embedding configuration for text chunks.
@@ -5499,6 +5515,12 @@ impl WasmEmbeddingConfig {
             max_embed_duration_secs: maxEmbedDurationSecs,
             max_sequence_length: maxSequenceLength,
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmEmbeddingConfig {
+        <WasmEmbeddingConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -5580,12 +5602,6 @@ impl WasmEmbeddingConfig {
     pub fn set_max_sequence_length(&mut self, value: Option<usize>) {
         self.max_sequence_length = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmEmbeddingConfig {
-        xberg::EmbeddingConfig::default().into()
-    }
 }
 
 /// Configuration for the redaction post-processor.
@@ -5626,6 +5642,12 @@ impl WasmRedactionConfig {
             custom_terms: customTerms.unwrap_or_default(),
             custom_patterns: customPatterns.unwrap_or_default(),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmRedactionConfig {
+        <WasmRedactionConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -5689,12 +5711,6 @@ impl WasmRedactionConfig {
     #[wasm_bindgen(setter, js_name = "customPatterns")]
     pub fn set_custom_patterns(&mut self, value: Vec<WasmRedactionPattern>) {
         self.custom_patterns = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmRedactionConfig {
-        xberg::RedactionConfig::default().into()
     }
 
     /// Validate user-supplied terms and patterns at config-construction time.
@@ -5904,6 +5920,12 @@ impl WasmRerankerConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmRerankerConfig {
+        <WasmRerankerConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter)]
     pub fn model(&self) -> JsValue {
         self.model.clone()
@@ -5973,12 +5995,6 @@ impl WasmRerankerConfig {
     pub fn set_max_rerank_duration_secs(&mut self, value: Option<u64>) {
         self.max_rerank_duration_secs = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmRerankerConfig {
-        xberg::RerankerConfig::default().into()
-    }
 }
 
 /// Configuration for the sparse-embedding pipeline.
@@ -6019,14 +6035,20 @@ impl WasmSparseEmbeddingConfig {
         maxEmbedDurationSecs: Option<u64>,
     ) -> WasmSparseEmbeddingConfig {
         WasmSparseEmbeddingConfig {
-            model: model.unwrap_or_default(),
-            batch_size: batchSize.unwrap_or_default(),
-            max_length: maxLength.unwrap_or_default(),
+            model: model.unwrap_or_else(|| serde_wasm_bindgen::to_value(&xberg::SparseEmbeddingConfig::default().model).unwrap_or(JsValue::NULL)),
+            batch_size: batchSize.unwrap_or_else(|| xberg::SparseEmbeddingConfig::default().batch_size),
+            max_length: maxLength.unwrap_or_else(|| xberg::SparseEmbeddingConfig::default().max_length),
             show_download_progress: showDownloadProgress.unwrap_or(false),
             cache_dir: cacheDir,
             acceleration: acceleration,
             max_embed_duration_secs: maxEmbedDurationSecs,
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmSparseEmbeddingConfig {
+        <WasmSparseEmbeddingConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -6097,12 +6119,6 @@ impl WasmSparseEmbeddingConfig {
     #[wasm_bindgen(setter, js_name = "maxEmbedDurationSecs")]
     pub fn set_max_embed_duration_secs(&mut self, value: Option<u64>) {
         self.max_embed_duration_secs = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmSparseEmbeddingConfig {
-        xberg::SparseEmbeddingConfig::default().into()
     }
 }
 
@@ -6243,6 +6259,12 @@ impl WasmTranscriptionConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmTranscriptionConfig {
+        <WasmTranscriptionConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter)]
     pub fn enabled(&self) -> bool {
         self.enabled
@@ -6341,12 +6363,6 @@ impl WasmTranscriptionConfig {
     #[wasm_bindgen(setter, js_name = "verifyHash")]
     pub fn set_verify_hash(&mut self, value: bool) {
         self.verify_hash = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmTranscriptionConfig {
-        xberg::TranscriptionConfig::default().into()
     }
 }
 
@@ -7003,6 +7019,12 @@ impl WasmSecurityLimits {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmSecurityLimits {
+        <WasmSecurityLimits as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "maxArchiveSize")]
     pub fn max_archive_size(&self) -> usize {
         self.max_archive_size
@@ -7091,12 +7113,6 @@ impl WasmSecurityLimits {
     #[wasm_bindgen(setter, js_name = "maxTableCells")]
     pub fn set_max_table_cells(&mut self, value: usize) {
         self.max_table_cells = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmSecurityLimits {
-        xberg::SecurityLimits::default().into()
     }
 }
 
@@ -7900,6 +7916,12 @@ impl WasmDocumentStructure {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmDocumentStructure {
+        <WasmDocumentStructure as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter)]
     pub fn nodes(&self) -> Vec<WasmDocumentNode> {
         self.nodes.clone()
@@ -7955,12 +7977,6 @@ impl WasmDocumentStructure {
     #[wasm_bindgen(js_name = "isEmpty")]
     pub fn is_empty(&self) -> bool {
         xberg::DocumentStructure::from(self.clone()).is_empty()
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmDocumentStructure {
-        xberg::DocumentStructure::default().into()
     }
 }
 
@@ -11590,6 +11606,12 @@ impl WasmImagePreprocessingConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmImagePreprocessingConfig {
+        <WasmImagePreprocessingConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "targetDpi")]
     pub fn target_dpi(&self) -> i32 {
         self.target_dpi
@@ -11658,12 +11680,6 @@ impl WasmImagePreprocessingConfig {
     #[wasm_bindgen(setter, js_name = "invertColors")]
     pub fn set_invert_colors(&mut self, value: bool) {
         self.invert_colors = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmImagePreprocessingConfig {
-        xberg::ImagePreprocessingConfig::default().into()
     }
 }
 
@@ -11755,6 +11771,12 @@ impl WasmTesseractConfig {
             textord_space_size_is_variable: textordSpaceSizeIsVariable.unwrap_or(true),
             thresholding_method: thresholdingMethod.unwrap_or(false),
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmTesseractConfig {
+        <WasmTesseractConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -11966,12 +11988,6 @@ impl WasmTesseractConfig {
     pub fn set_thresholding_method(&mut self, value: bool) {
         self.thresholding_method = value;
     }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmTesseractConfig {
-        xberg::TesseractConfig::default().into()
-    }
 }
 
 /// Image preprocessing metadata.
@@ -12118,27 +12134,27 @@ impl WasmImagePreprocessingMetadata {
     }
 }
 
-/// A mathematical formula detected and recognized in a document.
+/// A mathematical formula extracted from a document.
 ///
-/// Populated by the layout-guided formula pipeline: regions classified as
-/// `LayoutClass.Formula` are routed to the formula OCR task, which returns the
-/// LaTeX source for the region. The field is always present on
-/// `ExtractedDocument` but only populated
-/// when the `layout-detection` feature is active and the document contains
-/// formula regions.
+/// Three kinds of sources populate this type. Layout-guided OCR detects
+/// formula regions and recognizes them; those formulas carry a `bbox` and a
+/// `page`. VLM OCR recognizes formulas in transcribed text without layout, so
+/// its formulas carry no geometry. Markup extraction (DOCX, PPTX, ODT, EPUB,
+/// HTML, JATS, LaTeX, Markdown, and related formats) converts embedded math
+/// to LaTeX, also without geometry.
 #[derive(Clone, Default)]
 #[wasm_bindgen]
 pub struct WasmFormula {
     latex: String,
-    bbox: WasmBoundingBox,
-    page: u32,
+    bbox: Option<WasmBoundingBox>,
+    page: Option<u32>,
 }
 
 #[wasm_bindgen]
 impl WasmFormula {
     #[allow(non_snake_case)]
     #[wasm_bindgen(constructor)]
-    pub fn new(latex: String, bbox: WasmBoundingBox, page: u32) -> WasmFormula {
+    pub fn new(latex: String, bbox: Option<WasmBoundingBox>, page: Option<u32>) -> WasmFormula {
         WasmFormula { latex, bbox, page }
     }
 
@@ -12159,22 +12175,22 @@ impl WasmFormula {
     }
 
     #[wasm_bindgen(getter)]
-    pub fn bbox(&self) -> WasmBoundingBox {
+    pub fn bbox(&self) -> Option<WasmBoundingBox> {
         self.bbox.clone()
     }
 
     #[wasm_bindgen(setter)]
-    pub fn set_bbox(&mut self, value: WasmBoundingBox) {
+    pub fn set_bbox(&mut self, value: Option<WasmBoundingBox>) {
         self.bbox = value;
     }
 
     #[wasm_bindgen(getter)]
-    pub fn page(&self) -> u32 {
+    pub fn page(&self) -> Option<u32> {
         self.page
     }
 
     #[wasm_bindgen(setter)]
-    pub fn set_page(&mut self, value: u32) {
+    pub fn set_page(&mut self, value: Option<u32>) {
         self.page = value;
     }
 }
@@ -16630,6 +16646,12 @@ impl WasmYakeParams {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmYakeParams {
+        <WasmYakeParams as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "windowSize")]
     pub fn window_size(&self) -> usize {
         self.window_size
@@ -16638,12 +16660,6 @@ impl WasmYakeParams {
     #[wasm_bindgen(setter, js_name = "windowSize")]
     pub fn set_window_size(&mut self, value: usize) {
         self.window_size = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmYakeParams {
-        xberg::YakeParams::default().into()
     }
 }
 
@@ -16672,6 +16688,12 @@ impl WasmRakeParams {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmRakeParams {
+        <WasmRakeParams as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "minWordLength")]
     pub fn min_word_length(&self) -> usize {
         self.min_word_length
@@ -16690,12 +16712,6 @@ impl WasmRakeParams {
     #[wasm_bindgen(setter, js_name = "maxWordsPerPhrase")]
     pub fn set_max_words_per_phrase(&mut self, value: usize) {
         self.max_words_per_phrase = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmRakeParams {
-        xberg::RakeParams::default().into()
     }
 }
 
@@ -16737,6 +16753,12 @@ impl WasmKeywordConfig {
             yake_params: yakeParams,
             rake_params: rakeParams,
         }
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmKeywordConfig {
+        <WasmKeywordConfig as ::core::default::Default>::default()
     }
 
     #[wasm_bindgen(getter)]
@@ -16797,12 +16819,6 @@ impl WasmKeywordConfig {
     #[wasm_bindgen(setter, js_name = "rakeParams")]
     pub fn set_rake_params(&mut self, value: Option<WasmRakeParams>) {
         self.rake_params = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmKeywordConfig {
-        xberg::KeywordConfig::default().into()
     }
 }
 
@@ -17206,6 +17222,12 @@ impl WasmHeuristicsConfig {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmHeuristicsConfig {
+        <WasmHeuristicsConfig as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "enablePdfTextHeuristics")]
     pub fn enable_pdf_text_heuristics(&self) -> bool {
         self.enable_pdf_text_heuristics
@@ -17314,12 +17336,6 @@ impl WasmHeuristicsConfig {
     #[wasm_bindgen(setter, js_name = "maxPptxEmbeddedCount")]
     pub fn set_max_pptx_embedded_count(&mut self, value: u32) {
         self.max_pptx_embedded_count = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmHeuristicsConfig {
-        xberg::HeuristicsConfig::default().into()
     }
 
     /// Validate the configuration.
@@ -17714,6 +17730,12 @@ impl WasmMultidocThresholds {
         }
     }
 
+    #[wasm_bindgen]
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> WasmMultidocThresholds {
+        <WasmMultidocThresholds as ::core::default::Default>::default()
+    }
+
     #[wasm_bindgen(getter, js_name = "densityShiftThreshold")]
     pub fn density_shift_threshold(&self) -> f32 {
         self.density_shift_threshold
@@ -17732,12 +17754,6 @@ impl WasmMultidocThresholds {
     #[wasm_bindgen(setter, js_name = "bigramOverlapMin")]
     pub fn set_bigram_overlap_min(&mut self, value: f32) {
         self.bigram_overlap_min = value;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    #[wasm_bindgen]
-    pub fn default() -> WasmMultidocThresholds {
-        xberg::MultidocThresholds::default().into()
     }
 }
 
@@ -18948,7 +18964,7 @@ impl WasmCrawlConfig {
             warc_output: warcOutput,
             browser_profile: browserProfile,
             save_browser_profile: saveBrowserProfile.unwrap_or(false),
-            ssrf: ssrf.unwrap_or_default(),
+            ssrf: ssrf.unwrap_or_else(|| crawlberg::SsrfPolicy::from_env().into()),
             ssrf_deny_private_explicit: ssrfDenyPrivateExplicit,
         }
     }
@@ -20681,6 +20697,38 @@ impl WasmLateInteractionModelType {
     #[wasm_bindgen(setter, js_name = "maxLength")]
     pub fn set_max_length(&mut self, value: Option<i64>) {
         self.max_length = value;
+    }
+}
+
+/// Formula recognition model selection.
+
+#[wasm_bindgen]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WasmFormulaModel {
+    LatexOcr = 0,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for WasmFormulaModel {
+    fn default() -> Self {
+        Self::LatexOcr
+    }
+}
+
+impl WasmFormulaModel {
+    /// Returns the serde wire string for this variant (e.g. `"stop"`, `"tool_calls"`).
+    pub fn to_api_str(self) -> &'static str {
+        match self {
+            Self::LatexOcr => "latex_ocr",
+        }
+    }
+
+    /// Parses a serde wire string and returns the corresponding variant, or None if unrecognized.
+    pub fn from_api_str(s: &str) -> Option<Self> {
+        match s {
+            "latex_ocr" => Some(Self::LatexOcr),
+            _ => None,
+        }
     }
 }
 
@@ -22747,9 +22795,10 @@ pub enum WasmElementType {
     Image = 5,
     PageBreak = 6,
     CodeBlock = 7,
-    BlockQuote = 8,
-    Footer = 9,
-    Header = 10,
+    Formula = 8,
+    BlockQuote = 9,
+    Footer = 10,
+    Header = 11,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -22771,6 +22820,7 @@ impl WasmElementType {
             Self::Image => "image",
             Self::PageBreak => "page_break",
             Self::CodeBlock => "code_block",
+            Self::Formula => "formula",
             Self::BlockQuote => "block_quote",
             Self::Footer => "footer",
             Self::Header => "header",
@@ -22788,6 +22838,7 @@ impl WasmElementType {
             "image" => Some(Self::Image),
             "page_break" => Some(Self::PageBreak),
             "code_block" => Some(Self::CodeBlock),
+            "formula" => Some(Self::Formula),
             "block_quote" => Some(Self::BlockQuote),
             "footer" => Some(Self::Footer),
             "header" => Some(Self::Header),
@@ -30268,6 +30319,7 @@ impl From<WasmLayoutDetectionConfig> for xberg::LayoutDetectionConfig {
             confidence_threshold: val.confidence_threshold,
             apply_heuristics: val.apply_heuristics,
             table_model: val.table_model.into(),
+            formula_model: val.formula_model.map(Into::into),
             table_overlap_preference: val.table_overlap_preference.into(),
             acceleration: val.acceleration.map(Into::into),
             enable_chart_understanding: val.enable_chart_understanding,
@@ -30284,6 +30336,7 @@ impl From<xberg::LayoutDetectionConfig> for WasmLayoutDetectionConfig {
             confidence_threshold: val.confidence_threshold,
             apply_heuristics: val.apply_heuristics,
             table_model: val.table_model.into(),
+            formula_model: val.formula_model.map(Into::into),
             table_overlap_preference: val.table_overlap_preference.into(),
             acceleration: val.acceleration.map(Into::into),
             enable_chart_understanding: val.enable_chart_understanding,
@@ -31021,23 +31074,6 @@ impl From<xberg::RedactionPattern> for WasmRedactionPattern {
             label: val.label.to_string(),
             pattern: val.pattern.to_string(),
             case_sensitive: val.case_sensitive,
-        }
-    }
-}
-
-#[allow(clippy::needless_update)]
-#[allow(clippy::useless_conversion)]
-impl From<WasmRerankerConfig> for xberg::RerankerConfig {
-    fn from(val: WasmRerankerConfig) -> Self {
-        Self {
-            model: serde_wasm_bindgen::from_value(val.model.clone()).unwrap_or_default(),
-            top_k: val.top_k,
-            batch_size: val.batch_size,
-            show_download_progress: val.show_download_progress,
-            cache_dir: val.cache_dir.map(Into::into),
-            acceleration: val.acceleration.map(Into::into),
-            max_rerank_duration_secs: val.max_rerank_duration_secs,
-            ..Default::default()
         }
     }
 }
@@ -32500,7 +32536,7 @@ impl From<WasmFormula> for xberg::Formula {
     fn from(val: WasmFormula) -> Self {
         Self {
             latex: val.latex,
-            bbox: val.bbox.into(),
+            bbox: val.bbox.map(Into::into),
             page: val.page,
         }
     }
@@ -32511,7 +32547,7 @@ impl From<xberg::Formula> for WasmFormula {
     fn from(val: xberg::Formula) -> Self {
         Self {
             latex: val.latex.to_string(),
-            bbox: val.bbox.into(),
+            bbox: val.bbox.map(Into::into),
             page: val.page,
         }
     }
@@ -34091,17 +34127,6 @@ impl From<xberg::DocumentBoundary> for WasmDocumentBoundary {
     }
 }
 
-#[allow(clippy::needless_update)]
-impl From<WasmMultidocThresholds> for xberg::MultidocThresholds {
-    fn from(val: WasmMultidocThresholds) -> Self {
-        Self {
-            density_shift_threshold: val.density_shift_threshold,
-            bigram_overlap_min: val.bigram_overlap_min,
-            ..Default::default()
-        }
-    }
-}
-
 impl From<xberg::MultidocThresholds> for WasmMultidocThresholds {
     fn from(val: xberg::MultidocThresholds) -> Self {
         Self {
@@ -34921,6 +34946,22 @@ impl From<xberg::LateInteractionModelType> for WasmLateInteractionModelType {
     }
 }
 
+impl From<WasmFormulaModel> for xberg::core::config::layout::FormulaModel {
+    fn from(val: WasmFormulaModel) -> Self {
+        match val {
+            WasmFormulaModel::LatexOcr => Self::LatexOcr,
+        }
+    }
+}
+
+impl From<xberg::core::config::layout::FormulaModel> for WasmFormulaModel {
+    fn from(val: xberg::core::config::layout::FormulaModel) -> Self {
+        match val {
+            xberg::core::config::layout::FormulaModel::LatexOcr => Self::LatexOcr,
+        }
+    }
+}
+
 impl From<WasmTableModel> for xberg::TableModel {
     fn from(val: WasmTableModel) -> Self {
         match val {
@@ -35351,32 +35392,6 @@ impl From<xberg::RerankerHead> for WasmRerankerHead {
         match val {
             xberg::RerankerHead::CrossEncoder => Self::CrossEncoder,
             xberg::RerankerHead::Qwen3Generative => Self::Qwen3Generative,
-        }
-    }
-}
-
-impl From<WasmRerankerModelType> for xberg::RerankerModelType {
-    fn from(val: WasmRerankerModelType) -> Self {
-        match val.r#type.as_str() {
-            "preset" => Self::Preset {
-                name: val.name.clone().unwrap_or_default(),
-            },
-            "custom" => Self::Custom {
-                model_id: val.model_id.clone().unwrap_or_default(),
-                model_file: val.model_file.clone(),
-                additional_files: val.additional_files.clone().unwrap_or_default(),
-                max_length: val.max_length.clone(),
-                head: val.head.clone().map(Into::into).unwrap_or_default(),
-            },
-            "llm" => Self::Llm {
-                llm: val.llm.clone().map(Into::into).map(Box::new).unwrap_or_default(),
-            },
-            "plugin" => Self::Plugin {
-                name: val.name.clone().unwrap_or_default(),
-            },
-            _ => Self::Preset {
-                name: Default::default(),
-            },
         }
     }
 }
@@ -36614,6 +36629,7 @@ impl From<WasmElementType> for xberg::ElementType {
             WasmElementType::Image => Self::Image,
             WasmElementType::PageBreak => Self::PageBreak,
             WasmElementType::CodeBlock => Self::CodeBlock,
+            WasmElementType::Formula => Self::Formula,
             WasmElementType::BlockQuote => Self::BlockQuote,
             WasmElementType::Footer => Self::Footer,
             WasmElementType::Header => Self::Header,
@@ -36632,6 +36648,7 @@ impl From<xberg::ElementType> for WasmElementType {
             xberg::ElementType::Image => Self::Image,
             xberg::ElementType::PageBreak => Self::PageBreak,
             xberg::ElementType::CodeBlock => Self::CodeBlock,
+            xberg::ElementType::Formula => Self::Formula,
             xberg::ElementType::BlockQuote => Self::BlockQuote,
             xberg::ElementType::Footer => Self::Footer,
             xberg::ElementType::Header => Self::Header,
