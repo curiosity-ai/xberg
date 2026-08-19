@@ -22,6 +22,7 @@ public enum MdEventKind
     StartImage, EndImage,
     StartFootnoteDefinition, EndFootnoteDefinition,
     Code, Text, SoftBreak, HardBreak, FootnoteReference, Html, TaskListMarker,
+    InlineMath, DisplayMath,
 }
 
 public struct MdEvent
@@ -731,6 +732,31 @@ public static class MarkdownParser
         }
     }
 
+    /// <summary>
+    /// The offset of the delimiter closing a math span opened at <paramref name="from"/>, or -1.
+    /// </summary>
+    /// <remarks>
+    /// Math cannot contain a bare <c>$</c>, so the first one found either closes the span or
+    /// invalidates it. An inline span closes on a <c>$</c> not preceded by whitespace; a display
+    /// span closes only on another <c>$$</c>, whatever precedes it.
+    /// </remarks>
+    private static int FindClosingMath(string text, int from, int run)
+    {
+        for (int j = from; j < text.Length; j++)
+        {
+            if (text[j] == '\\') { j++; continue; }
+            if (text[j] != '$') continue;
+
+            if (run == 2)
+                return j + 1 < text.Length && text[j + 1] == '$' ? j : -1;
+
+            return j > 0 && !IsAsciiWhitespace(text[j - 1]) ? j : -1;
+        }
+        return -1;
+    }
+
+    private static bool IsAsciiWhitespace(char c) => c is ' ' or '\t' or '\n' or '\r' or '\f' or '\v';
+
     private static LinkedList<Node> Tokenize(string text)
     {
         var nodes = new LinkedList<Node>();
@@ -773,6 +799,33 @@ public static class MarkdownParser
                     continue;
                 }
                 buf.Append('`', ticks); i += ticks; continue;
+            }
+
+            // Math. A run of one `$` is inline, two is display; longer runs are not delimiters.
+            // The opening delimiter must not be followed by whitespace, which is what keeps a
+            // lone `$` in prose — a price, say — from opening a span.
+            if (c == '$')
+            {
+                int run = i + 1 < n && text[i + 1] == '$' ? 2 : 1;
+                bool canOpen = i + 1 < n && !IsAsciiWhitespace(text[i + 1]);
+                if (canOpen)
+                {
+                    int mclose = FindClosingMath(text, i + run, run);
+                    if (mclose >= 0)
+                    {
+                        Flush();
+                        string body = text.Substring(i + run, mclose - (i + run));
+                        var kind = run == 2 ? MdEventKind.DisplayMath : MdEventKind.InlineMath;
+                        nodes.AddLast(new Node
+                        {
+                            T = NType.Opaque,
+                            Ev = new List<MdEvent> { MdEvent.WithText(kind, body) },
+                        });
+                        i = mclose + run;
+                        continue;
+                    }
+                }
+                buf.Append('$', run); i += run; continue;
             }
 
             // Image.

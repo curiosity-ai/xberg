@@ -149,4 +149,50 @@ public class MarkdownExtractorTests
         // JSX component recorded as a raw block.
         Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.RawBlock);
     }
+
+    // ── math ──────────────────────────────────────────────────────────────────
+
+    /// <summary>Display math is a block of its own, so it becomes a Formula without delimiters.</summary>
+    [Fact]
+    public void DisplayMathBecomesAFormulaElement()
+    {
+        var doc = Extract("Before.\n\n$$A=\\pi r^{2} $$\n\nAfter.\n");
+        var formula = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Formula);
+        Assert.Equal("A=\\pi r^{2}", formula.Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("$$", StringComparison.Ordinal));
+    }
+
+    /// <summary>Inline math stays in the text: `$x$` reads as maths wherever the text ends up.</summary>
+    [Fact]
+    public void InlineMathKeepsItsDelimiters()
+    {
+        var doc = Extract("The identity $a^2 + b^2$ holds.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("The identity $a^2 + b^2$ holds.", para.Text);
+    }
+
+    /// <summary>
+    /// A delimiter followed by whitespace cannot open a span, which is what keeps a lone `$` in
+    /// prose from swallowing the rest of the line.
+    /// </summary>
+    [Theory]
+    [InlineData("It costs $ 5 and $ 10 today.")]
+    [InlineData("Prices: $5 today.")]
+    public void ALoneDollarStaysLiteral(string source)
+    {
+        var doc = Extract(source + "\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal(source, para.Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Formula);
+    }
+
+    /// <summary>Math inside a code span is code, not maths.</summary>
+    [Fact]
+    public void MathInsideACodeSpanIsNotParsed()
+    {
+        var doc = Extract("Use `$x$` for maths.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Contains("$x$", para.Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Formula);
+    }
 }
