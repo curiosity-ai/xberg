@@ -528,4 +528,78 @@ public class PdfExtractorTests
         var kept = PdfPageText.DeduplicateOverlappingSpans(spans);
         Assert.Equal(2, kept.Count);
     }
+
+    // ── super/subscript reattachment (pdf_oxide merge_sub_superscript_spans) ──
+
+    /// <summary>
+    /// A producer sets `H2SO4` as a base plus small raised digits. Nothing keeps those digits
+    /// beside the word once spans are sorted into baseline bands, so they drift — a formula loses
+    /// its subscripts and they resurface elsewhere on the page.
+    /// </summary>
+    [Fact]
+    public void SubscriptDigitsMergeIntoTheirBase()
+    {
+        var spans = new List<TextSpan>
+        {
+            Span("H", 100, 200, 8, 10),
+            Span("2", 108, 197, 4, 6),
+            Span("SO", 112, 200, 16, 10),
+            Span("4", 128, 197, 4, 6),
+        };
+
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(new[] { "H2", "SO4" }, spans.Select(s => s.Text));
+    }
+
+    /// <summary>A span far from any base keeps its place rather than being dragged onto one.</summary>
+    [Fact]
+    public void ADetachedDigitIsNotMerged()
+    {
+        var spans = new List<TextSpan>
+        {
+            Span("H", 100, 200, 8, 10),
+            // Well past the base's advance edge: a different word's marker, not this one's.
+            Span("2", 300, 197, 4, 6),
+        };
+
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(2, spans.Count);
+    }
+
+    /// <summary>
+    /// An ordinary lowercase word is not a subscript host, or every digit following prose would
+    /// be glued onto the preceding word.
+    /// </summary>
+    [Fact]
+    public void ProseIsNotASubscriptHost()
+    {
+        var spans = new List<TextSpan>
+        {
+            Span("of", 100, 200, 12, 10),
+            Span("2", 112, 197, 4, 6),
+        };
+
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(2, spans.Count);
+    }
+
+    /// <summary>
+    /// A run the producer raised with the Text Rise operator is a superscript on its own say-so,
+    /// whatever its size — the shift is the statement, not the metrics.
+    /// </summary>
+    [Fact]
+    public void TextRiseMarksASuperscriptRegardlessOfSize()
+    {
+        var baseSpan = Span("x", 100, 200, 8, 10);
+        var raised = Span("*", 108, 203, 5, 10);
+        raised.TextRiseRatio = 0.33;
+
+        var spans = new List<TextSpan> { baseSpan, raised };
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(new[] { "x*" }, spans.Select(s => s.Text));
+    }
 }

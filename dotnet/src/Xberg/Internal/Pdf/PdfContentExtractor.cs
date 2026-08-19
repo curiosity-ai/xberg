@@ -35,6 +35,16 @@ public sealed class TextSpan
     /// <summary>Text-matrix rotation in degrees; 0 for upright text.</summary>
     public double RotationDegrees;
 
+    /// <summary>
+    /// The Text Rise operator's shift (ISO 32000-1 §9.3.7 `Ts`) as a fraction of the font size.
+    /// A producer that raises or lowers a run this way has said outright that it is a super- or
+    /// subscript, whatever its size or characters.
+    /// </summary>
+    public double TextRiseRatio;
+
+    /// <summary>Emission order within the page, used to break ties in a stable way.</summary>
+    public int Sequence;
+
     // Geometry accessors mirroring pdf_oxide Rect (PDF coords: Y grows up).
     public double Left => X;
     public double Right => X + Width;
@@ -74,6 +84,7 @@ public sealed class PdfContentExtractor
     {
         public StringBuilder Text = new();
         public double StartX, StartY;          // user-space origin at buffer start
+        public double RiseRatio;               // Ts shift ÷ font size at buffer start
         public double AccumWidth;              // text-space width (incl. Tz)
         public double UserHScale;              // sqrt(a²+c²) of combined matrix
         public double EffFontSize;             // font_size * sqrt(b²+d²)
@@ -293,6 +304,7 @@ public sealed class PdfContentExtractor
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = false,
             RotationDegrees = RotationOf(combined),
+            Sequence = _spans.Count,
         });
     }
 
@@ -309,6 +321,7 @@ public sealed class PdfContentExtractor
             IsBold = _gs.Font?.IsBold ?? false,
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = _gs.Font?.IsMonospace ?? false,
+            RiseRatio = _gs.FontSize != 0 ? _gs.Rise / _gs.FontSize : 0,
         };
     }
 
@@ -335,6 +348,8 @@ public sealed class PdfContentExtractor
             IsItalic = b.IsItalic,
             IsMonospace = b.IsMonospace,
             RotationDegrees = b.RotationDegrees,
+            TextRiseRatio = b.RiseRatio,
+            Sequence = _spans.Count,
         });
     }
 

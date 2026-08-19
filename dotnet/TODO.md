@@ -50,7 +50,7 @@ not a cosmetic difference.
       float spelling — an integral `f32` is `0.0`, not `0`, so `scanned_confidence` failed
       on every document that is *not* scanned. The remaining 64 are other field differences,
       not yet triaged.
-- [ ] **PDF content (389 fixtures, 77 fully matching; plain 114/388, markdown 49/388).**
+- [ ] **PDF content (389 fixtures, 79 fully matching; plain 122/388, markdown 49/388).**
       The largest remaining area, and upstream landed 127 PDF commits in this window. This is
       extraction *quality*, not a missing feature, and it does not decompose into a few
       systematic fixes — measured, not assumed:
@@ -70,6 +70,28 @@ not a cosmetic difference.
       A caution learned the hard way: `pdf/structure/text_repair.rs` looks like a free win but
       belongs *only* to documents the structure pipeline assembled. Applying it to the flat
       native-text split as well cost 33 of the 114 matching plain fixtures.
+
+      **Where the remaining plain gap actually is.** Upstream reaches text through `pdf_oxide`,
+      a 62k-line native library, and the divergence is that extractor's *geometry*, not a
+      missing xberg module. Three passes were ported from it and each is correct and measured
+      neutral on the score, which is worth stating plainly rather than quietly keeping:
+      - Ligature expansion for encoding-derived mappings (never ToUnicode — a ToUnicode CMap is
+        the font's own statement and is taken at its word). Upstream also reaches a custom
+        encoding by parsing the embedded font program; standing in for that with "the font is
+        embedded" was measured and over-applies, costing four fixtures.
+      - `merge_sub_superscript_spans`, which reattaches raised and lowered runs to the words
+        they modify. Without it a formula loses its subscripts and they resurface at the end of
+        the document. On `pdf/embedded_images_tables.pdf` this makes our output *better* than
+        the golden — we produce `H2SO4` where upstream produces `H SO4`, stranding the `2` — so
+        the fixture can never match on that line.
+      - The inter-span space threshold, judged against the larger of the two spans rather than
+        the current one alone.
+
+      `reorder_same_line_runs` was ported too and **reverted**: it costs two fixtures, because
+      it assumes upstream's span ordering and ours differs going in. What is left after these
+      is per-glyph advance widths — `compo sition` splits mid-word because our span width for
+      `compo` is short enough that the following gap clears the (now identical) threshold. That
+      is font-metrics work in the text extractor, not a porting gap.
 - [x] **DocTags ingestion.** Not a new format after all: upstream types these by content, and
       `*.doctags.txt` reached the plain-text extractor only because the port let the extension
       decide. Fixed by the extension/content change; the fixtures now route as markup.

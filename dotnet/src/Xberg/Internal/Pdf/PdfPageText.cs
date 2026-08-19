@@ -132,6 +132,10 @@ public static class PdfPageText
         // AFTER sort_spans_by_reading_order and BEFORE merge_adjacent_spans.
         spans = DeduplicateOverlappingSpans(spans);
 
+        // Off-baseline glyphs go back onto the words they modify before anything groups spans
+        // into lines; a raised digit left on its own drifts to wherever its baseline band sorts.
+        PdfSubSuperscript.Merge(spans);
+
         var runs = new List<TextSpan>();
         var members = new List<List<int>>();
         TextSpan? cur = null;
@@ -277,19 +281,26 @@ public static class PdfPageText
         double minX = double.MaxValue, maxRight = double.MinValue, maxHeight = 0, maxFont = 0;
         int boldCount = 0, italicCount = 0, count = 0; bool allMono = true;
         double prevEndX = double.NegativeInfinity;
+        double prevFontSize = 0;
         double fontSize = group.Count == 0 ? 0 : group.Max(s => s.FontSize);
         foreach (var s in group)
         {
             if (!double.IsNegativeInfinity(prevEndX))
             {
                 double gap = s.X - prevEndX;
-                double threshold = byXThreshold ? fontSize * 0.5 : s.FontSize * 0.15;
+                // The gap is judged against the larger of the two spans, not the current one
+                // alone: where a small run follows a large one — a hyphen after body text, a
+                // word split across a font change — the smaller size lowers the bar enough that
+                // ordinary kerning reads as a word break, and `10-week` comes out `10 -week`.
+                double pairFontSize = Math.Max(1.0, Math.Max(prevFontSize, s.FontSize));
+                double threshold = byXThreshold ? fontSize * 0.5 : pairFontSize * 0.15;
                 if (gap > threshold && !SuppressGapSpace(sb, s.Text, gap, s.FontSize))
                     sb.Append(' ');
             }
             // Dedupe literal space across span boundary (pdf_oxide merge guard).
             sb.Append(s.Text);
             prevEndX = s.X + s.Width;
+            prevFontSize = s.FontSize;
             minX = Math.Min(minX, s.X);
             maxRight = Math.Max(maxRight, s.X + s.Width);
             maxHeight = Math.Max(maxHeight, s.Height);

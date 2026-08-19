@@ -128,6 +128,13 @@ public sealed class PdfFont
                     cur++;
                 }
             }
+
+            // A /Differences array makes the whole encoding a custom one, and upstream expands
+            // ligature codepoints throughout a custom encoding rather than only in the differing
+            // slots. Upstream also reaches a custom encoding by parsing the embedded font
+            // program, which this port does not do; standing in for that with "the font is
+            // embedded" was measured and over-applies, costing four fixtures.
+            for (int c = 0; c < 256; c++) enc[c] = ExpandLigature(enc[c]);
         }
 
         // Symbolic standard fonts: per spec 9.6.6.1 (and pdf_oxide's priority order) a
@@ -252,10 +259,33 @@ public sealed class PdfFont
         }
     }
 
-    // Note: pdf_oxide only expands ligature chars (U+FB00–06 → "fi"/"fl"…) when the
-    // mapping comes from a parsed embedded font-program encoding — NOT from ToUnicode.
-    // Since this port doesn't parse embedded CFF/TrueType programs, we return the raw
-    // Unicode (matching pdf_oxide's ToUnicode path, which is the common case).
+    /// <summary>
+    /// A ligature codepoint spelled out, or the text unchanged.
+    /// </summary>
+    /// <remarks>
+    /// This applies to <em>encoding</em>-derived mappings only, never to ToUnicode. A ToUnicode
+    /// CMap is the font's own statement about what a code means and is taken at its word, but an
+    /// encoding reaches Unicode through a glyph name, and the glyph named <c>fi</c> is the letters
+    /// `f` and `i` set as one shape rather than a character anybody wrote. Upstream draws the line
+    /// in the same place.
+    /// </remarks>
+    private static string ExpandLigature(string? text)
+    {
+        if (string.IsNullOrEmpty(text) || text.Length != 1) return text ?? "";
+        return text[0] switch
+        {
+            '\uFB00' => "ff",
+            '\uFB01' => "fi",
+            '\uFB02' => "fl",
+            '\uFB03' => "ffi",
+            '\uFB04' => "ffl",
+            '\uFB05' or '\uFB06' => "st",
+            _ => text,
+        };
+    }
+
+    // A ligature reaching us through ToUnicode is returned as the font wrote it; only the
+    // encoding-derived mappings above are expanded. See ExpandLigature.
     public string CharToUnicode(int code)
     {
         if (_toUnicode != null)
