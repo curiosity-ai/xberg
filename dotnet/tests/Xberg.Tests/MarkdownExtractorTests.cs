@@ -300,3 +300,51 @@ public class MarkdownExtractorTests
         Assert.Equal("First line second line", heading.Text);
     }
 }
+
+/// <summary>
+/// How a GFM table's rows are squared up against its header.
+/// </summary>
+public class MarkdownTableShapeTests
+{
+    private static Table Parse(string markdown)
+    {
+        var doc = new MarkdownExtractor().Extract(
+            Encoding.UTF8.GetBytes(markdown), "text/markdown", new ExtractionConfig());
+        return doc.Tables.Single();
+    }
+
+    [Fact]
+    public void AShortRowIsPaddedToTheHeadersWidth()
+    {
+        // Without the padding a row's second value slides under the fourth heading.
+        var table = Parse("""
+            | A | B | C | D |
+            | --- | --- | --- | --- |
+            | 1 | 2.78% |
+            """);
+        Assert.Equal(new[] { "1", "2.78%", "", "" }, table.Cells[1]);
+    }
+
+    [Fact]
+    public void ALongRowLosesItsExcess()
+    {
+        var table = Parse("""
+            | A | B |
+            | --- | --- |
+            | 1 | 2 | 3 | 4 |
+            """);
+        Assert.Equal(new[] { "1", "2" }, table.Cells[1]);
+    }
+
+    [Fact]
+    public void AWellFormedRowIsUnchanged()
+    {
+        var table = Parse("""
+            | A | B |
+            | --- | --- |
+            | 1 | 2 |
+            """);
+        Assert.Equal(new[] { "A", "B" }, table.Cells[0]);
+        Assert.Equal(new[] { "1", "2" }, table.Cells[1]);
+    }
+}

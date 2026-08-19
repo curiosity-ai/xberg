@@ -641,33 +641,36 @@ public static class MarkdownParser
     {
         ev.Add(MdEvent.Simple(MdEventKind.StartTable));
 
-        // Header row
-        ev.Add(MdEvent.Simple(MdEventKind.StartTableRow));
-        foreach (var cell in SplitTableRow(lines[start]))
-        {
-            ev.Add(MdEvent.Simple(MdEventKind.StartTableCell));
-            ParseInlines(cell, ev);
-            ev.Add(MdEvent.Simple(MdEventKind.EndTableCell));
-        }
-        ev.Add(MdEvent.Simple(MdEventKind.EndTableRow));
+        // The header row fixes the table's width. Every other row is made to match it: a short
+        // row is padded with empty cells and a long one loses its excess, which is what GFM says
+        // and what keeps a row's nth value under the nth heading.
+        var headerCells = SplitTableRow(lines[start]);
+        int columns = headerCells.Count;
+
+        EmitRow(headerCells, columns, ev);
 
         int i = start + 2; // skip delimiter row
         while (i < hi)
         {
             string line = lines[i];
             if (IsBlank(line) || !line.Contains('|')) break;
-            ev.Add(MdEvent.Simple(MdEventKind.StartTableRow));
-            foreach (var cell in SplitTableRow(line))
-            {
-                ev.Add(MdEvent.Simple(MdEventKind.StartTableCell));
-                ParseInlines(cell, ev);
-                ev.Add(MdEvent.Simple(MdEventKind.EndTableCell));
-            }
-            ev.Add(MdEvent.Simple(MdEventKind.EndTableRow));
+            EmitRow(SplitTableRow(line), columns, ev);
             i++;
         }
         ev.Add(MdEvent.Simple(MdEventKind.EndTable));
         return i;
+    }
+
+    private static void EmitRow(List<string> cells, int columns, List<MdEvent> ev)
+    {
+        ev.Add(MdEvent.Simple(MdEventKind.StartTableRow));
+        for (int c = 0; c < columns; c++)
+        {
+            ev.Add(MdEvent.Simple(MdEventKind.StartTableCell));
+            if (c < cells.Count) ParseInlines(cells[c], ev);
+            ev.Add(MdEvent.Simple(MdEventKind.EndTableCell));
+        }
+        ev.Add(MdEvent.Simple(MdEventKind.EndTableRow));
     }
 
     private static List<string> SplitTableRow(string line)
