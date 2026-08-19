@@ -6,89 +6,138 @@ Each format is "done" when the `Xberg.TestRunner` output matches the locally gen
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
-> **Status (after the August upstream merge, 1821 Rust commits).** The corpus grew when the
-> merge advanced `test_documents`: goldens are now generated for **3165 fixtures**, up from
-> 2942, the new ones being maths-heavy HTML/XML and a large `office/regression` set of
-> real-world HTML.
+> **Status.** Goldens are generated for **3165 fixtures**, the corpus having grown when the
+> August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
+> large `office/regression` set of real-world HTML.
 >
-> Against the full 3165: **2340 fixtures (73.9%) match on every hard dimension**;
-> content-parity **79.8% identical, 89.4% ≥95%-similar**; 78 fixtures (<80%) are genuine
-> content misses; **7 catastrophes (0.2%)**, all HTML. 412 unit tests.
+> **2469 fixtures (78.0%) match on every hard dimension**; content parity is **81.4%
+> identical, 90.1% ≥95%-similar**; 66 fixtures (<80%) are genuine content misses; **7
+> catastrophes (0.2%), all HTML**. 467 unit tests.
 >
-> Against the 2942 the earlier figures used, for continuity: **2295 matching (78.0%)**,
-> content-identical 82.7%, 2 catastrophes. That pass took it from 2122 and catastrophes from
-> 22, and the new fixtures are simply harder — they are the ones nothing has been tuned for.
+> The last pass took it from 2340 and was mostly a matter of finding things the port had never
+> implemented at all rather than tuning what it had. Ordered by what they were worth:
 >
-> Ordered by what they were worth: a file's content now overrules its extension when the two
-> disagree (txt 888/975 → 947, which is where the DocTags fixtures lived); attachment text is
-> extracted into the message that carries it, embedded messages included (eml 20/43 → 39,
-> msg 4/16 → 14); `app.xml` titles are sliced by their heading pairs and pptx chart parts are
-> followed (pptx 0/11 → 10); typst's missing branches (0/8 → 7); a drawing's name as alt text
-> when it has no description (docx 34/46 → 40); whole citation records rather than titles
-> alone, and a Table *element* for djot tables (nbib, ris, djot all to full parity); HWP's
-> record tags, whose decimal offsets had been read as hexadecimal; reserving the columns a
-> rowspan covers and dropping a second copy of every table that upstream had already removed
-> (html 10/41 → 27/41); markdown math, raw inline HTML, pandoc super/subscripts and setext
-> headings (md 671/775 → 708); and notebooks (ipynb 0/6 → 2, metadata 0/6 → 6/6).
+> - **Plain text (txt 957 → 989 of 1008, plain 991/991).** The text extractor builds its
+>   document directly, which bypasses the paragraph splitter downstream, so nothing normalized
+>   its line endings: a CRLF document came out as one paragraph carrying every carriage return.
+> - **Markdown table shape (md 718 → 741 of 782, tables 781/782).** A GFM table's header fixes
+>   its width and every other row is squared against it. Emitting rows at whatever width they
+>   had put a row's second value under the second heading in a four-column table.
+> - **XML entity references (xml 8 → 14 of 15, svg 30 → 40 of 41).** The tokenizer split text
+>   at a reference and dropped it, so `Trinidad &amp; Tobago` became two paragraphs, neither of
+>   them a country. That modelled raw quick-xml; upstream wraps it in an `EntityReader` that
+>   coalesces and resolves, and the port had the first half without the second.
+> - **RST (2 → 13 of 15).** Every table was emitted twice — upstream removed the second raw
+>   pass, the port still had it — and an unhandled directive's body was dropped rather than kept
+>   as the text it is.
+> - **PDF metadata (324 → 359 of 388).** XMP was missing from the port entirely; a scanned
+>   confidence widened an `f32` differently from serde; and pdf_oxide's page classifier never
+>   reports JBIG2, so naming it scored four scanned fixtures 0.10 high.
+> - **Three formats that had no extractor at all**: AsciiDoc (0 → 6/6), ODP (0 → 5/5) and
+>   WebVTT (0 → 1/1), plus Quarto and R Markdown, which reached no extractor because the
+>   markdown extractor claimed six of its ten MIME types.
+> - **CommonMark fence indentation, YAML number lexemes, ODF list styles, heading attribute
+>   blocks, display-math line structure** — each a small rule with a document-shaped consequence.
 >
-> Three of those were latent defects the extension/content change exposed rather than caused:
-> the HTML signature test sat behind the generic `<` fallback and was unreachable, and
-> container signatures (OLE compound files, bare ZIP) were allowed to displace an extension
-> that named the format inside them. Both are fixed; see the commits for what was measured.
+> ## Upstream defects, flagged and left alone
+>
+> Per the standing instruction to flag rather than reproduce an incorrect upstream extract:
+>
+> - **UTF-16 XML** (`vendored/unstructured/xml/factbook-utf-16.xml`). Upstream ignores the
+>   byte-order mark and reads the file as UTF-8, emitting `? x m l` with the NULs as spaces.
+>   This port decodes it. One fixture, permanently red.
+> - **Escaped markup in XMP `dc:description`.** quick-xml emits an entity reference as its own
+>   event, splitting the text run, so upstream keeps only the first fragment — `div` for a value
+>   that is a whole HTML document. This port returns the value. Four PDF fixtures.
+> - **Inherited `/MediaBox`** (`pdf/pdfa_034.pdf`). ISO 32000-1 §7.7.3.4 inherits from the
+>   nearest ancestor that defines the attribute; on a document with two nested `Pages` nodes
+>   upstream reports the root's A4 box where the page's own parent says Letter.
+> - **AsciiDoc math macros.** Upstream's current source converts `latexmath:`/`asciimath:`/
+>   `stem:` and `[latexmath]` + `++++` blocks; the reference outputs predate that and carry them
+>   verbatim. The port matches the references, which is also what the AsciiMath path can do
+>   without a converter it does not have.
+> - **`H2SO4` on `pdf/embedded_images_tables.pdf`**, where upstream reads `H SO4`.
 
 ## Known gaps after the merge
 
 Ordered by corpus impact. Each is a real upstream behaviour the port does not yet reproduce —
 not a cosmetic difference.
 
-- [x] **PDF metadata (388 fixtures).** Was 0/388, now 324/388. Two independent causes, both
-      fixed: the missing scanned-detection fields (`pdf/scan_detect.rs` is now ported as
-      `Internal/Pdf/PdfScanDetect.cs`, fed by a dedicated content-stream pass), and serde's
-      float spelling — an integral `f32` is `0.0`, not `0`, so `scanned_confidence` failed
-      on every document that is *not* scanned. The remaining 64 are other field differences,
-      not yet triaged.
-- [ ] **PDF content (389 fixtures, 79 fully matching; plain 122/388, markdown 49/388).**
+- [x] **PDF metadata (388 fixtures).** Was 0/388, now 359/388. Four causes, all fixed: the
+      missing scanned-detection fields (`pdf/scan_detect.rs` is ported as
+      `Internal/Pdf/PdfScanDetect.cs`, fed by a dedicated content-stream pass); serde's float
+      spelling, where an integral `f32` is `0.0` and not `0`; the *width* of that float, since
+      Rust widens an `f32` to `f64` before printing and 0.85 becomes `0.8500000238418579`; and
+      XMP (ISO 32000-1 §14.3.2), which the port had not implemented at all — the richer of a
+      PDF's two metadata channels and the only one many modern producers write.
+
+      Two scan-detection differences came from reading pdf_oxide rather than guessing: its page
+      classifier asks each image only whether it carries CCITT parameters and whether its data
+      decodes as JPEG, so a JBIG2 image is `Other` and never earns the bilevel bonus; and the
+      score terms accumulate in single precision, so 0.50 + 0.35 + 0.05 is 0.90000004.
+
+      The remaining 29 are the flagged upstream defects above (the `dc:description` fragment
+      and the inherited `/MediaBox`) plus genuine scan-signal differences.
+- [ ] **PDF content (389 fixtures, 100 fully matching; plain 122/388, markdown 53/388).**
       The largest remaining area, and upstream landed 127 PDF commits in this window. This is
       extraction *quality*, not a missing feature, and it does not decompose into a few
       systematic fixes — measured, not assumed:
-      - Plain-text divergence spreads across **223 distinct first-divergence clusters** for
-        274 failing fixtures, i.e. mostly reading-order and whitespace, one document at a time.
-      - Markdown/html were pinned far below plain by **heading level** assignment rather than
-        heading detection. Porting the sparsity gate, the H1-rescue gates and the level
-        inference took markdown 32 → 49 and html 27 → 41 of 388, but moved **no fixture into
-        `ok`**: every one of them still fails plain or json, so the heading work only pays off
-        once reading order does. Rust's remaining rules are in `pdf/structure/classify.rs` +
-        `adapters.rs` — still unported there: `sparse_multi_page_heading_map` (a repeated font
-        tier across pages), `has_repeated_sparse_peer_heading_tier`, the changelog
-        hierarchy passes, and `promote_title_heading`'s guard. Port a rule at a time and
-        measure; guessing costs more than it gains.
-      - Tables: of 234 mismatches only **30** are "we found no table at all" (the missing
-        ruling-line/bordered-grid tier). The other 204 are cell-segmentation differences.
-      A caution learned the hard way: `pdf/structure/text_repair.rs` looks like a free win but
-      belongs *only* to documents the structure pipeline assembled. Applying it to the flat
-      native-text split as well cost 33 of the 114 matching plain fixtures.
+      - Plain-text divergence spreads across **216 distinct first-divergence clusters** for
+        the failing fixtures, i.e. mostly reading-order and whitespace, one document at a time.
+      - Tables: of the mismatches only a minority are "we found no table at all" (the missing
+        ruling-line/bordered-grid tier). Most are cell-segmentation differences.
+
+      **The structure pipeline is now much closer to upstream's.** Ported in the last pass:
+      `sparse_multi_page_heading_map` and `has_repeated_sparse_peer_heading_tier` (a font tier
+      repeated at the top of several pages is peer sections, and repetition is evidence the
+      block count cannot supply); the baseline-advance paragraph break, which is what a blank
+      line actually produces — the whitespace-band rule is blind to it, since with leading of
+      1.1–1.3 glyph heights a blank line only leaves 1.2–1.6 and the threshold is 1.5; the
+      continuation-merge gates (bold boundary, vertical distance, numbered section heading),
+      without which every bold lead-in was absorbed into the paragraph after it before anything
+      could classify it; the segment-level text repair chain; `split_colon_semicolon_run_in_lists`
+      and `compact_final_heading_hierarchy`.
+
+      Still unported from `pdf/structure/`: `mark_validated_page_numbers` (`page_number.rs`, 965
+      lines), `recover_headings_from_outline` (needs PDF bookmarks), `stitch_fragmented_tables`,
+      `merge_spatial_footnote_markers`, `suppress_table_dominant_paragraph_spill`, and everything
+      that depends on layout regions (ML).
 
       **Where the remaining plain gap actually is.** Upstream reaches text through `pdf_oxide`,
       a 62k-line native library, and the divergence is that extractor's *geometry*, not a
-      missing xberg module. Three passes were ported from it and each is correct and measured
-      neutral on the score, which is worth stating plainly rather than quietly keeping:
+      missing xberg module. **Transplanting its assembly loop does not work** — this was
+      measured three ways and all three were reverted:
+      - The whole break cascade from `Document::extract_text_column_aware`, faithfully ported:
+        plain 122 → 72.
+      - `same_line_threshold` alone (`max(min_fs*1.2, max_fs*0.3)`, replacing our
+        `max(height, fs*0.5)*0.5`): plain 122 → 100.
+      - Its same-line font-transition space rule alone: plain 122 → 121.
+
+      The reason is structural: pdf_oxide's loop runs over spans its own merger produced, and
+      ours runs over spans ours produced. Its constants are calibrated to that granularity and
+      do not transfer. Our loop compensates differently (a row-reset rule and a tighter y
+      tolerance) and is at a local optimum for the spans it actually sees. Closing this gap
+      means porting the span merger first, not the loop that consumes it.
+
+      Three passes from pdf_oxide *were* ported successfully and are correct but score-neutral:
       - Ligature expansion for encoding-derived mappings (never ToUnicode — a ToUnicode CMap is
         the font's own statement and is taken at its word). Upstream also reaches a custom
         encoding by parsing the embedded font program; standing in for that with "the font is
-        embedded" was measured and over-applies, costing four fixtures.
+        embedded" was measured and over-applies, costing four fixtures. 26 goldens keep raw
+        ligatures in their plain output, so this is genuinely font-dependent.
       - `merge_sub_superscript_spans`, which reattaches raised and lowered runs to the words
-        they modify. Without it a formula loses its subscripts and they resurface at the end of
-        the document. On `pdf/embedded_images_tables.pdf` this makes our output *better* than
-        the golden — we produce `H2SO4` where upstream produces `H SO4`, stranding the `2` — so
-        the fixture can never match on that line.
-      - The inter-span space threshold, judged against the larger of the two spans rather than
-        the current one alone.
+        they modify. On `pdf/embedded_images_tables.pdf` this makes our output *better* than
+        the golden — we produce `H2SO4` where upstream produces `H SO4`.
+      - The inter-span space threshold, judged against the larger of the two spans.
 
       `reorder_same_line_runs` was ported too and **reverted**: it costs two fixtures, because
-      it assumes upstream's span ordering and ours differs going in. What is left after these
-      is per-glyph advance widths — `compo sition` splits mid-word because our span width for
-      `compo` is short enough that the following gap clears the (now identical) threshold. That
-      is font-metrics work in the text extractor, not a porting gap.
+      it assumes upstream's span ordering and ours differs going in.
+
+      A caution learned the hard way: `pdf/structure/text_repair.rs`'s element-level chain
+      belongs *only* to documents the structure pipeline assembled. Applying it to the flat
+      native-text split as well cost 33 of the 114 matching plain fixtures. The *segment*-level
+      chain, which upstream runs inside `segments_to_paragraphs`, is a different pass and is
+      now ported.
 - [x] **DocTags ingestion.** Not a new format after all: upstream types these by content, and
       `*.doctags.txt` reached the plain-text extractor only because the port let the extension
       decide. Fixed by the extension/content change; the fixtures now route as markup.
@@ -153,7 +202,26 @@ not a cosmetic difference.
       once on the 41-fixture set and again on the 157 — and costs far more than it fixes
       (27 matching → 15). This walker buffers text in places upstream does not; until that is
       reconciled the narrow no-elements fallback is the honest fix.
-- [ ] **odp, mdx.** Not yet triaged; use `--cluster`.
+- [x] **odp 0/5 → 5/5.** There was no ODP extractor: every presentation fell through to the
+      ZIP archive lister. See `Internal/Odf/OdfPresentationParser.cs`.
+- [ ] **mdx 0/5.** Not yet triaged; use `--cluster`.
+- [x] **txt 957/1008 → 989.** The text extractor builds its InternalDocument directly, which
+      bypasses the paragraph splitter downstream, so nothing normalized its line endings and a
+      CRLF document came out as one paragraph carrying every carriage return.
+- [x] **rst 2/15 → 13.** Every table was emitted twice (upstream removed the second raw pass;
+      the port still had it), and an unhandled directive's body was dropped instead of kept.
+      A directive and a comment are told apart by shape: a directive's name is a single word
+      immediately followed by `::`.
+- [x] **xml 8/15 → 14, svg 30/41 → 40.** Entity references were treated as boundaries and
+      dropped. Upstream wraps quick-xml in an `EntityReader` that coalesces the surrounding text
+      and resolves the reference; the port modelled the splitting without the coalescing.
+- [x] **yaml 4/10 → 8.** A number now keeps the lexeme it was written with, so a 64-bit hash
+      above `long.MaxValue` stays exact and `397.0` stays a float. A failed parse falls through
+      rather than throwing out of the extractor, which had been losing four documents whole.
+- [x] **markdown tables (761/782 → 781).** A GFM table's header fixes its width; short rows are
+      padded and long ones truncated, so a row's nth value stays under the nth heading.
+- [x] **AsciiDoc, ODP, WebVTT, Quarto, R Markdown.** Five formats that reached no extractor.
+      The first three had none written; the last two were unclaimed MIME types.
 - [x] **typ 0/8 → 7/8.** Five separate missing branches; the last fixture needs `@label`
       reference resolution, which is a feature rather than a fix.
 
