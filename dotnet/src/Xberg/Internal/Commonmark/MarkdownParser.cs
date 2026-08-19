@@ -298,6 +298,7 @@ public static class MarkdownParser
                     string content = trimmedStart.Substring(h).Trim();
                     // Strip optional closing sequence of #'s.
                     content = StripAtxClosing(content);
+                    content = StripHeadingAttributeBlock(content);
                     ev.Add(new MdEvent { Kind = MdEventKind.StartHeading, Level = (byte)h, Text = "", Url = "" });
                     ParseInlines(content, ev);
                     ev.Add(MdEvent.Simple(MdEventKind.EndHeading));
@@ -381,7 +382,7 @@ public static class MarkdownParser
                     {
                         i++;
                         ev.Add(new MdEvent { Kind = MdEventKind.StartHeading, Level = setextLevel, Text = "", Url = "" });
-                        ParseInlines(JoinInline(paraLines), ev);
+                        ParseInlines(StripHeadingAttributeBlock(JoinInline(paraLines)), ev);
                         ev.Add(MdEvent.Simple(MdEventKind.EndHeading));
                         paraLines.Clear();
                         break;
@@ -420,6 +421,32 @@ public static class MarkdownParser
             ParseInlines(paraText, ev);
             ev.Add(MdEvent.Simple(MdEventKind.EndParagraph));
         }
+    }
+
+    /// <summary>
+    /// Remove a heading's trailing attribute block — <c># Section {#sec-intro .cls}</c> — from
+    /// its text.
+    /// </summary>
+    /// <remarks>
+    /// The block names the heading's id and classes; it is metadata about the heading, not part
+    /// of what the heading says, and leaving it in puts a literal "{#sec-intro}" in the extracted
+    /// title. Recognised only as the very last thing on the line, and only when the braces
+    /// enclose nothing that would make them something else: another brace, an angle bracket, a
+    /// backslash or a line break all mean this is ordinary text that happens to end in "}".
+    /// Ported from pulldown-cmark's <c>extract_attribute_block_content_from_header_text</c>,
+    /// which upstream enables through <c>ENABLE_HEADING_ATTRIBUTES</c>.
+    /// </remarks>
+    private static string StripHeadingAttributeBlock(string heading)
+    {
+        int ix = heading.Length;
+        while (ix > 0 && heading[ix - 1] is '\n' or '\r' or ' ' or '\t') ix--;
+        if (ix == 0 || heading[ix - 1] != '}') return heading;
+        ix--; // step before the closing brace
+
+        while (ix > 0 && heading[ix - 1] is not ('{' or '}' or '<' or '>' or '\\' or '\n' or '\r')) ix--;
+        if (ix == 0 || heading[ix - 1] != '{') return heading;
+
+        return heading[..(ix - 1)].TrimEnd();
     }
 
     private static string StripAtxClosing(string s)
@@ -792,7 +819,14 @@ public static class MarkdownParser
     {
         var nodes = new LinkedList<Node>();
         var buf = new StringBuilder();
-        void Flush() { if (buf.Length > 0) { nodes.AddLast(new Node { T = NType.Text, S = buf.ToString() }); buf.Clear(); } }
+        // A newline inside a text node is the soft line break the source wrote, which renders as
+        // a space. Spans that take their body verbatim — math, code — never pass through here.
+        void Flush()
+        {
+            if (buf.Length == 0) return;
+            nodes.AddLast(new Node { T = NType.Text, S = buf.ToString().Replace('\n', ' ') });
+            buf.Clear();
+        }
 
         int n = text.Length;
         int i = 0;
@@ -1149,7 +1183,11 @@ public static class MarkdownParser
             }
             parts.Add(s);
         }
-        return string.Join(" ", parts);
+        // Joined with newlines, not spaces. A soft line break in prose still reads as a space —
+        // the inline scanner turns it into one when it flushes a text node — but a math span
+        // takes its body verbatim from this string, and a display equation's line structure is
+        // part of the equation. Collapsing it here would leave no way to recover it.
+        return string.Join("\n", parts);
     }
 
     private static bool IsFlWhite(char c) => c == '\n' || char.IsWhiteSpace(c);

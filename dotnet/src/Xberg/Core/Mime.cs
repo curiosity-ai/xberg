@@ -278,6 +278,8 @@ public static class Mime
         Add("text/plain", "txt");
         Add("text/markdown", "md", "markdown");
         Add("text/x-commonmark", "commonmark");
+        Add("text/x-quarto", "qmd");
+        Add("text/x-r-markdown", "rmd");
         Add("text/mdx", "mdx");
         Add("text/x-djot", "djot");
         Add("application/pdf", "pdf");

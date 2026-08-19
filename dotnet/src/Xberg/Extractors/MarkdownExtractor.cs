@@ -27,6 +27,14 @@ public sealed class MarkdownExtractor : IExtractor
         "text/x-commonmark",
         "text/x-markdown-extra",
         "text/x-multimarkdown",
+        "text/x-pandoc",
+        "text/x-quarto",
+        // application/x-quarto is an alias of text/x-quarto in the format table, so
+        // validation accepts it — but the registry resolves extractors by exact string with
+        // no alias resolution, so an unclaimed alias would reach extraction and fail as an
+        // unsupported format despite being advertised as supported.
+        "application/x-quarto",
+        "text/x-r-markdown",
     };
 
     public int Priority => 50;
