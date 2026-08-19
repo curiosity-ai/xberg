@@ -53,13 +53,47 @@ public class HtmlExtractorTests
     public void Html_Table()
     {
         var doc = Html("<table><tr><th>Name</th><th>Age</th></tr><tr><td>Alice</td><td>30</td></tr></table>");
-        // Rust records each table twice: the DocumentStructure copy (page 0) and the
-        // table_data copy (page i+1). Both carry identical cells.
-        Assert.Equal(2, doc.Tables.Count);
+        // One entry per table in the source. A second, unreferenced copy used to be appended,
+        // which upstream removed: it came from the same conversion pass, so it only duplicated
+        // what the document already had.
+        Assert.Single(doc.Tables);
         Assert.Equal(0u, doc.Tables[0].PageNumber);
-        Assert.Equal(1u, doc.Tables[1].PageNumber);
         Assert.Equal(new[] { "Name", "Age" }, doc.Tables[0].Cells[0]);
         Assert.Equal(new[] { "Alice", "30" }, doc.Tables[0].Cells[1]);
+    }
+
+    /// <summary>
+    /// A rowspan reserves its column in the rows it covers. Advancing through each row on its own
+    /// slides every cell beneath one leftwards, so the data stops lining up with its headers.
+    /// </summary>
+    [Fact]
+    public void Html_RowspanReservesItsColumnInLaterRows()
+    {
+        var doc = Html(
+            "<table>" +
+            "<tr><td rowspan=\"2\">spans down</td><td>r1c2</td></tr>" +
+            "<tr><td>r2c2</td></tr>" +
+            "</table>");
+
+        var cells = Assert.Single(doc.Tables).Cells;
+        Assert.Equal(new[] { "spans down", "r1c2" }, cells[0]);
+        // Not ["r2c2", ""] — column 0 is still covered by the rowspan above.
+        Assert.Equal(new[] { "", "r2c2" }, cells[1]);
+    }
+
+    /// <summary>A colspan leaves the columns it covers empty, and the row stays rectangular.</summary>
+    [Fact]
+    public void Html_ColspanLeavesTheColumnsItCoversEmpty()
+    {
+        var doc = Html(
+            "<table>" +
+            "<tr><th>a</th><th>b</th><th>c</th></tr>" +
+            "<tr><td colspan=\"2\">wide</td><td>c2</td></tr>" +
+            "</table>");
+
+        var cells = Assert.Single(doc.Tables).Cells;
+        Assert.Equal(new[] { "a", "b", "c" }, cells[0]);
+        Assert.Equal(new[] { "wide", "", "c2" }, cells[1]);
     }
 
     [Fact]

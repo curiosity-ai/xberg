@@ -531,20 +531,10 @@ public sealed class HtmlWalker
             _b.PushTableFromCells(simple, null, null);
             return;
         }
-        int numCols = rows.Count == 0 ? 0 : rows.Max(r => (int)r.Sum(c => c.ColSpan));
-        var grid = new List<List<string>>();
-        foreach (var row in rows)
-        {
-            var line = new List<string>(new string[numCols]);
-            for (int k = 0; k < numCols; k++) line[k] = "";
-            int col = 0;
-            foreach (var cell in row)
-            {
-                if (col < numCols) line[col] = CellNormalize(cell.Text);
-                col += (int)cell.ColSpan;
-            }
-            grid.Add(line);
-        }
+        // Advancing by colspan alone ignores the columns a rowspan from an earlier row still
+        // covers, which slides every cell beneath one leftwards and out from under its header.
+        var grid = Tables.GridFlatten.FlattenSpannedRows<CellMeta>(
+            rows, c => (int)c.ColSpan, c => (int)c.RowSpan, c => CellNormalize(c.Text));
         _b.PushTableFromCells(grid, null, null);
     }
 

@@ -40,6 +40,15 @@ if (args.Length >= 2 && args[0] == "--dump-metadata")
     return 0;
 }
 
+// Table dump mode: `--dump-tables <file>` prints the C# tables as JSON, so a mismatch can be
+// diffed cell-by-cell against the golden's `tables` array.
+if (args.Length >= 2 && args[0] == "--dump-tables")
+{
+    var res = new Extractor().Extract(ExtractInput.FromUri(args[1]), new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+    Console.Out.Write(SerializeToNode(res.Results.FirstOrDefault()?.Tables)?.ToJsonString() ?? "null");
+    return 0;
+}
+
 var opts = ParseArgs(args);
 if (opts is null) return 2;
 
