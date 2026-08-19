@@ -64,12 +64,30 @@ public class DataXmlTests
     }
 
     [Fact]
-    public void EntityReferences_SplitText()
+    public void AnEntityReferenceIsPartOfTheTextAroundIt()
     {
-        // quick-xml emits general references as separate events; text is split around them.
+        // A reference is a spelling of a character, not a boundary: this is one country's name.
         var doc = Extract("<root>Trinidad &amp; Tobago</root>");
         var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
-        Assert.Equal(new[] { "Trinidad", "Tobago" }, paras);
+        Assert.Equal(new[] { "Trinidad & Tobago" }, paras);
+    }
+
+    [Fact]
+    public void CharacterReferencesResolveInBothDecimalAndHex()
+    {
+        var doc = Extract("<root>caf&#233; and caf&#xE9;</root>");
+        var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
+        Assert.Equal(new[] { "café and café" }, paras);
+    }
+
+    [Fact]
+    public void AnUnresolvableReferenceContributesNothing()
+    {
+        // A reference this parser cannot resolve names something the document did not carry
+        // inline, and its literal spelling is not that thing.
+        var doc = Extract("<root>before &unknownentity; after</root>");
+        var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
+        Assert.Equal(new[] { "before  after" }, paras);
     }
 
     [Fact]
