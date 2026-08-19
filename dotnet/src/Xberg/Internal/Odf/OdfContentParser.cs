@@ -31,6 +31,21 @@ internal static class OdfContentParser
         var doc = XDocument.Parse(contentXml, LoadOptions.PreserveWhitespace);
         var root = doc.Root!;
         var styleMap = OdfStyles.BuildStyleMap(root);
+        var listStyleMap = OdfStyles.BuildListStyleMap(root);
+        // A named list style ("L1") is commonly declared in styles.xml's shared office:styles
+        // rather than content.xml's automatic-styles. Merge those in, without letting them
+        // override a same-named style content.xml already defined.
+        if (ReadEntry(archive, "styles.xml") is { } stylesXmlForLists)
+        {
+            try
+            {
+                var stylesDoc = XDocument.Parse(stylesXmlForLists, LoadOptions.PreserveWhitespace);
+                if (stylesDoc.Root is not null)
+                    foreach (var (name, ordered) in OdfStyles.BuildListStyleMap(stylesDoc.Root))
+                        listStyleMap.TryAdd(name, ordered);
+            }
+            catch (System.Xml.XmlException) { }
+        }
         var builder = new InternalDocumentBuilder("odt");
 
         foreach (var bodyChild in root.Elements())
@@ -41,7 +56,7 @@ internal static class OdfContentParser
             {
                 if (textElem.Name.LocalName != "text")
                     continue;
-                BuildInternalElements(textElem, builder, styleMap, imageData, formulaData);
+                BuildInternalElements(textElem, builder, styleMap, listStyleMap, imageData, formulaData);
             }
         }
 
@@ -52,10 +67,11 @@ internal static class OdfContentParser
     // ── recursive body walk ────────────────────────────────────────────────
 
     /// <summary>Ports `build_internal_elements` (revision handling dropped).</summary>
-    private static void BuildInternalElements(
+    internal static void BuildInternalElements(
         XElement parent,
         InternalDocumentBuilder builder,
         Dictionary<string, OdtStyleProps> styleMap,
+        Dictionary<string, bool> listStyleMap,
         Dictionary<string, OdfImage> imageData,
         Dictionary<string, string> formulaData)
     {
@@ -92,10 +108,10 @@ internal static class OdfContentParser
                     break;
                 }
                 case "list":
-                    BuildList(node, builder);
+                    BuildList(node, builder, listStyleMap);
                     break;
                 case "section":
-                    BuildInternalElements(node, builder, styleMap, imageData, formulaData);
+                    BuildInternalElements(node, builder, styleMap, listStyleMap, imageData, formulaData);
                     break;
             }
         }
@@ -264,10 +280,18 @@ internal static class OdfContentParser
             builder.PushParagraph(finalTrimmed, annotations, null, null);
     }
 
-    /// <summary>Ports `build_internal_list`. Lists are always emitted unordered (matches Rust).</summary>
-    private static void BuildList(XElement listNode, InternalDocumentBuilder builder)
+    /// <summary>
+    /// Emit one list, ordered or not according to its own declared style.
+    /// </summary>
+    /// <remarks>A nested list resolves its own style name rather than inheriting its parent's: a
+    /// numbered outline commonly alternates numbered and bulleted levels.</remarks>
+    private static void BuildList(
+        XElement listNode, InternalDocumentBuilder builder, Dictionary<string, bool> listStyleMap)
     {
-        builder.PushList(false);
+        string? styleName = OdfStyles.Attr(listNode, "style-name");
+        bool ordered = styleName is not null && listStyleMap.TryGetValue(styleName, out bool o) && o;
+
+        builder.PushList(ordered);
         foreach (var item in listNode.Elements())
         {
             if (item.Name.LocalName != "list-item")
@@ -284,12 +308,12 @@ internal static class OdfContentParser
                         {
                             var trimmed = text.Trim();
                             if (trimmed.Length > 0)
-                                builder.PushListItem(trimmed, false, new List<TextAnnotation>(), null, null);
+                                builder.PushListItem(trimmed, ordered, new List<TextAnnotation>(), null, null);
                         }
                         break;
                     }
                     case "list":
-                        BuildList(child, builder);
+                        BuildList(child, builder, listStyleMap);
                         break;
                 }
             }
@@ -488,6 +512,17 @@ internal static class OdfContentParser
                     case "line-break":
                         parts.Add("\n");
                         break;
+                    // A comment's body is not part of the text it annotates.
+                    case "annotation":
+                    case "annotation-end":
+                        break;
+                    // A field carries its last-rendered value as text — a slide master's page
+                    // number placeholder reads "<number>". That is the application's cache of
+                    // what the field showed, not something anyone wrote, and emitting it puts a
+                    // literal "<number>" in the extracted text of every presentation.
+                    case "page-number":
+                    case "page-count":
+                        break;
                     default:
                     {
                         var t = NodeText(el);
@@ -544,7 +579,7 @@ internal static class OdfContentParser
     // ── tables ─────────────────────────────────────────────────────────────
 
     /// <summary>Ports `extract_table_cells`. Handles direct rows and table-header-rows containers.</summary>
-    private static List<List<string>> ExtractTableCells(XElement tableNode)
+    internal static List<List<string>> ExtractTableCells(XElement tableNode)
     {
         var rows = new List<List<string>>();
         foreach (var child in tableNode.Elements())
@@ -591,7 +626,7 @@ internal static class OdfContentParser
     // ── image / formula pre-extraction ─────────────────────────────────────
 
     /// <summary>Ports `pre_extract_images`. Maps <c>Pictures/*</c> href → (bytes, format).</summary>
-    private static Dictionary<string, OdfImage> PreExtractImages(ZipArchive archive)
+    internal static Dictionary<string, OdfImage> PreExtractImages(ZipArchive archive)
     {
         var images = new Dictionary<string, OdfImage>();
         foreach (var entry in archive.Entries)
@@ -622,7 +657,7 @@ internal static class OdfContentParser
     }
 
     /// <summary>Ports `pre_extract_formulas`. Maps embedded object dirs → MathML text.</summary>
-    private static Dictionary<string, string> PreExtractFormulas(ZipArchive archive)
+    internal static Dictionary<string, string> PreExtractFormulas(ZipArchive archive)
     {
         var formulas = new Dictionary<string, string>();
         foreach (var entry in archive.Entries)
@@ -782,7 +817,7 @@ internal static class OdfContentParser
         return s;
     }
 
-    private static string? ReadEntry(ZipArchive archive, string name)
+    internal static string? ReadEntry(ZipArchive archive, string name)
     {
         var entry = archive.GetEntry(name);
         if (entry is null)

@@ -302,6 +302,7 @@ public static class Mime
         Add("application/vnd.ms-excel.addin.macroEnabled.12", "xlam");
         Add("application/vnd.ms-excel.template.macroEnabled.12", "xla");
         Add("application/vnd.oasis.opendocument.spreadsheet", "ods");
+        Add("application/vnd.oasis.opendocument.presentation", "odp");
         Add("application/x-dbf", "dbf");
         Add("application/x-hwp", "hwp");
         Add("application/haansofthwpx", "hwpx");
