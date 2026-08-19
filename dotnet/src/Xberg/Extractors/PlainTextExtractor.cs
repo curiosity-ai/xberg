@@ -41,10 +41,19 @@ public sealed class PlainTextExtractor : IExtractor
         return doc;
     }
 
+    /// <summary>
+    /// Split the text into paragraphs on blank lines.
+    /// </summary>
+    /// <remarks>
+    /// Line endings are normalized here rather than left to a later stage: this extractor
+    /// populates an InternalDocument directly, which bypasses the paragraph splitter downstream.
+    /// Without it "\r\n\r\n" never matches the blank-line boundary and a CRLF document collapses
+    /// into one paragraph carrying its carriage returns.
+    /// </remarks>
     private static InternalDocument BuildInternalDocument(string text)
     {
         var builder = new InternalDocumentBuilder("text");
-        foreach (var paragraph in SplitDoubleNewline(text))
+        foreach (var paragraph in SplitDoubleNewline(TextTransform.NormalizeLineEndings(text)))
         {
             string trimmed = paragraph.Trim();
             if (trimmed.Length > 0)
