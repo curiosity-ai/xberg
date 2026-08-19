@@ -124,27 +124,35 @@ not a cosmetic difference.
       `$}$` stay literal.
 - [x] **Citation formats (nbib, ris).** Both at full parity. The parsers were fine; the element
       carried only the title, so everything else was parsed and then dropped.
-- [~] **html 10/41 → 27/41.** Two defects, both shared-algorithm rather than HTML-specific.
-      Cells were placed by advancing through each row on its own, which ignores the columns a
-      rowspan from an earlier row still covers and slides everything beneath one leftwards out
-      from under its header; upstream keeps the placement rule in one place (`grid_flatten.rs`)
-      so the geometry cannot drift between formats, and this port now does too. And every table
-      was recorded twice — a second, unreferenced copy that upstream deliberately removed,
-      because it came from the same conversion pass as the first.
+- [~] **html 27/41 on the original set; 27/157 on the grown one.** Two defects fixed: cells
+      were placed by advancing through each row on its own, which ignores the columns a rowspan
+      from an earlier row still covers and slides everything beneath one out from under its
+      header (upstream keeps that placement rule in one helper, `grid_flatten.rs`, so the
+      geometry cannot drift between formats, and this port now does too); and every table was
+      recorded twice, a second unreferenced copy upstream had already removed. Two more
+      recovered documents that produced *nothing*: `<body>` now closes an unterminated
+      `<head>` rather than the head running to the last byte, and a document that yields no
+      elements at all falls back to the loose text it gathered.
 
-      What remains is loose text: the walker discards text that is not inside a `<p>`, so
-      `<div>Hello</div>` extracts to nothing. That is also why the two
-      `ground_truth/fictionbook/*.md` fixtures (raw `<div>` at the top, so HTML by content) are
-      empty — the last two catastrophes. Emitting it unconditionally was tried and is *not* the
-      answer: it fixes those two and costs twelve others (plain 22/41 → 10/41). Whatever the
-      rule is, it is narrower than "always emit".
-- [~] **ipynb 0/6 → 2/6, metadata 0/6 → 6/6.** The extractor invented content: `[cell_id: …]`,
-      `[kernel_language: …]`, `execution_count: …`, `[output_type: …]` and `[mime: …]` went into
-      the text as paragraphs, none of which upstream emits — those are metadata, and the cell
-      metadata it *should* have carried (each cell's `id`, and a per-output record) was missing.
-      Markdown cells now go through the markdown parser proper rather than an ad-hoc line scan,
-      which is what upstream does and what gets them smart punctuation and setext headings.
-      What remains is inter-cell blank-line spacing.
+      **The 117 `office/regression` fixtures are the real remaining work**, and 7 of them are
+      catastrophes. Diagnosed, not guessed:
+      - The walker captures a whole `<table>` subtree and hands it to the markdown converter,
+        while upstream's structure walker handles tables inline with its own cell accumulator.
+        So anything inside a layout table — and 1990s HTML puts the entire page inside one —
+        goes through cell rendering. A `<pre>` in a cell comes out fenced and dedented
+        (` ```…``` ` in *plain* output, indentation collapsed) where upstream emits a Code
+        element carrying the raw indented text. `000_000448.html` loses three quarters of its
+        content this way. Fixing it means giving the walker its own table path rather than
+        delegating.
+      - Malformed markup gets no error recovery. `000_000190.html` has 5 `<tr>` opens against
+        55 closes; upstream's parser synthesises the rows anyway, ours finds 3 tables where it
+        finds 7.
+
+      Loose text outside a `<p>` is still dropped, and that is deliberate: flushing at every
+      block boundary is what upstream's `flush_paragraph` does, but it was measured twice —
+      once on the 41-fixture set and again on the 157 — and costs far more than it fixes
+      (27 matching → 15). This walker buffers text in places upstream does not; until that is
+      reconciled the narrow no-elements fallback is the honest fix.
 - [ ] **odp, mdx.** Not yet triaged; use `--cluster`.
 - [x] **typ 0/8 → 7/8.** Five separate missing branches; the last fixture needs `@label`
       reference resolution, which is a feature rather than a fix.
