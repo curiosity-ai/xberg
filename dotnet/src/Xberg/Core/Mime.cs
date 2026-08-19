@@ -341,6 +341,7 @@ public static class Mime
         Add("application/gzip", "gz", "tgz");
         Add("application/x-7z-compressed", "7z");
         Add("text/x-rst", "rst");
+        Add("text/asciidoc", "adoc", "asciidoc");
         Add("text/x-org", "org");
         Add("application/epub+zip", "epub");
         Add("application/rtf", "rtf");
