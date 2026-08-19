@@ -149,4 +149,120 @@ public class MarkdownExtractorTests
         // JSX component recorded as a raw block.
         Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.RawBlock);
     }
+
+    // ── math ──────────────────────────────────────────────────────────────────
+
+    /// <summary>Display math is a block of its own, so it becomes a Formula without delimiters.</summary>
+    [Fact]
+    public void DisplayMathBecomesAFormulaElement()
+    {
+        var doc = Extract("Before.\n\n$$A=\\pi r^{2} $$\n\nAfter.\n");
+        var formula = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Formula);
+        Assert.Equal("A=\\pi r^{2}", formula.Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("$$", StringComparison.Ordinal));
+    }
+
+    /// <summary>Inline math stays in the text: `$x$` reads as maths wherever the text ends up.</summary>
+    [Fact]
+    public void InlineMathKeepsItsDelimiters()
+    {
+        var doc = Extract("The identity $a^2 + b^2$ holds.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("The identity $a^2 + b^2$ holds.", para.Text);
+    }
+
+    /// <summary>
+    /// A delimiter followed by whitespace cannot open a span, which is what keeps a lone `$` in
+    /// prose from swallowing the rest of the line.
+    /// </summary>
+    [Theory]
+    [InlineData("It costs $ 5 and $ 10 today.")]
+    [InlineData("Prices: $5 today.")]
+    public void ALoneDollarStaysLiteral(string source)
+    {
+        var doc = Extract(source + "\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal(source, para.Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Formula);
+    }
+
+    /// <summary>Math inside a code span is code, not maths.</summary>
+    [Fact]
+    public void MathInsideACodeSpanIsNotParsed()
+    {
+        var doc = Extract("Use `$x$` for maths.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Contains("$x$", para.Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Formula);
+    }
+
+    // ── raw inline HTML ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Markdown has no syntax for subscripts or superscripts, so documents reach for HTML. The
+    /// tags used to be scanned and thrown away, taking the text they wrapped with them.
+    /// </summary>
+    [Fact]
+    public void InlineHtmlPassesThroughVerbatim()
+    {
+        var doc = Extract("H<sub>2</sub>O is a liquid. 2<sup>10</sup> is 1024.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("H<sub>2</sub>O is a liquid. 2<sup>10</sup> is 1024.", para.Text);
+    }
+
+    /// <summary>An HTML comment is inline HTML too, and documents use it as a marker.</summary>
+    [Fact]
+    public void InlineHtmlCommentsAreKept()
+    {
+        var doc = Extract("<!-- image -->\nText and picture.\n");
+        Assert.Contains(doc.Elements, e => e.Text.Contains("<!-- image -->", StringComparison.Ordinal));
+    }
+
+    // ── superscript / subscript ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Pandoc's `^x^` and `~x~`: markers are structure, so they leave the text. Both delimiters
+    /// have to start a word, which is why a document wanting `H₂O` reaches for `<sub>` instead.
+    /// </summary>
+    [Fact]
+    public void SuperscriptAndSubscriptBecomeAnnotations()
+    {
+        var doc = Extract("~Subscript~ and ^superscript^\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("Subscript and superscript", para.Text);
+        Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Superscript);
+        Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Subscript);
+    }
+
+    /// <summary>
+    /// A single `~` and a `^` cannot sit inside a word, so a pair separated by a space is not a
+    /// span. Treating them as one silently deleted both markers and the space between them.
+    /// </summary>
+    [Fact]
+    public void IntrawordSuperscriptAndSubscriptDoNotPair()
+    {
+        var doc = Extract("These are not spans: a^b c^d, a~b c~d.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("These are not spans: a^b c^d, a~b c~d.", para.Text);
+        Assert.Empty(para.Annotations);
+    }
+
+    /// <summary>A doubled `~` is still a strikethrough, and may sit inside a word.</summary>
+    [Fact]
+    public void DoubledTildeRemainsStrikethrough()
+    {
+        var doc = Extract("~~gone~~ but here.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("gone but here.", para.Text);
+        Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Strikethrough);
+    }
+
+    /// <summary>Runs of different lengths are not partners, so `~x~~` stays literal.</summary>
+    [Fact]
+    public void TildeRunsPairOnlyWithTheirOwnLength()
+    {
+        var doc = Extract("a ~x~~ b\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("a ~x~~ b", para.Text);
+    }
 }

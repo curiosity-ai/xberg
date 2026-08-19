@@ -7,6 +7,20 @@ use quick_xml::events::Event;
 
 use crate::utils::xml_utils::EntityReader;
 
+/// Extract the LaTeX for a `disp-formula` / `inline-formula` subtree.
+///
+/// JATS writes verbatim TeX in `tex-math` and the equation number in `label`.
+pub(super) fn extract_formula_latex(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<String> {
+    crate::extraction::formula_xml::extract_formula_latex(
+        reader,
+        budget,
+        &crate::extraction::formula_xml::FormulaElements {
+            tex: "tex-math",
+            label: Some("label"),
+        },
+    )
+}
+
 /// Extract text content from a JATS element and its children.
 pub(super) fn extract_text_content(reader: &mut EntityReader<'_>, budget: &mut SecurityBudget) -> Result<String> {
     let mut text = String::new();

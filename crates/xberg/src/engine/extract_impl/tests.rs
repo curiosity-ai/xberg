@@ -174,6 +174,49 @@ async fn extract_batch_applies_item_timeout() {
     assert_eq!(error_type(&error), "timeout");
 }
 
+#[test]
+fn should_map_named_variants_to_their_dedicated_code_and_type() {
+    let cases: [(XbergError, u32, &str); 6] = [
+        (XbergError::Io(std::io::Error::other("t")), 1001, "io"),
+        (XbergError::validation("t"), 1002, "validation"),
+        (XbergError::UnsupportedFormat("t/mime".to_string()), 1003, "unsupported_format"),
+        (XbergError::Timeout { elapsed_ms: 1, limit_ms: 2 }, 1004, "timeout"),
+        (XbergError::Cancelled, 1005, "cancelled"),
+        (XbergError::security("t"), 1006, "security"),
+    ];
+
+    for (error, expected_code, expected_type) in cases {
+        assert_eq!(error_code(&error), expected_code);
+        assert_eq!(error_type(&error), expected_type);
+    }
+}
+
+#[test]
+fn should_default_unlisted_variants_to_1099_and_other() {
+    let cases: [XbergError; 12] = [
+        XbergError::parsing("t"),
+        XbergError::ocr("t"),
+        XbergError::cache("t"),
+        XbergError::image_processing("t"),
+        XbergError::serialization("t"),
+        XbergError::MissingDependency("t".to_string()),
+        XbergError::Plugin {
+            message: "t".to_string(),
+            plugin_name: "p".to_string(),
+        },
+        XbergError::LockPoisoned("t".to_string()),
+        XbergError::embedding("t"),
+        XbergError::Other("t".to_string()),
+        XbergError::transcription("t"),
+        XbergError::reranking("t"),
+    ];
+
+    for error in cases {
+        assert_eq!(error_code(&error), 1099);
+        assert_eq!(error_type(&error), "other");
+    }
+}
+
 #[tokio::test]
 async fn batch_scheduler_prioritizes_larger_inputs() {
     let directory = tempdir().unwrap();

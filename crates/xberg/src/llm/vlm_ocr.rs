@@ -17,7 +17,7 @@ use regex::Regex;
 
 use crate::core::config::LlmConfig;
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
-use crate::types::{BoundingBox, FormatMetadata, Formula, Metadata, OcrMetadata, Table};
+use crate::types::{FormatMetadata, Formula, Metadata, OcrMetadata, Table};
 
 // Taken from the ungated `crate::ocr_metadata_keys` rather than `crate::ocr`, which is
 // gated on `feature = "ocr"` / `"ocr-wasm"` — neither of which `liter-llm` implies, so a
@@ -420,10 +420,9 @@ fn extract_gfm_tables(text: &str) -> Vec<Table> {
 
 /// Extract LaTeX formulas from VLM OCR output text.
 ///
-/// The VLM path has no layout detection, so recognized formulas have no known
-/// region on the page; `bbox` is left at [`BoundingBox::default`] (all-zero)
-/// rather than a fabricated position, and `page` is fixed at `1` since a single
-/// call always OCRs one page image.
+/// The VLM path has no layout detection, so recognized formulas carry no
+/// geometry: `bbox` and `page` are `None`. The PDF pipeline renumbers `page`
+/// per document page; single-image extraction keeps `None`.
 fn extract_formulas(text: &str) -> Vec<Formula> {
     FORMULA_PATTERN
         .captures_iter(text)
@@ -437,8 +436,8 @@ fn extract_formulas(text: &str) -> Vec<Formula> {
         .filter(|latex| !latex.is_empty())
         .map(|latex| Formula {
             latex: latex.to_string(),
-            bbox: BoundingBox::default(),
-            page: 1,
+            bbox: None,
+            page: None,
         })
         .collect()
 }
@@ -566,8 +565,8 @@ mod tests {
         assert_eq!(formulas.len(), 1, "expected exactly one formula; got: {formulas:?}");
         assert_eq!(formulas[0].latex, r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}");
         assert!(!formulas[0].latex.contains("$$"), "delimiters must be stripped");
-        assert_eq!(formulas[0].bbox, crate::types::BoundingBox::default());
-        assert_eq!(formulas[0].page, 1);
+        assert_eq!(formulas[0].bbox, None, "VLM formulas carry no geometry");
+        assert_eq!(formulas[0].page, None, "VLM formulas carry no page");
     }
 
     /// Multiple formulas in one response must each be extracted independently.
@@ -600,8 +599,8 @@ mod tests {
 
         assert_eq!(formulas.len(), 1, "expected exactly one formula; got: {formulas:?}");
         assert_eq!(formulas[0].latex, r"A = \pi r^2");
-        assert_eq!(formulas[0].bbox, crate::types::BoundingBox::default());
-        assert_eq!(formulas[0].page, 1);
+        assert_eq!(formulas[0].bbox, None, "VLM formulas carry no geometry");
+        assert_eq!(formulas[0].page, None, "VLM formulas carry no page");
     }
 
     /// Regression test for issue #188: `\(...\)` inline math must also be

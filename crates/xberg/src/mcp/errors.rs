@@ -3,6 +3,7 @@
 //! This module provides functions to map Xberg errors to MCP error responses.
 
 use crate::XbergError;
+use crate::error::McpErrorCategory;
 use rmcp::ErrorData as McpError;
 use std::fmt::Write;
 
@@ -19,25 +20,39 @@ use std::fmt::Write;
 /// The error message and source chain are preserved to aid debugging.
 #[doc(hidden)]
 pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
+    let category = error.mcp_error_category();
+    let message = mcp_error_message(error);
+
+    match category {
+        McpErrorCategory::InvalidParams => McpError::invalid_params(message, None),
+        McpErrorCategory::ParseError => McpError::parse_error(message, None),
+        McpErrorCategory::Cancelled => McpError {
+            code: rmcp::model::ErrorCode(-32800),
+            message: message.into(),
+            data: None,
+        },
+        McpErrorCategory::Internal => McpError::internal_error(message, None),
+    }
+}
+
+/// Builds the human-readable message for an [`XbergError`], as reported by the MCP error
+/// conversion. The JSON-RPC error code for the same error is selected separately, via
+/// [`XbergError::mcp_error_category`]; see [`map_xberg_error_to_mcp`].
+fn mcp_error_message(error: XbergError) -> String {
     match error {
         XbergError::Validation { message, source } => {
             let mut error_message = format!("Validation error: {}", message);
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::invalid_params(error_message, None)
+            error_message
         }
 
-        XbergError::UnsupportedFormat(mime_type) => {
-            McpError::invalid_params(format!("Unsupported format: {}", mime_type), None)
-        }
+        XbergError::UnsupportedFormat(mime_type) => format!("Unsupported format: {}", mime_type),
 
-        XbergError::MissingDependency(dep) => McpError::invalid_params(
-            format!(
-                "Missing required dependency: {}. Please install it to use this feature.",
-                dep
-            ),
-            None,
+        XbergError::MissingDependency(dep) => format!(
+            "Missing required dependency: {}. Please install it to use this feature.",
+            dep
         ),
 
         XbergError::Parsing { message, source } => {
@@ -45,18 +60,18 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::parse_error(error_message, None)
+            error_message
         }
 
         // OSError/RuntimeError must bubble up - system errors need user reports ~keep
-        XbergError::Io(io_err) => McpError::internal_error(format!("System I/O error: {}", io_err), None),
+        XbergError::Io(io_err) => format!("System I/O error: {}", io_err),
 
         XbergError::Ocr { message, source } => {
             let mut error_message = format!("OCR processing error: {}", message);
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::internal_error(error_message, None)
+            error_message
         }
 
         XbergError::Cache { message, source } => {
@@ -64,7 +79,7 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::internal_error(error_message, None)
+            error_message
         }
 
         XbergError::ImageProcessing { message, source } => {
@@ -72,7 +87,7 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::internal_error(error_message, None)
+            error_message
         }
 
         XbergError::Serialization { message, source } => {
@@ -80,7 +95,7 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::internal_error(error_message, None)
+            error_message
         }
 
         XbergError::Embedding { message, source } => {
@@ -88,34 +103,29 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::internal_error(error_message, None)
+            error_message
         }
 
         XbergError::Plugin { message, plugin_name } => {
-            McpError::internal_error(format!("Plugin '{}' error: {}", plugin_name, message), None)
+            format!("Plugin '{}' error: {}", plugin_name, message)
         }
 
-        XbergError::LockPoisoned(msg) => McpError::internal_error(format!("Internal lock poisoned: {}", msg), None),
+        XbergError::LockPoisoned(msg) => format!("Internal lock poisoned: {}", msg),
 
-        XbergError::Timeout { elapsed_ms, limit_ms } => McpError::internal_error(
-            format!("Extraction timed out after {elapsed_ms}ms (limit: {limit_ms}ms)"),
-            None,
-        ),
+        XbergError::Timeout { elapsed_ms, limit_ms } => {
+            format!("Extraction timed out after {elapsed_ms}ms (limit: {limit_ms}ms)")
+        }
 
-        XbergError::Other(msg) => McpError::internal_error(msg, None),
+        XbergError::Other(msg) => msg,
 
-        XbergError::Cancelled => McpError {
-            code: rmcp::model::ErrorCode(-32800),
-            message: "Extraction cancelled".into(),
-            data: None,
-        },
+        XbergError::Cancelled => "Extraction cancelled".to_string(),
 
         XbergError::Security { message, source } => {
             let mut error_message = format!("Security violation: {}", message);
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::invalid_params(error_message, None)
+            error_message
         }
 
         XbergError::Transcription { message, source } => {
@@ -123,7 +133,7 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::internal_error(error_message, None)
+            error_message
         }
 
         XbergError::Reranking { message, source } => {
@@ -131,7 +141,7 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
             if let Some(src) = source {
                 let _ = write!(error_message, " (caused by: {})", src);
             }
-            McpError::internal_error(error_message, None)
+            error_message
         }
     }
 }
@@ -305,6 +315,48 @@ mod tests {
 
         assert_eq!(mcp_error.code.0, -32800);
         assert!(mcp_error.message.contains("cancelled"));
+    }
+
+    #[test]
+    fn should_map_security_error_to_invalid_params() {
+        let error = XbergError::security("zip bomb detected");
+        let mcp_error = map_xberg_error_to_mcp(error);
+
+        assert_eq!(mcp_error.code.0, -32602);
+        assert!(mcp_error.message.contains("Security violation"));
+        assert!(mcp_error.message.contains("zip bomb detected"));
+    }
+
+    #[test]
+    fn should_map_timeout_error_to_internal_error_with_exact_message() {
+        let error = XbergError::Timeout {
+            elapsed_ms: 5000,
+            limit_ms: 3000,
+        };
+        let mcp_error = map_xberg_error_to_mcp(error);
+
+        assert_eq!(mcp_error.code.0, -32603);
+        assert_eq!(mcp_error.message, "Extraction timed out after 5000ms (limit: 3000ms)");
+    }
+
+    #[test]
+    fn should_map_transcription_error_to_internal_error() {
+        let error = XbergError::transcription("whisper backend failed");
+        let mcp_error = map_xberg_error_to_mcp(error);
+
+        assert_eq!(mcp_error.code.0, -32603);
+        assert!(mcp_error.message.contains("Transcription error"));
+        assert!(mcp_error.message.contains("whisper backend failed"));
+    }
+
+    #[test]
+    fn should_map_reranking_error_to_internal_error() {
+        let error = XbergError::reranking("cross-encoder failed");
+        let mcp_error = map_xberg_error_to_mcp(error);
+
+        assert_eq!(mcp_error.code.0, -32603);
+        assert!(mcp_error.message.contains("Reranking error"));
+        assert!(mcp_error.message.contains("cross-encoder failed"));
     }
 
     #[test]

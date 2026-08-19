@@ -7,8 +7,7 @@ using System.Text.Json.Serialization;
 
 namespace Xberg;
 /// <summary>
-/// Controls how markdown tables are handled when they exceed the chunk size
-/// limit.
+/// Controls how markdown tables are handled when they exceed the chunk size limit.
 ///
 /// Only applies when `chunker_type` is `Markdown`.
 ///
@@ -23,40 +22,45 @@ namespace Xberg;
 ///   self-contained for extraction, search, and LLM consumption.
 /// </summary>
 [JsonConverter(typeof(TableChunkingModeJsonConverter))]
-public enum TableChunkingMode {
-  /// <summary>
-  /// Split tables at row boundaries (default). Continuation chunks have no
-  /// header.
-  /// </summary>
-  [JsonPropertyName("split")] Split,
-  /// <summary>
-  /// Prepend the table header to every chunk that continues a split table.
-  /// </summary>
-  [JsonPropertyName("repeat_header")] RepeatHeader,
+public enum TableChunkingMode
+{
+    /// <summary>
+    /// Split tables at row boundaries (default). Continuation chunks have no header.
+    /// </summary>
+    [JsonPropertyName("split")]
+    Split,
+    /// <summary>
+    /// Prepend the table header to every chunk that continues a split table.
+    /// </summary>
+    [JsonPropertyName("repeat_header")]
+    RepeatHeader,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="TableChunkingMode"/> that respects
-/// explicit variant names.
-/// </summary>
-internal sealed class TableChunkingModeJsonConverter
-    : JsonConverter<TableChunkingMode> {
-  public override TableChunkingMode Read(ref Utf8JsonReader reader,
-                                         Type typeToConvert,
-                                         JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch { "split" => TableChunkingMode.Split,
-                          "repeat_header" => TableChunkingMode.RepeatHeader,
-                          _ => throw new JsonException(
-                              $"Unknown TableChunkingMode value: {value}") };
-  }
 
-  public override void Write(Utf8JsonWriter writer, TableChunkingMode value,
-                             JsonSerializerOptions options) {
-    var str = value switch { TableChunkingMode.Split => "split",
-                             TableChunkingMode.RepeatHeader => "repeat_header",
-                             _ => throw new JsonException(
-                                 $"Unknown TableChunkingMode value: {value}") };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="TableChunkingMode"/> that respects explicit variant names.
+/// </summary>
+internal sealed class TableChunkingModeJsonConverter : JsonConverter<TableChunkingMode>
+{
+    public override TableChunkingMode Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "split" => TableChunkingMode.Split,
+            "repeat_header" => TableChunkingMode.RepeatHeader,
+            _ => throw new JsonException($"Unknown TableChunkingMode value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, TableChunkingMode value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            TableChunkingMode.Split => "split",
+            TableChunkingMode.RepeatHeader => "repeat_header",
+            _ => throw new JsonException($"Unknown TableChunkingMode value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

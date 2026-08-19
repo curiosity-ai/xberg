@@ -8,9 +8,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 
 > **Status (after the August upstream merge, 1821 Rust commits):** measured against goldens
 > regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
-> **2239 fixtures (76.1%) match on every hard dimension**; content-parity **80.9% identical,
-> 90.4% ≥95%-similar**; 56 fixtures (<80%) are genuine content misses; **2 catastrophes
-> (0.1%)**. 389 unit tests.
+> **2292 fixtures (77.9%) match on every hard dimension**; content-parity **82.5% identical,
+> 90.6% ≥95%-similar**; 53 fixtures (<80%) are genuine content misses; **2 catastrophes
+> (0.1%)**. 402 unit tests.
 >
 > The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
 > they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
@@ -21,7 +21,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > character counts as Unicode scalars rather than UTF-8 bytes, and — for PDF — scanned-page
 > detection plus serde-faithful float formatting.
 >
-> A later pass took 2122 → 2239 and catastrophes 22 → 2. Ordered by what they were worth:
+> A later pass took 2122 → 2292 and catastrophes 22 → 2. Ordered by what they were worth:
 > a file's content now overrules its extension when the two disagree (txt 888/975 → 947,
 > which is where the DocTags fixtures lived); attachment text is extracted into the message
 > that carries it, embedded messages included (eml 20/43 → 39, msg 4/16 → 14); `app.xml`
@@ -29,8 +29,10 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > typst's missing branches
 > (0/8 → 7); a drawing's name as alt text when it has no description (docx 34/46 → 40);
 > whole citation records rather than titles alone, and a Table *element* for djot tables
-> (nbib, ris, djot all to full parity); and HWP's record tags, whose decimal offsets had been
-> read as hexadecimal.
+> (nbib, ris, djot all to full parity); HWP's record tags, whose decimal offsets had been
+> read as hexadecimal; and — for html 10/41 → 27/41 — reserving the columns a rowspan covers,
+> plus dropping a second copy of every table that upstream had already removed; and markdown
+> math, raw inline HTML and pandoc super/subscripts (md 671/775 → 707).
 >
 > Three of those were latent defects the extension/content change exposed rather than caused:
 > the HTML signature test sat behind the generic `<` fallback and was unreachable, and
@@ -94,16 +96,29 @@ not a cosmetic difference.
       embedded message where it is 32 at the top level and 8 for an attachment storage, three
       sizes the port had collapsed into two. msg 4/16 → 14/16, the last failure being PDF text
       quality inside an attachment rather than anything about email.
-- [ ] **Markdown math.** `$…$` / `$$…$$` should surface as content with the delimiters
-      stripped (pulldown-cmark `ENABLE_MATH`); we pass the delimiters through as literal text.
+- [x] **Markdown math (md 671/775 → 691).** Inline `$…$` keeps its delimiters in the text;
+      display `$$…$$` becomes a Formula element with them stripped. The delimiter rules are
+      pulldown-cmark's, read from its source rather than guessed: a run of one `$` is inline and
+      two is display, an opening delimiter must not be followed by whitespace (so a price in
+      prose cannot open a span), an inline span closes on a `$` not preceded by whitespace, and
+      a display span closes only on another `$$`. Not ported: the brace-context rule that lets
+      `$}$` stay literal.
 - [x] **Citation formats (nbib, ris).** Both at full parity. The parsers were fine; the element
       carried only the title, so everything else was parsed and then dropped.
-- [ ] **html 10/41.** Still the largest untriaged format. One concrete lead, measured: the
-      walker discards loose text that is not inside a `<p>`, so `<div>Hello</div>` extracts to
-      nothing — which is also why the two `ground_truth/fictionbook/*.md` fixtures (raw `<div>`
-      at the top, so HTML by content) are now empty. Emitting it unconditionally was tried and
-      is *not* the answer: it fixes those two and costs twelve others (plain 22/41 → 10/41).
-      Whatever the rule is, it is narrower than "always emit".
+- [~] **html 10/41 → 27/41.** Two defects, both shared-algorithm rather than HTML-specific.
+      Cells were placed by advancing through each row on its own, which ignores the columns a
+      rowspan from an earlier row still covers and slides everything beneath one leftwards out
+      from under its header; upstream keeps the placement rule in one place (`grid_flatten.rs`)
+      so the geometry cannot drift between formats, and this port now does too. And every table
+      was recorded twice — a second, unreferenced copy that upstream deliberately removed,
+      because it came from the same conversion pass as the first.
+
+      What remains is loose text: the walker discards text that is not inside a `<p>`, so
+      `<div>Hello</div>` extracts to nothing. That is also why the two
+      `ground_truth/fictionbook/*.md` fixtures (raw `<div>` at the top, so HTML by content) are
+      empty — the last two catastrophes. Emitting it unconditionally was tried and is *not* the
+      answer: it fixes those two and costs twelve others (plain 22/41 → 10/41). Whatever the
+      rule is, it is narrower than "always emit".
 - [ ] **odp, ipynb, mdx.** Not yet triaged; use `--cluster`. For ipynb the divergence is
       visible immediately: we emit `[cell_id: …]` and `execution_count: …` as paragraphs and
       skip cell outputs, neither of which upstream does.

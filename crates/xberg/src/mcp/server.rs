@@ -419,6 +419,14 @@ impl XbergMcp {
             }
         }
 
+        #[cfg(feature = "formula-recognition")]
+        {
+            let manifest = crate::formula_recognition::manifest();
+            for entry in manifest {
+                entries.push(serde_json::to_value(&entry).unwrap_or_default());
+            }
+        }
+
         #[cfg(feature = "ner-onnx")]
         {
             let manifest = crate::text::ner::manifest();
@@ -500,6 +508,26 @@ impl XbergMcp {
                 &mut already_cached,
                 "paddle-ocr v2 (server+mobile det, cls, doc_ori, unified+per-script rec)".to_string(),
                 CacheWarmDisposition::AvailabilityConfirmed,
+            );
+        }
+
+        #[cfg(feature = "formula-recognition")]
+        {
+            let formula_dir = cache_base.join("formula-recognition");
+            let was_cached = crate::formula_recognition::models_cached_in(Some(&formula_dir));
+            crate::formula_recognition::ensure_models_in(Some(&formula_dir)).map_err(|e| {
+                rmcp::ErrorData::internal_error(format!("Failed to download formula recognition models: {e}"), None)
+            })?;
+            record_warmed_model(
+                &mut available,
+                &mut downloaded,
+                &mut already_cached,
+                "formula-recognition (latex_ocr)".to_string(),
+                if was_cached {
+                    CacheWarmDisposition::AlreadyCached
+                } else {
+                    CacheWarmDisposition::Downloaded
+                },
             );
         }
 

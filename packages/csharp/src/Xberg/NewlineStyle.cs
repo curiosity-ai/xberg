@@ -9,42 +9,48 @@ namespace Xberg;
 /// <summary>
 /// Line break syntax in Markdown output.
 ///
-/// Controls how soft line breaks (from `&lt;br&gt;` or line breaks in source)
-/// are rendered.
+/// Controls how soft line breaks (from `&lt;br&gt;` or line breaks in source) are rendered.
 /// </summary>
 [JsonConverter(typeof(NewlineStyleJsonConverter))]
-public enum NewlineStyle {
-  /// <summary>
-  /// Two trailing spaces at end of line. Default. Standard Markdown syntax.
-  /// </summary>
-  [JsonPropertyName("Spaces")] Spaces,
-  /// <summary>
-  /// Backslash at end of line. Alternative Markdown syntax.
-  /// </summary>
-  [JsonPropertyName("Backslash")] Backslash,
+public enum NewlineStyle
+{
+    /// <summary>
+    /// Two trailing spaces at end of line. Default. Standard Markdown syntax.
+    /// </summary>
+    [JsonPropertyName("Spaces")]
+    Spaces,
+    /// <summary>
+    /// Backslash at end of line. Alternative Markdown syntax.
+    /// </summary>
+    [JsonPropertyName("Backslash")]
+    Backslash,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="NewlineStyle"/> that respects explicit
-/// variant names.
-/// </summary>
-internal sealed class NewlineStyleJsonConverter : JsonConverter<NewlineStyle> {
-  public override NewlineStyle Read(ref Utf8JsonReader reader,
-                                    Type typeToConvert,
-                                    JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch {
-      "Spaces" => NewlineStyle.Spaces, "Backslash" => NewlineStyle.Backslash,
-      _ => throw new JsonException($"Unknown NewlineStyle value: {value}")
-    };
-  }
 
-  public override void Write(Utf8JsonWriter writer, NewlineStyle value,
-                             JsonSerializerOptions options) {
-    var str = value switch {
-      NewlineStyle.Spaces => "Spaces", NewlineStyle.Backslash => "Backslash",
-      _ => throw new JsonException($"Unknown NewlineStyle value: {value}")
-    };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="NewlineStyle"/> that respects explicit variant names.
+/// </summary>
+internal sealed class NewlineStyleJsonConverter : JsonConverter<NewlineStyle>
+{
+    public override NewlineStyle Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "Spaces" => NewlineStyle.Spaces,
+            "Backslash" => NewlineStyle.Backslash,
+            _ => throw new JsonException($"Unknown NewlineStyle value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, NewlineStyle value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            NewlineStyle.Spaces => "Spaces",
+            NewlineStyle.Backslash => "Backslash",
+            _ => throw new JsonException($"Unknown NewlineStyle value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

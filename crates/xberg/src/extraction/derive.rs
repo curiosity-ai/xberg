@@ -714,6 +714,65 @@ pub fn derive_extraction_result(
         .and_then(serde_json::Value::as_str)
         .and_then(ExtractionMethod::from_metadata_value);
 
+    // The OCR pipeline fills `doc.formulas` directly (with geometry). Markup
+    // extractors emit `ElementKind::Formula` elements instead. Append the
+    // element-derived formulas so every source reaches the public list.
+    //
+    // Some OCR paths represent one formula twice: the layout image path pushes
+    // a side-channel `Formula` and a matching geometry-less element for the
+    // same region. A geometry-less element whose normalized LaTeX already
+    // appears in the side channel is a second representation, not a second
+    // formula, so it is skipped. An element that carries its own page or bbox
+    // is always its own formula: a mixed native+scanned document can hold the
+    // same equation on two different pages. Duplicate formulas WITHIN the
+    // element stream are all kept. The FFI round-trip
+    // (`InternalDocument::from(ExtractedDocument)`) restores `doc.formulas`
+    // with an empty element list, so re-derivation cannot duplicate either.
+    let mut formulas = std::mem::take(&mut doc.formulas);
+    let side_channel_latex: std::collections::HashSet<String> = formulas
+        .iter()
+        .map(|f| normalized_latex(strip_math_delimiters(&f.latex)))
+        .collect();
+    let side_channel_paged: std::collections::HashSet<(String, u32)> = formulas
+        .iter()
+        .filter_map(|f| Some((normalized_latex(strip_math_delimiters(&f.latex)), f.page?)))
+        .collect();
+    formulas.extend(
+        doc.elements
+            .iter()
+            .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Formula))
+            .filter_map(|e| {
+                let latex = strip_math_delimiters(&e.text);
+                if latex.is_empty() {
+                    return None;
+                }
+                // A geometry-less element that repeats a side-channel formula is
+                // the same formula's second representation. A paged element is
+                // one only when the side channel holds the same latex on the
+                // SAME page: the OCR pipeline emits both an element and a
+                // side-channel entry per detected region.
+                let norm = normalized_latex(latex);
+                let duplicate = match e.page {
+                    None if e.bbox.is_none() => side_channel_latex.contains(&norm),
+                    Some(page) => side_channel_paged.contains(&(norm, page)),
+                    _ => false,
+                };
+                if duplicate {
+                    return None;
+                }
+                Some(crate::types::Formula {
+                    latex: latex.to_string(),
+                    bbox: e.bbox,
+                    page: e.page,
+                })
+            }),
+    );
+
+    // A formula that stays inside its text is its own formula, never a second
+    // representation of an element, so it joins the list without the dedup
+    // above.
+    formulas.extend(std::mem::take(&mut doc.recorded_formulas));
+
     tracing::debug!(
         content_length = content.len(),
         has_document_structure = document.is_some(),
@@ -736,12 +795,55 @@ pub fn derive_extraction_result(
         llm_usage: std::mem::take(&mut doc.llm_usage),
         revisions: std::mem::take(&mut doc.revisions),
         form_fields: std::mem::take(&mut doc.form_fields),
-        formulas: std::mem::take(&mut doc.formulas),
+        formulas,
         #[cfg(feature = "tree-sitter")]
         code_intelligence,
         formatted_content,
         ..Default::default()
     }
+}
+
+/// Remove one pair of TeX math delimiters (`$$..$$`, `\[..\]`, or `$..$`)
+/// from formula text.
+///
+/// `Formula.latex` holds bare LaTeX; extractors that store delimited math in
+/// the element text stay renderable while the projection stays delimiter-free.
+/// Text that holds more than one delimited formula (`$x$ and $y$`) is left
+/// untouched: stripping the outer pair would splice unrelated math together.
+pub(crate) fn strip_math_delimiters(text: &str) -> &str {
+    let t = text.trim();
+    for (open, close) in [("$$", "$$"), ("\\[", "\\]"), ("$", "$")] {
+        if t.len() > open.len() + close.len()
+            && let Some(inner) = t.strip_prefix(open).and_then(|s| s.strip_suffix(close))
+            && !contains_unescaped(inner, open)
+            && !contains_unescaped(inner, close)
+        {
+            return inner.trim();
+        }
+    }
+    t
+}
+
+/// True when `needle` occurs in `text` outside a backslash escape. `\$` is
+/// LaTeX for a literal dollar sign and does not end a math span.
+fn contains_unescaped(text: &str, needle: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(needle) {
+        let at = from + pos;
+        let escaped = at > 0 && bytes[at - 1] == b'\\';
+        if !escaped {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// Whitespace-free form of a LaTeX string, for duplicate detection between
+/// the OCR side channel and formula elements.
+fn normalized_latex(latex: &str) -> String {
+    latex.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Map source format identifiers to MIME types.
@@ -994,6 +1096,167 @@ mod tests {
     /// Helper: create a minimal internal document.
     fn make_doc(source_format: &'static str) -> InternalDocument {
         InternalDocument::new(source_format)
+    }
+
+    /// A table cell records its formula in the side channel with a page but no
+    /// bounding box. The same equation may appear again in the body as its own
+    /// element, and both are real formulas: only an OCR entry, which carries a
+    /// bounding box, is a second representation of an element.
+    #[test]
+    fn test_a_table_formula_does_not_suppress_the_same_equation_in_the_body() {
+        let mut doc = InternalDocument::new("docx");
+        doc.recorded_formulas.push(crate::types::Formula {
+            latex: "E = mc^2".to_string(),
+            bbox: None,
+            page: Some(3),
+        });
+        doc.push_element(InternalElement::text(ElementKind::Formula, "E = mc^2", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Markdown);
+
+        assert_eq!(result.formulas.len(), 2, "the table cell and the body each hold one");
+    }
+
+    #[test]
+    fn test_markup_formula_elements_reach_public_formulas() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Formula, "E = mc^2", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Markdown);
+        assert_eq!(result.formulas.len(), 1);
+        assert_eq!(result.formulas[0].latex, "E = mc^2");
+        assert_eq!(result.formulas[0].page, None);
+        assert_eq!(result.formulas[0].bbox, None);
+    }
+
+    #[test]
+    fn test_ocr_side_channel_formulas_stay_first() {
+        let mut doc = make_doc("pdf");
+        doc.push_element(InternalElement::text(ElementKind::Formula, "b", 0));
+        doc.formulas.push(crate::types::Formula {
+            latex: "a".to_string(),
+            bbox: None,
+            page: Some(1),
+        });
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        let latexes: Vec<&str> = result.formulas.iter().map(|f| f.latex.as_str()).collect();
+        assert_eq!(latexes, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_formula_projection_strips_dollar_delimiters() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Formula, "$$x + 1$$", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        assert_eq!(result.formulas[0].latex, "x + 1");
+    }
+
+    #[test]
+    fn test_empty_formula_elements_are_skipped() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Formula, "   ", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        assert!(result.formulas.is_empty());
+    }
+
+    #[test]
+    fn test_projection_carries_element_geometry() {
+        let mut doc = make_doc("pdf");
+        let mut elem = InternalElement::text(ElementKind::Formula, "a + b", 0);
+        elem.page = Some(3);
+        elem.bbox = Some(crate::types::BoundingBox {
+            x0: 1.0,
+            y0: 2.0,
+            x1: 3.0,
+            y1: 4.0,
+        });
+        doc.push_element(elem);
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        assert_eq!(result.formulas.len(), 1);
+        assert_eq!(result.formulas[0].page, Some(3));
+        assert_eq!(result.formulas[0].bbox.unwrap().y1, 4.0);
+    }
+
+    #[test]
+    fn test_projection_skips_side_channel_duplicates() {
+        let mut doc = make_doc("image");
+        // The layout image path represents one formula twice: side channel
+        // with geometry plus a matching element. Only one may survive.
+        doc.formulas.push(crate::types::Formula {
+            latex: "E=mc^2".to_string(),
+            bbox: None,
+            page: Some(1),
+        });
+        doc.push_element(InternalElement::text(ElementKind::Formula, "E = mc^2", 0));
+        doc.push_element(InternalElement::text(ElementKind::Formula, "a + b", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        let latexes: Vec<&str> = result.formulas.iter().map(|f| f.latex.as_str()).collect();
+        assert_eq!(latexes, vec!["E=mc^2", "a + b"]);
+    }
+
+    #[test]
+    fn test_projection_keeps_geometry_bearing_twins() {
+        // Mixed native+scanned document: the same equation on two different
+        // pages is two formulas, never a duplicate.
+        let mut doc = make_doc("pdf");
+        doc.formulas.push(crate::types::Formula {
+            latex: "E=mc^2".to_string(),
+            bbox: None,
+            page: Some(7),
+        });
+        let mut elem = InternalElement::text(ElementKind::Formula, "E = mc^2", 0);
+        elem.page = Some(2);
+        doc.push_element(elem);
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        assert_eq!(result.formulas.len(), 2, "got: {:?}", result.formulas);
+    }
+
+    #[test]
+    fn test_projection_dedups_across_delimiter_wrapping() {
+        let mut doc = make_doc("image");
+        doc.formulas.push(crate::types::Formula {
+            latex: "$$x$$".to_string(),
+            bbox: None,
+            page: Some(1),
+        });
+        doc.push_element(InternalElement::text(ElementKind::Formula, "x", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        assert_eq!(result.formulas.len(), 1, "got: {:?}", result.formulas);
+    }
+
+    #[test]
+    fn test_projection_skips_formulas_empty_after_stripping() {
+        let mut doc = make_doc("markdown");
+        doc.push_element(InternalElement::text(ElementKind::Formula, "$ $", 0));
+
+        let result = derive_extraction_result(doc, false, crate::core::config::OutputFormat::Plain);
+        assert!(result.formulas.is_empty(), "got: {:?}", result.formulas);
+    }
+
+    #[test]
+    fn test_strip_math_delimiters_ignores_escaped_delimiters() {
+        assert_eq!(strip_math_delimiters(r"$a \$ b$"), r"a \$ b");
+    }
+
+    #[test]
+    fn test_strip_math_delimiters_cases() {
+        assert_eq!(strip_math_delimiters("$$a$$"), "a");
+        assert_eq!(strip_math_delimiters("\\[ x \\]"), "x");
+        assert_eq!(strip_math_delimiters("$x$"), "x");
+        // Multi-formula text keeps its delimiters: stripping the outer pair
+        // would splice unrelated math together.
+        assert_eq!(strip_math_delimiters("$x$ and $y$"), "$x$ and $y$");
+        assert_eq!(strip_math_delimiters("$$a$$ text $$b$$"), "$$a$$ text $$b$$");
+        assert_eq!(strip_math_delimiters("$"), "$");
+        assert_eq!(strip_math_delimiters("$$"), "$$");
+        assert_eq!(strip_math_delimiters("plain"), "plain");
     }
 
     #[test]

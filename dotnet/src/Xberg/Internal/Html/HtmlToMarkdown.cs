@@ -78,35 +78,33 @@ internal static class HtmlToMarkdown
         HandleTableWithContext(table, dummy, ctx);
     }
 
-    // collect_table_grid: 2D cell grid, cells placed left-to-right advancing by colspan
-    // (rowspan does not reserve columns in later rows), content rendered under an in-cell context.
+    /// <summary>
+    /// collect_table_grid: the table's cells on a 2D grid, each rendered under an in-cell context.
+    /// <para>
+    /// Column positions are resolved by <see cref="Tables.GridFlatten"/> rather than by advancing
+    /// through each row independently. Advancing per row ignores the columns a rowspan started
+    /// earlier still covers, which slides every cell beneath one leftwards and out from under its
+    /// header.
+    /// </para>
+    /// </summary>
     private static List<List<string>> CollectGrid(HNode table, Ctx ctx)
     {
-        var placed = new List<(string content, int row, int col)>();
-        int rowIndex = 0, maxCols = 0;
+        var rows = new List<IReadOnlyList<GridCellSpan>>();
         foreach (var row in TableRows(table))
         {
-            int col = 0;
+            var cells = new List<GridCellSpan>();
             foreach (var cell in CollectTableCells(row))
             {
-                string content = RenderCellForGrid(cell, ctx);
-                placed.Add((content, rowIndex, col));
-                col += GetColspan(cell);
+                var (colspan, rowspan) = GetColspanRowspan(cell);
+                cells.Add(new GridCellSpan(RenderCellForGrid(cell, ctx), colspan, rowspan));
             }
-            if (col > maxCols) maxCols = col;
-            rowIndex++;
+            rows.Add(cells);
         }
-        var grid = new List<List<string>>(rowIndex);
-        for (int r = 0; r < rowIndex; r++)
-        {
-            var line = new List<string>(maxCols);
-            for (int c = 0; c < maxCols; c++) line.Add("");
-            grid.Add(line);
-        }
-        foreach (var (content, r, c) in placed)
-            if (r < rowIndex && c < maxCols) grid[r][c] = content;
-        return grid;
+
+        return Tables.GridFlatten.FlattenSpannedRows(rows, c => c.ColSpan, c => c.RowSpan, c => c.Content);
     }
+
+    private readonly record struct GridCellSpan(string Content, int ColSpan, int RowSpan);
 
     // Cell content for the grid: walk children under in-cell context, normalize (keep newlines),
     // trim. Mirrors collect_grid_row's `normalize_whitespace(walk_node(children)).trim()`.

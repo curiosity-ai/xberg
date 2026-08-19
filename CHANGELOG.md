@@ -9,11 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Formula.bbox` and `Formula.page` are now optional. Markup sources (DOCX, PPTX,
+  ODT, EPUB, HTML, JATS, LaTeX, Markdown, and related formats) produce formulas with no geometry;
+  the old required fields forced fake values on those paths (a zeroed bbox and `page: 1` on VLM
+  OCR results). Layout-guided OCR still reports both. The C FFI reports an absent bbox as a null
+  pointer and an absent page as `0`; JSON omits absent fields. The field docs now state the real
+  coordinate space: pixels of the rendered page image at the OCR render DPI (base 150, reduced
+  automatically for very large pages), not the previously claimed 300 DPI (#1385).
+
+### Added
+
+- Opt-in `formula-recognition` feature: layout-detected formula regions on rasterized pages (image inputs and PDF pages) are
+  recognized as LaTeX by the RapidLaTeXOCR model set (MIT, pix2tex-derived; resizer + encoder +
+  autoregressive decoder ONNX, ~180 MB, downloaded on demand and SHA256-verified). Enable with
+  `LayoutDetectionConfig.formula_model = latex_ocr` or `--layout-formula-model latex_ocr`; the
+  region's plain OCR text stays as the fallback whenever recognition yields nothing (#1385).
+
+- `ExtractedDocument.formulas` is now populated for every format, not only layout-guided OCR.
+  Formula elements produced by markup extractors are projected into the public list in reading
+  order, with `$$` delimiters stripped, after any OCR-detected formulas. A new public element type
+  `formula` identifies these elements in element-based output, where they previously degraded to
+  `narrative_text` (#1385).
+- JATS `disp-formula` and `inline-formula` content now yields LaTeX. A `tex-math` alternative is
+  used verbatim when present; otherwise the `mml:math` subtree runs through the shared MathML
+  converter; plain text remains the fallback. Inline formulas in the all-in-one path render as
+  `$...$` (#1385).
+
 ### Fixed
 
+- `cargo install xberg-cli` works again. `tree-sitter-language-pack` 1.15.0 added two required
+  fields to the public `ProcessConfig` struct in a minor release, so every caller constructing it
+  with a struct literal failed to compile with `E0063`. Published 1.0.14 declares `"1.14.1"` under
+  caret semantics and therefore resolves 1.15.0, and `cargo install` cannot pin a transitive
+  dependency, so there was no user-side workaround. The dependency is now upgraded and both fields
+  are set explicitly; they default to `None`, matching the previous unbounded parser behaviour
+  (#1446).
+- Nine features are no longer compiled out of Windows builds. `captioning`, `translation`,
+  `summarization-llm`, `ner-llm`, `redaction-ml`, `redaction-rehydrate`, `static-embeddings`,
+  `enrichment` and `otel` were absent from `windows-target`, so the published Windows wheel and
+  every other binding resolving through it silently lacked that functionality even though each
+  gates real code. Six needed no new dependencies at all; the other three pull only pure-Rust
+  crates. `heic` remains excluded — it needs native libheif via vcpkg (#1443).
+- A PDF page whose table extraction fails is no longer silently dropped. The per-page failure was
+  logged and skipped, so callers received tables from every other page with no way to distinguish
+  the failure from a page that genuinely has no table. Both the native and bordered detectors now
+  report it as a processing warning naming the page and the underlying cause, matching how
+  annotation, image and form-field extraction already surface partial failures.
+- Scanned PDFs now produce formulas. A page whose OCR backend emits plain text only (tesseract on
+  a rasterized page) had its layout-detected formula regions silently dropped, because recognition
+  only replaced existing formula text and skipped any page whose counts differed. Regions now pair
+  with existing formula text by bounding-box overlap when the counts differ, and a region with no
+  matching text becomes a new formula with its bounding box in PDF points (#1385).
+- RT-DETR layout detections are no longer misplaced on non-square pages. The model's
+  `orig_target_sizes` input takes `(width, height)`; passing `(height, width)` stretched every box
+  x by the page aspect ratio and compressed y by its inverse, so region crops (formulas, tables)
+  cut the wrong page area on portrait pages.
+- Recognized formula LaTeX no longer carries raw BPE markers (`Ġ`) or special tokens. The
+  RapidLaTeXOCR tokenizer file declares a ByteLevel pre-tokenizer but no decoder; the loader now
+  attaches the matching decoder and skips special tokens when decoding.
+  comparable to native PDF geometry, instead of rendered-image pixels whose DPI varied per page.
+  Image inputs, and PDF pages whose geometry is unavailable, keep pixel coordinates and say so.
+- The RST text path now renders `.. math::` directives inside `$$` display-math delimiters instead
+  of a literal `math:` prose prefix.
 - Rotated PDF text runs are now reassembled along their own reading axis on the default extraction path, restoring
   word order and spacing without changing unrotated pages.
-
 - Alef now extracts Crawlberg binding types from the pinned registry dependency instead of a
   neighboring checkout, keeping generated bindings aligned with the version Cargo compiles.
 

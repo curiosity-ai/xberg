@@ -10,42 +10,48 @@ namespace Xberg;
 /// Summarisation strategy.
 /// </summary>
 [JsonConverter(typeof(SummaryStrategyJsonConverter))]
-public enum SummaryStrategy {
-  /// <summary>
-  /// Pure-Rust extractive summary (TextRank over the chunk graph).
-  /// Deterministic, fast, no external service required.
-  /// </summary>
-  [JsonPropertyName("extractive")] Extractive,
-  /// <summary>
-  /// Abstractive summary produced by liter-llm. Requires `liter-llm` feature
-  /// and a configured `LlmConfig`. Token usage is captured in
-  /// `ExtractedDocument.llm_usage`.
-  /// </summary>
-  [JsonPropertyName("abstractive")] Abstractive,
+public enum SummaryStrategy
+{
+    /// <summary>
+    /// Pure-Rust extractive summary (TextRank over the chunk graph). Deterministic,
+    /// fast, no external service required.
+    /// </summary>
+    [JsonPropertyName("extractive")]
+    Extractive,
+    /// <summary>
+    /// Abstractive summary produced by liter-llm. Requires `liter-llm` feature and
+    /// a configured `LlmConfig`. Token usage is captured in
+    /// `ExtractedDocument.llm_usage`.
+    /// </summary>
+    [JsonPropertyName("abstractive")]
+    Abstractive,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="SummaryStrategy"/> that respects
-/// explicit variant names.
-/// </summary>
-internal sealed class SummaryStrategyJsonConverter
-    : JsonConverter<SummaryStrategy> {
-  public override SummaryStrategy Read(ref Utf8JsonReader reader,
-                                       Type typeToConvert,
-                                       JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch { "extractive" => SummaryStrategy.Extractive,
-                          "abstractive" => SummaryStrategy.Abstractive,
-                          _ => throw new JsonException(
-                              $"Unknown SummaryStrategy value: {value}") };
-  }
 
-  public override void Write(Utf8JsonWriter writer, SummaryStrategy value,
-                             JsonSerializerOptions options) {
-    var str = value switch { SummaryStrategy.Extractive => "extractive",
-                             SummaryStrategy.Abstractive => "abstractive",
-                             _ => throw new JsonException(
-                                 $"Unknown SummaryStrategy value: {value}") };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="SummaryStrategy"/> that respects explicit variant names.
+/// </summary>
+internal sealed class SummaryStrategyJsonConverter : JsonConverter<SummaryStrategy>
+{
+    public override SummaryStrategy Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "extractive" => SummaryStrategy.Extractive,
+            "abstractive" => SummaryStrategy.Abstractive,
+            _ => throw new JsonException($"Unknown SummaryStrategy value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, SummaryStrategy value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            SummaryStrategy.Extractive => "extractive",
+            SummaryStrategy.Abstractive => "abstractive",
+            _ => throw new JsonException($"Unknown SummaryStrategy value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

@@ -176,6 +176,23 @@ public sealed class MarkdownExtractor : IExtractor
                         paragraphAnns, headingAnns, listItemAnns, MakeSimple(AnnotationKind.Tag.Strikethrough));
                     break;
 
+                // Pandoc's `^x^` and `~x~`. Like emphasis, the markers are structure rather than
+                // content: they become annotations and leave the text alone.
+                case MdEventKind.StartSuperscript:
+                    PushAnnStart(annStarts, 5, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText);
+                    break;
+                case MdEventKind.EndSuperscript:
+                    EndAnn(annStarts, 5, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText,
+                        paragraphAnns, headingAnns, listItemAnns, MakeSimple(AnnotationKind.Tag.Superscript));
+                    break;
+                case MdEventKind.StartSubscript:
+                    PushAnnStart(annStarts, 6, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText);
+                    break;
+                case MdEventKind.EndSubscript:
+                    EndAnn(annStarts, 6, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText,
+                        paragraphAnns, headingAnns, listItemAnns, MakeSimple(AnnotationKind.Tag.Subscript));
+                    break;
+
                 case MdEventKind.StartLink:
                 {
                     string? titleOpt = string.IsNullOrEmpty(e.LinkTitle) ? null : e.LinkTitle;
@@ -374,6 +391,22 @@ public sealed class MarkdownExtractor : IExtractor
                     else if (footnoteDefLabel is not null) footnoteDefText.Append(e.Text);
                     else if (inParagraph) AppendCode(paragraphText, paragraphAnns, e.Text);
                     break;
+                // Inline math stays in the text with its delimiters, since `$x$` reads as maths
+                // wherever the text ends up. Display math is a block of its own and becomes a
+                // Formula element, delimiters dropped.
+                case MdEventKind.InlineMath:
+                    if (inHeading) headingText.Append('$').Append(e.Text).Append('$');
+                    else if (inTableCell) currentCell.Append('$').Append(e.Text).Append('$');
+                    else if (inListItem) listItemText.Append('$').Append(e.Text).Append('$');
+                    else if (footnoteDefLabel is not null) footnoteDefText.Append('$').Append(e.Text).Append('$');
+                    else if (inParagraph) paragraphText.Append('$').Append(e.Text).Append('$');
+                    break;
+                case MdEventKind.DisplayMath:
+                {
+                    string formula = e.Text.Trim();
+                    if (formula.Length > 0) b.PushFormula(formula, null, null);
+                    break;
+                }
                 case MdEventKind.Text:
                     if (inCodeBlock) codeText.Append(e.Text);
                     else if (inHeading) headingText.Append(e.Text);

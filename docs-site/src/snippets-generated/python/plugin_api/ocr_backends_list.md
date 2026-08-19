@@ -14,6 +14,7 @@ from xberg import list_ocr_backends
 
 def main() -> None:
     _ = list_ocr_backends()
+    print(result)
 
 main()
 

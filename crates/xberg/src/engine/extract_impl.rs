@@ -1684,27 +1684,11 @@ fn error_item(index: usize, source: String, error: &XbergError) -> ExtractionErr
 }
 
 fn error_code(error: &XbergError) -> u32 {
-    match error {
-        XbergError::Io(_) => 1001,
-        XbergError::Validation { .. } => 1002,
-        XbergError::UnsupportedFormat(_) => 1003,
-        XbergError::Timeout { .. } => 1004,
-        XbergError::Cancelled => 1005,
-        XbergError::Security { .. } => 1006,
-        _ => 1099,
-    }
+    error.extraction_error_code()
 }
 
 fn error_type(error: &XbergError) -> &'static str {
-    match error {
-        XbergError::Io(_) => "io",
-        XbergError::Validation { .. } => "validation",
-        XbergError::UnsupportedFormat(_) => "unsupported_format",
-        XbergError::Timeout { .. } => "timeout",
-        XbergError::Cancelled => "cancelled",
-        XbergError::Security { .. } => "security",
-        _ => "other",
-    }
+    error.extraction_error_type()
 }
 
 #[cfg(all(test, feature = "tokio-runtime"))]

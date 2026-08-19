@@ -22,6 +22,9 @@ public enum MdEventKind
     StartImage, EndImage,
     StartFootnoteDefinition, EndFootnoteDefinition,
     Code, Text, SoftBreak, HardBreak, FootnoteReference, Html, TaskListMarker,
+    InlineMath, DisplayMath,
+    StartSuperscript, EndSuperscript,
+    StartSubscript, EndSubscript,
 }
 
 public struct MdEvent
@@ -731,6 +734,31 @@ public static class MarkdownParser
         }
     }
 
+    /// <summary>
+    /// The offset of the delimiter closing a math span opened at <paramref name="from"/>, or -1.
+    /// </summary>
+    /// <remarks>
+    /// Math cannot contain a bare <c>$</c>, so the first one found either closes the span or
+    /// invalidates it. An inline span closes on a <c>$</c> not preceded by whitespace; a display
+    /// span closes only on another <c>$$</c>, whatever precedes it.
+    /// </remarks>
+    private static int FindClosingMath(string text, int from, int run)
+    {
+        for (int j = from; j < text.Length; j++)
+        {
+            if (text[j] == '\\') { j++; continue; }
+            if (text[j] != '$') continue;
+
+            if (run == 2)
+                return j + 1 < text.Length && text[j + 1] == '$' ? j : -1;
+
+            return j > 0 && !IsAsciiWhitespace(text[j - 1]) ? j : -1;
+        }
+        return -1;
+    }
+
+    private static bool IsAsciiWhitespace(char c) => c is ' ' or '\t' or '\n' or '\r' or '\f' or '\v';
+
     private static LinkedList<Node> Tokenize(string text)
     {
         var nodes = new LinkedList<Node>();
@@ -773,6 +801,33 @@ public static class MarkdownParser
                     continue;
                 }
                 buf.Append('`', ticks); i += ticks; continue;
+            }
+
+            // Math. A run of one `$` is inline, two is display; longer runs are not delimiters.
+            // The opening delimiter must not be followed by whitespace, which is what keeps a
+            // lone `$` in prose — a price, say — from opening a span.
+            if (c == '$')
+            {
+                int run = i + 1 < n && text[i + 1] == '$' ? 2 : 1;
+                bool canOpen = i + 1 < n && !IsAsciiWhitespace(text[i + 1]);
+                if (canOpen)
+                {
+                    int mclose = FindClosingMath(text, i + run, run);
+                    if (mclose >= 0)
+                    {
+                        Flush();
+                        string body = text.Substring(i + run, mclose - (i + run));
+                        var kind = run == 2 ? MdEventKind.DisplayMath : MdEventKind.InlineMath;
+                        nodes.AddLast(new Node
+                        {
+                            T = NType.Opaque,
+                            Ev = new List<MdEvent> { MdEvent.WithText(kind, body) },
+                        });
+                        i = mclose + run;
+                        continue;
+                    }
+                }
+                buf.Append('$', run); i += run; continue;
             }
 
             // Image.
@@ -859,7 +914,21 @@ public static class MarkdownParser
                     }
                 }
                 int htmlLen = ScanInlineHtml(text, i);
-                if (htmlLen > 0) { Flush(); i += htmlLen; continue; } // inline HTML dropped
+                if (htmlLen > 0)
+                {
+                    // Raw inline HTML passes through verbatim. Dropping it silently lost the
+                    // markup a document uses where markdown has no syntax of its own — `<sub>`
+                    // and `<sup>` for chemistry and exponents, `<br>` inside a table cell — and
+                    // with it the text those tags wrap.
+                    Flush();
+                    nodes.AddLast(new Node
+                    {
+                        T = NType.Opaque,
+                        Ev = new List<MdEvent> { MdEvent.WithText(MdEventKind.Html, text.Substring(i, htmlLen)) },
+                    });
+                    i += htmlLen;
+                    continue;
+                }
                 buf.Append('<'); i++; continue;
             }
 
@@ -903,7 +972,7 @@ public static class MarkdownParser
             }
 
             // Emphasis / strong / strikethrough delimiter run.
-            if (c == '*' || c == '_' || c == '~')
+            if (c == '*' || c == '_' || c == '~' || c == '^')
             {
                 int run = 0;
                 while (i + run < n && text[i + run] == c) run++;
@@ -917,7 +986,11 @@ public static class MarkdownParser
                 bool left = !aWhite && (!aPunct || bWhite || bPunct);
                 bool right = !bWhite && (!bPunct || aWhite || aPunct);
                 bool canOpen, canClose;
-                if (c == '_') { canOpen = left && (!right || bPunct); canClose = right && (!left || aPunct); }
+                // `*` and `~~` may sit inside a word; `_`, a single `~` and `^` may not. Without
+                // that restriction `a~b c~d` — deliberately not a subscript — pairs up and both
+                // tildes vanish along with the space between them.
+                bool intraword = c == '*' || (c == '~' && run > 1);
+                if (!intraword) { canOpen = left && (!right || bPunct); canClose = right && (!left || aPunct); }
                 else { canOpen = left; canClose = right; }
 
                 Flush();
@@ -957,8 +1030,10 @@ public static class MarkdownParser
                 var od = opener.Value;
                 if (od.T == NType.Delim && od.CanOpen && od.C == ch)
                 {
+                    // A `~` run pairs only with one of its own length, so `~x~~` is not a span.
+                    if (ch == '~' && od.OrigCount != cd.OrigCount) { opener = opener.Previous; continue; }
                     bool odd = false;
-                    if (ch != '~' && (od.CanClose || cd.CanOpen)
+                    if (ch != '~' && ch != '^' && (od.CanClose || cd.CanOpen)
                         && (cd.OrigCount + od.OrigCount) % 3 == 0
                         && !(od.OrigCount % 3 == 0 && cd.OrigCount % 3 == 0))
                         odd = true;
@@ -970,9 +1045,17 @@ public static class MarkdownParser
             if (found)
             {
                 var od = opener!.Value;
-                int use = ch == '~' ? Math.Min(Math.Min(od.Count, cd.Count), 2) : ((od.Count >= 2 && cd.Count >= 2) ? 2 : 1);
+                int use = ch switch
+                {
+                    '~' => Math.Min(Math.Min(od.Count, cd.Count), 2),
+                    '^' => 1,
+                    _ => (od.Count >= 2 && cd.Count >= 2) ? 2 : 1,
+                };
                 MdEventKind ok, ck;
-                if (ch == '~') { ok = MdEventKind.StartStrikethrough; ck = MdEventKind.EndStrikethrough; }
+                // A doubled `~` is a strikethrough; a single one is a subscript.
+                if (ch == '~' && use == 2) { ok = MdEventKind.StartStrikethrough; ck = MdEventKind.EndStrikethrough; }
+                else if (ch == '~') { ok = MdEventKind.StartSubscript; ck = MdEventKind.EndSubscript; }
+                else if (ch == '^') { ok = MdEventKind.StartSuperscript; ck = MdEventKind.EndSuperscript; }
                 else if (use == 2) { ok = MdEventKind.StartStrong; ck = MdEventKind.EndStrong; }
                 else { ok = MdEventKind.StartEmphasis; ck = MdEventKind.EndEmphasis; }
 

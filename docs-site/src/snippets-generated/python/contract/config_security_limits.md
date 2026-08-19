@@ -17,6 +17,7 @@ async def main() -> None:
     input = ExtractInput(kind=ExtractInputKind("uri"), uri="https://example.com/archives/documents.zip")
     config = ExtractionConfig(security_limits={"max_archive_size": 104857600, "max_compression_ratio": 50, "max_files_in_archive": 100})
     _ = await extract(input, config)
+    print(result)
 
 asyncio.run(main())
 

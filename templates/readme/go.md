@@ -26,16 +26,14 @@ For development in the Xberg monorepo:
 # Build the static FFI library
 cargo build -p xberg-ffi --release
 
-# Go build will automatically link against the static library
-# (from target/release/libxberg_ffi.a)
+# Verify the package builds and passes its tests. cgo links against the
+# static library from target/release/libxberg_ffi.a automatically.
 cd packages/go
-go build -v
-
-# Run your binary (no library path needed - it's statically linked)
-./v4
+go build ./...
+go test ./...
 ```
 
-That's it! The resulting binary is self-contained and has no runtime dependencies on Xberg libraries.
+`packages/go` is a library (`package xberg`), so `go build` produces no executable here. Build a binary from your own `package main` that imports it — the resulting binary is self-contained and has no runtime dependency on Xberg libraries.
 
 ### Using Go Modules
 

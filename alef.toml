@@ -1,7 +1,7 @@
 [workspace]
-alef_version = "0.60.1"
+alef_version = "0.61.0"
 # -D warnings (emitted into every generated Rust binding as #![allow(...)]).
-extra_clippy_allows = ["redundant_field_names"]
+extra_clippy_allows = ["redundant_field_names", "collapsible_if", "vec_init_then_push"]
 languages = [
   "python",
   "node",
@@ -73,24 +73,73 @@ outputs = [".codex/skills", ".agents/skills", ".github/skills", ".claude/skills"
 [workspace.docs.snippets]
 dirs = ["docs-site/src/snippets", "docs-site/src/snippets-generated"]
 validation_level = "compile"
-timeout_secs = 600
+# 600s was sized for typecheck/compile-only validation of individual snippets.
+# It is also the ceiling for every session `before` hook (single global
+# knob, no per-session override -- see alef's SnippetSession/RunnerConfig).
+# The new swift `before` hook below runs `cargo build -p xberg-swift`, which
+# compiles xberg's heavy native dependency chain (onnxruntime, tesseract,
+# PDF/office parsers) from a cold target dir; a from-scratch build of that
+# graph routinely exceeds 10 minutes even before swift-bridge/staticlib
+# linking. Raised to bound that cold build without starving it. ~keep
+timeout_secs = 1800
 strict = true
 report_output = ".alef/snippet-validation-report.json"
 
 [workspace.docs.snippets.sessions.rust]
 cwd = "."
 manifest = "crates/xberg/Cargo.toml"
-rust_features = ["api"]
+# Beyond `api`, these three are the features hand-authored snippets actually
+# demonstrate. All are cheap: `keywords-yake` resolves to `stopwords`, which is
+# an empty feature list (Cargo.toml:516,507), and `embedding-presets` is `[]`
+# outright (:463) -- together they add ZERO crates. `pdf` (:61) pulls only
+# pure-Rust parsers.
+# Do NOT reach for `embeddings` (:466) to fix an embedding snippet: it enables
+# `onnx-runtime` (:452) -> `dep:ort` + `ort-bundled`, which DOWNLOADS ONNX
+# Runtime binaries at build time. `embedding-presets` clears the same
+# unresolved-import error for free. ~keep
+rust_features = ["api", "keywords-yake", "embedding-presets", "pdf"]
+# `async-trait` is not optional garnish here: every plugin trait in the public
+# surface (DocumentExtractor, OcrBackend, PostProcessor, Validator) is declared
+# with `#[async_trait]`, so a snippet that implements one CANNOT be written
+# without it. xberg itself depends on it (crates/xberg/Cargo.toml:1116); it was
+# simply never mirrored into the snippet session, which is why eight
+# hand-authored plugin snippets failed on `unresolved import async_trait`
+# rather than on anything wrong with their own code. Kept at the workspace
+# version (Cargo.toml:51). ~keep
 rust_dependencies = { tokio = { version = "1.53.1", features = [
   "macros",
   "rt-multi-thread",
-] }, serde_json = { version = "1.0.151" } }
+] }, serde_json = { version = "1.0.151" }, async-trait = { version = "0.1.92" } }
 
 [workspace.docs.snippets.sessions.python]
 cwd = "packages/python"
 manifest = "packages/python/pyproject.toml"
 
 [workspace.docs.snippets.sessions.node]
+cwd = "crates/xberg-node"
+manifest = "crates/xberg-node/package.json"
+
+# Sessions are keyed by BINDING-PACKAGE name, but alef's session lookup falls
+# back to the snippet's LANGUAGE name when a snippet carries no explicit
+# `target` metadata. TypeScript is the one language where those two names never
+# coincide: its packages are `node` and `wasm`, so `sessions.get("typescript")`
+# missed and the 48 hand-authored snippets under docs-site/src/snippets/
+# typescript/ were typechecked against a bare tsconfig with no path mapping to
+# `@xberg-io/xberg` -- 64 of their 69 failures were a single TS2307
+# "cannot find module". Generated snippets are unaffected either way: they
+# carry `target: node`/`target: wasm`, which takes priority over this fallback.
+# Aliased to the node package because every hand-authored TS snippet under
+# docs-site/src/snippets/typescript/ imports `@xberg-io/xberg`.
+# KNOWN GAP, measured 2026-08-14: that alias is wrong for the 15 hand-authored
+# snippets under docs-site/src/snippets/wasm/ (9 .md + 6 .ts), which DO import
+# `@xberg-io/xberg-wasm` and therefore fail this session with 18 x TS2307
+# "cannot find module". An earlier revision of this comment asserted that none
+# of them existed; it only surveyed the typescript/ directory.
+# They cannot be routed the generated tree's way either: `target:` lives in
+# markdown frontmatter, 0 of the 419 hand-authored snippets carry frontmatter at
+# all, and 6 of these 15 are raw `.ts` files that cannot carry any. Selecting a
+# session per directory is the missing capability; raised upstream. ~keep
+[workspace.docs.snippets.sessions.typescript]
 cwd = "crates/xberg-node"
 manifest = "crates/xberg-node/package.json"
 
@@ -118,7 +167,7 @@ manifest = "packages/elixir/mix.exs"
 cwd = "packages/java"
 manifest = "packages/java/pom.xml"
 before = [
-  "if [ -x /usr/libexec/java_home ]; then JAVA_HOME=$(/usr/libexec/java_home -v 25); else JAVA_HOME=$(java -XshowSettings:properties -version 2>&1 | sed -n 's/ *java.home = //p'); fi; export JAVA_HOME; if [ ! -d target/classes ]; then mvn -q -Dcheckstyle.skip -DskipTests compile; fi; mvn -q -DskipTests dependency:copy-dependencies",
+  "if [ -x /usr/libexec/java_home ]; then JAVA_HOME=$(/usr/libexec/java_home -v 25); else JAVA_HOME=$(java -XshowSettings:properties -version 2>&1 | sed -n 's/ *java.home = //p'); fi; export JAVA_HOME; if [ ! -d target/classes ]; then mvn -q -Dcheckstyle.skip -DskipTests compile; fi && mvn -q -DskipTests dependency:copy-dependencies",
 ]
 
 [workspace.docs.snippets.sessions.csharp]
@@ -138,9 +187,21 @@ manifest = "packages/kotlin-android/build.gradle.kts"
 # four nested dirnames each print "usage: dirname string [...]", ANDROID_HOME
 # ends up empty, and gradle aborts. That matters more than it looks: a `before`
 # hook failure aborts the ENTIRE configured snippet check, so every other
-# language goes unvalidated because Android tooling happens to be missing. ~keep
+# language goes unvalidated because Android tooling happens to be missing.
+# Second guard, for the same reason: gradle-wrapper.jar is gitignored (.gitignore
+# `*.jar`), so it is absent from every staged-tree copy a pre-commit hook builds.
+# Without this check `./gradlew` dies with ClassNotFoundException on
+# GradleWrapperMain and takes the whole snippet run down with it, on every
+# commit, no matter what the commit touches.
+# Third guard, the same reasoning taken one step further: a gradle build that
+# runs and FAILS must not abort the run either. Swift already works this way
+# (its trailing `; true` is load-bearing, for exactly this reason). A real
+# Kotlin compile error should leave Kotlin's own snippets failing typecheck --
+# the io.xberg classes simply will not exist -- rather than leave the other
+# sixteen languages unmeasured. Kotlin's reported count is then artifact
+# absence, NOT snippet quality, and must not be read as the latter. ~keep
 before = [
-  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -n "${ANDROID_HOME:-}" ]; then ./gradlew assembleDebug; else echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; fi',
+  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -z "${ANDROID_HOME:-}" ]; then echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; elif [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then echo "alef: gradle/wrapper/gradle-wrapper.jar is absent; skipping gradle assembleDebug"; else ./gradlew assembleDebug || echo "alef: gradle assembleDebug FAILED; Kotlin snippets will fail typecheck (the io.xberg classes will be absent) instead of zeroing every other language"; fi',
 ]
 
 [workspace.docs.snippets.sessions.kotlin_android]
@@ -152,14 +213,53 @@ manifest = "packages/kotlin-android/build.gradle.kts"
 # four nested dirnames each print "usage: dirname string [...]", ANDROID_HOME
 # ends up empty, and gradle aborts. That matters more than it looks: a `before`
 # hook failure aborts the ENTIRE configured snippet check, so every other
-# language goes unvalidated because Android tooling happens to be missing. ~keep
+# language goes unvalidated because Android tooling happens to be missing.
+# Second guard, for the same reason: gradle-wrapper.jar is gitignored (.gitignore
+# `*.jar`), so it is absent from every staged-tree copy a pre-commit hook builds.
+# Without this check `./gradlew` dies with ClassNotFoundException on
+# GradleWrapperMain and takes the whole snippet run down with it, on every
+# commit, no matter what the commit touches.
+# Third guard, the same reasoning taken one step further: a gradle build that
+# runs and FAILS must not abort the run either. Swift already works this way
+# (its trailing `; true` is load-bearing, for exactly this reason). A real
+# Kotlin compile error should leave Kotlin's own snippets failing typecheck --
+# the io.xberg classes simply will not exist -- rather than leave the other
+# sixteen languages unmeasured. Kotlin's reported count is then artifact
+# absence, NOT snippet quality, and must not be read as the latter. ~keep
 before = [
-  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -n "${ANDROID_HOME:-}" ]; then ./gradlew assembleDebug; else echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; fi',
+  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -z "${ANDROID_HOME:-}" ]; then echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; elif [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then echo "alef: gradle/wrapper/gradle-wrapper.jar is absent; skipping gradle assembleDebug"; else ./gradlew assembleDebug || echo "alef: gradle assembleDebug FAILED; Kotlin snippets will fail typecheck (the io.xberg classes will be absent) instead of zeroing every other language"; fi',
 ]
 
 [workspace.docs.snippets.sessions.swift]
 cwd = "packages/swift"
 manifest = "packages/swift/Package.swift"
+# Guarded so a machine with no Swift toolchain SKIPS the build instead of
+# failing it -- same reasoning as the Android guard above: a `before` hook
+# failure aborts the ENTIRE configured snippet check, so every other language
+# goes unvalidated because Swift tooling happens to be missing (xberg task
+# #521: all 95 Swift snippets failed because this session had no build step
+# at all and `import Xberg` could never resolve).
+# packages/swift/Sources/RustBridge{,C} are already-generated, committed
+# swift-bridge output (see Package.swift's own header comment) -- `alef
+# generate` does not need to run here. What's missing is the Rust side:
+# Package.swift's `resolvedStaticLib` links target/{release,debug}/lib
+# xberg_swift.a and libxberg_ffi.a explicitly, and neither exists until
+# `cargo build -p xberg-swift` has run at least once. Skip that build when
+# it is already satisfied (release preferred, matching resolvedStaticLib's
+# own preference) so repeat runs stay fast. If the build itself fails,
+# report it and move on instead of letting the `before` hook fail: a Swift
+# build failure should leave Swift's snippets failing typecheck (the
+# `Xberg` module still won't exist), not silently zero the other 14
+# languages. The trailing `; true` is load-bearing: with no `set -e`, a
+# `sh -c` one-liner's exit status is that of its LAST command, and an
+# `if/elif/.../fi` with no matching branch inherits the exit status of the
+# last condition it tested -- without `; true`, a chain that ends by
+# skipping every branch (e.g. no swift on PATH) could still exit non-zero
+# and take the whole snippet run down, exactly the failure mode this guard
+# exists to prevent. ~keep
+before = [
+  'if ! command -v swift >/dev/null 2>&1; then echo "alef: swift not on PATH; skipping cargo build (Swift snippets will fail typecheck)"; elif [ -f ../../target/release/libxberg_swift.a ] && [ -f ../../target/release/libxberg_ffi.a ]; then echo "alef: release staticlibs already built; skipping cargo build"; elif [ -f ../../target/debug/libxberg_swift.a ] && [ -f ../../target/debug/libxberg_ffi.a ]; then echo "alef: debug staticlibs already built; skipping cargo build"; else cargo build --manifest-path rust/Cargo.toml -p xberg-swift -p xberg-ffi || echo "alef: cargo build -p xberg-swift -p xberg-ffi failed; Swift snippets will fail typecheck (Xberg module unavailable), other languages unaffected"; fi; true',
+]
 
 [workspace.docs.snippets.sessions.zig]
 cwd = "packages/zig"
@@ -210,6 +310,13 @@ exclude = [
   "**/*.diff",
   "**/*.patch",
   "**/frb_generated.rs",
+  # The Dart half of the same flutter_rust_bridge output. Only the Rust half was
+  # excluded, so `poly fmt --check .` reports `would reformat` on all four Dart
+  # bridge files (frb_generated{,.io,.web}.dart and lib.dart) and fails the
+  # Validate (poly) job on every run. Reproduced against poly 0.20.1 locally and
+  # 0.19.7 in CI. Same reasoning as the sibling `**/*.freezed.dart` exclusion
+  # poly already applies: this is generator output nothing should reflow. ~keep
+  "packages/dart/lib/src/xberg_bridge_generated/**",
   "charts/**",
   # ai-rulez-generated coding-agent plugin outputs: owned by `ai-rulez generate
   # --plugin`, never reformatted by poly (would break BLAKE3 provenance). Sources
@@ -229,6 +336,14 @@ exclude = [
   ".claude-plugin/marketplace.json",
   ".agents/plugins/marketplace.json",
   ".ai-rulez-generated.json",
+  # Benchmark cohort manifests are BLAKE3-pinned by value in
+  # tools/benchmark-harness/src/bench_matrix.rs (*_MANIFEST_BLAKE3) and verified
+  # at runtime by validate_artifacts. Any reformat changes the digest and fails
+  # the contract, so these are data files poly must not rewrite -- same reasoning
+  # as the ai-rulez plugin outputs above. Without this, every regen that runs
+  # poly silently re-breaks the pin: it collapsed the `fixtures` array onto one
+  # line in 888023d75d, and 8a60458a7dd was an earlier re-pin for the same cause. ~keep
+  "tools/benchmark-harness/cohorts/**",
 ]
 
 # Opt-in comment-removal sweep. Preserve doc comments (rustdoc is required on
@@ -649,14 +764,25 @@ reexported_types = ["ExtractionResult", "ExtractedDocument", "ExtractionDiff"]
 [crates.python.stubs]
 output = "packages/python/xberg/"
 
+# Every `target_dep_overrides` block below sets `default_features = false`, which
+# replaces the core crate's `default = ["tokio-runtime", "simd-utf8"]` rather than
+# adding to it. Each `*-target` feature reaches `tokio-runtime` transitively, but
+# none reaches `simd-utf8`, so it must be listed explicitly or SIMD UTF-8
+# validation is silently compiled out of every Windows, macOS-Intel and Android
+# binding build.
+#
+# This applies to `target_dep_overrides` ONLY, because those govern the dep on the
+# core `xberg` crate. It must NOT be copied to `[[crates.swift.ffi_target_dep_overrides]]`,
+# which governs the dep on `xberg-ffi` — a crate that has no `simd-utf8` feature at
+# all, so listing it there makes the generated swift manifest fail to resolve. ~keep
 [[crates.python.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.python.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.node]
@@ -696,12 +822,12 @@ serde_with = "3"
 
 [[crates.node.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.node.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.ruby]
@@ -737,12 +863,12 @@ output = "packages/ruby/sig/"
 # Ruby is the only binding that needs this — every other Windows target is MSVC. ~keep
 [[crates.ruby.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-gnu-target"]
+features = ["windows-gnu-target", "simd-utf8"]
 default_features = false
 
 [[crates.ruby.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.php]
@@ -782,12 +908,12 @@ exclude_functions = [
 
 [[crates.php.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.php.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.elixir]
@@ -823,12 +949,12 @@ exclude_types = ["Recyclable"]
 
 [[crates.elixir.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.elixir.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.wasm]
@@ -997,6 +1123,21 @@ async-trait = "0.1"
 [crates.wasm.extra_dev_dependencies]
 wasm-bindgen-test = "0.3"
 
+# The generated FFI lib.rs is written whole by alef and declares no modules of its
+# own, so a hand-written sibling file in crates/xberg-ffi/src/ is unreachable from
+# the crate root: never compiled, absent from the cdylib symbol table, and correctly
+# absent from xberg.h. That silently killed 34 `extern "C"` functions when the
+# hand-written lib.rs was replaced by a generated one -- cancellation.rs (4),
+# config_builder.rs (19) and config/mod.rs (11) -- a link-time break for any C
+# consumer, not a header cosmetic. These three wrap `CancellationToken` and the
+# config builder, which are `alef(skip)`ed on purpose because they need a
+# hand-authored opaque-handle surface alef cannot derive. Declaring them here is
+# what makes them part of the crate again. `pub mod` alone is right: `no_mangle`
+# symbols export regardless of module visibility, cbindgen parses the whole crate,
+# and a glob re-export would risk colliding with generated crate-root items. ~keep
+[crates.custom_modules]
+ffi = ["cancellation", "config_builder", "config"]
+
 [crates.ffi]
 prefix = "xberg"
 header_name = "xberg.h"
@@ -1159,22 +1300,22 @@ exclude_functions = [
 
 [[crates.ffi.target_dep_overrides]]
 cfg = 'target_os = "android"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.ffi.target_dep_overrides]]
 cfg = 'target_os = "ios"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.ffi.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.ffi.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.go]
@@ -1319,16 +1460,6 @@ exclude_functions = [
   "embed_multi_vector_async",
 ]
 
-[[crates.java.target_dep_overrides]]
-cfg = 'target_os = "windows"'
-features = ["windows-target"]
-default_features = false
-
-[[crates.java.target_dep_overrides]]
-cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
-default_features = false
-
 [crates.dart]
 pubspec_name = "xberg"
 lib_name = "xberg"
@@ -1407,22 +1538,22 @@ exclude_functions = [
 
 [[crates.dart.target_dep_overrides]]
 cfg = 'target_os = "android"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.dart.target_dep_overrides]]
 cfg = 'target_os = "ios"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.dart.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.dart.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.kotlin_android]
@@ -1453,31 +1584,26 @@ exclude_functions = [
   "embed_multi_vector_async",
 ]
 
-[[crates.kotlin_android.target_dep_overrides]]
-cfg = 'target_os = "windows"'
-features = ["windows-target"]
-default_features = false
-
 [crates.jni]
 
 [[crates.jni.target_dep_overrides]]
 cfg = 'target_os = "android"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.jni.target_dep_overrides]]
 cfg = 'target_os = "ios"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.jni.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.jni.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 [crates.swift]
@@ -1579,22 +1705,22 @@ exclude_functions = [
 
 [[crates.swift.target_dep_overrides]]
 cfg = 'target_os = "ios"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.swift.target_dep_overrides]]
 cfg = 'target_os = "android"'
-features = ["android-target"]
+features = ["android-target", "simd-utf8"]
 default_features = false
 
 [[crates.swift.target_dep_overrides]]
 cfg = 'target_os = "windows"'
-features = ["windows-target"]
+features = ["windows-target", "simd-utf8"]
 default_features = false
 
 [[crates.swift.target_dep_overrides]]
 cfg = 'all(target_os = "macos", target_arch = "x86_64")'
-features = ["macos-intel-target"]
+features = ["macos-intel-target", "simd-utf8"]
 default_features = false
 
 # The swift-bridge backend injects the xberg-ffi dependency itself. Without these
@@ -1694,7 +1820,6 @@ elixir = "packages/elixir/native/xberg_nif/src/"
 wasm = "crates/xberg-wasm/src/"
 java = "packages/java/"
 csharp = "packages/csharp/src/"
-jni = "crates/xberg-jni/src/"
 kotlin_android = "packages/kotlin-android/"
 swift = "packages/swift/Sources/Xberg/"
 dart = "packages/dart/lib/src/"
@@ -1976,6 +2101,18 @@ functions = [
   "batch_extract_files",
   "batch_extract_files_sync",
 
+  # Both take `TokenizerSource<'a>`, a borrowed enum whose four variants mean
+  # different things (HF model ID, model+revision pair, local `tokenizer.json`
+  # path, embedded bytes). Alef cannot represent it across FFI, so it sanitizes
+  # the parameter to a bare `String` — collapsing all four into one untyped
+  # argument the caller has no way to disambiguate. Neither function appears in
+  # any of the 15 generated bindings today, so excluding them removes nothing
+  # from the published surface; it only stops a lossy one being fabricated.
+  # Excluded rather than suppressed via `suppress_validation_codes` so
+  # `lossy_sanitized_surface` stays armed for every other item. ~keep
+  "try_count_tokens",
+  "preload_tokenizer",
+
 ]
 
 [crates.update.kotlin_android]
@@ -2127,26 +2264,6 @@ languages = [
   "zig",
   "homebrew",
 ]
-
-[crates.e2e.snippets]
-output = "docs-site/src/snippets-generated"
-languages = [
-  "python",
-  "rust",
-  "node",
-  "go",
-  "ruby",
-  "elixir",
-  "wasm",
-  "java",
-  "csharp",
-  "php",
-  "dart",
-  "kotlin_android",
-  "swift",
-  "zig",
-  "c",
-]
 fields_optional = [
   "results[0].metadata.format",
   "results[0].metadata.format.excel",
@@ -2223,6 +2340,26 @@ result_fields = [
 
 fields_method_calls = ["results[0].metadata.format.excel", "metadata.format.excel"]
 
+[crates.e2e.snippets]
+output = "docs-site/src/snippets-generated"
+languages = [
+  "python",
+  "rust",
+  "node",
+  "go",
+  "ruby",
+  "elixir",
+  "wasm",
+  "java",
+  "csharp",
+  "php",
+  "dart",
+  "kotlin_android",
+  "swift",
+  "zig",
+  "c",
+]
+
 [crates.e2e.call]
 function = "extract"
 module = "xberg"
@@ -2270,7 +2407,6 @@ options_type = "ExtractionConfig"
 class = "XbergLib"
 function = "Extract"
 options_type = "ExtractionConfig"
-json_object_types = { chunking = "ChunkingConfig", ocr = "OcrConfig", images = "ImageExtractionConfig", html_output = "HtmlOutputConfig", language_detection = "LanguageDetectionConfig", postprocessor = "PostProcessorConfig", acceleration = "AccelerationConfig", email = "EmailConfig", pages = "PageConfig", pdf_options = "PdfConfig", layout = "LayoutDetectionConfig", tree_sitter = "TreeSitterConfig", structured_extraction = "StructuredExtractionConfig", content_filter = "ContentFilterConfig", token_reduction = "TokenReductionOptions" }
 nested_types = { model = "EmbeddingModelType", embedding = "EmbeddingConfig", keywords = "KeywordConfig", pages = "PageConfig", securityLimits = "SecurityLimits", treeSitter = "TreeSitterConfig" }
 
 [crates.e2e.call.overrides.ruby]
@@ -2324,7 +2460,6 @@ result_is_json_struct = true
 [crates.e2e.calls.extract.overrides.csharp]
 options_type = "ExtractionConfig"
 options_via = "from_json"
-json_object_types = { chunking = "ChunkingConfig", ocr = "OcrConfig", images = "ImageExtractionConfig", html_output = "HtmlOutputConfig", language_detection = "LanguageDetectionConfig", postprocessor = "PostProcessorConfig", acceleration = "AccelerationConfig", email = "EmailConfig", pages = "PageConfig", pdf_options = "PdfConfig", layout = "LayoutDetectionConfig", tree_sitter = "TreeSitterConfig", structured_extraction = "StructuredExtractionConfig", content_filter = "ContentFilterConfig", token_reduction = "TokenReductionOptions" }
 
 [crates.e2e.calls.extract.overrides.python]
 options_type = "ExtractionConfig"

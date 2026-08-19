@@ -14,6 +14,7 @@ from xberg import list_post_processors, ExtractionConfig
 
 def main() -> None:
     _ = list_post_processors()
+    print(result)
 
 main()
 
