@@ -272,14 +272,23 @@ public static class MarkdownParser
                 {
                     string cl = lines[i];
                     string cls = cl.TrimStart();
-                    if (cls.Length >= fenceLen && cls.Take(fenceLen).All(c => c == fenceChar) &&
-                        cls.Substring(fenceLen).Trim().Length == 0)
+                    // A closing fence takes at most three spaces of indentation. A fourth makes
+                    // the line code content, not a fence, so a block closed that way runs on —
+                    // which is the whole point of the rule, and what the document actually says.
+                    int closeIndent = cl.Length - cls.Length;
+                    if (closeIndent <= 3 && cls.Length >= fenceLen
+                        && cls.Take(fenceLen).All(c => c == fenceChar)
+                        && cls.Substring(fenceLen).Trim().Length == 0)
                     {
                         closed = true;
                         i++;
                         break;
                     }
-                    code.Append(cl).Append('\n');
+                    // Content lines lose the opening fence's indentation, and only that much: the
+                    // fence's own position is not part of the code, but any deeper indentation is.
+                    int strip = 0;
+                    while (strip < indent && strip < cl.Length && cl[strip] == ' ') strip++;
+                    code.Append(cl, strip, cl.Length - strip).Append('\n');
                     i++;
                 }
                 _ = closed;
