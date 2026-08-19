@@ -45,8 +45,38 @@ public static class PdfMetadataExtractor
         var md = GetInfoString(info, "ModDate");
         if (md != null) r.ModifiedAt = ParsePdfDate(md);
 
+        ApplyXmpFallbacks(r, PdfXmp.Extract(doc));
         return r;
     }
+
+    /// <summary>
+    /// Fill in from the XMP packet whatever the Info dictionary left unset.
+    /// </summary>
+    /// <remarks>
+    /// The Info dictionary wins wherever it says anything, because a producer that writes both
+    /// keeps Info current and XMP is frequently a stale copy from an earlier save. XMP dates are
+    /// already ISO 8601 and need none of the <c>D:YYYYMMDD</c> unpicking.
+    /// <para>
+    /// Info <c>/Subject</c> maps to <c>dc:description</c>, not <c>dc:subject</c> — that is
+    /// Adobe's own mapping. <c>dc:description</c> is one descriptive string; <c>dc:subject</c> is
+    /// a keyword bag, and it feeds Keywords instead.
+    /// </para>
+    /// </remarks>
+    private static void ApplyXmpFallbacks(PdfMetaResult r, XmpMetadata? xmp)
+    {
+        if (xmp is null) return;
+        r.Title ??= NonEmpty(xmp.DcTitle);
+        r.Subject ??= NonEmpty(xmp.DcDescription);
+        r.CreatedBy ??= NonEmpty(xmp.XmpCreatorTool);
+        if (r.Authors is null && xmp.DcCreator.Count > 0) r.Authors = new List<string>(xmp.DcCreator);
+        if (r.Keywords is null && xmp.DcSubject.Count > 0) r.Keywords = new List<string>(xmp.DcSubject);
+        r.CreatedAt ??= NonEmpty(xmp.XmpCreateDate);
+        r.ModifiedAt ??= NonEmpty(xmp.XmpModifyDate);
+    }
+
+    /// <summary>An XMP field may legally be present but empty; that is the same as absent.</summary>
+    private static string? NonEmpty(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static string? GetInfoString(PdfDict? info, string key)
     {

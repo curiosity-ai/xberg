@@ -209,12 +209,11 @@ internal static class PdfContentScan
             Math.Max(Math.Max(x0, x1), Math.Max(x2, x3)),
             Math.Max(Math.Max(y0, y1), Math.Max(y2, y3))));
 
-        // CCITT/JBIG2 win over anything already seen; otherwise the first codec sticks.
+        // CCITT wins over anything already seen; otherwise the first codec sticks.
         walk.Codec = (walk.Codec, codec) switch
         {
             (ImageCodecClass.None, var x) => x,
             (_, ImageCodecClass.Ccitt) => ImageCodecClass.Ccitt,
-            (_, ImageCodecClass.Jbig2) => ImageCodecClass.Jbig2,
             (var cur, _) => cur,
         };
     }
@@ -233,8 +232,11 @@ internal static class PdfContentScan
             switch (n)
             {
                 case "CCITTFaxDecode" or "CCF": return ImageCodecClass.Ccitt;
-                case "JBIG2Decode": return ImageCodecClass.Jbig2;
                 case "DCTDecode" or "DCT" or "JPXDecode": return ImageCodecClass.Dct;
+                // JBIG2 is deliberately absent. pdf_oxide's page classifier asks each image only
+                // whether it carries CCITT parameters and whether its data decodes as JPEG, so a
+                // JBIG2 image comes back as `Other` and never earns the bilevel-codec bonus.
+                // Naming it here would score four scanned fixtures 0.10 above the reference.
             }
         }
         return ImageCodecClass.Other;

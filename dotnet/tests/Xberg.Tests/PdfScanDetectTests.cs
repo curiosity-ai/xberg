@@ -23,12 +23,20 @@ public class PdfScanDetectTests
             ProducerPrior = prior,
         };
 
+    /// <summary>
+    /// A score is a sum of single-precision weights, so 0.50 + 0.35 + 0.10 lands a few ULPs off
+    /// 0.95. Compare within tolerance rather than rounding the score — the same helper upstream's
+    /// own tests use, for the same reason.
+    /// </summary>
+    private static void AssertScore(double expected, double actual) =>
+        Assert.True(Math.Abs(actual - expected) < 1e-5, $"expected score {expected}, got {actual}");
+
     [Fact]
     public void BelowCoverageFloor_ScoresZero()
     {
         // A page with a figure is text with a figure, never a scan — no other signal can
         // lift it, so the codec and producer are deliberately the most incriminating ones.
-        Assert.Equal(0.0, PdfScanDetect.ScorePage(
+        AssertScore(0.0, PdfScanDetect.ScorePage(
             Signals(0.79, glyphs: 0, codec: ImageCodecClass.Ccitt, prior: ProducerPrior.Scanner)));
     }
 
@@ -36,38 +44,38 @@ public class PdfScanDetectTests
     public void FullPageRasterWithVisibleText_ScoresExactlyTheRasterFloor()
     {
         // A slide with a full-bleed background image: below every usable threshold.
-        Assert.Equal(0.50, PdfScanDetect.ScorePage(Signals(1.0)));
+        AssertScore(0.50, PdfScanDetect.ScorePage(Signals(1.0)));
     }
 
     [Fact]
     public void FullPageRasterWithNoTextLayer_AddsTheNoVisibleTextScore()
     {
-        Assert.Equal(0.85, PdfScanDetect.ScorePage(Signals(1.0, glyphs: 0)));
+        AssertScore(0.85, PdfScanDetect.ScorePage(Signals(1.0, glyphs: 0)));
     }
 
     [Fact]
     public void MostlyInvisibleTextLayer_CountsAsAnOcrSidecar()
     {
-        Assert.Equal(0.85, PdfScanDetect.ScorePage(Signals(1.0, invisible: 0.50)));
+        AssertScore(0.85, PdfScanDetect.ScorePage(Signals(1.0, invisible: 0.50)));
         // Just under the threshold the text layer is treated as real.
-        Assert.Equal(0.50, PdfScanDetect.ScorePage(Signals(1.0, invisible: 0.49)));
+        AssertScore(0.50, PdfScanDetect.ScorePage(Signals(1.0, invisible: 0.49)));
     }
 
     [Fact]
     public void BilevelCodecs_AddTheirScore()
     {
-        Assert.Equal(0.60, PdfScanDetect.ScorePage(Signals(1.0, codec: ImageCodecClass.Ccitt)));
-        Assert.Equal(0.60, PdfScanDetect.ScorePage(Signals(1.0, codec: ImageCodecClass.Jbig2)));
+        AssertScore(0.60, PdfScanDetect.ScorePage(Signals(1.0, codec: ImageCodecClass.Ccitt)));
+        AssertScore(0.60, PdfScanDetect.ScorePage(Signals(1.0, codec: ImageCodecClass.Jbig2)));
         // A photo or flate raster is not evidence of a fax-style scan.
-        Assert.Equal(0.50, PdfScanDetect.ScorePage(Signals(1.0, codec: ImageCodecClass.Dct)));
+        AssertScore(0.50, PdfScanDetect.ScorePage(Signals(1.0, codec: ImageCodecClass.Dct)));
     }
 
     [Fact]
     public void ScannerProducer_IsAWeakNudgeAndNeverDecisive()
     {
-        Assert.Equal(0.55, PdfScanDetect.ScorePage(Signals(1.0, prior: ProducerPrior.Scanner)));
+        AssertScore(0.55, PdfScanDetect.ScorePage(Signals(1.0, prior: ProducerPrior.Scanner)));
         // Even every signal together stays within [0, 1].
-        Assert.Equal(1.0, PdfScanDetect.ScorePage(
+        AssertScore(1.0, PdfScanDetect.ScorePage(
             Signals(1.0, glyphs: 0, codec: ImageCodecClass.Ccitt, prior: ProducerPrior.Scanner)));
     }
 
