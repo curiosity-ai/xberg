@@ -67,8 +67,47 @@ public static class PdfStructure
     /// first-paragraph H1 rescue: its one paragraph is not "the biggest text on a page of
     /// body copy", it is the whole document (Rust `MIN_BLOCKS_FOR_FONT_HEADING`).</summary>
     private const int MIN_BLOCKS_FOR_FONT_HEADING = 5;
+
+    /// <summary>Pages that must share the enlarged opening tier before a sparse document is
+    /// allowed a heading level at all (Rust `SPARSE_REPEATED_TIER_MIN_PAGES`).</summary>
+    private const int SPARSE_REPEATED_TIER_MIN_PAGES = 2;
+    /// <summary>Heading and body — the only split a sparse document is read as having.</summary>
+    private const int SPARSE_FONT_TIER_CLUSTER_COUNT = 2;
+    /// <summary>Points either side of a tier centroid that still count as that tier.</summary>
+    private const float SPARSE_FONT_TIER_TOLERANCE = 0.5f;
+    /// <summary>A tier repeated at the top of several pages is peer sections, not a unique
+    /// document title, so H1 stays reserved for a title.</summary>
+    private const byte SPARSE_REPEATED_TIER_HEADING_LEVEL = 2;
+    /// <summary>Pages that must repeat an H2 tier before title inference is suppressed.</summary>
+    private const int SPARSE_PEER_HEADING_MIN_PAGES = 2;
+    /// <summary>Font tolerance for the repeated-peer-tier test.</summary>
+    private const float SPARSE_PEER_HEADING_FONT_TOLERANCE = 0.5f;
     private const int MAX_BOLD_HEADING_WORD_COUNT = 12;
     private const float PARAGRAPH_GAP_HEIGHT_FACTOR = 1.5f;
+
+    /// <summary>
+    /// Multiple of the page's own body leading that a baseline-to-baseline advance must reach
+    /// to count as a paragraph break.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="PARAGRAPH_GAP_HEIGHT_FACTOR"/> measures the whitespace band between two lines
+    /// against the glyph height, which makes it blind to the commonest paragraph separator there
+    /// is. With glyph height <c>h</c> and leading <c>L</c>, single spacing leaves a band of
+    /// <c>L - h</c> and a blank line leaves <c>2L - h</c>; for the usual <c>L</c> of 1.1–1.3
+    /// <c>h</c> that blank line is only 1.2–1.6 <c>h</c>, so a 1.5<c>h</c> band threshold asks
+    /// for more vertical space than a blank line actually provides. Comparing the advance to the
+    /// leading is scale-free instead: a blank line doubles the advance. The two rules are OR-ed,
+    /// so no break the band rule already finds is lost.
+    /// </remarks>
+    private const float PARAGRAPH_BREAK_LEADING_MULTIPLE = 1.5f;
+
+    /// <summary>
+    /// Largest baseline-to-baseline gap, as a multiple of the larger paragraph's dominant font
+    /// size, that a continuation merge will cross. A wrapped line sits roughly one line-height
+    /// below its predecessor (leading is typically 1.0–1.6× the font size); several times that
+    /// means the two paragraphs come from spatially distinct regions of the page.
+    /// </summary>
+    private const float MAX_CONTINUATION_LINE_GAP_MULTIPLE = 3.0f;
 
     // hierarchy clustering constants
     private const int KMEANS_MAX_ITERATIONS = 100;
@@ -103,6 +142,11 @@ public static class PdfStructure
             var segs = allPageSegments[i];
             var gapYs = ComputeParagraphGapYs(segs);
             var paras = BlocksToParagraphs(segs, headingMap, gapYs);
+            // Segment-level repair runs here, before paragraphs are merged, because the
+            // continuation and dehyphenation rules read the last and first characters of
+            // neighbouring segments — a trailing soft hyphen or control character left in place
+            // would be read as ordinary text and change the decision.
+            ApplyToAllSegments(paras, PdfTextRepair.RepairSegment);
             MergeContinuationParagraphs(paras);
             RetainPageFurnitureSafely(paras);
             allPageParagraphs.Add(paras);
@@ -207,13 +251,19 @@ public static class PdfStructure
 
         int paragraphCount = blockFonts.Count;
 
-        // Sparsity gate: too few text blocks to establish a reliable body-font baseline. Return
-        // a body-only map and skip both k-means heading promotion and the fallback title
-        // promotion, so a lone larger line on a cover, title or one-line document is not
-        // over-promoted to a heading — the bold pass will still call it an H2 if it looks like
-        // one. (Rust `build_heading_map`; the sparse repeated-tier branch is not ported.)
         if (paragraphCount < MIN_BLOCKS_FOR_FONT_HEADING)
         {
+            // A document too small for font clustering can still be structured: a handful of
+            // pages that each open at the same larger size are peer sections, and that repetition
+            // is evidence the block count alone cannot supply.
+            var sparse = SparseMultiPageHeadingMap(allPageSegments, blockFonts);
+            if (sparse is not null) return sparse;
+
+            // Sparsity gate: too few text blocks to establish a reliable body-font baseline.
+            // Return a body-only map and skip both k-means heading promotion and the fallback
+            // title promotion, so a lone larger line on a cover, title or one-line document is
+            // not over-promoted to a heading — the bold pass will still call it an H2 if it
+            // looks like one.
             var bodyOnly = ClusterFontSizes(blockFonts, 1);
             return bodyOnly.Select(c => (c.Centroid, (byte?)null)).ToList();
         }
@@ -245,6 +295,58 @@ public static class PdfStructure
             }
         }
         return map;
+    }
+
+    /// <summary>
+    /// A heading map for documents below <see cref="MIN_BLOCKS_FOR_FONT_HEADING"/> whose pages
+    /// each open at the same larger font tier.
+    /// </summary>
+    /// <remarks>
+    /// The block floor exists because a lone large line is more often display prose than a
+    /// section heading. Repetition breaks that tie: when two or more pages begin at the same
+    /// enlarged size, those lines are peer sections and the size is a heading tier, however few
+    /// blocks the document has. They are peers, not a title, so they get level 2 and H1 stays
+    /// reserved. Ported from Rust <c>sparse_multi_page_heading_map</c>; the port has no
+    /// structure-tree path, so every page is a heuristic page.
+    /// </remarks>
+    private static List<(float centroid, byte? level)>? SparseMultiPageHeadingMap(
+        List<List<SegmentData>> allPageSegments, List<float> blockFonts)
+    {
+        if (allPageSegments.Count < SPARSE_REPEATED_TIER_MIN_PAGES) return null;
+
+        var clusters = ClusterFontSizes(blockFonts, SPARSE_FONT_TIER_CLUSTER_COUNT);
+        if (clusters.Count != SPARSE_FONT_TIER_CLUSTER_COUNT) return null;
+
+        // Two tiers only: any block that sits between them means the sizes are a spread rather
+        // than a heading/body split, and the repetition argument no longer holds.
+        bool twoNarrowTiers = blockFonts.All(f =>
+            !float.IsNaN(f) && !float.IsInfinity(f)
+            && clusters.Any(c => Math.Abs(f - c.Centroid) <= SPARSE_FONT_TIER_TOLERANCE));
+        if (!twoNarrowTiers) return null;
+
+        float headingFont = clusters[0].Centroid;
+        float bodyFont = clusters[1].Centroid;
+        if (headingFont - bodyFont <= SPARSE_FONT_TIER_TOLERANCE) return null;
+        if (headingFont < bodyFont * MIN_HEADING_FONT_RATIO || headingFont < bodyFont + MIN_HEADING_FONT_GAP)
+            return null;
+
+        int repeatedPages = 0;
+        foreach (var page in allPageSegments)
+        {
+            var first = page.FirstOrDefault(s => !string.IsNullOrWhiteSpace(s.Text));
+            if (first is null) continue;
+            if (!float.IsNaN(first.FontSize) && !float.IsInfinity(first.FontSize)
+                && Math.Abs(first.FontSize - headingFont) <= SPARSE_FONT_TIER_TOLERANCE)
+                repeatedPages++;
+        }
+        if (repeatedPages < SPARSE_REPEATED_TIER_MIN_PAGES) return null;
+
+        return clusters
+            .Select(c => (c.Centroid,
+                Math.Abs(c.Centroid - headingFont) <= SPARSE_FONT_TIER_TOLERANCE
+                    ? (byte?)SPARSE_REPEATED_TIER_HEADING_LEVEL
+                    : null))
+            .ToList();
     }
 
     private static List<FontSizeCluster> ClusterFontSizes(List<float> blockFonts, int k)
@@ -416,16 +518,43 @@ public static class PdfStructure
         if (lines.Count < 2) return new();
 
         var heights = lines.Select(l => l.height).OrderBy(h => h).ToList();
-        float gapThreshold = heights[heights.Count / 2] * PARAGRAPH_GAP_HEIGHT_FACTOR;
+        float medianHeight = heights[heights.Count / 2];
+        float gapThreshold = medianHeight * PARAGRAPH_GAP_HEIGHT_FACTOR;
+        float advanceThreshold = BodyLeading(lines, medianHeight) * PARAGRAPH_BREAK_LEADING_MULTIPLE;
 
         var gapYs = new List<float>();
         for (int i = 0; i + 1 < lines.Count; i++)
         {
             float gap = lines[i].bottom - lines[i + 1].top;
-            if (gap > gapThreshold && !(lines[i].mono && lines[i + 1].mono))
+            float advance = lines[i].anchor - lines[i + 1].anchor;
+            if ((gap > gapThreshold || advance > advanceThreshold) && !(lines[i].mono && lines[i + 1].mono))
                 gapYs.Add((lines[i].bottom + lines[i + 1].top) / 2.0f);
         }
         return gapYs;
+    }
+
+    /// <summary>
+    /// The page's body leading, read off its own line pitch: the tightest baseline-to-baseline
+    /// advance between consecutive lines, floored at the median line height.
+    /// </summary>
+    /// <remarks>
+    /// The tightest advance is used rather than the median or the mode because a short
+    /// block-structured page — a memo of five one-line blocks — has more break-sized advances
+    /// than body-sized ones, so any central statistic reports the break spacing as normal and no
+    /// break is ever found. The floor is what makes the minimum safe: an advance below one line
+    /// height is not a wrapped line at all (stacked accents, a subscript resolved onto its own
+    /// band) and must not shrink the estimate enough to split every ordinary line on the page.
+    /// </remarks>
+    private static float BodyLeading(
+        List<(float top, float bottom, float height, bool mono, float anchor)> lines, float medianHeight)
+    {
+        float tightest = float.PositiveInfinity;
+        for (int i = 0; i + 1 < lines.Count; i++)
+        {
+            float advance = lines[i].anchor - lines[i + 1].anchor;
+            if (float.IsFinite(advance) && advance > 0f && advance < tightest) tightest = advance;
+        }
+        return float.IsFinite(tightest) ? Math.Max(tightest, medianHeight) : medianHeight;
     }
 
     private static List<PdfParagraph> BlocksToParagraphs(List<SegmentData> lines, List<(float centroid, byte? level)> headingMap, List<float> gapYs)
@@ -626,6 +755,28 @@ public static class PdfStructure
 
     // ── merge_continuation_paragraphs (paragraphs.rs) ────────────────────────────
 
+    /// <summary>Apply a text repair to every segment of every paragraph, in place.</summary>
+    private static void ApplyToAllSegments(List<PdfParagraph> paragraphs, Func<string, string> repair)
+    {
+        foreach (var para in paragraphs)
+        {
+            bool changed = false;
+            foreach (var line in para.Lines)
+                for (int i = 0; i < line.Segments.Count; i++)
+                {
+                    string repaired = repair(line.Segments[i].Text);
+                    if (!ReferenceEquals(repaired, line.Segments[i].Text) && repaired != line.Segments[i].Text)
+                    {
+                        line.Segments[i].Text = repaired;
+                        changed = true;
+                    }
+                }
+            // The cached paragraph text was assembled from the segments; once they move it is
+            // stale, and every reader falls back to rejoining the segments.
+            if (changed) para.Text = "";
+        }
+    }
+
     private static void MergeContinuationParagraphs(List<PdfParagraph> paragraphs)
     {
         if (paragraphs.Count < 2) return;
@@ -640,15 +791,72 @@ public static class PdfStructure
                 && !current.IsCodeBlock && !next.IsCodeBlock
                 && !current.IsFormula && !next.IsFormula;
             bool fontsCompatible = Math.Abs(current.DominantFontSize - next.DominantFontSize) < 2.0f;
+            // Never merge across a bold-state boundary. A bold run following non-bold prose (or
+            // the reverse) is a formatting break — an emphasized heading, a list item's bold
+            // lead-in — not a wrapped continuation, and absorbing it buries the heading as inline
+            // bold before anything can classify it.
+            bool boldCompatible = current.IsBold == next.IsBold;
             bool continuationSignal = !EndsWithSentenceTerminator(current) || StartsWithLowercaseContinuation(next);
-            if (bothBody && fontsCompatible && continuationSignal)
+            bool verticalGapCompatible = BaselinesWithinContinuationGap(current, next);
+            // A numbered section heading starts a new element. It does not end in `.?!:;`, so the
+            // continuation signal is satisfied by the *previous* heading alone — an `||` boost,
+            // not a requirement — and a run of consecutive subsection headings would be rejoined
+            // here even after the line grouper split them.
+            bool nextStartsSection = StartsNumberedSection(next);
+            if (bothBody && fontsCompatible && boldCompatible && continuationSignal
+                && verticalGapCompatible && !nextStartsSection)
             {
                 current.Text = "";
+                current.BlockBbox = UnionBlockBbox(current.BlockBbox, next.BlockBbox);
                 current.Lines.AddRange(next.Lines);
             }
             else { paragraphs.Add(current); current = next; }
         }
         paragraphs.Add(current);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="next"/>'s first baseline sits close enough below
+    /// <paramref name="current"/>'s last to be a wrapped continuation rather than a spatially
+    /// distant block — a recipient block at the top of an invoice and a legal footer at the
+    /// bottom satisfy every textual signal and must still never be joined.
+    /// </summary>
+    /// <remarks>Paragraphs without per-line geometry are allowed to merge, gated by the other
+    /// signals, since no vertical distance can be computed for them.</remarks>
+    private static bool BaselinesWithinContinuationGap(PdfParagraph current, PdfParagraph next)
+    {
+        var currentLast = current.Lines.LastOrDefault();
+        var nextFirst = next.Lines.FirstOrDefault();
+        if (currentLast is null || nextFirst is null) return true;
+        if (currentLast.BaselineY == 0f || nextFirst.BaselineY == 0f) return true;
+        float gap = Math.Abs(currentLast.BaselineY - nextFirst.BaselineY);
+        float lineHeight = Math.Max(Math.Max(current.DominantFontSize, next.DominantFontSize), 1.0f);
+        return gap <= lineHeight * MAX_CONTINUATION_LINE_GAP_MULTIPLE;
+    }
+
+    /// <summary>Union of two block boxes, so a merged paragraph's box spans all of its text.</summary>
+    private static (float L, float B, float R, float T)? UnionBlockBbox(
+        (float L, float B, float R, float T)? current, (float L, float B, float R, float T)? next)
+    {
+        if (current is { } c && next is { } n)
+            return (Math.Min(c.L, n.L), Math.Min(c.B, n.B), Math.Max(c.R, n.R), Math.Max(c.T, n.T));
+        return current ?? next;
+    }
+
+    /// <summary>
+    /// Whether a paragraph's first visual line reads as a numbered section heading
+    /// ("1.3 Gasinstallatie", "IV. Results", "1. INTRODUCTION").
+    /// </summary>
+    /// <remarks>The line's segments are rejoined because word-processor output often splits the
+    /// numbering into its own run, leaving the leading segment as a bare "1.3".</remarks>
+    private static bool StartsNumberedSection(PdfParagraph para)
+    {
+        var firstLine = para.Lines.FirstOrDefault();
+        if (firstLine is null) return false;
+        string joined = string.Join(" ", firstLine.Segments
+            .Select(s => s.Text.Trim())
+            .Where(t => t.Length > 0));
+        return IsNumberedSectionHeading(joined);
     }
 
     private static bool StartsWithLowercaseContinuation(PdfParagraph p)
@@ -694,7 +902,7 @@ public static class PdfStructure
         if (H1Count() == 0)
         {
             bool hasAny = allPages.SelectMany(p => p).Any(p => p.HeadingLevel.HasValue);
-            if (hasAny) PromoteTitleHeading(allPages);
+            if (hasAny && !HasRepeatedSparsePeerHeadingTier(allPages)) PromoteTitleHeading(allPages);
 
             bool stillNoH1 = !allPages.SelectMany(p => p).Any(p => p.HeadingLevel == 1);
             if (stillNoH1 && allPages.Count > 0 && allPages[0].Count > 0)
@@ -738,6 +946,35 @@ public static class PdfStructure
                     if (!foundFirst) { foundFirst = true; continue; }
                     if (StartsWithSectionNumber(ParagraphPlainText(para))) para.HeadingLevel = 2;
                 }
+    }
+
+    /// <summary>
+    /// True when a sparse document repeats the same H2 tier at the start of several pages.
+    /// </summary>
+    /// <remarks>
+    /// Those openings are peer sections. Promoting the first of them to H1 would say the
+    /// document has a title and that this is it, which is exactly what the repetition denies —
+    /// so title inference is skipped and they stay level peers.
+    /// </remarks>
+    private static bool HasRepeatedSparsePeerHeadingTier(List<List<PdfParagraph>> allPages)
+    {
+        int paragraphCount = allPages.Sum(p => p.Count);
+        if (paragraphCount >= MIN_BLOCKS_FOR_FONT_HEADING) return false;
+
+        var leadingH2Fonts = new List<float>();
+        foreach (var page in allPages)
+        {
+            var first = page.FirstOrDefault(p =>
+                !p.IsPageFurniture && ParagraphPlainText(p).Trim().Length > 0);
+            if (first is null) continue;
+            if (first.HeadingLevel == 2 && !float.IsNaN(first.DominantFontSize)
+                && !float.IsInfinity(first.DominantFontSize))
+                leadingH2Fonts.Add(first.DominantFontSize);
+        }
+
+        return leadingH2Fonts.Any(candidate =>
+            leadingH2Fonts.Count(f => Math.Abs(f - candidate) <= SPARSE_PEER_HEADING_FONT_TOLERANCE)
+                >= SPARSE_PEER_HEADING_MIN_PAGES);
     }
 
     /// <summary>Character-weighted mean font size of every paragraph except the excluded one —
