@@ -217,4 +217,52 @@ public class MarkdownExtractorTests
         var doc = Extract("<!-- image -->\nText and picture.\n");
         Assert.Contains(doc.Elements, e => e.Text.Contains("<!-- image -->", StringComparison.Ordinal));
     }
+
+    // ── superscript / subscript ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Pandoc's `^x^` and `~x~`: markers are structure, so they leave the text. Both delimiters
+    /// have to start a word, which is why a document wanting `H₂O` reaches for `<sub>` instead.
+    /// </summary>
+    [Fact]
+    public void SuperscriptAndSubscriptBecomeAnnotations()
+    {
+        var doc = Extract("~Subscript~ and ^superscript^\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("Subscript and superscript", para.Text);
+        Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Superscript);
+        Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Subscript);
+    }
+
+    /// <summary>
+    /// A single `~` and a `^` cannot sit inside a word, so a pair separated by a space is not a
+    /// span. Treating them as one silently deleted both markers and the space between them.
+    /// </summary>
+    [Fact]
+    public void IntrawordSuperscriptAndSubscriptDoNotPair()
+    {
+        var doc = Extract("These are not spans: a^b c^d, a~b c~d.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("These are not spans: a^b c^d, a~b c~d.", para.Text);
+        Assert.Empty(para.Annotations);
+    }
+
+    /// <summary>A doubled `~` is still a strikethrough, and may sit inside a word.</summary>
+    [Fact]
+    public void DoubledTildeRemainsStrikethrough()
+    {
+        var doc = Extract("~~gone~~ but here.\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("gone but here.", para.Text);
+        Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Strikethrough);
+    }
+
+    /// <summary>Runs of different lengths are not partners, so `~x~~` stays literal.</summary>
+    [Fact]
+    public void TildeRunsPairOnlyWithTheirOwnLength()
+    {
+        var doc = Extract("a ~x~~ b\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Equal("a ~x~~ b", para.Text);
+    }
 }

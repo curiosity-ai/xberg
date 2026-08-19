@@ -176,6 +176,23 @@ public sealed class MarkdownExtractor : IExtractor
                         paragraphAnns, headingAnns, listItemAnns, MakeSimple(AnnotationKind.Tag.Strikethrough));
                     break;
 
+                // Pandoc's `^x^` and `~x~`. Like emphasis, the markers are structure rather than
+                // content: they become annotations and leave the text alone.
+                case MdEventKind.StartSuperscript:
+                    PushAnnStart(annStarts, 5, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText);
+                    break;
+                case MdEventKind.EndSuperscript:
+                    EndAnn(annStarts, 5, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText,
+                        paragraphAnns, headingAnns, listItemAnns, MakeSimple(AnnotationKind.Tag.Superscript));
+                    break;
+                case MdEventKind.StartSubscript:
+                    PushAnnStart(annStarts, 6, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText);
+                    break;
+                case MdEventKind.EndSubscript:
+                    EndAnn(annStarts, 6, inParagraph, inHeading, inListItem, paragraphText, headingText, listItemText,
+                        paragraphAnns, headingAnns, listItemAnns, MakeSimple(AnnotationKind.Tag.Subscript));
+                    break;
+
                 case MdEventKind.StartLink:
                 {
                     string? titleOpt = string.IsNullOrEmpty(e.LinkTitle) ? null : e.LinkTitle;
