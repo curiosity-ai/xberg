@@ -374,6 +374,19 @@ public static class MarkdownParser
                 int pind = pl.Length - pts.Length;
                 if (paraLines.Count > 0)
                 {
+                    // A setext underline turns everything gathered so far into a heading, and is
+                    // tested before the interruption rules: a line of `---` after paragraph
+                    // content is an underline, not the thematic break it would be on its own.
+                    if (pind <= 3 && SetextLevel(pts) is byte setextLevel)
+                    {
+                        i++;
+                        ev.Add(new MdEvent { Kind = MdEventKind.StartHeading, Level = setextLevel, Text = "", Url = "" });
+                        ParseInlines(JoinInline(paraLines), ev);
+                        ev.Add(MdEvent.Simple(MdEventKind.EndHeading));
+                        paraLines.Clear();
+                        break;
+                    }
+
                     // Paragraph interruption rules (simplified).
                     if (pind <= 3 && (pts.StartsWith("#") || pts.StartsWith("```") || pts.StartsWith("~~~")
                         || pts.StartsWith(">") || IsThematicBreak(pts)))
@@ -400,6 +413,8 @@ public static class MarkdownParser
                 paraLines.Add(pl);
                 i++;
             }
+            if (paraLines.Count == 0) continue;
+
             string paraText = JoinInline(paraLines);
             ev.Add(MdEvent.Simple(MdEventKind.StartParagraph));
             ParseInlines(paraText, ev);
@@ -414,6 +429,20 @@ public static class MarkdownParser
         if (end < s.Length && (end == 0 || s[end - 1] == ' ' || s[end - 1] == '\t'))
             return s.Substring(0, end).TrimEnd();
         return s;
+    }
+
+    /// <summary>
+    /// The heading level a setext underline gives the paragraph above it, or null if the line is
+    /// not one: a run of `=` for level 1 or `-` for level 2, with nothing else on the line.
+    /// </summary>
+    private static byte? SetextLevel(string trimmed)
+    {
+        string body = trimmed.TrimEnd();
+        if (body.Length == 0) return null;
+        char c = body[0];
+        if (c != '=' && c != '-') return null;
+        foreach (char ch in body) if (ch != c) return null;
+        return c == '=' ? (byte)1 : (byte)2;
     }
 
     private static bool IsThematicBreak(string s)

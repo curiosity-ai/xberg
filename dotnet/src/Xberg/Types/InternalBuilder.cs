@@ -181,6 +181,42 @@ public sealed class InternalDocumentBuilder
         return _doc.PushElement(element);
     }
 
+    /// <summary>
+    /// Append another document's contents to this one, rebasing every index it carries.
+    /// <para>
+    /// A document assembled elsewhere numbers its tables, images and elements from zero, so its
+    /// elements' table and image indices — and its relationships' element indices — have to be
+    /// shifted by what this document already holds, or they would point at the wrong rows.
+    /// </para>
+    /// </summary>
+    public void AppendDocument(InternalDocument other)
+    {
+        uint tableOffset = (uint)_doc.Tables.Count;
+        uint imageOffset = (uint)_doc.Images.Count;
+        uint elementOffset = (uint)_doc.Elements.Count;
+
+        _doc.Tables.AddRange(other.Tables);
+        _doc.Images.AddRange(other.Images);
+        _doc.Uris.AddRange(other.Uris);
+
+        foreach (var element in other.Elements)
+        {
+            if (element.Kind.Tag == ElementKindTag.Table)
+                element.Kind = ElementKind.Table(element.Kind.TableIndex + tableOffset);
+            else if (element.Kind.Tag == ElementKindTag.Image && element.Kind.ImageIndex != uint.MaxValue)
+                element.Kind = ElementKind.Image(element.Kind.ImageIndex + imageOffset);
+            PushElement(element);
+        }
+
+        foreach (var relationship in other.Relationships)
+        {
+            relationship.Source += elementOffset;
+            if (relationship.Target.Index is uint index)
+                relationship.Target = RelationshipTarget.FromIndex(index + elementOffset);
+            _doc.PushRelationship(relationship);
+        }
+    }
+
     // --- container helpers ---
 
     private void PushContainerStart(ElementKind kind, uint? page, Dictionary<string, string>? attrs)

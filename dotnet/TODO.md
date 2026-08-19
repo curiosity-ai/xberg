@@ -8,9 +8,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 
 > **Status (after the August upstream merge, 1821 Rust commits):** measured against goldens
 > regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
-> **2292 fixtures (77.9%) match on every hard dimension**; content-parity **82.5% identical,
-> 90.6% ≥95%-similar**; 53 fixtures (<80%) are genuine content misses; **2 catastrophes
-> (0.1%)**. 402 unit tests.
+> **2295 fixtures (78.0%) match on every hard dimension**; content-parity **82.7% identical,
+> 90.7% ≥95%-similar**; 48 fixtures (<80%) are genuine content misses; **2 catastrophes
+> (0.1%)**. 409 unit tests.
 >
 > The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
 > they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
@@ -21,7 +21,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > character counts as Unicode scalars rather than UTF-8 bytes, and — for PDF — scanned-page
 > detection plus serde-faithful float formatting.
 >
-> A later pass took 2122 → 2292 and catastrophes 22 → 2. Ordered by what they were worth:
+> A later pass took 2122 → 2295 and catastrophes 22 → 2. Ordered by what they were worth:
 > a file's content now overrules its extension when the two disagree (txt 888/975 → 947,
 > which is where the DocTags fixtures lived); attachment text is extracted into the message
 > that carries it, embedded messages included (eml 20/43 → 39, msg 4/16 → 14); `app.xml`
@@ -32,7 +32,8 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > (nbib, ris, djot all to full parity); HWP's record tags, whose decimal offsets had been
 > read as hexadecimal; and — for html 10/41 → 27/41 — reserving the columns a rowspan covers,
 > plus dropping a second copy of every table that upstream had already removed; and markdown
-> math, raw inline HTML and pandoc super/subscripts (md 671/775 → 707).
+> math, raw inline HTML, pandoc super/subscripts and setext headings (md 671/775 → 708);
+> and notebooks (ipynb 0/6 → 2, metadata 0/6 → 6/6).
 >
 > Three of those were latent defects the extension/content change exposed rather than caused:
 > the HTML signature test sat behind the generic `<` fallback and was unreachable, and
@@ -141,9 +142,14 @@ not a cosmetic difference.
       empty — the last two catastrophes. Emitting it unconditionally was tried and is *not* the
       answer: it fixes those two and costs twelve others (plain 22/41 → 10/41). Whatever the
       rule is, it is narrower than "always emit".
-- [ ] **odp, ipynb, mdx.** Not yet triaged; use `--cluster`. For ipynb the divergence is
-      visible immediately: we emit `[cell_id: …]` and `execution_count: …` as paragraphs and
-      skip cell outputs, neither of which upstream does.
+- [~] **ipynb 0/6 → 2/6, metadata 0/6 → 6/6.** The extractor invented content: `[cell_id: …]`,
+      `[kernel_language: …]`, `execution_count: …`, `[output_type: …]` and `[mime: …]` went into
+      the text as paragraphs, none of which upstream emits — those are metadata, and the cell
+      metadata it *should* have carried (each cell's `id`, and a per-output record) was missing.
+      Markdown cells now go through the markdown parser proper rather than an ad-hoc line scan,
+      which is what upstream does and what gets them smart punctuation and setext headings.
+      What remains is inter-cell blank-line spacing.
+- [ ] **odp, mdx.** Not yet triaged; use `--cluster`.
 - [x] **typ 0/8 → 7/8.** Five separate missing branches; the last fixture needs `@label`
       reference resolution, which is a feature rather than a fix.
 

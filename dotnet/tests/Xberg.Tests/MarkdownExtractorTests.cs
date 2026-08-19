@@ -265,4 +265,38 @@ public class MarkdownExtractorTests
         var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
         Assert.Equal("a ~x~~ b", para.Text);
     }
+
+    // ── setext headings ───────────────────────────────────────────────────────
+
+    /// <summary>Text underlined with `=` or `-` is a heading, not a paragraph.</summary>
+    [Fact]
+    public void SetextUnderlinesMakeHeadings()
+    {
+        var doc = Extract("Lorem ipsum\n===========\n\nBody.\n\nSub\n---\n");
+
+        var headings = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Heading).ToList();
+        Assert.Equal(2, headings.Count);
+        Assert.Equal(("Lorem ipsum", 1), (headings[0].Text, (int)headings[0].Kind.Level));
+        Assert.Equal(("Sub", 2), (headings[1].Text, (int)headings[1].Kind.Level));
+    }
+
+    /// <summary>
+    /// A line of `---` is an underline only after paragraph content; standing alone it stays the
+    /// thematic break it would otherwise be.
+    /// </summary>
+    [Fact]
+    public void ADashRuleWithNoParagraphAboveIsNotAHeading()
+    {
+        var doc = Extract("---\n\nBody.\n");
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading);
+    }
+
+    /// <summary>A setext heading takes the whole paragraph above it, however many lines.</summary>
+    [Fact]
+    public void SetextHeadingTakesEveryLineOfItsParagraph()
+    {
+        var doc = Extract("First line\nsecond line\n=====\n");
+        var heading = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading);
+        Assert.Equal("First line second line", heading.Text);
+    }
 }
