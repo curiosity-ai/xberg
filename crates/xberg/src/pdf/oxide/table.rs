@@ -19,7 +19,7 @@
 use super::OxideDocument;
 use crate::pdf::error::{PdfError, Result};
 use crate::pdf::table_reconstruct::table_to_markdown;
-use crate::types::{BoundingBox, Table};
+use crate::types::{BoundingBox, ProcessingWarning, Table};
 use std::collections::HashSet;
 
 /// Cap on candidate vertical regions per page. Real tables fit comfortably
@@ -97,8 +97,12 @@ enum HeuristicTableRejection {
 ///
 /// # Returns
 ///
-/// A `Vec<Table>` containing all detected tables with cells, markdown, and bounding boxes.
-pub(crate) fn extract_tables_native(doc: &mut OxideDocument) -> Result<Vec<Table>> {
+/// A `Vec<Table>` containing all detected tables with cells, markdown, and bounding boxes,
+/// together with a `Vec<ProcessingWarning>` describing any pages whose native table detection
+/// failed (issue #74). A per-page failure is skipped rather than aborting the whole document,
+/// so without a warning that page would be silently indistinguishable from a page that simply
+/// has no table.
+pub(crate) fn extract_tables_native(doc: &mut OxideDocument) -> Result<(Vec<Table>, Vec<ProcessingWarning>)> {
     let page_count = doc
         .doc
         .page_count()
@@ -106,17 +110,18 @@ pub(crate) fn extract_tables_native(doc: &mut OxideDocument) -> Result<Vec<Table
 
     let config = pdf_oxide::structure::spatial_table_detector::TableDetectionConfig::strict();
     let mut all_tables = Vec::new();
+    let mut warnings = Vec::new();
 
     for page_idx in 0..page_count {
+        let page_number = (page_idx + 1) as u32;
         let extracted = match doc.doc.extract_tables_with_config(page_idx, config.clone()) {
             Ok(tables) => tables,
             Err(e) => {
                 tracing::warn!(page = page_idx, "pdf_oxide extract_tables failed: {e}");
+                warnings.push(native_table_extraction_failure_warning(page_number, &e));
                 continue;
             }
         };
-
-        let page_number = (page_idx + 1) as u32;
 
         for extracted_table in extracted {
             if extracted_table.rows.is_empty() || extracted_table.col_count == 0 {
@@ -156,7 +161,19 @@ pub(crate) fn extract_tables_native(doc: &mut OxideDocument) -> Result<Vec<Table
         }
     }
 
-    Ok(all_tables)
+    Ok((all_tables, warnings))
+}
+
+/// Build the `ProcessingWarning` for a page whose native (strict-mode) table detection
+/// failed (issue #74). Named per page and cause so the warning is actionable without
+/// leaking internal file paths or system details.
+fn native_table_extraction_failure_warning(page_number: u32, error: &pdf_oxide::Error) -> ProcessingWarning {
+    ProcessingWarning {
+        source: std::borrow::Cow::Borrowed("pdf_tables"),
+        message: std::borrow::Cow::Owned(format!(
+            "table extraction failed for page {page_number}: {error}; tables on this page were skipped"
+        )),
+    }
 }
 
 /// Extract bordered tables from all pages using a relaxed Lines-strategy config.
@@ -175,7 +192,15 @@ pub(crate) fn extract_tables_native(doc: &mut OxideDocument) -> Result<Vec<Table
 ///
 /// `skip_pages` (1-indexed) suppresses this pass on pages where a higher-priority
 /// detector already produced a result. Pass an empty set to run on every page.
-pub(crate) fn extract_tables_bordered(doc: &mut OxideDocument, skip_pages: &HashSet<u32>) -> Result<Vec<Table>> {
+///
+/// # Returns
+///
+/// A `Vec<Table>` of detected bordered tables, together with a `Vec<ProcessingWarning>`
+/// describing any (non-skipped) pages whose bordered-table detection failed (issue #74).
+pub(crate) fn extract_tables_bordered(
+    doc: &mut OxideDocument,
+    skip_pages: &HashSet<u32>,
+) -> Result<(Vec<Table>, Vec<ProcessingWarning>)> {
     use pdf_oxide::structure::spatial_table_detector::{TableDetectionConfig, TableStrategy};
 
     let page_count = doc
@@ -199,6 +224,7 @@ pub(crate) fn extract_tables_bordered(doc: &mut OxideDocument, skip_pages: &Hash
     };
 
     let mut all_tables = Vec::new();
+    let mut warnings = Vec::new();
 
     for page_idx in 0..page_count {
         let page_number = (page_idx + 1) as u32;
@@ -210,6 +236,7 @@ pub(crate) fn extract_tables_bordered(doc: &mut OxideDocument, skip_pages: &Hash
             Ok(tables) => tables,
             Err(e) => {
                 tracing::warn!(page = page_idx, "pdf_oxide bordered extract_tables failed: {e}");
+                warnings.push(bordered_table_extraction_failure_warning(page_number, &e));
                 continue;
             }
         };
@@ -252,7 +279,20 @@ pub(crate) fn extract_tables_bordered(doc: &mut OxideDocument, skip_pages: &Hash
         }
     }
 
-    Ok(all_tables)
+    Ok((all_tables, warnings))
+}
+
+/// Build the `ProcessingWarning` for a page whose bordered (relaxed Lines-strategy)
+/// table detection failed (issue #74). Named per page and cause so the warning is
+/// actionable without leaking internal file paths or system details.
+fn bordered_table_extraction_failure_warning(page_number: u32, error: &pdf_oxide::Error) -> ProcessingWarning {
+    ProcessingWarning {
+        source: std::borrow::Cow::Borrowed("pdf_tables"),
+        message: std::borrow::Cow::Owned(format!(
+            "bordered table extraction failed for page {page_number}: {error}; bordered tables on \
+             this page were skipped"
+        )),
+    }
 }
 
 /// Owned hierarchy segments produced while detecting heuristic tables.
@@ -2913,6 +2953,82 @@ mod tests {
         assert!(regions.is_empty());
     }
 
+    /// GH#1358: a rotated (90-degree) table's row/column grid must survive
+    /// heuristic clustering.
+    ///
+    /// `segments_to_words` (`pdf::table_reconstruct`) is the boundary where
+    /// PDF segments become the `HocrWord`s that `cluster_words_into_vertical_regions`
+    /// groups into rows and columns by raw `left`/`top`. Unlike
+    /// `cell_text_in_reading_order` (which already corrects word order
+    /// *within* an already-assigned cell via `upright_origin`,
+    /// see `test_cell_text_in_reading_order_sorts_rotated_spans_by_advance_axis`
+    /// above), `segments_to_words` builds `HocrWord.left`/`.top` straight from
+    /// `SegmentData.x`/`.y` — the *page-space* coordinates — with no rotation
+    /// correction. For a 90-degree run the table's own row axis is page-x and
+    /// its own column axis is page-y, the opposite of the unrotated case, so
+    /// raw-page-space clustering groups words that share a row position
+    /// (`x`) into the same table *row* when they actually belong to three
+    /// different rows at the same column, and disperses one true row's cells
+    /// across bogus, single-row "regions" that `cluster_words_into_vertical_regions`'s
+    /// `row_ycs.len() >= 3` guard then rejects outright — the region is
+    /// dropped, not merely misordered.
+    ///
+    /// Three rows (`x` = 0.0, 12.0, 24.0) by two columns (`y` = 0.0, 120.0),
+    /// all spans sharing one 90-degree rotation, mirroring a small sideways
+    /// spec table. Row/column spacing is chosen to satisfy the clustering
+    /// tolerances once transformed into the upright frame (`row_tolerance` =
+    /// 5, `row_gap_split` = 18 for `height` = 10): a correct implementation
+    /// must find exactly one region containing all six words in row-major
+    /// reading order.
+    #[test]
+    fn should_preserve_cell_order_in_a_rotated_table() {
+        use crate::pdf::hierarchy::SegmentData;
+        use crate::pdf::table_reconstruct::segments_to_words;
+
+        fn rotated_seg(text: &str, x: f32, y: f32) -> SegmentData {
+            SegmentData {
+                text: text.to_string(),
+                x,
+                y,
+                width: 50.0,
+                height: 10.0,
+                font_size: 10.0,
+                is_bold: false,
+                is_italic: false,
+                is_monospace: false,
+                baseline_y: y,
+                rotation_degrees: 90.0,
+                assigned_role: None,
+            }
+        }
+
+        let segments = vec![
+            rotated_seg("A1", 0.0, 0.0),
+            rotated_seg("B1", 0.0, 120.0),
+            rotated_seg("A2", 12.0, 0.0),
+            rotated_seg("B2", 12.0, 120.0),
+            rotated_seg("A3", 24.0, 0.0),
+            rotated_seg("B3", 24.0, 120.0),
+        ];
+
+        let page_height = 800.0;
+        let words = segments_to_words(&segments, page_height);
+        let regions = cluster_words_into_vertical_regions(&words);
+
+        assert_eq!(
+            regions.len(),
+            1,
+            "the rotated table's six words must cluster into a single region; got {regions:?}"
+        );
+        let ordered: Vec<&str> = regions[0].iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            ordered,
+            vec!["A1", "B1", "A2", "B2", "A3", "B3"],
+            "rotated-table words must come out in row-major reading order (row0: A1,B1; \
+             row1: A2,B2; row2: A3,B3), not scrambled by raw page-space x/y; got: {ordered:?}"
+        );
+    }
+
     #[test]
     fn dense_numeric_region_caps_adaptive_column_gap() {
         let mut words = Vec::new();
@@ -3264,10 +3380,15 @@ mod tests {
     fn extract_tables_native_misses_two_column_bordered_table() {
         let bytes = build_two_column_bordered_table_pdf();
         let mut doc = OxideDocument::open_bytes(&bytes).expect("open synthetic PDF");
-        let tables = extract_tables_native(&mut doc).expect("extract_tables_native must not error");
+        let (tables, warnings) = extract_tables_native(&mut doc).expect("extract_tables_native must not error");
         assert!(
             tables.is_empty(),
             "extract_tables_native (strict, min 3 cols) must not detect a 2-column table; got: {tables:?}"
+        );
+        assert_eq!(
+            warnings.len(),
+            0,
+            "a page with no table (not a failure) must not produce a warning; got: {warnings:?}"
         );
     }
 
@@ -3278,7 +3399,8 @@ mod tests {
         let bytes = build_two_column_bordered_table_pdf();
         let mut doc = OxideDocument::open_bytes(&bytes).expect("open synthetic PDF");
         let skip = HashSet::new();
-        let tables = extract_tables_bordered(&mut doc, &skip).expect("extract_tables_bordered must not error");
+        let (tables, warnings) =
+            extract_tables_bordered(&mut doc, &skip).expect("extract_tables_bordered must not error");
         assert!(
             !tables.is_empty(),
             "extract_tables_bordered must detect the 2-column stroke-bordered table"
@@ -3292,6 +3414,11 @@ mod tests {
         );
         assert_eq!(table.page_number, 1);
         assert!(!table.markdown.trim().is_empty(), "must produce non-empty markdown");
+        assert_eq!(
+            warnings.len(),
+            0,
+            "a successfully detected table must not produce a warning; got: {warnings:?}"
+        );
     }
 
     /// `extract_tables_bordered` must skip pages listed in `skip_pages`.
@@ -3301,10 +3428,47 @@ mod tests {
         let mut doc = OxideDocument::open_bytes(&bytes).expect("open synthetic PDF");
         let mut skip = HashSet::new();
         skip.insert(1u32);
-        let tables = extract_tables_bordered(&mut doc, &skip).expect("extract_tables_bordered must not error");
+        let (tables, warnings) =
+            extract_tables_bordered(&mut doc, &skip).expect("extract_tables_bordered must not error");
         assert!(
             tables.is_empty(),
             "skip_pages={{1}} must suppress the only page; got: {tables:?}"
+        );
+        assert_eq!(
+            warnings.len(),
+            0,
+            "a page suppressed by skip_pages must not produce a warning; got: {warnings:?}"
+        );
+    }
+
+    /// `native_table_extraction_failure_warning` must name the operation
+    /// ("table extraction"), the exact page number, and embed the underlying pdf_oxide
+    /// error, so a per-page native-detection failure is visible to callers instead of
+    /// being indistinguishable from a page that simply has no table.
+    #[test]
+    fn native_table_extraction_failure_warning_names_page_and_cause() {
+        let error = pdf_oxide::Error::InvalidPdf("corrupt content stream".to_string());
+        let warning = native_table_extraction_failure_warning(3, &error);
+        assert_eq!(warning.source.as_ref(), "pdf_tables");
+        assert_eq!(
+            warning.message.as_ref(),
+            "table extraction failed for page 3: Invalid PDF: corrupt content stream; \
+             tables on this page were skipped"
+        );
+    }
+
+    /// `bordered_table_extraction_failure_warning` must name the operation
+    /// ("bordered table extraction"), the exact page number, and embed the underlying
+    /// pdf_oxide error.
+    #[test]
+    fn bordered_table_extraction_failure_warning_names_page_and_cause() {
+        let error = pdf_oxide::Error::InvalidPdf("malformed table grid".to_string());
+        let warning = bordered_table_extraction_failure_warning(7, &error);
+        assert_eq!(warning.source.as_ref(), "pdf_tables");
+        assert_eq!(
+            warning.message.as_ref(),
+            "bordered table extraction failed for page 7: Invalid PDF: malformed table grid; \
+             bordered tables on this page were skipped"
         );
     }
 }

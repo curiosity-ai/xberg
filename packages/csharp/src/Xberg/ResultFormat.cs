@@ -10,42 +10,49 @@ namespace Xberg;
 /// Result-shape selection for extraction results.
 ///
 /// Distinct from `OutputFormat` (which controls rendering — Plain, Markdown,
-/// HTML, etc.). `ResultFormat` controls the *shape* of the result: a unified
-/// content blob vs. an element-based decomposition.
+/// HTML, etc.). `ResultFormat` controls the *shape* of the result: a unified content
+/// blob vs. an element-based decomposition.
 /// </summary>
 [JsonConverter(typeof(ResultFormatJsonConverter))]
-public enum ResultFormat {
-  /// <summary>
-  /// Unified format with all content in `content` field
-  /// </summary>
-  [JsonPropertyName("unified")] Unified,
-  /// <summary>
-  /// Element-based format with semantic element extraction
-  /// </summary>
-  [JsonPropertyName("element_based")] ElementBased,
+public enum ResultFormat
+{
+    /// <summary>
+    /// Unified format with all content in `content` field
+    /// </summary>
+    [JsonPropertyName("unified")]
+    Unified,
+    /// <summary>
+    /// Element-based format with semantic element extraction
+    /// </summary>
+    [JsonPropertyName("element_based")]
+    ElementBased,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="ResultFormat"/> that respects explicit
-/// variant names.
-/// </summary>
-internal sealed class ResultFormatJsonConverter : JsonConverter<ResultFormat> {
-  public override ResultFormat Read(ref Utf8JsonReader reader,
-                                    Type typeToConvert,
-                                    JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch { "unified" => ResultFormat.Unified,
-                          "element_based" => ResultFormat.ElementBased,
-                          _ => throw new JsonException(
-                              $"Unknown ResultFormat value: {value}") };
-  }
 
-  public override void Write(Utf8JsonWriter writer, ResultFormat value,
-                             JsonSerializerOptions options) {
-    var str = value switch { ResultFormat.Unified => "unified",
-                             ResultFormat.ElementBased => "element_based",
-                             _ => throw new JsonException(
-                                 $"Unknown ResultFormat value: {value}") };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="ResultFormat"/> that respects explicit variant names.
+/// </summary>
+internal sealed class ResultFormatJsonConverter : JsonConverter<ResultFormat>
+{
+    public override ResultFormat Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "unified" => ResultFormat.Unified,
+            "element_based" => ResultFormat.ElementBased,
+            _ => throw new JsonException($"Unknown ResultFormat value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, ResultFormat value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            ResultFormat.Unified => "unified",
+            ResultFormat.ElementBased => "element_based",
+            _ => throw new JsonException($"Unknown ResultFormat value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

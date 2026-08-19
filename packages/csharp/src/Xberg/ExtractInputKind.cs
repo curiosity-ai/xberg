@@ -10,39 +10,45 @@ namespace Xberg;
 /// Source kind for `ExtractInput`.
 /// </summary>
 [JsonConverter(typeof(ExtractInputKindJsonConverter))]
-public enum ExtractInputKind {
-  /// <summary>
-  /// Raw in-memory bytes.
-  /// </summary>
-  [JsonPropertyName("bytes")] Bytes,
-  /// <summary>
-  /// A filesystem path, `file://` URI, or HTTP(S) URL.
-  /// </summary>
-  [JsonPropertyName("uri")] Uri,
+public enum ExtractInputKind
+{
+    /// <summary>
+    /// Raw in-memory bytes.
+    /// </summary>
+    [JsonPropertyName("bytes")]
+    Bytes,
+    /// <summary>
+    /// A filesystem path, `file://` URI, or HTTP(S) URL.
+    /// </summary>
+    [JsonPropertyName("uri")]
+    Uri,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="ExtractInputKind"/> that respects
-/// explicit variant names.
-/// </summary>
-internal sealed class ExtractInputKindJsonConverter
-    : JsonConverter<ExtractInputKind> {
-  public override ExtractInputKind Read(ref Utf8JsonReader reader,
-                                        Type typeToConvert,
-                                        JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch {
-      "bytes" => ExtractInputKind.Bytes, "uri" => ExtractInputKind.Uri,
-      _ => throw new JsonException($"Unknown ExtractInputKind value: {value}")
-    };
-  }
 
-  public override void Write(Utf8JsonWriter writer, ExtractInputKind value,
-                             JsonSerializerOptions options) {
-    var str = value switch {
-      ExtractInputKind.Bytes => "bytes", ExtractInputKind.Uri => "uri",
-      _ => throw new JsonException($"Unknown ExtractInputKind value: {value}")
-    };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="ExtractInputKind"/> that respects explicit variant names.
+/// </summary>
+internal sealed class ExtractInputKindJsonConverter : JsonConverter<ExtractInputKind>
+{
+    public override ExtractInputKind Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "bytes" => ExtractInputKind.Bytes,
+            "uri" => ExtractInputKind.Uri,
+            _ => throw new JsonException($"Unknown ExtractInputKind value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, ExtractInputKind value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            ExtractInputKind.Bytes => "bytes",
+            ExtractInputKind.Uri => "uri",
+            _ => throw new JsonException($"Unknown ExtractInputKind value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

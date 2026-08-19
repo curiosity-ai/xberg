@@ -70,4 +70,13 @@ tasks:
     cmds:
       - alef snippets audit --snippets docs-site/src/snippets
       - alef snippets gaps --snippets docs-site/src/snippets --docs docs-site/src/content/docs
-      - alef snippets validate --snippets docs-site/src/snippets --timeout 120
+      # --strict fails the run when a language's validator reports Unavailable (or
+      # Skip/Downgraded) instead of silently passing. Without it, a language whose
+      # toolchain isn't on the runner's PATH (TypeScriptValidator::is_available() etc.
+      # do a global `which`, never node_modules/.bin) is dropped from the gate with no
+      # signal in the exit code -- only visible by reading the printed summary line.
+      # The docs-snippets CI job now installs every validator's toolchain (see
+      # ci-lint.yaml), so this should have zero effect when everything is present and
+      # only fire on a genuine regression (a toolchain silently missing again, or a
+      # new language added to alef.toml without CI wiring). ~keep
+      - alef snippets validate --snippets docs-site/src/snippets --timeout 120 --strict

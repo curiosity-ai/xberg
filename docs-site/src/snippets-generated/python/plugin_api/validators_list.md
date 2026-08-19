@@ -14,6 +14,7 @@ from xberg import list_validators
 
 def main() -> None:
     _ = list_validators()
+    print(result)
 
 main()
 

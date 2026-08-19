@@ -80,6 +80,8 @@ office = [
     "dep:biblib",
     "dep:org",
     "dep:dbase",
+    "dep:typst-syntax",
+    "dep:mathemascii",
     "html",
     "notebook",
 ]
@@ -88,7 +90,7 @@ office = [
 # can be built standalone; `office` re-includes it for backward compatibility.
 notebook = ["html"]
 hwp = ["dep:cfb", "dep:flate2"]
-hwpx = ["dep:unhwp", "dep:zip"]
+hwpx = ["dep:unhwp", "dep:zip", "dep:quick-xml"]
 iwork = ["dep:zip", "dep:snap"]
 email = [
     "dep:mail-parser",
@@ -351,6 +353,10 @@ layout-detection = [
     "tokio-runtime",
     "ort-bundled",
 ]
+# LaTeX recognition for layout-detected formula regions (RapidLaTeXOCR ONNX,
+# MIT). ORT-dependent: excluded from `full`, `formats`, and every no-ORT
+# target, like `candle-vlm-ocr`. Opt in explicitly.
+formula-recognition = ["layout-detection", "ocr-pipeline", "dep:tokenizers", "dep:ureq"]
 # layout-tract: no-ORT sibling of `layout-detection` (issue #1275, Phase 5). Runs RT-DETR
 # layout detection and the PP-LCNet table (wired/wireless) classifier through the pure-Rust
 # `tract` engine instead of ONNX Runtime, so it builds on no-ORT targets (Android x86_64
@@ -809,6 +815,19 @@ windows-target = [
     # CPU candle links cleanly on Windows MSVC (no cudarc/metal-kernels). Parity with other platforms.
     "candle-vlm-ocr",
     "embeddings",
+    # static-embeddings = [embedding-presets, tokio-runtime, dep:model2vec-rs,
+    # dep:tokenizers-model2vec, dep:tokenizers, dep:ndarray, dep:hf-hub, dep:reqwest,
+    # dep:sha2, dep:fs2]: embedding-presets/tokio-runtime/ndarray/hf-hub/reqwest/sha2/fs2/
+    # tokenizers are all already pulled on Windows by `embeddings`/`chunking-tokenizers`
+    # above. The only two crates this adds that nothing else here reaches are
+    # model2vec-rs and the `tokenizers-model2vec` alias (feature-activation-only, see
+    # the cargo-machete ignore list) — both verified pure Rust with no build script
+    # (model2vec-rs 0.2.1 and tokenizers 0.21.4 Cargo.toml: `build = false`, no native
+    # deps). model2vec-rs's own default features (`onig`, `hf-hub`) are explicitly
+    # disabled by the target-independent `not(wasm32)` dependency block above precisely
+    # to dodge `esaxx_fast`'s C++ build, which breaks Windows MSVC linking (GH#1389) —
+    # see that block's comment. This is the only dense embedder available without ORT.
+    "static-embeddings",
     "reranker",
     "sparse-embeddings",
     "late-interaction",
@@ -818,6 +837,12 @@ windows-target = [
     "ner-llm-types",
     "presets",
     "redaction",
+    # redaction-rehydrate = [redaction, dep:aes-gcm, dep:scrypt, dep:zeroize]: `redaction`
+    # is already enabled above. aes-gcm 0.11.0, scrypt 0.12.0 (kdf feature) and zeroize
+    # 1.x are all RustCrypto crates — verified via their published Cargo.toml (`build =
+    # false`, no native/system deps, no unix-only cfg). Encrypted rehydration map capture
+    # was compiled out on Windows for no platform reason.
+    "redaction-rehydrate",
     "diff",
     "qr-codes",
     "summarization",
@@ -831,6 +856,20 @@ windows-target = [
     # ClassificationEnrichmentConfig) unconditionally; without it those types are
     # #[cfg]-compiled-out on Windows and the bindings fail with E0425.
     "classification",
+    # The following five features each depend only on some combination of `liter-llm`,
+    # `tokio-runtime`, `ner`, `redaction` and `summarization` — every one of them already
+    # enabled above — so none of these adds a single new dependency on Windows (GH#1443).
+    # captioning = [liter-llm, tokio-runtime]; ner-llm = [ner, liter-llm] (note:
+    # `ner-llm-types` above only stubs `LlmBackend`/omits `NerBackend` — see
+    # `text::ner::mod.rs` and `lib.rs`'s `#[cfg(feature = "ner-llm")]` gate — so without
+    # this entry Windows silently got the non-functional stub even though its own
+    # dependencies were already present); redaction-ml = [redaction, ner];
+    # summarization-llm = [summarization, liter-llm]; translation = [liter-llm].
+    "captioning",
+    "ner-llm",
+    "redaction-ml",
+    "summarization-llm",
+    "translation",
     "structured",
     "quality",
     # Pure-Rust features missing from the original list whose public types the
@@ -843,6 +882,10 @@ windows-target = [
     # zero-dep flag). url-ingestion (not just url-config-types) is required so the
     # non-feature-aware Dart FRB dispatch resolves `crate::map_url` on Windows.
     "heuristics",
+    # enrichment = [] — literally no dependencies at all, so there is nothing to verify
+    # (GH#1443). Cloud-upstreamed generic-defaults infrastructure with no domain
+    # knowledge; was simply missing from the original list.
+    "enrichment",
     "xml",
     "svg",
     "chunking-tokenizers",
@@ -853,6 +896,18 @@ windows-target = [
     # late-interaction-presets is implied by "late-interaction" above (the ORT
     # ML feature added for full Windows ONNX Runtime parity).
     "markdown-footnotes",
+    # otel = [dep:opentelemetry, dep:opentelemetry_sdk, dep:tracing-opentelemetry,
+    # crawlberg?/otel, liter-llm?/otel] (GH#1443). All three direct deps verified pure
+    # Rust with no build script (opentelemetry 0.32.0, opentelemetry_sdk 0.32.1,
+    # tracing-opentelemetry 0.33.0 — their only target-specific blocks are wasm32 deps
+    # and non-Windows dev-dependencies, neither of which apply here). The two weak (`?/`)
+    # forwards add nothing new: `crawlberg/otel` only forwards to crawlberg's own
+    # optional `liter-llm` dep, which isn't enabled here (windows-target enables
+    # crawlberg via `url-ingestion` -> `native-runtime` only, not crawlberg's `ai`
+    # feature), so it is a no-op; `liter-llm/otel` pulls `dep:tracing-opentelemetry` +
+    # `dep:opentelemetry` at the exact same 0.33/0.32 versions already declared above,
+    # so Cargo unifies them into the instances already being built — no new crate.
+    "otel",
     # wordperfect = [dep:xberg-libwpd]: xberg-libwpd vendors its boost header
     # subset (no vcpkg boost needed, unlike `heic`'s libheif), but its build.rs
     # still links vcpkg-provided `zlib` on Windows. That zlib install and the
@@ -1232,6 +1287,10 @@ rmcp = { version = "3.1.2", features = [
 rmp-serde = "1.3"
 
 roxmltree = { version = "0.21.1", optional = true }
+# Typst's own parser, used to convert Typst math to LaTeX.
+typst-syntax = { version = "0.15.1", optional = true }
+# AsciiMath parser, used to reach LaTeX through the shared MathML converter.
+mathemascii = { version = "0.4.0", optional = true }
 rqrr = { version = "0.10", optional = true }
 sceptre = { workspace = true, optional = true }
 scrypt = { version = "0.12", optional = true, default-features = false, features = ["kdf"] }

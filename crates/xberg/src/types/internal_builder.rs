@@ -180,6 +180,30 @@ impl InternalDocumentBuilder {
         page: Option<u32>,
         bbox: Option<BoundingBox>,
     ) -> u32 {
+        // A cell keeps its equation in the cell, so the equation cannot also be
+        // an element without emptying the cell or repeating it beside the table.
+        // The formula list is still expected to hold every formula in the
+        // document, so the cell's math is recorded instead.
+        //
+        // A grid is padded before it reaches here: a cell spanning columns is
+        // repeated across them, and a vertically merged cell is copied down from
+        // the row above. Both produce a cell identical to its left neighbour or
+        // to the cell above it, so those copies are skipped and the equation is
+        // recorded once.
+        for (row_index, row) in cells.iter().enumerate() {
+            for (col_index, cell) in row.iter().enumerate() {
+                let repeats_left = col_index > 0 && row[col_index - 1] == *cell;
+                let repeats_above = row_index > 0
+                    && cells[row_index - 1].get(col_index).is_some_and(|above| above == cell);
+                if repeats_left || repeats_above {
+                    continue;
+                }
+                for latex in display_math_spans(cell) {
+                    self.record_formula(&latex, page);
+                }
+            }
+        }
+
         let markdown = crate::rendering::common::render_table_markdown(cells);
         let table = Table {
             cells: cells.to_vec(),
@@ -216,6 +240,24 @@ impl InternalDocumentBuilder {
     ) -> u32 {
         let attrs = language.map(|lang| single_attr("language", lang));
         self.push_simple(ElementKind::Code, text, page, bbox, Vec::new(), attrs, None)
+    }
+
+    /// Record a formula that stays inside the text it came from.
+    ///
+    /// An equation in a table cell or spliced into a sentence cannot become an
+    /// element without changing that text, so it goes to the side channel. The
+    /// derivation step appends the side channel to the public formula list, so a
+    /// caller still sees every formula the document holds.
+    pub fn record_formula(&mut self, latex: &str, page: Option<u32>) {
+        let latex = latex.trim();
+        if latex.is_empty() {
+            return;
+        }
+        self.doc.recorded_formulas.push(crate::types::Formula {
+            latex: latex.to_string(),
+            bbox: None,
+            page,
+        });
     }
 
     /// Push a math formula element.
@@ -659,11 +701,85 @@ const _: () = {
     }
 };
 
+/// Return the LaTeX of every `$$...$$` span in a table cell.
+///
+/// A cell renders its math delimited, so the delimiters mark where each formula
+/// starts and ends. Inline `$...$` is left alone: a cell holding a price reads
+/// the same as a cell holding one-character math, and inline math stays in its
+/// sentence everywhere else.
+pub(crate) fn display_math_spans(cell: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = cell;
+    while let Some(start) = rest.find("$$") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("$$") else { break };
+        let latex = after[..end].trim();
+        if !latex.is_empty() {
+            out.push(latex.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
     use std::borrow::Cow;
+
+    /// A cell keeps its equation, and the equation still reaches the formula
+    /// list: a caller asking for the formulas of a document gets all of them.
+    /// A grid is padded before it reaches the builder, so a spanned or merged
+    /// cell arrives several times. Its equation is one equation.
+    #[test]
+    fn test_a_spanned_or_merged_cell_reports_its_equation_once() {
+        let mut b = InternalDocumentBuilder::new("docx");
+        let spanned = "$$E=mc^2$$".to_string();
+        let cells = vec![
+            vec![spanned.clone(), spanned.clone(), spanned.clone()],
+            vec![spanned.clone(), spanned.clone(), spanned.clone()],
+        ];
+        b.push_table_from_cells(&cells, None, None);
+
+        let doc = b.build();
+        let latex: Vec<&str> = doc.recorded_formulas.iter().map(|f| f.latex.as_str()).collect();
+        assert_eq!(latex, vec!["E=mc^2"], "one cell, one equation");
+    }
+
+    #[test]
+    fn test_table_cell_math_reaches_the_formula_list_and_stays_in_the_cell() {
+        let mut b = InternalDocumentBuilder::new("docx");
+        let cells = vec![
+            vec!["Area".to_string(), "$$A=\\pi r^{2}$$".to_string()],
+            vec!["Roots".to_string(), "$$x=\\frac{-b}{2a}$$".to_string()],
+        ];
+        b.push_table_from_cells(&cells, None, None);
+        let doc = b.build();
+
+        let latex: Vec<&str> = doc.recorded_formulas.iter().map(|f| f.latex.as_str()).collect();
+        assert_eq!(latex, vec!["A=\\pi r^{2}", "x=\\frac{-b}{2a}"]);
+
+        let table = doc.tables.first().expect("the table survives");
+        assert!(
+            table.cells[0][1].contains("A=\\pi r^{2}"),
+            "the cell keeps its equation: {:?}",
+            table.cells[0][1]
+        );
+    }
+
+    /// A price is not mathematics, so a lone `$` must not open a formula.
+    #[test]
+    fn test_table_cell_currency_is_not_a_formula() {
+        let mut b = InternalDocumentBuilder::new("docx");
+        let cells = vec![vec!["Widget".to_string(), "$5 each, $7 boxed".to_string()]];
+        b.push_table_from_cells(&cells, None, None);
+
+        assert!(
+            b.build().recorded_formulas.is_empty(),
+            "currency must not become a formula"
+        );
+    }
 
     #[test]
     fn test_empty_builder() {

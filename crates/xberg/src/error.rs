@@ -314,6 +314,138 @@ impl XbergError {
     error_constructor!(transcription, Transcription);
 }
 
+/// HTTP status category for [`XbergError`], used to select the REST API response status.
+///
+/// This is not part of the public API: it exists solely so `api::error::ApiError`'s
+/// `From<XbergError>` conversion has a single canonical source for its status-code grouping
+/// instead of a private copy of the match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(alef, alef(skip))]
+pub(crate) enum ApiStatusCategory {
+    /// Maps to HTTP 400 Bad Request.
+    Validation,
+    /// Maps to HTTP 422 Unprocessable Entity.
+    Unprocessable,
+    /// Maps to HTTP 500 Internal Server Error.
+    Internal,
+}
+
+/// JSON-RPC error category for [`XbergError`], used to select the MCP error code.
+///
+/// This is not part of the public API: it exists solely so `mcp::errors::map_xberg_error_to_mcp`
+/// has a single canonical source for its error-code grouping instead of a private copy of the
+/// match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(alef, alef(skip))]
+pub(crate) enum McpErrorCategory {
+    /// Maps to JSON-RPC code -32602 (`INVALID_PARAMS`).
+    InvalidParams,
+    /// Maps to JSON-RPC code -32700 (`PARSE_ERROR`).
+    ParseError,
+    /// Maps to JSON-RPC code -32800 (`REQUEST_CANCELLED`).
+    Cancelled,
+    /// Maps to JSON-RPC code -32603 (`INTERNAL_ERROR`).
+    Internal,
+}
+
+impl XbergError {
+    /// Returns the canonical PascalCase error-type label used in REST API error responses.
+    ///
+    /// Exhaustive over every variant. This is the single source of truth for
+    /// `api::types::ErrorResponse::error_type`; do not duplicate this match elsewhere.
+    #[cfg_attr(alef, alef(skip))]
+    pub(crate) fn api_error_type(&self) -> &'static str {
+        match self {
+            XbergError::Validation { .. } => "ValidationError",
+            XbergError::Parsing { .. } => "ParsingError",
+            XbergError::Ocr { .. } => "OCRError",
+            XbergError::Io(_) => "IOError",
+            XbergError::Cache { .. } => "CacheError",
+            XbergError::ImageProcessing { .. } => "ImageProcessingError",
+            XbergError::Serialization { .. } => "SerializationError",
+            XbergError::MissingDependency(_) => "MissingDependencyError",
+            XbergError::Plugin { .. } => "PluginError",
+            XbergError::LockPoisoned(_) => "LockPoisonedError",
+            XbergError::UnsupportedFormat(_) => "UnsupportedFormatError",
+            XbergError::Embedding { .. } => "EmbeddingError",
+            XbergError::Timeout { .. } => "TimeoutError",
+            XbergError::Other(_) => "Error",
+            XbergError::Cancelled => "CancelledError",
+            XbergError::Security { .. } => "SecurityError",
+            XbergError::Transcription { .. } => "TranscriptionError",
+            XbergError::Reranking { .. } => "RerankingError",
+        }
+    }
+
+    /// Returns the canonical HTTP status category used by the REST API error conversion.
+    ///
+    /// This is the single source of truth for `api::error::ApiError`'s `From<XbergError>`
+    /// status-code selection; do not duplicate this match elsewhere.
+    #[cfg_attr(alef, alef(skip))]
+    pub(crate) fn api_status_category(&self) -> ApiStatusCategory {
+        match self {
+            XbergError::Validation { .. } | XbergError::UnsupportedFormat(_) => ApiStatusCategory::Validation,
+            XbergError::Parsing { .. } | XbergError::Ocr { .. } => ApiStatusCategory::Unprocessable,
+            _ => ApiStatusCategory::Internal,
+        }
+    }
+
+    /// Returns the canonical snake_case error-type label used in batch extraction error items.
+    ///
+    /// Only a subset of variants have a dedicated label; every other variant reports `"other"`.
+    /// This is the single source of truth for
+    /// `core::config::extraction::types::ExtractionErrorItem::error_type`; do not duplicate this
+    /// match elsewhere.
+    #[cfg_attr(alef, alef(skip))]
+    pub(crate) fn extraction_error_type(&self) -> &'static str {
+        match self {
+            XbergError::Io(_) => "io",
+            XbergError::Validation { .. } => "validation",
+            XbergError::UnsupportedFormat(_) => "unsupported_format",
+            XbergError::Timeout { .. } => "timeout",
+            XbergError::Cancelled => "cancelled",
+            XbergError::Security { .. } => "security",
+            _ => "other",
+        }
+    }
+
+    /// Returns the canonical numeric error code used in batch extraction error items.
+    ///
+    /// Only a subset of variants have a dedicated code; every other variant reports `1099`. This
+    /// is the single source of truth for
+    /// `core::config::extraction::types::ExtractionErrorItem::code`; do not duplicate this match
+    /// elsewhere.
+    #[cfg_attr(alef, alef(skip))]
+    pub(crate) fn extraction_error_code(&self) -> u32 {
+        match self {
+            XbergError::Io(_) => 1001,
+            XbergError::Validation { .. } => 1002,
+            XbergError::UnsupportedFormat(_) => 1003,
+            XbergError::Timeout { .. } => 1004,
+            XbergError::Cancelled => 1005,
+            XbergError::Security { .. } => 1006,
+            _ => 1099,
+        }
+    }
+
+    /// Returns the canonical JSON-RPC error category used by the MCP error conversion.
+    ///
+    /// This is the single source of truth for `mcp::errors::map_xberg_error_to_mcp`'s error-code
+    /// selection; do not duplicate this match elsewhere.
+    #[cfg_attr(alef, alef(skip))]
+    pub(crate) fn mcp_error_category(&self) -> McpErrorCategory {
+        match self {
+            XbergError::Validation { .. }
+            | XbergError::UnsupportedFormat(_)
+            | XbergError::MissingDependency(_)
+            | XbergError::Security { .. } => McpErrorCategory::InvalidParams,
+            XbergError::Parsing { .. } => McpErrorCategory::ParseError,
+            XbergError::Cancelled => McpErrorCategory::Cancelled,
+            _ => McpErrorCategory::Internal,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +664,182 @@ mod tests {
 
         let parse_err = XbergError::parsing("corrupted format");
         assert!(matches!(parse_err, XbergError::Parsing { .. }));
+    }
+
+    fn plugin_error() -> XbergError {
+        XbergError::Plugin {
+            message: "plugin failed".to_string(),
+            plugin_name: "test-plugin".to_string(),
+        }
+    }
+
+    #[test]
+    fn should_map_every_variant_to_its_canonical_api_error_type() {
+        assert_eq!(XbergError::Io(std::io::Error::other("t")).api_error_type(), "IOError");
+        assert_eq!(XbergError::parsing("t").api_error_type(), "ParsingError");
+        assert_eq!(XbergError::ocr("t").api_error_type(), "OCRError");
+        assert_eq!(XbergError::validation("t").api_error_type(), "ValidationError");
+        assert_eq!(XbergError::cache("t").api_error_type(), "CacheError");
+        assert_eq!(XbergError::image_processing("t").api_error_type(), "ImageProcessingError");
+        assert_eq!(XbergError::serialization("t").api_error_type(), "SerializationError");
+        assert_eq!(
+            XbergError::MissingDependency("t".to_string()).api_error_type(),
+            "MissingDependencyError"
+        );
+        assert_eq!(plugin_error().api_error_type(), "PluginError");
+        assert_eq!(XbergError::LockPoisoned("t".to_string()).api_error_type(), "LockPoisonedError");
+        assert_eq!(
+            XbergError::UnsupportedFormat("t/mime".to_string()).api_error_type(),
+            "UnsupportedFormatError"
+        );
+        assert_eq!(XbergError::embedding("t").api_error_type(), "EmbeddingError");
+        assert_eq!(
+            XbergError::Timeout { elapsed_ms: 1, limit_ms: 2 }.api_error_type(),
+            "TimeoutError"
+        );
+        assert_eq!(XbergError::Other("t".to_string()).api_error_type(), "Error");
+        assert_eq!(XbergError::Cancelled.api_error_type(), "CancelledError");
+        assert_eq!(XbergError::security("t").api_error_type(), "SecurityError");
+        assert_eq!(XbergError::transcription("t").api_error_type(), "TranscriptionError");
+        assert_eq!(XbergError::reranking("t").api_error_type(), "RerankingError");
+    }
+
+    #[test]
+    fn should_categorize_validation_and_unsupported_format_as_bad_request() {
+        assert_eq!(XbergError::validation("t").api_status_category(), ApiStatusCategory::Validation);
+        assert_eq!(
+            XbergError::UnsupportedFormat("t".to_string()).api_status_category(),
+            ApiStatusCategory::Validation
+        );
+    }
+
+    #[test]
+    fn should_categorize_parsing_and_ocr_as_unprocessable_entity() {
+        assert_eq!(XbergError::parsing("t").api_status_category(), ApiStatusCategory::Unprocessable);
+        assert_eq!(XbergError::ocr("t").api_status_category(), ApiStatusCategory::Unprocessable);
+    }
+
+    #[test]
+    fn should_default_remaining_variants_to_internal_server_error() {
+        assert_eq!(
+            XbergError::Io(std::io::Error::other("t")).api_status_category(),
+            ApiStatusCategory::Internal
+        );
+        assert_eq!(XbergError::Cancelled.api_status_category(), ApiStatusCategory::Internal);
+        assert_eq!(XbergError::Other("t".to_string()).api_status_category(), ApiStatusCategory::Internal);
+        assert_eq!(plugin_error().api_status_category(), ApiStatusCategory::Internal);
+    }
+
+    #[test]
+    fn should_map_named_variants_to_their_extraction_error_type() {
+        assert_eq!(XbergError::Io(std::io::Error::other("t")).extraction_error_type(), "io");
+        assert_eq!(XbergError::validation("t").extraction_error_type(), "validation");
+        assert_eq!(
+            XbergError::UnsupportedFormat("t/mime".to_string()).extraction_error_type(),
+            "unsupported_format"
+        );
+        assert_eq!(
+            XbergError::Timeout { elapsed_ms: 1, limit_ms: 2 }.extraction_error_type(),
+            "timeout"
+        );
+        assert_eq!(XbergError::Cancelled.extraction_error_type(), "cancelled");
+        assert_eq!(XbergError::security("t").extraction_error_type(), "security");
+    }
+
+    #[test]
+    fn should_default_unlisted_variants_to_other_extraction_error_type() {
+        assert_eq!(XbergError::parsing("t").extraction_error_type(), "other");
+        assert_eq!(XbergError::ocr("t").extraction_error_type(), "other");
+        assert_eq!(XbergError::cache("t").extraction_error_type(), "other");
+        assert_eq!(XbergError::image_processing("t").extraction_error_type(), "other");
+        assert_eq!(XbergError::serialization("t").extraction_error_type(), "other");
+        assert_eq!(
+            XbergError::MissingDependency("t".to_string()).extraction_error_type(),
+            "other"
+        );
+        assert_eq!(plugin_error().extraction_error_type(), "other");
+        assert_eq!(XbergError::LockPoisoned("t".to_string()).extraction_error_type(), "other");
+        assert_eq!(XbergError::embedding("t").extraction_error_type(), "other");
+        assert_eq!(XbergError::Other("t".to_string()).extraction_error_type(), "other");
+        assert_eq!(XbergError::transcription("t").extraction_error_type(), "other");
+        assert_eq!(XbergError::reranking("t").extraction_error_type(), "other");
+    }
+
+    #[test]
+    fn should_map_named_variants_to_their_extraction_error_code() {
+        assert_eq!(XbergError::Io(std::io::Error::other("t")).extraction_error_code(), 1001);
+        assert_eq!(XbergError::validation("t").extraction_error_code(), 1002);
+        assert_eq!(
+            XbergError::UnsupportedFormat("t/mime".to_string()).extraction_error_code(),
+            1003
+        );
+        assert_eq!(
+            XbergError::Timeout { elapsed_ms: 1, limit_ms: 2 }.extraction_error_code(),
+            1004
+        );
+        assert_eq!(XbergError::Cancelled.extraction_error_code(), 1005);
+        assert_eq!(XbergError::security("t").extraction_error_code(), 1006);
+    }
+
+    #[test]
+    fn should_default_unlisted_variants_to_1099_extraction_error_code() {
+        assert_eq!(XbergError::parsing("t").extraction_error_code(), 1099);
+        assert_eq!(XbergError::ocr("t").extraction_error_code(), 1099);
+        assert_eq!(XbergError::cache("t").extraction_error_code(), 1099);
+        assert_eq!(XbergError::image_processing("t").extraction_error_code(), 1099);
+        assert_eq!(XbergError::serialization("t").extraction_error_code(), 1099);
+        assert_eq!(XbergError::MissingDependency("t".to_string()).extraction_error_code(), 1099);
+        assert_eq!(plugin_error().extraction_error_code(), 1099);
+        assert_eq!(XbergError::LockPoisoned("t".to_string()).extraction_error_code(), 1099);
+        assert_eq!(XbergError::embedding("t").extraction_error_code(), 1099);
+        assert_eq!(XbergError::Other("t".to_string()).extraction_error_code(), 1099);
+        assert_eq!(XbergError::transcription("t").extraction_error_code(), 1099);
+        assert_eq!(XbergError::reranking("t").extraction_error_code(), 1099);
+    }
+
+    #[test]
+    fn should_categorize_client_input_errors_as_invalid_params_for_mcp() {
+        assert_eq!(XbergError::validation("t").mcp_error_category(), McpErrorCategory::InvalidParams);
+        assert_eq!(
+            XbergError::UnsupportedFormat("t".to_string()).mcp_error_category(),
+            McpErrorCategory::InvalidParams
+        );
+        assert_eq!(
+            XbergError::MissingDependency("t".to_string()).mcp_error_category(),
+            McpErrorCategory::InvalidParams
+        );
+        assert_eq!(XbergError::security("t").mcp_error_category(), McpErrorCategory::InvalidParams);
+    }
+
+    #[test]
+    fn should_categorize_parsing_as_parse_error_for_mcp() {
+        assert_eq!(XbergError::parsing("t").mcp_error_category(), McpErrorCategory::ParseError);
+    }
+
+    #[test]
+    fn should_categorize_cancelled_as_cancelled_for_mcp() {
+        assert_eq!(XbergError::Cancelled.mcp_error_category(), McpErrorCategory::Cancelled);
+    }
+
+    #[test]
+    fn should_default_remaining_variants_to_internal_for_mcp() {
+        assert_eq!(
+            XbergError::Io(std::io::Error::other("t")).mcp_error_category(),
+            McpErrorCategory::Internal
+        );
+        assert_eq!(XbergError::ocr("t").mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(XbergError::cache("t").mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(XbergError::image_processing("t").mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(XbergError::serialization("t").mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(plugin_error().mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(XbergError::LockPoisoned("t".to_string()).mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(XbergError::embedding("t").mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(
+            XbergError::Timeout { elapsed_ms: 1, limit_ms: 2 }.mcp_error_category(),
+            McpErrorCategory::Internal
+        );
+        assert_eq!(XbergError::Other("t".to_string()).mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(XbergError::transcription("t").mcp_error_category(), McpErrorCategory::Internal);
+        assert_eq!(XbergError::reranking("t").mcp_error_category(), McpErrorCategory::Internal);
     }
 }

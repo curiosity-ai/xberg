@@ -17,6 +17,7 @@ async def main() -> None:
     input = ExtractInput(kind=ExtractInputKind("uri"), mime_type="application/pdf", uri="https://example.com/pdf/fake_memo.pdf")
     config = ExtractionConfig()
     _ = await extract(input, config)
+    print(result)
 
 asyncio.run(main())
 

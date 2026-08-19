@@ -13,49 +13,59 @@ namespace Xberg;
 /// equivalent semantics for PaddleOCR.
 /// </summary>
 [JsonConverter(typeof(OcrElementLevelJsonConverter))]
-public enum OcrElementLevel {
-  /// <summary>
-  /// Individual word
-  /// </summary>
-  [JsonPropertyName("word")] Word,
-  /// <summary>
-  /// Line of text (default for PaddleOCR)
-  /// </summary>
-  [JsonPropertyName("line")] Line,
-  /// <summary>
-  /// Paragraph or text block
-  /// </summary>
-  [JsonPropertyName("block")] Block,
-  /// <summary>
-  /// Page-level element
-  /// </summary>
-  [JsonPropertyName("page")] Page,
+public enum OcrElementLevel
+{
+    /// <summary>
+    /// Individual word
+    /// </summary>
+    [JsonPropertyName("word")]
+    Word,
+    /// <summary>
+    /// Line of text (default for PaddleOCR)
+    /// </summary>
+    [JsonPropertyName("line")]
+    Line,
+    /// <summary>
+    /// Paragraph or text block
+    /// </summary>
+    [JsonPropertyName("block")]
+    Block,
+    /// <summary>
+    /// Page-level element
+    /// </summary>
+    [JsonPropertyName("page")]
+    Page,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="OcrElementLevel"/> that respects
-/// explicit variant names.
-/// </summary>
-internal sealed class OcrElementLevelJsonConverter
-    : JsonConverter<OcrElementLevel> {
-  public override OcrElementLevel Read(ref Utf8JsonReader reader,
-                                       Type typeToConvert,
-                                       JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch {
-      "word" => OcrElementLevel.Word, "line" => OcrElementLevel.Line,
-      "block" => OcrElementLevel.Block, "page" => OcrElementLevel.Page,
-      _ => throw new JsonException($"Unknown OcrElementLevel value: {value}")
-    };
-  }
 
-  public override void Write(Utf8JsonWriter writer, OcrElementLevel value,
-                             JsonSerializerOptions options) {
-    var str = value switch {
-      OcrElementLevel.Word => "word", OcrElementLevel.Line => "line",
-      OcrElementLevel.Block => "block", OcrElementLevel.Page => "page",
-      _ => throw new JsonException($"Unknown OcrElementLevel value: {value}")
-    };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="OcrElementLevel"/> that respects explicit variant names.
+/// </summary>
+internal sealed class OcrElementLevelJsonConverter : JsonConverter<OcrElementLevel>
+{
+    public override OcrElementLevel Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "word" => OcrElementLevel.Word,
+            "line" => OcrElementLevel.Line,
+            "block" => OcrElementLevel.Block,
+            "page" => OcrElementLevel.Page,
+            _ => throw new JsonException($"Unknown OcrElementLevel value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, OcrElementLevel value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            OcrElementLevel.Word => "word",
+            OcrElementLevel.Line => "line",
+            OcrElementLevel.Block => "block",
+            OcrElementLevel.Page => "page",
+            _ => throw new JsonException($"Unknown OcrElementLevel value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

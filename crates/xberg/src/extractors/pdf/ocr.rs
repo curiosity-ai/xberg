@@ -825,13 +825,119 @@ fn build_mixed_ocr_page_document(
     );
     attach_page_ocr_payload(&mut doc, backend_tables, Vec::new(), page_number);
     // `assemble_mixed_ocr_page_document`/`ocr_doc_to_paragraphs` still take the page
-    // height as a `u32` (see `crate::pdf::structure::adapters`); rounding to the
     // nearest point loses at most ~0.5pt, negligible next to the pixel-vs-point unit
     // bug this rescale fixes.
     let page_height_rounded_pt = page_height_pt.max(0.0).round() as u32;
     let mut assembled = assemble_mixed_ocr_page_document(doc, page_number, page_height_rounded_pt);
     attach_page_ocr_payload(&mut assembled, Vec::new(), backend_elements, page_number);
     Some(assembled)
+}
+
+/// Convert one OCR formula bbox to PDF points.
+///
+/// Backends can rescale the page image before OCR; when the result metadata
+/// carries the processed dimensions, those describe the bbox's pixel space
+/// and take precedence over the rendered dimensions.
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+fn formula_bbox_to_page_points(
+    formula: &mut crate::types::Formula,
+    doc: &pdf_oxide::PdfDocument,
+    page_idx: usize,
+    metadata: Option<&crate::types::Metadata>,
+    rendered_w: u32,
+    rendered_h: u32,
+) {
+    if let Some(bbox) = formula.bbox {
+        let (px_w, px_h) = metadata
+            .and_then(processed_ocr_layout_dimensions)
+            .unwrap_or((rendered_w, rendered_h));
+        let (w_pt, h_pt) = crate::pdf::render::get_page_dimensions_pt(doc, page_idx);
+        formula.bbox = Some(crate::pdf::render::pixel_bbox_to_pdf_points(bbox, px_w, px_h, w_pt, h_pt));
+    }
+}
+
+/// Flip the bboxes of a document's table elements from a top-left to a bottom-left
+/// origin, in points.
+///
+/// `crate::pdf::structure::assembly::push_table_element` copies `Table::bounding_box`
+/// verbatim onto the table's element, so on the pipeline route that element inherits the
+/// table's raw top-left pixel rect while every paragraph element around it was already
+/// flipped (in pixel space) by `ocr_doc_to_paragraphs`. Once
+/// [`rescale_ocr_bboxes_to_page_points`] has put both in points, only the table elements
+/// still need the flip the single-backend route gives them before assembly.
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+fn flip_table_element_bboxes_to_bottom_left(doc: &mut crate::types::internal::InternalDocument, page_height_pt: f32) {
+    let page_height_pt = f64::from(page_height_pt);
+    for element in &mut doc.elements {
+        if matches!(element.kind, crate::types::internal::ElementKind::Table { .. })
+            && let Some(bbox) = element.bbox.as_mut()
+        {
+            let (top, bottom) = (bbox.y0, bbox.y1);
+            bbox.y0 = page_height_pt - bottom;
+            bbox.y1 = page_height_pt - top;
+        }
+    }
+}
+
+/// Build the per-page structured document for the multi-stage pipeline / `vlm_fallback`
+/// route, converting its pixel-space bboxes into the PDF page's point space (#1423).
+///
+/// The single-backend route's [`build_mixed_ocr_page_document`] cannot be reused as a
+/// shared choke point: it takes the backend's *raw* OCR document and rescales it before
+/// running assembly, whereas `run_ocr_pipeline` returns a document `extract_with_ocr` has
+/// already assembled — its element bboxes carry the top-left -> bottom-left flip applied
+/// with the *raster's* pixel height, so re-assembling it here would flip them a second
+/// time. Only the pixel -> point scale is missing, which is exactly what
+/// [`rescale_ocr_bboxes_to_page_points`] applies to document elements (tables, whose
+/// bboxes are raw top-left pixel rects on this route too, still get the full
+/// scale-and-flip).
+///
+/// `raster_size_px` is the rendered page image this route OCR'd; `page_size_pt` is the
+/// page's own MediaBox size in points.
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+fn build_pipeline_ocr_page_document(
+    doc: Option<crate::types::internal::InternalDocument>,
+    mut tables: Vec<crate::types::Table>,
+    elements: Vec<crate::types::OcrElement>,
+    page_text: &str,
+    page_number: u32,
+    raster_size_px: (u32, u32),
+    page_size_pt: (f32, f32),
+) -> Option<crate::types::internal::InternalDocument> {
+    if doc.is_none() && tables.is_empty() && elements.is_empty() {
+        return None;
+    }
+    let mut doc = doc.unwrap_or_else(|| flat_ocr_page_document(page_text));
+    let (raster_width_px, raster_height_px) = raster_size_px;
+    let (page_width_pt, page_height_pt) = page_size_pt;
+
+    // Tables already folded into the assembled document are a separate allocation from
+    // the `tables` returned alongside it, so each is converted exactly once.
+    let mut assembled_tables = std::mem::take(&mut doc.tables);
+    rescale_ocr_bboxes_to_page_points(
+        Some(&mut doc),
+        &mut assembled_tables,
+        raster_width_px,
+        raster_height_px,
+        page_width_pt,
+        page_height_pt,
+    );
+    if raster_width_px != 0 && raster_height_px != 0 {
+        flip_table_element_bboxes_to_bottom_left(&mut doc, page_height_pt);
+    }
+    doc.tables = assembled_tables;
+    rescale_ocr_bboxes_to_page_points(
+        None,
+        &mut tables,
+        raster_width_px,
+        raster_height_px,
+        page_width_pt,
+        page_height_pt,
+    );
+
+    attach_page_ocr_payload(&mut doc, tables, elements, page_number);
+    normalize_mixed_ocr_document_page(&mut doc, page_number);
+    Some(doc)
 }
 
 /// Build mixed text from native extraction and per-page OCR results.
@@ -1000,8 +1106,15 @@ pub(crate) async fn extract_mixed_ocr_native(
                     let (text, tables, elements, doc, usage, page_texts, _rasters, formulas) = result?;
                     accumulated_llm_usage.extend(usage);
                     let page_number = (page_idx + 1) as u32;
+                    let page_dims = page_images
+                        .iter()
+                        .find(|(i, _)| *i == page_idx)
+                        .map(|(_, img)| (img.width(), img.height()));
                     for mut formula in formulas {
-                        formula.page = page_number;
+                        formula.page = Some(page_number);
+                        if let Some((w, h)) = page_dims {
+                            formula_bbox_to_page_points(&mut formula, &render_doc, page_idx, None, w, h);
+                        }
                         accumulated_formulas.push(formula);
                     }
                     // `run_ocr_pipeline`/`extract_with_ocr` assemble `text` as if this
@@ -1012,18 +1125,26 @@ pub(crate) async fn extract_mixed_ocr_native(
                     let page_text = page_texts.into_iter().next().unwrap_or(text);
                     // The pipeline's tables and OCR elements used to be dropped here (#60);
                     // they now ride along on the page's structured document. ~keep
-                    let page_doc = match doc {
-                        Some(doc) => Some(doc),
-                        None if tables.is_empty() && elements.is_empty() => None,
-                        None => Some(flat_ocr_page_document(&page_text)),
-                    };
-                    if let Some(mut d) = page_doc {
-                        attach_page_ocr_payload(&mut d, tables, elements, page_number);
+                    // This route also skipped the pixel -> point bbox conversion entirely,
+                    // so its bboxes stayed in raster pixels after #1423 fixed the
+                    // single-backend route; `build_pipeline_ocr_page_document` applies it.
+                    let raster_size_px = page_images
+                        .iter()
+                        .find(|(rendered_page, _)| *rendered_page == page_idx)
+                        .map_or((0, 0), |(_, image)| (image.width(), image.height()));
+                    if let Some(mut d) = build_pipeline_ocr_page_document(
+                        doc,
+                        tables,
+                        elements,
+                        &page_text,
+                        page_number,
+                        raster_size_px,
+                        page_dimensions_pt(&render_doc, page_idx),
+                    ) {
                         crate::core::diagnostics::dedup_extend_warnings(
                             &mut accumulated_warnings,
                             std::mem::take(&mut d.processing_warnings),
                         );
-                        normalize_mixed_ocr_document_page(&mut d, page_number);
                         structured_ocr_pages.insert(page_number, d);
                     }
                     ocr_results.insert(page_number, page_text);
@@ -1046,22 +1167,31 @@ pub(crate) async fn extract_mixed_ocr_native(
                     accumulated_llm_usage.extend(usage);
                     let page_number = (*page_idx + 1) as u32;
                     for mut formula in formulas {
-                        formula.page = page_number;
+                        formula.page = Some(page_number);
+                        formula_bbox_to_page_points(
+                            &mut formula,
+                            &render_doc,
+                            *page_idx,
+                            None,
+                            image.width(),
+                            image.height(),
+                        );
                         accumulated_formulas.push(formula);
                     }
                     let page_text = page_texts.into_iter().next().unwrap_or(text);
-                    let page_doc = match doc {
-                        Some(doc) => Some(doc),
-                        None if tables.is_empty() && elements.is_empty() => None,
-                        None => Some(flat_ocr_page_document(&page_text)),
-                    };
-                    if let Some(mut d) = page_doc {
-                        attach_page_ocr_payload(&mut d, tables, elements, page_number);
+                    if let Some(mut d) = build_pipeline_ocr_page_document(
+                        doc,
+                        tables,
+                        elements,
+                        &page_text,
+                        page_number,
+                        (image.width(), image.height()),
+                        page_dimensions_pt(&render_doc, *page_idx),
+                    ) {
                         crate::core::diagnostics::dedup_extend_warnings(
                             &mut accumulated_warnings,
                             std::mem::take(&mut d.processing_warnings),
                         );
-                        normalize_mixed_ocr_document_page(&mut d, page_number);
                         structured_ocr_pages.insert(page_number, d);
                     }
                     ocr_results.insert(page_number, page_text);
@@ -1157,8 +1287,22 @@ pub(crate) async fn extract_mixed_ocr_native(
                 if let Some(usage) = extraction_result.llm_usage.take() {
                     accumulated_llm_usage.extend(usage);
                 }
+                let page_dims = encoded
+                    .iter()
+                    .find(|(encoded_page, ..)| *encoded_page == page_idx)
+                    .map(|(_, _, w, h)| (*w, *h));
                 for mut formula in std::mem::take(&mut extraction_result.formulas) {
-                    formula.page = (page_idx + 1) as u32;
+                    formula.page = Some((page_idx + 1) as u32);
+                    if let Some((w, h)) = page_dims {
+                        formula_bbox_to_page_points(
+                            &mut formula,
+                            &render_doc,
+                            page_idx,
+                            Some(&extraction_result.metadata),
+                            w,
+                            h,
+                        );
+                    }
                     accumulated_formulas.push(formula);
                 }
                 // The backend's own warnings used to be dropped on this route (#60).
@@ -1196,7 +1340,8 @@ pub(crate) async fn extract_mixed_ocr_native(
                     accumulated_llm_usage.extend(usage);
                 }
                 for mut formula in std::mem::take(&mut extraction_result.formulas) {
-                    formula.page = (*page_idx + 1) as u32;
+                    formula.page = Some((*page_idx + 1) as u32);
+                    formula_bbox_to_page_points(&mut formula, &render_doc, *page_idx, Some(&extraction_result.metadata), *width, *height);
                     accumulated_formulas.push(formula);
                 }
                 crate::core::diagnostics::dedup_extend_warnings(
@@ -1789,15 +1934,15 @@ fn analyze_container_markers(elements: &[crate::types::internal::InternalElement
 // than from `crate::ocr`: this PDF OCR path also compiles under `ocr-pipeline` (VLM OCR,
 // e.g. the `binstall` CLI) or under `layout-detection` alone (layout without any OCR
 // backend enabled), where the `ocr` module — gated on `ocr`/`ocr-wasm` — is absent. ~keep
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", all(feature = "ocr-pipeline", feature = "pdf")))]
 use crate::ocr_metadata_keys::{OCR_PROCESSED_IMAGE_HEIGHT_METADATA_KEY, OCR_PROCESSED_IMAGE_WIDTH_METADATA_KEY};
 // Same rationale, scoped to `layout-detection` only: `resolved_ocr_correction_degrees` and
 // `transform_ocr_elements_to_render_space` (both `layout-detection`-only) are the sole
 // readers of these two key names in this file.
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 use crate::ocr_metadata_keys::{OCR_AUTO_ROTATED_METADATA_KEY, OCR_ORIENTATION_DEGREES_METADATA_KEY};
 
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", all(feature = "ocr-pipeline", feature = "pdf")))]
 fn valid_ocr_layout_dimension(value: &serde_json::Value) -> Option<u32> {
     let value = value.as_f64()?;
     if !value.is_finite() || value <= 0.0 || value > u32::MAX as f64 || value.fract() != 0.0 {
@@ -1806,7 +1951,7 @@ fn valid_ocr_layout_dimension(value: &serde_json::Value) -> Option<u32> {
     Some(value as u32)
 }
 
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", all(feature = "ocr-pipeline", feature = "pdf")))]
 fn processed_ocr_layout_dimensions(metadata: &crate::types::Metadata) -> Option<(u32, u32)> {
     let width = metadata
         .additional
@@ -1823,7 +1968,7 @@ fn processed_ocr_layout_dimensions(metadata: &crate::types::Metadata) -> Option<
     }
 }
 
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+#[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
 fn resolved_ocr_layout_dimensions(
     metadata: &crate::types::Metadata,
     render_width: u32,
@@ -1832,7 +1977,7 @@ fn resolved_ocr_layout_dimensions(
     processed_ocr_layout_dimensions(metadata).unwrap_or((render_width, render_height))
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn scale_detection_to_dimensions(
     detection: &crate::layout::DetectionResult,
     target_width: u32,
@@ -1856,7 +2001,7 @@ fn scale_detection_to_dimensions(
     scaled
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn resolved_ocr_correction_degrees(metadata: &crate::types::Metadata) -> Option<u16> {
     if !metadata
         .additional
@@ -1876,7 +2021,7 @@ fn resolved_ocr_correction_degrees(metadata: &crate::types::Metadata) -> Option<
     Some(((360 - orientation) % 360) as u16)
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn rotate_detection(
     mut detection: crate::layout::DetectionResult,
     correction_degrees: u16,
@@ -1913,7 +2058,7 @@ fn rotate_detection(
     detection
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn scale_detection_to_ocr_coordinates(
     detection: &crate::layout::DetectionResult,
     metadata: &crate::types::Metadata,
@@ -1935,7 +2080,7 @@ fn scale_detection_to_ocr_coordinates(
     rotate_detection(scaled, correction_degrees)
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn inverse_rotate_ocr_point(
     x: f64,
     y: f64,
@@ -1951,7 +2096,7 @@ fn inverse_rotate_ocr_point(
     }
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn transform_ocr_point_to_render(
     point: (u32, u32),
     correction_degrees: u16,
@@ -1976,7 +2121,7 @@ fn transform_ocr_point_to_render(
     (render_x, render_y)
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn transform_ocr_geometry_to_render(
     geometry: &crate::types::OcrBoundingGeometry,
     correction_degrees: u16,
@@ -2020,7 +2165,7 @@ fn transform_ocr_geometry_to_render(
     }
 }
 
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn transform_ocr_elements_to_render_space(
     elements: &[crate::types::OcrElement],
     metadata: &crate::types::Metadata,
@@ -2060,7 +2205,7 @@ fn transform_ocr_elements_to_render_space(
         .collect()
 }
 
-#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "layout-detection"))]
+#[cfg(all(any(feature = "ocr", feature = "ocr-wasm"), feature = "layout-detection"))]
 fn assemble_ocr_page_paragraphs(
     doc: &crate::types::internal::InternalDocument,
     page_height: u32,
@@ -2100,7 +2245,7 @@ fn fill_unstructured_ocr_pages(
 /// from randomness or wall-clock time, so the same input document always
 /// produces the same id. See [`crate::types::Table::table_id`] for the shared
 /// scheme doc.
-#[cfg(feature = "layout-detection")]
+#[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
 fn recognized_table_to_public_table(
     recognized: &crate::RecognizedTable,
     page_number: u32,
@@ -2183,7 +2328,7 @@ pub(crate) async fn extract_with_ocr(
     let structured_ocr_config;
     let ocr_config = {
         let cfg = ensure_elements_enabled(base_ocr_config);
-        #[cfg(feature = "layout-detection")]
+        #[cfg(all(feature = "ocr", feature = "layout-detection"))]
         let cfg = if layout_detections.is_some() || backend.emits_structured_markdown() {
             inject_layout_config_to_backend(&cfg, config)
         } else {
@@ -2429,7 +2574,12 @@ pub(crate) async fn extract_with_ocr(
             }
 
             for mut formula in ocr_result.formulas {
-                formula.page = (page_idx + 1) as u32;
+                formula.page = Some((page_idx + 1) as u32);
+                #[cfg(feature = "pdf")]
+                if let Some((doc, _, _)) = lazy_pdf_render_state.as_ref() {
+                    let (w, h) = (encoded_batch[offset].2, encoded_batch[offset].3);
+                    formula_bbox_to_page_points(&mut formula, doc, page_idx, Some(&ocr_result.metadata), w, h);
+                }
                 accumulated_formulas.push(formula);
             }
 
@@ -2480,7 +2630,7 @@ pub(crate) async fn extract_with_ocr(
                 }
             }
 
-            #[cfg(feature = "layout-detection")]
+            #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
             if ocr_result.ocr_internal_document.is_some()
                 || ocr_result
                     .ocr_elements
@@ -5309,6 +5459,19 @@ Buffers:           50000 kB
         assert!(result.6.is_empty());
     }
 
+    /// Root of the shared `test_documents` fixture corpus, resolved relative to this
+    /// crate's manifest dir (mirrors the identically named helper in
+    /// `crate::pdf::oxide::images` test module).
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    fn test_documents_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("test_documents")
+    }
+
     /// Minimal 2-page PDF (no content streams, just two bare `/Page` objects) for
     /// tests that need `extract_mixed_ocr_native` to target a specific *later* page.
     /// Mirrors `crate::pdf::render::build_minimal_pdf_with_mediabox`, which already
@@ -5560,6 +5723,355 @@ Buffers:           50000 kB
         crate::plugins::unregister_ocr_backend("below-threshold-warning-test-backend").unwrap();
     }
 
+    /// #1444: `run_ocr_pipeline` has no OCR execution loop of its own -- every stage is
+    /// delegated to `extract_with_ocr`, which already carries the force_ocr image-XObject
+    /// fallback (#1355, lines ~2593-2630). This proves that delegation actually threads
+    /// the recovered text and its warning through the pipeline route's return value: a
+    /// page whose OCR text comes back blank, but whose page carries a real (decodable)
+    /// image XObject, must be retried against the embedded image bytes and the recovered
+    /// text must replace the blank result.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[tokio::test]
+    async fn should_recover_blank_pipeline_page_and_warn_when_embedded_image_exists() {
+        use crate::core::config::{OcrConfig, OcrPipelineConfig, OcrPipelineStage, OcrQualityThresholds};
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const BACKEND_NAME: &str = "pipeline-blank-recovery-test-backend";
+        const RECOVERED_TEXT: &str = "RECOVERED PAGE TEXT";
+
+        // Returns blank text on the first call (the full-page render) and recovered
+        // text on every later call (the force_ocr fallback retry over embedded image
+        // bytes). The fixture has exactly one page, so the call order is deterministic.
+        struct BlankThenRecoverBackend {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl OcrBackend for BlankThenRecoverBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, _: &[u8], _: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                let call_number = self.calls.fetch_add(1, Ordering::SeqCst);
+                let content = if call_number == 0 {
+                    String::new()
+                } else {
+                    RECOVERED_TEXT.to_string()
+                };
+                Ok(ExtractedDocument {
+                    content,
+                    ..Default::default()
+                })
+            }
+            fn supports_document_processing(&self) -> bool {
+                false
+            }
+        }
+
+        impl Plugin for BlankThenRecoverBackend {
+            fn name(&self) -> &str {
+                BACKEND_NAME
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        crate::plugins::register_ocr_backend(Arc::new(BlankThenRecoverBackend { calls: calls.clone() })).unwrap();
+
+        // Single page, exactly one embedded (DCT/JPEG) image XObject -- verified via
+        // `mutool info -I` and already relied on by
+        // `test_page_ocr_fallback_image_bytes_recovers_real_image` in
+        // `crate::pdf::oxide::images`.
+        let pdf_path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+        let pdf_bytes = std::fs::read(&pdf_path).expect("failed to read test PDF fixture");
+
+        let pipeline = OcrPipelineConfig {
+            stages: vec![OcrPipelineStage {
+                backend: BACKEND_NAME.to_string(),
+                priority: 100,
+                language: None,
+                tesseract_config: None,
+                paddle_ocr_config: None,
+                vlm_config: None,
+                backend_options: None,
+            }],
+            // Accept the first (only) stage unconditionally so the test exercises the
+            // fallback recovery in isolation, not the best-effort selection branch.
+            quality_thresholds: OcrQualityThresholds {
+                pipeline_min_quality: 0.0,
+                ..Default::default()
+            },
+        };
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                pipeline: Some(pipeline.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = run_ocr_pipeline(
+            Some(&pdf_bytes),
+            None,
+            #[cfg(feature = "layout-detection")]
+            None,
+            &config,
+            &pipeline,
+            None,
+        )
+        .await;
+
+        crate::plugins::unregister_ocr_backend(BACKEND_NAME).unwrap();
+
+        let (text, _, _, doc, _, _, _, _) = result.expect("pipeline run must succeed");
+        assert_eq!(
+            text, RECOVERED_TEXT,
+            "recovered fallback text must replace the blank OCR result in the pipeline route"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "expected exactly one full-page OCR call and one fallback OCR call"
+        );
+
+        let warnings = doc
+            .expect("the fallback warning must produce an internal document")
+            .processing_warnings;
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one processing warning, got: {warnings:?}"
+        );
+        assert_eq!(warnings[0].source.as_ref(), "ocr");
+        assert_eq!(
+            warnings[0].message.as_ref(),
+            "Page 1 rendered blank but contains 1 image XObject(s) the PDF rasterizer could not draw; \
+             OCR was retried on the embedded image bytes."
+        );
+    }
+
+    /// #1444: a blank OCR result on a page with no embedded image XObjects has nothing
+    /// to recover from. The pipeline route must not fabricate content and must not emit
+    /// the force_ocr fallback warning -- `page_ocr_fallback_image_bytes` degrades to an
+    /// empty vec, and the reference implementation's `if !fallback_images.is_empty()`
+    /// guard is a no-op in that case.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[tokio::test]
+    async fn should_not_warn_or_fabricate_content_when_blank_pipeline_page_has_no_embedded_images() {
+        use crate::core::config::{OcrConfig, OcrPipelineConfig, OcrPipelineStage, OcrQualityThresholds};
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Arc;
+
+        const BACKEND_NAME: &str = "pipeline-no-image-blank-test-backend";
+
+        struct AlwaysBlankBackend;
+
+        #[async_trait::async_trait]
+        impl OcrBackend for AlwaysBlankBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, _: &[u8], _: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                Ok(ExtractedDocument::default())
+            }
+            fn supports_document_processing(&self) -> bool {
+                false
+            }
+        }
+
+        impl Plugin for AlwaysBlankBackend {
+            fn name(&self) -> &str {
+                BACKEND_NAME
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        crate::plugins::register_ocr_backend(Arc::new(AlwaysBlankBackend)).unwrap();
+
+        // No content stream, no resources, no image XObjects.
+        let pdf_bytes = crate::pdf::render::build_minimal_pdf_with_mediabox(612.0, 792.0);
+
+        let pipeline = OcrPipelineConfig {
+            stages: vec![OcrPipelineStage {
+                backend: BACKEND_NAME.to_string(),
+                priority: 100,
+                language: None,
+                tesseract_config: None,
+                paddle_ocr_config: None,
+                vlm_config: None,
+                backend_options: None,
+            }],
+            quality_thresholds: OcrQualityThresholds {
+                pipeline_min_quality: 0.0,
+                ..Default::default()
+            },
+        };
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                pipeline: Some(pipeline.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = run_ocr_pipeline(
+            Some(&pdf_bytes),
+            None,
+            #[cfg(feature = "layout-detection")]
+            None,
+            &config,
+            &pipeline,
+            None,
+        )
+        .await;
+
+        crate::plugins::unregister_ocr_backend(BACKEND_NAME).unwrap();
+
+        let (text, _, _, doc, _, _, _, _) = result.expect("pipeline run must succeed");
+        assert_eq!(text, "", "a page with no recoverable images must not fabricate content");
+        assert!(
+            doc.is_none(),
+            "a page with no recoverable images must not produce an internal document, got: {doc:?}"
+        );
+    }
+
+    /// #1444: the force_ocr fallback warning is deliberately unconditional on recovery
+    /// succeeding (reference implementation, ocr.rs ~2618-2630) -- it fires whenever the
+    /// page had image XObjects worth retrying, even if the retry also comes back blank.
+    /// The defining property of the original bug is silence, so the warning is the part
+    /// that must never be skipped, independent of whether any text was recovered.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[tokio::test]
+    async fn should_warn_when_pipeline_fallback_ocr_recovers_nothing() {
+        use crate::core::config::{OcrConfig, OcrPipelineConfig, OcrPipelineStage, OcrQualityThresholds};
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Arc;
+
+        const BACKEND_NAME: &str = "pipeline-unrecoverable-blank-test-backend";
+
+        struct AlwaysBlankBackend;
+
+        #[async_trait::async_trait]
+        impl OcrBackend for AlwaysBlankBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, _: &[u8], _: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                Ok(ExtractedDocument::default())
+            }
+            fn supports_document_processing(&self) -> bool {
+                false
+            }
+        }
+
+        impl Plugin for AlwaysBlankBackend {
+            fn name(&self) -> &str {
+                BACKEND_NAME
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        crate::plugins::register_ocr_backend(Arc::new(AlwaysBlankBackend)).unwrap();
+
+        let pdf_path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+        let pdf_bytes = std::fs::read(&pdf_path).expect("failed to read test PDF fixture");
+
+        let pipeline = OcrPipelineConfig {
+            stages: vec![OcrPipelineStage {
+                backend: BACKEND_NAME.to_string(),
+                priority: 100,
+                language: None,
+                tesseract_config: None,
+                paddle_ocr_config: None,
+                vlm_config: None,
+                backend_options: None,
+            }],
+            quality_thresholds: OcrQualityThresholds {
+                pipeline_min_quality: 0.0,
+                ..Default::default()
+            },
+        };
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                pipeline: Some(pipeline.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = run_ocr_pipeline(
+            Some(&pdf_bytes),
+            None,
+            #[cfg(feature = "layout-detection")]
+            None,
+            &config,
+            &pipeline,
+            None,
+        )
+        .await;
+
+        crate::plugins::unregister_ocr_backend(BACKEND_NAME).unwrap();
+
+        let (text, _, _, doc, _, _, _, _) = result.expect("pipeline run must succeed");
+        assert_eq!(
+            text, "",
+            "an unrecovered blank page must not fabricate content even though the warning fires"
+        );
+
+        let warnings = doc
+            .expect("the fallback warning must produce an internal document even with no recovered text")
+            .processing_warnings;
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one processing warning, got: {warnings:?}"
+        );
+        assert_eq!(warnings[0].source.as_ref(), "ocr");
+        assert_eq!(
+            warnings[0].message.as_ref(),
+            "Page 1 rendered blank but contains 1 image XObject(s) the PDF rasterizer could not draw; \
+             OCR was retried on the embedded image bytes."
+        );
+    }
+
     /// Verifies that formulas returned by a per-page OCR backend are accumulated and
     /// renumbered to 1-indexed document page numbers by `extract_with_ocr`.
     ///
@@ -5591,13 +6103,13 @@ Buffers:           50000 kB
                     content: "page text".to_string(),
                     formulas: vec![crate::types::Formula {
                         latex: "E = mc^2".to_string(),
-                        bbox: BoundingBox {
+                        bbox: Some(BoundingBox {
                             x0: 0.0,
                             y0: 0.0,
                             x1: 100.0,
                             y1: 50.0,
-                        },
-                        page: 0,
+                        }),
+                        page: None,
                     }],
                     ..Default::default()
                 })
@@ -5664,7 +6176,10 @@ Buffers:           50000 kB
 
         assert_eq!(formulas.len(), 2, "one formula per page, got {}", formulas.len());
 
-        let mut pages: Vec<u32> = formulas.iter().map(|f| f.page).collect();
+        let mut pages: Vec<u32> = formulas
+            .iter()
+            .map(|f| f.page.expect("OCR formulas must have a renumbered page"))
+            .collect();
         pages.sort_unstable();
         assert_eq!(
             pages,
@@ -5981,7 +6496,7 @@ Name: ___
         );
     }
 
-    #[cfg(feature = "layout-detection")]
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
     #[test]
     fn ocr_layout_dimensions_use_valid_processed_image_metadata() {
         let mut metadata = crate::types::Metadata::default();
@@ -5997,7 +6512,7 @@ Name: ___
         assert_eq!(resolved_ocr_layout_dimensions(&metadata, 1000, 1500), (2000, 3000));
     }
 
-    #[cfg(feature = "layout-detection")]
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
     #[test]
     fn ocr_layout_dimensions_fall_back_for_incomplete_or_invalid_metadata() {
         let mut metadata = crate::types::Metadata::default();
@@ -6023,7 +6538,7 @@ Name: ___
         assert_eq!(resolved_ocr_layout_dimensions(&metadata, 1000, 1500), (1000, 1500));
     }
 
-    #[cfg(feature = "layout-detection")]
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
     #[test]
     fn detection_scaling_targets_ocr_coordinate_space() {
         let detection = crate::layout::DetectionResult {
@@ -6051,7 +6566,7 @@ Name: ___
         assert_eq!(scaled.detections[0].bbox.y2, 600.0);
     }
 
-    #[cfg(feature = "layout-detection")]
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
     fn rotated_ocr_metadata(final_width: u32, final_height: u32, orientation_degrees: i32) -> crate::types::Metadata {
         let mut metadata = crate::types::Metadata::default();
         metadata.additional.insert(
@@ -6073,7 +6588,7 @@ Name: ___
         metadata
     }
 
-    #[cfg(feature = "layout-detection")]
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
     fn rotation_test_detection() -> crate::layout::DetectionResult {
         crate::layout::DetectionResult {
             page_width: 100,
@@ -6091,7 +6606,7 @@ Name: ___
         }
     }
 
-    #[cfg(feature = "layout-detection")]
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
     #[test]
     fn ocr_detection_rotation_matches_clockwise_90_pixel_transform() {
         let metadata = rotated_ocr_metadata(200, 100, 270);
@@ -6605,7 +7120,6 @@ Name: ___
             .expect("the OCR paragraph must survive assembly");
         let bbox = hello_element.bbox.expect("assembled element must carry a bbox");
         // scale_x = scale_y = 0.36; top-left pixel (100, 200)-(300, 260) scales to
-        // points (36, 72)-(108, 93.6), then flips top-left -> bottom-left using the
         // page height in points (792, not the 2200px raster height):
         //   bottom = 792 - 93.6 = 698.4, top = 792 - 72 = 720.0
         // Tolerance of 1e-3 accounts for the f32 arithmetic `pdf_block_bbox`
@@ -6628,5 +7142,274 @@ Name: ___
             bbox.x1,
             bbox.y1
         );
+    }
+
+    /// An already-assembled pipeline page document: one paragraph whose bbox is in the
+    /// raster's *pixel* space with a bottom-left origin (`ocr_doc_to_paragraphs` has
+    /// already flipped it using the raster height), plus one table carrying the raw
+    /// top-left pixel rect that `push_table_element` copies onto its element.
+    ///
+    /// Raster is 1700x2200px; the paragraph sits 200-260px below the raster's top edge.
+    #[cfg(feature = "pdf")]
+    fn assembled_pipeline_page_document() -> crate::types::internal::InternalDocument {
+        use crate::types::extraction::BoundingBox;
+        use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
+
+        let mut doc = InternalDocument::new("pdf");
+        let mut paragraph = InternalElement::text(ElementKind::Paragraph, "hello", 0);
+        paragraph.bbox = Some(BoundingBox {
+            x0: 100.0,
+            y0: 1940.0,
+            x1: 300.0,
+            y1: 2000.0,
+        });
+        doc.push_element(paragraph);
+
+        let table_bbox = BoundingBox {
+            x0: 100.0,
+            y0: 200.0,
+            x1: 300.0,
+            y1: 400.0,
+        };
+        let mut table = ocr_table("| a | b |", 1);
+        table.bounding_box = Some(table_bbox);
+        let table_index = doc.push_table(table);
+        let mut table_element = InternalElement::text(ElementKind::Table { table_index }, "", 0);
+        table_element.bbox = Some(table_bbox);
+        doc.push_element(table_element);
+
+        doc
+    }
+
+    /// #529 (extends #1423) — the `vlm_fallback` / explicit-`pipeline` route builds its
+    /// page document without going through `build_mixed_ocr_page_document`, so it never
+    /// received the pixel -> point conversion at all and emitted raw raster pixels. The
+    /// paragraph bbox is scaled only (it is already bottom-left), the table bbox and its
+    /// element get the full scale-and-flip, and every box must fit on the page.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn should_emit_page_point_bboxes_when_ocr_runs_via_vlm_fallback_pipeline() {
+        const PAGE_WIDTH_PT: f64 = 612.0;
+        const PAGE_HEIGHT_PT: f64 = 792.0;
+
+        // 1700x2200px raster of a 612x792pt (US Letter) page: scale_x = scale_y = 0.36.
+        let page_doc = build_pipeline_ocr_page_document(
+            Some(assembled_pipeline_page_document()),
+            Vec::new(),
+            Vec::new(),
+            "hello",
+            4,
+            (1700, 2200),
+            (PAGE_WIDTH_PT as f32, PAGE_HEIGHT_PT as f32),
+        )
+        .expect("a pipeline document must produce a page document");
+
+        let paragraph = page_doc
+            .elements
+            .iter()
+            .find(|element| element.text == "hello")
+            .expect("the pipeline paragraph must survive");
+        let bbox = paragraph.bbox.expect("paragraph must keep its bbox");
+        assert_eq!(bbox.x0, 36.0);
+        assert_eq!(bbox.y0, 698.4);
+        assert_eq!(bbox.x1, 108.0);
+        assert_eq!(bbox.y1, 720.0);
+        // The defining symptom of #1423 is a box that cannot fit on the page: unconverted,
+        // this paragraph reports y1 = 2000 against a 792pt page.
+        assert!(
+            bbox.x1 <= PAGE_WIDTH_PT && bbox.y1 <= PAGE_HEIGHT_PT,
+            "paragraph bbox must fit within the page, got ({}, {})-({}, {})",
+            bbox.x0,
+            bbox.y0,
+            bbox.x1,
+            bbox.y1
+        );
+
+        let table_bbox = page_doc.tables[0]
+            .bounding_box
+            .expect("the table must keep its bounding box");
+        assert_eq!(table_bbox.x0, 36.0);
+        assert_eq!(table_bbox.y0, 648.0, "bottom = 792 - 400 * 0.36");
+        assert_eq!(table_bbox.x1, 108.0);
+        assert_eq!(table_bbox.y1, 720.0, "top = 792 - 200 * 0.36");
+        assert!(
+            table_bbox.x1 <= PAGE_WIDTH_PT && table_bbox.y1 <= PAGE_HEIGHT_PT,
+            "table bbox must fit within the page, got ({}, {})-({}, {})",
+            table_bbox.x0,
+            table_bbox.y0,
+            table_bbox.x1,
+            table_bbox.y1
+        );
+
+        let table_element_bbox = page_doc
+            .elements
+            .iter()
+            .find(|element| matches!(element.kind, crate::types::internal::ElementKind::Table { .. }))
+            .and_then(|element| element.bbox)
+            .expect("the table element must keep its bbox");
+        assert_eq!(
+            (
+                table_element_bbox.x0,
+                table_element_bbox.y0,
+                table_element_bbox.x1,
+                table_element_bbox.y1
+            ),
+            (36.0, 648.0, 108.0, 720.0),
+            "the table element must report the same bottom-left point rect as its table"
+        );
+    }
+
+    /// #529 — a pipeline stage that produced only a table (no structured document) must
+    /// still get a page document whose table bbox is in page points, and a stage that
+    /// produced nothing structured must still produce no document at all.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn should_convert_pipeline_table_bboxes_when_no_structured_document_is_returned() {
+        use crate::types::extraction::BoundingBox;
+
+        let mut table = ocr_table("| a | b |", 1);
+        table.bounding_box = Some(BoundingBox {
+            x0: 100.0,
+            y0: 200.0,
+            x1: 300.0,
+            y1: 400.0,
+        });
+
+        let page_doc = build_pipeline_ocr_page_document(
+            None,
+            vec![table],
+            Vec::new(),
+            "scanned prose",
+            2,
+            (1700, 2200),
+            (612.0, 792.0),
+        )
+        .expect("a pipeline result with a table must produce a page document");
+
+        assert_eq!(page_doc.tables.len(), 1);
+        assert_eq!(page_doc.tables[0].page_number, 2, "table renumbered onto its page");
+        let bbox = page_doc.tables[0].bounding_box.expect("table bbox must survive");
+        assert_eq!((bbox.x0, bbox.y0, bbox.x1, bbox.y1), (36.0, 648.0, 108.0, 720.0));
+
+        assert!(
+            build_pipeline_ocr_page_document(
+                None,
+                Vec::new(),
+                Vec::new(),
+                "text only",
+                2,
+                (1700, 2200),
+                (612.0, 792.0)
+            )
+            .is_none(),
+            "a text-only pipeline result must keep the raw-text replacement path"
+        );
+    }
+
+    /// A single-page PDF with a landscape 200x100pt MediaBox and the given `/Rotate`.
+    ///
+    /// Mirrors the fixture builder in `layout_runner`'s tests, which is where the
+    /// rotation convention exercised below is established.
+    #[cfg(feature = "pdf")]
+    fn rotated_landscape_pdf(rotation: i64) -> Vec<u8> {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let page_id = document.new_object_id();
+        let content_id = document.add_object(Stream::new(dictionary! {}, Vec::new()));
+
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 100.into()],
+            "Resources" => dictionary! {},
+            "Contents" => content_id,
+        };
+        page.set("Rotate", rotation);
+        document.objects.insert(page_id, Object::Dictionary(page));
+
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("fixture PDF must serialize");
+        bytes
+    }
+
+    /// #530 — on a page with `/Rotate` 90 or 270 the OCR bbox conversion must still land
+    /// inside the page. `pdf_oxide` renders such a page in *displayed* orientation (with
+    /// width and height swapped relative to the MediaBox), but every OCR route rasterizes
+    /// through `normalize_rendered_page_for_ocr`, which applies the inverse quarter turn
+    /// and hands OCR a raster back in raw MediaBox orientation — the same convention
+    /// `layout_runner::render_layout_chunk` encodes by using the raw MediaBox dimensions
+    /// whenever `normalize_for_ocr` is set. `page_dimensions_pt` also returns the raw
+    /// MediaBox, so the two agree and no axis swap belongs in the conversion.
+    ///
+    /// This test pins that agreement: it fails if the raster stops being MediaBox-oriented
+    /// or if a swap is introduced into the conversion, either of which puts rotated-page
+    /// boxes off the page.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn should_convert_ocr_bboxes_within_page_bounds_on_rotated_pages() {
+        for rotation in [90, 270] {
+            let bytes = rotated_landscape_pdf(rotation);
+            let rendered = render_selected_pages_for_ocr(&bytes, &[0]).expect("rotated page must render for OCR");
+            let (_, image) = rendered.first().expect("page 0 must be rendered");
+            let (raster_width_px, raster_height_px) = (image.width(), image.height());
+
+            let document = pdf_oxide::PdfDocument::from_bytes(bytes.clone()).expect("fixture PDF must open");
+            let (page_width_pt, page_height_pt) = page_dimensions_pt(&document, 0);
+            assert_eq!(
+                (page_width_pt, page_height_pt),
+                (200.0, 100.0),
+                "/Rotate {rotation}: page_dimensions_pt reports the raw MediaBox"
+            );
+            assert!(
+                raster_width_px > raster_height_px,
+                "/Rotate {rotation}: the OCR raster must keep the MediaBox's landscape \
+                 orientation, got {raster_width_px}x{raster_height_px}"
+            );
+
+            // A table box covering the whole raster must convert to exactly the whole page.
+            let mut tables = [ocr_table("| a | b |", 1)];
+            tables[0].bounding_box = Some(crate::types::extraction::BoundingBox {
+                x0: 0.0,
+                y0: 0.0,
+                x1: f64::from(raster_width_px),
+                y1: f64::from(raster_height_px),
+            });
+            rescale_ocr_bboxes_to_page_points(
+                None,
+                &mut tables,
+                raster_width_px,
+                raster_height_px,
+                page_width_pt,
+                page_height_pt,
+            );
+
+            let bbox = tables[0].bounding_box.expect("table bbox must survive rescale");
+            assert_eq!(
+                (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+                (0.0, 0.0, 200.0, 100.0),
+                "/Rotate {rotation}: a full-raster box must map onto the full page"
+            );
+            assert!(
+                bbox.x1 <= f64::from(page_width_pt) && bbox.y1 <= f64::from(page_height_pt),
+                "/Rotate {rotation}: converted bbox must fit within the page"
+            );
+        }
     }
 }

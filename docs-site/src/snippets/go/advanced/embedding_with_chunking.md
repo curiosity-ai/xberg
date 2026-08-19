@@ -19,7 +19,7 @@ func main() {
 			MaxChars:   &maxChars,
 			MaxOverlap: &maxOverlap,
 			Embedding: &xberg.EmbeddingConfig{
-				Model:                xberg.EmbeddingModelType_Preset("balanced"),
+				Model:                xberg.EmbeddingModelTypePreset{Name: "balanced"},
 				Normalize:            &normalize,
 				BatchSize:            &batchSize,
 				ShowDownloadProgress: &showProgress,

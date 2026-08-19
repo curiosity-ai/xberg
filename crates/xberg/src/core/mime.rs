@@ -121,6 +121,96 @@ fn looks_like_html(trimmed: &str) -> bool {
     let name = name.to_ascii_lowercase();
     HTML_FRAGMENT_ELEMENTS.contains(&name.as_str())
 }
+pub(crate) const DOCBOOK_MIME_TYPE: &str = "application/docbook+xml";
+pub(crate) const JATS_MIME_TYPE: &str = "application/x-jats+xml";
+
+/// Return the XML vocabulary that `trimmed` declares, if it declares one.
+///
+/// Real DocBook and JATS documents use the `.xml` extension, so the extension
+/// map alone routes them to the generic XML extractor and their structure and
+/// equations are lost.
+///
+/// The test is structural, not a search of the text. A public identifier counts
+/// only inside the DOCTYPE declaration, and a namespace counts only when the
+/// root element declares it. A stylesheet, a schema or a catalog that merely
+/// names DocBook keeps its generic XML routing.
+fn xml_vocabulary(trimmed: &str) -> Option<&'static str> {
+    let doctype = declaration_of(trimmed, "<!DOCTYPE");
+    if let Some(doctype) = doctype {
+        if doctype.contains("//OASIS//DTD DocBook") {
+            return Some(DOCBOOK_MIME_TYPE);
+        }
+        if doctype.contains("//NLM//DTD JATS") || doctype.contains("//NLM//DTD Journal") {
+            return Some(JATS_MIME_TYPE);
+        }
+    }
+    let root = root_start_tag(trimmed)?;
+    root_is_in_namespace(root, "http://docbook.org/ns/docbook").then_some(DOCBOOK_MIME_TYPE)
+}
+
+/// Report whether the root element itself belongs to `namespace`.
+///
+/// A declaration alone proves nothing: an XSL stylesheet that transforms
+/// DocBook binds the namespace on its own root. The element belongs to the
+/// namespace only when the binding it carries is the one its name uses.
+fn root_is_in_namespace(root: &str, namespace: &str) -> bool {
+    let name = root
+        .trim_start_matches('<')
+        .split([' ', '\t', '\n', '\r', '>', '/'])
+        .next()
+        .unwrap_or_default();
+    let binding = match name.split_once(':') {
+        Some((prefix, _)) => format!("xmlns:{prefix}="),
+        None => "xmlns=".to_string(),
+    };
+    let Some(start) = root.find(&binding) else {
+        return false;
+    };
+    let value = &root[start + binding.len()..];
+    let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return false;
+    };
+    value[1..].split(quote).next().is_some_and(|uri| uri == namespace)
+}
+
+/// Return the text of the first declaration that opens with `opener`.
+///
+/// The declaration ends at its own `>`. An internal subset may hold a `>`
+/// inside brackets, so the scan tracks bracket depth rather than searching for
+/// a `]` anywhere in the document: a `]` in the body would otherwise stretch
+/// the declaration over the whole file.
+fn declaration_of<'a>(trimmed: &'a str, opener: &str) -> Option<&'a str> {
+    let start = trimmed.find(opener)?;
+    let rest = &trimmed[start..];
+    let tail = &rest[opener.len()..];
+    let end = crate::utils::xml_utils::doctype_end(tail)?;
+    Some(&rest[..opener.len() + end])
+}
+
+/// Return the start tag of the root element, skipping the prolog.
+///
+/// The scan stops at the first element, so a namespace bound deeper in the
+/// document cannot claim the file.
+fn root_start_tag(trimmed: &str) -> Option<&str> {
+    let mut rest = trimmed;
+    loop {
+        let open = rest.find('<')?;
+        rest = &rest[open..];
+        if rest.starts_with("<?") || rest.starts_with("<!") {
+            let skip = if rest.starts_with("<!DOCTYPE") {
+                declaration_of(rest, "<!DOCTYPE").map(str::len)?
+            } else {
+                rest.find('>')?
+            };
+            debug_assert!(skip < rest.len(), "a declaration ends inside the input");
+            rest = &rest[skip + 1..];
+            continue;
+        }
+        let end = rest.find('>')?;
+        return Some(&rest[..=end]);
+    }
+}
+
 pub(crate) const PDF_MIME_TYPE: &str = "application/pdf";
 pub(crate) const PLAIN_TEXT_MIME_TYPE: &str = "text/plain";
 pub(crate) const POWER_POINT_MIME_TYPE: &str =
@@ -143,6 +233,7 @@ pub(crate) const ODS_MIME_TYPE: &str = "application/vnd.oasis.opendocument.sprea
 #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
 const ZIP_MIME_TYPE: &str = "application/zip";
 
+#[cfg(feature = "hwpx")]
 pub(crate) const HWPX_MIME_TYPE: &str = "application/haansofthwpx";
 pub(crate) const IWORK_PAGES_MIME_TYPE: &str = "application/x-iwork-pages-sffpages";
 pub(crate) const IWORK_NUMBERS_MIME_TYPE: &str = "application/x-iwork-numbers-sffnumbers";
@@ -853,10 +944,15 @@ fn magic_override(path: &Path, extension_mime: &str) -> Option<String> {
 
     let from_magic = detect_mime_type_from_bytes(&header).ok()?;
     #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
-    if (from_magic == ZIP_MIME_TYPE || from_magic.starts_with("application/vnd.oasis.opendocument."))
-        && let Some(odf_mime) = detect_odf_mime_from_zip(std::fs::File::open(path).ok()?)
-    {
-        return (odf_mime != extension_mime).then(|| odf_mime.to_string());
+    if from_magic == ZIP_MIME_TYPE || from_magic.starts_with("application/vnd.oasis.opendocument.") {
+        // The header holds only the first entries of the archive, and a real
+        // document names its main part far later: `ppt/presentation.xml` sits
+        // 107 KB into a 27-slide deck. The archive directory finds the part
+        // wherever it is, so the document is not mistaken for a plain ZIP. One
+        // open answers both questions.
+        if let Some(package_mime) = detect_zip_package(std::fs::File::open(path).ok()?) {
+            return (package_mime != extension_mime).then(|| package_mime.to_string());
+        }
     }
 
     if from_magic == PLAIN_TEXT_MIME_TYPE {
@@ -922,7 +1018,7 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
 
         #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
         if mime_type.starts_with("application/vnd.oasis.opendocument.") {
-            return Ok(detect_odf_mime_from_zip(std::io::Cursor::new(content))
+            return Ok(detect_zip_package(std::io::Cursor::new(content))
                 .unwrap_or(ZIP_MIME_TYPE)
                 .to_string());
         }
@@ -934,6 +1030,16 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
         }
 
         if SUPPORTED_MIME_TYPES.contains(mime_type) || mime_type.starts_with("image/") {
+            // `infer` reads the `<?xml` declaration and stops at generic XML, so
+            // the vocabulary check has to run before that result is returned.
+            // A caller may pass a truncated header, so decode lossily: a split
+            // multi-byte character must not suppress the check.
+            let prolog = String::from_utf8_lossy(&content[..content.len().min(8192)]);
+            if is_generic_xml_mime(mime_type)
+                && let Some(vocabulary) = xml_vocabulary(prolog.trim_start())
+            {
+                return Ok(vocabulary.to_string());
+            }
             return Ok(mime_type.to_string());
         }
     }
@@ -968,6 +1074,9 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String> {
         }
 
         if trimmed.starts_with("<?xml") || trimmed.starts_with('<') {
+            if let Some(vocabulary) = xml_vocabulary(trimmed) {
+                return Ok(vocabulary.to_string());
+            }
             return Ok(XML_MIME_TYPE.to_string());
         }
 
@@ -1012,19 +1121,20 @@ fn detect_office_format_from_zip(content: &[u8]) -> Option<&'static str> {
     const KEYNOTE_MARKER: &[u8] = b"Index/Presentation.iwa";
     const KEYNOTE_SLIDE_MARKERS: &[&[u8]] = &[b"Index/Slide-", b"Index/Slide_"];
 
+    #[cfg(feature = "hwpx")]
     const HWPX_MARKER: &[u8] = b"Contents/content.hpf";
     #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
-    if let Some(odf_mime) = detect_odf_mime_from_zip(std::io::Cursor::new(content)) {
-        return Some(odf_mime);
+    if let Some(package_mime) = detect_zip_package(std::io::Cursor::new(content)) {
+        return Some(package_mime);
     }
 
+    #[cfg(feature = "hwpx")]
     if contains_subsequence(content, HWPX_MARKER) {
         return Some(HWPX_MIME_TYPE);
     }
 
-    if contains_subsequence(content, PAGES_MARKER) {
-        return Some(IWORK_PAGES_MIME_TYPE);
-    }
+    // A Numbers package carries `Index/Document.iwa` as well, so the
+    // discriminating parts are tested before it.
     if contains_subsequence(content, NUMBERS_MARKER) {
         return Some(IWORK_NUMBERS_MIME_TYPE);
     }
@@ -1035,6 +1145,9 @@ fn detect_office_format_from_zip(content: &[u8]) -> Option<&'static str> {
             .any(|marker| contains_subsequence(content, marker))
     {
         return Some(IWORK_KEYNOTE_MIME_TYPE);
+    }
+    if contains_subsequence(content, PAGES_MARKER) {
+        return Some(IWORK_PAGES_MIME_TYPE);
     }
 
     if contains_subsequence(content, DOCX_MARKER) {
@@ -1049,17 +1162,70 @@ fn detect_office_format_from_zip(content: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Read the `mimetype` entry a ZIP-based document package declares.
+///
+/// OpenDocument and HWPX both store their own media type in an uncompressed
+/// `mimetype` entry, which is the format's authoritative identifier. An HWPX
+/// package that carries no `Contents/content.hpf` is still identified here.
+/// A package with two `mimetype` entries is rejected rather than guessed at.
+/// Identify a ZIP-based office format from the names in the archive directory.
+///
+/// `detect_office_format_from_zip` searches raw bytes, so it only sees the part
+/// of the archive it was given. A caller that reads a fixed-size header misses
+/// every part written after it.
 #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
-fn detect_odf_mime_from_zip<R: Read + Seek>(mut reader: R) -> Option<&'static str> {
-    const MAX_MIMETYPE_LENGTH: u64 = ODP_MIME_TYPE.len() as u64;
+fn detect_office_format_from_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Option<&'static str> {
+    let has = |archive: &mut zip::ZipArchive<R>, name: &str| archive.index_for_name(name).is_some();
+    #[cfg(feature = "hwpx")]
+    if has(archive, "Contents/content.hpf") {
+        return Some(HWPX_MIME_TYPE);
+    }
+    if has(archive, "word/document.xml") {
+        return Some(DOCX_MIME_TYPE);
+    }
+    if has(archive, "xl/workbook.xml") {
+        return Some(EXCEL_MIME_TYPE);
+    }
+    if has(archive, "ppt/presentation.xml") {
+        return Some(POWER_POINT_MIME_TYPE);
+    }
+    // A Numbers package also carries `Index/Document.iwa`, so the discriminating
+    // parts are tested first. Otherwise a spreadsheet is read as a Pages
+    // document and yields no sheets at all.
+    if has(archive, "Index/CalculationEngine.iwa") {
+        return Some(IWORK_NUMBERS_MIME_TYPE);
+    }
+    if has(archive, "Index/Presentation.iwa")
+        || archive.file_names().any(|n| n.starts_with("Index/Slide-") || n.starts_with("Index/Slide_"))
+    {
+        return Some(IWORK_KEYNOTE_MIME_TYPE);
+    }
+    if has(archive, "Index/Document.iwa") {
+        return Some(IWORK_PAGES_MIME_TYPE);
+    }
+    None
+}
 
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+fn detect_zip_package<R: Read + Seek>(mut reader: R) -> Option<&'static str> {
     let limits = SecurityLimits::default();
     if !zip_central_directory_within_limits(&mut reader, &limits) {
         return None;
     }
     reader.seek(SeekFrom::Start(0)).ok()?;
-
     let mut archive = zip::ZipArchive::new(reader).ok()?;
+
+    // The package's own declaration wins, and its main part answers otherwise.
+    detect_zip_mimetype_entry(&mut archive).or_else(|| detect_office_format_from_archive(&mut archive))
+}
+
+/// Read the `mimetype` entry a ZIP-based document package declares.
+#[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+fn detect_zip_mimetype_entry<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Option<&'static str> {
+    /// The value an HWPX package stores in its `mimetype` entry.
+    #[cfg(feature = "hwpx")]
+    const HWPX_PACKAGE_MIMETYPE: &[u8] = b"application/hwp+zip";
+    const MAX_MIMETYPE_LENGTH: u64 = ODP_MIME_TYPE.len() as u64;
 
     let mut mimetype_index = None;
     for index in 0..archive.len() {
@@ -1067,6 +1233,9 @@ fn detect_odf_mime_from_zip<R: Read + Seek>(mut reader: R) -> Option<&'static st
             return None;
         }
     }
+
+    #[cfg(feature = "hwpx")]
+    let has_hwpx_manifest = archive.index_for_name("Contents/content.hpf").is_some();
 
     let mimetype = archive.by_index(mimetype_index?).ok()?;
     if mimetype.size() > MAX_MIMETYPE_LENGTH {
@@ -1079,6 +1248,12 @@ fn detect_odf_mime_from_zip<R: Read + Seek>(mut reader: R) -> Option<&'static st
         value if value == ODT_MIME_TYPE.as_bytes() => Some(ODT_MIME_TYPE),
         value if value == ODP_MIME_TYPE.as_bytes() => Some(ODP_MIME_TYPE),
         value if value == ODS_MIME_TYPE.as_bytes() => Some(ODS_MIME_TYPE),
+        // The HWPX reader needs the manifest, so a package without one keeps its
+        // ZIP routing and its members stay readable. The entry is looked up in
+        // the archive directory, because Hangul writes it near the end of the
+        // file, past any header a caller may have truncated to.
+        #[cfg(feature = "hwpx")]
+        value if value == HWPX_PACKAGE_MIMETYPE && has_hwpx_manifest => Some(HWPX_MIME_TYPE),
         _ => None,
     }
 }
@@ -1368,6 +1543,189 @@ mod tests {
             "FictionBook semantic text.",
         )
         .await;
+    }
+
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[test]
+    fn should_detect_hwpx_without_a_content_hpf_from_its_mimetype_entry() {
+        // Real Hangul packages carry `version.xml` and `Contents/section0.xml`
+        // but no `Contents/content.hpf`, so only the `mimetype` entry names them.
+        let mut buffer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
+            let stored =
+                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("mimetype", stored).unwrap();
+            std::io::Write::write_all(&mut writer, b"application/hwp+zip").unwrap();
+            writer
+                .start_file("Contents/section0.xml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, b"<hs:sec/>").unwrap();
+            // Written last, as Hangul does, so a truncated header cannot see it.
+            writer
+                .start_file("Contents/content.hpf", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, b"<opf:package/>").unwrap();
+            writer.finish().unwrap();
+        }
+
+        assert_eq!(
+            detect_mime_type_from_bytes(&buffer).unwrap(),
+            "application/haansofthwpx"
+        );
+    }
+
+    #[test]
+    fn should_detect_docbook_by_namespace_when_extension_is_plain_xml() {
+        // Real DocBook ships as `.xml`, so only the namespace identifies it.
+        let content = br#"<!DOCTYPE refentry [ <!ENTITY % mathent SYSTEM "math.ent"> %mathent; ]>
+<refentry xmlns="http://docbook.org/ns/docbook" version="5.0" xml:id="exp">
+  <refsect1><para>Text.</para></refsect1>
+</refentry>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "application/docbook+xml");
+    }
+
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[test]
+    fn should_detect_a_deck_whose_main_part_is_written_late_in_the_archive() {
+        // A real 27-slide deck names `ppt/presentation.xml` 107 KB in, so a
+        // detector that reads a fixed-size header sees a plain ZIP and the
+        // presentation extracts as a list of archive members.
+        let mut buffer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
+            let options = zip::write::SimpleFileOptions::default();
+            for index in 0..12 {
+                writer.start_file(format!("ppt/media/image{index}.bin"), options).unwrap();
+                std::io::Write::write_all(&mut writer, &vec![index as u8; 8192]).unwrap();
+            }
+            writer.start_file("ppt/presentation.xml", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"<p:presentation/>").unwrap();
+            writer.finish().unwrap();
+        }
+        // Name it `.zip` so the extension does not answer the question. That is
+        // the path a real deck takes: the header search fails, and only the
+        // archive directory can identify it.
+        let path = std::env::temp_dir().join("xberg_late_part_test.zip");
+        std::fs::write(&path, &buffer).unwrap();
+
+        let detected = detect_or_validate(path.to_str(), None).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            detected,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "the deck is identified by its parts, not by its name"
+        );
+    }
+
+    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[test]
+    fn should_keep_zip_routing_for_an_hwpx_package_without_its_manifest() {
+        // `unhwp` needs `Contents/content.hpf`. Without it the HWPX extractor
+        // fails outright, so the package stays on the ZIP route and its members
+        // remain readable.
+        let mut buffer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
+            let stored =
+                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("mimetype", stored).unwrap();
+            std::io::Write::write_all(&mut writer, b"application/hwp+zip").unwrap();
+            writer
+                .start_file("Contents/section0.xml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, b"<hs:sec/>").unwrap();
+            writer.finish().unwrap();
+        }
+
+        assert_eq!(detect_mime_type_from_bytes(&buffer).unwrap(), "application/zip");
+    }
+
+    #[test]
+    fn should_keep_generic_xml_for_a_stylesheet_that_only_names_docbook() {
+        // A DocBook XSL customization layer binds the namespace on a foreign
+        // root. It is not a DocBook document, and the DocBook extractor drops
+        // every element it does not know.
+        let content = br#"<?xml version="1.0"?>
+<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:d="http://docbook.org/ns/docbook" version="1.0">
+  <xsl:template match="d:para"><p><xsl:apply-templates/></p></xsl:template>
+</xsl:stylesheet>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "text/xml");
+    }
+
+    #[test]
+    fn should_keep_generic_xml_for_a_catalog_that_has_a_doctype_and_names_the_docbook_dtd() {
+        // The declaration ends at its own `>`. A `]` later in the body must not
+        // stretch it over the public identifier that follows.
+        let content = br#"<?xml version="1.0"?>
+<!DOCTYPE catalog PUBLIC "-//OASIS//DTD Entity Resolution XML Catalog V1.0//EN" "catalog.dtd">
+<catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
+  <public publicId="-//OASIS//DTD DocBook XML V4.5//EN" uri="docbookx.dtd"/>
+  <note>index a[0] and b[1]</note>
+</catalog>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "text/xml");
+    }
+
+    #[test]
+    fn should_detect_docbook_when_the_body_holds_a_bracket() {
+        // A `]` in the body must not make the root element unreachable.
+        let content = br#"<?xml version="1.0"?>
+<!DOCTYPE book SYSTEM "docbook.dtd">
+<book xmlns="http://docbook.org/ns/docbook" version="5.0">
+  <chapter><para>The value a[0] is first.</para></chapter>
+</book>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "application/docbook+xml");
+    }
+
+    #[test]
+    fn should_keep_generic_xml_for_a_catalog_that_lists_the_docbook_dtd() {
+        let content = br#"<?xml version="1.0"?>
+<catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
+  <public publicId="-//OASIS//DTD DocBook XML V4.5//EN" uri="docbookx.dtd"/>
+</catalog>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "text/xml");
+    }
+
+    #[test]
+    fn should_detect_docbook_when_the_namespace_is_bound_to_a_prefix() {
+        let content = br#"<?xml version="1.0"?>
+<db:book xmlns:db="http://docbook.org/ns/docbook" version="5.0">
+  <db:chapter><db:para>Text.</db:para></db:chapter>
+</db:book>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "application/docbook+xml");
+    }
+
+    #[test]
+    fn should_detect_docbook_by_dtd_public_identifier() {
+        let content = br#"<?xml version="1.0"?>
+<!DOCTYPE article PUBLIC "-//OASIS//DTD DocBook XML V4.4//EN" "http://www.oasis-open.org/docbook/xml/4.4/docbookx.dtd">
+<article><para>Text.</para></article>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "application/docbook+xml");
+    }
+
+    #[test]
+    fn should_detect_jats_by_dtd_public_identifier() {
+        let content = br#"<?xml version="1.0"?>
+<!DOCTYPE article PUBLIC "-//NLM//DTD JATS (Z39.96) Journal Archiving DTD v1.0 20120330//EN" "JATS-archivearticle1.dtd">
+<article><body><p>Text.</p></body></article>"#;
+
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "application/x-jats+xml");
+    }
+
+    #[test]
+    fn should_keep_generic_xml_without_a_vocabulary_declaration() {
+        let content = br#"<?xml version="1.0"?><catalog><item>Text.</item></catalog>"#;
+
+        // `text/xml` is the registered alias `infer` returns for a declaration.
+        assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "text/xml");
     }
 
     #[cfg(all(feature = "office", feature = "xml", feature = "tokio-runtime"))]

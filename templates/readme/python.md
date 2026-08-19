@@ -17,17 +17,7 @@
 pip install xberg
 ```
 
-### With OCR Support
-
-```bash
-pip install "xberg[paddleocr]"
-```
-
-### All Features
-
-```bash
-pip install "xberg[all]"
-```
+There are no optional extras to install. The wheel bundles the feature set for your platform — OCR (including PaddleOCR), layout detection, embeddings, chunking, and the rest — so `pip install xberg` is all you need.
 
 ## Quick Start
 

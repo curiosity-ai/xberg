@@ -10,39 +10,45 @@ namespace Xberg;
 /// Keyword algorithm selection.
 /// </summary>
 [JsonConverter(typeof(KeywordAlgorithmJsonConverter))]
-public enum KeywordAlgorithm {
-  /// <summary>
-  /// YAKE (Yet Another Keyword Extractor) - statistical approach
-  /// </summary>
-  [JsonPropertyName("yake")] Yake,
-  /// <summary>
-  /// RAKE (Rapid Automatic Keyword Extraction) - co-occurrence based
-  /// </summary>
-  [JsonPropertyName("rake")] Rake,
+public enum KeywordAlgorithm
+{
+    /// <summary>
+    /// YAKE (Yet Another Keyword Extractor) - statistical approach
+    /// </summary>
+    [JsonPropertyName("yake")]
+    Yake,
+    /// <summary>
+    /// RAKE (Rapid Automatic Keyword Extraction) - co-occurrence based
+    /// </summary>
+    [JsonPropertyName("rake")]
+    Rake,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="KeywordAlgorithm"/> that respects
-/// explicit variant names.
-/// </summary>
-internal sealed class KeywordAlgorithmJsonConverter
-    : JsonConverter<KeywordAlgorithm> {
-  public override KeywordAlgorithm Read(ref Utf8JsonReader reader,
-                                        Type typeToConvert,
-                                        JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch {
-      "yake" => KeywordAlgorithm.Yake, "rake" => KeywordAlgorithm.Rake,
-      _ => throw new JsonException($"Unknown KeywordAlgorithm value: {value}")
-    };
-  }
 
-  public override void Write(Utf8JsonWriter writer, KeywordAlgorithm value,
-                             JsonSerializerOptions options) {
-    var str = value switch {
-      KeywordAlgorithm.Yake => "yake", KeywordAlgorithm.Rake => "rake",
-      _ => throw new JsonException($"Unknown KeywordAlgorithm value: {value}")
-    };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="KeywordAlgorithm"/> that respects explicit variant names.
+/// </summary>
+internal sealed class KeywordAlgorithmJsonConverter : JsonConverter<KeywordAlgorithm>
+{
+    public override KeywordAlgorithm Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "yake" => KeywordAlgorithm.Yake,
+            "rake" => KeywordAlgorithm.Rake,
+            _ => throw new JsonException($"Unknown KeywordAlgorithm value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, KeywordAlgorithm value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            KeywordAlgorithm.Yake => "yake",
+            KeywordAlgorithm.Rake => "rake",
+            _ => throw new JsonException($"Unknown KeywordAlgorithm value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

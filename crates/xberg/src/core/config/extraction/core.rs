@@ -155,7 +155,7 @@ pub struct ExtractionConfig {
     /// giving slow paths (VLM-based OCR, large scanned documents) enough
     /// headroom to finish. Set to `None` to disable the timeout for trusted
     /// input or long-running workloads.
-    #[serde(default = "default_extraction_timeout")]
+    #[serde(default = "ExtractionConfig::default_extraction_timeout")]
     pub extraction_timeout_secs: Option<u64>,
 
     /// Maximum concurrent document extractions in batch operations.
@@ -196,7 +196,7 @@ pub struct ExtractionConfig {
     ///
     /// Set to `None` to disable the per-embedded-file cap (falls back to
     /// `security_limits.max_archive_size` as the only guard).
-    #[serde(default = "default_max_embedded_file_bytes")]
+    #[serde(default = "ExtractionConfig::default_max_embedded_file_bytes")]
     pub max_embedded_file_bytes: Option<u64>,
 
     /// Content text format (default: Plain).
@@ -361,7 +361,7 @@ pub struct ExtractionConfig {
 
     /// Maximum recursion depth for archive extraction (default: 3).
     /// Set to 0 to disable recursive extraction (legacy behavior).
-    #[serde(default = "default_archive_depth")]
+    #[serde(default = "ExtractionConfig::default_archive_depth")]
     pub max_archive_depth: usize,
 
     /// Tree-sitter language pack configuration (None = tree-sitter disabled).
@@ -461,6 +461,43 @@ pub struct ExtractionConfig {
     pub source_name: Option<String>,
 }
 
+impl ExtractionConfig {
+    /// Default [`Self::max_archive_depth`]: 3 levels of nested archives.
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_archive_depth() -> usize {
+        3
+    }
+
+    /// Default per-embedded-file cap: 50 MiB.
+    ///
+    /// A single embedded object larger than this can consume significant memory
+    /// when the recursive extractor materialises it. 50 MiB is generous for
+    /// real-world embedded documents while still bounding worst-case allocation.
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_max_embedded_file_bytes() -> Option<u64> {
+        Some(50 * 1024 * 1024)
+    }
+
+    /// Default extraction timeout: 600 seconds (10 minutes).
+    ///
+    /// Pathological files (deeply nested archives, sheets with millions of cells,
+    /// adversarial PDFs) can otherwise run indefinitely and exhaust caller
+    /// resources. 600 s bounds the worst-case cost of a single untrusted input
+    /// while giving legitimate but slow paths — VLM-based OCR, large scanned
+    /// documents — enough headroom to finish instead of being cut off at the
+    /// previous 60 s default.
+    ///
+    /// Public and on the type rather than a free private `fn` because generated bindings
+    /// have to call it to reproduce the default, and a private one is out of their reach.
+    pub fn default_extraction_timeout() -> Option<u64> {
+        Some(600)
+    }
+}
+
 impl Default for ExtractionConfig {
     fn default() -> Self {
         Self {
@@ -486,10 +523,10 @@ impl Default for ExtractionConfig {
             html_options: None,
             #[cfg(feature = "html")]
             html_output: None,
-            extraction_timeout_secs: default_extraction_timeout(),
+            extraction_timeout_secs: ExtractionConfig::default_extraction_timeout(),
             max_concurrent_extractions: None,
             security_limits: None,
-            max_embedded_file_bytes: default_max_embedded_file_bytes(),
+            max_embedded_file_bytes: ExtractionConfig::default_max_embedded_file_bytes(),
             #[cfg(feature = "layout-types")]
             layout: None,
             #[cfg(feature = "transcription-types")]
@@ -508,7 +545,7 @@ impl Default for ExtractionConfig {
             csv: None,
             concurrency: None,
             url: UrlExtractionConfig::default(),
-            max_archive_depth: default_archive_depth(),
+            max_archive_depth: ExtractionConfig::default_archive_depth(),
             #[cfg(feature = "tree-sitter")]
             tree_sitter: None,
             structured_extraction: None,
@@ -882,30 +919,7 @@ fn default_true() -> bool {
     true
 }
 
-fn default_archive_depth() -> usize {
-    3
-}
 
-/// Default per-embedded-file cap: 50 MiB.
-///
-/// A single embedded object larger than this can consume significant memory
-/// when the recursive extractor materialises it. 50 MiB is generous for
-/// real-world embedded documents while still bounding worst-case allocation.
-fn default_max_embedded_file_bytes() -> Option<u64> {
-    Some(50 * 1024 * 1024)
-}
-
-/// Default extraction timeout: 600 seconds (10 minutes).
-///
-/// Pathological files (deeply nested archives, sheets with millions of cells,
-/// adversarial PDFs) can otherwise run indefinitely and exhaust caller
-/// resources. 600 s bounds the worst-case cost of a single untrusted input
-/// while giving legitimate but slow paths — VLM-based OCR, large scanned
-/// documents — enough headroom to finish instead of being cut off at the
-/// previous 60 s default.
-fn default_extraction_timeout() -> Option<u64> {
-    Some(600)
-}
 
 #[cfg(test)]
 mod tests {

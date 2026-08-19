@@ -17,6 +17,7 @@ async def main() -> None:
     input = ExtractInput(bytes=[], config={}, filename="empty.txt", kind=ExtractInputKind("bytes"), mime_type="text/plain")
     config = ExtractionConfig()
     _ = await extract(input, config)
+    print(result)
 
 asyncio.run(main())
 

@@ -5,17 +5,22 @@ using System;
 
 namespace Xberg;
 
-public class XbergException : Exception {
-  public int Code { get; }
+public class XbergException : Exception
+{
+    public int Code { get; }
 
-  public XbergException(int code, string message) : base(message) {
-    Code = code;
-  }
+    public XbergException(int code, string message) : base(message)
+    {
+        Code = code;
+    }
 
-  public XbergException(string message) : base(message) { Code = 0; }
+    public XbergException(string message) : base(message)
+    {
+        Code = 0;
+    }
 
-  public XbergException(string message, Exception innerException)
-      : base(message, innerException) {
-    Code = 0;
-  }
+    public XbergException(string message, Exception innerException) : base(message, innerException)
+    {
+        Code = 0;
+    }
 }

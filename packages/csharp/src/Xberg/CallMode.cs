@@ -15,43 +15,52 @@ namespace Xberg;
 /// type is the stable, serializable surface presets and bindings depend on.
 /// </summary>
 [JsonConverter(typeof(CallModeJsonConverter))]
-public enum CallMode {
-  /// <summary>
-  /// Use the extracted text only.
-  /// </summary>
-  [JsonPropertyName("text_only")] TextOnly,
-  /// <summary>
-  /// Use rasterized page images only.
-  /// </summary>
-  [JsonPropertyName("vision_only")] VisionOnly,
-  /// <summary>
-  /// Provide both extracted text and page images to the model.
-  /// </summary>
-  [JsonPropertyName("text_plus_vision")] TextPlusVision,
+public enum CallMode
+{
+    /// <summary>
+    /// Use the extracted text only.
+    /// </summary>
+    [JsonPropertyName("text_only")]
+    TextOnly,
+    /// <summary>
+    /// Use rasterized page images only.
+    /// </summary>
+    [JsonPropertyName("vision_only")]
+    VisionOnly,
+    /// <summary>
+    /// Provide both extracted text and page images to the model.
+    /// </summary>
+    [JsonPropertyName("text_plus_vision")]
+    TextPlusVision,
 }
 
-/// <summary>
-/// Custom JSON converter for <see cref="CallMode"/> that respects explicit
-/// variant names.
-/// </summary>
-internal sealed class CallModeJsonConverter : JsonConverter<CallMode> {
-  public override CallMode Read(ref Utf8JsonReader reader, Type typeToConvert,
-                                JsonSerializerOptions options) {
-    var value = reader.GetString();
-    return value switch {
-      "text_only" => CallMode.TextOnly, "vision_only" => CallMode.VisionOnly,
-      "text_plus_vision" => CallMode.TextPlusVision,
-      _ => throw new JsonException($"Unknown CallMode value: {value}")
-    };
-  }
 
-  public override void Write(Utf8JsonWriter writer, CallMode value,
-                             JsonSerializerOptions options) {
-    var str = value switch {
-      CallMode.TextOnly => "text_only", CallMode.VisionOnly => "vision_only",
-      CallMode.TextPlusVision => "text_plus_vision",
-      _ => throw new JsonException($"Unknown CallMode value: {value}")
-    };
-    writer.WriteStringValue(str);
-  }
+/// <summary>
+/// Custom JSON converter for <see cref="CallMode"/> that respects explicit variant names.
+/// </summary>
+internal sealed class CallModeJsonConverter : JsonConverter<CallMode>
+{
+    public override CallMode Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return value switch
+        {
+            "text_only" => CallMode.TextOnly,
+            "vision_only" => CallMode.VisionOnly,
+            "text_plus_vision" => CallMode.TextPlusVision,
+            _ => throw new JsonException($"Unknown CallMode value: {value}")
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, CallMode value, JsonSerializerOptions options)
+    {
+        var str = value switch
+        {
+            CallMode.TextOnly => "text_only",
+            CallMode.VisionOnly => "vision_only",
+            CallMode.TextPlusVision => "text_plus_vision",
+            _ => throw new JsonException($"Unknown CallMode value: {value}")
+        };
+        writer.WriteStringValue(str);
+    }
 }

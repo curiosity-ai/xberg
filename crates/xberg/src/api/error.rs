@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 
-use crate::error::XbergError;
+use crate::error::{ApiStatusCategory, XbergError};
 
 use super::types::ErrorResponse;
 
@@ -102,26 +102,7 @@ pub struct ApiError {
 impl ApiError {
     /// Create a new API error.
     pub(crate) fn new(status: StatusCode, error: XbergError) -> Self {
-        let error_type = match &error {
-            XbergError::Validation { .. } => "ValidationError",
-            XbergError::Parsing { .. } => "ParsingError",
-            XbergError::Ocr { .. } => "OCRError",
-            XbergError::Io(_) => "IOError",
-            XbergError::Cache { .. } => "CacheError",
-            XbergError::ImageProcessing { .. } => "ImageProcessingError",
-            XbergError::Serialization { .. } => "SerializationError",
-            XbergError::MissingDependency(_) => "MissingDependencyError",
-            XbergError::Plugin { .. } => "PluginError",
-            XbergError::LockPoisoned(_) => "LockPoisonedError",
-            XbergError::UnsupportedFormat(_) => "UnsupportedFormatError",
-            XbergError::Embedding { .. } => "EmbeddingError",
-            XbergError::Timeout { .. } => "TimeoutError",
-            XbergError::Other(_) => "Error",
-            XbergError::Cancelled => "CancelledError",
-            XbergError::Security { .. } => "SecurityError",
-            XbergError::Transcription { .. } => "TranscriptionError",
-            XbergError::Reranking { .. } => "RerankingError",
-        };
+        let error_type = error.api_error_type();
 
         Self {
             status,
@@ -175,10 +156,10 @@ impl IntoResponse for ApiError {
 
 impl From<XbergError> for ApiError {
     fn from(error: XbergError) -> Self {
-        match &error {
-            XbergError::Validation { .. } | XbergError::UnsupportedFormat(_) => Self::validation(error),
-            XbergError::Parsing { .. } | XbergError::Ocr { .. } => Self::unprocessable(error),
-            _ => Self::internal(error),
+        match error.api_status_category() {
+            ApiStatusCategory::Validation => Self::validation(error),
+            ApiStatusCategory::Unprocessable => Self::unprocessable(error),
+            ApiStatusCategory::Internal => Self::internal(error),
         }
     }
 }
@@ -215,6 +196,87 @@ impl From<JsonRejection> for ApiError {
                 traceback: None,
                 status_code: status.as_u16(),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_use_bad_request_for_validation_and_unsupported_format_errors() {
+        let validation = ApiError::from(XbergError::validation("bad input"));
+        let unsupported = ApiError::from(XbergError::UnsupportedFormat("application/unknown".to_string()));
+
+        assert_eq!(validation.status, StatusCode::BAD_REQUEST);
+        assert_eq!(validation.body.error_type, "ValidationError");
+        assert_eq!(validation.body.status_code, StatusCode::BAD_REQUEST.as_u16());
+
+        assert_eq!(unsupported.status, StatusCode::BAD_REQUEST);
+        assert_eq!(unsupported.body.error_type, "UnsupportedFormatError");
+    }
+
+    #[test]
+    fn should_use_unprocessable_entity_for_parsing_and_ocr_errors() {
+        let parsing = ApiError::from(XbergError::parsing("corrupt file"));
+        let ocr = ApiError::from(XbergError::ocr("ocr failed"));
+
+        assert_eq!(parsing.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(parsing.body.error_type, "ParsingError");
+
+        assert_eq!(ocr.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(ocr.body.error_type, "OCRError");
+    }
+
+    #[test]
+    fn should_use_internal_server_error_for_every_other_variant() {
+        let io = ApiError::from(XbergError::Io(std::io::Error::other("disk failure")));
+        let cancelled = ApiError::from(XbergError::Cancelled);
+        let other = ApiError::from(XbergError::Other("unexpected".to_string()));
+
+        assert_eq!(io.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(io.body.error_type, "IOError");
+
+        assert_eq!(cancelled.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(cancelled.body.error_type, "CancelledError");
+
+        assert_eq!(other.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(other.body.error_type, "Error");
+    }
+
+    #[test]
+    fn should_report_every_variant_error_type_via_api_error_new() {
+        let cases: [(XbergError, &str); 18] = [
+            (XbergError::validation("t"), "ValidationError"),
+            (XbergError::parsing("t"), "ParsingError"),
+            (XbergError::ocr("t"), "OCRError"),
+            (XbergError::Io(std::io::Error::other("t")), "IOError"),
+            (XbergError::cache("t"), "CacheError"),
+            (XbergError::image_processing("t"), "ImageProcessingError"),
+            (XbergError::serialization("t"), "SerializationError"),
+            (XbergError::MissingDependency("t".to_string()), "MissingDependencyError"),
+            (
+                XbergError::Plugin {
+                    message: "t".to_string(),
+                    plugin_name: "p".to_string(),
+                },
+                "PluginError",
+            ),
+            (XbergError::LockPoisoned("t".to_string()), "LockPoisonedError"),
+            (XbergError::UnsupportedFormat("t/mime".to_string()), "UnsupportedFormatError"),
+            (XbergError::embedding("t"), "EmbeddingError"),
+            (XbergError::Timeout { elapsed_ms: 1, limit_ms: 1 }, "TimeoutError"),
+            (XbergError::Other("t".to_string()), "Error"),
+            (XbergError::Cancelled, "CancelledError"),
+            (XbergError::security("t"), "SecurityError"),
+            (XbergError::transcription("t"), "TranscriptionError"),
+            (XbergError::reranking("t"), "RerankingError"),
+        ];
+
+        for (error, expected_type) in cases {
+            let api_error = ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error);
+            assert_eq!(api_error.body.error_type, expected_type);
         }
     }
 }

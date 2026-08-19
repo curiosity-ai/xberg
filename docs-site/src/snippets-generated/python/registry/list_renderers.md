@@ -14,6 +14,7 @@ from xberg import list_renderers, ExtractionConfig
 
 def main() -> None:
     _ = list_renderers()
+    print(result)
 
 main()
 
