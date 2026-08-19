@@ -69,6 +69,9 @@ public sealed class HtmlWalker
         }
         CloseParagraphContext();
         while (_groupStack.Count > 0) { _b.PushGroupEnd(); _groupStack.RemoveAt(_groupStack.Count - 1); }
+
+        if (_b.NodeCount == 0 && _discarded.Length != 0)
+            _b.PushParagraph(_discarded.ToString(), new(), null, null);
     }
 
     private bool Starts(string s) => string.CompareOrdinal(_src, _pos, s, 0, s.Length) == 0 && _pos + s.Length <= _src.Length;
@@ -223,9 +226,15 @@ public sealed class HtmlWalker
         {
             case "head":
             {
-                // Skip the entire head — metadata is handled by a separate scan.
+                // Skip the head — metadata is handled by a separate scan. `<body>` closes it
+                // implicitly, which matters: a document with no `</head>` at all is not one
+                // whose head runs to the last byte, and treating it that way swallowed the
+                // whole file.
                 int close = _src.IndexOf("</head>", _pos, StringComparison.OrdinalIgnoreCase);
-                _pos = close < 0 ? _src.Length : close + "</head>".Length;
+                int body = _src.IndexOf("<body", _pos, StringComparison.OrdinalIgnoreCase);
+                if (close >= 0 && (body < 0 || close < body)) _pos = close + "</head>".Length;
+                else if (body >= 0) _pos = body;
+                else _pos = _src.Length;
                 break;
             }
             case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
@@ -656,8 +665,25 @@ public sealed class HtmlWalker
         DiscardParagraph();
     }
 
+    /// <summary>
+    /// Loose text seen outside any `<p>`, kept only in case the document turns out to have no
+    /// structure at all. Emitting it eagerly is measurably wrong — this walker buffers text in
+    /// places upstream does not, and flushing every block boundary costs far more fixtures than
+    /// it fixes — but a document that produces *nothing* has clearly lost everything, and the
+    /// corpus has several: plain text under an .html name, and markdown whose only wrapper is a
+    /// raw `<div>`.
+    /// </summary>
+    private readonly StringBuilder _discarded = new();
+
     private void DiscardParagraph()
     {
+        string text = _textBuf.ToString().Replace('\x01', '\n').Trim();
+        if (text.Length != 0)
+        {
+            if (_discarded.Length != 0) _discarded.Append('\n');
+            _discarded.Append(text);
+        }
+
         ClearTextBuf();
         _annotations.Clear();
         _inlineStack.Clear();

@@ -233,4 +233,43 @@ public class HtmlExtractorTests
         Assert.Equal(new[] { "Study", "Year" }, t.Cells[0]);
         Assert.Equal(new[] { "A", "2003" }, t.Cells[1]);
     }
+
+    // ── documents with no structure to walk ───────────────────────────────────
+
+    /// <summary>
+    /// A file that is plain text under an .html name still has content. Loose text is normally
+    /// dropped — this walker buffers it in places upstream does not, and flushing at every block
+    /// boundary was measured and costs far more than it fixes — but a document that yields no
+    /// elements at all has clearly lost everything it had.
+    /// </summary>
+    [Fact]
+    public void ADocumentWithNoMarkupFallsBackToItsText()
+    {
+        var doc = Html("Hazard Mitigation Technical Assistance Program\nContract No. EMW-2000-CO-0247\n");
+        var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
+        Assert.Contains("Hazard Mitigation Technical Assistance Program", para.Text);
+    }
+
+    /// <summary>The fallback is only that: a document with real structure is left alone.</summary>
+    [Fact]
+    public void TheFallbackDoesNotFireWhenTheDocumentHasStructure()
+    {
+        var doc = Html("<div>loose</div><p>real</p>");
+        var paragraphs = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).ToList();
+        Assert.Equal(new[] { "real" }, paragraphs.Select(p => p.Text));
+    }
+
+    /// <summary>
+    /// `<body>` closes an unterminated `<head>`. Reading to the end of the file instead skipped
+    /// the whole document, since head content is deliberately not content.
+    /// </summary>
+    [Fact]
+    public void AnUnclosedHeadEndsAtTheBody()
+    {
+        var doc = Html("<HTML>\n<HEAD>\n<TITLE>Ignored</TITLE>\n<body>\n<h2>Real heading</h2>\n<p>Body text</p>\n");
+
+        Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text == "Real heading");
+        Assert.Contains(doc.Elements, e => e.Text == "Body text");
+        Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("Ignored", StringComparison.Ordinal));
+    }
 }

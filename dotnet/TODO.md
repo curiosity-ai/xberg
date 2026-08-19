@@ -6,34 +6,30 @@ Each format is "done" when the `Xberg.TestRunner` output matches the locally gen
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
-> **Status (after the August upstream merge, 1821 Rust commits):** measured against goldens
-> regenerated from the merged `crates/xberg` over the full 2942-fixture corpus:
-> **2295 fixtures (78.0%) match on every hard dimension**; content-parity **82.7% identical,
-> 90.7% ≥95%-similar**; 48 fixtures (<80%) are genuine content misses; **2 catastrophes
-> (0.1%)**. 409 unit tests.
+> **Status (after the August upstream merge, 1821 Rust commits).** The corpus grew when the
+> merge advanced `test_documents`: goldens are now generated for **3165 fixtures**, up from
+> 2942, the new ones being maths-heavy HTML/XML and a large `office/regression` set of
+> real-world HTML.
 >
-> The merge moved the goalposts: these numbers are against *current* upstream behaviour, so
-> they are not comparable with the pre-merge figures they replace. Re-sync fixes so far:
-> markdown smart punctuation and block-level raw HTML, structural rendering for
-> YAML/TOML/JSONL plus `flattened_fields`, a JSON node for every element kind, docx entity
-> refs / inline annotations / page-break accounting, `.msg` PR_HTML binary bodies, the full
-> email header set with CRLF normalization, csv table elements, DocSecurity flags,
-> character counts as Unicode scalars rather than UTF-8 bytes, and — for PDF — scanned-page
-> detection plus serde-faithful float formatting.
+> Against the full 3165: **2340 fixtures (73.9%) match on every hard dimension**;
+> content-parity **79.8% identical, 89.4% ≥95%-similar**; 78 fixtures (<80%) are genuine
+> content misses; **7 catastrophes (0.2%)**, all HTML. 412 unit tests.
 >
-> A later pass took 2122 → 2295 and catastrophes 22 → 2. Ordered by what they were worth:
-> a file's content now overrules its extension when the two disagree (txt 888/975 → 947,
-> which is where the DocTags fixtures lived); attachment text is extracted into the message
-> that carries it, embedded messages included (eml 20/43 → 39, msg 4/16 → 14); `app.xml`
-> titles are sliced by their heading pairs and pptx chart parts are followed (pptx 0/11 → 10);
-> typst's missing branches
-> (0/8 → 7); a drawing's name as alt text when it has no description (docx 34/46 → 40);
-> whole citation records rather than titles alone, and a Table *element* for djot tables
-> (nbib, ris, djot all to full parity); HWP's record tags, whose decimal offsets had been
-> read as hexadecimal; and — for html 10/41 → 27/41 — reserving the columns a rowspan covers,
-> plus dropping a second copy of every table that upstream had already removed; and markdown
-> math, raw inline HTML, pandoc super/subscripts and setext headings (md 671/775 → 708);
-> and notebooks (ipynb 0/6 → 2, metadata 0/6 → 6/6).
+> Against the 2942 the earlier figures used, for continuity: **2295 matching (78.0%)**,
+> content-identical 82.7%, 2 catastrophes. That pass took it from 2122 and catastrophes from
+> 22, and the new fixtures are simply harder — they are the ones nothing has been tuned for.
+>
+> Ordered by what they were worth: a file's content now overrules its extension when the two
+> disagree (txt 888/975 → 947, which is where the DocTags fixtures lived); attachment text is
+> extracted into the message that carries it, embedded messages included (eml 20/43 → 39,
+> msg 4/16 → 14); `app.xml` titles are sliced by their heading pairs and pptx chart parts are
+> followed (pptx 0/11 → 10); typst's missing branches (0/8 → 7); a drawing's name as alt text
+> when it has no description (docx 34/46 → 40); whole citation records rather than titles
+> alone, and a Table *element* for djot tables (nbib, ris, djot all to full parity); HWP's
+> record tags, whose decimal offsets had been read as hexadecimal; reserving the columns a
+> rowspan covers and dropping a second copy of every table that upstream had already removed
+> (html 10/41 → 27/41); markdown math, raw inline HTML, pandoc super/subscripts and setext
+> headings (md 671/775 → 708); and notebooks (ipynb 0/6 → 2, metadata 0/6 → 6/6).
 >
 > Three of those were latent defects the extension/content change exposed rather than caused:
 > the HTML signature test sat behind the generic `<` fallback and was unreachable, and
