@@ -256,7 +256,13 @@ public sealed class PdfMetadata
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public uint? PageCount { get; set; }
 
     /// <summary>Highest per-page scanned-page confidence in the document, in [0, 1].</summary>
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public float? ScannedConfidence { get; set; }
+    /// <remarks>
+    /// Held as a double but always assigned from a <c>float</c>, so it serializes with the same
+    /// digits Rust's <c>f32</c> produces once serde widens it — 0.85f prints as
+    /// <c>0.8500000238418579</c>, not <c>0.85</c>. The value is a single-precision score either
+    /// way; only the printed form differs, and the two must agree byte for byte.
+    /// </remarks>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public double? ScannedConfidence { get; set; }
 
     /// <summary>One-based page numbers graded at or above the configured confidence.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<uint>? ScannedPages { get; set; }

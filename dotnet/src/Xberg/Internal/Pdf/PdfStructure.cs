@@ -155,6 +155,7 @@ public static class PdfStructure
         RefineHeadingHierarchy(allPageParagraphs);
         DemoteUnnumberedSubsections(allPageParagraphs);
         DemoteHeadingRuns(allPageParagraphs);
+        SplitColonSemicolonRunInLists(allPageParagraphs);
 
         // strip_repeating_text default true
         MarkCrossPageRepeatingText(allPageParagraphs, pageHeights);
@@ -162,6 +163,7 @@ public static class PdfStructure
         MarkArxivNoise(allPageParagraphs);
         foreach (var page in allPageParagraphs) RetainPageFurnitureSafely(page);
         DeduplicateParagraphs(allPageParagraphs);
+        CompactFinalHeadingHierarchy(allPageParagraphs);
 
         var doc = AssembleInternalDocument(allPageParagraphs);
 
@@ -894,6 +896,132 @@ public static class PdfStructure
         string.Join(" ", p.Lines.SelectMany(l => l.Segments).Select(s => s.Text));
 
     private static string EffectiveText(PdfParagraph p) => p.Text.Length > 0 ? p.Text : ParagraphPlainText(p);
+
+    /// <summary>Words the lead clause must have before a colon can introduce a run-in list.</summary>
+    private const int RUN_IN_LIST_MIN_LEAD_WORDS = 4;
+    /// <summary>Clauses a run-in list must have; one semicolon is punctuation, not a list.</summary>
+    private const int RUN_IN_LIST_MIN_ITEMS = 2;
+    /// <summary>Words a single clause must have to read as an item rather than an aside.</summary>
+    private const int RUN_IN_LIST_MIN_ITEM_WORDS = 3;
+
+    /// <summary>
+    /// Split "…the following: to exclude x; where y applies; unless z." into a lead paragraph
+    /// and one list item per clause.
+    /// </summary>
+    /// <remarks>
+    /// A run-in list is a list that the typesetter set as prose. Nothing in the geometry marks
+    /// it — there are no bullets and no line breaks — so the only evidence is the colon and the
+    /// semicolon-delimited clauses after it, and the gates are deliberately tight: a lead of
+    /// several words, at least two clauses, and every clause substantial, lowercase-initial and
+    /// clause-terminated. A capitalized clause is a new sentence, not an item.
+    /// </remarks>
+    private static void SplitColonSemicolonRunInLists(List<List<PdfParagraph>> allPageParagraphs)
+    {
+        foreach (var page in allPageParagraphs)
+        {
+            int index = 0;
+            while (index < page.Count)
+            {
+                var replacement = TrySplitRunInList(page[index]);
+                if (replacement is null) { index++; continue; }
+                page.RemoveAt(index);
+                page.InsertRange(index, replacement);
+                index += replacement.Count;
+            }
+        }
+    }
+
+    private static List<PdfParagraph>? TrySplitRunInList(PdfParagraph para)
+    {
+        if (para.HeadingLevel.HasValue || para.IsListItem || para.IsCodeBlock
+            || para.IsFormula || para.IsPageFurniture)
+            return null;
+
+        string normalized = string.Join(" ", EffectiveText(para)
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        int colon = normalized.LastIndexOf(':');
+        if (colon < 0) return null;
+
+        string lead = normalized.Substring(0, colon + 1).Trim();
+        if (WordCount(lead) < RUN_IN_LIST_MIN_LEAD_WORDS) return null;
+
+        string tail = normalized.Substring(colon + 1).TrimStart();
+        if (tail.Length == 0) return null;
+
+        var items = SplitInclusive(tail, ';')
+            .Select(seg => seg.Trim())
+            .Where(seg => seg.Length > 0)
+            .ToList();
+        if (items.Count < RUN_IN_LIST_MIN_ITEMS || !items.All(IsProbableRunInListItem)) return null;
+
+        var split = new List<PdfParagraph>(items.Count + 1) { RunInListFragment(para, lead, false) };
+        foreach (var item in items) split.Add(RunInListFragment(para, item, true));
+        return split;
+    }
+
+    /// <summary>Split on <paramref name="sep"/>, keeping it at the end of each piece.</summary>
+    private static List<string> SplitInclusive(string text, char sep)
+    {
+        var parts = new List<string>();
+        int start = 0;
+        for (int i = 0; i < text.Length; i++)
+            if (text[i] == sep) { parts.Add(text.Substring(start, i - start + 1)); start = i + 1; }
+        if (start < text.Length) parts.Add(text.Substring(start));
+        return parts;
+    }
+
+    /// <summary>
+    /// Whether one semicolon-delimited clause reads as a genuine list item: substantial, a
+    /// lowercase continuation of the lead sentence rather than a new capitalized one, and
+    /// clause-terminated.
+    /// </summary>
+    private static bool IsProbableRunInListItem(string item)
+    {
+        if (WordCount(item) < RUN_IN_LIST_MIN_ITEM_WORDS) return false;
+        if (item.Length == 0 || !char.IsLower(item[0])) return false;
+        return item[^1] is ';' or '.';
+    }
+
+    /// <summary>One split-off fragment, inheriting the source's non-textual attributes.</summary>
+    private static PdfParagraph RunInListFragment(PdfParagraph source, string text, bool isListItem) => new()
+    {
+        Text = text,
+        Lines = new(),
+        DominantFontSize = source.DominantFontSize,
+        HeadingLevel = null,
+        IsBold = source.IsBold,
+        IsListItem = isListItem,
+        IsCodeBlock = false,
+        IsFormula = false,
+        IsPageFurniture = source.IsPageFurniture,
+        BlockBbox = source.BlockBbox,
+        WordCount = WordCount(text),
+    };
+
+    /// <summary>
+    /// Close a one-level hole in the heading hierarchy: a document with exactly one H1, no H2 at
+    /// all and something at H3 or below has skipped a level, so everything below H2 moves up one.
+    /// </summary>
+    /// <remarks>
+    /// Only that exact shape qualifies. A document with several H1s has no single title for the
+    /// deeper levels to hang from, and one that already uses H2 has no hole to close.
+    /// </remarks>
+    private static void CompactFinalHeadingHierarchy(List<List<PdfParagraph>> allPages)
+    {
+        int h1Count = 0;
+        bool hasH2 = false, hasDeeper = false;
+        foreach (var para in allPages.SelectMany(p => p))
+        {
+            if (para.HeadingLevel is not byte level) continue;
+            if (level == 1) h1Count++;
+            if (level == 2) hasH2 = true;
+            if (level >= 3) hasDeeper = true;
+        }
+        if (h1Count != 1 || hasH2 || !hasDeeper) return;
+
+        foreach (var para in allPages.SelectMany(p => p))
+            if (para.HeadingLevel is byte level && level >= 3) para.HeadingLevel = (byte)(level - 1);
+    }
 
     private static void RefineHeadingHierarchy(List<List<PdfParagraph>> allPages)
     {

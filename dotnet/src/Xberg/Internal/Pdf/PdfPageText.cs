@@ -329,6 +329,8 @@ public static class PdfPageText
     {
         Text = s.Text, X = s.X, Y = s.Y, Width = s.Width, Height = s.Height,
         FontSize = s.FontSize, IsBold = s.IsBold, IsItalic = s.IsItalic, IsMonospace = s.IsMonospace,
+        FontName = s.FontName, RotationDegrees = s.RotationDegrees, TextRiseRatio = s.TextRiseRatio,
+        Sequence = s.Sequence,
     };
 
     // Port of is_fragmented_span_list (oxide/text.rs).

@@ -32,6 +32,10 @@ public sealed class TextSpan
     public bool IsItalic;
     public bool IsMonospace;
 
+    /// <summary>The font's <c>/BaseFont</c> name. A change of it across a span boundary is a
+    /// font-run transition, which producers frequently leave without an explicit space glyph.</summary>
+    public string FontName = "";
+
     /// <summary>Text-matrix rotation in degrees; 0 for upright text.</summary>
     public double RotationDegrees;
 
@@ -89,6 +93,7 @@ public sealed class PdfContentExtractor
         public double UserHScale;              // sqrt(a²+c²) of combined matrix
         public double EffFontSize;             // font_size * sqrt(b²+d²)
         public bool IsBold, IsItalic, IsMonospace;
+        public string FontName = "";
         public bool HasRtl;
         public double RotationDegrees;         // atan2(b, a) of the combined matrix
     }
@@ -303,6 +308,7 @@ public sealed class PdfContentExtractor
             IsBold = false,
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = false,
+            FontName = _gs.Font?.BaseFont ?? "",
             RotationDegrees = RotationOf(combined),
             Sequence = _spans.Count,
         });
@@ -321,6 +327,7 @@ public sealed class PdfContentExtractor
             IsBold = _gs.Font?.IsBold ?? false,
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = _gs.Font?.IsMonospace ?? false,
+            FontName = _gs.Font?.BaseFont ?? "",
             RiseRatio = _gs.FontSize != 0 ? _gs.Rise / _gs.FontSize : 0,
         };
     }
@@ -347,6 +354,7 @@ public sealed class PdfContentExtractor
             IsBold = b.IsBold,
             IsItalic = b.IsItalic,
             IsMonospace = b.IsMonospace,
+            FontName = b.FontName,
             RotationDegrees = b.RotationDegrees,
             TextRiseRatio = b.RiseRatio,
             Sequence = _spans.Count,
