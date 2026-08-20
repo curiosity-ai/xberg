@@ -858,25 +858,64 @@ internal static class PdfTableReconstruct
 
     // ── is_well_formed_table (pdf/table_reconstruct.rs) ──────────────────────
 
-    internal static bool IsWellFormedTable(List<List<string>> grid)
+    // ── is_well_formed_table (pdf/table_reconstruct.rs) ─────────────────────
+
+    private const int DenseNumericMinDataRows = 6;
+    private const int DenseNumericMinColumns = 6;
+    private const int DenseNumericMinCellPercent = 75;
+    private const int ShortWideMaxDataRows = 2;
+    private const int ShortWideMinColumns = 6;
+    private const int ShortWideMaxEmptyCellPercent = 35;
+    private const int LargeTableMinColumns = 6;
+    private const int DefaultMaxEmptyCellPercent = 40;
+
+    /// <summary>
+    /// Whether a reconstructed grid is a real table rather than multi-column prose, a repeated
+    /// page element or low-vocabulary boilerplate. Ports <c>is_well_formed_table_core</c>.
+    /// </summary>
+    /// <param name="skipColumnarProseGuard">
+    /// Drops only the uniform-column-length prose heuristic, for callers that have already vetted
+    /// the region geometrically: a genuine key-value grid has the regular short columns that
+    /// heuristic mistakes for wrapped prose. Every other guard still applies.
+    /// </param>
+    internal static bool IsWellFormedTable(List<List<string>> grid, bool skipColumnarProseGuard = false)
     {
         if (grid.Count < 2) return false;
         int numCols = grid[0].Count;
         if (numCols < 2) return false;
 
-        // Check 0: cell density.
+        bool denseNumericGrid = IsDenseNumericGrid(grid);
+
+        // Check 0: cell density. A short, wide grid is allowed to be emptier — its shape is the
+        // evidence, not its fill — unless it is already a dense numeric grid.
+        int dataRowCount = grid.Count - 1;
+        int maxEmptyCellPercent =
+            dataRowCount <= ShortWideMaxDataRows && numCols >= ShortWideMinColumns && !denseNumericGrid
+                ? ShortWideMaxEmptyCellPercent
+                : DefaultMaxEmptyCellPercent;
         int maxCols = grid.Max(r => r.Count);
         int totalCells = grid.Count * maxCols;
         if (totalCells > 0)
         {
             int filled = grid.SelectMany(r => r).Count(cell => cell.Trim().Length > 0);
             int emptyCells = totalCells - filled;
-            if (emptyCells * 100 > totalCells * 40) return false;
+            if (emptyCells * 100 > totalCells * maxEmptyCellPercent) return false;
         }
 
         var dataRows = grid.GetRange(1, grid.Count - 1);
 
-        // Check 1: row coherence (prose detection).
+        // Check 1: a wide grid of one or two rows, every one of them a clause of a shredded
+        // semicolon-delimited list rather than table data.
+        if (dataRows.Count is >= 1 and < 3 && numCols >= LargeTableMinColumns && !denseNumericGrid)
+        {
+            if (dataRows.All(row => LooksLikeShreddedProseRow(row, numCols))) return false;
+        }
+
+        // Check 2: a one- or two-row grid that is really wrapped prose split across columns.
+        if (dataRows.Count > 0 && !denseNumericGrid && LooksLikeShortColumnedProse(dataRows, numCols))
+            return false;
+
+        // Check 3: row coherence (prose detection).
         if (dataRows.Count >= 3 && numCols >= 2)
         {
             int proseLike = 0, eligible = 0;
@@ -885,19 +924,15 @@ internal static class PdfTableReconstruct
                 string concatenated = string.Join(" ", row.Select(c => c.Trim()).Where(c => c.Length > 0));
                 if (Utf8Len(concatenated) < 15) continue;
                 eligible++;
-                int alpha = 0;
-                foreach (var rune in concatenated.EnumerateRunes())
-                    if (System.Text.Rune.IsLetter(rune) || System.Text.Rune.IsWhiteSpace(rune)) alpha++;
-                double alphaRatio = (double)alpha / Utf8Len(concatenated);
-                if (alphaRatio > 0.8) proseLike++;
+                if (AlphaRatio(concatenated) > 0.8) proseLike++;
             }
             if (eligible >= 3 && proseLike * 2 > eligible) return false;
         }
 
-        // Check 2: column semantic uniformity.
+        // Check 4: column semantic uniformity.
         if (numCols >= 3 && dataRows.Count >= 4)
         {
-            var colStats = new (double mean, double stddev)[numCols];
+            var colStats = new (double Mean, double StdDev)[numCols];
             for (int c = 0; c < numCols; c++)
             {
                 var lengths = new List<double>();
@@ -911,30 +946,30 @@ internal static class PdfTableReconstruct
                 double variance = lengths.Sum(l => (l - mean) * (l - mean)) / lengths.Count;
                 colStats[c] = (mean, Math.Sqrt(variance));
             }
-            var meaningful = colStats.Where(s => s.mean > 3.0).ToList();
+            var meaningful = colStats.Where(st => st.Mean > 3.0).ToList();
             if (meaningful.Count >= 3)
             {
-                double minMean = meaningful.Min(s => s.mean);
-                double maxMean = meaningful.Max(s => s.mean);
+                double minMean = meaningful.Min(st => st.Mean);
+                double maxMean = meaningful.Max(st => st.Mean);
                 bool columnsUniform = minMean > 0.0 && maxMean <= minMean * 2.0;
-                bool lowVariance = meaningful.All(s => s.mean > 0.0 && s.stddev / s.mean < 0.3);
-                if (columnsUniform && lowVariance) return false;
+                bool lowVariance = meaningful.All(st => st.Mean > 0.0 && st.StdDev / st.Mean < 0.3);
+                if (!skipColumnarProseGuard && !denseNumericGrid && columnsUniform && lowVariance) return false;
             }
         }
 
-        // Check 3: minimum meaningful content (repetitive vocabulary).
+        // Check 5: minimum meaningful content (repetitive vocabulary).
         if (numCols >= 3)
         {
-            var uniqueWords = new HashSet<string>();
+            var uniqueWords = new HashSet<string>(StringComparer.Ordinal);
             foreach (var row in dataRows)
                 foreach (var cell in row)
                     foreach (var w in SplitWhitespace(cell))
                         uniqueWords.Add(w);
             int rowCount = dataRows.Count;
-            if (rowCount >= 3 && uniqueWords.Count < rowCount * 2) return false;
+            if (!denseNumericGrid && rowCount >= 3 && uniqueWords.Count < rowCount * 2) return false;
         }
 
-        // Check 4: repeated header detection.
+        // Check 6: repeated header detection.
         {
             var header = grid[0];
             int headerMatches = dataRows.Count(row =>
@@ -943,6 +978,133 @@ internal static class PdfTableReconstruct
         }
 
         return true;
+    }
+
+    /// <summary>Fraction of a string that is letters or whitespace, measured over UTF-8 bytes.</summary>
+    private static double AlphaRatio(string text)
+    {
+        int len = Utf8Len(text);
+        if (len == 0) return 0.0;
+        int alpha = 0;
+        foreach (var rune in text.EnumerateRunes())
+            if (System.Text.Rune.IsLetter(rune) || System.Text.Rune.IsWhiteSpace(rune)) alpha++;
+        return (double)alpha / len;
+    }
+
+    /// <summary>A cell holding at least one digit, and at least as many digits as other letters.</summary>
+    private static bool IsNumericValueCell(string cell)
+    {
+        int digits = cell.Count(char.IsAsciiDigit);
+        if (digits == 0) return false;
+        int alphanumeric = cell.Count(char.IsLetterOrDigit);
+        return digits * 2 >= alphanumeric;
+    }
+
+    /// <summary>A cell with letters in it that is not a numeric value — the signal of wrapped prose.</summary>
+    private static bool IsWordCell(string cell) => !IsNumericValueCell(cell) && cell.Any(char.IsLetter);
+
+    /// <summary>
+    /// A large grid whose data cells are overwhelmingly numeric. Such a grid is exempt from the
+    /// prose guards: a ledger's regular short columns look exactly like wrapped columnar prose to
+    /// them.
+    /// </summary>
+    private static bool IsDenseNumericGrid(List<List<string>> grid)
+    {
+        if (grid.Count == 0) return false;
+        if (grid[0].Count < DenseNumericMinColumns || grid.Count <= DenseNumericMinDataRows) return false;
+
+        int nonEmpty = 0, numeric = 0;
+        for (int r = 1; r < grid.Count; r++)
+            foreach (var cell in grid[r])
+            {
+                string trimmed = cell.Trim();
+                if (trimmed.Length == 0) continue;
+                nonEmpty++;
+                if (IsNumericValueCell(trimmed)) numeric++;
+            }
+
+        return nonEmpty > 0 && numeric * 100 >= nonEmpty * DenseNumericMinCellPercent;
+    }
+
+    private const int ShreddedProseMinFilledCells = 4;
+    private const double ShreddedProseMaxAvgWordsPerCell = 2.5;
+    private const int ShreddedProseMinRowTextLen = 30;
+
+    /// <summary>
+    /// Whether one data row reads as a clause of a word-shredded, semicolon-delimited prose list:
+    /// most columns filled (a real wrapped-table row leaves many empty), few words per cell, a
+    /// substantial run of text, and clause-terminal punctuation at the end.
+    /// </summary>
+    private static bool LooksLikeShreddedProseRow(List<string> row, int numCols)
+    {
+        var cells = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+        if (cells.Count < ShreddedProseMinFilledCells) return false;
+        if (numCols == 0 || cells.Count <= numCols * 0.5) return false;
+        if (cells.Sum(Utf8Len) < ShreddedProseMinRowTextLen) return false;
+
+        double avgWords = (double)cells.Sum(c => SplitWhitespace(c).Count()) / cells.Count;
+        if (avgWords > ShreddedProseMaxAvgWordsPerCell) return false;
+
+        string last = cells[^1];
+        return last.Length > 0 && last[^1] is ';' or ':' or '.' or ',';
+    }
+
+    private const double ShortProseWordsPerCell = 4.0;
+    private const double ShortProseAlphaRatio = 0.8;
+    private const int ShortProseMinConcatLen = 15;
+    private const int ShortProseNumericExemptPercent = 30;
+    private const int MinShreddedWordCells = 4;
+    private const double ShreddedMaxAvgWords = 2.5;
+    private const double ShreddedMinWordCellFraction = 0.6;
+
+    /// <summary>
+    /// Whether a short grid is a wrapped-prose passage split across columns rather than a table.
+    /// Closes the hole the row-count-gated guards leave: with one or two data rows there is no
+    /// cross-row evidence, so a reflowed paragraph reaches acceptance untouched.
+    /// </summary>
+    /// <remarks>
+    /// Two prose shapes, each judged per row: cells averaging four or more words in an alphabetic
+    /// row (columns of phrases), and a wide row of thin mostly-word cells (a line chopped into
+    /// one-word columns). A grid that is at least 30% numeric-value cells is exempt outright —
+    /// a real short table is mostly values, prose with a stray number is not.
+    /// </remarks>
+    private static bool LooksLikeShortColumnedProse(List<List<string>> dataRows, int numCols)
+    {
+        if (numCols < 2) return false;
+
+        int filledCells = 0, numericValueCells = 0;
+        foreach (var row in dataRows)
+            foreach (var cell in row)
+            {
+                string trimmed = cell.Trim();
+                if (trimmed.Length == 0) continue;
+                filledCells++;
+                if (IsNumericValueCell(trimmed)) numericValueCells++;
+            }
+        if (filledCells == 0) return false;
+        if (numericValueCells * 100 >= filledCells * ShortProseNumericExemptPercent) return false;
+
+        int eligibleRows = 0, proseRows = 0;
+        foreach (var row in dataRows)
+        {
+            var cells = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+            if (cells.Count < 2) continue;
+            string concatenated = string.Join(" ", cells);
+            if (Utf8Len(concatenated) < ShortProseMinConcatLen) continue;
+            eligibleRows++;
+
+            double avgWords = (double)cells.Sum(c => SplitWhitespace(c).Count()) / cells.Count;
+            bool isPhraseProse = avgWords >= ShortProseWordsPerCell && AlphaRatio(concatenated) > ShortProseAlphaRatio;
+
+            int wordCells = cells.Count(IsWordCell);
+            bool isShreddedProse = cells.Count >= MinShreddedWordCells
+                && avgWords <= ShreddedMaxAvgWords
+                && wordCells >= cells.Count * ShreddedMinWordCellFraction;
+
+            if (isPhraseProse || isShreddedProse) proseRows++;
+        }
+
+        return eligibleRows >= 1 && proseRows * 2 > eligibleRows;
     }
 
     // ── looks_like_code_listing (pdf/table_reconstruct.rs) ───────────────────

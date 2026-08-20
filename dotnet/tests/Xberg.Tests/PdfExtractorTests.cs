@@ -704,3 +704,59 @@ public class PdfListMarkerTests
         Assert.False(PdfListMarker.IsProbableAuthorByline("A. First item in a list"));
     }
 }
+
+/// <summary>
+/// Tests for the reconstructed-grid admission test (<see cref="PdfTableReconstruct"/>).
+/// </summary>
+public class PdfTableWellFormednessTests
+{
+    private static List<List<string>> Grid(params string[][] rows) =>
+        rows.Select(r => r.ToList()).ToList();
+
+    /// <summary>A plain two-column grid of short values is a table.</summary>
+    [Fact]
+    public void AShortValueGridIsATable()
+    {
+        Assert.True(PdfTableReconstruct.IsWellFormedTable(Grid(
+            ["Region", "Units"],
+            ["North", "412"],
+            ["South", "377"],
+            ["West", "1,204"])));
+    }
+
+    /// <summary>
+    /// A single paragraph chopped into one-word columns has no cross-row evidence to average
+    /// over, which is why the row-count-gated guards miss it and it needs its own.
+    /// </summary>
+    [Fact]
+    public void ALineShreddedIntoWordColumnsIsNotATable()
+    {
+        Assert.False(PdfTableReconstruct.IsWellFormedTable(Grid(
+            ["the", "quick", "brown", "fox", "jumps"],
+            ["over", "the", "lazy", "dog", "again"])));
+    }
+
+    /// <summary>
+    /// A ledger's regular short columns look exactly like wrapped columnar prose to the
+    /// uniformity guard, so a grid this numeric is exempt from it.
+    /// </summary>
+    [Fact]
+    public void ADenseNumericLedgerSurvivesTheProseGuards()
+    {
+        var rows = new List<List<string>> { new() { "Acct", "Q1", "Q2", "Q3", "Q4", "Total" } };
+        for (int i = 0; i < 8; i++)
+            rows.Add(new List<string> { $"100{i}", "1,204", "1,318", "1,127", "1,402", "5,051" });
+
+        Assert.True(PdfTableReconstruct.IsWellFormedTable(rows));
+    }
+
+    /// <summary>A header repeated in the body is a page element caught on every page.</summary>
+    [Fact]
+    public void ARepeatedHeaderIsNotATable()
+    {
+        Assert.False(PdfTableReconstruct.IsWellFormedTable(Grid(
+            ["Name", "Value"],
+            ["Name", "Value"],
+            ["Name", "Value"])));
+    }
+}
