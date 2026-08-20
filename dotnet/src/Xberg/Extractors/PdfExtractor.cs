@@ -228,7 +228,8 @@ public sealed class PdfExtractor : IExtractor
                         spans = OxSpanBridge.ToPdfSpans(
                             Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPageText(pdf, i).Spans);
                     var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
-                    (pageText, var lines) = PdfPageText.AssembleWithLines(spans, Math.Abs(mbUrx - mbLlx));
+                    (pageText, var lines) = PdfPageText.AssembleWithLines(
+                        spans, Math.Abs(mbUrx - mbLlx), spansArePostProcessed: UsePortedSpans);
                     segs = PdfStructure.SegmentsFromLines(lines);
                     words = PdfSpatialTables.SpansToWords(spans);
                     paths = extractor.Paths;

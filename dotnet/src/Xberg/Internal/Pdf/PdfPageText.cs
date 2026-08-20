@@ -42,9 +42,16 @@ public static class PdfPageText
 
     /// <summary>Assemble + line segments from ONE ordering pass (the ordering —
     /// presort, run merge, XY-cut, column repair — dominates cost on large documents).</summary>
-    public static (string text, List<LineSeg> lines) AssembleWithLines(List<TextSpan> spans, double pageWidth = 0)
+    /// <param name="spansArePostProcessed">
+    /// True when the spans already came through the ported pdf_oxide extractor, which sorts
+    /// them into reading order, drops double-drawn glyphs and reattaches off-baseline runs
+    /// itself. Repeating those here with this port's older approximations of the same three
+    /// passes changes text that was already right.
+    /// </param>
+    public static (string text, List<LineSeg> lines) AssembleWithLines(
+        List<TextSpan> spans, double pageWidth = 0, bool spansArePostProcessed = false)
     {
-        var ordering = OrderViaRuns(spans, pageWidth);
+        var ordering = OrderViaRuns(spans, pageWidth, spansArePostProcessed);
         return (AssembleOrdered(ordering), BuildLineSegmentsOrdered(ordering));
     }
 
@@ -117,8 +124,11 @@ public static class PdfPageText
     // extractors/text.rs), order the runs with XY-cut, then flatten back to the original
     // spans in run order. Runs are used ONLY for reading-order geometry; assembly still
     // walks the original spans so spacing/line-break decisions are unchanged.
-    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(List<TextSpan> spans, double pageWidth = 0)
+    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(
+        List<TextSpan> spans, double pageWidth = 0, bool spansArePostProcessed = false)
     {
+        if (!spansArePostProcessed)
+        {
         // pdf_oxide sorts spans into reading order (rounded-Y descending, X
         // ascending, column-aware) BEFORE merge_adjacent_spans (extractors/
         // text.rs :: sort_spans_by_reading_order). Without this, show-ops that
@@ -135,6 +145,7 @@ public static class PdfPageText
         // Off-baseline glyphs go back onto the words they modify before anything groups spans
         // into lines; a raised digit left on its own drifts to wherever its baseline band sorts.
         PdfSubSuperscript.Merge(spans);
+        }
 
         var runs = new List<TextSpan>();
         var members = new List<List<int>>();
