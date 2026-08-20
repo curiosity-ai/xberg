@@ -139,6 +139,16 @@ public sealed class PdfExtractor : IExtractor
         doc.Metadata.Additional["extraction_method"] =
             System.Text.Json.JsonSerializer.SerializeToElement("native");
 
+        // /PageLabels — one display label per page, index-aligned with the page structure.
+        // Metadata has no field for it, so it rides in `additional`, as upstream does.
+        try
+        {
+            if (PdfPageLabels.ExtractAll(pdf) is { } pageLabels)
+                doc.Metadata.Additional["page_labels"] =
+                    System.Text.Json.JsonSerializer.SerializeToElement(pageLabels);
+        }
+        catch { }
+
         if (meta.IsEncrypted && pdf.Decryptor is null && nativeText.Length == 0)
             doc.ProcessingWarnings.Add(new ProcessingWarning
             {
