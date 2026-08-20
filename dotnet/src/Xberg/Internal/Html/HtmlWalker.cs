@@ -948,6 +948,46 @@ public sealed class HtmlWalker
     // Quote-aware attribute lookup: tokenizes the attribute string so a `name=` sequence inside
     // a quoted value (e.g. `?title=` in an href query string) is never mistaken for the attribute.
     // Returns null when absent, "" when present with an empty/omitted value.
+    /// <summary>
+    /// The element's attributes in source order, each as its name and its value (null when the
+    /// attribute was written with no value at all).
+    /// </summary>
+    internal static IEnumerable<(string Key, string? Value)> EnumerateAttributes(string attrs)
+    {
+        int i = 0, n = attrs.Length;
+        while (i < n)
+        {
+            while (i < n && char.IsWhiteSpace(attrs[i])) i++;
+            if (i >= n) break;
+            int ks = i;
+            while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
+            string key = attrs[ks..i];
+            while (i < n && char.IsWhiteSpace(attrs[i])) i++;
+            string? value = null;
+            if (i < n && attrs[i] == '=')
+            {
+                i++;
+                while (i < n && char.IsWhiteSpace(attrs[i])) i++;
+                if (i < n && (attrs[i] == '"' || attrs[i] == '\''))
+                {
+                    char q = attrs[i++];
+                    int vs = i;
+                    while (i < n && attrs[i] != q) i++;
+                    value = attrs[vs..i];
+                    if (i < n) i++;
+                }
+                else
+                {
+                    int vs = i;
+                    while (i < n && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>') i++;
+                    value = attrs[vs..i];
+                }
+            }
+            if (key.Length == 0) { i++; continue; }
+            yield return (key, value);
+        }
+    }
+
     internal static string? ExtractAttr(string attrs, string name)
     {
         int i = 0, n = attrs.Length;

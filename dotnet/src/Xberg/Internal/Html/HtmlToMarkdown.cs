@@ -345,7 +345,10 @@ internal static class HtmlToMarkdown
             case "html": case "body":
                 WalkChildren(node, output, ctx);
                 break;
-            case "audio": case "video": case "picture": case "iframe": case "svg": case "math":
+            case "math":
+                HandleMath(node, output, ctx);
+                break;
+            case "audio": case "video": case "picture": case "iframe": case "svg":
             case "object": case "embed": case "canvas": case "map": case "area":
                 break; // media handlers: not ported (no output for defaults)
             case "form": case "fieldset": case "legend": case "label": case "input":
@@ -1103,6 +1106,70 @@ internal static class HtmlToMarkdown
         int relEnd = url.IndexOf(')', parenStart);
         if (relEnd < 0 || parenStart >= relEnd) return url;
         return url[parenStart..relEnd];
+    }
+
+    // ── MathML (media/svg.rs) ────────────────────────────────────────────────
+    /// <summary>
+    /// Emit a `&lt;math&gt;` element as its serialized source in an HTML comment followed by its
+    /// text content, which is what the extractor reads the equations back out of.
+    /// </summary>
+    private static void HandleMath(HNode node, StringBuilder output, Ctx ctx)
+    {
+        string textContent = CollectRawText(node).Trim();
+        if (textContent.Length == 0) return;
+
+        bool isDisplayBlock = node.Attr("display") == "block";
+        bool separated = isDisplayBlock && !ctx.InParagraph && !ctx.ConvertAsInline;
+
+        if (separated) output.Append("\n\n");
+        output.Append("<!-- MathML: ").Append(SerializeElement(node)).Append(" --> ").Append(textContent);
+        if (separated) output.Append("\n\n");
+    }
+
+    /// <summary>The concatenated text of a node's descendants, entity references resolved.</summary>
+    private static string CollectRawText(HNode node)
+    {
+        var sb = new StringBuilder();
+        void Walk(HNode n)
+        {
+            foreach (var c in n.Children)
+            {
+                if (c.IsComment) continue;
+                if (c.Tag is null) sb.Append(HtmlWalker.DecodeEntitiesFull(c.Text));
+                else Walk(c);
+            }
+        }
+        Walk(node);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Re-serialize an element and its subtree. A childless element closes itself with
+    /// <c>&lt;tag /&gt;</c>, matching the crate's serializer.
+    /// </summary>
+    private static string SerializeElement(HNode node)
+    {
+        // Text is serialized with its character references already resolved, which is how the
+        // MathML in the comment comes out reading `⁡` rather than `&ApplyFunction;`.
+        if (node.Tag is null) return node.IsComment ? "" : HtmlWalker.DecodeEntitiesFull(node.Text);
+
+        var sb = new StringBuilder(256);
+        sb.Append('<').Append(node.Tag);
+        // Attributes come out sorted by name: the parser upstream serializes from keeps them in
+        // a sorted map, so `stretchy="false" scriptlevel="+1"` is written the other way round.
+        foreach (var (key, value) in HtmlWalker.EnumerateAttributes(node.AttrString)
+                     .OrderBy(a => a.Key, StringComparer.Ordinal))
+        {
+            sb.Append(' ').Append(key);
+            if (value is not null) sb.Append("=\"").Append(value).Append('"');
+        }
+
+        if (node.Children.Count == 0) { sb.Append(" />"); return sb.ToString(); }
+
+        sb.Append('>');
+        foreach (var child in node.Children) sb.Append(SerializeElement(child));
+        sb.Append("</").Append(node.Tag).Append('>');
+        return sb.ToString();
     }
 
     // ── image (handlers/image.rs) ────────────────────────────────────────────
