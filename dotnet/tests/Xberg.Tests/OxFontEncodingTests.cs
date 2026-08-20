@@ -550,7 +550,7 @@ public class OxFontEncodingTests
     // CharacterMapper priority chain
     // ==========================================================================
 
-    private sealed class StubCMap : IOxCMap
+    private sealed class StubCMap : IOxToUnicodeLookup
     {
         private readonly Dictionary<uint, string> _map;
 

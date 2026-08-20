@@ -17,7 +17,7 @@ namespace Xberg.Internal.PdfOxide.Fonts;
 /// code → Unicode lookup that <see cref="OxCharacterMapper"/> needs is declared here; the
 /// concrete CMap is adapted onto this interface.
 /// </summary>
-internal interface IOxCMap
+internal interface IOxToUnicodeLookup
 {
     /// <summary>The Unicode string mapped to <paramref name="code"/>, or null on a miss.</summary>
     string? Get(uint code);
@@ -52,7 +52,7 @@ internal sealed class OxCharacterMapper
     internal static Func<string, ushort, uint?>? CidMappingLookup { get; set; }
 
     // Priority 1: ToUnicode CMap (explicit character code to Unicode mapping).
-    private IOxCMap? _toUnicodeCMap;
+    private IOxToUnicodeLookup? _toUnicodeCMap;
 
     // Priority 3: predefined CMap config for CID-to-Unicode lookup.
     private OxPredefinedCMapConfig? _predefinedCMap;
@@ -60,7 +60,7 @@ internal sealed class OxCharacterMapper
     // Priority 5: font encoding (character code to character).
     private Dictionary<uint, Rune>? _fontEncoding;
 
-    internal void SetToUnicodeCMap(IOxCMap? cmap) => _toUnicodeCMap = cmap;
+    internal void SetToUnicodeCMap(IOxToUnicodeLookup? cmap) => _toUnicodeCMap = cmap;
 
     internal void SetPredefinedCMap(OxPredefinedCMapConfig? config) => _predefinedCMap = config;
 
