@@ -42,20 +42,27 @@ public sealed class PdfExtractor : IExtractor
             || config.OutputFormat.Equals(OutputFormat.Djot)
             || config.OutputFormat.Equals(OutputFormat.Html);
 
-        string nativeText = ExtractTextAndSegments(pdf, deadline, out var pageSegments);
+        string nativeText = ExtractTextAndSegments(pdf, deadline, out var pageSegments,
+            out var pageWords, out var pagePaths);
 
         // --- Metadata ---
         var meta = PdfMetadataExtractor.Extract(pdf);
         // Advisory: a document we cannot grade reports no scan evidence.
         var scanDetection = PdfScanDetect.Detect(pdf);
 
-        // --- Tables (text-layer heuristic tier) ---
-        // Mirrors the Rust three-tier detector, minus pdf_oxide's native/bordered
-        // ruling-line grid passes (no managed equivalent). Extract regardless of
-        // output format — tables live in the result independent of `content`.
-        List<Xberg.Types.Table> tables;
-        try { tables = PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false); }
-        catch { tables = new List<Xberg.Types.Table>(); }
+        // --- Tables: native → bordered → heuristic, each tier only on pages the
+        // previous one left empty (crates/xberg/src/extractors/pdf/extraction.rs).
+        // Extracted regardless of output format — tables live in the result
+        // independent of `content`.
+        var tables = new List<Xberg.Types.Table>();
+        try { tables.AddRange(ExtractRuledTables(pageWords, pagePaths, TableDetectionConfig.Strict(), null)); }
+        catch { }
+        var nativePages = new HashSet<uint>(tables.Select(t => t.PageNumber));
+        try { tables.AddRange(ExtractRuledTables(pageWords, pagePaths, TableDetectionConfig.Bordered(), nativePages)); }
+        catch { }
+        var coveredPages = new HashSet<uint>(tables.Select(t => t.PageNumber));
+        try { tables.AddRange(PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false, coveredPages)); }
+        catch { }
         foreach (var table in tables) PdfTableNormalize.RepairConsistentlyMergedNumericColumn(table);
 
         // --- Build InternalDocument ---
@@ -66,7 +73,7 @@ public sealed class PdfExtractor : IExtractor
         InternalDocument? structured = null;
         if (needsStructured)
         {
-            try { structured = PdfStructure.Build(pageSegments); }
+            try { structured = PdfStructure.Build(pageSegments, ruledTables: tables); }
             catch { structured = null; }
         }
 
@@ -141,12 +148,34 @@ public sealed class PdfExtractor : IExtractor
 
     // Single per-page pass: parse each page's content stream once, then derive both the
     // assembled page text (returned, joined by blank lines) and the font-metric
+    /// <summary>
+    /// Run one ruling-line tier over every page the previous tier left uncovered.
+    /// </summary>
+    private static List<Xberg.Types.Table> ExtractRuledTables(
+        List<List<TableSpan>> pageWords, List<List<PdfPath>> pagePaths,
+        TableDetectionConfig config, HashSet<uint>? skipPages)
+    {
+        var tables = new List<Xberg.Types.Table>();
+        for (int i = 0; i < pageWords.Count && i < pagePaths.Count; i++)
+        {
+            uint pageNumber = (uint)(i + 1);
+            if (skipPages is not null && skipPages.Contains(pageNumber)) continue;
+            try { tables.AddRange(PdfSpatialTables.DetectPageTables(pageWords[i], pagePaths[i], pageNumber, config)); }
+            catch { }
+        }
+        return tables;
+    }
+
     // SegmentData grid (out param) used for tables and heading structure. Mirrors Rust
     // `oxide::text::extract_text` + `oxide::hierarchy::extract_all_segments` sharing spans.
-    private static string ExtractTextAndSegments(PdfDocument pdf, long deadline, out List<List<SegmentData>> pageSegments)
+    private static string ExtractTextAndSegments(
+        PdfDocument pdf, long deadline, out List<List<SegmentData>> pageSegments,
+        out List<List<TableSpan>> pageWords, out List<List<PdfPath>> pagePaths)
     {
         int pageCount = pdf.PageCount;
         pageSegments = new List<List<SegmentData>>(pageCount);
+        pageWords = new List<List<TableSpan>>(pageCount);
+        pagePaths = new List<List<PdfPath>>(pageCount);
         var sb = new System.Text.StringBuilder();
 
         for (int i = 0; i < pageCount; i++)
@@ -157,6 +186,8 @@ public sealed class PdfExtractor : IExtractor
 
             string pageText = "";
             List<SegmentData> segs = new();
+            List<TableSpan> words = new();
+            List<PdfPath> paths = new();
             try
             {
                 byte[] contentBytes = pdf.GetPageContent(i);
@@ -168,6 +199,8 @@ public sealed class PdfExtractor : IExtractor
                     var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
                     (pageText, var lines) = PdfPageText.AssembleWithLines(spans, Math.Abs(mbUrx - mbLlx));
                     segs = PdfStructure.SegmentsFromLines(lines);
+                    words = PdfSpatialTables.SpansToWords(spans);
+                    paths = extractor.Paths;
                 }
                 // AcroForm: interactive text-field values are stored as the widget's /V and are
                 // not drawn into the content stream when no appearance stream exists. pdf_oxide
@@ -178,9 +211,11 @@ public sealed class PdfExtractor : IExtractor
                         ? pageText + "\n" + string.Join("\n", formValues)
                         : string.Join("\n", formValues);
             }
-            catch { pageText = ""; segs = new(); }
+            catch { pageText = ""; segs = new(); words = new(); paths = new(); }
 
             pageSegments.Add(segs);
+            pageWords.Add(words);
+            pagePaths.Add(paths);
             if (i > 0) sb.Append("\n\n");
             sb.Append(PdfPageText.FixControlChars(pageText));
         }

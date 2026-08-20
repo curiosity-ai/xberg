@@ -70,6 +70,12 @@ public sealed class PdfContentExtractor
         public double FontSize;
         public double Rise;
         public PdfFont? Font;
+        public double LineWidth = 1.0;
+        public int LineCap;
+        // pdf_oxide's path extractor carries its own f32 graphics state, and rounding
+        // the product after every concatenation is what makes `.23999999 3.125 cm cm`
+        // land on exactly 0.75. Keeping it separate leaves the text CTM alone.
+        public Matrix PathCtm = Matrix.Identity;
         public GState Clone() => (GState)MemberwiseClone();
     }
 
@@ -102,6 +108,15 @@ public sealed class PdfContentExtractor
 
     // pdf_oxide TextExtractionConfig::default().space_insertion_threshold.
     private const double SpaceInsertionThreshold = -120.0;
+
+    // Painted paths, in device space. Ruling-line table detection reads these; text
+    // extraction ignores them, so collection costs one list append per painting operator.
+    private readonly List<PdfPath> _paths = new();
+    private List<PathOp> _currentOps = new();
+    private (double X, double Y)? _subpathStart;
+
+    /// <summary>Paths painted by the content processed so far (pdf_oxide `extract_paths`).</summary>
+    public List<PdfPath> Paths => _paths;
 
     public PdfContentExtractor(PdfDocument doc, long deadlineTicks) { _doc = doc; _deadline = deadlineTicks; }
 
@@ -177,6 +192,8 @@ public sealed class PdfContentExtractor
 
     private static double Num(List<PdfObject> ops, int i) => i < ops.Count ? (ops[i].AsNumber() ?? 0) : 0;
 
+    private static float NumF(List<PdfObject> ops, int i) => (float)Num(ops, i);
+
     private void Execute(string op, List<PdfObject> ops, Dictionary<string, PdfFont> fonts, PdfDict? xobjects, int depth)
     {
         switch (op)
@@ -187,7 +204,11 @@ public sealed class PdfContentExtractor
                 if (ops.Count >= 6)
                 {
                     FlushBuffer();
-                    _gs.Ctm = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5)).Multiply(_gs.Ctm);
+                    var cmMatrix = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5));
+                    _gs.Ctm = cmMatrix.Multiply(_gs.Ctm);
+                    _gs.PathCtm = RoundToSingle(
+                        new Matrix(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3), NumF(ops, 4), NumF(ops, 5))
+                            .Multiply(_gs.PathCtm));
                 }
                 break;
             case "BT": FlushBuffer(); _tm = Matrix.Identity; _tlm = Matrix.Identity; break;
@@ -250,8 +271,142 @@ public sealed class PdfContentExtractor
                 FlushBuffer();
                 if (ops.Count >= 1 && ops[0] is PdfName xn) DoXObject(xn.Value, xobjects, depth);
                 break;
+
+            // ── Path construction and painting (pdf_oxide `extractors::paths`) ────────
+            case "w": _gs.LineWidth = Num(ops, 0); break;
+            case "J": _gs.LineCap = (int)Num(ops, 0); break;
+            // Path operands are read as f32 upstream, so round them here too: a
+            // rectangle's far corner is `x + width` in single precision, and a double
+            // sum rounded afterwards is not the same number.
+            case "m": PathMoveTo(NumF(ops, 0), NumF(ops, 1)); break;
+            case "l": PathLineTo(NumF(ops, 0), NumF(ops, 1)); break;
+            case "c": PathCurveTo(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3), NumF(ops, 4), NumF(ops, 5)); break;
+            case "v": PathCurveToV(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3)); break;
+            case "y": PathCurveToY(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3)); break;
+            case "re": PathRectangle(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3)); break;
+            case "h": PathClose(); break;
+            case "S": FinalizePath(stroke: true, fill: false); break;
+            case "s": PathClose(); FinalizePath(stroke: true, fill: false); break;
+            case "f": case "F": case "f*": FinalizePath(stroke: false, fill: true); break;
+            case "B": case "B*": FinalizePath(stroke: true, fill: true); break;
+            case "b": case "b*": PathClose(); FinalizePath(stroke: true, fill: true); break;
+            case "n": EndPath(); break;
         }
     }
+
+    // ── Path construction ────────────────────────────────────────────────────────
+    // Points are CTM-transformed as they are recorded, matching pdf_oxide's
+    // `PathExtractor`: the path list is device-space geometry with no matrix attached.
+
+    // pdf_oxide's path pipeline is f32 end to end, and the edge coordinates a table's
+    // bounding box is built from come straight out of it. Rounding each transformed
+    // point to single precision keeps our geometry bit-comparable with the reference
+    // instead of carrying double-width CTM residue into the output.
+    private (double x, double y) TransformPath(double x, double y)
+    {
+        var (tx, ty) = _gs.PathCtm.Transform(x, y);
+        return ((float)tx, (float)ty);
+    }
+
+    private static Matrix RoundToSingle(in Matrix m) =>
+        new((float)m.A, (float)m.B, (float)m.C, (float)m.D, (float)m.E, (float)m.F);
+
+    private void PathMoveTo(double x, double y)
+    {
+        var (tx, ty) = TransformPath(x, y);
+        _currentOps.Add(PathOp.MoveTo(tx, ty));
+        _pathCurrent = (tx, ty);
+        _subpathStart = (tx, ty);
+    }
+
+    private void PathLineTo(double x, double y)
+    {
+        var (tx, ty) = TransformPath(x, y);
+        _currentOps.Add(PathOp.LineTo(tx, ty));
+        _pathCurrent = (tx, ty);
+    }
+
+    private void PathCurveTo(double x1, double y1, double x2, double y2, double x3, double y3)
+    {
+        var p1 = TransformPath(x1, y1);
+        var p2 = TransformPath(x2, y2);
+        var p3 = TransformPath(x3, y3);
+        _currentOps.Add(PathOp.CurveTo(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y));
+        _pathCurrent = (p3.x, p3.y);
+    }
+
+    private void PathCurveToV(double x2, double y2, double x3, double y3)
+    {
+        var p1 = _pathCurrent ?? (0.0, 0.0);
+        var p2 = TransformPath(x2, y2);
+        var p3 = TransformPath(x3, y3);
+        _currentOps.Add(PathOp.CurveTo(p1.Item1, p1.Item2, p2.x, p2.y, p3.x, p3.y));
+        _pathCurrent = (p3.x, p3.y);
+    }
+
+    private void PathCurveToY(double x1, double y1, double x3, double y3)
+    {
+        var p1 = TransformPath(x1, y1);
+        var p3 = TransformPath(x3, y3);
+        _currentOps.Add(PathOp.CurveTo(p1.x, p1.y, p3.x, p3.y, p3.x, p3.y));
+        _pathCurrent = (p3.x, p3.y);
+    }
+
+    private void PathRectangle(double x, double y, double w, double h)
+    {
+        var p1 = TransformPath(x, y);
+        var p2 = TransformPath((float)(x + w), (float)(y + h));
+        _currentOps.Add(PathOp.Rect(p1.x, p1.y, (float)(p2.x - p1.x), (float)(p2.y - p1.y)));
+        _pathCurrent = (p1.x, p1.y);
+        _subpathStart = (p1.x, p1.y);
+    }
+
+    private void PathClose()
+    {
+        _currentOps.Add(PathOp.Close);
+        if (_subpathStart is { } s) _pathCurrent = s;
+    }
+
+    private void EndPath()
+    {
+        _currentOps.Clear();
+        _pathCurrent = null;
+        _subpathStart = null;
+    }
+
+    private void FinalizePath(bool stroke, bool fill)
+    {
+        if (_currentOps.Count == 0) return;
+        // Cap the collected set: a chart or map can paint tens of thousands of paths,
+        // none of which is a table rule, and the detector is quadratic in edge count.
+        if (_paths.Count < MaxPaths)
+        {
+            var candidate = new PdfPath
+            {
+                Operations = _currentOps,
+                Bbox = PdfPath.ComputeBbox(_currentOps),
+                Stroked = stroke,
+                Filled = fill,
+                LineCap = stroke ? _gs.LineCap : 0,
+                // The `w` operand is user-space while the path above is CTM-transformed
+                // (§8.4.3.2), so scale it by sqrt(|det|) — the uniform-scale approximation
+                // renderers use — to keep width and bbox in one coordinate space.
+                StrokeWidth = stroke
+                    ? (float)(_gs.LineWidth * Math.Sqrt(Math.Abs(
+                        _gs.PathCtm.A * _gs.PathCtm.D - _gs.PathCtm.B * _gs.PathCtm.C)))
+                    : 0.0,
+            };
+            // Only rules and boxes are ever consulted; glyph outlines and chart fills
+            // would otherwise dominate the list on graphics-heavy pages.
+            if (candidate.IsTablePrimitive()) _paths.Add(candidate);
+        }
+        _currentOps = new List<PathOp>();
+        _pathCurrent = null;
+        _subpathStart = null;
+    }
+
+    private const int MaxPaths = 20000;
+    private (double, double)? _pathCurrent;
 
     // TJ array (pdf_oxide process_tj_array_tiebreaker): accumulate all strings
     // into one span; only offsets below SpaceInsertionThreshold split the span
@@ -411,6 +566,7 @@ public sealed class PdfContentExtractor
                 fm.Items[2].AsNumber() ?? 0, fm.Items[3].AsNumber() ?? 1,
                 fm.Items[4].AsNumber() ?? 0, fm.Items[5].AsNumber() ?? 0);
             _gs.Ctm = m.Multiply(_gs.Ctm);
+            _gs.PathCtm = RoundToSingle(RoundToSingle(m).Multiply(_gs.PathCtm));
         }
         var formRes = _doc.Resolve(st.Dict.Get("Resources")).AsDict();
         try { Run(_doc.DecodeStream(st), formRes, depth + 1); } catch { }

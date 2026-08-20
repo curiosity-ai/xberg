@@ -6,9 +6,9 @@
 // bounding boxes (derived from font-metric segments) are clustered into
 // vertically-contiguous regions, each region is reconstructed into a cell
 // grid, then validated/cleaned by the same prose-rejection chain the Rust
-// heuristic tier uses. Only the heuristic tier is ported — pdf_oxide's native
-// ruling-line grid detector (extract_tables_native/_bordered) has no managed
-// equivalent.
+// heuristic tier uses. The two ruling-line tiers that run before it
+// (extract_tables_native/_bordered) live in PdfSpatialTables.
+using System.Collections.Generic;
 using System.Text;
 using Xberg.Types;
 
@@ -34,12 +34,15 @@ internal static class PdfTableReconstruct
 
     /// <summary>Port of `pdf::oxide::table::extract_tables_heuristic`. Runs the
     /// text-edge heuristic on every page's segments and returns detected tables.</summary>
-    public static List<Table> ExtractHeuristicTables(List<List<SegmentData>> allPageSegments, bool allowSingleColumn)
+    /// <param name="skipPages">1-indexed pages a higher-priority tier already covered.</param>
+    public static List<Table> ExtractHeuristicTables(
+        List<List<SegmentData>> allPageSegments, bool allowSingleColumn, HashSet<uint>? skipPages = null)
     {
         var tables = new List<Table>();
         for (int pageIdx = 0; pageIdx < allPageSegments.Count; pageIdx++)
         {
             uint pageNumber = (uint)(pageIdx + 1);
+            if (skipPages is not null && skipPages.Contains(pageNumber)) continue;
             var segments = allPageSegments[pageIdx];
             if (segments.Count == 0) continue;
 

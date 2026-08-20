@@ -120,7 +120,11 @@ public static class PdfStructure
 
     /// <summary>Build a structured InternalDocument from per-page segments.
     /// Returns null when no elements were produced (caller falls back to flat text).</summary>
-    public static InternalDocument? Build(List<List<SegmentData>> allPageSegments, int kClusters = 4)
+    /// <param name="ruledTables">Tables the ruling-line tiers already found, keyed by
+    /// their page number. A page they cover keeps them instead of re-deriving a grid
+    /// from text geometry, matching the tier priority in the flat table list.</param>
+    public static InternalDocument? Build(
+        List<List<SegmentData>> allPageSegments, int kClusters = 4, List<Table>? ruledTables = null)
     {
         int pageCount = allPageSegments.Count;
 
@@ -143,6 +147,12 @@ public static class PdfStructure
         for (int i = 0; i < pageCount; i++)
         {
             List<Table> pageTables;
+            uint pageNumber = (uint)(i + 1);
+            if (ruledTables is not null)
+            {
+                var ruled = ruledTables.FindAll(t => t.PageNumber == pageNumber);
+                if (ruled.Count > 0) { tablesByPage.Add(ruled); continue; }
+            }
             try
             {
                 var words = PdfTableReconstruct.SegmentsToWords(allPageSegments[i], pageHeights[i]);
