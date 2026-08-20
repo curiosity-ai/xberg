@@ -10,9 +10,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2469 fixtures (78.0%) match on every hard dimension**; content parity is **81.4%
+> **2506 fixtures (79.2%) match on every hard dimension**; content parity is **81.4%
 > identical, 90.1% ≥95%-similar**; 66 fixtures (<80%) are genuine content misses; **7
-> catastrophes (0.2%), all HTML**. 467 unit tests.
+> catastrophes (0.2%), all HTML**. 495 unit tests.
 >
 > The last pass took it from 2340 and was mostly a matter of finding things the port had never
 > implemented at all rather than tuning what it had. Ordered by what they were worth:
@@ -38,6 +38,10 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >   markdown extractor claimed six of its ten MIME types.
 > - **CommonMark fence indentation, YAML number lexemes, ODF list styles, heading attribute
 >   blocks, display-math line structure** — each a small rule with a document-shaped consequence.
+> - **docx (40 → 46 of 46, every dimension).** Reviewer comments were missing end to end; a text
+>   box's inner paragraphs were emitted as document structure, so a numbered `w:p` inside a shape
+>   became a list in the body; and page boundaries were measured against text that dropped every
+>   equation, which put both boundaries of a maths-heavy document 700 bytes short.
 >
 > ## Upstream defects, flagged and left alone
 >
@@ -149,9 +153,14 @@ not a cosmetic difference.
       is one flat vector concatenating fonts, theme and slide titles, and `HeadingPairs` says
       how many entries each group owns. Taking it whole put the font list in every
       presentation's slide titles. Chart and SmartArt frames are followed now too.
-- [ ] **Reviewer comments (`CommentRef` / `CommentDefinition`).** Upstream gave docx comments
-      their own element kinds (GH#300). The C# `ElementKindTag` has no such variants, so the
-      JSON renderer's comment arms could not be ported with the rest.
+- [x] **Reviewer comments (`CommentRef` / `CommentDefinition`).** Upstream gave docx comments
+      their own element kinds (GH#300), which the C# `ElementKindTag` did not have. Both kinds
+      now exist and are wired through the plain, JSON and markdown/HTML renderers: a
+      `w:commentReference` writes a `[cmt:N]` marker into the run text, the assembled paragraph
+      text is scanned for those markers (the same post-hoc scan upstream uses, which also
+      recovers `[^N]` footnote references and a run's hyperlink URIs), and `word/comments.xml`
+      supplies the definitions. Comment bodies render at the end like footnote definitions
+      rather than being dropped.
 - [x] **Email attachment text.** Attachments now go back through the pipeline and contribute a
       level-2 heading plus their text (eml 20/43 → 39, msg 4/16 → 14). Images are deliberately
       excluded: what this port recovers from one is EXIF, which belongs to the attachment's own
@@ -265,7 +274,8 @@ not a cosmetic difference.
 - [x] `Internal/Ooxml`: shared OOXML helpers (ZIP open, relationships, shared strings,
       content-types, core/app properties → `Metadata`).
 - [x] **docx** (`extractors/docx.rs`, `extraction/docx/`) — paragraphs, styles, tables,
-      lists, hyperlinks, images, headers/footers, tracked changes.
+      lists, hyperlinks, images, headers/footers, tracked changes, text boxes, reviewer
+      comments. 46/46 on every dimension.
 - [x] **xlsx** (`extractors/excel.rs`, `extraction/excel.rs`) — sheets → tables, shared
       strings, number formats. Port needed calamine logic.
 - [x] **pptx** (`extractors/pptx.rs`, `extraction/pptx/`) — slides, text frames, tables, notes.

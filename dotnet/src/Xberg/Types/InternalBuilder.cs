@@ -94,6 +94,12 @@ public sealed class InternalDocumentBuilder
     public uint PushFootnoteDefinition(string text, string key, uint? page) =>
         PushSimple(ElementKind.FootnoteDefinition, text, page, null, new(), null, key);
 
+    public uint PushCommentDefinition(string text, string key, uint? page) =>
+        PushSimple(ElementKind.CommentDefinition, text, page, null, new(), null, key);
+
+    public uint PushCommentRef(string marker, string key, uint? page) =>
+        PushSimple(ElementKind.CommentRef, marker, page, null, new(), null, key);
+
     public uint PushCitation(string text, string key, uint? page) =>
         PushSimple(ElementKind.Citation, text, page, null, new(), null, key);
 

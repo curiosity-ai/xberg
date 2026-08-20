@@ -272,4 +272,92 @@ public class OoxmlTests
         Assert.Equal("**B**", doc.Tables[0].Cells[0][1]); // runs_to_markdown wraps bold
         Assert.Equal("docx", doc.Metadata.Format!.FormatType);
     }
+
+    /// <summary>
+    /// A reviewer comment leaves a `[cmt:N]` marker in the body and its body text in
+    /// `word/comments.xml`; the marker becomes a `CommentRef` element and the body a
+    /// `CommentDefinition`, so a consumer can tell a comment from an authored footnote.
+    /// </summary>
+    [Fact]
+    public void Docx_CommentsBecomeCommentRefAndDefinitionElements()
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>" +
+                "<w:p><w:r><w:t>Annotated sentence.</w:t></w:r>" +
+                "<w:r><w:commentReference w:id=\"7\"/></w:r></w:p>" +
+                "</w:body></w:document>"),
+            ("word/comments.xml",
+                "<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">" +
+                "<w:comment w:id=\"7\"><w:p><w:r><w:t>Please rephrase.</w:t></w:r></w:p></w:comment>" +
+                "</w:comments>"));
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        var refElem = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.CommentRef);
+        Assert.Equal("7", refElem.Text);
+        Assert.Equal("cmt7", refElem.Anchor);
+
+        var def = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.CommentDefinition);
+        Assert.Equal("Please rephrase.", def.Text);
+        Assert.Equal("cmt7", def.Anchor);
+
+        // The comment body is not part of the flow, but it is not dropped either: it is
+        // rendered at the end, the way a footnote definition is.
+        Assert.Contains("Please rephrase.", Render(doc, OutputFormat.Markdown));
+        Assert.Contains("Annotated sentence.[cmt:7]", Render(doc, OutputFormat.Plain));
+    }
+
+    /// <summary>
+    /// The paragraphs inside a text box are layout, not document structure: they collapse into a
+    /// single paragraph whose lines are newline-separated, so a numbered `w:p` inside a shape
+    /// cannot turn into a list item of the surrounding document.
+    /// </summary>
+    [Fact]
+    public void Docx_TextBoxParagraphsCollapseIntoOneParagraph()
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:v=\"urn:schemas-microsoft-com:vml\"><w:body>" +
+                "<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent>" +
+                "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>" +
+                "<w:r><w:t>First line</w:t></w:r></w:p>" +
+                "<w:p><w:r><w:t>Second line</w:t></w:r></w:p>" +
+                "</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>" +
+                "</w:body></w:document>"));
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        var paragraphs = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).ToList();
+        Assert.Single(paragraphs);
+        Assert.Equal("First line\nSecond line", paragraphs[0].Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.ListItem);
+    }
+
+    /// <summary>
+    /// `mc:AlternateContent` stores a shape twice — DrawingML in `mc:Choice`, VML in
+    /// `mc:Fallback`. Only the DrawingML copy is kept, or the text box would be extracted twice.
+    /// </summary>
+    [Fact]
+    public void Docx_AlternateContentTextBoxIsNotEmittedTwice()
+    {
+        const string txbx = "<w:txbxContent><w:p><w:r><w:t>Boxed</w:t></w:r></w:p></w:txbxContent>";
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" " +
+                "xmlns:v=\"urn:schemas-microsoft-com:vml\" " +
+                "xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><w:body>" +
+                "<w:p><w:r><mc:AlternateContent>" +
+                "<mc:Choice Requires=\"wps\"><w:drawing><wps:wsp><wps:txbx>" + txbx +
+                "</wps:txbx></wps:wsp></w:drawing></mc:Choice>" +
+                "<mc:Fallback><w:pict><v:shape><v:textbox>" + txbx +
+                "</v:textbox></v:shape></w:pict></mc:Fallback>" +
+                "</mc:AlternateContent></w:r></w:p>" +
+                "</w:body></w:document>"));
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        var paragraphs = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).ToList();
+        Assert.Single(paragraphs);
+        Assert.Equal("Boxed", paragraphs[0].Text);
+    }
 }

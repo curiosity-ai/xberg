@@ -238,7 +238,10 @@ internal static class ComrakBridge
                 }
                 case ElementKindTag.FootnoteDefinition:
                 case ElementKindTag.Citation:
+                case ElementKindTag.CommentDefinition:
                     break; // rendered at the end
+                case ElementKindTag.CommentRef:
+                    break;
                 case ElementKindTag.PageBreak:
                     break;
                 case ElementKindTag.Slide:
@@ -417,6 +420,24 @@ internal static class ComrakBridge
         foreach (var elem in doc.Elements)
         {
             if (elem.Kind.Tag == ElementKindTag.Citation)
+            {
+                string key = elem.Anchor ?? "?";
+                var fndef = new MdNode(NodeType.FootnoteDefinition)
+                {
+                    FootnoteDefinition = new NodeFootnoteDefinition { Name = key, TotalReferences = 1 },
+                };
+                var para = new MdNode(NodeType.Paragraph);
+                para.Append(MkText(elem.Text));
+                fndef.Append(para);
+                root.Append(fndef);
+            }
+        }
+
+        // Comment definitions are not tracked by the footnote collector, so they are surfaced
+        // the same way citations are above — keyed by anchor — rather than dropped.
+        foreach (var elem in doc.Elements)
+        {
+            if (elem.Kind.Tag == ElementKindTag.CommentDefinition)
             {
                 string key = elem.Anchor ?? "?";
                 var fndef = new MdNode(NodeType.FootnoteDefinition)
