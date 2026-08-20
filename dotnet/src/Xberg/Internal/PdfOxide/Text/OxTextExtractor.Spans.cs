@@ -72,17 +72,8 @@ internal sealed partial class OxTextExtractor
     // owns the field set every section of the extractor shares.
 
     /// <summary>Seam to the separately-ported space decision; see <see cref="OxShouldInsertSpaceFn"/>.</summary>
-    internal OxShouldInsertSpaceFn ShouldInsertSpace = UnwiredShouldInsertSpace;
+    internal OxShouldInsertSpaceFn ShouldInsertSpace = OxSpaceDecisionRules.ShouldInsertSpace;
 
-    /// <summary>Seam to the page's font-width and /ReversedChars facts; null means the defaults.</summary>
-    internal IOxSpanMergeContext? MergeContext;
-
-    private static OxSpaceDecision UnwiredShouldInsertSpace(
-        string precedingText, string followingText, float gapPt, float fontSize, string fontName,
-        IOxSpanFonts? fonts, bool tjOffsetTriggered, OxSpanMergingConfig config,
-        OxRect? prevBbox, OxRect? nextBbox, float prevFontSize, float nextFontSize) =>
-        throw new InvalidOperationException(
-            "OxTextExtractor.ShouldInsertSpace was never wired to OxSpaceDecisionRules.ShouldInsertSpace.");
 
     /// <summary>
     /// Deduplicate overlapping characters on the same line (text.rs:3930).
@@ -854,7 +845,7 @@ internal sealed partial class OxTextExtractor
             // still drives the merge-vs-column decision, the decimal-merge heuristic and
             // every branch reasoning about actual layout, so fallback-width fonts merge
             // exactly as before and only the separator question sees the honest gap.
-            bool reliableWidths = MergeContext?.HasExplicitWidths(current.FontName) ?? true;
+            bool reliableWidths = MergeContext.HasExplicitWidths(current.FontName);
             float spaceGap = OxTextHelpers.CorrectedSpaceGap(
                 gap, reliableWidths, current.Bbox.Width, current.Text.Length == 0);
 
@@ -1059,7 +1050,7 @@ internal sealed partial class OxTextExtractor
                     float sameBaselineTol = MathF.Max(MathF.Max(current.FontSize, span.FontSize), 1.0f) * 0.04f;
                     bool sameBaseline = MathF.Abs(current.Bbox.Y - span.Bbox.Y) < sameBaselineTol;
                     if (spaceDecision.Source == OxSpaceSource.IntraWordKerning
-                        && !(MergeContext?.SawReversedChars ?? false)
+                        && !MergeContext.SawReversedChars
                         && sameBaseline
                         && !OxTextHelpers.GapHasInterveningGlyph(inkBoxes, current.Bbox, span.Bbox))
                     {
@@ -1086,7 +1077,7 @@ internal sealed partial class OxTextExtractor
                     // adjacent Arabic letters is a positioning artifact, not a word break.
                     // Only fires on ReversedChars pages, leaving ordinary
                     // geometric-spaced Arabic producers alone.
-                    if ((MergeContext?.SawReversedChars ?? false) && spaceDecision.InsertSpace)
+                    if (MergeContext.SawReversedChars && spaceDecision.InsertSpace)
                     {
                         bool prevAr = LastRune(current.Text) is Rune pr && ScriptSignals.IsArabicLetter(pr.Value);
                         bool nextAr = FirstRune(span.Text) is Rune nr && ScriptSignals.IsArabicLetter(nr.Value);

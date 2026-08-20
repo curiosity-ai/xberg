@@ -164,6 +164,18 @@ internal sealed partial class OxTextExtractor
     internal IOxSpanFonts SpanFonts => _spanFonts ??= new LoadedFonts(this);
     private IOxSpanFonts? _spanFonts;
 
+    /// <summary>
+    /// The merger's view of the page's fonts. Resolved on demand so a bare extractor is
+    /// usable without a wiring step; the merger and the space decision were ported
+    /// separately and meet here rather than by direct reference.
+    /// </summary>
+    internal IOxSpanMergeContext MergeContext
+    {
+        get => _mergeContext ??= new LoadedFontContext(this);
+        set => _mergeContext = value;
+    }
+    private IOxSpanMergeContext? _mergeContext;
+
     private sealed class LoadedFonts : IOxSpanFonts
     {
         private readonly OxTextExtractor _owner;
@@ -171,5 +183,18 @@ internal sealed partial class OxTextExtractor
 
         public float? SpaceGlyphWidth(string fontName) =>
             _owner.Fonts.TryGetValue(fontName, out var font) ? font.GetSpaceGlyphWidth() : null;
+    }
+
+    private sealed class LoadedFontContext : IOxSpanMergeContext
+    {
+        private readonly OxTextExtractor _owner;
+        internal LoadedFontContext(OxTextExtractor owner) => _owner = owner;
+
+        /// <summary>A font the page never declared counts as reliable, as upstream's
+        /// `map(..).unwrap_or(true)` does.</summary>
+        public bool HasExplicitWidths(string fontName) =>
+            !_owner.Fonts.TryGetValue(fontName, out var font) || font.HasExplicitWidths();
+
+        public bool SawReversedChars => _owner.SawReversedChars;
     }
 }
