@@ -12,6 +12,7 @@ namespace Xberg.Tests;
 /// The sibling seams (glyph names, encoding tables) are stubbed here, so these tests pin
 /// the font-dictionary behaviour rather than the tables.
 /// </summary>
+[Collection(OxFontSeamCollection.Name)]
 public sealed class OxFontInfoTests : IDisposable
 {
     public OxFontInfoTests()

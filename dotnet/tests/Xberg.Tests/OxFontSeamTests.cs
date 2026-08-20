@@ -7,6 +7,7 @@ namespace Xberg.Tests;
 /// Covers the wiring that joins the independently ported font modules: the font
 /// dictionary reaching the CMap parser, the glyph list and the Adobe CID tables.
 /// </summary>
+[Collection(OxFontSeamCollection.Name)]
 public class OxFontSeamTests
 {
     private const string SimpleCMap =
