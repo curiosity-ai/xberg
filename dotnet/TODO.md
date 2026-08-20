@@ -313,8 +313,10 @@ and the shortfall was not one bug but three layers. **Two of the three are now c
 **What the PDF port still owes.** The ruling-line tiers read their drawn paths from the older
 content interpreter, which is why both span producers still run per page; the paths belong in
 the ported pipeline. `PageText.chars` is left empty, since page text is assembled from spans
-alone. Pattern marking is a no-op, so email and URL characters are not yet protected from
-splitting. And `.Showing.cs` re-implements three rules — the MCID scope, the artifact type and
+alone. Pattern marking is a no-op, and that is faithful rather than a gap: its only caller is
+`process_tj_array_primary`, which runs solely under `WordBoundaryMode::Primary`, and both
+pdf_oxide and xberg leave the mode at `Tiebreaker`. Porting `pattern_detector.rs` would be 400
+lines nothing reaches. And `.Showing.cs` re-implements three rules — the MCID scope, the artifact type and
 the content-suppression test — that `.Core.cs` also owns; they agree today and should be one
 copy. Still unported from `pdf/structure/`: `mark_validated_page_numbers`,
 `stitch_fragmented_tables`, `merge_spatial_footnote_markers`,
