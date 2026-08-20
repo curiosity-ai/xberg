@@ -2,6 +2,7 @@ using System.Text;
 using Xberg.Core;
 using Xberg.Extractors;
 using Xberg.Internal.Pdf;
+using Xberg.Internal.Pdf.Fonts;
 using Xberg.Types;
 using Xunit;
 
@@ -601,5 +602,51 @@ public class PdfExtractorTests
         PdfSubSuperscript.Merge(spans);
 
         Assert.Equal(new[] { "x*" }, spans.Select(s => s.Text));
+    }
+}
+
+/// <summary>
+/// Tests for the Type 1 built-in encoding reader (<see cref="Type1Encoding"/>).
+/// </summary>
+public class Type1EncodingTests
+{
+    private static byte[] Bytes(string s) => System.Text.Encoding.ASCII.GetBytes(s);
+
+    /// <summary>
+    /// The ligature slots of a TeX font live at codes 11-15, which no named encoding assigns —
+    /// the program's own array is the only place they are declared.
+    /// </summary>
+    [Fact]
+    public void Parse_ReadsDupPutEntriesIncludingLigatureSlots()
+    {
+        var map = Type1Encoding.Parse(Bytes(
+            "%!PS-AdobeFont-1.0: CMR9 003.002\n" +
+            "/Encoding 256 array\n" +
+            "0 1 255 {1 index exch /.notdef put} for\n" +
+            "dup 11 /ff put\ndup 12 /fi put\ndup 13 /fl put\ndup 14 /ffi put\ndup 15 /ffl put\n" +
+            "dup 65 /A put\ndup 48 /zero put\ndup 123 /endash put\n" +
+            "readonly def\ncurrentfile eexec\n"));
+
+        Assert.NotNull(map);
+        Assert.Equal("ﬀ", map![11]);
+        Assert.Equal("ﬁ", map[12]);
+        Assert.Equal("ﬂ", map[13]);
+        Assert.Equal("ﬃ", map[14]);
+        Assert.Equal("ﬄ", map[15]);
+        Assert.Equal("A", map[65]);
+        Assert.Equal("0", map[48]);
+        Assert.Equal("–", map[123]);
+    }
+
+    /// <summary>
+    /// A program that just names a predefined encoding declares nothing of its own; the caller's
+    /// handling of that name is already right, so there is no map to return.
+    /// </summary>
+    [Fact]
+    public void Parse_ReturnsNullForPredefinedOrAbsentEncoding()
+    {
+        Assert.Null(Type1Encoding.Parse(Bytes("/Encoding StandardEncoding def\n")));
+        Assert.Null(Type1Encoding.Parse(Bytes("no encoding here")));
+        Assert.Null(Type1Encoding.Parse([]));
     }
 }
