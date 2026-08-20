@@ -15,16 +15,25 @@ namespace Xberg.Tests;
 [Collection(OxFontSeamCollection.Name)]
 public sealed class OxFontInfoTests : IDisposable
 {
+    private readonly IOxGlyphNames? _glyphNames;
+    private readonly IOxEncodingTables? _encodingTables;
+
     public OxFontInfoTests()
     {
+        // The seams are process-wide, so what was there has to come back afterwards.
+        // Nulling them instead left every later test in the run looking at an unwired
+        // font layer, which is the same failure a production caller would see.
+        _glyphNames = OxFontSeams.GlyphNames;
+        _encodingTables = OxFontSeams.EncodingTables;
+
         OxFontSeams.GlyphNames = new StubGlyphNames();
         OxFontSeams.EncodingTables = new StubEncodingTables();
     }
 
     public void Dispose()
     {
-        OxFontSeams.GlyphNames = null;
-        OxFontSeams.EncodingTables = null;
+        OxFontSeams.GlyphNames = _glyphNames;
+        OxFontSeams.EncodingTables = _encodingTables;
     }
 
     // ---- simple fonts: /Widths, /FirstChar and the fallback ----

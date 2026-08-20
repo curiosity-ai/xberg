@@ -9,38 +9,46 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 
+using System.Threading;
+
 namespace Xberg.Internal.PdfOxide.Fonts;
 
 /// <summary>Registers every font seam with the module that implements it.</summary>
 internal static class OxFontWiring
 {
-    private static bool _installed;
+    private static readonly object InstallGate = new();
 
     /// <summary>
-    /// Idempotent: the seams are process-wide statics, and a font may be loaded from any
-    /// thread, so installation happens once and never changes afterwards.
+    /// Fill in any font seam that is not yet wired. Safe to call from any thread and on
+    /// every font load — the seams are process-wide statics and a font may be built from
+    /// anywhere.
     /// </summary>
     internal static void Install()
     {
-        if (_installed) return;
-        _installed = true;
-
-        OxFontSeams.GlyphNames ??= new GlyphNamesSeam();
-        OxFontSeams.CMaps ??= new CMapSeam();
-        OxFontSeams.TrueType ??= new TrueTypeSeam();
-        OxFontSeams.FontPrograms ??= new FontProgramSeam();
-        OxFontSeams.EncodingTables ??= new EncodingTablesSeam();
-        OxFontSeams.PredefinedCidUnicode ??= new PredefinedCidSeam();
-
-        OxCharacterMapper.CidMappingLookup ??= static (ordering, cid) => ordering switch
+        // Every assignment below is `??=`, so this fills whatever is missing and leaves the
+        // rest alone. There is deliberately no "already ran" flag: a flag makes the call a
+        // no-op forever after, and anything that clears a seam later — a test swapping in a
+        // stub, most obviously — can then never get the real one back.
+        lock (InstallGate)
         {
-            "GB1" => OxCidMappings.LookupAdobeGb1(cid),
-            "Japan1" => OxCidMappings.LookupAdobeJapan1(cid),
-            "CNS1" => OxCidMappings.LookupAdobeCns1(cid),
-            "Korea1" => OxCidMappings.LookupAdobeKorea1(cid),
-            "Arabic" or "Persian" => OxCidMappings.LookupAdobeArabic(cid),
-            _ => null,
-        };
+
+            OxFontSeams.GlyphNames ??= new GlyphNamesSeam();
+            OxFontSeams.CMaps ??= new CMapSeam();
+            OxFontSeams.TrueType ??= new TrueTypeSeam();
+            OxFontSeams.FontPrograms ??= new FontProgramSeam();
+            OxFontSeams.EncodingTables ??= new EncodingTablesSeam();
+            OxFontSeams.PredefinedCidUnicode ??= new PredefinedCidSeam();
+
+            OxCharacterMapper.CidMappingLookup ??= static (ordering, cid) => ordering switch
+            {
+                "GB1" => OxCidMappings.LookupAdobeGb1(cid),
+                "Japan1" => OxCidMappings.LookupAdobeJapan1(cid),
+                "CNS1" => OxCidMappings.LookupAdobeCns1(cid),
+                "Korea1" => OxCidMappings.LookupAdobeKorea1(cid),
+                "Arabic" or "Persian" => OxCidMappings.LookupAdobeArabic(cid),
+                _ => null,
+            };
+        }
     }
 
     /// <summary>
@@ -152,10 +160,20 @@ internal static class OxFontWiring
         /// </summary>
         private static IReadOnlyDictionary<byte, char>? ToCharMap(Dictionary<byte, Rune>? source)
         {
-            if (source is null) return null;
+            if (source is null)
+            {
+                return null;
+            }
+
             var map = new Dictionary<byte, char>(source.Count);
             foreach (var (code, rune) in source)
-                if (rune.Utf16SequenceLength == 1) map[code] = (char)rune.Value;
+            {
+                if (rune.Utf16SequenceLength == 1)
+                {
+                    map[code] = (char)rune.Value;
+                }
+            }
+
             return map;
         }
 
@@ -174,9 +192,19 @@ internal static class OxFontWiring
         private static IReadOnlyDictionary<byte, Rune> ToRuneMap(Dictionary<byte, char>? source)
         {
             var map = new Dictionary<byte, Rune>(source?.Count ?? 0);
-            if (source is null) return map;
+            if (source is null)
+            {
+                return map;
+            }
+
             foreach (var (code, value) in source)
-                if (Rune.TryCreate(value, out Rune rune)) map[code] = rune;
+            {
+                if (Rune.TryCreate(value, out Rune rune))
+                {
+                    map[code] = rune;
+                }
+            }
+
             return map;
         }
     }

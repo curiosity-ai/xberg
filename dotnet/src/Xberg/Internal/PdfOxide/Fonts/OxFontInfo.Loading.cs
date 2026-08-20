@@ -28,6 +28,13 @@ internal sealed partial class OxFontInfo
     /// </summary>
     public static OxFontInfo? FromDict(PdfObject? dictObj, PdfDocument? doc)
     {
+        // The modules this reaches — glyph names, CMaps, TrueType, font programs, the
+        // encoding tables — were ported separately and find each other through process-wide
+        // seams that something has to fill in. Installing here rather than in a static
+        // constructor avoids a type-initialization cycle: a seam's own construction can
+        // touch this class, and the CLR would let that re-entrant call skip the install.
+        OxFontWiring.Install();
+
         var fontDict = Ox.Dict(doc, dictObj);
         if (fontDict is null) return null;
 
