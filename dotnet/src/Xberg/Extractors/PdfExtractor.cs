@@ -56,6 +56,7 @@ public sealed class PdfExtractor : IExtractor
         List<Xberg.Types.Table> tables;
         try { tables = PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false); }
         catch { tables = new List<Xberg.Types.Table>(); }
+        foreach (var table in tables) PdfTableNormalize.RepairConsistentlyMergedNumericColumn(table);
 
         // --- Build InternalDocument ---
         // For Markdown/Djot/HTML the Rust path pre-renders a *structured* document with

@@ -757,7 +757,12 @@ internal static class PdfTableReconstruct
                 int filledCells = 0;
                 for (int r = 1; r < processed.Count; r++)
                     foreach (var cell in processed[r]) if (cell.Trim().Length > 0) filledCells++;
-                if (totalDataCells > 0 && filledCells * 100 > totalDataCells * 80) return null;
+                // The density alone is not the signal: a 30-row ledger of three columns is dense
+                // too. What separates prose is words per cell — a table cell holds a value, a
+                // reflowed column holds a phrase.
+                if (totalDataCells > 0
+                    && filledCells * 100 > totalDataCells * 80
+                    && LooksLikeProseInColumns(processed.GetRange(1, processed.Count - 1), numCols)) return null;
             }
         }
 
@@ -1099,6 +1104,29 @@ internal static class PdfTableReconstruct
         if (width == 0) return false;
         int populated = row.Take(width).Count(cell => cell.Trim().Length > 0);
         return populated * 100 >= width * ShortNumericMinRowOccupancyPercent;
+    }
+
+    /// <summary>
+    /// Whether a dense grid of data rows is prose laid out in columns rather than a real table.
+    /// The signal is words per cell: a table cell holds a value — a number, a code, a short label
+    /// — while columned prose fills each cell with a phrase.
+    /// </summary>
+    private static bool LooksLikeProseInColumns(List<List<string>> dataRows, int numCols)
+    {
+        const double ProseWordsPerCell = 4.0;
+
+        if (numCols < 2) return false;
+        int proseRows = 0, eligibleRows = 0;
+        foreach (var row in dataRows)
+        {
+            var cells = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+            if (cells.Count < 2) continue;
+            if (cells.Sum(Utf8Len) < 15) continue;
+            eligibleRows++;
+            double avgWords = (double)cells.Sum(WordCount) / cells.Count;
+            if (avgWords >= ProseWordsPerCell) proseRows++;
+        }
+        return eligibleRows >= 3 && proseRows * 2 > eligibleRows;
     }
 
     // ── is_well_formed_table (pdf/table_reconstruct.rs) ──────────────────────

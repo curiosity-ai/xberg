@@ -760,3 +760,52 @@ public class PdfTableWellFormednessTests
             ["Name", "Value"])));
     }
 }
+
+/// <summary>
+/// Tests for the collapsed-column repair (<see cref="PdfTableNormalize"/>).
+/// </summary>
+public class PdfTableNormalizeTests
+{
+    private static Table WideTable(string mergedCell, int dataRows = 8)
+    {
+        var header = new List<string>();
+        for (int c = 0; c < 18; c++) header.Add(c is 8 or 9 ? "Amount" : $"C{c}");
+
+        var cells = new List<List<string>> { header };
+        for (int r = 0; r < dataRows; r++)
+        {
+            var row = new List<string>();
+            for (int c = 0; c < 18; c++) row.Add(c == 8 ? mergedCell : "1,204");
+            cells.Add(row);
+        }
+        return new Table { Cells = cells };
+    }
+
+    /// <summary>
+    /// Two adjacent numeric columns can come back merged into one cell holding the value twice.
+    /// The repair splits them and widens the header to match.
+    /// </summary>
+    [Fact]
+    public void ARepeatedNumericCellIsSplitBackIntoTwoColumns()
+    {
+        var table = WideTable("1,204   1,204");
+
+        Assert.True(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(table));
+        Assert.Equal(19, table.Cells[0].Count);
+        Assert.Equal("1,204", table.Cells[1][8]);
+        Assert.Equal("1,204", table.Cells[1][9]);
+    }
+
+    /// <summary>
+    /// The repair is deliberately narrow. A cell whose halves differ is two real values, not one
+    /// value counted twice, and a narrow table is left alone whatever its cells look like.
+    /// </summary>
+    [Fact]
+    public void UnequalHalvesAndNarrowTablesAreLeftAlone()
+    {
+        Assert.False(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(WideTable("1,204   9,999")));
+        Assert.False(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(WideTable("1,204   1,204", dataRows: 3)));
+        Assert.False(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(
+            new Table { Cells = new List<List<string>> { new() { "a", "b" }, new() { "1  1", "2" } } }));
+    }
+}
