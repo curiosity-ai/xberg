@@ -348,3 +348,43 @@ public class MarkdownTableShapeTests
         Assert.Equal(new[] { "1", "2" }, table.Cells[1]);
     }
 }
+
+/// <summary>
+/// What a fenced code block's info string contributes.
+/// </summary>
+public class MarkdownFenceInfoTests
+{
+    private static string? Language(string markdown)
+    {
+        var doc = new MarkdownExtractor().Extract(
+            Encoding.UTF8.GetBytes(markdown), "text/markdown", new ExtractionConfig());
+        var code = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Code);
+        return code.Attributes is { } a && a.TryGetValue("language", out var lang) ? lang : null;
+    }
+
+    [Fact]
+    public void OnlyTheFirstTokenIsTheLanguage()
+    {
+        // The rest of an info string is renderer options, not part of the language name.
+        Assert.Equal("mdx-invalid", Language("```mdx-invalid chrome=no\ncode\n```\n"));
+        Assert.Equal("js", Language("```js,live\ncode\n```\n"));
+    }
+
+    [Fact]
+    public void PandocBracesAndALeadingDotAreNotPartOfTheName()
+    {
+        Assert.Equal("python", Language("```{.python}\ncode\n```\n"));
+    }
+
+    [Fact]
+    public void AFenceWithNoInfoStringNamesNoLanguage()
+    {
+        Assert.Null(Language("```\ncode\n```\n"));
+    }
+
+    [Fact]
+    public void APlainLanguageIsUnchanged()
+    {
+        Assert.Equal("rust", Language("```rust\ncode\n```\n"));
+    }
+}

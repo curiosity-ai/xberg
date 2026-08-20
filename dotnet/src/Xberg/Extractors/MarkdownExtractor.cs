@@ -261,7 +261,7 @@ public sealed class MarkdownExtractor : IExtractor
 
                 case MdEventKind.StartCodeBlock:
                     codeText.Clear();
-                    codeLang = string.IsNullOrEmpty(e.Text) ? null : e.Text;
+                    codeLang = NormalizeFenceLang(e.Text);
                     inCodeBlock = true;
                     break;
                 case MdEventKind.EndCodeBlock:
@@ -459,6 +459,31 @@ public sealed class MarkdownExtractor : IExtractor
         return b.Build();
 
         static AnnotationKind MakeSimple(AnnotationKind.Tag tag) => new() { Which = tag };
+    }
+
+    /// <summary>
+    /// The language a fence's info string names.
+    /// </summary>
+    /// <remarks>
+    /// An info string may carry more than the language: renderer options after a space or comma
+    /// (<c>```mdx-invalid chrome=no</c>), Pandoc-style braces and a leading dot
+    /// (<c>```{.python}</c>). Only the first token is the language; passing the whole string
+    /// through puts the options into the rendered fence.
+    /// </remarks>
+    private static string? NormalizeFenceLang(string? info)
+    {
+        string trimmed = (info ?? "").Trim();
+        if (trimmed.Length == 0) return null;
+
+        string inner = trimmed;
+        if (inner.StartsWith('{'))
+        {
+            inner = inner[1..];
+            if (inner.EndsWith('}')) inner = inner[..^1];
+        }
+
+        string lang = inner.Split(',', ' ', '\t')[0].Trim().TrimStart('.');
+        return lang.Length == 0 ? null : lang;
     }
 
     /// <summary>Renders a non-string YAML frontmatter value the way the Rust extractor does —

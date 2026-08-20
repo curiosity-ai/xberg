@@ -330,7 +330,11 @@ public static class MarkdownParser
                 int newI = TryHtmlBlock(lines, i, hi);
                 if (newI > i)
                 {
-                    ev.Add(MdEvent.WithText(MdEventKind.Html, string.Join("\n", lines.GetRange(i, newI - i))));
+                    // One event per line, as pulldown-cmark emits them. The extractor records
+                    // each as its own raw block, so a `<details>` wrapper and the `<summary>` it
+                    // contains stay separate rather than fusing into one indented run.
+                    for (int h = i; h < newI; h++)
+                        ev.Add(MdEvent.WithText(MdEventKind.Html, lines[h]));
                     i = newI; continue;
                 }
             }
