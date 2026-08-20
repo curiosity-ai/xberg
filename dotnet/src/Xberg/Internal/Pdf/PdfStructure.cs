@@ -1448,61 +1448,40 @@ public static class PdfStructure
         return false;
     }
 
+    /// <summary>
+    /// Whether a line opens with a list marker. Ports <c>looks_like_list_item</c>: a bullet
+    /// glyph, a dash followed by a space, or an ordered marker that has both a separator and
+    /// alphabetic content after it.
+    /// </summary>
     private static bool LooksLikeListItem(string text)
     {
         string t = text.TrimStart();
         if (t.Length == 0) return false;
-        if (t.StartsWith('•') || t.StartsWith('·') || t.StartsWith('◦') || t.StartsWith('▪') || t.StartsWith('–') || t.StartsWith('—'))
-            return true;
+
+        if (t[0] is '\u2022' or '\u00b7' or '\u25e6' or '\u25aa') return true;
+
+        if (t[0] is '\u2013' or '\u2014')
+        {
+            string rest = t[1..];
+            if (!rest.StartsWith(' ') && !rest.StartsWith('\t')) return false;
+            string body = rest.TrimStart(' ', '\t');
+            return body.Length != 0 && body[0] is not ('\r' or '\n');
+        }
+
         if (t.StartsWith("- "))
         {
-            string rest = t.Substring(2);
-            return rest.Length > 0 && char.IsLetter(rest[0]);
-        }
-        int i = 0;
-        if (t[0] == '(')
-        {
-            i = 1;
-            if (i < t.Length && char.IsLetterOrDigit(t[i]))
-            {
-                while (i < t.Length && char.IsLetterOrDigit(t[i])) i++;
-                if (i < t.Length && t[i] == ')')
-                {
-                    i++;
-                    if (i < t.Length && char.IsWhiteSpace(t[i]))
-                    {
-                        i++;
-                        return i < t.Length && char.IsLetter(t[i]);
-                    }
-                }
-            }
-            return false;
+            string rest = t[2..];
+            return rest.Length != 0 && char.IsLetter(rest[0]);
         }
 
         if (IsNumberedSectionHeading(t)) return false;
 
-        if (char.IsLetterOrDigit(t[0]))
-        {
-            int numLen = 0; bool allDigits = true; bool allRoman = true;
-            while (i < t.Length && char.IsLetterOrDigit(t[i]))
-            {
-                allDigits &= char.IsAsciiDigit(t[i]);
-                char lc = char.ToLowerInvariant(t[i]);
-                allRoman &= lc is 'i' or 'v' or 'x' or 'l' or 'c' or 'd' or 'm';
-                i++; numLen++;
-            }
-            bool markerLike = allDigits || numLen == 1 || allRoman;
-            if (numLen <= 4 && markerLike && i < t.Length && (t[i] == '.' || t[i] == ')'))
-            {
-                i++;
-                if (i < t.Length && char.IsWhiteSpace(t[i]))
-                {
-                    i++;
-                    return i < t.Length && char.IsLetter(t[i]);
-                }
-            }
-        }
-        return false;
+        if (PdfListMarker.Parse(t) is not { } marker) return false;
+        return marker.HasContent
+            && marker.HasSeparator
+            && !PdfListMarker.IsProbableAuthorByline(t)
+            && marker.ContentStart < t.Length
+            && char.IsLetter(t[marker.ContentStart]);
     }
 
     private static bool IsStructuralHeadingWord(string text) => text.Trim() switch

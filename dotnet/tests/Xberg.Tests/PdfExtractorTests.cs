@@ -650,3 +650,57 @@ public class Type1EncodingTests
         Assert.Null(Type1Encoding.Parse([]));
     }
 }
+
+/// <summary>
+/// Tests for ordered-list marker recognition (<see cref="PdfListMarker"/>) and the line
+/// classification built on it.
+/// </summary>
+public class PdfListMarkerTests
+{
+    [Theory]
+    [InlineData("1. first", 1)]
+    [InlineData("  12) twelfth", 12)]
+    [InlineData("(7) seventh", 7)]
+    [InlineData("[3] bracketed", 3)]
+    public void Parse_ExposesNumericValueForNumericMarkers(string source, int expected)
+    {
+        var marker = PdfListMarker.Parse(source);
+        Assert.NotNull(marker);
+        Assert.Equal(expected, marker!.Value.NumericValue);
+        Assert.True(marker.Value.HasContent);
+        Assert.True(marker.Value.HasSeparator);
+    }
+
+    [Theory]
+    [InlineData("a. alpha", "alpha")]
+    [InlineData("I. Roman", "Roman")]
+    [InlineData("(1) parenthesized", "parenthesized")]
+    [InlineData("  12) numeric", "numeric")]
+    public void Parse_ReportsWhereTheContentStarts(string source, string expected)
+    {
+        var marker = PdfListMarker.Parse(source);
+        Assert.NotNull(marker);
+        Assert.Equal(expected, source[marker!.Value.ContentStart..]);
+    }
+
+    /// <summary>
+    /// The three-digit cap is what keeps a year from opening a list: in
+    /// "…delivered on January 23,\n2023. A total of 3 trucks…" the second line would otherwise
+    /// become an ordered item and split the sentence in two.
+    /// </summary>
+    [Fact]
+    public void Parse_RejectsNumbersTooLongToBeMarkers()
+    {
+        Assert.Null(PdfListMarker.Parse("2023. A total of 3 trucks were used for 15 hours."));
+        Assert.Null(PdfListMarker.Parse("1234) not a marker"));
+        Assert.NotNull(PdfListMarker.Parse("123. still a marker"));
+    }
+
+    /// <summary>An author's initial is not a list marker, but only in a byline's company.</summary>
+    [Fact]
+    public void IsProbableAuthorByline_NeedsASurnameCommaAndASecondInitial()
+    {
+        Assert.True(PdfListMarker.IsProbableAuthorByline("A. Smith, B. Jones et al."));
+        Assert.False(PdfListMarker.IsProbableAuthorByline("A. First item in a list"));
+    }
+}
