@@ -10,12 +10,12 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2506 fixtures (79.2%) match on every hard dimension**; content parity is **81.4%
-> identical, 90.1% ≥95%-similar**; 66 fixtures (<80%) are genuine content misses; **7
-> catastrophes (0.2%), all HTML**. 495 unit tests.
+> **2509 fixtures (79.3%) match on every hard dimension**; content parity is **82.0%
+> identical, 90.4% ≥95%-similar**; 57 fixtures (<80%) are genuine content misses; **4
+> catastrophes (0.1%), all HTML**. 529 unit tests.
 >
-> The last pass took it from 2340 and was mostly a matter of finding things the port had never
-> implemented at all rather than tuning what it had. Ordered by what they were worth:
+> The last two passes took it from 2340 and were mostly a matter of finding things the port had
+> never implemented at all rather than tuning what it had. Ordered by what they were worth:
 >
 > - **Plain text (txt 957 → 989 of 1008, plain 991/991).** The text extractor builds its
 >   document directly, which bypasses the paragraph splitter downstream, so nothing normalized
@@ -42,6 +42,20 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >   box's inner paragraphs were emitted as document structure, so a numbered `w:p` inside a shape
 >   became a list in the body; and page boundaries were measured against text that dropped every
 >   equation, which put both boundaries of a maths-heavy document 700 bytes short.
+> - **HTML catastrophes 7 → 4.** The DOM builder had implied-close rules for list items but none
+>   for tables, so `<table><td>…` left every cell hanging off the table where no consumer looks
+>   for it. On one fixture that table held 99% of the document. Content losses fell from 327K
+>   characters to 245K.
+> - **PDF tables in the structured document.** The markdown and HTML renderers were fed a
+>   document with no tables in it at all. Upstream reaches them through a layout detector with a
+>   geometric fallback; the reference outputs were generated without the detector, so the
+>   fallback is the whole path — and it needs nothing but the words on the page. 163 fixtures had
+>   a table in the reference markdown and none in ours; 132 now.
+> - **PDF table guards (218 → 222, ok 100 → 103).** The well-formedness gate was a simplified
+>   version of upstream's, rejecting dense numeric ledgers and accepting reflowed paragraphs.
+> - **HTML entities and comment-prefixed pages.** The markdown converter knew forty entity names
+>   where upstream's HTML5 parser knows 2125, and a page whose first line is a comment was
+>   handed to the XML extractor as a tag outline.
 >
 > ## Upstream defects, flagged and left alone
 >
@@ -61,6 +75,14 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >   verbatim. The port matches the references, which is also what the AsciiMath path can do
 >   without a converter it does not have.
 > - **`H2SO4` on `pdf/embedded_images_tables.pdf`**, where upstream reads `H SO4`.
+> - **Duplicated body text on `office/regression/000_000213.html`.** A 7 KB page extracts to
+>   39 KB upstream, with one paragraph repeated ten times. The page leaves `<p>` and `<a>`
+>   unclosed across blocks, and html5ever's adoption-agency algorithm reparents the formatting
+>   element into each block it spans. This port's simpler tree builder does not, so it extracts
+>   the page once. Counted as an under-extraction by the harness; it is not one.
+> - **An empty bullet before every list item on `pdf/multi_page.pdf`.** Upstream emits `- ` with
+>   nothing after it, then the item's text as a separate bold paragraph, wherever a bullet glyph
+>   is its own text run. This port keeps the item and its text together.
 
 ## Known gaps after the merge
 
@@ -82,7 +104,8 @@ not a cosmetic difference.
 
       The remaining 29 are the flagged upstream defects above (the `dc:description` fragment
       and the inherited `/MediaBox`) plus genuine scan-signal differences.
-- [ ] **PDF content (389 fixtures, 100 fully matching; plain 122/388, markdown 53/388).**
+- [ ] **PDF content (389 fixtures, 103 fully matching; plain 123/388, markdown 54/388,
+      tables 222/388).**
       The largest remaining area, and upstream landed 127 PDF commits in this window. This is
       extraction *quality*, not a missing feature, and it does not decompose into a few
       systematic fixes — measured, not assumed:
@@ -90,6 +113,9 @@ not a cosmetic difference.
         the failing fixtures, i.e. mostly reading-order and whitespace, one document at a time.
       - Tables: of the mismatches only a minority are "we found no table at all" (the missing
         ruling-line/bordered-grid tier). Most are cell-segmentation differences.
+      - The structured document now emits tables (see "The PDF gap, measured" below): the
+        geometric region fallback and its reconstruction path are ported, which took the count
+        of fixtures whose reference markdown has a table and ours has none from 163 to 132.
 
       **The structure pipeline is now much closer to upstream's.** Ported in the last pass:
       `sparse_multi_page_heading_map` and `has_repeated_sparse_peer_heading_tier` (a font tier
@@ -125,10 +151,10 @@ not a cosmetic difference.
 
       Three passes from pdf_oxide *were* ported successfully and are correct but score-neutral:
       - Ligature expansion for encoding-derived mappings (never ToUnicode — a ToUnicode CMap is
-        the font's own statement and is taken at its word). Upstream also reaches a custom
-        encoding by parsing the embedded font program; standing in for that with "the font is
-        embedded" was measured and over-applies, costing four fixtures. 26 goldens keep raw
-        ligatures in their plain output, so this is genuinely font-dependent.
+        the font's own statement and is taken at its word). The embedded Type 1 program's own
+        `/Encoding` array is parsed now, which is where a TeX font declares its ligature slots
+        (codes 11-15, which no named encoding assigns): spurious ligatures across the corpus fell
+        from 55 to 13, the remainder being CFF fonts whose encoding lives in `/FontFile3`.
       - `merge_sub_superscript_spans`, which reattaches raised and lowered runs to the words
         they modify. On `pdf/embedded_images_tables.pdf` this makes our output *better* than
         the golden — we produce `H2SO4` where upstream produces `H SO4`.
@@ -145,10 +171,10 @@ not a cosmetic difference.
 - [x] **DocTags ingestion.** Not a new format after all: upstream types these by content, and
       `*.doctags.txt` reached the plain-text extractor only because the port let the extension
       decide. Fixed by the extension/content change; the fixtures now route as markup.
-- [ ] **TOML key ordering (toml 1/5).** Rust's `toml::Value::Table` is a `BTreeMap`, so keys
-      are emitted in sorted order; the C# parser preserves file order. Datetimes also need the
-      `$__toml_private_datetime` wrapper that toml→serde_json produces, while the flattened
-      view keeps them plain.
+- [x] **TOML key ordering (now 5/5).** Rust's `toml::Value::Table` is a `BTreeMap`, so keys are
+      emitted in sorted order where the C# parser preserved file order; datetimes also needed the
+      `$__toml_private_datetime` wrapper that toml→serde_json produces, while the flattened view
+      keeps them plain. Both done.
 - [x] **pptx metadata (was 0/11, now 11/11).** Not slide numbering: `app.xml`'s `TitlesOfParts`
       is one flat vector concatenating fonts, theme and slide titles, and `HeadingPairs` says
       how many entries each group owns. Taking it whole put the font list in every
@@ -233,6 +259,28 @@ not a cosmetic difference.
       The first three had none written; the last two were unclaimed MIME types.
 - [x] **typ 0/8 → 7/8.** Five separate missing branches; the last fixture needs `@label`
       reference resolution, which is a feature rather than a fix.
+
+### The PDF gap, measured
+
+PDF is where the remaining distance is: 103 of 389 fixtures match on every hard dimension, and
+the shortfall is not one bug but three layers.
+
+- [ ] **Span assembly (plain 123/388).** The single biggest cause. pdf_oxide's text layer merges
+      glyph runs into spans on its own thresholds, and every downstream rule — spacing, reading
+      order, paragraph breaks — is calibrated to that granularity. The port's own merger produces
+      a different granularity, so a header row can come out `2010 2011` where upstream has them a
+      column apart. Three transplants of upstream's assembly loop were tried and each regressed
+      the corpus (plain 122 → 72, → 100, → 121); they were reverted. Closing this means porting
+      pdf_oxide's span merger itself, not tuning constants around it.
+- [ ] **Table recognition beyond the geometric fallback (tables 222/388).** The geometric path is
+      ported and finds the borderless grids. What is missing is pdf_oxide's *native* and
+      *bordered* passes, which read the page's drawn ruling lines — no managed equivalent exists,
+      so a ruled table with no column-aligned text geometry is still missed (the `skia_*` fixtures
+      are exactly this). `regions/table_recognition.rs` (2412 lines) is the ML-only tier and is
+      out of scope while the reference runs without the detector.
+- [ ] **Font programs other than Type 1 (13 stray ligatures).** `/FontFile` is parsed for its
+      built-in encoding; `/FontFile3` (CFF) is not, so a CFF subset font's own encoding — and the
+      ligature slots in it — are unavailable. Upstream's `cff_encoding.rs` is 2482 lines.
 
 ---
 
