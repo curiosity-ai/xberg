@@ -327,4 +327,50 @@ public class HtmlExtractorTests
         Assert.Contains("| a | b |", md);
         Assert.Contains("| c | d |", md);
     }
+
+    private static HtmlMetadata Meta(string html) => HtmlMeta.Extract(html);
+
+    /// <summary>
+    /// A `</style` closed with whitespace before its bracket is still a close tag. Matching the
+    /// literal `</style>` swallowed the rest of the document — on one Wikipedia fixture that was
+    /// four of its five headings and every link after them.
+    /// </summary>
+    [Fact]
+    public void ARawTextElementClosesOnWhitespaceBeforeTheBracket()
+    {
+        var m = Meta("<html><head><style>.a { color: red; }</style\n><title>T</title></head>" +
+                     "<body><h2 id=\"one\">One</h2></body></html>");
+
+        Assert.Equal("T", m.Title);
+        Assert.Single(m.Headers);
+    }
+
+    /// <summary>
+    /// Preprocessing removes navigation and form subtrees before anything is collected, so a
+    /// sidebar's heading is not one of the document's headings.
+    /// </summary>
+    [Fact]
+    public void HeadingsInsideNavigationChromeAreNotDocumentHeadings()
+    {
+        var m = Meta("<html><body>" +
+                     "<nav class=\"toc\"><h2>Contents</h2></nav>" +
+                     "<h1 id=\"main\">Real heading</h1>" +
+                     "<form><h3>Search</h3></form>" +
+                     "</body></html>");
+
+        Assert.Single(m.Headers);
+    }
+
+    /// <summary>`lang` and `dir` are read from whichever of html/head/body carries them.</summary>
+    [Theory]
+    [InlineData("<html lang=\"he\" dir=\"rtl\"><body>x</body></html>", "he", TextDirection.RightToLeft)]
+    [InlineData("<html><body lang=\"fr\" dir=\"ltr\">x</body></html>", "fr", TextDirection.LeftToRight)]
+    [InlineData("<html><body dir=\"sideways\">x</body></html>", null, null)]
+    public void DocumentLanguageAndDirectionComeFromTheFirstElementThatDeclaresThem(
+        string html, string? language, TextDirection? direction)
+    {
+        var m = Meta(html);
+        Assert.Equal(language, m.Language);
+        Assert.Equal(direction, m.TextDirection);
+    }
 }

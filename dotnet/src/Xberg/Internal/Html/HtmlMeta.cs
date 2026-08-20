@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json.Serialization;
 using Xberg.Types;
 
 namespace Xberg.Internal.Html;
@@ -27,6 +28,7 @@ public static class HtmlMeta
         int captureHeading = 0;           // heading level currently open (0 = none)
         var headingText = new StringBuilder();
         int headingDepthAtOpen = 0;
+        string? headingId = null;
         int inCell = 0;                   // open <td>/<th> nesting (headings in cells are reprocessed)
         bool inAnchor = false;
         var anchorText = new StringBuilder();
@@ -36,6 +38,9 @@ public static class HtmlMeta
         List<string> anchorRel = new();
         bool inTitle = false;
         var titleText = new StringBuilder();
+        // Preprocessing removes navigation and form subtrees before anything is collected, so a
+        // sidebar's `<h2>Contents</h2>` is not one of the document's headings.
+        int skipDepth = -1;
 
         while (pos < n)
         {
@@ -62,6 +67,15 @@ public static class HtmlMeta
 
                 if (closing)
                 {
+                    if (skipDepth >= 0)
+                    {
+                        if (!Void.Contains(tag) && domDepth > 0)
+                        {
+                            domDepth--;
+                            if (domDepth <= skipDepth) skipDepth = -1;
+                        }
+                        continue;
+                    }
                     if (tag is "td" or "th") { if (inCell > 0) inCell--; }
                     if (tag is "h1" or "h2" or "h3" or "h4" or "h5" or "h6" && captureHeading != 0)
                     {
@@ -72,11 +86,20 @@ public static class HtmlMeta
                             // structure passes) by html-to-markdown, each recording it at depth 0.
                             if (inCell > 0)
                                 for (int r = 0; r < 3; r++)
-                                    m.Headers.Add(new Header { Level = captureHeading, Text = text, Depth = 0, HtmlOffset = 0 });
+                                    m.Headers.Add(new Header
+                                    {
+                                        Level = captureHeading, Text = text, Id = headingId,
+                                        Depth = 0, HtmlOffset = 0,
+                                    });
                             else
-                                m.Headers.Add(new Header { Level = captureHeading, Text = text, Depth = headingDepthAtOpen, HtmlOffset = 0 });
+                                m.Headers.Add(new Header
+                                {
+                                    Level = captureHeading, Text = text, Id = headingId,
+                                    Depth = headingDepthAtOpen, HtmlOffset = 0,
+                                });
                         }
                         captureHeading = 0;
+                        headingId = null;
                     }
                     else if (tag == "a" && inAnchor)
                     {
@@ -105,13 +128,39 @@ public static class HtmlMeta
                     continue;
                 }
 
+                if (skipDepth >= 0)
+                {
+                    if (!Void.Contains(tag) && !selfClose) domDepth++;
+                    continue;
+                }
+
+                if (!selfClose && !Void.Contains(tag)
+                    && HtmlToMarkdown.ShouldDropForPreprocessing(
+                        tag,
+                        ExtractAttrDecoded(attrsStr, "role"),
+                        ExtractAttrDecoded(attrsStr, "aria-label"),
+                        ExtractAttrDecoded(attrsStr, "class"),
+                        ExtractAttrDecoded(attrsStr, "id")))
+                {
+                    skipDepth = domDepth;
+                    domDepth++;
+                    continue;
+                }
+
                 // Opening / self-closing tag.
                 switch (tag)
                 {
+                    // `lang` and `dir` are read from whichever of these carries them, first
+                    // occurrence winning: a page that sets direction on `<body>` rather than
+                    // `<html>` is still declaring the document's direction.
                     case "html":
+                    case "head":
+                    case "body":
                     {
                         string? lang = ExtractAttrDecoded(attrsStr, "lang");
-                        if (lang is not null) m.Language = lang;
+                        if (lang is not null && m.Language is null) m.Language = lang;
+                        string? dir = ExtractAttrDecoded(attrsStr, "dir");
+                        if (dir is not null && m.TextDirection is null) m.TextDirection = ParseTextDirection(dir);
                         break;
                     }
                     case "meta":
@@ -142,6 +191,7 @@ public static class HtmlMeta
                         captureHeading = tag[1] - '0';
                         headingText.Clear();
                         headingDepthAtOpen = domDepth;
+                        headingId = ExtractAttrDecoded(attrsStr, "id");
                         break;
                     case "a":
                     {
@@ -171,9 +221,9 @@ public static class HtmlMeta
                     case "script":
                     {
                         string? type = ExtractAttrDecoded(attrsStr, "type");
-                        int close = html.IndexOf("</script>", pos, StringComparison.OrdinalIgnoreCase);
+                        var (close, after) = FindRawTextEnd(html, pos, "script");
                         string body = close < 0 ? html[pos..] : html[pos..close];
-                        pos = close < 0 ? n : close + "</script>".Length;
+                        pos = close < 0 ? n : after;
                         if (type is not null && type.Contains("ld+json", StringComparison.OrdinalIgnoreCase))
                         {
                             string rawJson = body.Trim();
@@ -189,8 +239,8 @@ public static class HtmlMeta
                     }
                     case "style":
                     {
-                        int close = html.IndexOf("</style>", pos, StringComparison.OrdinalIgnoreCase);
-                        pos = close < 0 ? n : close + "</style>".Length;
+                        var (close, after) = FindRawTextEnd(html, pos, "style");
+                        pos = close < 0 ? n : after;
                         continue;
                     }
                 }
@@ -210,6 +260,39 @@ public static class HtmlMeta
         }
         return m;
     }
+
+    /// <summary>
+    /// Locate the end of a raw-text element's body: the offset where <c>&lt;/name</c> starts, and
+    /// the offset just past the tag's <c>&gt;</c>.
+    /// </summary>
+    /// <remarks>
+    /// The close tag is not always spelled <c>&lt;/style&gt;</c> — whitespace is allowed before
+    /// the bracket, and pages in the corpus write <c>&lt;/style\n&gt;</c>. Matching the literal
+    /// swallowed the rest of the document, taking every heading and link after it with it.
+    /// </remarks>
+    private static (int Start, int After) FindRawTextEnd(string html, int from, string name)
+    {
+        string needle = "</" + name;
+        int search = from;
+        while (true)
+        {
+            int close = html.IndexOf(needle, search, StringComparison.OrdinalIgnoreCase);
+            if (close < 0) return (-1, html.Length);
+            int k = close + needle.Length;
+            while (k < html.Length && char.IsWhiteSpace(html[k])) k++;
+            if (k < html.Length && html[k] == '>') return (close, k + 1);
+            search = close + 1;
+        }
+    }
+
+    /// <summary>The `dir` attribute's value, or null when it is not one the spec defines.</summary>
+    private static TextDirection? ParseTextDirection(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "ltr" => TextDirection.LeftToRight,
+        "rtl" => TextDirection.RightToLeft,
+        "auto" => TextDirection.Auto,
+        _ => null,
+    };
 
     private static void HandleMeta(HtmlMetadata m, string attrs)
     {
@@ -339,6 +422,11 @@ public static class HtmlMeta
     {
         public int Level { get; set; }
         public string Text { get; set; } = "";
+
+        /// <summary>The heading's `id` attribute, which is what an in-page link targets.</summary>
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Id { get; set; }
+
         public int Depth { get; set; }
         public int HtmlOffset { get; set; }
     }

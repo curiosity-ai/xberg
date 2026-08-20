@@ -346,13 +346,8 @@ internal static class HtmlToMarkdown
     }
 
     // ── preprocessing drop (preprocessing_helpers::should_drop_for_preprocessing) ─
-    private static bool ShouldDrop(string tag, HNode node)
-    {
-        if (tag == "form") return true;
-        if (tag == "nav") return true;
-        if (tag is "header" or "footer" or "aside") return HasNavigationHint(node);
-        return false;
-    }
+    private static bool ShouldDrop(string tag, HNode node) => ShouldDropForPreprocessing(
+        tag, node.Attr("role"), node.Attr("aria-label"), node.Attr("class"), node.Attr("id"));
 
     private static readonly string[] NavKeywords =
     {
@@ -363,18 +358,35 @@ internal static class HtmlToMarkdown
         "vector-header", "vector-footer",
     };
 
-    private static bool HasNavigationHint(HNode node)
+    private static bool HasNavigationHint(HNode node) =>
+        HasNavigationHint(node.Attr("role"), node.Attr("aria-label"), node.Attr("class"), node.Attr("id"));
+
+    /// <summary>
+    /// Whether an element's attributes mark it as navigation chrome. Shared with the metadata
+    /// scanner, which sees attribute strings rather than nodes but has to drop exactly what
+    /// preprocessing drops — otherwise a sidebar's heading is collected as a document heading.
+    /// </summary>
+    internal static bool HasNavigationHint(string? role, string? ariaLabel, string? cls, string? id)
     {
-        string? role = node.Attr("role");
         if (role is not null && role is "navigation" or "menubar" or "tablist" or "toolbar") return true;
-        string? aria = node.Attr("aria-label");
-        if (aria is not null)
+        if (ariaLabel is not null)
         {
-            string lower = aria.ToLowerInvariant();
+            string lower = ariaLabel.ToLowerInvariant();
             foreach (var kw in new[] { "navigation", "menu", "contents", "table of contents", "toc" })
                 if (lower.Contains(kw, StringComparison.Ordinal)) return true;
         }
-        return AttrTokenMatches(node.Attr("class")) || AttrTokenMatches(node.Attr("id"));
+        return AttrTokenMatches(cls) || AttrTokenMatches(id);
+    }
+
+    /// <summary>
+    /// Whether preprocessing removes this element outright: every form and every nav, and a
+    /// header, footer or aside that carries a navigation hint.
+    /// </summary>
+    internal static bool ShouldDropForPreprocessing(string tag, string? role, string? ariaLabel, string? cls, string? id)
+    {
+        if (tag is "form" or "nav") return true;
+        if (tag is "header" or "footer" or "aside") return HasNavigationHint(role, ariaLabel, cls, id);
+        return false;
     }
 
     private static bool AttrTokenMatches(string? value)

@@ -144,7 +144,10 @@ public sealed class HtmlWalker
             }
             if (_lastWasSpace)
             {
-                if (target.Length > 0 && target[^1] != ' ' && target[^1] != '\n') target.Append(' ');
+                // A pending word-break space is dropped after a line break, including the `<br>`
+                // sentinel: the source newline that follows `<br>` is layout, and keeping it
+                // indents the next line by one space.
+                if (target.Length > 0 && target[^1] is not (' ' or '\n' or '\x01')) target.Append(' ');
                 _lastWasSpace = false;
             }
             target.Append(c);
