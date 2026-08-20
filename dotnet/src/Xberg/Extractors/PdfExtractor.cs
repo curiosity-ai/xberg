@@ -179,6 +179,19 @@ public sealed class PdfExtractor : IExtractor
         return tables;
     }
 
+    /// <summary>
+    /// Whether page spans come from the ported pdf_oxide pipeline rather than this port's
+    /// own content interpreter.
+    /// </summary>
+    /// <remarks>
+    /// On by default: the ported producer wins on every dimension the corpus measures.
+    /// The older interpreter stays reachable because it is still the source of the drawn
+    /// paths the table tiers read, and because a per-fixture A/B is the fastest way to
+    /// attribute a regression to the span layer.
+    /// </remarks>
+    internal static bool UsePortedSpans { get; set; } =
+        Environment.GetEnvironmentVariable("XBERG_OXIDE_SPANS") != "0";
+
     // SegmentData grid (out param) used for tables and heading structure. Mirrors Rust
     // `oxide::text::extract_text` + `oxide::hierarchy::extract_all_segments` sharing spans.
     private static string ExtractTextAndSegments(
@@ -209,6 +222,11 @@ public sealed class PdfExtractor : IExtractor
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
+                    // The older interpreter still runs: its `Paths` are what the ruling-line
+                    // table tiers read, and nothing in the ported pipeline collects those yet.
+                    if (UsePortedSpans)
+                        spans = OxSpanBridge.ToPdfSpans(
+                            Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPageText(pdf, i).Spans);
                     var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
                     (pageText, var lines) = PdfPageText.AssembleWithLines(spans, Math.Abs(mbUrx - mbLlx));
                     segs = PdfStructure.SegmentsFromLines(lines);
