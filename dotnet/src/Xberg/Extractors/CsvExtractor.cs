@@ -189,30 +189,38 @@ public sealed partial class CsvExtractor : IExtractor
         return true;
     }
 
+    /// <summary>
+    /// Whether the first row names the columns.
+    /// </summary>
+    /// <remarks>
+    /// A numeric cell anywhere in the first row makes it data: column names are words. An all-text
+    /// first row is a header even where the rows under it are also all text — reading
+    /// <c>Name,City / Alice,NYC</c> as headerless would render a blank header row over a table
+    /// that plainly has one.
+    /// </remarks>
     private static bool DetectHeader(List<List<string>> rows)
     {
         if (rows.Count < 2) return false;
         var first = rows[0];
         if (first.Count < 2) return false;
+        return !first.Any(IsCsvNumber);
+    }
 
-        bool firstHasNumber = first.Any(cell =>
-        {
-            string t = cell.Trim();
-            return t.Length > 0 && double.TryParse(t, NumberStyles.Any, CultureInfo.InvariantCulture, out _);
-        });
-        if (firstHasNumber) return false;
-
-        int end = Math.Min(rows.Count, 6);
-        for (int r = 1; r < end; r++)
-        {
-            if (rows[r].Any(cell =>
-            {
-                string t = cell.Trim();
-                return t.Length > 0 && double.TryParse(t, NumberStyles.Any, CultureInfo.InvariantCulture, out _);
-            }))
-                return true;
-        }
-        return false;
+    /// <summary>
+    /// Whether a cell is a real number.
+    /// </summary>
+    /// <remarks>
+    /// A float parse also accepts "NaN", "inf" and "infinity", so a header cell or a column of
+    /// those words would read as numeric and flip both header and column-type detection.
+    /// </remarks>
+    private static bool IsCsvNumber(string cell)
+    {
+        string trimmed = cell.Trim();
+        if (trimmed.Length == 0) return false;
+        string lower = trimmed.ToLowerInvariant();
+        if (lower.Length > 0 && (lower[0] == '+' || lower[0] == '-')) lower = lower[1..];
+        if (lower is "nan" or "inf" or "infinity") return false;
+        return double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out _);
     }
 
     private static List<string> InferColumnTypes(List<List<string>> rows, bool hasHeader)
