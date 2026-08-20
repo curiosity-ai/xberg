@@ -104,7 +104,7 @@ public static class HtmlMeta
                     else if (tag == "a" && inAnchor)
                     {
                         string text = HtmlWalker.NormalizeWhitespace(anchorText.ToString());
-                        m.Links.Add(new Link
+                        var link = new Link
                         {
                             Href = anchorHref,
                             Text = text,
@@ -112,7 +112,10 @@ public static class HtmlMeta
                             LinkType = ClassifyLink(anchorHref),
                             Rel = anchorRel,
                             Attributes = anchorAttrs,
-                        });
+                        };
+                        // A link inside a table cell is walked three times, as a heading or an
+                        // image in a cell is.
+                        for (int r = 0; r < (inCell > 0 ? 3 : 1); r++) m.Links.Add(link);
                         inAnchor = false;
                     }
                     else if (tag == "title" && inTitle)
@@ -204,16 +207,34 @@ public static class HtmlMeta
                     }
                     case "img":
                     {
-                        string? src = ExtractAttrDecoded(attrsStr, "src");
+                        // The source is recorded as written. A query string spelled
+                        // `?a=1&amp;b=2` stays that way — the collector reads the attribute, it
+                        // does not resolve the URL.
+                        string? src = HtmlWalker.ExtractAttr(attrsStr, "src");
                         string? alt = ExtractAttrDecoded(attrsStr, "alt");
                         var attrs = ParseAttrs(attrsStr, exclude: "src", out _);
-                        m.Images.Add(new Img
+                        // Dimensions are recorded only when the element states both, which is
+                        // what makes them a size rather than half of one.
+                        uint[]? dimensions =
+                            uint.TryParse(ExtractAttrDecoded(attrsStr, "width"), out uint width)
+                            && uint.TryParse(ExtractAttrDecoded(attrsStr, "height"), out uint height)
+                                ? [width, height]
+                                : null;
+                        var image = new Img
                         {
                             Src = src ?? "",
-                            Alt = alt,
+                            // An empty `alt` is the absence of alt text, not alt text that is
+                            // empty, and is recorded as absent.
+                            Alt = alt is { Length: > 0 } ? alt : null,
+                            Title = ExtractAttrDecoded(attrsStr, "title"),
+                            Dimensions = dimensions,
                             ImageType = ClassifyImage(src ?? ""),
                             Attributes = attrs,
-                        });
+                        };
+                        // An image inside a table cell is walked three times (grid + markdown +
+                        // structure passes) by html-to-markdown, each recording it, the same way
+                        // a heading in a cell is.
+                        for (int r = 0; r < (inCell > 0 ? 3 : 1); r++) m.Images.Add(image);
                         // A link wrapping an image carries the image markdown as its label text.
                         if (inAnchor) anchorText.Append("![").Append(alt ?? "").Append("](").Append(src ?? "").Append(')');
                         break;
@@ -343,12 +364,16 @@ public static class HtmlMeta
         return "other";
     }
 
+    /// <summary>
+    /// An image source is external only when it names its own scheme. A protocol-relative
+    /// <c>//host/path</c> inherits the page's, which makes it relative.
+    /// </summary>
     private static string ClassifyImage(string src)
     {
-        if (src.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) return "data-uri";
-        if (src.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-            src.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
-            src.StartsWith("//", StringComparison.Ordinal)) return "external";
+        if (src.StartsWith("data:", StringComparison.Ordinal)) return "data-uri";
+        if (src.StartsWith("http://", StringComparison.Ordinal)
+            || src.StartsWith("https://", StringComparison.Ordinal)) return "external";
+        if (src.StartsWith('<') && src.Contains("svg", StringComparison.Ordinal)) return "inline-svg";
         return "relative";
     }
 
@@ -445,8 +470,16 @@ public static class HtmlMeta
     private sealed class Img
     {
         public string Src { get; set; } = "";
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string? Alt { get; set; }
-        public object? Dimensions { get; set; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Title { get; set; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public uint[]? Dimensions { get; set; }
+
         public string ImageType { get; set; } = "external";
         public List<string[]> Attributes { get; set; } = new();
     }

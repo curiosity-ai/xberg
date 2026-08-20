@@ -373,4 +373,30 @@ public class HtmlExtractorTests
         Assert.Equal(language, m.Language);
         Assert.Equal(direction, m.TextDirection);
     }
+
+    /// <summary>
+    /// An image records its size only when the element states both halves of it, keeps the source
+    /// as written, and treats a protocol-relative URL as relative — it inherits the page's scheme
+    /// rather than naming one.
+    /// </summary>
+    [Fact]
+    public void ImageMetadataRecordsSizeSourceAndKind()
+    {
+        var m = Meta("<html><body>" +
+                     "<img src=\"//cdn.example/a.png?x=1&amp;y=2\" alt=\"A\" width=\"20\" height=\"10\">" +
+                     "<img src=\"b.png\" alt=\"\" width=\"20\">" +
+                     "</body></html>");
+
+        string json = System.Text.Json.JsonSerializer.Serialize(m.Images, new System.Text.Json.JsonSerializerOptions
+        {
+            PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.SnakeCaseLower,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        Assert.Contains("\"src\":\"//cdn.example/a.png?x=1&amp;y=2\"", json);
+        Assert.Contains("\"dimensions\":[20,10]", json);
+        Assert.Contains("\"image_type\":\"relative\"", json);
+        // The second image states only a width, and its alt is empty: neither is recorded.
+        Assert.DoesNotContain("\"alt\":\"\"", json);
+        Assert.Equal(2, m.Images.Count);
+    }
 }
