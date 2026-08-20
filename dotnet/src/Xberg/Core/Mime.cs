@@ -62,7 +62,7 @@ public static class Mime
             // every tag first and the HTML test never runs — upstream's issue #235, which this
             // port had inherited. It went unnoticed while the extension always won; once content
             // can overrule the extension, every HTML file routes to the XML extractor.
-            if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(trimmed))
+            if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(SkipLeadingComments(trimmed)))
                 return "text/html";
             if (trimmed.StartsWith("<?xml", StringComparison.Ordinal) || trimmed.StartsWith('<'))
                 return "application/xml";
@@ -154,6 +154,28 @@ public static class Mime
         "pre", "script", "select", "span", "strong", "style", "table", "tbody", "td", "textarea",
         "tfoot", "th", "thead", "tr", "ul",
     };
+
+    /// <summary>
+    /// Skip any leading comments, so the markup test sees the document's first real tag.
+    /// </summary>
+    /// <remarks>
+    /// The WHATWG sniffing table upstream reaches through <c>infer</c> lists <c>&lt;!--</c> among
+    /// the HTML openings outright — a document that starts with a comment is HTML. Applying that
+    /// only after the content is known to be text keeps a binary file with an HTML preamble (a
+    /// captive-portal page prepended to a PDF, which the corpus has) routed by its real
+    /// signature, while a page whose first line is a <c>Last-Modified</c> note above the DOCTYPE
+    /// is recognised rather than handed to the XML extractor as a tag outline.
+    /// </remarks>
+    private static string SkipLeadingComments(string trimmed)
+    {
+        while (trimmed.StartsWith("<!--", StringComparison.Ordinal))
+        {
+            int end = trimmed.IndexOf("-->", 4, StringComparison.Ordinal);
+            if (end < 0) return trimmed;
+            trimmed = trimmed[(end + 3)..].TrimStart();
+        }
+        return trimmed;
+    }
 
     /// <summary>Whether markup opens as HTML rather than as some other XML vocabulary.</summary>
     private static bool LooksLikeHtml(string trimmed)

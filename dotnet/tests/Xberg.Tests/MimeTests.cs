@@ -178,4 +178,25 @@ public class MimeTests
     {
         Assert.Equal("text/markdown", Mime.ResolveWithContent("text/markdown", ReadOnlySpan<byte>.Empty));
     }
+
+    /// <summary>
+    /// A page whose first line is a comment — a `Last-Modified` note above the DOCTYPE, as three
+    /// of the regression fixtures have — is still HTML. Without skipping it the DOCTYPE is never
+    /// seen and the file reaches the XML extractor, which renders it as an indented tag outline.
+    /// </summary>
+    [Theory]
+    [InlineData("<!-- Last-Modified: Mon, 22 Sep 2008 -->\n<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\">\n<html><body><p>hi</p></body></html>")]
+    [InlineData("<!-- one --><!-- two -->\n<HTML>\n<HEAD><TITLE>t</TITLE></HEAD><BODY>x</BODY>")]
+    public void CommentPrefixedMarkupIsStillHtml(string markup)
+    {
+        Assert.Equal("text/html", Mime.DetectMimeTypeFromBytes(Encoding.UTF8.GetBytes(markup)));
+    }
+
+    /// <summary>An unterminated comment is not a licence to guess; the file stays what it was.</summary>
+    [Fact]
+    public void AnUnterminatedCommentDoesNotMakeMarkupHtml()
+    {
+        Assert.Equal("application/xml", Mime.DetectMimeTypeFromBytes(
+            Encoding.UTF8.GetBytes("<!-- never closed\n<book><title>t</title></book>")));
+    }
 }
