@@ -993,6 +993,65 @@ public sealed class HtmlWalker
         return null;
     }
 
+    /// <summary>
+    /// Resolve every named character reference in the WHATWG table, plus numeric references.
+    /// </summary>
+    /// <remarks>
+    /// This is the decoder the HTML-to-markdown converter needs: upstream runs that path through
+    /// a real HTML5 parser, so a page writing <c>&amp;deg;</c> or <c>&amp;oacute;</c> arrives with
+    /// the character already resolved. <see cref="DecodeEntities"/> stays deliberately small
+    /// because the structure walker it serves ports a Rust function that knows only a few dozen
+    /// names, and widening it there would diverge from the reference the other way.
+    /// </remarks>
+    internal static string DecodeEntitiesFull(string s)
+    {
+        if (!s.Contains('&')) return s;
+        var outp = new StringBuilder(s.Length);
+        int i = 0;
+        while (i < s.Length)
+        {
+            char c = s[i++];
+            if (c != '&') { outp.Append(c); continue; }
+
+            int semi = s.IndexOf(';', i);
+            if (semi < 0 || semi - i > HtmlEntityTable.MaxNameLength) { outp.Append('&'); continue; }
+            string name = s[i..semi];
+            if (name.Length == 0) { outp.Append('&'); continue; }
+
+            if (HtmlEntityTable.Named.TryGetValue(name, out var mapped))
+            {
+                outp.Append(mapped);
+                i = semi + 1;
+                continue;
+            }
+
+            if (name[0] == '#' && DecodeNumericReference(name) is { } numeric)
+            {
+                outp.Append(numeric);
+                i = semi + 1;
+                continue;
+            }
+
+            outp.Append('&');
+        }
+        return outp.ToString();
+    }
+
+    private static string? DecodeNumericReference(string name)
+    {
+        string num = name[1..];
+        int cp;
+        if (num.StartsWith('x') || num.StartsWith('X'))
+        {
+            if (!int.TryParse(num[1..], System.Globalization.NumberStyles.HexNumber, null, out cp)) return null;
+        }
+        else if (!int.TryParse(num, out cp)) return null;
+
+        if (cp < 0 || cp > 0x10FFFF) return null;
+        try { return char.ConvertFromUtf32(cp); }
+        catch { return null; }
+    }
+
     internal static string DecodeEntities(string s)
     {
         if (!s.Contains('&')) return s;

@@ -1,5 +1,6 @@
 using System.Text;
 using Xberg.Core;
+using Xberg.Internal.Html;
 using Xberg.Extractors;
 using Xberg.Types;
 using Xunit;
@@ -271,5 +272,32 @@ public class HtmlExtractorTests
         Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading && e.Text == "Real heading");
         Assert.Contains(doc.Elements, e => e.Text == "Body text");
         Assert.DoesNotContain(doc.Elements, e => e.Text.Contains("Ignored", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The markdown converter resolves every name in the WHATWG table, not the few dozen the
+    /// structure walker knows: a weather page writing <c>&amp;deg;</c> should read "46.84°N",
+    /// not "46.84&amp;deg;N".
+    /// </summary>
+    [Theory]
+    [InlineData("46.84&deg;N", "46.84\u00b0N")]
+    [InlineData("Versi&oacute;n", "Versi\u00f3n")]
+    [InlineData("a &OverBar; b", "a \u203e b")]
+    [InlineData("&amp;lt; stays escaped once", "&lt; stays escaped once")]
+    [InlineData("&#176; and &#x2014;", "\u00b0 and \u2014")]
+    [InlineData("bare & ampersand", "bare & ampersand")]
+    [InlineData("&notanentity; kept", "&notanentity; kept")]
+    public void FullEntityDecoderResolvesTheWholeNamedTable(string input, string expected) =>
+        Assert.Equal(expected, HtmlWalker.DecodeEntitiesFull(input));
+
+    /// <summary>
+    /// The structure walker's decoder stays small on purpose — it ports a Rust function that
+    /// knows only a few dozen names, and widening it would diverge from the reference.
+    /// </summary>
+    [Fact]
+    public void StructureDecoderKeepsUnknownNamesVerbatim()
+    {
+        Assert.Equal("46.84&deg;N", HtmlWalker.DecodeEntities("46.84&deg;N"));
+        Assert.Equal("a & b", HtmlWalker.DecodeEntities("a &amp; b"));
     }
 }

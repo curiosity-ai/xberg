@@ -392,7 +392,7 @@ internal static class HtmlToMarkdown
     // ── text node (converter/text_node.rs, Normalized whitespace mode, no escaping) ─
     private static void ProcessTextNode(HNode node, StringBuilder output, Ctx ctx)
     {
-        string text = HtmlWalker.DecodeEntities(node.Text);
+        string text = HtmlWalker.DecodeEntitiesFull(node.Text);
         if (text.Length == 0) return;
 
         bool hadNewlines = text.Contains('\n');
@@ -875,7 +875,7 @@ internal static class HtmlToMarkdown
             return;
         }
 
-        string href = SanitizeMarkdownUrl(HtmlWalker.DecodeEntities(hrefRaw));
+        string href = SanitizeMarkdownUrl(HtmlWalker.DecodeEntitiesFull(hrefRaw));
 
         if (ctx.InLink) { WalkChildren(node, output, ctx); return; }
 
@@ -1010,7 +1010,7 @@ internal static class HtmlToMarkdown
         {
             var n = stack.Pop();
             if (n.IsComment) continue;
-            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntities(n.Text)); continue; }
+            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntitiesFull(n.Text)); continue; }
             if (BlockLevelForLabel.Contains(n.Tag)) { sawBlock = true; continue; }
             for (int i = n.Children.Count - 1; i >= 0; i--) stack.Push(n.Children[i]);
         }
@@ -1581,7 +1581,7 @@ internal static class HtmlToMarkdown
         if (node.IsComment) return;
         if (node.Tag is null)
         {
-            if (!scan.HasText && HtmlWalker.DecodeEntities(node.Text).Trim().Length > 0)
+            if (!scan.HasText && HtmlWalker.DecodeEntitiesFull(node.Text).Trim().Length > 0)
                 scan.HasText = true;
             return;
         }
@@ -2059,7 +2059,7 @@ internal static class HtmlToMarkdown
     {
         var sb = new StringBuilder();
         AppendTextContent(node, sb);
-        return HtmlWalker.DecodeEntities(sb.ToString());
+        return HtmlWalker.DecodeEntitiesFull(sb.ToString());
     }
 
     private static void AppendTextContent(HNode node, StringBuilder sb)
@@ -2295,6 +2295,9 @@ internal sealed class HNode
         if (Tag is null) return null;
         _attrCache ??= new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         if (_attrCache.TryGetValue(name, out var cached)) return cached;
+        // Attribute values are left as written. A real HTML5 tokenizer resolves character
+        // references in them, but the markdown writer escapes what it emits, and decoding an
+        // `alt` only to re-escape its `&` measured worse than leaving the source spelling alone.
         string? v = HtmlWalker.ExtractAttr(AttrString, name);
         _attrCache[name] = v;
         return v;
