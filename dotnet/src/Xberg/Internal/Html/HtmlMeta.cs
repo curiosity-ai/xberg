@@ -67,6 +67,13 @@ public static class HtmlMeta
         // Preprocessing removes navigation and form subtrees before anything is collected, so a
         // sidebar's `<h2>Contents</h2>` is not one of the document's headings.
         int skipDepth = -1;
+        // Head metadata is read from the children of `<head>`. A `<title>` written before the
+        // head — as some Federal Register pages are — is not one of them, and a document whose
+        // head holds nothing has no metadata at all.
+        bool inHead = false;
+        // A `<pre>` block is emitted as its raw text, so nothing inside it is visited as an
+        // element: a link written inside preformatted text is not one of the document's links.
+        int preDepth = 0;
 
         while (pos < n)
         {
@@ -102,6 +109,7 @@ public static class HtmlMeta
                         }
                         continue;
                     }
+                    if (tag == "pre" && preDepth > 0) preDepth--;
                     if (tag == "table" && tableDepth > 0 && --tableDepth == 0) CloseOutermostTable();
                     if (tag is "h1" or "h2" or "h3" or "h4" or "h5" or "h6" && captureHeading != 0)
                     {
@@ -133,11 +141,14 @@ public static class HtmlMeta
                         LinkSink().Add(link);
                         inAnchor = false;
                     }
+                    else if (tag == "head") inHead = false;
                     else if (tag == "title" && inTitle)
                     {
                         if (m.Title is null)
                         {
-                            string t = HtmlWalker.NormalizeWhitespace(titleText.ToString());
+                            // Trimmed but not collapsed: a title written with two spaces between
+                            // its halves keeps them.
+                            string t = titleText.ToString().Trim();
                             if (t.Length > 0) m.Title = t;
                         }
                         inTitle = false;
@@ -165,14 +176,23 @@ public static class HtmlMeta
                     continue;
                 }
 
+                if (tag == "pre" && !selfClose) preDepth++;
+                if (preDepth > 0 && tag is "a" or "img" or "h1" or "h2" or "h3" or "h4" or "h5" or "h6")
+                {
+                    if (!Void.Contains(tag) && !selfClose) domDepth++;
+                    continue;
+                }
+
                 // Opening / self-closing tag.
                 switch (tag)
                 {
                     // `lang` and `dir` are read from whichever of these carries them, first
                     // occurrence winning: a page that sets direction on `<body>` rather than
                     // `<html>` is still declaring the document's direction.
+                    case "head" when !selfClose:
+                        inHead = true;
+                        goto case "html";
                     case "html":
-                    case "head":
                     case "body":
                     {
                         string? lang = ExtractAttrDecoded(attrsStr, "lang");
@@ -200,7 +220,7 @@ public static class HtmlMeta
                         break;
                     }
                     case "title":
-                        inTitle = true; titleText.Clear();
+                        if (inHead) { inTitle = true; titleText.Clear(); }
                         break;
                     case "table":
                         if (!selfClose) tableDepth++;

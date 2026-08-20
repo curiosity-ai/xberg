@@ -399,4 +399,40 @@ public class HtmlExtractorTests
         Assert.DoesNotContain("\"alt\":\"\"", json);
         Assert.Equal(2, m.Images.Count);
     }
+
+    /// <summary>
+    /// Head metadata is read from the children of `<head>`. A `<title>` written before the head
+    /// — as some Federal Register pages are — is not one of them.
+    /// </summary>
+    [Fact]
+    public void OnlyTheHeadsOwnTitleCounts()
+    {
+        Assert.Null(Meta("<HTML>\n<TITLE>Stray</TITLE>\n<HEAD></HEAD>\n<BODY>x</BODY></HTML>").Title);
+        Assert.Equal("Real", Meta("<html><head><title>Real</title></head><body>x</body></html>").Title);
+    }
+
+    /// <summary>
+    /// A title is trimmed but not collapsed: one written with two spaces between its halves
+    /// keeps them, and its entities are resolved.
+    /// </summary>
+    [Fact]
+    public void ATitleKeepsItsInternalSpacing()
+    {
+        Assert.Equal(
+            "Understanding Output \u2014 aequitas  documentation",
+            Meta("<html><head><title>\n  Understanding Output &mdash; aequitas  documentation\n</title></head></html>").Title);
+    }
+
+    /// <summary>
+    /// A `<pre>` block is emitted as raw text, so nothing inside it is visited as an element —
+    /// a link written inside preformatted text is not one of the document's links.
+    /// </summary>
+    [Fact]
+    public void PreformattedTextContributesNoLinks()
+    {
+        var m = Meta("<html><body><pre>see <a href=\"http://example.com\">here</a></pre>" +
+                     "<p><a href=\"/real\">real</a></p></body></html>");
+
+        Assert.Single(m.Links);
+    }
 }
