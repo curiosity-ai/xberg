@@ -73,7 +73,10 @@ public sealed class PdfExtractor : IExtractor
         InternalDocument? structured = null;
         if (needsStructured)
         {
-            try { structured = PdfStructure.Build(pageSegments, ruledTables: tables); }
+            List<PdfOutlineEntry> outline;
+            try { outline = PdfBookmarks.ExtractOutlineEntries(pdf); }
+            catch { outline = new List<PdfOutlineEntry>(); }
+            try { structured = PdfStructure.Build(pageSegments, ruledTables: tables, outlineEntries: outline); }
             catch { structured = null; }
         }
 

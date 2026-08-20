@@ -123,8 +123,11 @@ public static class PdfStructure
     /// <param name="ruledTables">Tables the ruling-line tiers already found, keyed by
     /// their page number. A page they cover keeps them instead of re-deriving a grid
     /// from text geometry, matching the tier priority in the flat table list.</param>
+    /// <param name="outlineEntries">The document's bookmarks, if any. A heading the
+    /// font-size classifier could not see is recovered from the outline item that names it.</param>
     public static InternalDocument? Build(
-        List<List<SegmentData>> allPageSegments, int kClusters = 4, List<Table>? ruledTables = null)
+        List<List<SegmentData>> allPageSegments, int kClusters = 4, List<Table>? ruledTables = null,
+        List<PdfOutlineEntry>? outlineEntries = null)
     {
         int pageCount = allPageSegments.Count;
 
@@ -192,6 +195,7 @@ public static class PdfStructure
         MarkCrossPageRepeatingText(allPageParagraphs, pageHeights);
         MarkCrossPageRepeatingShortText(allPageParagraphs);
         MarkArxivNoise(allPageParagraphs);
+        if (outlineEntries is { Count: > 0 }) RecoverHeadingsFromOutline(allPageParagraphs, outlineEntries);
         foreach (var page in allPageParagraphs) RetainPageFurnitureSafely(page);
         DeduplicateParagraphs(allPageParagraphs);
         CompactFinalHeadingHierarchy(allPageParagraphs);
@@ -717,40 +721,52 @@ public static class PdfStructure
         var first = lines[0];
         int wordCount = WordCount(trimmed);
         bool isBold = lines.Count(l => l.IsBold) > lines.Count / 2;
+        bool isItalic = lines.Count > 0 && lines.All(l => l.IsItalic);
         var reconstructed = ReconstructPdfLines(lines);
+        float bodyFont = BodyFontSize(headingMap);
+        bool looksListItem = LooksLikeListItem(trimmed);
 
         bool pageNumberLike = wordCount <= 10 && IsPageNumberPattern(trimmed);
 
         // Pass 1: font-size heading.
         byte? headingLevel = FindHeadingLevel(first.FontSize, headingMap, avgGap);
-        if (headingLevel.HasValue && (wordCount > 20 || IsSeparatorText(trimmed) || pageNumberLike))
+        if (headingLevel.HasValue
+            && (wordCount > MAX_HEADING_WORD_COUNT || IsSeparatorText(trimmed) || LooksLikeBareUrl(trimmed)
+                || pageNumberLike))
             headingLevel = null;
 
-        // Pass 2: bold-at-body-size → H2.
-        if (headingLevel is null && isBold && wordCount >= 1 && wordCount <= 8 && lines.Count == 1
-            && !trimmed.EndsWith('.') && !trimmed.EndsWith(':') && !trimmed.EndsWith(',') && !trimmed.EndsWith(';')
-            && !trimmed.Contains('@') && !trimmed.Contains('(') && !trimmed.Contains(',')
-            && (char.IsUpper(trimmed[0]) || char.IsAsciiDigit(trimmed[0]))
-            && !IsSeparatorText(trimmed) && !LooksLikeFigureLabel(trimmed))
-            headingLevel = InferBoldHeadingLevel(first.FontSize, BodyFontSize(headingMap), trimmed);
-
-        // Pass 3: font-above-body for short section-pattern paragraphs.
-        if (headingLevel is null)
+        // Pass 2: a bold or italic run short enough to be a heading, at whatever level its
+        // size implies. A line that ends a sentence, labels a figure, or is a bare URL is
+        // emphasis inside the prose, not a section head.
+        if (headingLevel is null && (isBold || isItalic) && !looksListItem
+            && wordCount <= MAX_BOLD_HEADING_WORD_COUNT)
         {
-            float bodyFont = BodyFontSize(headingMap);
-            float minThreshold = bodyFont * MIN_HEADING_FONT_RATIO;
-            if (bodyFont > 0f && first.FontSize >= minThreshold && first.FontSize > bodyFont + 0.5f
-                && wordCount <= MAX_BOLD_HEADING_WORD_COUNT && lines.Count <= 2
-                && !trimmed.EndsWith(':') && !trimmed.Contains('@')
-                && (IsSectionPattern(trimmed) || IsStructuralHeadingWord(trimmed))
-                && !IsSeparatorText(trimmed) && !LooksLikeFigureLabel(trimmed)
-                && !LooksLikeListItem(trimmed) && !pageNumberLike)
-                headingLevel = IsSectionPattern(trimmed) && StartsWithSectionNumber(trimmed)
-                    ? InferSectionLevel(trimmed)
-                    : (byte)2;
+            bool italicOk = !(isItalic && !isBold)
+                || (!trimmed.Contains('@') && !trimmed.Contains(',') && char.IsUpper(trimmed[0]));
+            // Two words at body size are a lead-in, not a section: the size says nothing and
+            // the length says less.
+            bool tooShortAtBody = wordCount <= 2 && bodyFont > 0f && first.FontSize <= bodyFont + 0.5f;
+            bool periodOk = !EndsWithSentencePeriod(trimmed) || IsSectionPattern(trimmed);
+            bool colonOk = !trimmed.EndsWith(':') || IsAllCapsText(trimmed);
+            if (italicOk && !tooShortAtBody && periodOk && colonOk
+                && !LooksLikeFigureLabel(trimmed) && !LooksLikeBareUrl(trimmed) && !IsSeparatorText(trimmed))
+                headingLevel = InferBoldHeadingLevel(first.FontSize, bodyFont, trimmed);
         }
 
-        bool isListItem = headingLevel is null && LooksLikeListItem(trimmed);
+        bool isCodeBlockCandidate = lines.All(l => l.IsMonospace) && lines.Count >= 2;
+
+        // Pass 3: a numbered section head, whatever its weight, as long as it is not set
+        // below the body text.
+        if (headingLevel is null && !looksListItem && !isCodeBlockCandidate
+            && wordCount >= 2 && wordCount <= MAX_HEADING_WORD_COUNT
+            && StartsWithSectionNumber(trimmed) && !trimmed.EndsWith(':')
+            && !LooksLikeFigureLabel(trimmed) && !IsSeparatorText(trimmed)
+            && (bodyFont <= 0f || first.FontSize >= bodyFont - 0.5f))
+            headingLevel = InferSectionLevel(trimmed);
+
+        if (isCodeBlockCandidate) headingLevel = null;
+
+        bool isListItem = headingLevel is null && looksListItem;
         bool isCodeBlock = headingLevel is null && !isListItem && lines.All(l => l.IsMonospace) && lines.Count >= 2;
         bool isPageFurniture = headingLevel is null && !isListItem && !isCodeBlock && wordCount <= 10 && IsPageNumberPattern(trimmed);
 
@@ -919,6 +935,171 @@ public static class PdfStructure
             return;
         }
         paragraphs.RemoveAll(p => p.IsPageFurniture);
+    }
+
+    // ── outline-driven heading recovery (pipeline.rs) ────────────────────────────
+
+    /// <summary>Depth added to an outline item's depth when nothing calibrates the offset.</summary>
+    private const int DEFAULT_OUTLINE_HEADING_OFFSET = 2;
+
+    /// <summary>Headings that must already agree on an offset before it is trusted.</summary>
+    private const int MIN_OUTLINE_CALIBRATION_ANCHORS = 2;
+
+    private const int MIN_MARKDOWN_HEADING_LEVEL = 1;
+    private const int MAX_MARKDOWN_HEADING_LEVEL = 6;
+
+    private readonly record struct OutlineParagraphMatch(int PageIndex, int ParagraphIndex, int Depth);
+
+    /// <summary>
+    /// Give a paragraph the heading level its outline item implies. The item's depth is
+    /// relative to the outline root, so it is shifted by an offset calibrated against the
+    /// headings the classifier already found — and by a default when too few agree.
+    /// </summary>
+    private static void RecoverHeadingsFromOutline(
+        List<List<PdfParagraph>> allPages, List<PdfOutlineEntry> outlineEntries)
+    {
+        var matches = CollectUniqueOutlineMatches(allPages, outlineEntries);
+        int offset = CalibratedOutlineHeadingOffset(allPages, matches);
+
+        foreach (var matched in matches)
+        {
+            var paragraph = allPages[matched.PageIndex][matched.ParagraphIndex];
+            if (paragraph.HeadingLevel.HasValue || !OutlineLayoutAllowsHeading(paragraph)) continue;
+            int level = Math.Clamp(matched.Depth + offset, MIN_MARKDOWN_HEADING_LEVEL, MAX_MARKDOWN_HEADING_LEVEL);
+            paragraph.HeadingLevel = (byte)level;
+            paragraph.IsListItem = false;
+            paragraph.IsPageFurniture = false;
+        }
+    }
+
+    /// <summary>
+    /// Match outline items to paragraphs, keeping only the pairs where the title occurs
+    /// exactly once in the outline for that page and exactly once among the page's
+    /// paragraphs — an ambiguous title says nothing about which paragraph is the heading.
+    /// </summary>
+    private static List<OutlineParagraphMatch> CollectUniqueOutlineMatches(
+        List<List<PdfParagraph>> allPages, List<PdfOutlineEntry> outlineEntries)
+    {
+        var outlineCounts = new Dictionary<(int, string), int>();
+        foreach (var entry in outlineEntries)
+        {
+            var key = OutlineMatchKey(entry, allPages.Count);
+            if (key is null) continue;
+            outlineCounts[key.Value] = outlineCounts.GetValueOrDefault(key.Value) + 1;
+        }
+
+        var paragraphMatches = new List<Dictionary<string, (int Count, int Index)>>(allPages.Count);
+        foreach (var page in allPages)
+        {
+            var map = new Dictionary<string, (int Count, int Index)>(StringComparer.Ordinal);
+            for (int index = 0; index < page.Count; index++)
+            {
+                string title = NormalizeOutlineTitle(ParagraphTextRaw(page[index]));
+                if (map.TryGetValue(title, out var existing)) map[title] = (existing.Count + 1, existing.Index);
+                else map[title] = (1, index);
+            }
+            paragraphMatches.Add(map);
+        }
+
+        var result = new List<OutlineParagraphMatch>();
+        foreach (var entry in outlineEntries)
+        {
+            var key = OutlineMatchKey(entry, allPages.Count);
+            if (key is not { } k) continue;
+            if (outlineCounts.GetValueOrDefault(k) != 1) continue;
+            if (!paragraphMatches[k.Item1].TryGetValue(k.Item2, out var match)) continue;
+            if (match.Count != 1) continue;
+            result.Add(new OutlineParagraphMatch(k.Item1, match.Index, entry.Depth));
+        }
+        return result;
+    }
+
+    private static (int, string)? OutlineMatchKey(PdfOutlineEntry entry, int pageCount)
+    {
+        if (entry.PageNumber is not { } pageNumber || pageNumber < 1) return null;
+        int pageIndex = pageNumber - 1;
+        string title = NormalizeOutlineTitle(entry.Title);
+        return pageIndex < pageCount && title.Length > 0 ? (pageIndex, title) : null;
+    }
+
+    /// <summary>
+    /// The modal (level − depth) among matches the classifier already levelled. Only a
+    /// single winner backed by enough anchors is trusted; anything else takes the default.
+    /// </summary>
+    private static int CalibratedOutlineHeadingOffset(
+        List<List<PdfParagraph>> allPages, List<OutlineParagraphMatch> matches)
+    {
+        var counts = new Dictionary<int, int>();
+        foreach (var matched in matches)
+        {
+            var paragraph = allPages[matched.PageIndex][matched.ParagraphIndex];
+            if (!OutlineLayoutAllowsHeading(paragraph)) continue;
+            if (paragraph.HeadingLevel is not { } level) continue;
+            int delta = level - matched.Depth;
+            counts[delta] = counts.GetValueOrDefault(delta) + 1;
+        }
+
+        if (counts.Count == 0) return DEFAULT_OUTLINE_HEADING_OFFSET;
+        int maxCount = counts.Values.Max();
+        var winners = counts.Where(kv => kv.Value == maxCount).ToList();
+        return winners.Count == 1 && maxCount >= MIN_OUTLINE_CALIBRATION_ANCHORS
+            ? winners[0].Key
+            : DEFAULT_OUTLINE_HEADING_OFFSET;
+    }
+
+    private static bool OutlineLayoutAllowsHeading(PdfParagraph paragraph) =>
+        !paragraph.IsCodeBlock && !paragraph.IsFormula;
+
+    private static string ParagraphTextRaw(PdfParagraph p) =>
+        p.Text.Length > 0 ? p.Text : ParagraphPlainText(p);
+
+    /// <summary>
+    /// Fold a title down to the letters and digits it is made of, so an outline item and
+    /// the line it points at compare equal across section labels, punctuation and case.
+    /// </summary>
+    private static string NormalizeOutlineTitle(string text)
+    {
+        string stripped = StripSectionLabel(text.Trim());
+        var normalized = new System.Text.StringBuilder();
+        bool pendingSpace = false;
+        foreach (char raw in stripped)
+        {
+            foreach (char character in char.ToLowerInvariant(raw).ToString())
+            {
+                if (char.IsLetterOrDigit(character))
+                {
+                    if (pendingSpace && normalized.Length > 0) normalized.Append(' ');
+                    normalized.Append(character);
+                    pendingSpace = false;
+                }
+                else if (normalized.Length > 0) pendingSpace = true;
+            }
+        }
+        return normalized.ToString();
+    }
+
+    /// <summary>Drop a leading section label ("3.", "(iv)", "A:") from a title.</summary>
+    private static string StripSectionLabel(string text)
+    {
+        int space = -1;
+        for (int i = 0; i < text.Length; i++) if (char.IsWhiteSpace(text[i])) { space = i; break; }
+        if (space < 0) return text;
+        string first = text.Substring(0, space);
+        string rest = text.Substring(space).TrimStart();
+        if (first.Length == 0) return text;
+
+        bool punctuated = first[0] is '(' or '['
+            || first[^1] is '.' or ')' or ']' or ':';
+        string core = first.Trim('(', '[', '.', ')', ']', ':');
+        var decimalParts = core.Split('.');
+        bool isDecimal = decimalParts.Length > 0
+            && decimalParts.All(part => part.Length > 0 && part.All(char.IsAsciiDigit));
+        bool decimalLabel = isDecimal && (punctuated || decimalParts.Length > 1 || core.Length <= 3);
+        bool romanLabel = punctuated && core.Length > 0
+            && core.All(c => char.ToUpperInvariant(c) is 'I' or 'V' or 'X' or 'L' or 'C' or 'D' or 'M');
+        bool letterLabel = punctuated && core.Length == 1 && char.IsAsciiLetter(core[0]);
+
+        return decimalLabel || romanLabel || letterLabel ? rest : text;
     }
 
     // ── heading refinement (classify.rs) ─────────────────────────────────────────
@@ -1537,6 +1718,33 @@ public static class PdfStructure
         }
         if (t.Length <= 5 && t.All(c => c is 'i' or 'v' or 'x' or 'I' or 'V' or 'X')) return true;
         return false;
+    }
+
+    /// <summary>A single trailing period ends a sentence; an ellipsis does not.</summary>
+    private static bool EndsWithSentencePeriod(string text)
+    {
+        string t = text.TrimEnd();
+        return t.EndsWith('.') && !t.EndsWith("..");
+    }
+
+    private static bool IsAllCapsText(string text)
+    {
+        int alpha = 0, upper = 0;
+        foreach (char c in text)
+            if (char.IsLetter(c)) { alpha++; if (char.IsUpper(c)) upper++; }
+        return alpha >= 2 && (double)upper / alpha > 0.8;
+    }
+
+    /// <summary>
+    /// Text that reads as the continuation of the line above: it opens lowercase, or with
+    /// the punctuation a broken sentence resumes on.
+    /// </summary>
+    private static bool StartsWithLowercaseOrContinuation(string text)
+    {
+        string t = text.TrimStart();
+        if (t.Length == 0) return false;
+        char first = t[0];
+        return char.IsLower(first) || first is ',' or ';' or ')' or ']' or '}';
     }
 
     private static bool IsSeparatorText(string text)
