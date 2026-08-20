@@ -315,9 +315,120 @@ internal static class PdfTextRepair
     }
 
     /// <summary>
+    /// Rejoin words a PDF's glyph positioning split apart: a lone leading letter, a short
+    /// fragment followed by a lowercase continuation, or a one- or two-letter tail.
+    /// </summary>
+    /// <remarks>
+    /// Markdown table rows are left alone — a run of pipes and dashes is not prose, and joining
+    /// its cells would corrupt the grid.
+    /// </remarks>
+    public static string RepairBrokenWordSpacing(string text)
+    {
+        if (text.Length == 0) return text;
+        if (text.Contains("| --- |", StringComparison.Ordinal) || text.StartsWith('|')) return text;
+
+        var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+
+        bool hasJoinable = false;
+        for (int i = 0; i + 1 < words.Length && !hasJoinable; i++)
+        {
+            hasJoinable = IsJoinableFragment(words[i], words[i + 1])
+                || (words[i].All(char.IsLetter)
+                    && !IsCommonShortWord(words[i])
+                    && IsTrailingFragment(words[i + 1]));
+        }
+        if (!hasJoinable) return text;
+
+        var result = new StringBuilder(text.Length);
+        int w = 0;
+        while (w < words.Length)
+        {
+            if (w > 0 && result.Length > 0) result.Append(' ');
+            string word = words[w];
+
+            // A single letter stranded before a lowercase word is that word's first letter.
+            if (word.Length == 1
+                && char.IsLetter(word[0])
+                && !IsCommonShortWord(word)
+                && w + 1 < words.Length
+                && char.IsLower(words[w + 1][0]))
+            {
+                result.Append(word).Append(words[w + 1]);
+                w += 2;
+                continue;
+            }
+
+            if (w + 1 < words.Length && IsJoinableFragment(word, words[w + 1]))
+            {
+                result.Append(word);
+                w++;
+                int lastConsumedLen = Utf8Len(word);
+                int totalConsumed = lastConsumedLen;
+                while (w < words.Length)
+                {
+                    string next = words[w];
+                    if (!char.IsLower(next[0])) break;
+                    if (lastConsumedLen <= 3 && Utf8Len(next) <= 3)
+                    {
+                        result.Append(next);
+                        lastConsumedLen = Utf8Len(next);
+                        totalConsumed += lastConsumedLen;
+                        w++;
+                        continue;
+                    }
+                    if (totalConsumed <= 3) { result.Append(next); w++; }
+                    break;
+                }
+                continue;
+            }
+
+            if (w + 1 < words.Length
+                && word.All(char.IsLetter)
+                && !IsCommonShortWord(word)
+                && IsTrailingFragment(words[w + 1]))
+            {
+                result.Append(word);
+                while (w + 1 < words.Length && IsTrailingFragment(words[w + 1]))
+                {
+                    w++;
+                    result.Append(words[w]);
+                }
+                w++;
+                continue;
+            }
+
+            result.Append(word);
+            w++;
+        }
+
+        string repaired = result.ToString();
+        return repaired == string.Join(" ", words) ? text : repaired;
+    }
+
+    /// <summary>A one- or two-letter lowercase tail split off the end of a word.</summary>
+    private static bool IsTrailingFragment(string word) =>
+        Utf8Len(word) <= 2
+        && word.Length > 0
+        && word.All(c => char.IsLower(c) && char.IsLetter(c))
+        && !IsCommonShortWord(word);
+
+    /// <summary>A short alphabetic fragment followed by a lowercase continuation.</summary>
+    private static bool IsJoinableFragment(string word, string next) =>
+        Utf8Len(word) <= 3
+        && word.Length > 0
+        && word.All(char.IsLetter)
+        && !word.All(char.IsUpper)
+        && !IsCommonShortWord(word)
+        && next.Length > 0
+        && char.IsLower(next[0]);
+
+    private static int Utf8Len(string s) => Encoding.UTF8.GetByteCount(s);
+
+    /// <summary>
     /// Whether a word is one of the short function words that legitimately end in <c>f</c>
     /// before a space — "of interest", "if flying". Guards
-    /// <see cref="RepairLigatureSpaces"/> against eating a real word boundary.
+    /// <see cref="RepairLigatureSpaces"/> against eating a real word boundary, and keeps
+    /// <see cref="RepairBrokenWordSpacing"/> from swallowing a real word.
     /// </summary>
     private static bool IsCommonShortWord(ReadOnlySpan<char> word) =>
         CommonShortWords.Contains(word.ToString());

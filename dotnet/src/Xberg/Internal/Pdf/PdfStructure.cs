@@ -136,10 +136,31 @@ public static class PdfStructure
             pageHeights[i] = Math.Max(max, 792.0f);
         }
 
+        // Table regions are recovered from text geometry (upstream's fallback for what its layout
+        // detector misses, and the whole path without one), then their words are taken out of the
+        // paragraph stream so a grid does not also come out as prose.
+        var tablesByPage = new List<List<Table>>(pageCount);
+        for (int i = 0; i < pageCount; i++)
+        {
+            List<Table> pageTables;
+            try
+            {
+                var words = PdfTableReconstruct.SegmentsToWords(allPageSegments[i], pageHeights[i]);
+                var hints = PdfLayoutTables.DetectGeometricTableHints(words, pageHeights[i]);
+                pageTables = hints.Count == 0
+                    ? new List<Table>()
+                    : PdfLayoutTables.ExtractTablesFromLayoutHints(
+                        words, hints, i, pageHeights[i], 0.5f,
+                        allowSingleColumn: false, prevalidatedColumns: true);
+            }
+            catch { pageTables = new List<Table>(); }
+            tablesByPage.Add(pageTables);
+        }
+
         var allPageParagraphs = new List<List<PdfParagraph>>(pageCount);
         for (int i = 0; i < pageCount; i++)
         {
-            var segs = allPageSegments[i];
+            var segs = FilterSegmentsByTableBboxes(allPageSegments[i], tablesByPage[i]);
             var gapYs = ComputeParagraphGapYs(segs);
             var paras = BlocksToParagraphs(segs, headingMap, gapYs);
             // Segment-level repair runs here, before paragraphs are merged, because the
@@ -165,7 +186,7 @@ public static class PdfStructure
         DeduplicateParagraphs(allPageParagraphs);
         CompactFinalHeadingHierarchy(allPageParagraphs);
 
-        var doc = AssembleInternalDocument(allPageParagraphs);
+        var doc = AssembleInternalDocument(allPageParagraphs, tablesByPage);
 
         // Stage 5: element-level text normalization.
         foreach (var elem in doc.Elements)
@@ -1662,17 +1683,47 @@ public static class PdfStructure
 
     // ── assembly (assembly.rs) ───────────────────────────────────────────────────
 
-    private static InternalDocument AssembleInternalDocument(List<List<PdfParagraph>> pages)
+    /// <summary>
+    /// Drop the segments a table already covers: a segment overlapping a table's box by at least
+    /// half is that table's own text, and leaving it in the stream emits the grid twice.
+    /// </summary>
+    private static List<SegmentData> FilterSegmentsByTableBboxes(List<SegmentData> segments, List<Table> tables)
+    {
+        var boxes = tables.Select(t => t.BoundingBox).OfType<BoundingBox>().ToList();
+        if (boxes.Count == 0) return segments;
+
+        return segments.Where(seg =>
+        {
+            float area = seg.Width * seg.Height;
+            if (area <= 0.0f || seg.Text.Trim().Length == 0) return true;
+            return !boxes.Any(bb =>
+            {
+                float left = Math.Max(seg.X, (float)bb.X0);
+                float right = Math.Min(seg.X + seg.Width, (float)bb.X1);
+                float bottom = Math.Max(seg.Y, (float)bb.Y0);
+                float top = Math.Min(seg.Y + seg.Height, (float)bb.Y1);
+                if (left >= right || bottom >= top) return false;
+                return (right - left) * (top - bottom) / area >= 0.5f;
+            });
+        }).ToList();
+    }
+
+    private static InternalDocument AssembleInternalDocument(
+        List<List<PdfParagraph>> pages, List<List<Table>> tablesByPage)
     {
         var builder = new InternalDocumentBuilder("pdf");
         bool hasEmitted = false;
         for (int pageIdx = 0; pageIdx < pages.Count; pageIdx++)
         {
             var paragraphs = pages[pageIdx];
+            var pageTables = pageIdx < tablesByPage.Count
+                ? tablesByPage[pageIdx].Where(t => t.Markdown.Trim().Length > 0).ToList()
+                : new List<Table>();
             uint pageNum = (uint)(pageIdx + 1);
-            bool pageHasContent = paragraphs.Count > 0;
+            bool pageHasContent = paragraphs.Count > 0 || pageTables.Count > 0;
             if (pageHasContent && hasEmitted) builder.PushPageBreak();
-            AssemblePageElements(builder, paragraphs, pageNum);
+            if (pageTables.Count > 0) AssemblePageElementsWithTables(builder, paragraphs, pageTables, pageNum);
+            else AssemblePageElements(builder, paragraphs, pageNum);
             if (pageHasContent) hasEmitted = true;
         }
         return builder.Build();
@@ -1688,6 +1739,112 @@ public static class PdfStructure
             PushParagraphElement(builder, para, page);
         }
         if (inList) builder.EndList();
+    }
+
+    /// <summary>
+    /// Emit a page whose paragraphs are interleaved with tables, each table placed at the reading
+    /// -order boundary its top edge falls on.
+    /// </summary>
+    private static void AssemblePageElementsWithTables(
+        InternalDocumentBuilder builder, List<PdfParagraph> paragraphs, List<Table> tables, uint page)
+    {
+        var positioned = new List<(float Top, Table Table)>();
+        var unpositioned = new List<Table>();
+        foreach (var table in tables)
+        {
+            if (table.BoundingBox is { } bb && float.IsFinite((float)bb.Y1)) positioned.Add(((float)bb.Y1, table));
+            else unpositioned.Add(table);
+        }
+        positioned.Sort((a, b) => b.Top.CompareTo(a.Top));
+
+        var tablesAtSlot = new List<Table>[paragraphs.Count + 1];
+        for (int i = 0; i <= paragraphs.Count; i++) tablesAtSlot[i] = new List<Table>();
+        foreach (var (top, table) in positioned)
+            tablesAtSlot[TableInsertionSlot(paragraphs, table, top)].Add(table);
+
+        bool inList = false;
+        for (int slot = 0; slot <= paragraphs.Count; slot++)
+        {
+            foreach (var table in tablesAtSlot[slot])
+            {
+                if (inList) { builder.EndList(); inList = false; }
+                PushTableElement(builder, table, page);
+            }
+            if (slot >= paragraphs.Count) break;
+
+            var para = paragraphs[slot];
+            if (para.IsListItem && !inList) { builder.PushList(ListItemIsOrdered(para)); inList = true; }
+            else if (!para.IsListItem && inList) { builder.EndList(); inList = false; }
+            PushParagraphElement(builder, para, page);
+        }
+        if (inList) builder.EndList();
+
+        foreach (var table in unpositioned) PushTableElement(builder, table, page);
+    }
+
+    private static void PushTableElement(InternalDocumentBuilder builder, Table table, uint page) =>
+        builder.PushTable(table, page, table.BoundingBox);
+
+    /// <summary>
+    /// The reading-order boundary a table belongs at: the first paragraph that starts below it.
+    /// When every paragraph has horizontal geometry and the table overlaps only some of them,
+    /// those identify the table's column and the others are ignored.
+    /// </summary>
+    private static int TableInsertionSlot(List<PdfParagraph> paragraphs, Table table, float tableY)
+    {
+        int Fallback() => VerticalInsertionSlot(
+            Enumerable.Range(0, paragraphs.Count).Select(i => (i, paragraphs[i])), tableY, paragraphs.Count);
+
+        if (table.BoundingBox is not { } bbox) return Fallback();
+
+        var overlapping = new List<(int Slot, PdfParagraph Para)>();
+        bool hasNonOverlapping = false;
+        for (int slot = 0; slot < paragraphs.Count; slot++)
+        {
+            if (ParagraphHorizontalBounds(paragraphs[slot]) is not { } bounds) return Fallback();
+            if (HorizontalRangesOverlap((float)bbox.X0, (float)bbox.X1, bounds.Left, bounds.Right))
+                overlapping.Add((slot, paragraphs[slot]));
+            else hasNonOverlapping = true;
+        }
+
+        if (overlapping.Count == 0 || !hasNonOverlapping) return Fallback();
+
+        int endSlot = overlapping[^1].Slot + 1;
+        return VerticalInsertionSlot(overlapping.Select(o => (o.Slot, o.Para)), tableY, endSlot);
+    }
+
+    private static int VerticalInsertionSlot(
+        IEnumerable<(int Slot, PdfParagraph Para)> paragraphs, float tableY, int endSlot)
+    {
+        foreach (var (slot, para) in paragraphs)
+            if (ParagraphVerticalAnchor(para) is { } anchor && anchor < tableY) return slot;
+        return endSlot;
+    }
+
+    private static (float Left, float Right)? ParagraphHorizontalBounds(PdfParagraph paragraph)
+    {
+        if (paragraph.BlockBbox is { } bb && float.IsFinite(bb.L) && float.IsFinite(bb.R) && bb.R > bb.L)
+            return (bb.L, bb.R);
+
+        float left = float.PositiveInfinity, right = float.NegativeInfinity;
+        foreach (var line in paragraph.Lines)
+            foreach (var segment in line.Segments)
+            {
+                left = Math.Min(left, segment.X);
+                right = Math.Max(right, segment.X + segment.Width);
+            }
+        return float.IsFinite(left) && float.IsFinite(right) && right > left ? (left, right) : null;
+    }
+
+    private static bool HorizontalRangesOverlap(float firstLeft, float firstRight, float secondLeft, float secondRight) =>
+        float.IsFinite(firstLeft) && float.IsFinite(firstRight) && firstRight > firstLeft
+        && firstLeft < secondRight && firstRight > secondLeft;
+
+    private static float? ParagraphVerticalAnchor(PdfParagraph paragraph)
+    {
+        float? anchor = paragraph.BlockBbox is { } bb ? bb.T
+            : paragraph.Lines.Count > 0 ? paragraph.Lines[0].BaselineY : null;
+        return anchor is { } value && float.IsFinite(value) ? value : null;
     }
 
     private static BoundingBox? Bbox(PdfParagraph p) => p.BlockBbox is { } bb

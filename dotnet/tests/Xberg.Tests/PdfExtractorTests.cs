@@ -809,3 +809,68 @@ public class PdfTableNormalizeTests
             new Table { Cells = new List<List<string>> { new() { "a", "b" }, new() { "1  1", "2" } } }));
     }
 }
+
+/// <summary>
+/// Tests for geometric table-region recovery (<see cref="PdfLayoutTables"/>).
+/// </summary>
+public class PdfGeometricTableTests
+{
+    private static List<HocrWord> Words(params (string Text, uint Left, uint Top)[] items) =>
+        items.Select(w => new HocrWord
+        {
+            Text = w.Text,
+            Left = w.Left,
+            Top = w.Top,
+            Width = (uint)(w.Text.Length * 6),
+            Height = 10,
+            Confidence = 1.0,
+        }).ToList();
+
+    /// <summary>
+    /// Three rows of three column-aligned numeric cells is the shape this fallback exists for:
+    /// a borderless line-item table no ruling line marks out.
+    /// </summary>
+    [Fact]
+    public void ANumericColumnAlignedBandBecomesATableRegion()
+    {
+        var words = new List<HocrWord>();
+        for (uint row = 0; row < 4; row++)
+            for (uint col = 0; col < 3; col++)
+                words.AddRange(Words(($"{row}{col}0.00", 100 + col * 120, 100 + row * 20)));
+
+        var hints = PdfLayoutTables.DetectGeometricTableHints(words, 792f);
+
+        Assert.Single(hints);
+        Assert.True(hints[0].Top > hints[0].Bottom, "hint is in PDF bottom-origin coordinates");
+    }
+
+    /// <summary>
+    /// Dense two-column body text is the dominant false positive this fallback has to refuse. It
+    /// is neither numeric nor sparse, so neither admission path takes it however well its words
+    /// happen to line up.
+    /// </summary>
+    [Fact]
+    public void DenseTwoColumnProseIsNotATableRegion()
+    {
+        string[] left = ["The", "quick", "brown", "fox", "jumps", "over"];
+        string[] right = ["the", "lazy", "dog", "while", "birds", "sing"];
+        var words = new List<HocrWord>();
+        for (uint row = 0; row < 6; row++)
+        {
+            uint x = 72;
+            foreach (string w in left) { words.AddRange(Words((w, x, 100 + row * 14))); x += (uint)(w.Length * 6 + 4); }
+            x = 320;
+            foreach (string w in right) { words.AddRange(Words((w, x, 100 + row * 14))); x += (uint)(w.Length * 6 + 4); }
+        }
+
+        Assert.Empty(PdfLayoutTables.DetectGeometricTableHints(words, 792f));
+    }
+
+    /// <summary>Fewer than three rows is not a band, whatever its columns look like.</summary>
+    [Fact]
+    public void ASingleRowIsNotATableRegion()
+    {
+        var words = Words(("100.00", 100, 100), ("200.00", 220, 100), ("300.00", 340, 100));
+        Assert.Empty(PdfLayoutTables.DetectGeometricTableHints(words, 792f));
+    }
+}
