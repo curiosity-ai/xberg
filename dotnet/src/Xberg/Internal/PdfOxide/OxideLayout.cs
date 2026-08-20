@@ -135,7 +135,19 @@ public sealed class OxTextSpan
     /// </summary>
     public bool RtlDrawLogical;
 
-    public OxTextSpan Clone() => (OxTextSpan)MemberwiseClone();
+    /// <summary>
+    /// A copy whose per-glyph lists are its own. The merge pass rewrites
+    /// <see cref="CharWidths"/> in place, so a shallow copy would let a span corrupt the
+    /// one it was cloned from — which is what Rust's derived Clone avoids by deep-copying
+    /// its Vecs.
+    /// </summary>
+    public OxTextSpan Clone()
+    {
+        var copy = (OxTextSpan)MemberwiseClone();
+        copy.CharWidths = new List<float>(CharWidths);
+        copy.CharXOffsets = new List<float>(CharXOffsets);
+        return copy;
+    }
 }
 
 public sealed class OxPageText
