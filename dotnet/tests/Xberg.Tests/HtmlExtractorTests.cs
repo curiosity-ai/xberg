@@ -435,4 +435,44 @@ public class HtmlExtractorTests
 
         Assert.Single(m.Links);
     }
+
+    /// <summary>
+    /// Dublin Core carries the author on `DC.Publisher` as often as on `author`, and the
+    /// collector accepts creator, contributor and publisher for it — a page that names none of
+    /// the plain ones still has an author.
+    /// </summary>
+    [Fact]
+    public void DublinCoreFieldsFeedTheDocumentFields()
+    {
+        var m = Meta("<html><head>" +
+                     "<META NAME=\"DC.Title\" CONTENT=\"School Detail\">" +
+                     "<META NAME=\"DC.Publisher\" CONTENT=\"National Center for Education Statistics\">" +
+                     "<META NAME=\"DC.Subject\" CONTENT=\"schools, statistics\">" +
+                     "<META NAME=\"DC.Language\" CONTENT=\"EN\">" +
+                     "</head></html>");
+
+        Assert.Equal("School Detail", m.Title);
+        Assert.Equal("National Center for Education Statistics", m.Author);
+        Assert.Equal(new[] { "schools", "statistics" }, m.Keywords);
+        // A Dublin Core field with no document field of its own is kept as a meta tag.
+        Assert.Equal("EN", m.MetaTags["dc_language"]);
+    }
+
+    /// <summary>
+    /// Open Graph and Twitter Card properties are keyed by their suffix with hyphens folded to
+    /// underscores, and an unrecognised name is kept as spelled.
+    /// </summary>
+    [Fact]
+    public void SocialCardPropertiesAreKeyedBySuffix()
+    {
+        var m = Meta("<html><head>" +
+                     "<meta property=\"og:site_name\" content=\"Example\">" +
+                     "<meta name=\"twitter:card\" content=\"summary\">" +
+                     "<meta name=\"robots\" content=\"ALL\">" +
+                     "</head></html>");
+
+        Assert.Equal("Example", m.OpenGraph["site_name"]);
+        Assert.Equal("summary", m.TwitterCard["card"]);
+        Assert.Equal("ALL", m.MetaTags["robots"]);
+    }
 }

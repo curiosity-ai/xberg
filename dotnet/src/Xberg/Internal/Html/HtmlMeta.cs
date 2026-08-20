@@ -71,6 +71,10 @@ public static class HtmlMeta
         // head — as some Federal Register pages are — is not one of them, and a document whose
         // head holds nothing has no metadata at all.
         bool inHead = false;
+        // Head metadata is gathered into a sorted map keyed the way the collector keys it, then
+        // interpreted once at the end. The sort matters: several fields take the first value they
+        // are offered, and "first" means first by key, not first in the document.
+        var headMetadata = new SortedDictionary<string, string>(StringComparer.Ordinal);
         // A `<pre>` block is emitted as its raw text, so nothing inside it is visited as an
         // element: a link written inside preformatted text is not one of the document's links.
         int preDepth = 0;
@@ -144,12 +148,11 @@ public static class HtmlMeta
                     else if (tag == "head") inHead = false;
                     else if (tag == "title" && inTitle)
                     {
-                        if (m.Title is null)
                         {
                             // Trimmed but not collapsed: a title written with two spaces between
                             // its halves keeps them.
                             string t = titleText.ToString().Trim();
-                            if (t.Length > 0) m.Title = t;
+                            if (t.Length > 0) headMetadata["title"] = t;
                         }
                         inTitle = false;
                     }
@@ -201,22 +204,30 @@ public static class HtmlMeta
                         if (dir is not null && m.TextDirection is null) m.TextDirection = ParseTextDirection(dir);
                         break;
                     }
-                    case "meta":
-                        HandleMeta(m, attrsStr);
-                        break;
-                    case "base":
+                    case "meta" when inHead:
                     {
-                        string? href = ExtractAttrDecoded(attrsStr, "href");
-                        if (href is not null && m.BaseHref is null) m.BaseHref = href;
+                        string? metaContent = HtmlWalker.ExtractAttr(attrsStr, "content");
+                        if (metaContent is null) break;
+                        if (HtmlWalker.ExtractAttr(attrsStr, "name") is { } metaName)
+                            headMetadata["meta-" + metaName] = metaContent;
+                        if (HtmlWalker.ExtractAttr(attrsStr, "property") is { } metaProperty)
+                            headMetadata["meta-" + metaProperty] = metaContent;
                         break;
                     }
-                    case "link":
+                    case "base" when inHead:
                     {
-                        string? rel = ExtractAttrDecoded(attrsStr, "rel");
-                        string? href = ExtractAttrDecoded(attrsStr, "href");
-                        if (rel is not null && href is not null &&
-                            rel.Split(' ', StringSplitOptions.RemoveEmptyEntries).Any(r => r.Equals("canonical", StringComparison.OrdinalIgnoreCase)))
-                            m.CanonicalUrl ??= href;
+                        if (HtmlWalker.ExtractAttr(attrsStr, "href") is { } href)
+                            headMetadata["base"] = href;
+                        break;
+                    }
+                    case "link" when inHead:
+                    {
+                        // Substring, not token: the collector asks whether the rel list contains
+                        // "canonical" at all.
+                        string? rel = HtmlWalker.ExtractAttr(attrsStr, "rel");
+                        string? href = HtmlWalker.ExtractAttr(attrsStr, "href");
+                        if (rel is not null && href is not null && rel.Contains("canonical", StringComparison.Ordinal))
+                            headMetadata["canonical"] = href;
                         break;
                     }
                     case "title":
@@ -313,6 +324,7 @@ public static class HtmlMeta
         }
         // An unclosed table still had its subtree walked three times.
         if (tableDepth > 0) CloseOutermostTable();
+        ApplyHeadMetadata(m, headMetadata);
         return m;
     }
 
@@ -349,40 +361,74 @@ public static class HtmlMeta
         _ => null,
     };
 
-    private static void HandleMeta(HtmlMetadata m, string attrs)
+    /// <summary>
+    /// Interpret the collected head entries. Ports <c>extract_document_metadata</c>: a key is
+    /// stripped of its <c>meta-</c> prefix, has any colon rewritten to a hyphen, and is matched
+    /// case-insensitively; anything unrecognised is kept as a meta tag under the key as spelled.
+    /// </summary>
+    private static void ApplyHeadMetadata(HtmlMetadata m, SortedDictionary<string, string> head)
     {
-        string? name = ExtractAttrDecoded(attrs, "name");
-        string? property = ExtractAttrDecoded(attrs, "property");
-        string? contentVal = ExtractAttrDecoded(attrs, "content");
-        if (contentVal is null) return;
+        foreach (var (rawKey, value) in head)
+        {
+            string key = rawKey.StartsWith("meta-", StringComparison.Ordinal) ? rawKey[5..] : rawKey;
+            string? replacedKey = key.Contains(':', StringComparison.Ordinal) ? key.Replace(':', '-') : null;
+            if (replacedKey is not null) key = replacedKey;
+            string lower = key.ToLowerInvariant();
 
-        if (property is not null && property.StartsWith("og:", StringComparison.OrdinalIgnoreCase))
-        {
-            m.OpenGraph[property[3..]] = contentVal;
-            return;
-        }
-        if (name is null) return;
-        string lname = name.ToLowerInvariant();
-        switch (lname)
-        {
-            case "description": m.Description ??= contentVal; break;
-            case "author": m.Author ??= contentVal; break;
-            case "keywords":
-                if (m.Keywords.Count == 0)
-                    foreach (var kw in contentVal.Split(','))
-                    {
-                        string t = kw.Trim();
-                        if (t.Length > 0) m.Keywords.Add(t);
-                    }
-                break;
-            default:
-                if (lname.StartsWith("twitter:", StringComparison.Ordinal))
-                    m.TwitterCard[name["twitter:".Length..]] = contentVal;
-                else
-                    m.MetaTags[name] = contentVal;
-                break;
+            switch (lower)
+            {
+                case "title": m.Title = value; continue;
+                case "description": m.Description = value; continue;
+                case "author" or "creator" or "publisher": m.Author ??= value; continue;
+                case "canonical": m.CanonicalUrl = value; continue;
+                case "base" or "base-href": m.BaseHref = value; continue;
+                case "keywords" or "news_keywords" or "citation_keywords" or "subject" or "topic"
+                    or "category" or "classification":
+                    if (m.Keywords.Count == 0) m.Keywords.AddRange(SplitKeywords(value));
+                    continue;
+            }
+
+            if (lower.StartsWith("og-", StringComparison.Ordinal))
+            {
+                m.OpenGraph[lower[3..].Replace('-', '_')] = value;
+                continue;
+            }
+            if (lower.StartsWith("twitter-", StringComparison.Ordinal))
+            {
+                m.TwitterCard[lower["twitter-".Length..].Replace('-', '_')] = value;
+                continue;
+            }
+            if (DublinCorePrefix(lower) is { } dc)
+            {
+                string field = lower[dc.Length..];
+                switch (field)
+                {
+                    case "title" or "alternative": m.Title ??= value; continue;
+                    case "description" or "abstract": m.Description ??= value; continue;
+                    case "creator" or "contributor" or "publisher": m.Author ??= value; continue;
+                    case "subject" or "keywords":
+                        if (m.Keywords.Count == 0) m.Keywords.AddRange(SplitKeywords(value));
+                        continue;
+                    default:
+                        m.MetaTags[dc.TrimEnd('.', '-').Replace('.', '_') + "_" + field.Replace('-', '_')] = value;
+                        continue;
+                }
+            }
+
+            m.MetaTags[replacedKey ?? key] = value;
         }
     }
+
+    /// <summary>The Dublin Core prefix a key carries, including its separator, or null.</summary>
+    private static string? DublinCorePrefix(string lower)
+    {
+        foreach (string prefix in (ReadOnlySpan<string>)["dcterms.", "dcterms-", "dc.", "dc-"])
+            if (lower.StartsWith(prefix, StringComparison.Ordinal)) return prefix;
+        return null;
+    }
+
+    private static IEnumerable<string> SplitKeywords(string value) =>
+        value.Split(',').Select(k => k.Trim()).Where(k => k.Length > 0);
 
     // Mirrors html-to-markdown's LinkMetadata::classify_link (metadata/types.rs). Note the
     // scheme checks are case-sensitive there, and "//"/"/" both classify as internal.
