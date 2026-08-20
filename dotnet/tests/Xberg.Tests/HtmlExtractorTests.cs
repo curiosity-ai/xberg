@@ -300,4 +300,31 @@ public class HtmlExtractorTests
         Assert.Equal("46.84&deg;N", HtmlWalker.DecodeEntities("46.84&deg;N"));
         Assert.Equal("a & b", HtmlWalker.DecodeEntities("a &amp; b"));
     }
+
+    /// <summary>
+    /// Old hand-written pages write cells straight into the table. Without the row the HTML5
+    /// insertion modes imply, every cell hangs off the table where no consumer looks for it —
+    /// on one regression fixture that table holds 99% of the document.
+    /// </summary>
+    [Fact]
+    public void ACellWithNoRowGetsOne()
+    {
+        string md = HtmlToMarkdown.Convert(
+            "<html><body><p>before</p><table border=1>" +
+            "<td>cell one</td><td>cell two</td></table><p>after</p></body></html>");
+
+        Assert.Contains("| cell one | cell two |", md);
+        Assert.Contains("after", md);
+    }
+
+    /// <summary>A cell left unclosed ends where the next one starts, not inside it.</summary>
+    [Fact]
+    public void UnclosedCellsAndRowsCloseEachOther()
+    {
+        string md = HtmlToMarkdown.Convert(
+            "<table><tr><td>a<td>b<tr><td>c<td>d</table>");
+
+        Assert.Contains("| a | b |", md);
+        Assert.Contains("| c | d |", md);
+    }
 }

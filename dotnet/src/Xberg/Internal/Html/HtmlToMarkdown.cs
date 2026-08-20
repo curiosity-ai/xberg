@@ -2402,6 +2402,38 @@ internal static class HtmlDom
                     if (stack[i].Tag == "dl") break;
                 }
             }
+            else if (tag is "td" or "th" or "tr" or "thead" or "tbody" or "tfoot")
+            {
+                // Table sections close each other the way the HTML5 insertion modes say, and a
+                // cell that opens with no row around it gets one. Old hand-written pages write
+                // `<table><td>…</td><td>…</td></table>`, and without the implied row every cell
+                // hangs off the table where no consumer looks for it — on one fixture that is the
+                // table holding 99% of the document.
+                for (int i = stack.Count - 1; i >= 1; i--)
+                {
+                    string? open = stack[i].Tag;
+                    if (open is "table") break;
+                    if (tag is "td" or "th")
+                    {
+                        if (open is "tr") break;
+                        if (open is "td" or "th") { stack.RemoveRange(i, stack.Count - i); break; }
+                    }
+                    else if (open is "tr" or "td" or "th"
+                             || (tag is "thead" or "tbody" or "tfoot" && open is "thead" or "tbody" or "tfoot"))
+                    {
+                        stack.RemoveRange(i, stack.Count - i);
+                    }
+                    else break;
+                }
+
+                if (tag is "td" or "th" && stack[^1].Tag is not "tr"
+                    && stack[^1].Tag is "table" or "thead" or "tbody" or "tfoot")
+                {
+                    var impliedRow = new HNode { Tag = "tr", AttrString = "" };
+                    AddChild(impliedRow);
+                    stack.Add(impliedRow);
+                }
+            }
 
             var node = new HNode { Tag = tag, AttrString = attrs };
             AddChild(node);
