@@ -571,12 +571,7 @@ internal static class PdfTableReconstruct
         int colCount = table.Count > 0 ? table[0].Count : 0;
         if (colCount < minColumns) return null;
 
-        int dataStart = 0;
-        for (int idx = 0; idx < table.Count; idx++)
-        {
-            int digitCells = table[idx].Count(cell => cell.Any(c => c >= '0' && c <= '9'));
-            if (digitCells >= 3) { dataStart = idx; break; }
-        }
+        int dataStart = FindDataStart(table, layoutGuided);
 
         var headerRows = dataStart > 0 ? table.GetRange(0, dataStart) : new List<List<string>>();
         var dataRows = table.GetRange(dataStart, table.Count - dataStart);
@@ -627,6 +622,8 @@ internal static class PdfTableReconstruct
 
         if (processed[0].Count < 2 || processed.Count <= 1) return null;
 
+        PruneSpuriousInteriorColumn(processed, layoutGuided);
+
         int dataRowCount = processed.Count - 1;
 
         // Column sparsity check.
@@ -669,7 +666,16 @@ internal static class PdfTableReconstruct
                     if (WordCount(t) <= 2) singleWord++;
                 }
             int threshold = layoutGuided ? 85 : 70;
-            if (nonEmptyCells >= 6 && singleWord * 100 > nonEmptyCells * threshold) return null;
+            // A grid whose cells are values rather than words is tabular data however thin the
+            // cells are: an invoice's line items are one or two words each and every one of them
+            // is a number.
+            bool denseNumericGrid = IsDenseNumericGrid(processed);
+            bool denseScalarGrid = layoutGuided && IsDenseScalarGrid(processed);
+            if (!denseNumericGrid
+                && !denseScalarGrid
+                && !IsPredominantlyNumericShortGrid(processed)
+                && nonEmptyCells >= 6
+                && singleWord * 100 > nonEmptyCells * threshold) return null;
         }
 
         // Column-text-flow check (col0 → col1).
@@ -854,6 +860,245 @@ internal static class PdfTableReconstruct
 
         if (text == "-") return "";
         return text;
+    }
+
+    // ── header/column repair (pdf/table_reconstruct.rs) ─────────────────────
+
+    private const int DefaultMinDataRowDigitCells = 3;
+    private const int RepeatedDataRowCount = 3;
+    private const int RowShapeMinOverlapPercent = 80;
+    private const int SpuriousColumnMinDataRows = 20;
+    private const int SpuriousColumnMinColumns = 6;
+    private const int SpuriousColumnMinRetainedDensityPercent = 75;
+    private const int FooterMinAlphaPercent = 70;
+
+    /// <summary>
+    /// The row the data starts on. The first row carrying enough digit cells usually is it, but a
+    /// wide layout-guided table can spell its header over several lines — a units row in
+    /// parentheses under multi-word labels — and the first of those lines already looks numeric.
+    /// Where three consecutive rows of the same shape follow, that run is the data instead.
+    /// </summary>
+    private static int FindDataStart(List<List<string>> table, bool layoutGuided)
+    {
+        int firstNumericRow = 0;
+        for (int i = 0; i < table.Count; i++)
+            if (DigitCellCount(table[i]) >= DefaultMinDataRowDigitCells) { firstNumericRow = i; break; }
+
+        int columnCount = table.Count > 0 ? table[0].Count : 0;
+        if (!layoutGuided || columnCount < LargeTableMinColumns || table.Count < RepeatedDataRowCount)
+            return firstNumericRow;
+
+        int repeatedStart = -1;
+        for (int i = 0; i + RepeatedDataRowCount <= table.Count; i++)
+        {
+            bool allNumeric = true, shapesMatch = true;
+            for (int k = 0; k < RepeatedDataRowCount; k++)
+                if (DigitCellCount(table[i + k]) < DefaultMinDataRowDigitCells) { allNumeric = false; break; }
+            if (!allNumeric) continue;
+            for (int k = 0; k + 1 < RepeatedDataRowCount; k++)
+                if (!RowShapesMatch(table[i + k], table[i + k + 1])) { shapesMatch = false; break; }
+            if (shapesMatch) { repeatedStart = i; break; }
+        }
+
+        if (repeatedStart < 0) return firstNumericRow;
+        if (repeatedStart == firstNumericRow) return repeatedStart;
+
+        var continuation = table.GetRange(firstNumericRow + 1, Math.Max(0, repeatedStart - firstNumericRow - 1));
+        return LooksLikeMultilineNumericHeader(table[firstNumericRow], continuation)
+            ? repeatedStart
+            : firstNumericRow;
+    }
+
+    /// <summary>
+    /// Whether a row that looks numeric is really the first line of a wrapped header: multi-word
+    /// labels above a shorter continuation row that carries a parenthesised unit.
+    /// </summary>
+    private static bool LooksLikeMultilineNumericHeader(List<string> header, List<List<string>> continuationRows)
+    {
+        int filledHeaderCells = header.Count(c => c.Trim().Length > 0);
+        int multiwordLabels = header.Count(c =>
+        {
+            string text = c.Trim();
+            return WordCount(text) >= 2 && text.Any(char.IsLetter);
+        });
+        var continuationCells = continuationRows
+            .SelectMany(r => r).Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+        bool hasParenthesizedUnit = continuationCells.Any(c => c.StartsWith('(') && c.Contains(')'));
+
+        return continuationRows.Count > 0
+            && multiwordLabels >= 2
+            && continuationCells.Count < filledHeaderCells
+            && hasParenthesizedUnit;
+    }
+
+    private static int DigitCellCount(List<string> row) => row.Count(cell => cell.Any(char.IsAsciiDigit));
+
+    /// <summary>Whether two rows fill the same columns, within a tolerance.</summary>
+    private static bool RowShapesMatch(List<string> left, List<string> right)
+    {
+        int columnCount = Math.Max(left.Count, right.Count);
+        int union = 0, intersection = 0;
+        for (int c = 0; c < columnCount; c++)
+        {
+            bool leftFilled = c < left.Count && left[c].Trim().Length > 0;
+            bool rightFilled = c < right.Count && right[c].Trim().Length > 0;
+            if (leftFilled || rightFilled) union++;
+            if (leftFilled && rightFilled) intersection++;
+        }
+        return union > 0 && intersection * 100 >= union * RowShapeMinOverlapPercent;
+    }
+
+    /// <summary>
+    /// Drop one empty-header interior column that catches nothing but a stray footer word, in a
+    /// large otherwise-dense table. Such a track appears when a word in the footer sits at an
+    /// x-position the body never uses.
+    /// </summary>
+    private static bool PruneSpuriousInteriorColumn(List<List<string>> table, bool layoutGuided)
+    {
+        if (table.Count == 0) return false;
+        int columnCount = table[0].Count;
+        int dataRowCount = table.Count - 1;
+        if (!layoutGuided || columnCount < SpuriousColumnMinColumns || dataRowCount < SpuriousColumnMinDataRows)
+            return false;
+
+        var candidates = new List<int>();
+        for (int column = 1; column < columnCount - 1; column++)
+        {
+            if (table[0][column].Trim().Length != 0) continue;
+            var populatedRows = new List<int>();
+            for (int r = 1; r < table.Count; r++)
+                if (column < table[r].Count && table[r][column].Trim().Length > 0) populatedRows.Add(r - 1);
+            if (populatedRows.Count == 1 && populatedRows[0] == dataRowCount - 1 && LooksLikeFooterRow(table[^1]))
+                candidates.Add(column);
+        }
+        if (candidates.Count != 1) return false;
+        int spurious = candidates[0];
+
+        int retainedCells = dataRowCount * (columnCount - 1);
+        int retainedFilled = 0;
+        for (int r = 1; r < table.Count; r++)
+            for (int c = 0; c < table[r].Count; c++)
+                if (c != spurious && table[r][c].Trim().Length > 0) retainedFilled++;
+        if (retainedCells == 0
+            || retainedFilled * 100 < retainedCells * SpuriousColumnMinRetainedDensityPercent) return false;
+
+        MergeInteriorColumn(table, spurious);
+        return true;
+    }
+
+    /// <summary>A row of mostly-alphabetic multi-word text, the shape of a page footer.</summary>
+    private static bool LooksLikeFooterRow(List<string> row)
+    {
+        var nonEmpty = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+        if (nonEmpty.Count < 2 || !nonEmpty.Any(c => WordCount(c) >= 2)) return false;
+        string text = string.Join(" ", nonEmpty);
+        int alphanumeric = text.Count(char.IsLetterOrDigit);
+        int alphabetic = text.Count(char.IsLetter);
+        return alphanumeric > 0 && alphabetic * 100 >= alphanumeric * FooterMinAlphaPercent;
+    }
+
+    /// <summary>Remove a column, folding whatever text it held into whichever neighbour is fuller.</summary>
+    private static void MergeInteriorColumn(List<List<string>> table, int column)
+    {
+        int leftOccupancy = 0, rightOccupancy = 0;
+        for (int r = 1; r < table.Count; r++)
+        {
+            if (column - 1 < table[r].Count && table[r][column - 1].Trim().Length > 0) leftOccupancy++;
+            if (column + 1 < table[r].Count && table[r][column + 1].Trim().Length > 0) rightOccupancy++;
+        }
+        bool mergeRight = rightOccupancy >= leftOccupancy;
+
+        foreach (var row in table)
+        {
+            if (column >= row.Count) continue;
+            string text = row[column].Trim();
+            row.RemoveAt(column);
+            if (text.Length == 0) continue;
+            int target = mergeRight ? column : column - 1;
+            if (target < 0 || target >= row.Count) continue;
+            string existing = row[target].Trim();
+            row[target] = existing.Length == 0
+                ? text
+                : mergeRight ? $"{text} {existing}" : $"{existing} {text}";
+        }
+    }
+
+    private const int DenseScalarMinDataRows = 20;
+    private const int DenseScalarMinColumns = 6;
+    private const int DenseScalarMinFilledPercent = 75;
+    private const int DenseScalarMinCompactPercent = 90;
+    private const int DenseScalarMinDigitPercent = 25;
+    private const int DenseScalarMaxCellChars = 24;
+    private const int ShortNumericMinDataCells = 4;
+    private const int ShortNumericMinCellPercent = 60;
+    private const int ShortNumericMinRowOccupancyPercent = 85;
+
+    /// <summary>
+    /// A big grid of short cells, most of them carrying a digit — a schedule or a price list,
+    /// whose one-and-two-word cells would otherwise read as shredded prose.
+    /// </summary>
+    private static bool IsDenseScalarGrid(List<List<string>> grid)
+    {
+        if (grid.Count == 0) return false;
+        int dataRows = grid.Count - 1;
+        if (grid[0].Count < DenseScalarMinColumns || dataRows < DenseScalarMinDataRows) return false;
+
+        int totalCells = dataRows * grid[0].Count;
+        int filled = 0, compact = 0, digit = 0;
+        for (int r = 1; r < grid.Count; r++)
+            foreach (var cell in grid[r])
+            {
+                string t = cell.Trim();
+                if (t.Length == 0) continue;
+                filled++;
+                if (CharCount(t) <= DenseScalarMaxCellChars && WordCount(t) <= 2) compact++;
+                if (t.Any(char.IsAsciiDigit)) digit++;
+            }
+
+        return totalCells > 0
+            && filled * 100 >= totalCells * DenseScalarMinFilledPercent
+            && compact * 100 >= filled * DenseScalarMinCompactPercent
+            && digit * 100 >= filled * DenseScalarMinDigitPercent;
+    }
+
+    /// <summary>
+    /// Whether the data cells are overwhelmingly numeric with no size floor — a borderless
+    /// line-item table. Measured twice, over every data cell and over the substantially populated
+    /// rows only, because a wrapped description row with the rest of its columns blank drags the
+    /// pooled fraction below the bar. Either measurement clearing it grants the exemption.
+    /// </summary>
+    private static bool IsPredominantlyNumericShortGrid(List<List<string>> grid)
+    {
+        int width = grid.Count > 0 ? grid[0].Count : 0;
+        return ShortGridNumericRatioMeetsBar(grid, false)
+            || (width > 0 && ShortGridNumericRatioMeetsBar(grid, true));
+    }
+
+    private static bool ShortGridNumericRatioMeetsBar(List<List<string>> grid, bool substantiallyPopulatedRowsOnly)
+    {
+        int width = grid.Count > 0 ? grid[0].Count : 0;
+        int nonEmpty = 0, numeric = 0;
+        for (int r = 1; r < grid.Count; r++)
+        {
+            if (substantiallyPopulatedRowsOnly && !IsSubstantiallyPopulatedDataRow(grid[r], width)) continue;
+            foreach (var cell in grid[r])
+            {
+                string t = cell.Trim();
+                if (t.Length == 0) continue;
+                nonEmpty++;
+                if (IsNumericValueCell(t)) numeric++;
+            }
+        }
+        return nonEmpty >= ShortNumericMinDataCells
+            && numeric * 100 >= nonEmpty * ShortNumericMinCellPercent;
+    }
+
+    /// <summary>Whether the row fills enough of the inferred grid to be self-contained.</summary>
+    private static bool IsSubstantiallyPopulatedDataRow(List<string> row, int width)
+    {
+        if (width == 0) return false;
+        int populated = row.Take(width).Count(cell => cell.Trim().Length > 0);
+        return populated * 100 >= width * ShortNumericMinRowOccupancyPercent;
     }
 
     // ── is_well_formed_table (pdf/table_reconstruct.rs) ──────────────────────
