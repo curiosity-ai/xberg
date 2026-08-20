@@ -61,7 +61,7 @@ public sealed class PdfExtractor : IExtractor
         try { tables.AddRange(ExtractRuledTables(pageWords, pagePaths, TableDetectionConfig.Bordered(), nativePages)); }
         catch { }
         var coveredPages = new HashSet<uint>(tables.Select(t => t.PageNumber));
-        try { tables.AddRange(PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false, coveredPages)); }
+        try { tables.AddRange(PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false, coveredPages, pagePaths)); }
         catch { }
         foreach (var table in tables) PdfTableNormalize.RepairConsistentlyMergedNumericColumn(table);
 

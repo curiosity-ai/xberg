@@ -397,8 +397,10 @@ public sealed class PdfContentExtractor
                     : 0.0,
             };
             // Only rules and boxes are ever consulted; glyph outlines and chart fills
-            // would otherwise dominate the list on graphics-heavy pages.
-            if (candidate.IsTablePrimitive()) _paths.Add(candidate);
+            // would otherwise dominate the list on graphics-heavy pages. Rule candidates
+            // are kept alongside primitives because the borderless-table gate counts
+            // drawn rules over a slightly wider thickness band.
+            if (candidate.IsTablePrimitive() || candidate.IsRuleCandidate()) _paths.Add(candidate);
         }
         _currentOps = new List<PathOp>();
         _pathCurrent = null;

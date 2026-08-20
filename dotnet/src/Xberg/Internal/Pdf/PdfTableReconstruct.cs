@@ -35,8 +35,12 @@ internal static class PdfTableReconstruct
     /// <summary>Port of `pdf::oxide::table::extract_tables_heuristic`. Runs the
     /// text-edge heuristic on every page's segments and returns detected tables.</summary>
     /// <param name="skipPages">1-indexed pages a higher-priority tier already covered.</param>
+    /// <param name="pagePaths">Per-page painted paths, used to count drawn rules. A page
+    /// whose producer drew rules is one where a table candidate is credible on its face;
+    /// without them the column boundaries have to prove they are whitespace.</param>
     public static List<Table> ExtractHeuristicTables(
-        List<List<SegmentData>> allPageSegments, bool allowSingleColumn, HashSet<uint>? skipPages = null)
+        List<List<SegmentData>> allPageSegments, bool allowSingleColumn, HashSet<uint>? skipPages = null,
+        List<List<PdfPath>>? pagePaths = null)
     {
         var tables = new List<Table>();
         for (int pageIdx = 0; pageIdx < allPageSegments.Count; pageIdx++)
@@ -57,9 +61,13 @@ internal static class PdfTableReconstruct
             if (regions.Count > MaxRegionsPerPage)
                 regions = regions.GetRange(0, MaxRegionsPerPage);
 
+            int horizontalRules = pagePaths is not null && pageIdx < pagePaths.Count
+                ? PdfPath.CountRules(pagePaths[pageIdx]).Horizontal
+                : 0;
+
             foreach (var region in regions)
             {
-                var table = ReconstructRegionTable(region, pageHeight, pageNumber, allowSingleColumn);
+                var table = ReconstructRegionTable(region, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
                 if (table != null) tables.Add(table);
             }
         }
@@ -93,7 +101,10 @@ internal static class PdfTableReconstruct
         {
             outWords.Add(new HocrWord
             {
-                Text = trimmed,
+                // `segment_to_hocr_word` clones the segment's raw text: the whitespace
+                // test is on the trimmed form, but the word keeps whatever padding the
+                // segment carried, and the cell join adds a space of its own on top.
+                Text = seg.Text,
                 Left = RoundClamp(seg.X, 0f),
                 Top = topImage,
                 Width = RoundClamp(seg.Width, 0f),
@@ -297,22 +308,26 @@ internal static class PdfTableReconstruct
 
     // ── Region → Table (pdf/oxide/table.rs reconstruct_region_table) ─────────
 
-    private static Table? ReconstructRegionTable(List<HocrWord> region, float pageHeight, uint pageNumber, bool allowSingleColumn)
+    private static Table? ReconstructRegionTable(
+        List<HocrWord> region, float pageHeight, uint pageNumber, bool allowSingleColumn, int horizontalRules = 0)
     {
         uint regionLeft = region.Min(w => w.Left);
         uint regionRight = region.Max(w => w.Left + w.Width);
         float regionWidth = regionRight > regionLeft ? regionRight - regionLeft : 0f;
-        uint colGap = ComputeAdaptiveColumnGap(region, regionWidth);
+        uint colGap = HeuristicColumnGap(region, regionWidth);
 
+        var columnPositions = DetectColumns(region, colGap);
         var grid = ReconstructTable(region, colGap, 0.5);
+        RepairSplitNumericTrack(grid, region, columnPositions);
         if (grid.Count == 0 || grid[0].Count == 0) return null;
 
         var cleaned = PostProcessTable(grid, layoutGuided: true, allowSingleColumn);
         if (cleaned == null) return null;
+        RepairHeuristicHeaderDelimiters(cleaned);
         if (cleaned.Count <= 1) return null;
 
         if (LooksLikeCodeListing(cleaned)) return null;
-        if (!IsWellFormedTable(cleaned)) return null;
+        if (!IsWellFormedBorderlessTable(cleaned, region, columnPositions, horizontalRules)) return null;
 
         double imgLeft = region.Min(w => (double)w.Left);
         double imgTop = region.Min(w => (double)w.Top);
@@ -1133,6 +1148,292 @@ internal static class PdfTableReconstruct
     /// the region geometrically: a genuine key-value grid has the regular short columns that
     /// heuristic mistakes for wrapped prose. Every other guard still applies.
     /// </param>
+
+    // ── Heuristic column gap and grid repairs (pdf/oxide/table.rs) ───────────
+
+    private const uint DenseNumericColumnGapCap = 20;
+    private const int DenseNumericMinRecurringRows = 5;
+    private const int DenseNumericMinWordsPerRow = 3;
+    private const int DenseNumericMinRowWordPercent = 60;
+    private const int DenseNumericMinRecurringTracks = 4;
+    private const int DenseNumericMinTrackRowPercent = 60;
+    private const int NumericHeaderMaxRows = 2;
+    private const int SplitNumericTrackMinRowsPerSide = 2;
+    private const int SplitNumericTrackMinTotalRows = 6;
+
+    /// <summary>
+    /// A ledger's columns sit closer together than ordinary prose, so a wide adaptive
+    /// gap would merge two numeric tracks into one column.
+    /// </summary>
+    private static uint HeuristicColumnGap(List<HocrWord> region, float regionWidth)
+    {
+        uint adaptive = ComputeAdaptiveColumnGap(region, regionWidth);
+        return IsDenseNumericRegion(region) ? Math.Min(adaptive, DenseNumericColumnGapCap) : adaptive;
+    }
+
+    private static bool IsNumericWord(string text)
+    {
+        int digits = 0, alphanumeric = 0;
+        foreach (char c in text)
+        {
+            if (char.IsAsciiDigit(c)) digits++;
+            if (char.IsLetterOrDigit(c)) alphanumeric++;
+        }
+        return digits > 0 && digits * 2 >= alphanumeric;
+    }
+
+    private static bool IsDenseNumericRegion(List<HocrWord> region)
+    {
+        if (region.Count == 0) return false;
+        var heights = region.Select(w => w.Height).OrderBy(h => h).ToList();
+        uint medianHeight = Math.Max(heights[heights.Count / 2], 1);
+        uint rowTolerance = Math.Max(medianHeight / 2, 3);
+        var rows = NumericRows(region, rowTolerance);
+        var recurring = LongestRecurringNumericRun(rows);
+        if (recurring is null) return false;
+        return RecurringNumericTrackCenters(recurring, medianHeight).Count >= DenseNumericMinRecurringTracks;
+    }
+
+    private static List<List<HocrWord>> NumericRows(List<HocrWord> region, uint rowTolerance)
+    {
+        var sorted = region.OrderBy(w => w.Top + w.Height / 2).ToList();
+        var rows = new List<List<HocrWord>>();
+        foreach (var word in sorted)
+        {
+            uint center = word.Top + word.Height / 2;
+            if (rows.Count > 0 && AbsDiff(rows[^1][0].Top + rows[^1][0].Height / 2, center) <= rowTolerance)
+                rows[^1].Add(word);
+            else rows.Add(new List<HocrWord> { word });
+        }
+        return rows;
+    }
+
+    private static bool IsNumericRow(List<HocrWord> row)
+    {
+        int numeric = row.Count(w => IsNumericWord(w.Text));
+        return numeric >= DenseNumericMinWordsPerRow
+            && numeric * 100 >= row.Count * DenseNumericMinRowWordPercent;
+    }
+
+    /// <summary>The longest unbroken run of numeric rows, if it is long enough to count.</summary>
+    private static List<List<HocrWord>>? LongestRecurringNumericRun(List<List<HocrWord>> rows)
+    {
+        int bestStart = 0, bestLen = 0, start = 0;
+        for (int index = 0; index < rows.Count; index++)
+        {
+            if (IsNumericRow(rows[index])) continue;
+            if (index - start > bestLen) { bestStart = start; bestLen = index - start; }
+            start = index + 1;
+        }
+        if (rows.Count - start > bestLen) { bestStart = start; bestLen = rows.Count - start; }
+        return bestLen >= DenseNumericMinRecurringRows ? rows.GetRange(bestStart, bestLen) : null;
+    }
+
+    private static List<uint> RecurringNumericTrackCenters(List<List<HocrWord>> rows, uint medianHeight)
+    {
+        uint xTolerance = Math.Max(medianHeight * 2, 12);
+        int minRowSupport = (rows.Count * DenseNumericMinTrackRowPercent + 99) / 100;
+
+        var candidates = rows.SelectMany(r => r).Where(w => IsNumericWord(w.Text))
+            .Select(w => w.Left + w.Width / 2).OrderBy(v => v).ToList();
+        var deduped = new List<uint>();
+        foreach (uint c in candidates)
+            if (deduped.Count == 0 || AbsDiff(deduped[^1], c) > xTolerance) deduped.Add(c);
+
+        return deduped.Where(candidate =>
+            rows.Count(row => row.Any(w => IsNumericWord(w.Text) && AbsDiff(w.Left + w.Width / 2, candidate) <= xTolerance))
+                >= minRowSupport).ToList();
+    }
+
+    /// <summary>
+    /// Rejoin one numeric column that column detection split in two. The signature is a
+    /// pair of adjacent columns that are never both filled on the same row, whose
+    /// positions are closer together than a single numeric value is wide.
+    /// </summary>
+    private static bool RepairSplitNumericTrack(
+        List<List<string>> grid, List<HocrWord> region, List<uint> columnPositions)
+    {
+        if (grid.Count == 0 || grid[0].Count != columnPositions.Count) return false;
+
+        int found = -1;
+        for (int column = 0; column + 1 < columnPositions.Count; column++)
+        {
+            if (!IsSplitNumericTrackCandidate(grid, region, columnPositions, column)) continue;
+            if (found >= 0) return false;   // more than one candidate: not this shape
+            found = column;
+        }
+        if (found < 0) return false;
+
+        foreach (var row in grid)
+        {
+            if (found + 1 >= row.Count) continue;
+            string right = row[found + 1];
+            row.RemoveAt(found + 1);
+            if (row[found].Trim().Length == 0) row[found] = right;
+        }
+        return true;
+    }
+
+    private static bool IsSplitNumericTrackCandidate(
+        List<List<string>> grid, List<HocrWord> region, List<uint> columnPositions, int column)
+    {
+        int leftNumeric = 0, rightNumeric = 0;
+        bool leftHeader = false, rightHeader = false;
+        for (int rowIndex = 0; rowIndex < grid.Count; rowIndex++)
+        {
+            var row = grid[rowIndex];
+            if (column + 1 >= row.Count) return false;
+            string left = row[column].Trim(), right = row[column + 1].Trim();
+            if (left.Length > 0 && right.Length > 0) return false;
+            string text;
+            bool onLeft;
+            if (left.Length > 0) { text = left; onLeft = true; }
+            else if (right.Length > 0) { text = right; onLeft = false; }
+            else continue;
+
+            if (IsNumericWord(text)) { if (onLeft) leftNumeric++; else rightNumeric++; }
+            else if (rowIndex >= NumericHeaderMaxRows) return false;
+            else if (onLeft) leftHeader = true;
+            else rightHeader = true;
+        }
+
+        if (leftNumeric < SplitNumericTrackMinRowsPerSide || rightNumeric < SplitNumericTrackMinRowsPerSide
+            || leftNumeric + rightNumeric < SplitNumericTrackMinTotalRows || leftHeader == rightHeader)
+            return false;
+
+        uint separation = AbsDiff(columnPositions[column], columnPositions[column + 1]);
+        var numericWidths = new List<uint>();
+        foreach (var word in region)
+        {
+            if (!IsNumericWord(word.Text)) continue;
+            int nearest = 0;
+            uint bestDiff = AbsDiff(columnPositions[0], word.Left);
+            for (int i = 1; i < columnPositions.Count; i++)
+            {
+                uint d = AbsDiff(columnPositions[i], word.Left);
+                if (d < bestDiff) { nearest = i; bestDiff = d; }
+            }
+            if (nearest == column || nearest == column + 1) numericWidths.Add(word.Width);
+        }
+        if (numericWidths.Count == 0) return false;
+        numericWidths.Sort();
+        uint medianWidth = numericWidths[numericWidths.Count / 2];
+        return separation * 2 < medianWidth;
+    }
+
+    /// <summary>
+    /// Move a closing bracket that column detection stranded at the head of the next
+    /// header cell back onto the cell whose opener it closes.
+    /// </summary>
+    private static void RepairHeuristicHeaderDelimiters(List<List<string>> rows)
+    {
+        if (rows.Count == 0) return;
+        var header = rows[0];
+        for (int column = 0; column + 1 < header.Count; column++)
+        {
+            var closerAndRest = LeadingSingleCloser(header[column + 1]);
+            if (closerAndRest is not { } pair) continue;
+            if (UnmatchedOpener(header[column]) != MatchingOpener(pair.Closer)) continue;
+            header[column] += pair.Closer;
+            header[column + 1] = pair.Remainder;
+        }
+    }
+
+    private static (char Closer, string Remainder)? LeadingSingleCloser(string text)
+    {
+        if (text.Length == 0) return null;
+        char closer = text[0];
+        if (MatchingOpener(closer) is null) return null;
+        string remainder = text.Substring(1).TrimStart();
+        if (remainder.Length == 0 || MatchingOpener(remainder[0]) is not null) return null;
+        return (closer, remainder);
+    }
+
+    private static char? UnmatchedOpener(string text)
+    {
+        var openers = new List<char>();
+        foreach (char character in text)
+        {
+            if (character is '(' or '[' or '{') { openers.Add(character); continue; }
+            char? expected = MatchingOpener(character);
+            if (expected is null) continue;
+            if (openers.Count == 0 || openers[^1] != expected) return null;
+            openers.RemoveAt(openers.Count - 1);
+        }
+        return openers.Count > 0 ? openers[^1] : null;
+    }
+
+    private static char? MatchingOpener(char closer) => closer switch
+    {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        _ => null,
+    };
+
+    /// <summary>Fraction of (column boundary, row) pairs a word's box runs across.</summary>
+    /// <remarks>
+    /// A column boundary is the *start* of the next column, not the midpoint between two
+    /// column positions: `DetectColumns` returns each column's median left edge, so a
+    /// midpoint falls inside the left column's own text and any word wider than half the
+    /// column pitch would straddle it. Measured per row, because a column boundary is a
+    /// band of whitespace that holds on every row — one long word on one row is not prose.
+    /// </remarks>
+    internal static double StraddledBoundaryRatio(List<HocrWord> region, List<uint> columnPositions)
+    {
+        if (columnPositions.Count < 2 || region.Count == 0) return 0.0;
+
+        var rowPositions = DetectRows(region, StraddleRowThresholdRatio);
+        if (rowPositions.Count == 0) return 0.0;
+
+        var rows = new List<List<HocrWord>>(rowPositions.Count);
+        for (int i = 0; i < rowPositions.Count; i++) rows.Add(new List<HocrWord>());
+        foreach (var word in region)
+        {
+            uint yCenter = (uint)word.YCenter;
+            int best = 0;
+            uint bestDiff = AbsDiff(rowPositions[0], yCenter);
+            for (int i = 1; i < rowPositions.Count; i++)
+            {
+                uint d = AbsDiff(rowPositions[i], yCenter);
+                if (d < bestDiff) { best = i; bestDiff = d; }
+            }
+            rows[best].Add(word);
+        }
+
+        int total = 0, straddled = 0;
+        for (int b = 1; b < columnPositions.Count; b++)
+        {
+            uint boundary = columnPositions[b];
+            foreach (var row in rows)
+            {
+                total++;
+                foreach (var word in row)
+                    if (word.Left < boundary && word.Left + word.Width > boundary) { straddled++; break; }
+            }
+        }
+        return total == 0 ? 0.0 : (double)straddled / total;
+    }
+
+    /// <summary>
+    /// Well-formedness gate for the borderless heuristic path, the only caller holding raw
+    /// word geometry and the page's drawn-rule count. Drawn rules are strong enough
+    /// evidence on their own; without them, the inferred column boundaries have to be
+    /// actual whitespace, which continuous prose bucketed into a wide grid is not.
+    /// </summary>
+    internal static bool IsWellFormedBorderlessTable(
+        List<List<string>> grid, List<HocrWord> region, List<uint> columnPositions, int horizontalRules)
+    {
+        if (!IsWellFormedTable(grid)) return false;
+        if (horizontalRules > 0) return true;
+        return StraddledBoundaryRatio(region, columnPositions) < MaxStraddledBoundaryRatio;
+    }
+
+    private const double MaxStraddledBoundaryRatio = 0.60;
+
+    /// <summary>Row-grouping tolerance matching what `ReconstructTable` itself uses.</summary>
+    private const double StraddleRowThresholdRatio = 0.5;
+
     internal static bool IsWellFormedTable(List<List<string>> grid, bool skipColumnarProseGuard = false)
     {
         if (grid.Count < 2) return false;

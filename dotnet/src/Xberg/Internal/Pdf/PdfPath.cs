@@ -126,6 +126,40 @@ public sealed class PdfPath
         return w > 5.0 && h > 5.0 && w < 1000.0 && h < 1000.0;
     }
 
+    /// <summary>Minimum length, in points, for a straight line to count as a drawn rule.</summary>
+    private const double RuledLineMinLengthPts = 20.0;
+
+    /// <summary>Maximum thickness of a line still considered a rule.</summary>
+    private const double GridEdgeAlignTolerancePts = 3.0;
+
+    /// <summary>
+    /// Whether this path is a drawn ruling line, as `pdf::rules::count_rules` counts them:
+    /// a straight line long enough not to be decoration and thin enough not to be a
+    /// diagonal on a chart-heavy page. Independent of <see cref="IsTablePrimitive"/> —
+    /// a 2.5 pt rule is a rule but not a primitive.
+    /// </summary>
+    public bool IsRuleCandidate()
+    {
+        if (!IsStraightLine) return false;
+        double w = Math.Abs(Bbox.Width), h = Math.Abs(Bbox.Height);
+        return (w >= RuledLineMinLengthPts && h <= GridEdgeAlignTolerancePts)
+            || (h >= RuledLineMinLengthPts && w <= GridEdgeAlignTolerancePts);
+    }
+
+    /// <summary>Horizontal and vertical drawn-rule counts for a page's paths.</summary>
+    public static (int Horizontal, int Vertical) CountRules(List<PdfPath> paths)
+    {
+        int horizontal = 0, vertical = 0;
+        foreach (var path in paths)
+        {
+            if (!path.IsStraightLine) continue;
+            double w = Math.Abs(path.Bbox.Width), h = Math.Abs(path.Bbox.Height);
+            if (w >= RuledLineMinLengthPts && h <= GridEdgeAlignTolerancePts) horizontal++;
+            else if (h >= RuledLineMinLengthPts && w <= GridEdgeAlignTolerancePts) vertical++;
+        }
+        return (horizontal, vertical);
+    }
+
     public static PathRect ComputeBbox(List<PathOp> ops)
     {
         double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
