@@ -1668,105 +1668,27 @@ internal sealed partial class OxTextExtractor
     }
 
     /// <summary>The default answers, read off the state the extractor already tracks.</summary>
+    /// <summary>
+    /// Routes the four questions the showing half asks about extractor state back to the
+    /// half that owns them.
+    /// </summary>
+    /// <remarks>
+    /// These were re-implemented here while the two halves were ported in parallel and this
+    /// file could not see the other. They agreed, but two copies of one rule only ever agree
+    /// until someone edits one of them.
+    /// </remarks>
     private sealed class DefaultShowingContext : IOxShowingContext
     {
         private readonly OxTextExtractor _owner;
         internal DefaultShowingContext(OxTextExtractor owner) => _owner = owner;
 
-        public OxMcidScope CurrentMcidScope() =>
-            _owner.McidScopeStack.Count > 0 ? _owner.McidScopeStack[^1] : OxMcidScope.Page(0);
+        public OxMcidScope CurrentMcidScope() => _owner.CurrentMcidScope();
 
-        public OxArtifactType? CurrentArtifactType()
-        {
-            for (int i = _owner.MarkedContentStack.Count - 1; i >= 0; i--)
-            {
-                if (_owner.MarkedContentStack[i].ArtifactType is OxArtifactType t)
-                {
-                    return t;
-                }
-            }
-            return null;
-        }
+        public OxArtifactType? CurrentArtifactType() => _owner.CurrentArtifactType();
 
-        /// <summary>
-        /// Artifact filtering is deliberately absent: artifacts are carried on span metadata
-        /// and filtered downstream, so only the layers whose content must never be seen at
-        /// all suppress emission here.
-        /// </summary>
-        public bool IsContentSuppressed() =>
-            _owner.InsideExcludedLayer
-            || _owner.InsideExcludedInk
-            || (_owner.InsidePlacedPdf && !_owner.PlacedPdfKeep);
+        public bool IsContentSuppressed() => _owner.IsContentSuppressed();
 
-        public float CalculateAdaptiveTjThreshold()
-        {
-            if (!_owner.Config.UseAdaptiveTjThreshold)
-            {
-                return _owner.Config.SpaceInsertionThreshold;
-            }
-
-            OxGraphicsState state = _owner.StateStack.Current;
-            float fontSize = state.FontSize;
-
-            float spaceWidthUnits = 250.0f; // Times-Roman's space, the fallback when unknown
-            if (state.FontName is string name && _owner.Fonts.TryGetValue(name, out OxFontInfo? font))
-            {
-                spaceWidthUnits = font.GetSpaceGlyphWidth();
-            }
-
-            // Justified text spreads whitespace through TJ offsets, so its offsets vary
-            // widely; a conservative multiple of the margin keeps that variance from reading
-            // as a word gap at every offset.
-            (bool isJustified, _) = AnalyzeTjDistribution();
-            float marginRatio = isJustified
-                ? _owner.Config.WordMarginRatio * 3.0f
-                : _owner.Config.WordMarginRatio;
-
-            return -((spaceWidthUnits * fontSize * marginRatio) / 1000.0f);
-        }
-
-        /// <summary>
-        /// `analyze_tj_distribution`: a coefficient of variation above 0.5 in the offsets
-        /// seen so far means justified text.
-        /// </summary>
-        private (bool IsJustified, float Cv) AnalyzeTjDistribution()
-        {
-            int n = _owner.TjOffsetHistory.Count;
-            if (n == 0)
-            {
-                return (false, 0.0f);
-            }
-
-            double sum;
-            double sumSq;
-            if (_owner.TjStatsLen == n)
-            {
-                sum = _owner.TjSum;
-                sumSq = _owner.TjSumSq;
-            }
-            else
-            {
-                // The history was replaced wholesale; summing in the same order reproduces
-                // the accumulators exactly.
-                sum = 0.0;
-                sumSq = 0.0;
-                foreach (float v in _owner.TjOffsetHistory)
-                {
-                    double x = v;
-                    sum += x;
-                    sumSq += x * x;
-                }
-            }
-
-            double nf = n;
-            double mean = sum / nf;
-            // E[x²] - E[x]², clamped because cancellation can push a tiny spread negative.
-            double variance = Math.Max((sumSq / nf) - mean * mean, 0.0);
-            double stdDev = Math.Sqrt(variance);
-
-            float cv = Math.Abs(mean) > 0.001 ? (float)(stdDev / Math.Abs(mean)) : 0.0f;
-            return (cv > 0.5f, cv);
-        }
+        public float CalculateAdaptiveTjThreshold() => _owner.CalculateAdaptiveTjThreshold();
     }
 
     /// <summary>Rejects invalid sequences instead of substituting, as <c>str::from_utf8</c> does.</summary>
