@@ -476,34 +476,13 @@ internal static class PdfTableReconstruct
         return RemoveEmptyRowsAndColumns(result);
     }
 
-    public static string TableToMarkdown(List<List<string>> table)
-    {
-        if (table.Count == 0) return "";
-        int numCols = table[0].Count;
-        if (numCols == 0) return "";
-
-        var sb = new StringBuilder();
-        for (int rowIdx = 0; rowIdx < table.Count; rowIdx++)
-        {
-            sb.Append('|');
-            foreach (var cell in table[rowIdx])
-            {
-                sb.Append(' ');
-                sb.Append(cell.Replace("|", "\\|"));
-                sb.Append(" |");
-            }
-            sb.Append('\n');
-            if (rowIdx == 0)
-            {
-                sb.Append('|');
-                for (int i = 0; i < numCols; i++) sb.Append(" --- |");
-                sb.Append('\n');
-            }
-        }
-        return sb.ToString();
-    }
-
-    // ── post_process_table (pdf/table_reconstruct.rs) ────────────────────────
+    /// <summary>
+    /// Render a reconstructed grid as a GFM pipe table, through the same renderer every other
+    /// source uses — so a PDF table serialises identically to one from a docx, and a ragged row
+    /// is padded out to the widest row rather than emitting fewer columns than the header.
+    /// </summary>
+    public static string TableToMarkdown(List<List<string>> table) =>
+        Xberg.Rendering.RenderCommon.RenderTableMarkdown(table);
 
     internal static List<List<string>>? PostProcessTable(List<List<string>> table, bool layoutGuided, bool allowSingleColumn)
     {
