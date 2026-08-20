@@ -222,14 +222,29 @@ public sealed class PdfExtractor : IExtractor
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
-                    // The older interpreter still runs: its `Paths` are what the ruling-line
-                    // table tiers read, and nothing in the ported pipeline collects those yet.
-                    if (UsePortedSpans)
-                        spans = OxSpanBridge.ToPdfSpans(
-                            Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPageText(pdf, i).Spans);
                     var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
-                    (pageText, var lines) = PdfPageText.AssembleWithLines(
-                        spans, Math.Abs(mbUrx - mbLlx), spansArePostProcessed: UsePortedSpans);
+                    double pageWidth = Math.Abs(mbUrx - mbLlx);
+                    List<PdfPageText.LineSeg> lines;
+                    if (UsePortedSpans)
+                    {
+                        // The ported pipeline's own assembler consumes the ported spans directly:
+                        // they already arrive column-aware ordered, deduplicated and merged, which
+                        // is exactly the shape upstream's `assemble_page_text` receives.
+                        var oxSpans = Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPageText(pdf, i).Spans;
+                        var assembly = Xberg.Internal.PdfOxide.Text.OxPageAssembler.Assemble(
+                            oxSpans, (float)pageWidth);
+                        pageText = assembly.Text;
+                        lines = PdfPageText.LineSegsFromOx(assembly.Lines);
+                        // Bridged AFTER assembly, so the word grid sees the column repairs' order.
+                        spans = OxSpanBridge.ToPdfSpans(oxSpans);
+                    }
+                    else
+                    {
+                        (pageText, lines) = PdfPageText.AssembleWithLines(spans, pageWidth);
+                    }
+                    // The older interpreter still runs either way: its `Paths` are what the
+                    // ruling-line table tiers read, and nothing in the ported pipeline collects
+                    // those yet.
                     segs = PdfStructure.SegmentsFromLines(lines);
                     words = PdfSpatialTables.SpansToWords(spans);
                     paths = extractor.Paths;

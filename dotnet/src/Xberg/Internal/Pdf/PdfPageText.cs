@@ -42,16 +42,16 @@ public static class PdfPageText
 
     /// <summary>Assemble + line segments from ONE ordering pass (the ordering —
     /// presort, run merge, XY-cut, column repair — dominates cost on large documents).</summary>
-    /// <param name="spansArePostProcessed">
-    /// True when the spans already came through the ported pdf_oxide extractor, which sorts
-    /// them into reading order, drops double-drawn glyphs and reattaches off-baseline runs
-    /// itself. Repeating those here with this port's older approximations of the same three
-    /// passes changes text that was already right.
-    /// </param>
+    /// <remarks>
+    /// This is the path for spans from the older content interpreter only. Spans from the
+    /// ported pdf_oxide extractor go to <c>OxPageAssembler</c> instead, which is the faithful
+    /// port of the same upstream assembler and does not re-derive an ordering the producer
+    /// already established.
+    /// </remarks>
     public static (string text, List<LineSeg> lines) AssembleWithLines(
-        List<TextSpan> spans, double pageWidth = 0, bool spansArePostProcessed = false)
+        List<TextSpan> spans, double pageWidth = 0)
     {
-        var ordering = OrderViaRuns(spans, pageWidth, spansArePostProcessed);
+        var ordering = OrderViaRuns(spans, pageWidth);
         return (AssembleOrdered(ordering), BuildLineSegmentsOrdered(ordering));
     }
 
@@ -125,10 +125,8 @@ public static class PdfPageText
     // spans in run order. Runs are used ONLY for reading-order geometry; assembly still
     // walks the original spans so spacing/line-break decisions are unchanged.
     private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(
-        List<TextSpan> spans, double pageWidth = 0, bool spansArePostProcessed = false)
+        List<TextSpan> spans, double pageWidth = 0)
     {
-        if (!spansArePostProcessed)
-        {
         // pdf_oxide sorts spans into reading order (rounded-Y descending, X
         // ascending, column-aware) BEFORE merge_adjacent_spans (extractors/
         // text.rs :: sort_spans_by_reading_order). Without this, show-ops that
@@ -145,7 +143,6 @@ public static class PdfPageText
         // Off-baseline glyphs go back onto the words they modify before anything groups spans
         // into lines; a raised digit left on its own drifts to wherever its baseline band sorts.
         PdfSubSuperscript.Merge(spans);
-        }
 
         var runs = new List<TextSpan>();
         var members = new List<List<int>>();
@@ -234,6 +231,48 @@ public static class PdfPageText
         public string Text = "";
         public double X, Y, Width, Height, FontSize;
         public bool IsBold, IsItalic, IsMonospace;
+    }
+
+    /// <summary>
+    /// The ported assembler's lines in the shape the structure/heading pipeline consumes.
+    /// Text comes from the assembly verbatim, so a segment always reads exactly as the
+    /// corresponding stretch of page text does; only the geometry is re-derived here.
+    /// </summary>
+    internal static List<LineSeg> LineSegsFromOx(
+        List<Xberg.Internal.PdfOxide.Text.OxPageAssembler.AssembledLine> lines)
+    {
+        var segs = new List<LineSeg>(lines.Count);
+        foreach (var line in lines)
+        {
+            double minX = double.MaxValue, maxRight = double.MinValue, maxHeight = 0, maxFont = 0;
+            int boldCount = 0, italicCount = 0, count = 0;
+            bool allMono = true;
+            foreach (var s in line.Spans)
+            {
+                minX = Math.Min(minX, s.Bbox.X);
+                maxRight = Math.Max(maxRight, s.Bbox.X + s.Bbox.Width);
+                maxHeight = Math.Max(maxHeight, s.Bbox.Height);
+                maxFont = Math.Max(maxFont, s.FontSize);
+                // pdf_oxide grades weight on the CSS scale; semibold and up reads as bold.
+                if ((int)s.FontWeight >= 600) boldCount++;
+                if (s.IsItalic) italicCount++;
+                allMono &= s.IsMonospace;
+                count++;
+            }
+            segs.Add(new LineSeg
+            {
+                Text = line.Text,
+                X = minX == double.MaxValue ? 0 : minX,
+                Y = line.Spans.Count > 0 ? line.Spans[0].Bbox.Y : 0,
+                Width = (maxRight == double.MinValue ? 0 : maxRight) - (minX == double.MaxValue ? 0 : minX),
+                Height = maxHeight,
+                FontSize = maxFont,
+                IsBold = boldCount * 2 > count,
+                IsItalic = italicCount * 2 > count,
+                IsMonospace = count > 0 && allMono,
+            });
+        }
+        return segs;
     }
 
     /// <summary>Assemble a page's spans into visual lines with the SAME reading-order and
