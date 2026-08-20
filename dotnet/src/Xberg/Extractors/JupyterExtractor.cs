@@ -74,7 +74,11 @@ public sealed class JupyterExtractor : IExtractor
             additional["cells"] = cellsMeta;
         }
 
-        var doc = BuildInternalDocument(notebook);
+        // Plain and structured output take an output's text/plain repr and nothing else. The
+        // richer representations are markup, and rendering them into a plain document would put
+        // HTML tags in it.
+        bool plain = config.OutputFormat.Which is OutputFormat.Kind.Plain or OutputFormat.Kind.Structured;
+        var doc = BuildInternalDocument(notebook, plain);
         doc.MimeType = mimeType;
         doc.Metadata = new Metadata { Language = languageName };
         foreach (var (k, v) in additional)
@@ -82,7 +86,7 @@ public sealed class JupyterExtractor : IExtractor
         return doc;
     }
 
-    private static InternalDocument BuildInternalDocument(JsonObject notebook)
+    private static InternalDocument BuildInternalDocument(JsonObject notebook, bool plain)
     {
         var builder = new InternalDocumentBuilder("jupyter");
         var cells = notebook["cells"] as JsonArray;
@@ -125,30 +129,35 @@ public sealed class JupyterExtractor : IExtractor
                 }
                 case "code":
                 {
-                    uint idx = builder.PushCode(trimmed, kernelLang, null, null);
-                    var attrs = new Dictionary<string, string>();
-                    if (cell.TryGetPropertyValue("execution_count", out var ec))
+                    // A code cell with no source contributes only its outputs. An empty code
+                    // element for it leaves a blank block between the cell before it and that
+                    // output. The outputs still belong to the document, so this guards the code
+                    // element alone rather than the whole cell.
+                    if (trimmed.Length != 0)
                     {
-                        if (ec is JsonValue ecv && ecv.GetValueKind() == JsonValueKind.Number) attrs["execution_count"] = ecv.ToJsonString();
-                        else if (ec is null || ec.GetValueKind() == JsonValueKind.Null) attrs["execution_count"] = "null";
+                        uint idx = builder.PushCode(trimmed, kernelLang, null, null);
+                        var attrs = new Dictionary<string, string>();
+                        if (cell.TryGetPropertyValue("execution_count", out var ec))
+                        {
+                            if (ec is JsonValue ecv && ecv.GetValueKind() == JsonValueKind.Number) attrs["execution_count"] = ecv.ToJsonString();
+                            else if (ec is null || ec.GetValueKind() == JsonValueKind.Null) attrs["execution_count"] = "null";
+                        }
+                        if (tags is not null && tags.Count > 0)
+                        {
+                            var tagStrs = tags.Select(t => (t as JsonValue)?.ToString()).Where(s => s is not null).Select(s => s!).ToList();
+                            attrs["tags"] = string.Join(",", tagStrs);
+                        }
+                        if (attrs.Count > 0) builder.SetAttributes(idx, attrs);
                     }
-                    if (tags is not null && tags.Count > 0)
-                    {
-                        var tagStrs = tags.Select(t => (t as JsonValue)?.ToString()).Where(s => s is not null).Select(s => s!).ToList();
-                        attrs["tags"] = string.Join(",", tagStrs);
-                    }
-                    if (attrs.Count > 0) builder.SetAttributes(idx, attrs);
 
-                    // An output contributes its text and nothing else. Its type and the mime
-                    // keys it carries describe the output rather than being part of it.
+                    // Each output contributes the richest representation it carries.
                     var outputs = cell["outputs"] as JsonArray;
                     if (outputs is not null)
                     {
                         foreach (var outNode in outputs)
                         {
                             if (outNode is not JsonObject output) continue;
-                            string outputText = CollectOutputText(output).Trim();
-                            if (outputText.Length != 0) builder.PushParagraph(outputText, new(), null, null);
+                            PushOutputElement(builder, output, plain);
                         }
                     }
                     break;
@@ -193,6 +202,64 @@ public sealed class JupyterExtractor : IExtractor
             return sb.ToString();
         }
         return "";
+    }
+
+    /// <summary>
+    /// Emit one output as whichever of its representations says the most.
+    /// </summary>
+    /// <remarks>
+    /// An output ships the same result under several MIME types, and the text/plain one is often
+    /// a placeholder for an object — "&lt;IPython.core.display.HTML object&gt;" — where the
+    /// text/html one is the output as its author meant it to be seen.
+    /// <para>
+    /// text/latex is deliberately not preferred. Upstream's current source takes it as a formula,
+    /// but the reference outputs this port is validated against predate that and keep the
+    /// text/plain repr — <c>z₀</c> rather than <c>$$z_{0}$$</c> — for every output carrying both.
+    /// </para>
+    /// </remarks>
+    private static void PushOutputElement(InternalDocumentBuilder builder, JsonObject output, bool plain)
+    {
+        string outputType = (output["output_type"] as JsonValue)?.ToString() ?? "";
+        switch (outputType)
+        {
+            case "stream":
+            {
+                string text = output.TryGetPropertyValue("text", out var t) ? ExtractSource(t).Trim() : "";
+                if (text.Length != 0) builder.PushParagraph(text, new(), null, null);
+                break;
+            }
+            case "execute_result":
+            case "display_data":
+            case "update_display_data":
+            {
+                if (output["data"] is not JsonObject data) break;
+                if (!plain)
+                {
+                    if (data.TryGetPropertyValue("text/html", out var html))
+                    {
+                        string text = ExtractSource(html).Trim();
+                        if (text.Length != 0) { builder.PushRawBlock("html", text, null); break; }
+                    }
+                    if (data.TryGetPropertyValue("text/markdown", out var md))
+                    {
+                        string text = ExtractSource(md).Trim();
+                        if (text.Length != 0) { builder.PushParagraph(text, new(), null, null); break; }
+                    }
+                }
+                if (data.TryGetPropertyValue("text/plain", out var p))
+                {
+                    string text = ExtractSource(p).Trim();
+                    if (text.Length != 0) builder.PushParagraph(text, new(), null, null);
+                }
+                break;
+            }
+            case "error":
+            {
+                string text = CollectOutputText(output).Trim();
+                if (text.Length != 0) builder.PushParagraph(text, new(), null, null);
+                break;
+            }
+        }
     }
 
     private static string CollectOutputText(JsonObject output)
