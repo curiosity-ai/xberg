@@ -10,9 +10,12 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2513 fixtures (79.4%) match on every hard dimension**; content parity is **82.0%
-> identical, 90.4% ≥95%-similar**; 57 fixtures (<80%) are genuine content misses; **4
-> catastrophes (0.1%), all HTML**. 541 unit tests.
+> **2456 fixtures of 2942 (83.5%) match on every hard dimension**; **0 catastrophes**; 4
+> fixtures still lose content (svg, eml, epub, odt). 1040 unit tests.
+>
+> The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
+> stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
+> measured".
 >
 > The last two passes took it from 2340 and were mostly a matter of finding things the port had
 > never implemented at all rather than tuning what it had. Ordered by what they were worth:
@@ -285,25 +288,37 @@ not a cosmetic difference.
 
 ### The PDF gap, measured
 
-PDF is where the remaining distance is: 103 of 389 fixtures match on every hard dimension, and
-the shortfall is not one bug but three layers.
+PDF was where the remaining distance was: 106 of 389 fixtures matched on every hard dimension,
+and the shortfall was not one bug but three layers. **Two of the three are now closed.**
 
-- [ ] **Span assembly (plain 123/388).** The single biggest cause. pdf_oxide's text layer merges
-      glyph runs into spans on its own thresholds, and every downstream rule — spacing, reading
-      order, paragraph breaks — is calibrated to that granularity. The port's own merger produces
-      a different granularity, so a header row can come out `2010 2011` where upstream has them a
-      column apart. Three transplants of upstream's assembly loop were tried and each regressed
-      the corpus (plain 122 → 72, → 100, → 121); they were reverted. Closing this means porting
-      pdf_oxide's span merger itself, not tuning constants around it.
-- [ ] **Table recognition beyond the geometric fallback (tables 222/388).** The geometric path is
-      ported and finds the borderless grids. What is missing is pdf_oxide's *native* and
-      *bordered* passes, which read the page's drawn ruling lines — no managed equivalent exists,
-      so a ruled table with no column-aligned text geometry is still missed (the `skia_*` fixtures
-      are exactly this). `regions/table_recognition.rs` (2412 lines) is the ML-only tier and is
-      out of scope while the reference runs without the detector.
-- [ ] **Font programs other than Type 1 (13 stray ligatures).** `/FontFile` is parsed for its
-      built-in encoding; `/FontFile3` (CFF) is not, so a CFF subset font's own encoding — and the
-      ligature slots in it — are unavailable. Upstream's `cff_encoding.rs` is 2482 lines.
+- [x] **Span assembly (plain 123 → 172 of 388).** The single biggest cause, and the reason the
+      other two were hard to see past. pdf_oxide's text layer merges glyph runs into spans on its
+      own thresholds, and every downstream rule — spacing, reading order, paragraph breaks, table
+      cell assignment — is calibrated to that granularity. Three transplants of individual
+      constants onto the port's own merger were tried and each regressed the corpus (plain
+      122 → 72, → 100, → 121); all were reverted. What closed it was porting the producer:
+      `extractors/text.rs` (9.2k lines of logic) with the font, content-stream and reading-order
+      layers under it, now in `Internal/PdfOxide`. Fully matching 106 → 142, json 118 → 163,
+      content-identical 35.0% → 49.1%, real content misses 20 → 12.
+- [x] **Table recognition beyond the geometric fallback (tables 222 → 237 of 388).** The
+      intersection pipeline both ruling-line tiers share is ported — edges, snap/join, dotted-line
+      reconstitution, coverage filtering, cells, union-find grouping, extended grids, span
+      assignment, section-divider splitting — along with the drawn-rule admission gate the
+      borderless heuristic was missing. `regions/table_recognition.rs` (2412 lines) is the
+      ML-only tier and stays out of scope while the reference runs without the detector.
+- [x] **Font programs other than Type 1.** `cff_encoding.rs` is ported, so a CFF subset font's
+      own encoding — and the ligature slots in it — are read from `/FontFile3` rather than
+      guessed at.
+
+**What the PDF port still owes.** The ruling-line tiers read their drawn paths from the older
+content interpreter, which is why both span producers still run per page; the paths belong in
+the ported pipeline. `PageText.chars` is left empty, since page text is assembled from spans
+alone. Pattern marking is a no-op, so email and URL characters are not yet protected from
+splitting. And `.Showing.cs` re-implements three rules — the MCID scope, the artifact type and
+the content-suppression test — that `.Core.cs` also owns; they agree today and should be one
+copy. Still unported from `pdf/structure/`: `mark_validated_page_numbers`,
+`stitch_fragmented_tables`, `merge_spatial_footnote_markers`,
+`suppress_table_dominant_paragraph_spill`, and everything that depends on layout regions (ML).
 
 ---
 
