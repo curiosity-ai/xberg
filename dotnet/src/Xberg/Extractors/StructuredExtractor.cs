@@ -348,12 +348,42 @@ public sealed class StructuredExtractor : IExtractor
 
     // Walk over the JsonNode trees produced by the YAML/TOML parsers.
     /// <summary>YAML/TOML counterpart of <see cref="ExtractFromJson"/>.</summary>
+    /// <summary>The key a TOML datetime is carried under once it becomes JSON.</summary>
+    private const string TomlDatetimeKey = "$__toml_private_datetime";
+
+    /// <summary>
+    /// A number as the flattened view prints it.
+    /// </summary>
+    /// <remarks>
+    /// The flattened view is built from the parsed value rather than its JSON rendering, and a
+    /// float there prints without a forced decimal point: 80.0 is "80". The JSON rendering keeps
+    /// the point, because there it is what distinguishes a float from an integer. An integer
+    /// lexeme is printed verbatim so a value too large for a double stays exact.
+    /// </remarks>
+    private static string DisplayNumber(JsonValue value)
+    {
+        string raw = value.ToJsonString();
+        if (raw.IndexOfAny(new[] { '.', 'e', 'E' }) < 0) return raw;
+        return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double d)
+            ? d.ToString("R", CultureInfo.InvariantCulture)
+            : raw;
+    }
+
     private static void ExtractFromNode(JsonNode? value, StringBuilder path,
         Dictionary<string, string> meta, List<string> textFields, List<string> flattened)
     {
         switch (value)
         {
             case JsonObject obj:
+                // A TOML datetime is carried as a one-entry table under a reserved key so the
+                // JSON rendering can tell it from a string. The flattened view is built from the
+                // parsed value, where it is simply a datetime, so the wrapper is not part of its
+                // path.
+                if (obj.Count == 1 && obj.First().Key == TomlDatetimeKey)
+                {
+                    ExtractFromNode(obj.First().Value, path, meta, textFields, flattened);
+                    break;
+                }
                 foreach (var kv in obj)
                 {
                     int baseLen = path.Length;
@@ -386,7 +416,7 @@ public sealed class StructuredExtractor : IExtractor
                         }
                         break;
                     case JsonValueKind.Number:
-                        flattened.Add($"{path}: {jv.ToJsonString()}");
+                        flattened.Add($"{path}: {DisplayNumber(jv)}");
                         break;
                     case JsonValueKind.True:
                         flattened.Add($"{path}: true");
