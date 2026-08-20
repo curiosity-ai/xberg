@@ -10,9 +10,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2509 fixtures (79.3%) match on every hard dimension**; content parity is **82.0%
+> **2513 fixtures (79.4%) match on every hard dimension**; content parity is **82.0%
 > identical, 90.4% ≥95%-similar**; 57 fixtures (<80%) are genuine content misses; **4
-> catastrophes (0.1%), all HTML**. 529 unit tests.
+> catastrophes (0.1%), all HTML**. 541 unit tests.
 >
 > The last two passes took it from 2340 and were mostly a matter of finding things the port had
 > never implemented at all rather than tuning what it had. Ordered by what they were worth:
@@ -56,6 +56,12 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > - **HTML entities and comment-prefixed pages.** The markdown converter knew forty entity names
 >   where upstream's HTML5 parser knows 2125, and a page whose first line is a comment was
 >   handed to the XML extractor as a tag outline.
+> - **HTML metadata (43 → 54 of 157).** The document scanner was a rough approximation of the
+>   collector it mirrors. It stopped at the first `</style` written with whitespace before its
+>   bracket, swallowing the rest of the page; it collected navigation chrome as document
+>   structure; it read head metadata from anywhere rather than the head; it flattened a
+>   heading's markdown to text; and it understood none of Dublin Core. Author mismatches went
+>   from 17 fixtures to none, meta tags from 29 to 5, titles from 25 to 12.
 >
 > ## Upstream defects, flagged and left alone
 >
@@ -208,7 +214,7 @@ not a cosmetic difference.
       `$}$` stay literal.
 - [x] **Citation formats (nbib, ris).** Both at full parity. The parsers were fine; the element
       carried only the title, so everything else was parsed and then dropped.
-- [~] **html 27/41 on the original set; 27/157 on the grown one.** Two defects fixed: cells
+- [~] **html 33/157 (was 27).** Two defects fixed: cells
       were placed by advancing through each row on its own, which ignores the columns a rowspan
       from an earlier row still covers and slides everything beneath one out from under its
       header (upstream keeps that placement rule in one helper, `grid_flatten.rs`, so the
@@ -218,8 +224,18 @@ not a cosmetic difference.
       `<head>` rather than the head running to the last byte, and a document that yields no
       elements at all falls back to the loose text it gathered.
 
-      **The 117 `office/regression` fixtures are the real remaining work**, and 7 of them are
-      catastrophes. Diagnosed, not guessed:
+      **The 117 `office/regression` fixtures are the real remaining work**, and 4 of them are
+      still catastrophes (7 before the table-cell fix below). Diagnosed, not guessed:
+      - A cell written straight into a `<table>` with no `<tr>` around it left every cell
+        hanging off the table where no consumer looks for it. The HTML5 in-table insertion
+        modes are implemented now; that alone fixed three of the seven catastrophes.
+      - **The structured document is built by the wrong walker.** `HtmlWalker` ports
+        `extraction/html/structure.rs`, which upstream uses for *email and epub* — its own HTML
+        extractor maps `html-to-markdown-rs`'s `DocumentStructure` instead. That is why plain
+        and json sit at 38 and 40 of 157 while markdown, which does go through the converter,
+        is at 78: a `<br>` reaches the reference as a markdown hard break (`"  \n"`), and the
+        structure walker has no notion of one. Closing this means teaching the ported converter
+        to emit a document structure (~1500 lines upstream) and mapping that instead.
       - The walker captures a whole `<table>` subtree and hands it to the markdown converter,
         while upstream's structure walker handles tables inline with its own cell accumulator.
         So anything inside a layout table — and 1990s HTML puts the entire page inside one —
@@ -231,6 +247,13 @@ not a cosmetic difference.
       - Malformed markup gets no error recovery. `000_000190.html` has 5 `<tr>` opens against
         55 closes; upstream's parser synthesises the rows anyway, ours finds 3 tables where it
         finds 7.
+
+      **Metadata** is at 54 of 157, up from 43. What remains is concentrated in three
+      collections — links (100 fixtures), images (70) and headers (36) — and all three now turn
+      on things a linear scanner cannot reproduce: the DOM depth the tree builder computes, and
+      the order in which a table's contents repeat across the converter's passes. The
+      field-level rules themselves are ported (Dublin Core, social-card keys, head-only
+      collection, preformatted skipping, heading markdown).
 
       Loose text outside a `<p>` is still dropped, and that is deliberate: flushing at every
       block boundary is what upstream's `flush_paragraph` does, but it was measured twice —
