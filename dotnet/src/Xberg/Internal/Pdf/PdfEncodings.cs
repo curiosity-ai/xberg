@@ -165,6 +165,9 @@ public static class PdfEncodings
         if (dot > 0) name = name[..dot];
         if (name.Length == 0) return "";
 
+        // The full Adobe Glyph List first, then the hand-built fallback for the handful
+        // of names it does not carry (`nbspace`, `Euro`).
+        if (AdobeGlyphList.TryGet(name, out var agl)) return agl;
         if (AglMap.TryGetValue(name, out var s)) return s;
 
         // uniXXXX (one or more 4-hex sequences).
@@ -186,8 +189,22 @@ public static class PdfEncodings
             if (int.TryParse(name.AsSpan(1), System.Globalization.NumberStyles.HexNumber, null, out int cp) && cp > 0 && cp <= 0x10FFFF)
                 return char.ConvertFromUtf32(cp);
         }
+        // Underscore-delimited compound names (AGL spec §2): "f_i" is two glyphs
+        // drawn as one, and its text is the concatenation of the components.
+        if (name.IndexOf('_') > 0)
+        {
+            var sb = new StringBuilder();
+            foreach (string part in name.Split('_'))
+            {
+                if (part.Length == 0) continue;
+                string mapped = GlyphNameToUnicode(part);
+                if (mapped.Length == 0) { sb.Clear(); break; }
+                sb.Append(mapped);
+            }
+            if (sb.Length > 0) return sb.ToString();
+        }
+
         // gXX / cidXX / index names → no unicode.
-        // "gNN" or trailing digits fallback: single ASCII letter names.
         return "";
     }
 
