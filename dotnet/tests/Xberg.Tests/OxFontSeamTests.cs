@@ -65,4 +65,23 @@ public class OxFontSeamTests
 
         Assert.Equal("あ", mapper.MapCharacter(843));
     }
+
+    [Fact]
+    public void TheCMapSeamCarriesItsCodespaceWidth()
+    {
+        OxFontWiring.Install();
+
+        // A two-byte codespace is authoritative for the byte-mode decision: a CJK font
+        // whose CMap declares one must be read two bytes at a time whatever its /Encoding
+        // name says. Without this reaching the decoder those pages decode single-byte.
+        IOxCMap twoByte = OxFontSeams.CMaps!.CreateLazy(System.Text.Encoding.ASCII.GetBytes(
+            "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n" +
+            "1 beginbfchar\n<3042> <3042>\nendbfchar\nendcmap\n"));
+        Assert.Equal(2, Assert.IsAssignableFrom<Xberg.Internal.PdfOxide.Text.IOxCMapCodeWidth>(twoByte).CodeWidth);
+
+        IOxCMap oneByte = OxFontSeams.CMaps!.CreateLazy(System.Text.Encoding.ASCII.GetBytes(
+            "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n" +
+            "1 beginbfchar\n<41> <0061>\nendbfchar\nendcmap\n"));
+        Assert.Equal(1, Assert.IsAssignableFrom<Xberg.Internal.PdfOxide.Text.IOxCMapCodeWidth>(oneByte).CodeWidth);
+    }
 }

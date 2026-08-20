@@ -88,7 +88,12 @@ internal static class OxFontWiring
     /// Wraps the lazy CMap so the first lookup is what triggers parsing — a font whose
     /// /ToUnicode is never consulted must not pay for it.
     /// </summary>
-    private sealed class LazyCMapAdapter : IOxCMap
+    /// <remarks>
+    /// Also carries the code width, which the byte-mode decision treats as authoritative
+    /// before any encoding-name rule: a CJK font whose CMap declares a two-byte codespace
+    /// must be read two bytes at a time even when its /Encoding name says nothing.
+    /// </remarks>
+    private sealed class LazyCMapAdapter : IOxCMap, Text.IOxCMapCodeWidth
     {
         private readonly OxLazyCMap _lazy;
         internal LazyCMapAdapter(OxLazyCMap lazy) => _lazy = lazy;
@@ -97,6 +102,7 @@ internal static class OxFontWiring
         public int Count => _lazy.Get()?.Count ?? 0;
         public string? Lookup(uint code) => _lazy.Get()?.Get(code);
         public byte Wmode => _lazy.WMode();
+        public byte CodeWidth => _lazy.CodeWidth();
     }
 
     private sealed class TrueTypeSeam : IOxTrueTypeProvider

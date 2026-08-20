@@ -61,7 +61,7 @@ public readonly struct OxMcidScope : IEquatable<OxMcidScope>
 /// <summary>Artifact classification for content marked outside the logical flow (§14.8.2.2).</summary>
 public enum OxArtifactType { Pagination, Layout, Page, Background }
 
-public enum OxPaginationSubtype { Header, Footer, Watermark }
+public enum OxPaginationSubtype { Header, Footer, Watermark, PageNumber, Other }
 
 /// <summary>One positioned glyph.</summary>
 public sealed class OxTextChar
