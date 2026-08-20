@@ -475,4 +475,29 @@ public class HtmlExtractorTests
         Assert.Equal("summary", m.TwitterCard["card"]);
         Assert.Equal("ALL", m.MetaTags["robots"]);
     }
+
+    /// <summary>
+    /// A heading's recorded text is the markdown its children convert to, so a permalink anchor
+    /// inside one is `[label](href "title")` and emphasis keeps its markers. An anchor with no
+    /// href is a link target, not a link, and contributes only its text.
+    /// </summary>
+    [Fact]
+    public void AHeadingRecordsTheMarkdownOfItsChildren()
+    {
+        var m = Meta("<html><body>" +
+                     "<h1>Understanding Output<a href=\"#out\" title=\"Permalink\">\u00b6</a></h1>" +
+                     "<h2><a id=\"anchor\"></a>Functions</h2>" +
+                     "<h3>The <em>quick</em> fox</h3>" +
+                     "</body></html>");
+
+        string json = System.Text.Json.JsonSerializer.Serialize(m.Headers, new System.Text.Json.JsonSerializerOptions
+        {
+            PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.SnakeCaseLower,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+
+        Assert.Contains("Understanding Output[\u00b6](#out \\\"Permalink\\\")", json);
+        Assert.Contains("\"text\":\"Functions\"", json);
+        Assert.Contains("The *quick* fox", json);
+    }
 }

@@ -29,6 +29,9 @@ public static class HtmlMeta
         var headingText = new StringBuilder();
         int headingDepthAtOpen = 0;
         string? headingId = null;
+        // A heading's recorded text is the markdown its children convert to, so a permalink
+        // anchor inside one is `[label](href)` rather than the label alone.
+        var headingLinks = new List<(int LabelStart, string Href, string? Title)>();
         // html-to-markdown walks a table's subtree three times — once to build the grid, once to
         // write the markdown, once for the structure — and the collector records what it sees on
         // every pass. So a table's headings, links and images each appear three times over, in
@@ -145,6 +148,21 @@ public static class HtmlMeta
                         LinkSink().Add(link);
                         inAnchor = false;
                     }
+                    else if (InlineMarker(tag) is { } closeMarker && (captureHeading != 0 || inAnchor))
+                    {
+                        (captureHeading != 0 ? headingText : anchorText).Append(closeMarker);
+                    }
+                    else if (tag == "a" && captureHeading != 0 && headingLinks.Count > 0)
+                    {
+                        var (labelStart, linkHref, linkTitle) = headingLinks[^1];
+                        headingLinks.RemoveAt(headingLinks.Count - 1);
+                        string label = HtmlWalker.NormalizeWhitespace(
+                            headingText.ToString(labelStart, headingText.Length - labelStart));
+                        headingText.Length = labelStart;
+                        headingText.Append(label).Append("](").Append(linkHref);
+                        if (linkTitle is { Length: > 0 }) headingText.Append(" \"").Append(linkTitle).Append('"');
+                        headingText.Append(')');
+                    }
                     else if (tag == "head") inHead = false;
                     else if (tag == "title" && inTitle)
                     {
@@ -183,6 +201,14 @@ public static class HtmlMeta
                 if (preDepth > 0 && tag is "a" or "img" or "h1" or "h2" or "h3" or "h4" or "h5" or "h6")
                 {
                     if (!Void.Contains(tag) && !selfClose) domDepth++;
+                    continue;
+                }
+
+                // Emphasis inside a heading or a link is part of the markdown those record.
+                if (InlineMarker(tag) is { } openMarker && (captureHeading != 0 || inAnchor) && !selfClose)
+                {
+                    (captureHeading != 0 ? headingText : anchorText).Append(openMarker);
+                    domDepth++;
                     continue;
                 }
 
@@ -239,9 +265,18 @@ public static class HtmlMeta
                     case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
                         captureHeading = tag[1] - '0';
                         headingText.Clear();
+                        headingLinks.Clear();
                         headingDepthAtOpen = domDepth;
                         headingId = ExtractAttrDecoded(attrsStr, "id");
                         break;
+                    // An anchor with no href is a link target, not a link: its children are
+                    // written straight into the heading.
+                    case "a" when captureHeading != 0 && HtmlWalker.ExtractAttr(attrsStr, "href") is { } headingHref:
+                    {
+                        headingText.Append('[');
+                        headingLinks.Add((headingText.Length, headingHref, HtmlWalker.ExtractAttr(attrsStr, "title")));
+                        break;
+                    }
                     case "a":
                     {
                         inAnchor = true;
@@ -351,6 +386,17 @@ public static class HtmlMeta
             search = close + 1;
         }
     }
+
+    /// <summary>The markdown delimiter an inline element is written with, or null.</summary>
+    private static string? InlineMarker(string tag) => tag switch
+    {
+        "em" or "i" or "var" or "dfn" or "cite" => "*",
+        "strong" or "b" => "**",
+        "code" => "`",
+        "del" or "s" or "strike" => "~~",
+        "mark" or "ins" => "==",
+        _ => null,
+    };
 
     /// <summary>The `dir` attribute's value, or null when it is not one the spec defines.</summary>
     private static TextDirection? ParseTextDirection(string value) => value.Trim().ToLowerInvariant() switch
