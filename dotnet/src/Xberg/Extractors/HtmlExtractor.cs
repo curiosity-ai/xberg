@@ -26,9 +26,13 @@ public sealed class HtmlExtractor : IExtractor
     {
         string html = XmlPullReader.Decode(content);
 
-        var builder = new InternalDocumentBuilder("html");
-        new HtmlWalker(html, builder).Walk();
-        var doc = builder.Build();
+        // The document is built from the structure the markdown converter reports, not from a
+        // second walk: upstream's HTML extractor maps the converter's own document structure, and
+        // that is why a `<br>` reaches the output as a markdown hard break and a table cell
+        // carries its rendered markdown. The structure walker is kept for email and epub, which
+        // are the paths upstream uses it for.
+        string markdown = HtmlToMarkdown.ConvertWithStructure(html, out var structure);
+        var doc = MapStructure(structure, markdown);
 
         var htmlMeta = HtmlMeta.Extract(html);
         var metadata = new Metadata();
@@ -47,14 +51,91 @@ public sealed class HtmlExtractor : IExtractor
         // pipeline returns it verbatim (after GFM normalization).
         if (config.OutputFormat.Which == OutputFormat.Kind.Markdown)
         {
-            string md = HtmlToMarkdown.Convert(html);
             metadata.OutputFormat = "markdown";
-            doc.PreRenderedContent = HtmlToMarkdown.NormalizeHtmlMarkdown(md);
+            doc.PreRenderedContent = HtmlToMarkdown.NormalizeHtmlMarkdown(markdown);
         }
 
         doc.Metadata = metadata;
         doc.MimeType = mimeType;
         return doc;
+    }
+
+    /// <summary>
+    /// Build the document from the converter's structure, falling back to the whole markdown as
+    /// one paragraph when the structure came back empty — which is what upstream does for a page
+    /// with content but no recognised blocks.
+    /// </summary>
+    private static InternalDocument MapStructure(HtmlStructureCollector structure, string markdown)
+    {
+        var builder = new InternalDocumentBuilder("html");
+        var roots = new List<int>();
+        for (int i = 0; i < structure.Nodes.Count; i++)
+            if (structure.Nodes[i].Parent < 0) roots.Add(i);
+        WalkStructure(structure, roots, builder);
+        var doc = builder.Build();
+
+        if (doc.Elements.Count == 0 && markdown.Trim().Length > 0)
+        {
+            var fallback = new InternalDocumentBuilder("html");
+            fallback.PushParagraph(markdown.Trim(), new(), null, null);
+            return fallback.Build();
+        }
+        return doc;
+    }
+
+    private static void WalkStructure(HtmlStructureCollector s, List<int> indices, InternalDocumentBuilder b)
+    {
+        foreach (int idx in indices)
+        {
+            var node = s.Nodes[idx];
+            switch (node.Kind)
+            {
+                case StructureKind.Group:
+                    b.PushGroupStart(node.Label, null);
+                    WalkStructure(s, node.Children, b);
+                    b.PushGroupEnd();
+                    break;
+                case StructureKind.Heading:
+                    b.PushHeading(node.Level, node.Text, null, null);
+                    break;
+                case StructureKind.Paragraph:
+                    b.PushParagraph(node.Text, new(), null, null);
+                    break;
+                case StructureKind.List:
+                    b.PushList(node.Ordered);
+                    WalkStructure(s, node.Children, b);
+                    b.EndList();
+                    break;
+                case StructureKind.ListItem:
+                {
+                    bool ordered = node.Parent >= 0
+                        && s.Nodes[node.Parent] is { Kind: StructureKind.List, Ordered: true };
+                    b.PushListItem(node.Text, ordered, new(), null, null);
+                    WalkStructure(s, node.Children, b);
+                    break;
+                }
+                case StructureKind.Table:
+                    if (node.Cells is { Count: > 0 }) b.PushTableFromCells(node.Cells, null, null);
+                    break;
+                case StructureKind.Image:
+                {
+                    string text = node.Description ?? "";
+                    if (text.Length > 0 || node.Src is not null)
+                    {
+                        string display = node.Src is { } src
+                            ? (text.Length == 0 ? $"![]({src})" : $"![{text}]({src})")
+                            : text;
+                        b.PushParagraph(display, new(), null, null);
+                    }
+                    if (node.Src is { Length: > 0 } imageSrc)
+                        b.PushUri(new ExtractedUri { Url = imageSrc, Label = node.Description, Kind = UriKind.Image });
+                    break;
+                }
+                case StructureKind.Code:
+                    b.PushCode(node.Text, node.Language, null, null);
+                    break;
+            }
+        }
     }
 
     private static bool IsEmpty(HtmlMetadata m) =>

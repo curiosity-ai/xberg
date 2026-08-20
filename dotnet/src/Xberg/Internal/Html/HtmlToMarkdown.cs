@@ -14,7 +14,22 @@ namespace Xberg.Internal.Html;
 internal static class HtmlToMarkdown
 {
     // ── public entry ─────────────────────────────────────────────────────────
-    public static string Convert(string html)
+    public static string Convert(string html) => Convert(html, null);
+
+    /// <summary>
+    /// Convert to markdown, and report the document structure the conversion saw.
+    /// </summary>
+    /// <remarks>
+    /// The structure is collected during the same walk rather than derived from a second one, so
+    /// each node carries the markdown its block rendered to.
+    /// </remarks>
+    public static string ConvertWithStructure(string html, out HtmlStructureCollector structure)
+    {
+        structure = new HtmlStructureCollector();
+        return Convert(html, structure);
+    }
+
+    private static string Convert(string html, HtmlStructureCollector? structure)
     {
         html = html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
         var root = HtmlDom.Parse(html);
@@ -23,7 +38,7 @@ internal static class HtmlToMarkdown
         string front = ExtractFrontmatter(root);
         sb.Append(front);
 
-        var ctx = new Ctx();
+        var ctx = new Ctx { Structure = structure };
         foreach (var child in root.Children)
             WalkNode(child, sb, ctx);
 
@@ -62,6 +77,9 @@ internal static class HtmlToMarkdown
         // When set, every <img> handled reports its (alt, src) to this sink (mirrors the crate's
         // structure collector `push_image`), so images inside table cells become image nodes.
         public Action<string?, string>? ImageEmit { get; init; }
+        // When set, the block handlers report what they emit to this collector as they emit it,
+        // which is how a node's text comes to be the markdown that block produced.
+        public HtmlStructureCollector? Structure { get; init; }
     }
 
     // ── table grid emission (structure collector) ────────────────────────────
@@ -532,6 +550,9 @@ internal static class HtmlToMarkdown
         if (trimmed.Length == 0) return;
         string normalized = NormalizeHeadingText(trimmed);
         PushHeading(output, ctx, level, normalized);
+
+        // A heading in a table cell is part of the cell's content, not a heading of the document.
+        if (!ctx.InTableCell) ctx.Structure?.PushHeading((byte)level, normalized);
     }
 
     private static string NormalizeHeadingText(string text)
@@ -630,6 +651,9 @@ internal static class HtmlToMarkdown
         bool hasContent = output.Length > contentStart;
         if (hasContent && !ctx.ConvertAsInline && !ctx.InTableCell)
             output.Append("\n\n");
+
+        if (hasContent && !ctx.InTableCell && !ctx.InListItem && !ctx.ConvertAsInline)
+            ctx.Structure?.PushParagraph(output.ToString(contentStart, output.Length - contentStart).Trim());
     }
 
     private static bool IsEmptyInlineElement(HNode n) =>
@@ -1091,6 +1115,7 @@ internal static class HtmlToMarkdown
         // Structure-collector side effect: report every <img> so cell images become nodes
         // (the crate's push_image runs unconditionally, once per handler invocation).
         ctx.ImageEmit?.Invoke(alt.Length == 0 ? null : alt, src);
+        ctx.Structure?.PushImage(src, alt);
 
         bool shouldUseAltText = ctx.ConvertAsInline || ctx.InHeading;
         if (shouldUseAltText) { output.Append(alt); return; }
@@ -1203,6 +1228,8 @@ internal static class HtmlToMarkdown
         output.Append(processed.TrimEnd('\n'));
         output.Append('\n');
         output.Append("```").Append("\n\n");
+
+        ctx.Structure?.PushCode(processed, language);
     }
 
     private static string? ExtractLanguageFromPre(HNode node)
@@ -1302,6 +1329,8 @@ internal static class HtmlToMarkdown
             PrevItemHadBlocks = false,
         };
 
+        if (!ctx.InTableCell) ctx.Structure?.PushListStart(ordered);
+
         foreach (var child in node.Children)
         {
             if (child.Tag is null && !child.IsComment && child.Text.Trim().Length == 0) continue;
@@ -1309,6 +1338,8 @@ internal static class HtmlToMarkdown
             WalkNode(child, output, listCtx);
             if (ordered && child.Tag == "li") counter++;
         }
+
+        if (!ctx.InTableCell) ctx.Structure?.PushListEnd();
 
         AddNestedListTrailingSeparator(output, ctx);
     }
@@ -1384,12 +1415,14 @@ internal static class HtmlToMarkdown
 
         // task lists: find checkbox
         var checkbox = FindCheckbox(node);
+        int itemStart;
         if (checkbox is not null)
         {
             output.Append("- ").Append(checkbox.Value.check ? "[x]" : "[ ]");
             var taskText = new StringBuilder();
             RenderLiContentSkippingCheckbox(node, taskText, liCtx, checkbox.Value.node);
             output.Append(' ');
+            itemStart = output.Length;
             string trimmedTask = taskText.ToString().Trim();
             if (trimmedTask.Length > 0) output.Append(trimmedTask);
         }
@@ -1406,11 +1439,15 @@ internal static class HtmlToMarkdown
                 }
             }
 
+            itemStart = output.Length;
             foreach (var child in node.Children)
                 WalkNode(child, output, liCtx);
 
             TrimTrailingWhitespace(output);
         }
+
+        if (!ctx.InTableCell && itemStart <= output.Length)
+            ctx.Structure?.PushListItem(output.ToString(itemStart, output.Length - itemStart).Trim());
 
         if (!ctx.InTableCell)
         {
@@ -1676,6 +1713,7 @@ internal static class HtmlToMarkdown
             var grid = CollectGrid(node, ctx);
             ctx.TableEmit(grid);
         }
+        if (ctx.Structure is not null) ctx.Structure.PushTable(CollectGrid(node, ctx));
 
         if (ctx.InListItem)
         {
@@ -2395,6 +2433,14 @@ internal static class HtmlDom
                     }
                 }
                 continue;
+            }
+
+            // `<body>` closes an unterminated `<head>`. Without this the body nests inside the
+            // head, and head content is deliberately not content — the whole document is lost.
+            if (tag is "body")
+            {
+                for (int i = stack.Count - 1; i >= 1; i--)
+                    if (stack[i].Tag == "head") { stack.RemoveRange(i, stack.Count - i); break; }
             }
 
             // implied close of li/dt/dd (normalize_unclosed_list_items) and p-in-p leniency
