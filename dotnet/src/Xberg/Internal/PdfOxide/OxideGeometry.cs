@@ -79,14 +79,19 @@ public readonly struct OxRect
 /// <summary>
 /// The PDF transformation matrix <c>[a b 0; c d 0; e f 1]</c> (ISO 32000-1 §8.3.3).
 /// </summary>
-public readonly struct OxMatrix
+public readonly record struct OxMatrix
 {
-    public readonly float A, B, C, D, E, F;
+    public float A { get; init; }
+    public float B { get; init; }
+    public float C { get; init; }
+    public float D { get; init; }
+    public float E { get; init; }
+    public float F { get; init; }
 
     public OxMatrix(float a, float b, float c, float d, float e, float f)
     { A = a; B = b; C = c; D = d; E = e; F = f; }
 
-    public static readonly OxMatrix Identity = new(1, 0, 0, 1, 0, 0);
+    public static OxMatrix Identity => new(1, 0, 0, 1, 0, 0);
 
     public bool IsIdentity => A == 1.0f && B == 0.0f && C == 0.0f && D == 1.0f && E == 0.0f && F == 0.0f;
 
@@ -98,7 +103,12 @@ public readonly struct OxMatrix
     /// single width scale, so this is the <c>sqrt(|det|)</c> approximation rasterizers use
     /// (ISO 32000-1 §8.4.3.2) — exact for uniform scaling and rotation.
     /// </summary>
-    public float StrokeScale() => MathF.Sqrt(MathF.Abs(A * D - B * C));
+    public float StrokeScale() => MathF.Sqrt(MathF.Abs(Determinant));
+
+    public float Determinant => A * D - B * C;
+
+    /// <summary>A degenerate matrix collapses geometry to a line or a point.</summary>
+    public bool IsInvertible => MathF.Abs(Determinant) > float.Epsilon;
 
     /// <summary><c>this × other</c>, i.e. this transform applied first.</summary>
     public OxMatrix Multiply(in OxMatrix other) => new(
