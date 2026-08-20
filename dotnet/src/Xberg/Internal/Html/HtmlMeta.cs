@@ -29,7 +29,33 @@ public static class HtmlMeta
         var headingText = new StringBuilder();
         int headingDepthAtOpen = 0;
         string? headingId = null;
-        int inCell = 0;                   // open <td>/<th> nesting (headings in cells are reprocessed)
+        // html-to-markdown walks a table's subtree three times — once to build the grid, once to
+        // write the markdown, once for the structure — and the collector records what it sees on
+        // every pass. So a table's headings, links and images each appear three times over, in
+        // table order, not as three copies in a row. Collections inside a table are buffered and
+        // replayed when the outermost table closes; a nested table contributes to that same
+        // buffer once, since the repeat is of the whole table region rather than compounding per
+        // level of nesting.
+        int tableDepth = 0;
+        var tableHeaders = new List<object>();
+        var tableLinks = new List<object>();
+        var tableImages = new List<object>();
+        List<object> HeaderSink() => tableDepth > 0 ? tableHeaders : m.Headers;
+        List<object> LinkSink() => tableDepth > 0 ? tableLinks : m.Links;
+        List<object> ImageSink() => tableDepth > 0 ? tableImages : m.Images;
+
+        void CloseOutermostTable()
+        {
+            for (int pass = 0; pass < 3; pass++)
+            {
+                m.Headers.AddRange(tableHeaders);
+                m.Links.AddRange(tableLinks);
+                m.Images.AddRange(tableImages);
+            }
+            tableHeaders.Clear();
+            tableLinks.Clear();
+            tableImages.Clear();
+        }
         bool inAnchor = false;
         var anchorText = new StringBuilder();
         string anchorHref = "";
@@ -76,28 +102,19 @@ public static class HtmlMeta
                         }
                         continue;
                     }
-                    if (tag is "td" or "th") { if (inCell > 0) inCell--; }
+                    if (tag == "table" && tableDepth > 0 && --tableDepth == 0) CloseOutermostTable();
                     if (tag is "h1" or "h2" or "h3" or "h4" or "h5" or "h6" && captureHeading != 0)
                     {
                         string text = HtmlWalker.NormalizeWhitespace(headingText.ToString());
                         if (text.Length > 0)
-                        {
-                            // A heading inside a table cell is walked three times (grid + markdown +
-                            // structure passes) by html-to-markdown, each recording it at depth 0.
-                            if (inCell > 0)
-                                for (int r = 0; r < 3; r++)
-                                    m.Headers.Add(new Header
-                                    {
-                                        Level = captureHeading, Text = text, Id = headingId,
-                                        Depth = 0, HtmlOffset = 0,
-                                    });
-                            else
-                                m.Headers.Add(new Header
-                                {
-                                    Level = captureHeading, Text = text, Id = headingId,
-                                    Depth = headingDepthAtOpen, HtmlOffset = 0,
-                                });
-                        }
+                            HeaderSink().Add(new Header
+                            {
+                                Level = captureHeading, Text = text, Id = headingId,
+                                // A heading inside a table is recorded at depth 0 — the passes
+                                // that re-walk it have no enclosing tree to count.
+                                Depth = tableDepth > 0 ? 0 : headingDepthAtOpen,
+                                HtmlOffset = 0,
+                            });
                         captureHeading = 0;
                         headingId = null;
                     }
@@ -113,9 +130,7 @@ public static class HtmlMeta
                             Rel = anchorRel,
                             Attributes = anchorAttrs,
                         };
-                        // A link inside a table cell is walked three times, as a heading or an
-                        // image in a cell is.
-                        for (int r = 0; r < (inCell > 0 ? 3 : 1); r++) m.Links.Add(link);
+                        LinkSink().Add(link);
                         inAnchor = false;
                     }
                     else if (tag == "title" && inTitle)
@@ -187,8 +202,8 @@ public static class HtmlMeta
                     case "title":
                         inTitle = true; titleText.Clear();
                         break;
-                    case "td": case "th":
-                        if (!selfClose) inCell++;
+                    case "table":
+                        if (!selfClose) tableDepth++;
                         break;
                     case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
                         captureHeading = tag[1] - '0';
@@ -211,7 +226,7 @@ public static class HtmlMeta
                         // `?a=1&amp;b=2` stays that way — the collector reads the attribute, it
                         // does not resolve the URL.
                         string? src = HtmlWalker.ExtractAttr(attrsStr, "src");
-                        string? alt = ExtractAttrDecoded(attrsStr, "alt");
+                        string? alt = HtmlWalker.ExtractAttr(attrsStr, "alt");
                         var attrs = ParseAttrs(attrsStr, exclude: "src", out _);
                         // Dimensions are recorded only when the element states both, which is
                         // what makes them a size rather than half of one.
@@ -226,15 +241,12 @@ public static class HtmlMeta
                             // An empty `alt` is the absence of alt text, not alt text that is
                             // empty, and is recorded as absent.
                             Alt = alt is { Length: > 0 } ? alt : null,
-                            Title = ExtractAttrDecoded(attrsStr, "title"),
+                            Title = HtmlWalker.ExtractAttr(attrsStr, "title"),
                             Dimensions = dimensions,
                             ImageType = ClassifyImage(src ?? ""),
                             Attributes = attrs,
                         };
-                        // An image inside a table cell is walked three times (grid + markdown +
-                        // structure passes) by html-to-markdown, each recording it, the same way
-                        // a heading in a cell is.
-                        for (int r = 0; r < (inCell > 0 ? 3 : 1); r++) m.Images.Add(image);
+                        ImageSink().Add(image);
                         // A link wrapping an image carries the image markdown as its label text.
                         if (inAnchor) anchorText.Append("![").Append(alt ?? "").Append("](").Append(src ?? "").Append(')');
                         break;
@@ -279,6 +291,8 @@ public static class HtmlMeta
                 pos = lt;
             }
         }
+        // An unclosed table still had its subtree walked three times.
+        if (tableDepth > 0) CloseOutermostTable();
         return m;
     }
 
@@ -430,7 +444,8 @@ public static class HtmlMeta
                     value = attrs[vs..i];
                 }
             }
-            value = HtmlWalker.DecodeEntities(value);
+            // Attribute values are recorded as written. The collector reads the attribute; it
+            // does not resolve it, so `alt="\lambda&gt;0"` keeps its reference.
             if (key.Equals("rel", StringComparison.OrdinalIgnoreCase))
                 rel.AddRange(value.Split(' ', StringSplitOptions.RemoveEmptyEntries));
             if (!key.Equals(exclude, StringComparison.OrdinalIgnoreCase))
@@ -477,7 +492,11 @@ public static class HtmlMeta
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string? Title { get; set; }
 
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        /// <summary>
+        /// Always serialised, as null when the element states no size — the collector's own
+        /// field carries no skip, so a sizeless image still names the key.
+        /// </summary>
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
         public uint[]? Dimensions { get; set; }
 
         public string ImageType { get; set; } = "external";
