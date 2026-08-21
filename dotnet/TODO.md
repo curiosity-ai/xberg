@@ -10,11 +10,17 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2639 fixtures of 2942 (89.7%) match on every hard dimension**; **0 catastrophes**; 2
+> **2638 fixtures of 2942 (89.7%) match on every hard dimension**; **0 catastrophes**; 2
 > fixtures still lose content (eml, epub — both wanting the MathML converter). 1146 unit tests.
 > Measured on the whole corpus in one run, which is the only figure that means anything: a
 > per-format run validated the mime sniff on md and txt while it was quietly handing three PDFs
 > to the HTML extractor.
+>
+> Read the last digit with care. `PdfExtractor` enforces a per-document wall-clock deadline and
+> drops whole pages when it trips, so a loaded machine moves the total by one to three fixtures
+> between runs of identical code — two consecutive runs here gave 2639 and 2638, and PDF `ok`
+> 274 and 273, with nothing changed in between. Treat a single-fixture move as noise and measure
+> a real change on a quiet machine.
 >
 > The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
 > stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
