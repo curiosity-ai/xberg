@@ -10,9 +10,11 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **PENDING_TOTAL fixtures of 2942 (PENDING_PCT) match on every hard dimension**; **0
-> catastrophes**; 2 fixtures still lose content (eml, epub — both wanting the MathML
-> converter). PENDING_TESTS unit tests.
+> **2639 fixtures of 2942 (89.7%) match on every hard dimension**; **0 catastrophes**; 2
+> fixtures still lose content (eml, epub — both wanting the MathML converter). 1146 unit tests.
+> Measured on the whole corpus in one run, which is the only figure that means anything: a
+> per-format run validated the mime sniff on md and txt while it was quietly handing three PDFs
+> to the HTML extractor.
 >
 > The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
 > stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
@@ -510,6 +512,13 @@ not a cosmetic difference.
 PDF was where the remaining distance was: 106 of 389 fixtures matched on every hard dimension,
 and the shortfall was not one bug but three layers. **Two of the three are now closed.**
 
+Where it stands after the segment and paragraph work: **274 of 389 fully matching**, plain
+356/388, md 217/388, html 208/388, json 315/388, metadata 382/388, tables 319/388, catastrophes
+0. The two rules that moved it furthest were both cases of the port having implemented the wrong
+function rather than implementing one badly — hierarchy segments built per line where upstream
+builds them per span, and `classify_paragraphs` where the untagged path calls
+`finalize_paragraph`.
+
 - [x] **Span assembly (plain 123 → 172 of 388).** The single biggest cause, and the reason the
       other two were hard to see past. pdf_oxide's text layer merges glyph runs into spans on its
       own thresholds, and every downstream rule — spacing, reading order, paragraph breaks, table
@@ -528,6 +537,17 @@ and the shortfall was not one bug but three layers. **Two of the three are now c
 - [x] **Font programs other than Type 1.** `cff_encoding.rs` is ported, so a CFF subset font's
       own encoding — and the ligature slots in it — are read from `/FontFile3` rather than
       guessed at.
+
+**The native table tier is a fraction of upstream's.** `pdf_oxide`'s
+`structure/spatial_table_detector.rs` carries 73 production functions; this port has 23 of them,
+all on the intersection path. Absent entirely: the whole text-edge strategy
+(`detect_tables_from_spans`, `_column_aware`, `detect_tables_hybrid`, `detect_text_edge_columns`),
+h-rule-bounded detection (`detect_tables_from_horizontal_rules`), and the entire validation layer
+— `validate_table_structure_internal`, `passes_spatial_quality_gate`, `is_regular_lattice`,
+`has_split_modal_column_groups`, `looks_like_prose_paragraph`, `looks_like_bulleted_list`,
+`looks_like_cjk_prose`, `trim_empty_columns`, `filter_columns_by_row_coverage` — plus
+`detect_merged_cells`, `detect_header_row`, and `consolidate_adjacent_table_fragments`. The
+heuristic tier compensates for some of this, which is why the gap is not larger than it is.
 
 **What the PDF port still owes.** The ruling-line tiers read their drawn paths from the older
 content interpreter, which is why both span producers still run per page; the paths belong in
