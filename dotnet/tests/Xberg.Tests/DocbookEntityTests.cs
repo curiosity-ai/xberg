@@ -51,4 +51,26 @@ public class DocbookEntityTests
     {
         Assert.Equal("a b", Plain(Doc("a&nbsp;b")));
     }
+
+    /// <summary>
+    /// The variablelist flag has to clear at the closing tag: a later itemizedlist's listitem
+    /// otherwise takes the definition branch and every bullet gains a blank line before it.
+    /// </summary>
+    [Fact]
+    public void AListAfterAVariableListIsStillAList()
+    {
+        var doc = new DocbookExtractor().Extract(
+            System.Text.Encoding.UTF8.GetBytes(
+                "<article xmlns=\"http://docbook.org/ns/docbook\">" +
+                "<variablelist><varlistentry><term>apple</term>" +
+                "<listitem><para>red fruit</para></listitem></varlistentry></variablelist>" +
+                "<itemizedlist><listitem><para>first</para></listitem>" +
+                "<listitem><para>second</para></listitem></itemizedlist></article>"),
+            "application/docbook+xml", new ExtractionConfig());
+
+        var kinds = doc.Elements.Select(e => e.Kind.Tag).ToList();
+        Assert.Contains(Xberg.Types.ElementKindTag.DefinitionTerm, kinds);
+        Assert.Equal(2, kinds.Count(k => k == Xberg.Types.ElementKindTag.ListItem));
+        Assert.DoesNotContain(Xberg.Types.ElementKindTag.DefinitionDescription, kinds.Skip(kinds.IndexOf(Xberg.Types.ElementKindTag.ListItem)));
+    }
 }

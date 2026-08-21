@@ -221,6 +221,8 @@ public sealed class DocbookExtractor : IExtractor
                         if (sectionDepth > 0) sectionDepth--; break;
                     case "itemizedlist": case "orderedlist":
                         if (inList) { builder.EndList(); inList = false; } break;
+                    case "variablelist":
+                        inVariablelist = false; break;
                     case "table": case "informaltable":
                         if (inTable) { if (currentTable.Count > 0) { builder.PushTableFromCells(currentTable, null, null); currentTable.Clear(); } inTable = false; } break;
                     case "tgroup": if (inTgroup) inTgroup = false; break;
