@@ -211,6 +211,42 @@ file cannot hang extraction, and upstream simply has no deadline to match.
 - `email-replace-mime-encodings-error-5.eml` — malformed MIME with no closed boundary.
 - `fake-email-multiple-attachments.msg` — PDF text quality inside an attachment.
 
+### The goldens are frozen at 2026-08-12, and cannot be regenerated here
+
+This bounds every claim in this file, so read it before concluding anything about a failing
+fixture.
+
+`dotnet/tools/xberg-reference-gen/target/release/xberg-reference-gen` is dated **2026-08-12
+16:44**, every golden is stamped 16:45, and **79 files under `crates/xberg/src` are newer than
+the binary**. It cannot be rebuilt in this container: `cargo build --release --offline` fails
+with `no matching package named 'mathemascii' found`, which is not vendored. So the goldens
+record what upstream did on 12 August, not what its source says today.
+
+That makes one obvious-looking test worthless. Running the existing binary over a fixture and
+finding it reproduces the committed golden byte for byte proves only that the August binary still
+agrees with itself — it says nothing about whether current source would agree. This was used
+here to argue a golden was current, and the argument does not hold.
+
+A worked example of the difference it makes. `epub/features.epub` renders U+23DE/U+23DF as
+`\overbrace`/`\underbrace` in this port, where the golden keeps them literal inside
+`\overset`/`\underset`. Both sides' `over_script_command` map U+23DE to `\overbrace`
+identically, and the EPUB path reaches the same converter, so the port and *current* upstream
+agree — but commit `ec94d8c0bd` (16 August, "populate formulas for every format") postdates the
+golden. This is a third category: neither a port bug nor an upstream defect, but a golden the
+current source would not reproduce. It cannot be settled here.
+
+The same bound applies to the seven HTML fixtures. Their goldens are `html-to-markdown-rs`
+**3.10.6** output — the only version vendored — while the lock records 3.11.2. Porting against
+3.10.6 is what took html to 41/41, and that is correct *while these goldens stand*; 3.11.0 added
+a `"template" | "noscript" => {}` dispatch arm that 3.10.6 lacks, so a regenerated corpus would
+need those arms re-ported in the other direction.
+
+**To settle any of this**, restore network access, `cargo update`/vendor `mathemascii`, rebuild
+the generator, regenerate, and re-measure. Expect the generator to abort partway: it panics in
+`mathemascii-0.4.0/src/scanner.rs:48` on a char boundary inside `≤` via the asciidoc extractor,
+and a full run also creates ~222 goldens for fixtures the extractors fail on, which changes the
+denominator. Back up `*-results-rust.json` first.
+
 ### Genuine upstream defects — 6 fixtures, safe to ignore
 
 Each is traced to a specific line, not assumed.
