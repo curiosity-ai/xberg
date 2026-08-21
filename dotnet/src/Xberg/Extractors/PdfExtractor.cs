@@ -225,18 +225,27 @@ public sealed class PdfExtractor : IExtractor
                     var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
                     double pageWidth = Math.Abs(mbUrx - mbLlx);
                     List<PdfPageText.LineSeg> lines;
+                    List<Xberg.Internal.PdfOxide.OxTextSpan>? structureSpans = null;
+                    float structurePageWidth = 0f, structurePageHeight = 0f;
                     if (UsePortedSpans)
                     {
                         // The ported pipeline's own assembler consumes the ported spans directly:
                         // they already arrive column-aware ordered, deduplicated and merged, which
                         // is exactly the shape upstream's `assemble_page_text` receives.
-                        var oxSpans = Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPageText(pdf, i).Spans;
+                        var oxPage = Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPageText(pdf, i);
+                        var oxSpans = oxPage.Spans;
                         var assembly = Xberg.Internal.PdfOxide.Text.OxPageAssembler.Assemble(
                             oxSpans, (float)pageWidth);
                         pageText = assembly.Text;
                         lines = PdfPageText.LineSegsFromOx(assembly.Lines);
                         // Bridged AFTER assembly, so the word grid sees the column repairs' order.
                         spans = OxSpanBridge.ToPdfSpans(oxSpans);
+                        // The structure pipeline runs its own span pipeline over the same page —
+                        // see PdfOxideSegments — so it keeps the spans whole rather than the
+                        // assembler's lines.
+                        structureSpans = oxSpans;
+                        structurePageWidth = oxPage.PageWidth;
+                        structurePageHeight = oxPage.PageHeight;
                     }
                     else
                     {
@@ -245,7 +254,9 @@ public sealed class PdfExtractor : IExtractor
                     // The older interpreter still runs either way: its `Paths` are what the
                     // ruling-line table tiers read, and nothing in the ported pipeline collects
                     // those yet.
-                    segs = PdfStructure.SegmentsFromLines(lines);
+                    segs = structureSpans is not null
+                        ? PdfOxideSegments.FromPage(structureSpans, structurePageWidth, structurePageHeight)
+                        : PdfStructure.SegmentsFromLines(lines);
                     words = PdfSpatialTables.SpansToWords(spans);
                     paths = extractor.Paths;
                 }

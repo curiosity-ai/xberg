@@ -83,6 +83,29 @@ public static class PdfStructure
     /// <summary>Font tolerance for the repeated-peer-tier test.</summary>
     private const float SPARSE_PEER_HEADING_FONT_TOLERANCE = 0.5f;
     private const int MAX_BOLD_HEADING_WORD_COUNT = 12;
+
+    /// <summary>Longest a run may be and still be read as a page number (Rust
+    /// <c>MAX_PAGE_NUMBER_WORD_COUNT</c>).</summary>
+    private const int MAX_PAGE_NUMBER_WORD_COUNT = 10;
+
+    /// <summary>Points either side of a baseline that still count as the same visual line
+    /// (Rust <c>INLINE_STYLE_BASELINE_TOLERANCE</c>).</summary>
+    private const float INLINE_STYLE_BASELINE_TOLERANCE = 0.5f;
+
+    /// <summary>Forward gap, as a multiple of the font size, that an inline style run may open
+    /// before it reads as a separate block (Rust <c>INLINE_STYLE_MAX_FORWARD_GAP_FONT_FACTOR</c>).</summary>
+    private const float INLINE_STYLE_MAX_FORWARD_GAP_FONT_FACTOR = 1.0f;
+
+    /// <summary>Overlap the same way: font metrics let adjacent runs overlap slightly
+    /// (Rust <c>INLINE_STYLE_MAX_OVERLAP_FONT_FACTOR</c>).</summary>
+    private const float INLINE_STYLE_MAX_OVERLAP_FONT_FACTOR = 0.15f;
+
+    /// <summary>Minimum horizontal gap between two same-line segments, as a fraction of the
+    /// trailing segment's font size, that reads as a word space rather than a kerning-run split
+    /// of one word. Matches pdf_oxide's own span-joining convention; zero and negative gaps stay
+    /// joined (Rust <c>SEGMENT_GAP_SPACE_RATIO</c>).</summary>
+    private const float SEGMENT_GAP_SPACE_RATIO = 0.15f;
+
     private const float PARAGRAPH_GAP_HEIGHT_FACTOR = 1.5f;
 
     /// <summary>
@@ -181,7 +204,9 @@ public static class PdfStructure
             // neighbouring segments — a trailing soft hyphen or control character left in place
             // would be read as ordinary text and change the decision.
             ApplyToAllSegments(paras, PdfTextRepair.RepairSegment);
+            SynchronizeParagraphTextMetadata(paras);
             MergeContinuationParagraphs(paras);
+            SynchronizeParagraphTextMetadata(paras);
             RetainPageFurnitureSafely(paras);
             allPageParagraphs.Add(paras);
         }
@@ -196,6 +221,9 @@ public static class PdfStructure
         MarkCrossPageRepeatingShortText(allPageParagraphs);
         MarkArxivNoise(allPageParagraphs);
         if (outlineEntries is { Count: > 0 }) RecoverHeadingsFromOutline(allPageParagraphs, outlineEntries);
+        // After heading recovery, so recovered headings are excluded, and immediately before the
+        // deletion pass it feeds.
+        MarkValidatedPageNumbers(allPageParagraphs, pageHeights);
         foreach (var page in allPageParagraphs) RetainPageFurnitureSafely(page);
         DeduplicateParagraphs(allPageParagraphs);
         CompactFinalHeadingHierarchy(allPageParagraphs);
@@ -242,7 +270,12 @@ public static class PdfStructure
         return DedupeRedrawnSegments(segs);
     }
 
-    private static List<SegmentData> DedupeRedrawnSegments(List<SegmentData> segments)
+    /// <summary>
+    /// Collapse re-drawn runs: identical text at overlapping positions. A PDF fakes bold by
+    /// drawing the same run twice at a small offset, so the survivor absorbs its duplicates'
+    /// bold and italic signal — the double draw <em>is</em> the boldness cue.
+    /// </summary>
+    internal static List<SegmentData> DedupeRedrawnSegments(List<SegmentData> segments)
     {
         var kept = new List<SegmentData>(segments.Count);
         foreach (var seg in segments)
@@ -275,14 +308,22 @@ public static class PdfStructure
 
     private sealed class FontSizeCluster { public float Centroid; public List<int> MemberTextLens = new(); }
 
+    /// <summary>One block of the font-size clustering input: a segment's size and the byte
+    /// length of its text, which is what decides which cluster is the body (Rust
+    /// <c>TextBlock</c>, of which clustering only ever reads <c>font_size</c> and
+    /// <c>text.len()</c>).</summary>
+    private readonly record struct FontBlock(float FontSize, int TextLen);
+
     private static List<(float centroid, byte? level)> BuildHeadingMap(List<List<SegmentData>> allPageSegments, int kClusters)
     {
-        // Collect font sizes (blocks) from all non-empty segments; text is not needed
-        // for the heuristic path (text len==0 for all → body = smallest cluster).
-        var blockFonts = new List<float>();
+        // Each non-empty segment is one block. The text length travels with it because
+        // `AssignHeadingLevelsSmart` picks the body cluster by character mass: drop it and every
+        // cluster ties at zero, the tie falls to the smallest font, and every larger run in the
+        // document is promoted to a heading (Rust `build_heading_map`, `~keep` comment).
+        var blockFonts = new List<FontBlock>();
         foreach (var page in allPageSegments)
             foreach (var seg in page)
-                if (!string.IsNullOrWhiteSpace(seg.Text)) blockFonts.Add(seg.FontSize);
+                if (!string.IsNullOrWhiteSpace(seg.Text)) blockFonts.Add(new FontBlock(seg.FontSize, Utf8Len(seg.Text)));
 
         if (blockFonts.Count == 0) return new();
 
@@ -322,7 +363,7 @@ public static class PdfStructure
                 if (!string.IsNullOrWhiteSpace(s.Text)) { firstSegFont = s.FontSize; break; }
             if (firstSegFont.HasValue)
             {
-                var sizes = blockFonts.OrderBy(f => f).ToList();
+                var sizes = blockFonts.Select(b => b.FontSize).OrderBy(f => f).ToList();
                 float median = sizes.Count == 0 ? 0f : sizes[sizes.Count / 2];
                 if (median > 0f && firstSegFont.Value >= median * 1.2f)
                 {
@@ -347,7 +388,7 @@ public static class PdfStructure
     /// structure-tree path, so every page is a heuristic page.
     /// </remarks>
     private static List<(float centroid, byte? level)>? SparseMultiPageHeadingMap(
-        List<List<SegmentData>> allPageSegments, List<float> blockFonts)
+        List<List<SegmentData>> allPageSegments, List<FontBlock> blockFonts)
     {
         if (allPageSegments.Count < SPARSE_REPEATED_TIER_MIN_PAGES) return null;
 
@@ -356,9 +397,9 @@ public static class PdfStructure
 
         // Two tiers only: any block that sits between them means the sizes are a spread rather
         // than a heading/body split, and the repetition argument no longer holds.
-        bool twoNarrowTiers = blockFonts.All(f =>
-            !float.IsNaN(f) && !float.IsInfinity(f)
-            && clusters.Any(c => Math.Abs(f - c.Centroid) <= SPARSE_FONT_TIER_TOLERANCE));
+        bool twoNarrowTiers = blockFonts.All(b =>
+            !float.IsNaN(b.FontSize) && !float.IsInfinity(b.FontSize)
+            && clusters.Any(c => Math.Abs(b.FontSize - c.Centroid) <= SPARSE_FONT_TIER_TOLERANCE));
         if (!twoNarrowTiers) return null;
 
         float headingFont = clusters[0].Centroid;
@@ -386,13 +427,13 @@ public static class PdfStructure
             .ToList();
     }
 
-    private static List<FontSizeCluster> ClusterFontSizes(List<float> blockFonts, int k)
+    private static List<FontSizeCluster> ClusterFontSizes(List<FontBlock> blockFonts, int k)
     {
         if (blockFonts.Count == 0) return new();
         if (k == 0) return new();
         int actualK = Math.Min(k, blockFonts.Count);
 
-        var fontSizes = blockFonts.Where(f => !float.IsNaN(f) && !float.IsInfinity(f)).ToList();
+        var fontSizes = blockFonts.Select(b => b.FontSize).Where(f => !float.IsNaN(f) && !float.IsInfinity(f)).ToList();
         fontSizes.Sort((a, b) => b.CompareTo(a)); // descending
         // dedup within 0.05
         var deduped = new List<float>();
@@ -424,7 +465,7 @@ public static class PdfStructure
             centroids.Sort((a, b) => b.CompareTo(a));
         }
 
-        var allFonts = blockFonts;
+        var allFonts = blockFonts.Select(b => b.FontSize).ToList();
         var prevAssign = new int[allFonts.Count];
         bool firstIter = true;
 
@@ -469,18 +510,19 @@ public static class PdfStructure
             if (converged) break;
         }
 
-        // Final assignment: count members per centroid (text len 0, so just membership counts).
+        // Final assignment: each block joins its nearest centroid and brings its text length,
+        // which is the mass `AssignHeadingLevelsSmart` weighs to find the body cluster.
         var memberLens = new List<int>[centroids.Count];
         for (int i = 0; i < centroids.Count; i++) memberLens[i] = new List<int>();
-        foreach (var f in blockFonts)
+        foreach (var b in blockFonts)
         {
             float minDist = float.PositiveInfinity; int best = 0;
             for (int i = 0; i < centroids.Count; i++)
             {
-                float d = Math.Abs(f - centroids[i]);
+                float d = Math.Abs(b.FontSize - centroids[i]);
                 if (d < minDist) { minDist = d; best = i; }
             }
-            memberLens[best].Add(0);
+            memberLens[best].Add(b.TextLen);
         }
 
         var result = new List<FontSizeCluster>();
@@ -497,7 +539,9 @@ public static class PdfStructure
         if (clusters.Count == 0) return new();
         if (clusters.Count == 1) return new() { (clusters[0].Centroid, (byte?)null) };
 
-        // body = cluster with most text content; text len==0 for all → max_by_key returns LAST of equal maxima.
+        // Body is the cluster carrying the most characters, not the smallest font: a document
+        // whose captions outnumber its prose still has the prose as body. Rust's `max_by_key`
+        // keeps the LAST of equal maxima, so the `>=` here is deliberate.
         int bodyIdx = 0; long bestSum = -1;
         for (int i = 0; i < clusters.Count; i++)
         {
@@ -601,6 +645,7 @@ public static class PdfStructure
 
         var paragraphs = new List<PdfParagraph>();
         var current = new List<SegmentData>();
+        bool currentIsSingleVisualLine = true;
 
         for (int lineIdx = 0; lineIdx < lines.Count; lineIdx++)
         {
@@ -611,12 +656,23 @@ public static class PdfStructure
             {
                 var prev = current[^1];
                 bool fontChange = Math.Abs(line.FontSize - prev.FontSize) > 1.5f;
-                bool boldChange = line.IsBold != prev.IsBold;
-                bool startsNewLine = Math.Abs(line.BaselineY - prev.BaselineY) > 0.5f;
+                // A change of weight only ends the paragraph when it is not an inline run
+                // continuing the same visual line — a bold lead-in and the prose after it are one
+                // paragraph with two styled runs, not two paragraphs.
+                bool boldChange = line.IsBold != prev.IsBold
+                    && !IsInlineStyleTransition(currentIsSingleVisualLine, prev, line);
+                bool startsNewLine = Math.Abs(line.BaselineY - prev.BaselineY) > INLINE_STYLE_BASELINE_TOLERANCE;
                 bool hasSameLineFollower = lineIdx + 1 < lines.Count &&
-                    Math.Abs(lines[lineIdx + 1].BaselineY - line.BaselineY) <= 0.5f;
-                bool isList = LooksLikeListItem(line.Text) ||
-                    (startsNewLine && hasSameLineFollower && IsBareListMarker(line.Text));
+                    Math.Abs(lines[lineIdx + 1].BaselineY - line.BaselineY) <= INLINE_STYLE_BASELINE_TOLERANCE;
+                bool isList = startsNewLine
+                    && (LooksLikeListItem(line.Text) || (hasSameLineFollower && IsBareListMarker(line.Text)));
+                // A numbered section heading always begins a new element. Without this term a run
+                // of same-size, same-weight, evenly-spaced headings gives the grouper no boundary
+                // at all — `LooksLikeListItem` deliberately declines numbered section headings —
+                // and the whole run collapses into one paragraph. The tighter
+                // `IsNumberedSectionHeading` is used so prose opening on a bare year does not
+                // break its own paragraph.
+                bool startsSection = startsNewLine && IsNumberedSectionHeading(line.Text);
                 bool crossedGap = false;
                 foreach (var gapY in gapYs)
                 {
@@ -625,7 +681,7 @@ public static class PdfStructure
                     else { upper = line.BaselineY; lower = prev.BaselineY; }
                     if (gapY < upper && gapY > lower) { crossedGap = true; break; }
                 }
-                shouldBreak = fontChange || boldChange || isList || crossedGap;
+                shouldBreak = fontChange || boldChange || isList || startsSection || crossedGap;
             }
 
             if (shouldBreak && current.Count > 0)
@@ -633,7 +689,11 @@ public static class PdfStructure
                 var para = FinalizeParagraph(current, headingMap, avgGap);
                 if (para != null) paragraphs.Add(para);
                 current = new List<SegmentData>();
+                currentIsSingleVisualLine = true;
             }
+            if (current.Count > 0)
+                currentIsSingleVisualLine &=
+                    Math.Abs(line.BaselineY - current[0].BaselineY) <= INLINE_STYLE_BASELINE_TOLERANCE;
             current.Add(line);
         }
         if (current.Count > 0)
@@ -642,6 +702,36 @@ public static class PdfStructure
             if (para != null) paragraphs.Add(para);
         }
         return paragraphs;
+    }
+
+    /// <summary>
+    /// Whether a change of weight or slant is an inline run continuing the same visual line
+    /// rather than a structural boundary (Rust <c>is_inline_style_transition</c>).
+    /// </summary>
+    /// <remarks>
+    /// PDF glyph runs can overlap slightly through font metrics, so a small negative advance gap
+    /// still reads as adjacency. A larger overlap, a run that starts to the left of the one
+    /// before it, or a wide forward gap all remain boundaries.
+    /// </remarks>
+    private static bool IsInlineStyleTransition(bool currentIsSingleVisualLine, SegmentData previous, SegmentData next)
+    {
+        if (!currentIsSingleVisualLine || previous.IsMonospace || next.IsMonospace) return false;
+        if (!float.IsFinite(previous.FontSize) || !float.IsFinite(next.FontSize)
+            || previous.FontSize <= 0f || next.FontSize <= 0f
+            || !float.IsFinite(previous.BaselineY) || !float.IsFinite(next.BaselineY)
+            || !float.IsFinite(previous.X) || !float.IsFinite(next.X)
+            || !float.IsFinite(previous.Width) || !float.IsFinite(next.Width)
+            || previous.Width < 0f || next.Width < 0f)
+            return false;
+        if (Math.Abs(next.BaselineY - previous.BaselineY) > INLINE_STYLE_BASELINE_TOLERANCE) return false;
+
+        float fontSize = Math.Max(previous.FontSize, next.FontSize);
+        float previousStart = previous.X, previousEnd = previous.X + previous.Width;
+        float nextStart = next.X;
+        float advanceGap = nextStart - previousEnd;
+        return nextStart >= previousStart
+            && advanceGap >= -(fontSize * INLINE_STYLE_MAX_OVERLAP_FONT_FACTOR)
+            && advanceGap <= fontSize * INLINE_STYLE_MAX_FORWARD_GAP_FONT_FACTOR;
     }
 
     private static float PrecomputeAvgGap(List<(float centroid, byte? level)> headingMap)
@@ -721,54 +811,76 @@ public static class PdfStructure
         var first = lines[0];
         int wordCount = WordCount(trimmed);
         bool isBold = lines.Count(l => l.IsBold) > lines.Count / 2;
-        bool isItalic = lines.Count > 0 && lines.All(l => l.IsItalic);
         var reconstructed = ReconstructPdfLines(lines);
         float bodyFont = BodyFontSize(headingMap);
-        bool looksListItem = LooksLikeListItem(trimmed);
 
-        bool pageNumberLike = wordCount <= 10 && IsPageNumberPattern(trimmed);
+        // A bare marker on its own line followed, at the same baseline, by the item's body is
+        // one list item split across two segments — the marker alone never reads as a list.
+        bool startsWithSplitListMarker = lines.Count > 1
+            && IsBareListMarker(first.Text)
+            && Math.Abs(lines[1].BaselineY - first.BaselineY) <= INLINE_STYLE_BASELINE_TOLERANCE
+            && lines[1].Text.Trim().Length != 0;
+        bool isListCandidate = LooksLikeListItem(trimmed) || startsWithSplitListMarker;
+
+        // Shape-only page-number test. It is used here purely to *suppress* heading
+        // promotion, which is non-destructive.
+        bool pageNumberLike = wordCount <= MAX_PAGE_NUMBER_WORD_COUNT
+            && PdfPageNumber.ClassifyPageNumberText(trimmed) is not null;
 
         // Pass 1: font-size heading.
         byte? headingLevel = FindHeadingLevel(first.FontSize, headingMap, avgGap);
         if (headingLevel.HasValue
-            && (wordCount > MAX_HEADING_WORD_COUNT || IsSeparatorText(trimmed) || LooksLikeBareUrl(trimmed)
-                || pageNumberLike))
+            && (wordCount > MAX_HEADING_WORD_COUNT || IsSeparatorText(trimmed) || pageNumberLike))
             headingLevel = null;
 
-        // Pass 2: a bold or italic run short enough to be a heading, at whatever level its
-        // size implies. A line that ends a sentence, labels a figure, or is a bare URL is
-        // emphasis inside the prose, not a section head.
-        if (headingLevel is null && (isBold || isItalic) && !looksListItem
-            && wordCount <= MAX_BOLD_HEADING_WORD_COUNT)
+        // A bold, short, single-line paragraph is only a heading candidate when its font is
+        // also meaningfully larger than the document's body font — the same ratio/gap the
+        // font-size clustering path already requires. Without this check any bold one-word
+        // line, including body-sized emphasis, gets promoted regardless of scale.
+        bool clearsBoldFontGate = bodyFont > 0f
+            && first.FontSize >= bodyFont * MIN_HEADING_FONT_RATIO
+            && first.FontSize >= bodyFont + MIN_HEADING_FONT_GAP;
+
+        // Pass 2: a bold, oversized, single-line run of a few words. Always H2 — a bold run is
+        // evidence of a section head, never of a document title.
+        if (headingLevel is null
+            && isBold
+            && clearsBoldFontGate
+            && wordCount >= 1 && wordCount <= 8
+            && lines.Count == 1
+            && !trimmed.EndsWith('.') && !trimmed.EndsWith(':')
+            && !trimmed.EndsWith(',') && !trimmed.EndsWith(';')
+            && !trimmed.Contains('@') && !trimmed.Contains('(') && !trimmed.Contains(',')
+            && (char.IsUpper(trimmed[0]) || char.IsAsciiDigit(trimmed[0]))
+            && !IsSeparatorText(trimmed)
+            && !LooksLikeFigureLabel(trimmed))
+            headingLevel = 2;
+
+        // Pass 3: an oversized run that also reads as a section marker — numbered, all-caps,
+        // or one of the structural words a document divides itself with.
+        if (headingLevel is null)
         {
-            bool italicOk = !(isItalic && !isBold)
-                || (!trimmed.Contains('@') && !trimmed.Contains(',') && char.IsUpper(trimmed[0]));
-            // Two words at body size are a lead-in, not a section: the size says nothing and
-            // the length says less.
-            bool tooShortAtBody = wordCount <= 2 && bodyFont > 0f && first.FontSize <= bodyFont + 0.5f;
-            bool periodOk = !EndsWithSentencePeriod(trimmed) || IsSectionPattern(trimmed);
-            bool colonOk = !trimmed.EndsWith(':') || IsAllCapsText(trimmed);
-            if (italicOk && !tooShortAtBody && periodOk && colonOk
-                && !LooksLikeFigureLabel(trimmed) && !LooksLikeBareUrl(trimmed) && !IsSeparatorText(trimmed))
-                headingLevel = InferBoldHeadingLevel(first.FontSize, bodyFont, trimmed);
+            float minHeadingThreshold = bodyFont * MIN_HEADING_FONT_RATIO;
+            if (bodyFont > 0f
+                && first.FontSize >= minHeadingThreshold
+                && first.FontSize > bodyFont + 0.5f
+                && wordCount <= MAX_BOLD_HEADING_WORD_COUNT
+                && lines.Count <= 2
+                && !trimmed.EndsWith(':')
+                && !trimmed.Contains('@')
+                && (IsSectionPattern(trimmed) || IsStructuralHeadingWord(trimmed))
+                && !IsSeparatorText(trimmed)
+                && !LooksLikeFigureLabel(trimmed)
+                && !isListCandidate
+                && !pageNumberLike)
+                headingLevel = 2;
         }
 
-        bool isCodeBlockCandidate = lines.All(l => l.IsMonospace) && lines.Count >= 2;
-
-        // Pass 3: a numbered section head, whatever its weight, as long as it is not set
-        // below the body text.
-        if (headingLevel is null && !looksListItem && !isCodeBlockCandidate
-            && wordCount >= 2 && wordCount <= MAX_HEADING_WORD_COUNT
-            && StartsWithSectionNumber(trimmed) && !trimmed.EndsWith(':')
-            && !LooksLikeFigureLabel(trimmed) && !IsSeparatorText(trimmed)
-            && (bodyFont <= 0f || first.FontSize >= bodyFont - 0.5f))
-            headingLevel = InferSectionLevel(trimmed);
-
-        if (isCodeBlockCandidate) headingLevel = null;
-
-        bool isListItem = headingLevel is null && looksListItem;
+        bool isListItem = headingLevel is null && isListCandidate;
         bool isCodeBlock = headingLevel is null && !isListItem && lines.All(l => l.IsMonospace) && lines.Count >= 2;
-        bool isPageFurniture = headingLevel is null && !isListItem && !isCodeBlock && wordCount <= 10 && IsPageNumberPattern(trimmed);
+        // Page-number furniture is decided document-wide by MarkValidatedPageNumbers, which
+        // needs every page in hand: shape alone matches table cells, list markers and footnote
+        // references, and furniture under 80 alphanumeric characters is physically deleted.
 
         int finalWc = ComputeWordCount(trimmed, reconstructed);
         float l0 = lines.Min(l => l.X);
@@ -786,7 +898,7 @@ public static class PdfStructure
             IsListItem = isListItem,
             IsCodeBlock = isCodeBlock,
             IsFormula = false,
-            IsPageFurniture = isPageFurniture,
+            IsPageFurniture = false,
             BlockBbox = (l0, b0, r0, t0),
             WordCount = finalWc,
         };
@@ -823,6 +935,26 @@ public static class PdfStructure
             // The cached paragraph text was assembled from the segments; once they move it is
             // stale, and every reader falls back to rejoining the segments.
             if (changed) para.Text = "";
+        }
+    }
+
+    /// <summary>
+    /// Drop the cached paragraph text and refresh the metadata derived from it.
+    /// </summary>
+    /// <remarks>
+    /// Assembly derives both the emitted text and the inline annotation byte ranges from the
+    /// segments whenever <c>Text</c> is empty, so an empty cache is what keeps repaired segment
+    /// text from diverging from the stale pre-repair string — and it is also what gives a
+    /// paragraph its per-run bold and italic spans instead of one annotation over the whole
+    /// block. Ports Rust <c>synchronize_paragraph_text_metadata</c>, which the heuristic path
+    /// runs after every segment mutation, leaving <c>text</c> empty for the whole pipeline.
+    /// </remarks>
+    private static void SynchronizeParagraphTextMetadata(List<PdfParagraph> paragraphs)
+    {
+        foreach (var para in paragraphs)
+        {
+            para.Text = "";
+            para.WordCount = ComputeWordCount("", para.Lines);
         }
     }
 
@@ -934,7 +1066,158 @@ public static class PdfStructure
             foreach (var p in paragraphs) p.IsPageFurniture = false;
             return;
         }
-        paragraphs.RemoveAll(p => p.IsPageFurniture);
+
+        // A page whose "furniture" carries a third of its characters is not a page with
+        // furniture on it — the classifier is wrong about something, and deleting on that
+        // reading would take real content with it. Stand down entirely.
+        long totalAlphanum = paragraphs.Sum(p => (long)ParagraphAlphanumLen(p));
+        if (totalAlphanum > 0)
+        {
+            long furnitureAlphanum = paragraphs.Where(p => p.IsPageFurniture).Sum(p => (long)ParagraphAlphanumLen(p));
+            if (furnitureAlphanum * 100 > totalAlphanum * 30)
+            {
+                foreach (var p in paragraphs) p.IsPageFurniture = false;
+                return;
+            }
+        }
+
+        // Running heads and page numbers are short. Anything longer than this is prose that
+        // happens to sit in a margin, and keeping it costs far less than losing it.
+        const int MIN_SUBSTANTIVE_CHARS = 80;
+        paragraphs.RemoveAll(p => p.IsPageFurniture && ParagraphAlphanumLen(p) <= MIN_SUBSTANTIVE_CHARS);
+    }
+
+    /// <summary>Page width assumed when a document yields no usable paragraph geometry —
+    /// US Letter portrait, matching the 792pt height fallback.</summary>
+    private const float FALLBACK_PAGE_WIDTH_PTS = 612.0f;
+
+    /// <summary>Page height assumed when no entry exists for a page index.</summary>
+    private const float FALLBACK_PAGE_HEIGHT_PTS = 792.0f;
+
+    /// <summary>
+    /// Mark confirmed running page numbers as furniture.
+    /// </summary>
+    /// <remarks>
+    /// Three independent signals must agree before anything is marked: the shape must be one
+    /// the classifier recognises, the paragraph's vertical centre must fall in a margin band,
+    /// and the cross-page sequence must reach the deletion threshold. Where confidence falls
+    /// short the text is kept — retaining an occasional page number is far cheaper than silently
+    /// dropping a table cell. Ports Rust <c>mark_validated_page_numbers</c>.
+    /// </remarks>
+    private static void MarkValidatedPageNumbers(List<List<PdfParagraph>> allPages, float[] pageHeights)
+    {
+        float pageWidth = DocumentContentWidth(allPages);
+        var sequence = new PdfPageNumber.PageNumberSequence();
+        var observations = new List<(int Page, int Paragraph, float YRatio, float XRatio)>();
+
+        // Pass 1: observe every candidate on every page. No deletion decision is taken here —
+        // the sequence is not usable until it has seen all pages.
+        for (int pageIndex = 0; pageIndex < allPages.Count; pageIndex++)
+        {
+            float pageHeight = pageIndex < pageHeights.Length ? pageHeights[pageIndex] : FALLBACK_PAGE_HEIGHT_PTS;
+            var page = allPages[pageIndex];
+            for (int paragraphIndex = 0; paragraphIndex < page.Count; paragraphIndex++)
+            {
+                var (yRatio, xRatio, candidate) = PageNumberObservation(page[paragraphIndex], pageHeight, pageWidth);
+                if (candidate is not { } shape) continue;
+                sequence.Observe(pageIndex, PdfPageNumber.Band(yRatio), xRatio, shape);
+                observations.Add((pageIndex, paragraphIndex, yRatio, xRatio));
+            }
+        }
+
+        // Pass 2: confirm. Every page has now been observed.
+        foreach (var (pageIndex, paragraphIndex, yRatio, xRatio) in observations)
+        {
+            var band = PdfPageNumber.Band(yRatio);
+            if (band == MarginBand.Body) continue;
+            if (sequence.ConfidenceAt(pageIndex, band, xRatio)
+                < PdfPageNumber.PageNumberSequence.DeletionThreshold) continue;
+            allPages[pageIndex][paragraphIndex].IsPageFurniture = true;
+        }
+    }
+
+    /// <summary>A page-number observation for one paragraph: its normalized position and the
+    /// shape candidate, or nulls when the paragraph is not a candidate or carries no usable
+    /// geometry — either way it is never deletable.</summary>
+    private static (float YRatio, float XRatio, PageNumberCandidate? Candidate) PageNumberObservation(
+        PdfParagraph paragraph, float pageHeight, float pageWidth)
+    {
+        if (paragraph.HeadingLevel is not null
+            || paragraph.IsListItem
+            || paragraph.IsCodeBlock
+            || paragraph.IsPageFurniture
+            || paragraph.WordCount > MAX_PAGE_NUMBER_WORD_COUNT)
+            return (0f, 0f, null);
+        if (PdfPageNumber.ClassifyPageNumberText(ParagraphTextRaw(paragraph).Trim()) is not { } candidate)
+            return (0f, 0f, null);
+        var (yRatio, xRatio) = ParagraphPositionRatios(paragraph, pageHeight, pageWidth);
+        if (float.IsNaN(yRatio) || float.IsNaN(xRatio)) return (0f, 0f, null);
+        return (yRatio, xRatio, candidate);
+    }
+
+    /// <summary>Normalized position of a paragraph's centre within its page: y 0.0 at the top and
+    /// 1.0 at the bottom, so the vertical axis is inverted from PDF space. NaN when the geometry
+    /// is unusable.</summary>
+    private static (float YRatio, float XRatio) ParagraphPositionRatios(
+        PdfParagraph paragraph, float pageHeight, float pageWidth)
+    {
+        if (!float.IsFinite(pageHeight) || pageHeight <= 0f || !float.IsFinite(pageWidth) || pageWidth <= 0f)
+            return (float.NaN, float.NaN);
+        if (FiniteParagraphBbox(paragraph) is not { } bbox) return (float.NaN, float.NaN);
+        float centreY = (bbox.B + bbox.T) * 0.5f;
+        float centreX = (bbox.L + bbox.R) * 0.5f;
+        return (Math.Clamp(1f - centreY / pageHeight, 0f, 1f), Math.Clamp(centreX / pageWidth, 0f, 1f));
+    }
+
+    /// <summary>The paragraph's geometry, restricted to fully finite boxes: a paragraph assembled
+    /// from degenerate font metrics would otherwise normalize to a meaningless position.</summary>
+    private static (float L, float B, float R, float T)? FiniteParagraphBbox(PdfParagraph paragraph)
+    {
+        if (ParagraphGeometryBbox(paragraph) is not { } bbox) return null;
+        return float.IsFinite(bbox.L) && float.IsFinite(bbox.B)
+            && float.IsFinite(bbox.R) && float.IsFinite(bbox.T) ? bbox : null;
+    }
+
+    private static (float L, float B, float R, float T)? ParagraphGeometryBbox(PdfParagraph paragraph)
+    {
+        if (paragraph.BlockBbox is { } blockBbox) return blockBbox;
+        var segments = paragraph.Lines.SelectMany(line => line.Segments).ToList();
+        if (segments.Count == 0) return null;
+        var first = segments[0];
+        float l = first.X, b = Math.Min(first.Y, first.BaselineY);
+        float r = first.X + first.Width, t = Math.Max(first.Y + first.Height, first.BaselineY + first.Height);
+        foreach (var segment in segments)
+        {
+            l = Math.Min(l, segment.X);
+            b = Math.Min(b, Math.Min(segment.Y, segment.BaselineY));
+            r = Math.Max(r, segment.X + segment.Width);
+            t = Math.Max(t, Math.Max(segment.Y + segment.Height, segment.BaselineY + segment.Height));
+        }
+        return (l, b, r, t);
+    }
+
+    /// <summary>Widest right edge across the whole document. A document-wide value rather than a
+    /// per-page one, because the sequence compares horizontal positions <em>across</em> pages:
+    /// with a per-page normalizer a stable footer slot would read as drifting.</summary>
+    private static float DocumentContentWidth(List<List<PdfParagraph>> allPages)
+    {
+        float widest = 0f;
+        foreach (var page in allPages)
+            foreach (var paragraph in page)
+                if (FiniteParagraphBbox(paragraph) is { } bbox && bbox.R > 0f) widest = Math.Max(widest, bbox.R);
+        return widest > 0f ? widest : FALLBACK_PAGE_WIDTH_PTS;
+    }
+
+    /// <summary>ASCII letters and digits across a paragraph's segments — the measure of how much
+    /// real content a paragraph carries (Rust <c>paragraph_alphanum_len</c>).</summary>
+    private static int ParagraphAlphanumLen(PdfParagraph para)
+    {
+        int count = 0;
+        foreach (var line in para.Lines)
+            foreach (var seg in line.Segments)
+                foreach (char c in seg.Text)
+                    if (char.IsAsciiLetterOrDigit(c)) count++;
+        return count;
     }
 
     // ── outline-driven heading recovery (pipeline.rs) ────────────────────────────
@@ -1704,49 +1987,6 @@ public static class PdfStructure
         _ => false,
     };
 
-    private static bool IsPageNumberPattern(string text)
-    {
-        string t = text.Trim();
-        if (t.Length == 0) return false;
-        if (t.All(char.IsAsciiDigit) && t.Length <= 4) return true;
-        string lower = t.ToLowerInvariant();
-        if (lower.StartsWith("page ")) return true;
-        if ((t.StartsWith("- ") || t.StartsWith("– ")) && (t.EndsWith(" -") || t.EndsWith(" –")))
-        {
-            string inner = t.TrimStart('-', '–', ' ').TrimEnd('-', '–', ' ').Trim();
-            if (inner.All(char.IsAsciiDigit) && inner.Length <= 4) return true;
-        }
-        if (t.Length <= 5 && t.All(c => c is 'i' or 'v' or 'x' or 'I' or 'V' or 'X')) return true;
-        return false;
-    }
-
-    /// <summary>A single trailing period ends a sentence; an ellipsis does not.</summary>
-    private static bool EndsWithSentencePeriod(string text)
-    {
-        string t = text.TrimEnd();
-        return t.EndsWith('.') && !t.EndsWith("..");
-    }
-
-    private static bool IsAllCapsText(string text)
-    {
-        int alpha = 0, upper = 0;
-        foreach (char c in text)
-            if (char.IsLetter(c)) { alpha++; if (char.IsUpper(c)) upper++; }
-        return alpha >= 2 && (double)upper / alpha > 0.8;
-    }
-
-    /// <summary>
-    /// Text that reads as the continuation of the line above: it opens lowercase, or with
-    /// the punctuation a broken sentence resumes on.
-    /// </summary>
-    private static bool StartsWithLowercaseOrContinuation(string text)
-    {
-        string t = text.TrimStart();
-        if (t.Length == 0) return false;
-        char first = t[0];
-        return char.IsLower(first) || first is ',' or ';' or ')' or ']' or '}';
-    }
-
     private static bool IsSeparatorText(string text)
     {
         string trimmed = text.Trim();
@@ -2090,13 +2330,20 @@ public static class PdfStructure
         {
             string text = GetText(para);
             bool ordered = ListItemIsOrdered(para);
-            string normalized = NormalizeListText(text);
             List<TextAnnotation> anns;
-            if (para.Text.Length > 0 && para.IsBold)
-                anns = new() { new TextAnnotation { Start = 0, End = (uint)Utf8Len(normalized), Kind = AnnotationKind.Bold } };
-            else if (para.Text.Length == 0)
-                (_, anns) = ExtractTextAndAnnotations(para);
+            if (para.Text.Length == 0)
+            {
+                // Segment-derived annotations are byte offsets into the segment-derived text.
+                // Where that text and the emitted text disagree — hyphen finalization moved a
+                // byte — an offset into the wrong string is worse than no emphasis at all.
+                var (annotatedText, segmentAnnotations) = ExtractTextAndAnnotations(para);
+                anns = annotatedText == text ? segmentAnnotations : new List<TextAnnotation>();
+            }
+            else if (para.IsBold)
+                anns = new() { new TextAnnotation { Start = 0, End = (uint)Utf8Len(text), Kind = AnnotationKind.Bold } };
             else anns = new();
+            var (normalized, removedPrefixLen) = NormalizeListText(text);
+            anns = ShiftAnnotationsAfterPrefixRemoval(anns, removedPrefixLen, Utf8Len(normalized));
             builder.PushListItem(normalized, ordered, anns, page, bbox);
             return;
         }
@@ -2146,17 +2393,21 @@ public static class PdfStructure
             int runStart = i;
             while (i < all.Count && all[i].IsBold == bold && all[i].IsItalic == italic) i++;
 
-            var runWords = new List<string>();
+            // Each word remembers the segment it came from: whether two words want a space
+            // between them is a geometric question once they cross a segment boundary.
+            var runWords = new List<(string Word, int Segment)>();
             for (int k = runStart; k < i; k++)
                 foreach (var w in all[k].Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
-                    runWords.Add(w);
+                    runWords.Add((w, k));
 
             if (text.Length > 0 && runWords.Count > 0)
             {
-                string prevLast = all[runStart - 1].Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
-                string nextFirst = all[runStart].Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                var prevSeg = all[runStart - 1];
+                var nextSeg = all[runStart];
+                string prevLast = prevSeg.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
+                string nextFirst = nextSeg.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
                 if (ShouldDehyphenate(prevLast, nextFirst)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
-                else if (NeedsSpaceBetween(prevLast, nextFirst)) text.Append(' ');
+                else if (SegmentsNeedSpace(prevSeg, prevLast, nextSeg, nextFirst)) text.Append(' ');
             }
 
             int spanStart = Utf8Len(text.ToString());
@@ -2164,11 +2415,13 @@ public static class PdfStructure
             {
                 if (wi > 0)
                 {
-                    string prev = runWords[wi - 1];
-                    if (ShouldDehyphenate(prev, runWords[wi])) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
-                    else if (NeedsSpaceBetween(prev, runWords[wi])) text.Append(' ');
+                    var (prev, prevIdx) = runWords[wi - 1];
+                    var (word, wordIdx) = runWords[wi];
+                    if (ShouldDehyphenate(prev, word)) { if (text.Length > 0) text.Remove(text.Length - 1, 1); }
+                    else if (prevIdx == wordIdx) { if (NeedsSpaceBetween(prev, word)) text.Append(' '); }
+                    else if (SegmentsNeedSpace(all[prevIdx], prev, all[wordIdx], word)) text.Append(' ');
                 }
-                text.Append(runWords[wi]);
+                text.Append(runWords[wi].Word);
             }
             int spanEnd = Utf8Len(text.ToString());
 
@@ -2184,28 +2437,74 @@ public static class PdfStructure
     private static string JoinLineTextsPlain(List<PdfLine> lines)
     {
         if (lines.Count == 0) return "";
-        var wordsPerLine = lines.Select(l => l.Segments.SelectMany(s => s.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).ToList()).ToList();
+        var wordsPerLine = lines
+            .Select(l => l.Segments
+                .SelectMany(seg => seg.Text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(word => (Word: word, Segment: seg)))
+                .ToList())
+            .ToList();
         var result = new StringBuilder();
         for (int li = 0; li < wordsPerLine.Count; li++)
         {
             var lineWords = wordsPerLine[li];
             for (int wi = 0; wi < lineWords.Count; wi++)
             {
-                string word = lineWords[wi];
+                var (word, seg) = lineWords[wi];
                 if (result.Length == 0) { result.Append(word); continue; }
-                string prevWord;
-                if (wi > 0) prevWord = lineWords[wi - 1];
+
+                (string Word, SegmentData Segment)? prev = null;
+                if (wi > 0) prev = lineWords[wi - 1];
                 else
+                    for (int p = li - 1; p >= 0; p--)
+                        if (wordsPerLine[p].Count > 0) { prev = wordsPerLine[p][^1]; break; }
+                if (prev is not { } previous) { result.Append(word); continue; }
+
+                if (ShouldDehyphenate(previous.Word, word))
                 {
-                    prevWord = "";
-                    for (int p = li - 1; p >= 0; p--) { if (wordsPerLine[p].Count > 0) { prevWord = wordsPerLine[p][^1]; break; } }
+                    if (result.Length > 0) result.Remove(result.Length - 1, 1);
+                    result.Append(word);
+                    continue;
                 }
-                if (ShouldDehyphenate(prevWord, word)) { if (result.Length > 0) result.Remove(result.Length - 1, 1); result.Append(word); }
-                else if (NeedsSpaceBetween(prevWord, word)) { result.Append(' '); result.Append(word); }
-                else result.Append(word);
+                bool insertSpace = ReferenceEquals(previous.Segment, seg)
+                    ? NeedsSpaceBetween(previous.Word, word)
+                    : SegmentsNeedSpace(previous.Segment, previous.Word, seg, word);
+                if (insertSpace) result.Append(' ');
+                result.Append(word);
             }
         }
         return result.ToString();
+    }
+
+    /// <summary>
+    /// Whether a space belongs between the last word of one segment and the first of the next.
+    /// </summary>
+    /// <remarks>
+    /// The producer splits a single word into several spans at kerning-run boundaries
+    /// ("elit" becomes "eli" + "t"). Those spans sit flush on one baseline, unlike spans a real
+    /// space character separates, so geometry is what tells them apart. Segments on different
+    /// lines, in different styles, or with an explicit space at the boundary always take one.
+    /// Ports Rust <c>segments_need_space</c>.
+    /// </remarks>
+    private static bool SegmentsNeedSpace(SegmentData prevSeg, string prevWord, SegmentData nextSeg, string nextWord)
+    {
+        if (!NeedsSpaceBetween(prevWord, nextWord)) return false;
+
+        bool explicitBoundarySpace =
+            (prevSeg.Text.Length > 0 && char.IsWhiteSpace(prevSeg.Text[^1]))
+            || (nextSeg.Text.Length > 0 && char.IsWhiteSpace(nextSeg.Text[0]));
+        if (explicitBoundarySpace) return true;
+
+        if (prevSeg.IsBold != nextSeg.IsBold
+            || prevSeg.IsItalic != nextSeg.IsItalic
+            || prevSeg.IsMonospace != nextSeg.IsMonospace)
+            return true;
+
+        float effHeight = Math.Max(Math.Max(nextSeg.Height, prevSeg.Height), nextSeg.FontSize * 0.5f);
+        bool sameLine = Math.Abs(prevSeg.BaselineY - nextSeg.BaselineY) < effHeight * 0.5f;
+        if (!sameLine) return true;
+
+        float advanceGap = nextSeg.X - (prevSeg.X + prevSeg.Width);
+        return advanceGap > nextSeg.FontSize * SEGMENT_GAP_SPACE_RATIO;
     }
 
     private static bool ShouldDehyphenate(string prev, string next)
@@ -2247,35 +2546,65 @@ public static class PdfStructure
         return result.ToString();
     }
 
+    /// <summary>
+    /// Whether the item carries an ordered marker — the same parser <see cref="NormalizeListText"/>
+    /// strips with, so an item whose marker was removed is never then rendered as a bullet
+    /// (Rust <c>list_item_is_ordered</c>). Lettered, roman, bracketed and parenthesised markers
+    /// all count, not just a digit followed by a dot.
+    /// </summary>
     private static bool ListItemIsOrdered(PdfParagraph para)
     {
         string text = para.Text.Length > 0 ? para.Text
             : (para.Lines.FirstOrDefault()?.Segments.FirstOrDefault()?.Text ?? "");
-        string t = text.TrimStart();
-        int digitEnd = 0;
-        while (digitEnd < t.Length && char.IsAsciiDigit(t[digitEnd])) digitEnd++;
-        return digitEnd > 0 && digitEnd < t.Length && (t[digitEnd] == '.' || t[digitEnd] == ')');
+        return PdfListMarker.Parse(text) is not null;
     }
 
     private static readonly char[] DashBullets = { '–', '—', '−', '‐', '‑', '‒', '―', '➤', '►', '▶', '○', '●', '◦' };
 
-    private static string NormalizeListText(string text)
+    /// <summary>
+    /// The item's text with its marker removed, and how many bytes that removal took off the
+    /// front — the inline annotations were measured against the un-normalized string, so they
+    /// have to move with it (Rust <c>normalize_list_text</c>).
+    /// </summary>
+    private static (string Normalized, int RemovedPrefixLen) NormalizeListText(string text)
     {
+        (string, int) Removed(string normalized) => (normalized, Utf8Len(text) - Utf8Len(normalized));
+
+        if (PdfListMarker.Parse(text) is { } marker && marker.ContentStart <= text.Length)
+            return (text[marker.ContentStart..], Utf8Len(text[..marker.ContentStart]));
+
         string trimmed = text.TrimStart();
-        if (trimmed.StartsWith('•')) return trimmed.Substring(1).TrimStart();
-        if (trimmed.StartsWith('·')) return trimmed.Substring(1).TrimStart();
-        if (trimmed.StartsWith("* ")) return trimmed.Substring(2).TrimStart();
-        if (trimmed.StartsWith("- ")) return trimmed.Substring(2);
-        foreach (char ch in DashBullets) if (trimmed.StartsWith(ch)) return trimmed.Substring(1).TrimStart();
+        if (trimmed.StartsWith('•')) return Removed(trimmed.Substring(1).TrimStart());
+        if (trimmed.StartsWith('·')) return Removed(trimmed.Substring(1).TrimStart());
+        if (trimmed.StartsWith("* ")) return Removed(trimmed.Substring(2).TrimStart());
+        if (trimmed.StartsWith("- ")) return Removed(trimmed.Substring(2));
+        foreach (char ch in DashBullets) if (trimmed.StartsWith(ch)) return Removed(trimmed.Substring(1).TrimStart());
         // Numbered prefix "1. " / "1) "
         int digitEnd = 0;
         while (digitEnd < trimmed.Length && char.IsAsciiDigit(trimmed[digitEnd])) digitEnd++;
         if (digitEnd > 0 && digitEnd < trimmed.Length && (trimmed[digitEnd] == '.' || trimmed[digitEnd] == ')'))
+            return Removed(trimmed[(digitEnd + 1)..].TrimStart());
+        return Removed(trimmed);
+    }
+
+    /// <summary>
+    /// Move the annotations left by the marker the normalization took off, clamp them into the
+    /// shortened string and drop the ones the removal swallowed whole (Rust
+    /// <c>shift_annotations_after_prefix_removal</c>).
+    /// </summary>
+    private static List<TextAnnotation> ShiftAnnotationsAfterPrefixRemoval(
+        List<TextAnnotation> annotations, int removedPrefixLen, int normalizedLen)
+    {
+        uint removed = (uint)Math.Max(removedPrefixLen, 0);
+        uint limit = (uint)Math.Max(normalizedLen, 0);
+        var shifted = new List<TextAnnotation>(annotations.Count);
+        foreach (var annotation in annotations)
         {
-            int after = digitEnd + 1;
-            if (after < trimmed.Length && trimmed[after] == ' ') return trimmed.Substring(after + 1);
+            uint start = Math.Min(annotation.Start >= removed ? annotation.Start - removed : 0u, limit);
+            uint end = Math.Min(annotation.End >= removed ? annotation.End - removed : 0u, limit);
+            if (start < end) shifted.Add(new TextAnnotation { Start = start, End = end, Kind = annotation.Kind });
         }
-        return trimmed;
+        return shifted;
     }
 
     private static int Utf8Len(string s) => Encoding.UTF8.GetByteCount(s);
