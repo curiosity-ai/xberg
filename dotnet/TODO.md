@@ -576,16 +576,31 @@ xberg tiers set `TableStrategy::Lines` on both axes — `strict()` does, and `ex
 builds its own config that does. `relaxed()`, the only preset using `Text`, is never used by
 xberg. So the whole text-edge strategy (`detect_tables_from_spans`, `_column_aware`,
 `detect_tables_hybrid`, `detect_text_edge_columns`, `detect_tables_from_horizontal_rules`) and the
-validation layer reached only from it (`validate_table_structure_internal`,
-`passes_spatial_quality_gate`, `is_regular_lattice`, `looks_like_prose_paragraph`,
-`looks_like_bulleted_list`, `looks_like_cjk_prose`) is dead code here, in the same way pattern
-marking is.
+gates reached only from it (`passes_spatial_quality_gate`, `is_regular_lattice`,
+`looks_like_prose_paragraph`, `looks_like_bulleted_list`, `looks_like_cjk_prose`,
+`filter_columns_by_row_coverage`, `consolidate_adjacent_table_fragments`) is dead code here, in
+the same way pattern marking is. `detect_merged_cells` joins them for a subtler reason: it is only
+the `None` arm of `grid_to_table`'s `visual_merge_info`, and the sole reachable caller always
+passes `Some(detect_merged_cells_visually(..))`.
 
-What the `(Lines, Lines)` arm actually reaches and this port lacks is the cluster fallback that
-runs when intersection detection finds nothing — a ruled table whose rules do not cross:
-`group_lines_into_clusters`, `detect_tables_in_cluster`, `cluster_values`,
-`detect_header_row_above`, and `grid_to_table` with `detect_merged_cells` and `detect_header_row`
-under it.
+Note that `validate_table_structure_internal` and `has_split_modal_column_groups` are NOT in that
+dead set, despite being easy to file there — `detect_tables_in_cluster` calls them directly. They
+are ported, as `ValidateClusterGrid` and `HasSplitModalColumnGroups`.
+
+**Closed.** Taking the call closure from the `(Lines, Lines)` arm gives 41 reachable functions,
+and all 41 are now ported: the intersection pipeline, plus the cluster fallback that runs when no
+rules cross (`group_lines_into_clusters`, `detect_tables_in_cluster`, `cluster_values`,
+`detect_header_row`/`_above`, `grid_to_table`, `detect_merged_cells_visually`,
+`trim_empty_columns`, the structural validation). Measured with the fallback live: PDF `ok`
+273 → 274, tables 318 → 318, catastrophes 0 — inside the noise band, so neutral. It is not inert
+though: instrumenting the branch shows it firing 420 times across the PDF corpus at one to four
+tables a hit, with the output absorbed by the caller's grid and prose guards or displacing
+heuristic-tier tables on pages a native hit suppresses.
+
+The lesson is worth keeping for the next audit: a raw function-count diff between the two trees
+reads as a large gap and is mostly noise. Take the call closure from the entry point xberg
+actually uses, and map names by hand — a snake_case-to-PascalCase match falsely reported twelve
+of these as missing when eleven were present under different names.
 
 **What the PDF port still owes.** The ruling-line tiers read their drawn paths from the older
 content interpreter, which is why both span producers still run per page; the paths belong in
