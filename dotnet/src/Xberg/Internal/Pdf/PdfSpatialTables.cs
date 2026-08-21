@@ -1092,7 +1092,9 @@ internal static partial class PdfSpatialTables
         if (entries.Count == 0) return "";
         if (entries.Count == 1) return entries[0].Span.Text;
 
-        entries.Sort((a, b) => b.Y.CompareTo(a.Y));
+        // Stable: spans sharing a baseline keep the order the cell collected them in, which
+        // is the only thing that orders words within one line of a cell — nothing sorts by X.
+        Xberg.Internal.PdfOxide.Layout.OxSpanCompare.SortStable(entries, (a, b) => SafeCmp(b.Y, a.Y));
 
         var lines = new List<List<TableSpan>>();
         var current = new List<TableSpan> { entries[0].Span };
@@ -1221,7 +1223,9 @@ internal static partial class PdfSpatialTables
         if (cell.SpanIndices.Count == 0) return cell.Text.Trim().Replace('\n', ' ');
 
         var sorted = cell.SpanIndices.Where(i => i >= 0 && i < spans.Count).Select(i => spans[i]).ToList();
-        sorted.Sort((a, b) =>
+        // Stable: two words sharing a baseline and a left edge keep the order the cell
+        // collected them in, which is all that separates them.
+        Xberg.Internal.PdfOxide.Layout.OxSpanCompare.SortStable(sorted, (a, b) =>
         {
             int c = b.Bbox.Y.CompareTo(a.Bbox.Y);
             return c != 0 ? c : a.Bbox.X.CompareTo(b.Bbox.X);

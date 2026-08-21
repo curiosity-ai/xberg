@@ -148,6 +148,11 @@ public sealed class PdfExtractor : IExtractor
         }
         catch { }
 
+        // Filled AcroForm values reach `content` only through the per-page widget splice,
+        // which the structured path never sees; this puts back the ones no element carries.
+        try { InjectUnrepresentedFormFieldElements(doc, PdfFormFields.Extract(pdf)); }
+        catch { }
+
         // The structured path assembles its own table list in element order, so its indices
         // are already the ones its `Table` elements point at; only a document that carries
         // none takes the detected ones.
@@ -235,6 +240,28 @@ public sealed class PdfExtractor : IExtractor
         {
             string trimmed = word.Trim(AsciiPunctuation).ToLowerInvariant();
             if (trimmed.Length > 0) yield return trimmed;
+        }
+    }
+
+    /// <summary>
+    /// Surface filled AcroForm values that no element already spells out, one paragraph per
+    /// field, as <c>"{full name}: {value}"</c>.
+    /// </summary>
+    /// <remarks>
+    /// The plain-text path splices widget values into the page text before it is chopped into
+    /// paragraphs, so its elements already carry them and the containment test skips them; the
+    /// structured path is built from span segments that never see that splice.
+    /// </remarks>
+    internal static void InjectUnrepresentedFormFieldElements(
+        InternalDocument doc, List<PdfAcroFormField> formFields)
+    {
+        foreach (var field in formFields)
+        {
+            string? value = field.Value;
+            if (string.IsNullOrEmpty(value)) continue;
+            if (doc.Elements.Any(element => element.Text.Contains(value, StringComparison.Ordinal))) continue;
+            string displayName = field.FullName.Length == 0 ? field.Name : field.FullName;
+            doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, $"{displayName}: {value}", 0));
         }
     }
 
@@ -429,10 +456,9 @@ public sealed class PdfExtractor : IExtractor
         return text;
     }
 
-    // Collect interactive text/choice field values from the widgets on one page, top to bottom.
-    // /V and /FT may be inherited via the /Parent field chain; only string values (text/choice
-    // fields) are surfaced — button fields store a /Name in /V and are skipped. De-duplicated by
-    // fully-qualified field name so widgets that share a parent field are not counted twice.
+    // Collect the /V of every Widget annotation on one page, top to bottom. /V may be inherited
+    // via the /Parent field chain. De-duplicated by fully-qualified field name so widgets that
+    // share a parent field are not counted twice.
     private static List<string> CollectWidgetTextValues(PdfDocument pdf, int pageIndex)
     {
         var values = new List<(double MidY, string Value)>();
@@ -446,23 +472,20 @@ public sealed class PdfExtractor : IExtractor
             if (widget is null) continue;
             if (pdf.Resolve(widget.Get("Subtype")).AsName() != "Widget") continue;
 
-            string? ft = null;
-            byte[]? vbytes = null;
+            string? raw = null;
             var names = new List<string>();
             var node = widget;
             for (int guard = 0; node is not null && guard < 32; guard++)
             {
-                ft ??= pdf.Resolve(node.Get("FT")).AsName();
-                vbytes ??= pdf.Resolve(node.Get("V")).AsStringBytes();
+                raw ??= AnnotationStringValue(pdf.Resolve(node.Get("V")));
                 var t = pdf.Resolve(node.Get("T")).AsStringBytes();
                 if (t is not null) names.Insert(0, PdfMetadataExtractor.DecodePdfString(t) ?? "");
                 node = pdf.Resolve(node.Get("Parent")).AsDict();
             }
 
-            if (vbytes is null) continue;                       // no value set
-            if (ft is not null && ft != "Tx" && ft != "Ch") continue; // not a text/choice field
-            string? value = PdfMetadataExtractor.DecodePdfString(vbytes);
-            if (string.IsNullOrEmpty(value)) continue;
+            if (raw is null) continue;                          // no value set
+            string value = raw.Trim();
+            if (value.Length == 0) continue;
 
             string key = names.Count > 0 ? string.Join(".", names) : value;
             if (!seen.Add(key)) continue;
@@ -481,4 +504,23 @@ public sealed class PdfExtractor : IExtractor
         // Stable, so widgets sharing a row keep the order the /Annots array gave them.
         return values.OrderByDescending(v => v.MidY).Select(v => v.Value).ToList();
     }
+
+    /// <summary>
+    /// An annotation entry read as the string the widget splice appends.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not the text-string decoding of ISO 32000-1 §7.9.2.2: the annotation layer
+    /// reads the bytes as UTF-8 and replaces what does not decode, so a UTF-16BE value reaches
+    /// the page text with its byte-order mark as replacement characters. The document-level
+    /// AcroForm model (<see cref="PdfFormFields"/>) is the one that decodes properly, and the
+    /// two disagreeing is what leaves a UTF-16 value unrepresented for the injection pass.
+    /// </remarks>
+    private static string? AnnotationStringValue(PdfObject? value) => value switch
+    {
+        PdfString s => System.Text.Encoding.UTF8.GetString(s.Bytes),
+        PdfName n => n.Value,
+        PdfNumber { IsInteger: true } n => ((long)n.Value).ToString(System.Globalization.CultureInfo.InvariantCulture),
+        PdfNumber n => n.Value.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+        _ => null,
+    };
 }

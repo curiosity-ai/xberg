@@ -808,21 +808,24 @@ internal static partial class PdfSpatialTables
             tableRows.Add(tableRow);
         }
 
+        // Single precision throughout: the reference sums, subtracts and compares span edges
+        // as f32, and the extents it reports round differently from the same arithmetic in
+        // double — enough to show up in a table's reported bounding box.
         PathRect? bbox = null;
-        double minX = double.PositiveInfinity, minY = double.PositiveInfinity;
-        double maxX = double.NegativeInfinity, maxY = double.NegativeInfinity;
+        float minX = float.PositiveInfinity, minY = float.PositiveInfinity;
+        float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity;
         foreach (var row in grid.Cells)
             foreach (var cell in row)
                 foreach (int idx in cell)
                 {
                     if (idx < 0 || idx >= spans.Count) continue;
                     var b = spans[idx].Bbox;
-                    minX = Math.Min(minX, b.X);
-                    minY = Math.Min(minY, b.Y);
-                    maxX = Math.Max(maxX, b.X + b.Width);
-                    maxY = Math.Max(maxY, b.Y + b.Height);
+                    minX = MathF.Min(minX, (float)b.X);
+                    minY = MathF.Min(minY, (float)b.Y);
+                    maxX = MathF.Max(maxX, (float)b.X + (float)b.Width);
+                    maxY = MathF.Max(maxY, (float)b.Y + (float)b.Height);
                 }
-        if (!double.IsInfinity(minX)) bbox = new PathRect(minX, minY, maxX - minX, maxY - minY);
+        if (!float.IsInfinity(minX)) bbox = new PathRect(minX, minY, maxX - minX, maxY - minY);
 
         return new GridTable
         {
