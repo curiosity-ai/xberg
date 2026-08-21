@@ -193,6 +193,10 @@ internal static class OdfContentParser
             if (child.Name.LocalName != "note")
                 continue;
             var noteId = OdfStyles.Attr(child, "id");
+            // The key prefix carries the note class (#118): "fn" for a footnote, "en" for an
+            // endnote. Both the ref and the definition are keyed identically, which is the only
+            // thing that tells the two classes apart — no ElementKind distinguishes them.
+            string keyPrefix = OdfStyles.Attr(child, "note-class") == "endnote" ? "en" : "fn";
 
             foreach (var noteChild in child.Elements())
             {
@@ -203,7 +207,7 @@ internal static class OdfContentParser
                     if (citationTrimmed.Length > 0)
                     {
                         footnoteCounter += 1;
-                        var key = noteId ?? $"fn{footnoteCounter}";
+                        var key = noteId is not null ? keyPrefix + noteId : $"{keyPrefix}{footnoteCounter}";
                         footnoteMarkers.Add(citationTrimmed);
                         builder.PushFootnoteRef(citationTrimmed, key, null);
                     }
@@ -219,13 +223,13 @@ internal static class OdfContentParser
                             string key;
                             if (noteId is not null)
                             {
-                                key = noteId;
+                                key = keyPrefix + noteId;
                             }
                             else
                             {
                                 if (footnoteCounter == 0)
                                     footnoteCounter += 1;
-                                key = $"fn{footnoteCounter}";
+                                key = $"{keyPrefix}{footnoteCounter}";
                             }
                             uint defIdx = builder.PushFootnoteDefinition(trimmed, key, null);
                             builder.SetLayer(defIdx, ContentLayer.Footnote);
@@ -379,6 +383,37 @@ internal static class OdfContentParser
         var annotations = new List<TextAnnotation>();
         var uris = new List<ExtractedUri>();
 
+        CollectInlineRun(node, styleMap, text, ref byteLen, annotations, uris);
+
+        // Fallback: no children produced text → use the node's own direct text.
+        if (text.Length == 0)
+        {
+            var own = NodeText(node);
+            if (own is not null)
+                text.Append(own);
+        }
+
+        return (text.ToString(), annotations, uris);
+    }
+
+    /// <summary>
+    /// Ports `collect_inline_run`: walk a paragraph's inline children, flattening their text and
+    /// recording byte-offset annotations.
+    /// </summary>
+    /// <remarks>
+    /// Recursion is the point — reading only an element's first text child drops everything past
+    /// one level of nesting, so a span inside a span, or a link wrapping a styled span, lost its
+    /// tail (upstream #93/#94). It is also why a caption paragraph inside a `draw:text-box` is
+    /// picked up here as well as by the caller's dedicated caption pass.
+    /// </remarks>
+    private static void CollectInlineRun(
+        XElement node,
+        Dictionary<string, OdtStyleProps> styleMap,
+        StringBuilder text,
+        ref int byteLen,
+        List<TextAnnotation> annotations,
+        List<ExtractedUri> uris)
+    {
         foreach (var child in node.Nodes())
         {
             if (child is XElement el)
@@ -387,13 +422,11 @@ internal static class OdfContentParser
                 {
                     case "span":
                     {
-                        var spanText = NodeText(el) ?? "";
-                        if (spanText.Length == 0)
-                            continue;
                         uint start = (uint)byteLen;
-                        text.Append(spanText);
-                        byteLen += Encoding.UTF8.GetByteCount(spanText);
+                        CollectInlineRun(el, styleMap, text, ref byteLen, annotations, uris);
                         uint end = (uint)byteLen;
+                        if (end == start)
+                            continue;
 
                         var styleName = OdfStyles.Attr(el, "style-name");
                         if (styleName is not null && styleMap.TryGetValue(styleName, out var props))
@@ -432,17 +465,25 @@ internal static class OdfContentParser
                         byteLen += 1;
                         break;
                     case "note":
-                        // Footnotes/endnotes handled separately.
+                    case "annotation":
+                    case "annotation-end":
+                        // Footnotes, endnotes and comments become their own elements.
+                        break;
+                    case "page-number":
+                    case "page-count":
+                        // A pagination field caches whatever the authoring application last
+                        // displayed there; with no layout pass there is nothing to resolve it to,
+                        // and the cached value can be the editor's own placeholder (upstream #69).
                         break;
                     case "a":
                     {
-                        var linkText = NodeText(el) ?? "";
-                        if (linkText.Length == 0)
-                            continue;
+                        int charStart = text.Length;
                         uint start = (uint)byteLen;
-                        text.Append(linkText);
-                        byteLen += Encoding.UTF8.GetByteCount(linkText);
+                        CollectInlineRun(el, styleMap, text, ref byteLen, annotations, uris);
                         uint end = (uint)byteLen;
+                        if (end == start)
+                            continue;
+                        var linkText = text.ToString(charStart, text.Length - charStart);
                         var url = OdfStyles.Attr(el, "href") ?? "";
                         if (url.Length > 0)
                         {
@@ -461,11 +502,17 @@ internal static class OdfContentParser
                     }
                     default:
                     {
+                        // An unknown wrapper (`text:ruby`, `text:meta`, a `draw:frame` holding a
+                        // caption) is descended into rather than dropped.
                         var t = NodeText(el);
                         if (t is not null)
                         {
                             text.Append(t);
                             byteLen += Encoding.UTF8.GetByteCount(t);
+                        }
+                        else
+                        {
+                            CollectInlineRun(el, styleMap, text, ref byteLen, annotations, uris);
                         }
                         break;
                     }
@@ -477,16 +524,6 @@ internal static class OdfContentParser
                 byteLen += Encoding.UTF8.GetByteCount(xt.Value);
             }
         }
-
-        // Fallback: no children produced text → use the node's own direct text.
-        if (text.Length == 0)
-        {
-            var t = NodeText(node);
-            if (t is not null)
-                text.Append(t);
-        }
-
-        return (text.ToString(), annotations, uris);
     }
 
     /// <summary>Ports `extract_node_text`: concatenates span/tab/line-break/direct-text of the node's children.</summary>

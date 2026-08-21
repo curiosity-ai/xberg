@@ -264,7 +264,10 @@ public sealed class EmailExtractor : IExtractor
                 break;
             case NodeContent.Tag.Image:
                 {
-                    string text = string.IsNullOrEmpty(c.Description) ? "[Image]" : c.Description!;
+                    // Only a *missing* description becomes the placeholder. `alt=""` is a
+                    // deliberate "this image carries no meaning", and upstream's
+                    // `description.as_deref().unwrap_or("[Image]")` keeps it as the empty string.
+                    string text = c.Description ?? "[Image]";
                     builder.PushParagraph(text, new(), null, null);
                     break;
                 }

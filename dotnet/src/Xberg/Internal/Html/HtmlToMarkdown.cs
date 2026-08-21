@@ -24,12 +24,23 @@ internal static class HtmlToMarkdown
     /// each node carries the markdown its block rendered to.
     /// </remarks>
     public static string ConvertWithStructure(string html, out HtmlStructureCollector structure)
+        => ConvertWithStructure(html, plainText: false, out structure);
+
+    /// <summary>
+    /// Convert and report the structure, optionally returning plain text instead of markdown.
+    /// </summary>
+    /// <remarks>
+    /// `converter/main.rs` runs the markdown walk either way — that walk is what fills the
+    /// structure collector — and only swaps the returned string for
+    /// <see cref="HtmlPlainText"/>'s when the caller asked for plain output.
+    /// </remarks>
+    public static string ConvertWithStructure(string html, bool plainText, out HtmlStructureCollector structure)
     {
         structure = new HtmlStructureCollector();
-        return Convert(html, structure);
+        return Convert(html, structure, plainText);
     }
 
-    private static string Convert(string html, HtmlStructureCollector? structure)
+    private static string Convert(string html, HtmlStructureCollector? structure, bool plainText = false)
     {
         html = html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
         var root = HtmlDom.Parse(html);
@@ -41,6 +52,8 @@ internal static class HtmlToMarkdown
         var ctx = new Ctx { Structure = structure };
         foreach (var child in root.Children)
             WalkNode(child, sb, ctx);
+
+        if (plainText) return HtmlPlainText.Extract(root);
 
         string outp = sb.ToString();
         outp = TrimLineEndWhitespace(outp);
@@ -253,14 +266,20 @@ internal static class HtmlToMarkdown
             case "ins":      // inserted text → ==…== (marks.rs handle_inserted)
                 HandleHighlight(node, output, ctx);
                 break;
-            case "u": case "small": case "abbr": case "bdi": case "bdo":
+            case "u": case "small": case "bdi": case "bdo":
             case "rb": case "rtc":
                 WalkChildren(node, output, ctx);
+                break;
+            case "abbr":
+                HandleAbbr(node, output, ctx);
                 break;
             case "sub": case "sup":
                 HandleSubSup(node, output, ctx);
                 break;
-            case "var": case "dfn": case "cite":
+            // `<cite>` has a handler in `semantic/attributes.rs` that italicizes it, but
+            // `converter/main.rs` never dispatches to it — the tag falls through to the unknown
+            // handler, so a citation keeps its own inline markup and gains none.
+            case "var": case "dfn":
                 HandleEmphasis(node, output, ctx);
                 break;
             case "q":
@@ -348,13 +367,20 @@ internal static class HtmlToMarkdown
             case "math":
                 HandleMath(node, output, ctx);
                 break;
-            case "audio": case "video": case "picture": case "iframe": case "svg":
+            case "svg":
+                HandleSvg(node, output, ctx);
+                break;
+            case "audio": case "video": case "picture": case "iframe":
+                HandleMedia(tag, node, output, ctx);
+                break;
             case "object": case "embed": case "canvas": case "map": case "area":
-                break; // media handlers: not ported (no output for defaults)
+                HandleUnknown(node, output, ctx);  // no arm upstream either — the unknown handler
+                break;
             case "form": case "fieldset": case "legend": case "label": case "input":
             case "textarea": case "select": case "option": case "optgroup": case "button":
             case "progress": case "meter": case "output": case "datalist":
-                break; // forms removed by Standard preprocessing / no output
+                HandleFormElement(tag, node, output, ctx);
+                break;
             default:
                 HandleUnknown(node, output, ctx);
                 break;
@@ -1126,6 +1152,197 @@ internal static class HtmlToMarkdown
         if (separated) output.Append("\n\n");
     }
 
+    /// <summary>
+    /// An abbreviation spells itself out: its text, then its <c>title</c> in parentheses
+    /// (`inline/semantic/typography.rs::handle_abbreviation`).
+    /// </summary>
+    private static void HandleAbbr(HNode node, StringBuilder output, Ctx ctx)
+    {
+        var content = new StringBuilder();
+        foreach (var c in node.Children) WalkNode(c, content, ctx);
+        string trimmed = content.ToString().Trim();
+        if (trimmed.Length == 0) return;
+        output.Append(trimmed);
+        string title = (node.Attr("title") ?? "").Trim();
+        if (title.Length > 0) output.Append(" (").Append(title).Append(')');
+    }
+
+    // ── embedded media (media/embedded.rs) ───────────────────────────────────
+    /// <summary>
+    /// A media element markdown cannot embed becomes a link to its source, plus whatever
+    /// fallback content it wrapped; a <c>&lt;picture&gt;</c> reduces to the first
+    /// <c>&lt;img&gt;</c> it holds (`converter/media/embedded.rs`).
+    /// </summary>
+    private static void HandleMedia(string tag, HNode node, StringBuilder output, Ctx ctx)
+    {
+        if (tag == "picture")
+        {
+            foreach (var child in node.Children)
+            {
+                if (child.Tag != "img") continue;
+                WalkNode(child, output, ctx);
+                return;
+            }
+            return;
+        }
+
+        string src = node.Attr("src") ?? "";
+        if (tag != "iframe" && src.Length == 0)
+        {
+            foreach (var child in node.Children)
+            {
+                if (child.Tag != "source") continue;
+                src = child.Attr("src") ?? "";
+                break;
+            }
+        }
+
+        if (src.Length > 0)
+        {
+            output.Append('[').Append(src).Append("](").Append(src).Append(')');
+            if (!ctx.InParagraph && !ctx.ConvertAsInline) output.Append("\n\n");
+        }
+
+        if (tag == "iframe") return;
+
+        // Everything that is not a `<source>` is the element's no-support fallback.
+        var fallback = new StringBuilder();
+        foreach (var child in node.Children)
+        {
+            if (child.Tag == "source") continue;
+            WalkNode(child, fallback, ctx);
+        }
+        if (fallback.Length > 0)
+        {
+            output.Append(fallback.ToString().Trim());
+            if (!ctx.InParagraph && !ctx.ConvertAsInline) output.Append("\n\n");
+        }
+    }
+
+    // ── form elements (form/elements.rs) ─────────────────────────────────────
+    /// <summary>
+    /// A form control has no markdown of its own, but the text and images inside it do, so each
+    /// handler renders its children and differs only in the spacing it adds
+    /// (`converter/form/elements.rs::handle`). `&lt;form&gt;` itself never reaches here —
+    /// preprocessing drops it — but the rest are ordinary page furniture.
+    /// </summary>
+    private static void HandleFormElement(string tag, HNode node, StringBuilder output, Ctx ctx)
+    {
+        switch (tag)
+        {
+            // Collected, trimmed and set off by blank lines; an empty one disappears.
+            case "form":
+            case "fieldset":
+            {
+                if (ctx.ConvertAsInline) { WalkChildren(node, output, ctx); return; }
+                var content = new StringBuilder();
+                foreach (var c in node.Children) WalkNode(c, content, ctx);
+                string trimmed = content.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                if (output.Length > 0 && !EndsWith(output, "\n\n")) output.Append("\n\n");
+                output.Append(trimmed).Append("\n\n");
+                return;
+            }
+
+            // A fieldset's caption reads as bold text.
+            case "legend":
+            {
+                var content = new StringBuilder();
+                var legendCtx = ctx.ConvertAsInline ? ctx : ctx with { InStrong = true };
+                foreach (var c in node.Children) WalkNode(c, content, legendCtx);
+                string trimmed = content.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                if (ctx.ConvertAsInline) output.Append(trimmed);
+                else output.Append("**").Append(trimmed).Append("**").Append("\n\n");
+                return;
+            }
+
+            case "label":
+            {
+                var content = new StringBuilder();
+                foreach (var c in node.Children) WalkNode(c, content, ctx);
+                string trimmed = content.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                output.Append(trimmed);
+                if (!ctx.ConvertAsInline) output.Append("\n\n");
+                return;
+            }
+
+            // An <input> carries no text content, so it contributes nothing.
+            case "input":
+                return;
+
+            // A group's label reads as bold text, then its options follow.
+            case "optgroup":
+            {
+                string label = node.Attr("label") ?? "";
+                if (label.Length > 0) output.Append("**").Append(label).Append("**").Append('\n');
+                WalkChildren(node, output, ctx);
+                return;
+            }
+
+            case "option":
+            {
+                bool selected = node.Attr("selected") is not null;
+                var text = new StringBuilder();
+                foreach (var c in node.Children) WalkNode(c, text, ctx);
+                string trimmed = text.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                if (selected && !ctx.ConvertAsInline) output.Append("* ");
+                output.Append(trimmed);
+                if (!ctx.ConvertAsInline) output.Append('\n');
+                return;
+            }
+
+            // The rest render in place and only differ in the separator they leave behind.
+            default:
+            {
+                int startLen = output.Length;
+                WalkChildren(node, output, ctx);
+                if (ctx.ConvertAsInline || output.Length == startLen) return;
+                output.Append(tag is "select" or "datalist" ? "\n" : "\n\n");
+                return;
+            }
+        }
+    }
+
+    // ── svg (media/svg.rs) ───────────────────────────────────────────────────
+    /// <summary>
+    /// An inline <c>&lt;svg&gt;</c> becomes an image whose source is the serialized subtree as a
+    /// base64 data URI (`media/svg.rs::handle_svg`); in inline context only its title is kept.
+    /// </summary>
+    /// <summary>
+    /// The image markdown one <c>&lt;svg&gt;</c> element's markup converts to, for the metadata
+    /// scanner, which sees source text rather than a tree.
+    /// </summary>
+    internal static string RenderSvgImage(string svgMarkup)
+    {
+        var root = HtmlDom.Parse(svgMarkup);
+        foreach (var child in root.Children)
+        {
+            if (child.Tag != "svg") continue;
+            var sb = new StringBuilder();
+            HandleSvg(child, sb, new Ctx());
+            return sb.ToString();
+        }
+        return "";
+    }
+
+    private static void HandleSvg(HNode node, StringBuilder output, Ctx ctx)
+    {
+        string title = "SVG Image";
+        foreach (var child in node.Children)
+        {
+            if (child.Tag == "title") { title = TextContent(child).Trim(); break; }
+        }
+
+        if (ctx.ConvertAsInline) { output.Append(title); return; }
+
+        string svgHtml = SerializeElement(node);
+        string base64 = System.Convert.ToBase64String(Encoding.UTF8.GetBytes(svgHtml));
+        output.Append("![").Append(title).Append("](data:image/svg+xml;base64,").Append(base64).Append(')');
+    }
+
     /// <summary>The concatenated text of a node's descendants, entity references resolved.</summary>
     private static string CollectRawText(HNode node)
     {
@@ -1160,8 +1377,10 @@ internal static class HtmlToMarkdown
         foreach (var (key, value) in HtmlWalker.EnumerateAttributes(node.AttrString)
                      .OrderBy(a => a.Key, StringComparer.Ordinal))
         {
-            sb.Append(' ').Append(key);
-            if (value is not null) sb.Append("=\"").Append(value).Append('"');
+            sb.Append(' ').Append(SvgAttrs.Canonical(key) ?? key);
+            // A bare attribute and `attr=""` are HTML5-equivalent; upstream writes both bare.
+            // The value goes out as written — the serializer does not re-escape it.
+            if (!string.IsNullOrEmpty(value)) sb.Append("=\"").Append(value).Append('"');
         }
 
         if (node.Children.Count == 0) { sb.Append(" />"); return sb.ToString(); }
@@ -1256,7 +1475,9 @@ internal static class HtmlToMarkdown
         return "";
     }
 
-    // ── pre (block/preformatted.rs) ──────────────────────────────────────────
+    // ── pre (handlers/code_block.rs) ─────────────────────────────────────────
+    // `block/preformatted.rs` carries a second, subtly different copy of this handler, but
+    // nothing dispatches to it — `converter/main.rs` routes `<pre>` to `handlers::handle_pre`.
     private static void HandlePre(HNode node, StringBuilder output, Ctx ctx)
     {
         var cctx = ctx with { InCode = true };
@@ -1272,7 +1493,7 @@ internal static class HtmlToMarkdown
         string core = s.Trim('\n');
         bool whitespaceOnly = core.Trim().Length == 0;
 
-        string coreText = leading > 0 ? DedentCodeBlock(core) : core;
+        string coreText = DedentCodeBlock(core);
         string processed;
         if (whitespaceOnly)
         {
@@ -1321,6 +1542,12 @@ internal static class HtmlToMarkdown
         return null;
     }
 
+    /// <summary>
+    /// Strip the common leading whitespace from every line of a code block
+    /// (`converter/text/processing.rs::dedent_code_block`). A whitespace-only line is kept
+    /// verbatim rather than blanked: the markdown output has its line ends trimmed globally
+    /// afterwards, but the structure collector's Code node keeps those spaces.
+    /// </summary>
     private static string DedentCodeBlock(string content)
     {
         var lines = content.Split('\n');
@@ -1338,7 +1565,7 @@ internal static class HtmlToMarkdown
         {
             if (i > 0) sb.Append('\n');
             var line = lines[i];
-            if (line.Trim().Length == 0) continue;
+            if (line.Trim().Length == 0) { sb.Append(line); continue; }
             int cut = 0, remaining = minIndent;
             while (remaining > 0 && cut < line.Length && char.IsWhiteSpace(line[cut])) { cut++; remaining--; }
             sb.Append(line[cut..]);

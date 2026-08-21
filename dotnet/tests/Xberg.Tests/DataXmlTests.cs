@@ -106,4 +106,19 @@ public class DataXmlTests
         var mimes = new XmlExtractor().SupportedMimeTypes.ToList();
         Assert.Equal(new[] { "application/xml", "text/xml", "image/svg+xml", "application/x-endnote+xml" }, mimes);
     }
+
+    /// <summary>
+    /// The SVG text-element filter guards only text nodes. A CDATA section — which is how an SVG
+    /// carries its script and style bodies — is kept wherever it appears; on one flamegraph
+    /// fixture that is half the document.
+    /// </summary>
+    [Fact]
+    public void SvgKeepsCdataOutsideTextElements()
+    {
+        var doc = Extract("<svg><script type=\"text/ecmascript\"><![CDATA[var a = 1;]]></script>" +
+                          "<rect/><text>Visible</text></svg>", "image/svg+xml");
+        var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
+        Assert.Contains("var a = 1;", paras);
+        Assert.Contains("Visible", paras);
+    }
 }

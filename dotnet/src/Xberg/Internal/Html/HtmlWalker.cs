@@ -990,38 +990,8 @@ public sealed class HtmlWalker
 
     internal static string? ExtractAttr(string attrs, string name)
     {
-        int i = 0, n = attrs.Length;
-        while (i < n)
-        {
-            while (i < n && char.IsWhiteSpace(attrs[i])) i++;
-            if (i >= n) break;
-            int ks = i;
-            while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
-            string key = attrs[ks..i];
-            while (i < n && char.IsWhiteSpace(attrs[i])) i++;
-            string? value = null;
-            if (i < n && attrs[i] == '=')
-            {
-                i++;
-                while (i < n && char.IsWhiteSpace(attrs[i])) i++;
-                if (i < n && (attrs[i] == '"' || attrs[i] == '\''))
-                {
-                    char q = attrs[i++];
-                    int vs = i;
-                    while (i < n && attrs[i] != q) i++;
-                    value = attrs[vs..i];
-                    if (i < n) i++;
-                }
-                else
-                {
-                    int vs = i;
-                    while (i < n && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>') i++;
-                    value = attrs[vs..i];
-                }
-            }
-            if (key.Length == 0) { i++; continue; }
+        foreach (var (key, value) in EnumerateAttributes(attrs))
             if (key.Equals(name, StringComparison.OrdinalIgnoreCase)) return value ?? "";
-        }
         return null;
     }
 

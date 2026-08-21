@@ -10,8 +10,8 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2456 fixtures of 2942 (83.5%) match on every hard dimension**; **0 catastrophes**; 4
-> fixtures still lose content (svg, eml, epub, odt). 1075 unit tests.
+> **2488 fixtures of 2942 (84.6%) match on every hard dimension**; **0 catastrophes**; 2
+> fixtures still lose content (eml, epub — both wanting the MathML converter). 1105 unit tests.
 >
 > The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
 > stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
@@ -92,6 +92,28 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > - **An empty bullet before every list item on `pdf/multi_page.pdf`.** Upstream emits `- ` with
 >   nothing after it, then the item's text as a separate bold paragraph, wherever a bullet glyph
 >   is its own text run. This port keeps the item and its text together.
+>
+> ## Goldens the current Rust tree no longer reproduces
+>
+> A separate category from an upstream defect, and one to check before chasing any HTML failure:
+> some goldens were generated against an older `html-to-markdown-rs` than the workspace now
+> resolves. `dotnet/tools/xberg-reference-gen/Cargo.lock` pins **3.10.6** while the root
+> `Cargo.toml` asks for `^3.11`, so `cargo build --locked` in that directory fails outright and an
+> unlocked build silently picks up a different converter than the one the goldens were made with.
+>
+> Verified by regenerating: rebuild `xberg-reference-gen`, run it over a copy of the fixture, and
+> diff the fresh `-results-rust.json` against the committed one. Every HTML fixture this port
+> fixed reproduces byte-for-byte; **all seven that remain do not** —
+> `html/hip_13044_b.html`, `html/international_emergency_medicine.html`, `html/sinthgunt.html`,
+> `html/taylor_swift.html`, `vendored/docling/html/wiki_duck.html` and both copies of
+> `vendored/markitdown/test_wikipedia.html`. So does `epub/features.epub`, and
+> `epub/wasteland.epub` on markdown alone. The two visible signatures of the older converter are
+> newlines preserved inside table cells and `<noscript>` content rendered rather than skipped.
+>
+> Measured against a *freshly generated* reference instead, `html/sinthgunt.html` now matches on
+> plain, html and json. The right fix is to regenerate the goldens (see "Re-syncing after an
+> upstream merge"), not to reverse-engineer the old converter — and the lock file should be
+> brought back in step with the workspace first, so the next regeneration is reproducible.
 
 ## Known gaps after the merge
 
@@ -217,6 +239,38 @@ not a cosmetic difference.
       `$}$` stay literal.
 - [x] **Citation formats (nbib, ris).** Both at full parity. The parsers were fine; the element
       carried only the title, so everything else was parsed and then dropped.
+- [~] **html 34/41 on the goldens that exist (was 29).** Eight conversion rules that had never
+      been ported, all read out of `html-to-markdown-rs` rather than guessed at:
+      - **`<pre>` came from the wrong module.** The crate carries two copies of the handler;
+        `block/preformatted.rs` is dead code and `converter/main.rs` dispatches to
+        `handlers/code_block.rs`. The live one dedents unconditionally and keeps a
+        whitespace-only line verbatim — the markdown has its line ends trimmed globally
+        afterwards, but the structure collector's Code node does not.
+      - **`<cite>` gained emphasis it should not have.** `semantic/attributes.rs::handle_cite`
+        italicizes, but nothing dispatches to it; the tag falls to the unknown handler.
+      - **`<abbr>` never spelled itself out** (`text (title)`).
+      - **The whole form family rendered nothing.** `<button>`, `<label>`, `<fieldset>`,
+        `<legend>`, `<select>`/`<option>`/`<optgroup>`, `<textarea>` and the measurement
+        elements each render their children and differ only in the spacing they add. A page's
+        close button holding an inline `<svg>` is how three fixtures lost their icons.
+      - **The media family too.** `<video>`/`<audio>` become a link to their source plus their
+        fallback content, `<iframe>` a link to its src, and `<picture>` reduces to the first
+        `<img>` it holds — which is where Wikipedia's footer logos live.
+      - **An inline `<svg>` is an image**, serialized to a base64 data URI with its attributes
+        sorted and their canonical camelCase restored (`converter/utility/svg_attrs.rs`).
+      - **`<table><caption>` was dropped.** The converter's grid carries only cells, so upstream
+        re-scans the raw HTML and inserts the nth caption before the nth table element
+        (`extractors/html.rs::recover_table_captions`).
+      - **Plain output uses a different walker.** `converter/plain_text.rs` replaces the returned
+        text when the caller asks for plain; the structure is the markdown walk's either way, so
+        it only shows on a page that yields no structured blocks and falls back to the whole
+        conversion as one paragraph. That fallback also stopped trimming the text, which upstream
+        pushes verbatim.
+
+      Two metadata rules with it: an autolink returns from the link handler *before* the metadata
+      collector runs, so `<https://example.com>` is a link in the output and no entry in `links`;
+      and a permalink anchor inside a heading is collected by the ordinary `<a>` handler, which
+      the heading path does not bypass.
 - [~] **html 33/157 (was 27).** Two defects fixed: cells
       were placed by advancing through each row on its own, which ignores the columns a rowspan
       from an earlier row still covers and slides everything beneath one out from under its
@@ -276,9 +330,62 @@ not a cosmetic difference.
 - [x] **xml 8/15 → 14, svg 30/41 → 40.** Entity references were treated as boundaries and
       dropped. Upstream wraps quick-xml in an `EntityReader` that coalesces the surrounding text
       and resolves the reference; the port modelled the splitting without the coalescing.
-- [x] **yaml 4/10 → 8.** A number now keeps the lexeme it was written with, so a 64-bit hash
-      above `long.MaxValue` stays exact and `397.0` stays a float. A failed parse falls through
-      rather than throwing out of the extractor, which had been losing four documents whole.
+- [x] **yaml 4/10 → 8 → 10/10.** A number now keeps the lexeme it was written with, so a 64-bit
+      hash above `long.MaxValue` stays exact and `397.0` stays a float. A failed parse falls
+      through rather than throwing out of the extractor, which had been losing four documents
+      whole. Two more, in the second pass: a double-quoted scalar resolves its escapes (`\uXXXX`
+      above all — a document that writes a curly apostrophe as `’` had the literal characters
+      `u2019` in its text), and one that runs past the end of its line folds back onto one line,
+      a plain break to a space and a backslash-escaped break to nothing (YAML 1.2 §7.3.1);
+      without the fold the scalar never closes and everything after it parses as if inside it,
+      which truncated one fixture by a third.
+
+      The float spelling also depends on which value the flattener was handed: YAML deserializes
+      into a `serde_json::Value` first, so its floats print serde's way and keep a fractional
+      part, while TOML flattens from `toml::Value` and prints through Rust's own `Display for
+      f64`, which drops the trailing `.0`. One `DisplayNumber` for both had `397.0` collapsing to
+      `397` in a YAML document.
+- [x] **svg 40/41 → 41/41.** The SVG text-element filter — only text inside `text`/`tspan`/
+      `title`/`desc`/`textPath` counts as content — was applied to CDATA sections as well.
+      Upstream guards only the `Text` arm; a CDATA section is how an SVG carries its script and
+      style bodies, and on one flamegraph fixture that was half the document (34,399 characters
+      against our 17,782).
+- [x] **rtf 18/19 → 19/19.** A `\'hh` escape was always decoded as Windows-1252. It decodes with
+      the active code page: the font table's `\fcharsetN` for the font in scope (or the `\deffN`
+      default), then `\ansicpgNNNN`, then 1252 — and `\fcharset` numbers are RTF's own font-charset
+      enumeration, not code page numbers, so they need translating. Adjacent escapes are decoded
+      as one byte string, since a multi-byte code page spells one character across several.
+- [x] **tex 8/9 → 9/9.** `longtable`, `tabularx` and `tabulary` hold the same `&`-separated grid
+      as `tabular` and were reaching no table handler at all; and longtable's page-break markers
+      (`\endhead`, `\endlastfoot`, the booktabs rules) are scaffolding rather than rows.
+- [x] **pptx 10/11 → 11/11.** Only `a:r` was read. Two siblings carry text as well: `a:br`, an
+      explicit in-paragraph line break, and `a:fld`, a field — a slide number — whose rendered
+      value PowerPoint caches in a nested `a:t`.
+- [x] **odt 17/21 → 20/21.** Three defects: a note's key lost the `fn`/`en` prefix that is the
+      only thing telling a footnote from an endnote; the inline run was read one level deep, so a
+      span inside a span lost its tail and a caption inside a `draw:text-box` was seen only by the
+      dedicated caption pass rather than twice as upstream sees it; and a pagination field's
+      cached display text was emitted as document content. The last fixture, `odt/formula.odt`,
+      needs the MathML→LaTeX converter below.
+- [x] **eml 39/43 → 42/43.** Only a *missing* image description becomes the `[Image]`
+      placeholder. `alt=""` is a deliberate "this image carries no meaning" and stays the empty
+      string; treating it as absent put a column of `[Image]` through every marketing email.
+
+      The last one, `email-replace-mime-encodings-error-5.eml`, is malformed MIME recovery: no
+      boundary in it is ever closed with `--`, and `mail_parser` recovers by keeping the
+      `text/plain` alternative as the body and demoting the `text/html` one to an attachment,
+      where this port takes the HTML part. Not a rule to port — a difference in how two parsers
+      guess at a broken message.
+- [x] **epub 5/9 → 8/9.** `<audio>`/`<video>` subtrees are stripped before conversion — they are
+      delivery controls, and the conversion otherwise emits their source URLs and serialized
+      fallback markup beside the prose. And a `<blockquote>` is recorded even though its contents
+      are not inside it: the walker's nodes are flat, so the quote opens and closes at once and
+      the quoted paragraph follows as a sibling (upstream #127).
+- [ ] **MathML → LaTeX (`extraction/mathml.rs`, ~1000 lines plus `math_symbols`).** Not ported.
+      It is what `odt/formula.odt` needs (`E=m\cdot c^{2}` where this port emits the concatenated
+      token text `E = m ⋅ c^2`), what `epub/features.epub`'s equation tests need, and what
+      `extractors/html.rs::recover_mathml_formulas` needs to recover a `<math>` subtree the
+      conversion library's structure has no node kind for.
 - [x] **markdown tables (761/782 → 781).** A GFM table's header fixes its width; short rows are
       padded and long ones truncated, so a row's nth value stays under the nth heading.
 - [x] **AsciiDoc, ODP, WebVTT, Quarto, R Markdown.** Five formats that reached no extractor.

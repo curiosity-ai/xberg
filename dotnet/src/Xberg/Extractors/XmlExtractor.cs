@@ -80,7 +80,9 @@ public sealed class XmlExtractor : IExtractor
                 }
                 case EventKind.CData:
                 {
-                    if (isSvg && !stack.Any(SvgTextElements.Contains)) break;
+                    // No SVG text-element filter here: upstream guards only the `Text` arm, so a
+                    // CDATA section — which is how an SVG carries its script and style bodies —
+                    // is kept wherever it appears.
                     string trimmed = ev.Text.Trim();
                     if (trimmed.Length == 0) break;
                     doc.PushElement(MakeElement(ElementKind.Paragraph, trimmed, depth, index++, null));

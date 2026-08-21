@@ -185,8 +185,14 @@ public sealed class EpubExtractor : IExtractor
 
             switch (content.Which)
             {
+                // The blockquote container is recorded even though its contents are not inside it
+                // (issue #127): upstream brackets the span the node claims as children, and this
+                // walker's nodes are flat, so the quote opens and closes at once and the quoted
+                // paragraph follows it as a sibling.
                 case NodeContent.Tag.Quote:
-                    continue; // handled via parent tracking upstream; skip here
+                    builder.PushQuoteStart();
+                    builder.PushQuoteEnd();
+                    continue;
 
                 case NodeContent.Tag.Heading:
                     builder.PushHeading(content.Level, content.Text ?? "", null, null);

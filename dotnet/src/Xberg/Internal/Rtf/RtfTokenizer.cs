@@ -33,6 +33,15 @@ internal sealed class CharCursor
     public int Next() => _i < _cp.Length ? _cp[_i++] : -1;
 
     public bool HasNext => _i < _cp.Length;
+
+    /// <summary>
+    /// The cursor's position, so a caller can look ahead and rewind (Rust clones the iterator).
+    /// </summary>
+    public int Position
+    {
+        get => _i;
+        set => _i = value;
+    }
 }
 
 /// <summary>UTF-8 helpers mirroring Rust `char::len_utf8` / `char::from_u32`.</summary>

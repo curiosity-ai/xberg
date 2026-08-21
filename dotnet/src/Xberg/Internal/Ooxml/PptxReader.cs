@@ -253,18 +253,31 @@ public static class PptxReader
         return new SlideElement { Kind = SlideKind.Image, ImageId = embed, Description = descr };
     }
 
+    /// <summary>
+    /// A paragraph's runs (`extraction/pptx/parser.rs::parse_paragraph`).
+    /// </summary>
+    /// <remarks>
+    /// Besides `a:r`, two siblings carry text: `a:br`, an explicit in-paragraph line break, and
+    /// `a:fld`, a field — a slide number or date — whose rendered value PowerPoint caches in a
+    /// nested `a:t`, so it reads exactly like a run.
+    /// </remarks>
     private static List<Run> ParseParagraph(XElement p, bool addNewLine)
     {
-        var runNodes = p.Elements().Where(e => e.Name.LocalName == "r").ToList();
-        var runs = new List<Run>(runNodes.Count);
-        for (int i = 0; i < runNodes.Count; i++)
+        var runs = new List<Run>();
+        foreach (var child in p.Elements())
         {
-            var run = ParseRun(runNodes[i]);
-            if (addNewLine && i == runNodes.Count - 1) run.Text += "\n";
-            runs.Add(run);
+            switch (child.Name.LocalName)
+            {
+                case "r": runs.Add(ParseRun(child)); break;
+                case "br": runs.Add(LineBreakRun()); break;
+                case "fld": runs.Add(ParseRun(child)); break;
+            }
         }
+        if (addNewLine && runs.Count > 0) runs[^1].Text += "\n";
         return runs;
     }
+
+    private static Run LineBreakRun() => new() { Text = "\n" };
 
     private static Run ParseRun(XElement r)
     {

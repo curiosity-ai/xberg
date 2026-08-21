@@ -120,4 +120,22 @@ public class EmailExtractorTests
             "From: =?utf-8?B?QW5kcsOp?= <andre@example.com>\r\nSubject: Hi\r\n\r\nBody.\r\n", OutputFormat.Plain);
         Assert.Contains("From: André <andre@example.com>", plain);
     }
+
+    /// <summary>
+    /// Only a *missing* description becomes the `[Image]` placeholder. `alt=""` is a deliberate
+    /// "this image carries no meaning", and a marketing email's tracking pixels and social icons
+    /// all carry one — placeholding them puts a column of `[Image]` through the message.
+    /// </summary>
+    [Fact]
+    public void AnEmptyAltIsNotAnImagePlaceholder()
+    {
+        const string eml =
+            "From: a@example.com\r\nSubject: Pixels\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n\r\n" +
+            "<html><body><p>Hi.</p><img alt=\"\" src=\"/pixel.png\"/><img src=\"/logo.png\"/></body></html>\r\n";
+
+        string plain = Extract(eml, OutputFormat.Plain);
+        Assert.Contains("Hi.", plain);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(plain, @"\[Image\]"));
+    }
 }

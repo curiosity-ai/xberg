@@ -92,7 +92,8 @@ internal static class EpubContent
             }
 
             string normalizedXhtml = NormalizeXhtml(rawXhtml);
-            string renderXhtml = StripSpecializedNavigationSections(StripDocumentHead(normalizedXhtml));
+            string renderXhtml = StripEmbeddedMediaElements(
+                StripSpecializedNavigationSections(StripDocumentHead(normalizedXhtml)));
 
             if (guideTocCandidate && LooksLikeNavigationDocument(renderXhtml))
                 continue;
@@ -189,6 +190,14 @@ internal static class EpubContent
 
     /// <summary>Remove the entire &lt;head&gt; element. Mirrors `strip_document_head`.</summary>
     public static string StripDocumentHead(string xhtml) => StripElements(xhtml, "head", _ => true);
+
+    /// <summary>
+    /// Remove &lt;audio&gt; and &lt;video&gt; subtrees (`strip_embedded_media_elements`). They are
+    /// delivery controls rather than book text, and the HTML conversion would otherwise emit
+    /// their source URLs and the serialized fallback markup alongside the prose.
+    /// </summary>
+    public static string StripEmbeddedMediaElements(string xhtml) =>
+        StripElements(StripElements(xhtml, "audio", _ => true), "video", _ => true);
 
     /// <summary>Remove specialized navigation &lt;nav&gt; sections (toc/landmarks/page-list).</summary>
     public static string StripSpecializedNavigationSections(string xhtml) =>

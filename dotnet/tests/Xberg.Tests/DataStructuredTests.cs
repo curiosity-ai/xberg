@@ -123,6 +123,47 @@ public class DataStructuredTests
         Assert.Contains("alerts.cpu: 80", flattened);
     }
 
+    /// <summary>
+    /// YAML is deserialized into a serde JSON value first, so its floats print serde's way:
+    /// always with a fractional part. TOML is flattened from its own value type, whose float
+    /// prints through Rust's `Display for f64` and drops the trailing `.0`.
+    /// </summary>
+    [Fact]
+    public void AYamlFloatKeepsItsPointInTheFlattenedViewWhereATomlOneDoesNot()
+    {
+        var yaml = Extract("size:\n  height: 397.0\n  width: 397\n", "application/yaml");
+        var flattened = yaml.Metadata.Additional["flattened_fields"].EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Contains("size.height: 397.0", flattened);
+        Assert.Contains("size.width: 397", flattened);
+    }
+
+    /// <summary>
+    /// A double-quoted YAML scalar resolves its escapes. The numeric forms matter as much as the
+    /// named ones: leaving `’` alone puts the characters `u2019` into the text.
+    /// </summary>
+    [Fact]
+    public void AQuotedYamlScalarResolvesItsEscapes()
+    {
+        string plain = Plain("orig: \"Let\\u2019s swim!\\tnow\"\n", "application/yaml");
+        Assert.Contains("orig: Let’s swim!\tnow", plain);
+    }
+
+    /// <summary>
+    /// A double-quoted scalar may run past the end of its line: a plain break folds to one space,
+    /// and a break the writer escaped with a trailing backslash folds to nothing. Without the
+    /// fold the scalar never closes and the rest of the document parses as though inside it.
+    /// </summary>
+    [Fact]
+    public void AQuotedYamlScalarFoldsAcrossLines()
+    {
+        string plain = Plain(
+            "a: \"one\\\n  \\ two\"\nb: \"three\n  four\"\nc: tail\n", "application/yaml");
+        Assert.Contains("a: one two", plain);
+        Assert.Contains("b: three four", plain);
+        Assert.Contains("c: tail", plain);
+    }
+
     [Theory]
     // serde_json's default (non-float_roundtrip) fast-path parser double-rounds: it scales a
     // u64 significand by an exact power of ten, so many-digit inputs land 1 ULP off the

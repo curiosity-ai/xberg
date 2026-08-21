@@ -500,4 +500,151 @@ public class HtmlExtractorTests
         Assert.Contains("\"text\":\"Functions\"", json);
         Assert.Contains("The *quick* fox", json);
     }
+
+    // \u2500\u2500 conversion rules ported from html-to-markdown-rs \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    /// <summary>
+    /// A `&lt;pre&gt;` is dedented unconditionally, and a whitespace-only line keeps its spaces:
+    /// the markdown has its line ends trimmed globally afterwards, but the Code element does not.
+    /// </summary>
+    [Fact]
+    public void PreDedentsAlwaysAndKeepsBlankLineWhitespace()
+    {
+        var doc = Html("<html><body><pre><code>\n            aaa\n            bbb\n        </code></pre></body></html>");
+        var code = Assert.Single(doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Code));
+        Assert.Equal("aaa\nbbb\n        ", code.Text);
+    }
+
+    /// <summary>
+    /// `&lt;cite&gt;` has an italicizing handler upstream that nothing dispatches to, so a
+    /// citation keeps its own inline markup and gains none.
+    /// </summary>
+    [Fact]
+    public void CiteAddsNoEmphasis()
+    {
+        Assert.Equal("x Y z\n", HtmlToMarkdown.Convert("<html><body><p>x <cite>Y</cite> z</p></body></html>"));
+    }
+
+    /// <summary>An abbreviation spells itself out: its text, then its title in parentheses.</summary>
+    [Fact]
+    public void AbbrAppendsItsTitle()
+    {
+        Assert.Equal("RA: (Right Ascension) +3\n",
+            HtmlToMarkdown.Convert("<html><body><p><abbr title=\"Right Ascension\">RA:</abbr> +3</p></body></html>"));
+    }
+
+    /// <summary>
+    /// A `&lt;button&gt;` renders its children and adds a block separator; being a form control
+    /// removes neither the text nor the images inside it.
+    /// </summary>
+    [Fact]
+    public void ButtonRendersItsContent()
+    {
+        Assert.Equal("Close\n\nafter\n",
+            HtmlToMarkdown.Convert("<html><body><button type=\"button\">Close</button><p>after</p></body></html>"));
+    }
+
+    /// <summary>A `&lt;legend&gt;` is bold; a selected `&lt;option&gt;` is bulleted.</summary>
+    [Fact]
+    public void FieldsetLegendIsBoldAndSelectedOptionIsBulleted()
+    {
+        string md = HtmlToMarkdown.Convert(
+            "<html><body><fieldset><legend>Colours</legend>" +
+            "<select><option>red</option><option selected>green</option></select>" +
+            "</fieldset></body></html>");
+        Assert.Contains("**Colours**", md);
+        Assert.Contains("* green", md);
+    }
+
+    /// <summary>
+    /// A media element markdown cannot embed becomes a link to its source plus its fallback
+    /// content; a `&lt;picture&gt;` reduces to the first `&lt;img&gt;` it holds.
+    /// </summary>
+    [Fact]
+    public void VideoLinksItsSourceAndPictureReducesToItsImage()
+    {
+        string md = HtmlToMarkdown.Convert(
+            "<html><body><video controls=\"controls\"><source src=\"/v.mp4\" type=\"video/mp4\"/>" +
+            "<p>no video</p></video></body></html>");
+        Assert.Contains("[/v.mp4](/v.mp4)", md);
+        Assert.Contains("no video", md);
+
+        Assert.Equal("![logo](/l.svg)\n",
+            HtmlToMarkdown.Convert("<html><body><picture><source srcset=\"/big.svg\"/>" +
+                                   "<img src=\"/l.svg\" alt=\"logo\"/></picture></body></html>"));
+    }
+
+    /// <summary>
+    /// An inline `&lt;svg&gt;` becomes an image whose source is the serialized subtree as a
+    /// base64 data URI, with attributes sorted and their canonical camelCase restored.
+    /// </summary>
+    [Fact]
+    public void InlineSvgBecomesABase64DataUri()
+    {
+        string md = HtmlToMarkdown.Convert(
+            "<html><body><svg width=\"10\" viewBox=\"0 0 1 1\" height=\"10\"><path d=\"M 0 0\"/></svg></body></html>");
+        Assert.StartsWith("![SVG Image](data:image/svg+xml;base64,", md);
+        int start = md.IndexOf("base64,", StringComparison.Ordinal) + "base64,".Length;
+        int end = md.IndexOf(')', start);
+        string svg = Encoding.UTF8.GetString(Convert.FromBase64String(md[start..end]));
+        Assert.Equal("<svg height=\"10\" viewBox=\"0 0 1 1\" width=\"10\"><path d=\"M 0 0\" /></svg>", svg);
+    }
+
+    /// <summary>
+    /// A `&lt;table&gt;&lt;caption&gt;` is recovered as a paragraph immediately before its table:
+    /// the converter's grid carries only cells, so the caption is otherwise lost.
+    /// </summary>
+    [Fact]
+    public void TableCaptionBecomesAParagraphBeforeItsTable()
+    {
+        var doc = Html("<html><body><table><caption>Basic <b>duck</b> facts</caption>" +
+                       "<tr><th>Name</th></tr><tr><td>Mallard</td></tr></table></body></html>");
+        int caption = doc.Elements.FindIndex(e => e.Text == "Basic duck facts");
+        int table = doc.Elements.FindIndex(e => e.Kind.Tag == ElementKindTag.Table);
+        Assert.True(caption >= 0 && table == caption + 1);
+    }
+
+    /// <summary>
+    /// An autolink returns from the link handler before the metadata collector runs, so a link
+    /// whose visible text is its own href is in the output and not in `links`.
+    /// </summary>
+    [Fact]
+    public void AnAutolinkIsNotCollectedAsALink()
+    {
+        var m = Meta("<html><body><p><a href=\"https://e.example/x\">https://e.example/x</a> " +
+                     "<a href=\"https://e.example/y\">Y</a></p></body></html>");
+        string json = System.Text.Json.JsonSerializer.Serialize(m.Links);
+        Assert.DoesNotContain("https://e.example/x", json);
+        Assert.Contains("https://e.example/y", json);
+    }
+
+    /// <summary>
+    /// A permalink anchor inside a heading is still a link: upstream collects it from the
+    /// ordinary `&lt;a&gt;` handler, which the heading path does not bypass.
+    /// </summary>
+    [Fact]
+    public void AHeadingsPermalinkAnchorIsAlsoCollectedAsALink()
+    {
+        var m = Meta("<html><body><h2>Setup<a href=\"#setup\" class=\"hash-link\">\u200b</a></h2></body></html>");
+        string json = System.Text.Json.JsonSerializer.Serialize(m.Links);
+        Assert.Contains("#setup", json);
+        Assert.Contains("hash-link", json);
+    }
+
+    /// <summary>
+    /// Asking for plain output swaps the conversion text for the plain-text walker's, which is
+    /// what reaches the document when the page yields no structured blocks at all.
+    /// </summary>
+    [Fact]
+    public void PlainOutputFallsBackToThePlainTextWalker()
+    {
+        const string html = "<html><body><a href=\"/start.html\"><div>This is some text.</div></a></body></html>";
+        var plain = new HtmlExtractor().Extract(
+            Encoding.UTF8.GetBytes(html), "text/html", new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        var markdown = new HtmlExtractor().Extract(
+            Encoding.UTF8.GetBytes(html), "text/html", new ExtractionConfig { OutputFormat = OutputFormat.Markdown });
+
+        Assert.Equal("This is some text.\n", Assert.Single(plain.Elements).Text);
+        Assert.Equal("[This is some text.](/start.html)\n", Assert.Single(markdown.Elements).Text);
+    }
 }

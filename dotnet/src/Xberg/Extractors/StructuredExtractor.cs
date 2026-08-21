@@ -277,7 +277,7 @@ public sealed class StructuredExtractor : IExtractor
         var textFields = new List<string>();
         var flattened = new List<string>();
         var path = new StringBuilder();
-        ExtractFromNode(value, path, meta, textFields, flattened);
+        ExtractFromNode(value, path, meta, textFields, flattened, serdeNumbers: true);
         return new StructuredResult(text, "yaml", meta, textFields, ToElement(value), flattened);
     }
 
@@ -289,7 +289,7 @@ public sealed class StructuredExtractor : IExtractor
         var textFields = new List<string>();
         var flattened = new List<string>();
         var path = new StringBuilder();
-        ExtractFromNode(value, path, meta, textFields, flattened);
+        ExtractFromNode(value, path, meta, textFields, flattened, serdeNumbers: false);
         return new StructuredResult(text, "toml", meta, textFields, ToElement(value), flattened);
     }
 
@@ -360,17 +360,20 @@ public sealed class StructuredExtractor : IExtractor
     /// the point, because there it is what distinguishes a float from an integer. An integer
     /// lexeme is printed verbatim so a value too large for a double stays exact.
     /// </remarks>
-    private static string DisplayNumber(JsonValue value)
+    private static string DisplayNumber(JsonValue value, bool serdeNumbers)
     {
         string raw = value.ToJsonString();
         if (raw.IndexOfAny(new[] { '.', 'e', 'E' }) < 0) return raw;
-        return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double d)
-            ? d.ToString("R", CultureInfo.InvariantCulture)
-            : raw;
+        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double d)) return raw;
+        // Which spelling depends on the value the flattener was handed. YAML is deserialized into
+        // a `serde_json::Value` first, so its floats print serde's way — always with a fractional
+        // part, `397.0`. TOML is flattened from `toml::Value` directly, and a `toml::Value::Float`
+        // prints through Rust's own `Display for f64`, which drops the trailing `.0`.
+        return serdeNumbers ? SerdeFloat.Format(d) : d.ToString("R", CultureInfo.InvariantCulture);
     }
 
     private static void ExtractFromNode(JsonNode? value, StringBuilder path,
-        Dictionary<string, string> meta, List<string> textFields, List<string> flattened)
+        Dictionary<string, string> meta, List<string> textFields, List<string> flattened, bool serdeNumbers)
     {
         switch (value)
         {
@@ -381,7 +384,7 @@ public sealed class StructuredExtractor : IExtractor
                 // path.
                 if (obj.Count == 1 && obj.First().Key == TomlDatetimeKey)
                 {
-                    ExtractFromNode(obj.First().Value, path, meta, textFields, flattened);
+                    ExtractFromNode(obj.First().Value, path, meta, textFields, flattened, serdeNumbers);
                     break;
                 }
                 foreach (var kv in obj)
@@ -389,7 +392,7 @@ public sealed class StructuredExtractor : IExtractor
                     int baseLen = path.Length;
                     if (path.Length > 0) path.Append('.');
                     path.Append(kv.Key);
-                    ExtractFromNode(kv.Value, path, meta, textFields, flattened);
+                    ExtractFromNode(kv.Value, path, meta, textFields, flattened, serdeNumbers);
                     path.Length = baseLen;
                 }
                 break;
@@ -399,7 +402,7 @@ public sealed class StructuredExtractor : IExtractor
                     int baseLen = path.Length;
                     if (path.Length == 0) { path.Append("item_"); path.Append(i); }
                     else { path.Append('['); path.Append(i); path.Append(']'); }
-                    ExtractFromNode(arr[i], path, meta, textFields, flattened);
+                    ExtractFromNode(arr[i], path, meta, textFields, flattened, serdeNumbers);
                     path.Length = baseLen;
                 }
                 break;
@@ -416,7 +419,7 @@ public sealed class StructuredExtractor : IExtractor
                         }
                         break;
                     case JsonValueKind.Number:
-                        flattened.Add($"{path}: {DisplayNumber(jv)}");
+                        flattened.Add($"{path}: {DisplayNumber(jv, serdeNumbers)}");
                         break;
                     case JsonValueKind.True:
                         flattened.Add($"{path}: true");

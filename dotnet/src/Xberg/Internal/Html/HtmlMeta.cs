@@ -31,7 +31,7 @@ public static class HtmlMeta
         string? headingId = null;
         // A heading's recorded text is the markdown its children convert to, so a permalink
         // anchor inside one is `[label](href)` rather than the label alone.
-        var headingLinks = new List<(int LabelStart, string Href, string? Title)>();
+        var headingLinks = new List<(int LabelStart, string Href, string? Title, List<string[]> Attrs, List<string> Rel)>();
         // html-to-markdown walks a table's subtree three times — once to build the grid, once to
         // write the markdown, once for the structure — and the collector records what it sees on
         // every pass. So a table's headings, links and images each appear three times over, in
@@ -61,6 +61,9 @@ public static class HtmlMeta
         }
         bool inAnchor = false;
         var anchorText = new StringBuilder();
+        // The autolink test is made against the anchor's plain text, not the markdown its
+        // children render to, so the two are accumulated separately.
+        var anchorRawText = new StringBuilder();
         string anchorHref = "";
         string? anchorTitle = null;
         List<string[]> anchorAttrs = new();
@@ -92,6 +95,7 @@ public static class HtmlMeta
                     pos = e < 0 ? n : e + 3;
                     continue;
                 }
+                int tagStart = pos;
                 int gt = html.IndexOf('>', pos);
                 if (gt < 0) break;
                 string raw = html[(pos + 1)..gt];
@@ -135,17 +139,26 @@ public static class HtmlMeta
                     }
                     else if (tag == "a" && inAnchor)
                     {
-                        string text = HtmlWalker.NormalizeWhitespace(anchorText.ToString());
-                        var link = new Link
+                        // An autolink returns from the link handler before it reaches the
+                        // metadata collector, so `<https://example.com>` is a link in the output
+                        // and no entry in `links` (`handlers/link.rs`).
+                        string rawText = HtmlWalker.NormalizeWhitespace(anchorRawText.ToString()).Trim();
+                        bool isAutolink = anchorHref.Length > 0 && HtmlToMarkdown.HasUriScheme(anchorHref)
+                            && (rawText == anchorHref
+                                || (anchorHref.StartsWith("mailto:", StringComparison.Ordinal)
+                                    && rawText == anchorHref[7..]));
+                        if (!isAutolink)
                         {
-                            Href = anchorHref,
-                            Text = text,
-                            Title = anchorTitle,
-                            LinkType = ClassifyLink(anchorHref),
-                            Rel = anchorRel,
-                            Attributes = anchorAttrs,
-                        };
-                        LinkSink().Add(link);
+                            LinkSink().Add(new Link
+                            {
+                                Href = anchorHref,
+                                Text = HtmlWalker.NormalizeWhitespace(anchorText.ToString()),
+                                Title = anchorTitle,
+                                LinkType = ClassifyLink(anchorHref),
+                                Rel = anchorRel,
+                                Attributes = anchorAttrs,
+                            });
+                        }
                         inAnchor = false;
                     }
                     else if (InlineMarker(tag) is { } closeMarker && (captureHeading != 0 || inAnchor))
@@ -154,7 +167,7 @@ public static class HtmlMeta
                     }
                     else if (tag == "a" && captureHeading != 0 && headingLinks.Count > 0)
                     {
-                        var (labelStart, linkHref, linkTitle) = headingLinks[^1];
+                        var (labelStart, linkHref, linkTitle, linkAttrs, linkRel) = headingLinks[^1];
                         headingLinks.RemoveAt(headingLinks.Count - 1);
                         string label = HtmlWalker.NormalizeWhitespace(
                             headingText.ToString(labelStart, headingText.Length - labelStart));
@@ -162,6 +175,18 @@ public static class HtmlMeta
                         headingText.Append(label).Append("](").Append(linkHref);
                         if (linkTitle is { Length: > 0 }) headingText.Append(" \"").Append(linkTitle).Append('"');
                         headingText.Append(')');
+                        // A permalink anchor inside a heading is still a link: upstream collects
+                        // it from its ordinary `<a>` handler, which the heading path does not
+                        // bypass, so recording it only in the heading's markdown loses it.
+                        LinkSink().Add(new Link
+                        {
+                            Href = linkHref,
+                            Text = label,
+                            Title = linkTitle,
+                            LinkType = ClassifyLink(linkHref),
+                            Rel = linkRel,
+                            Attributes = linkAttrs,
+                        });
                     }
                     else if (tag == "head") inHead = false;
                     else if (tag == "title" && inTitle)
@@ -274,13 +299,16 @@ public static class HtmlMeta
                     case "a" when captureHeading != 0 && HtmlWalker.ExtractAttr(attrsStr, "href") is { } headingHref:
                     {
                         headingText.Append('[');
-                        headingLinks.Add((headingText.Length, headingHref, HtmlWalker.ExtractAttr(attrsStr, "title")));
+                        var headingAttrs = ParseAttrs(attrsStr, exclude: "href", out var headingRel);
+                        headingLinks.Add((headingText.Length, headingHref,
+                            HtmlWalker.ExtractAttr(attrsStr, "title"), headingAttrs, headingRel));
                         break;
                     }
                     case "a":
                     {
                         inAnchor = true;
                         anchorText.Clear();
+                        anchorRawText.Clear();
                         anchorHref = ExtractAttrDecoded(attrsStr, "href") ?? "";
                         anchorTitle = ExtractAttrDecoded(attrsStr, "title");
                         anchorAttrs = ParseAttrs(attrsStr, exclude: "href", out anchorRel);
@@ -317,6 +345,23 @@ public static class HtmlMeta
                         if (inAnchor) anchorText.Append("![").Append(alt ?? "").Append("](").Append(src ?? "").Append(')');
                         break;
                     }
+                    // An `<svg>` converts to an image whose source is the serialized subtree, so
+                    // a link or heading wrapping one carries that markdown in its label. Its
+                    // children never reach the converter's walk, so the subtree is skipped here
+                    // too rather than scanned as page markup.
+                    case "svg" when !selfClose:
+                    {
+                        int svgEnd = FindElementEnd(html, tagStart, "svg");
+                        string markup = html[tagStart..(svgEnd < 0 ? n : svgEnd)];
+                        if (captureHeading != 0 || inAnchor)
+                        {
+                            string rendered = HtmlToMarkdown.RenderSvgImage(markup);
+                            if (captureHeading != 0) headingText.Append(rendered);
+                            else anchorText.Append(rendered);
+                        }
+                        pos = svgEnd < 0 ? n : svgEnd;
+                        continue;
+                    }
                     case "script":
                     {
                         string? type = ExtractAttrDecoded(attrsStr, "type");
@@ -352,7 +397,11 @@ public static class HtmlMeta
                 if (lt < 0) lt = n;
                 string text = html[pos..lt];
                 if (captureHeading != 0) headingText.Append(HtmlWalker.DecodeEntities(text));
-                else if (inAnchor) anchorText.Append(HtmlWalker.DecodeEntities(text));
+                else if (inAnchor)
+                {
+                    anchorText.Append(HtmlWalker.DecodeEntities(text));
+                    anchorRawText.Append(HtmlWalker.DecodeEntities(text));
+                }
                 else if (inTitle) titleText.Append(HtmlWalker.DecodeEntities(text));
                 pos = lt;
             }
@@ -520,6 +569,39 @@ public static class HtmlMeta
     {
         var v = HtmlWalker.ExtractAttr(attrs, name);
         return v is null ? null : HtmlWalker.DecodeEntities(v);
+    }
+
+    /// <summary>
+    /// Index just past the close tag matching the element that starts at <paramref name="start"/>,
+    /// counting nested opens of the same name; -1 when it is never closed.
+    /// </summary>
+    private static int FindElementEnd(string html, int start, string name)
+    {
+        int depth = 0;
+        int i = start;
+        while (i < html.Length)
+        {
+            int lt = html.IndexOf('<', i);
+            if (lt < 0) return -1;
+            int gt = html.IndexOf('>', lt);
+            if (gt < 0) return -1;
+            string inner = html[(lt + 1)..gt];
+            bool closing = inner.StartsWith('/');
+            var (tagName, _) = HtmlWalker.SplitTagName(closing ? inner[1..] : inner.TrimEnd('/').Trim());
+            if (tagName.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                if (closing)
+                {
+                    if (--depth == 0) return gt + 1;
+                }
+                else if (!inner.TrimEnd().EndsWith('/'))
+                {
+                    depth++;
+                }
+            }
+            i = gt + 1;
+        }
+        return -1;
     }
 
     private static List<string[]> ParseAttrs(string attrs, string exclude, out List<string> rel)

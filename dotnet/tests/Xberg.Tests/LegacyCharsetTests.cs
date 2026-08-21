@@ -94,4 +94,37 @@ public class LegacyCharsetTests
         Assert.Equal("Greetings", result.Subject);
         Assert.Contains("Hello UTF-16 world", result.Content);
     }
+
+    /// <summary>
+    /// An RTF `\'hh` escape decodes with the active code page, not always Windows-1252: the
+    /// document's `\ansicpg`, and above it the active font's `\fcharsetN`.
+    /// </summary>
+    [Theory]
+    // \ansicpg1251 alone.
+    [InlineData(@"{\rtf1\ansi\ansicpg1251\deff0{\fonttbl{\f0\fnil Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2}", "Привет")]
+    // The active font's fcharset wins over a contradicting \ansicpg...
+    [InlineData(@"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204 Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2}", "Привет")]
+    // ...including over a redundant \cpg on the same font entry, per RTF 1.9.1.
+    [InlineData(@"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204\cpg1252 Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2}", "Привет")]
+    // \deffN alone selects the default font's charset.
+    [InlineData(@"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204 Arial;}}\'cf\'f0\'e8\'e2\'e5\'f2}", "Привет")]
+    // A multi-byte code page spells one character across two escapes.
+    [InlineData(@"{\rtf1\ansi\ansicpg932\deff0{\fonttbl{\f0\fnil\fcharset128 MS Mincho;}}\f0 \'93\'fa\'96\'7b}", "日本")]
+    public void RtfHexEscapes_DecodeWithTheActiveCodepage(string rtf, string expected)
+    {
+        var doc = new RtfExtractor().Extract(Encoding.ASCII.GetBytes(rtf), "application/rtf", new ExtractionConfig());
+        Assert.Contains(doc.Elements, e => e.Text.Contains(expected, StringComparison.Ordinal));
+    }
+
+    /// <summary>Each run decodes with its own font's charset when the document switches fonts.</summary>
+    [Fact]
+    public void RtfHexEscapes_FollowAMidDocumentFontSwitch()
+    {
+        const string rtf = @"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset204 Arial;}" +
+                           @"{\f1\fnil\fcharset161 Arial;}}\f0 \'cf\'f0\'e8\'e2\'e5\'f2 \f1 \'e3\'e5\'e9\'e1}";
+        var doc = new RtfExtractor().Extract(Encoding.ASCII.GetBytes(rtf), "application/rtf", new ExtractionConfig());
+        string text = string.Join("\n", doc.Elements.Select(e => e.Text));
+        Assert.Contains("Привет", text);
+        Assert.Contains("γεια", text);
+    }
 }

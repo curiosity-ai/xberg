@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using Xberg.Core;
 using Xberg.Internal.Html;
 using Xberg.Types;
@@ -31,8 +32,12 @@ public sealed class HtmlExtractor : IExtractor
         // that is why a `<br>` reaches the output as a markdown hard break and a table cell
         // carries its rendered markdown. The structure walker is kept for email and epub, which
         // are the paths upstream uses it for.
-        string markdown = HtmlToMarkdown.ConvertWithStructure(html, out var structure);
-        var doc = MapStructure(structure, markdown);
+        // `extraction/html/converter.rs::map_output_format` sends Plain to the conversion
+        // library's own plain-text mode and everything else to Markdown; the structure the
+        // walk collects is the same either way, so only the fallback text changes.
+        bool plainText = config.OutputFormat.Which == OutputFormat.Kind.Plain;
+        string contentText = HtmlToMarkdown.ConvertWithStructure(html, plainText, out var structure);
+        var doc = MapStructure(structure, contentText);
 
         var htmlMeta = HtmlMeta.Extract(html);
         var metadata = new Metadata();
@@ -52,12 +57,50 @@ public sealed class HtmlExtractor : IExtractor
         if (config.OutputFormat.Which == OutputFormat.Kind.Markdown)
         {
             metadata.OutputFormat = "markdown";
-            doc.PreRenderedContent = HtmlToMarkdown.NormalizeHtmlMarkdown(markdown);
+            doc.PreRenderedContent = HtmlToMarkdown.NormalizeHtmlMarkdown(contentText);
         }
 
         doc.Metadata = metadata;
         doc.MimeType = mimeType;
+        RecoverTableCaptions(html, doc);
         return doc;
+    }
+
+    /// <summary>Inner content of a <c>&lt;caption&gt;</c>, wherever it appears in the raw HTML.</summary>
+    private static readonly Regex TableCaptionRe = new(
+        @"<caption\b[^>]*>(.*?)</caption>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    /// <summary>Any tag, used to strip inline markup out of a captured caption body.</summary>
+    private static readonly Regex AnyTagRe = new(
+        @"<[^>]+>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    /// <summary>
+    /// Recover a <c>&lt;table&gt;&lt;caption&gt;</c> as a paragraph immediately before its table
+    /// (`extractors/html.rs::recover_table_captions`).
+    /// </summary>
+    /// <remarks>
+    /// The converter's table grid carries only cells, so the caption is lost by the time the
+    /// structure reaches us. Upstream re-scans the raw HTML and pairs the nth caption with the
+    /// nth table element in document order, which is right for the common case of at most one
+    /// caption per table.
+    /// </remarks>
+    private static void RecoverTableCaptions(string html, InternalDocument doc)
+    {
+        var captions = new List<string>();
+        foreach (Match m in TableCaptionRe.Matches(html))
+        {
+            string inner = AnyTagRe.Replace(m.Groups[1].Value, "").Trim();
+            if (inner.Length > 0) captions.Add(inner);
+        }
+        if (captions.Count == 0) return;
+
+        var tablePositions = new List<int>();
+        for (int i = 0; i < doc.Elements.Count; i++)
+            if (doc.Elements[i].Kind.Tag == ElementKindTag.Table) tablePositions.Add(i);
+
+        // Inserted back-to-front so an earlier insertion does not shift a later position.
+        for (int i = Math.Min(tablePositions.Count, captions.Count) - 1; i >= 0; i--)
+            doc.Elements.Insert(tablePositions[i], InternalElement.TextElement(ElementKind.Paragraph, captions[i], 0));
     }
 
     /// <summary>
@@ -65,7 +108,7 @@ public sealed class HtmlExtractor : IExtractor
     /// one paragraph when the structure came back empty — which is what upstream does for a page
     /// with content but no recognised blocks.
     /// </summary>
-    private static InternalDocument MapStructure(HtmlStructureCollector structure, string markdown)
+    private static InternalDocument MapStructure(HtmlStructureCollector structure, string content)
     {
         var builder = new InternalDocumentBuilder("html");
         var roots = new List<int>();
@@ -74,10 +117,12 @@ public sealed class HtmlExtractor : IExtractor
         WalkStructure(structure, roots, builder);
         var doc = builder.Build();
 
-        if (doc.Elements.Count == 0 && markdown.Trim().Length > 0)
+        // Upstream pushes the conversion text verbatim, trailing newline and all — the html and
+        // json renderers show it, so trimming here loses a byte the golden has.
+        if (doc.Elements.Count == 0 && content.Length > 0)
         {
             var fallback = new InternalDocumentBuilder("html");
-            fallback.PushParagraph(markdown.Trim(), new(), null, null);
+            fallback.PushParagraph(content, new(), null, null);
             return fallback.Build();
         }
         return doc;

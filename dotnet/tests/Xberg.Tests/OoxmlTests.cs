@@ -360,4 +360,38 @@ public class OoxmlTests
         Assert.Single(paragraphs);
         Assert.Equal("Boxed", paragraphs[0].Text);
     }
+
+    /// <summary>
+    /// Two siblings of `a:r` carry text too: `a:br`, an explicit in-paragraph line break, and
+    /// `a:fld`, a field — a slide number, say — whose rendered value PowerPoint caches in a
+    /// nested `a:t`. Reading only `a:r` runs the two halves of a break together and loses the
+    /// field outright.
+    /// </summary>
+    [Fact]
+    public void Pptx_LineBreaksSplitRunsAndFieldsKeepTheirCachedText()
+    {
+        var pptx = Zip(
+            ("ppt/_rels/presentation.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
+            ("ppt/slides/slide1.xml",
+                "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p:cSld><p:spTree>" +
+                "<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr><p:txBody><a:p>" +
+                "<a:r><a:t>Company A</a:t></a:r><a:br/><a:r><a:t>Product is more expensive</a:t></a:r>" +
+                "</a:p></p:txBody></p:sp>" +
+                "<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr><p:txBody><a:p>" +
+                "<a:fld id=\"{1}\" type=\"slidenum\"><a:t>2</a:t></a:fld>" +
+                "</a:p></p:txBody></p:sp>" +
+                "</p:spTree></p:cSld></p:sld>"));
+
+        var doc = new PptxExtractor().Extract(pptx, PptxMime, new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        var texts = doc.Elements.Select(e => e.Text).ToList();
+        // The break separates the two halves rather than running them together...
+        Assert.Contains(texts, t => t.StartsWith("Company A", StringComparison.Ordinal)
+                                    && t.EndsWith("Product is more expensive", StringComparison.Ordinal)
+                                    && t != "Company AProduct is more expensive");
+        // ...and the field contributes the value PowerPoint cached for it.
+        Assert.Contains("2", texts);
+    }
 }

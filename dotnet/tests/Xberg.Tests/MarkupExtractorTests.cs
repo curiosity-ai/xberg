@@ -118,6 +118,24 @@ public class MarkupExtractorTests
         Assert.Contains(para.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Bold);
     }
 
+    /// <summary>
+    /// `longtable`, `tabularx` and `tabulary` hold the same `&amp;`-separated grid as `tabular`,
+    /// and longtable's page-break markers are scaffolding rather than rows.
+    /// </summary>
+    [Fact]
+    public void Latex_LongtableIsATableAndItsRuleLinesAreNotRows()
+    {
+        var doc = Extract(new LatexExtractor(),
+            "\\begin{document}\n\\begin{longtable}[]{@{}ll@{}}\n\\toprule\\noalign{}\n" +
+            "Metric & Type \\\\\n\\midrule\\noalign{}\n\\endhead\n\\bottomrule\\noalign{}\n\\endlastfoot\n" +
+            "hits & counter \\\\\n\\end{longtable}\n\\end{document}\n", "text/x-tex");
+
+        var table = Assert.Single(doc.Tables);
+        Assert.Equal(new[] { "Metric", "Type" }, table.Cells[0]);
+        Assert.Equal(new[] { "hits", "counter" }, table.Cells[1]);
+        Assert.Equal(2, table.Cells.Count);
+    }
+
     [Fact]
     public void Latex_TitleMetadata()
     {
