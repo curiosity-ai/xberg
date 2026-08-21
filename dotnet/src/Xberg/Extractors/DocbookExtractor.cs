@@ -7,7 +7,7 @@ namespace Xberg.Extractors;
 /// <summary>
 /// DocBook document extractor supporting both 4.x (no namespace) and 5.x (namespaced) formats.
 /// Ported from Rust `extractors/docbook.rs`. Single-pass traversal over a lenient XML pull reader
-/// (mirrors quick-xml event semantics: raw un-unescaped text, entity references dropped).
+/// (mirrors `EntityReader` semantics: references resolved and merged into the text run).
 /// </summary>
 public sealed class DocbookExtractor : IExtractor
 {
@@ -97,6 +97,7 @@ public sealed class DocbookExtractor : IExtractor
         byte titleDepth = 0;
         uint footnoteCounter = 0;
         bool inList = false;
+        bool inVariablelist = false;
         bool listOrdered = false;
 
         while (true)
@@ -151,8 +152,25 @@ public sealed class DocbookExtractor : IExtractor
                         inList = true; listOrdered = false; builder.PushList(false); break;
                     case "orderedlist":
                         inList = true; listOrdered = true; builder.PushList(true); break;
+                    case "variablelist":
+                        inVariablelist = true; break;
+                    case "term":
+                        if (inVariablelist)
+                        {
+                            string t = ExtractElementText(reader);
+                            if (t.Length > 0) builder.PushDefinitionTerm(t, null);
+                        }
+                        break;
                     case "listitem":
-                        if (inList)
+                        // A variablelist's listitem is the description half of a definition,
+                        // not a bullet; taking the itemizedlist branch here drops the term it
+                        // belongs to.
+                        if (inVariablelist)
+                        {
+                            string t = ExtractElementText(reader);
+                            if (t.Length > 0) builder.PushDefinitionDescription(t, null);
+                        }
+                        else if (inList)
                         {
                             string t = ExtractElementText(reader);
                             if (t.Length > 0) builder.PushListItem(t, listOrdered, new(), null, null);
@@ -428,8 +446,9 @@ public sealed class DocbookExtractor : IExtractor
 
 // ── Shared lenient XML pull reader (mirrors quick-xml event semantics) ────────
 // Used by both DocbookExtractor and JatsExtractor. Emits Start/End/Empty/Text/CData/Eof.
-// Text is raw (not unescaped) and split around well-formed entity references, which are
-// dropped — mirroring quick-xml's GeneralRef events being ignored by these extractors.
+// Text arrives with references resolved and merged into the surrounding run, which is what
+// `EntityReader` does for these extractors — not the raw, reference-dropping behaviour a bare
+// quick-xml reader gives.
 internal enum XmlEv { Start, End, Empty, Text, CData, Eof }
 
 internal readonly record struct XmlToken(XmlEv Kind, string Name, string Text, List<(string Key, string Value)>? Attrs);
@@ -452,6 +471,40 @@ internal sealed class XmlPullReader
         if (content.Length >= 3 && content[0] == 0xEF && content[1] == 0xBB && content[2] == 0xBF)
             return Encoding.UTF8.GetString(content[3..]);
         return Encoding.UTF8.GetString(content);
+    }
+
+    /// <summary>
+    /// Resolve one XML reference body (what sits between `&amp;` and `;`). Character
+    /// references decode to their code point, the five predefined entities and `nbsp` to
+    /// their character, and anything else — a DTD-defined entity this reader has no
+    /// declaration for — to nothing at all rather than to its own source text.
+    /// </summary>
+    private static string ResolveReference(ReadOnlySpan<char> body)
+    {
+        if (body.Length == 0) return "";
+        if (body[0] == '#')
+        {
+            var digits = body[1..];
+            bool hex = digits.Length > 0 && (digits[0] == 'x' || digits[0] == 'X');
+            if (hex) digits = digits[1..];
+            if (digits.Length > 0
+                && int.TryParse(digits, hex ? System.Globalization.NumberStyles.HexNumber
+                                            : System.Globalization.NumberStyles.None,
+                                System.Globalization.CultureInfo.InvariantCulture, out int cp)
+                && cp is > 0 and <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF))
+                return char.ConvertFromUtf32(cp);
+            return "";
+        }
+        return body switch
+        {
+            "amp" => "&",
+            "lt" => "<",
+            "gt" => ">",
+            "quot" => "\"",
+            "apos" => "'",
+            "nbsp" => "\u00A0",
+            _ => "",
+        };
     }
 
     private static List<XmlToken> Tokenize(string s)
@@ -510,7 +563,11 @@ internal sealed class XmlPullReader
             {
                 int lt = s.IndexOf('<', i);
                 if (lt < 0) lt = n;
-                int seg = i;
+                // `EntityReader` merges consecutive text and reference events into one
+                // resolved run, so a reference is part of the text around it rather than a
+                // break in it. Splitting on references instead drops them, which is what
+                // turned `print &quot;working&quot;;` into `print working ;`.
+                var run = new StringBuilder(lt - i);
                 for (int j = i; j < lt; j++)
                 {
                     if (s[j] == '&')
@@ -518,13 +575,14 @@ internal sealed class XmlPullReader
                         int semi = FindEntityEnd(s, j, lt);
                         if (semi > 0)
                         {
-                            if (j > seg) result.Add(new XmlToken(XmlEv.Text, "", s.Substring(seg, j - seg), null));
+                            run.Append(ResolveReference(s.AsSpan(j + 1, semi - j - 1)));
                             j = semi;
-                            seg = semi + 1;
+                            continue;
                         }
                     }
+                    run.Append(s[j]);
                 }
-                if (lt > seg) result.Add(new XmlToken(XmlEv.Text, "", s.Substring(seg, lt - seg), null));
+                if (run.Length > 0) result.Add(new XmlToken(XmlEv.Text, "", run.ToString(), null));
                 i = lt;
             }
         }
