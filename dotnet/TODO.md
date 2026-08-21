@@ -192,13 +192,23 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 
 The corpus is 2,942 fixtures. **155 of them Rust itself cannot extract** (75 where this port is
 also empty, 80 where it produces output and Rust errors), so they are not comparable in either
-direction. That leaves **2,787 comparable fixtures, 2,639 fully matching (94.7%)** and **148
-failing at least one hard dimension**. Run `--list-fail` to regenerate the list below; it prints
+direction. That leaves **2,787 comparable fixtures, 2,678 fully matching (96.1%)** and **109
+failing at least one hard dimension** — 107 once the archive fix below is counted, which landed
+after that sweep. Run `--list-fail` to regenerate the list below; it prints
 one line per failing fixture with the dimensions it failed.
 
 Read the 89.7% figure that appears in older notes with that in mind — it divided by all 2,942 and
 so scored this port against documents upstream never read. The harness said "Fixtures compared
 (rust succeeded)" over a total that included the incomparable ones; that label is now fixed.
+
+Closed since the first pass through this list: `opml/opml-reader.opml` (the `_note` attribute was
+never collected), `data_formats/test_01.ods` (an ODF package keeps its document properties in
+`meta.xml`, and the reader for that was already ported for ODT — ODS was simply not wired to it),
+`archives/documents.tar` and `.tgz` (`decode_archive_text` decodes lossily and always returns a
+string, where this port used a strict decode and dropped the member), and 37 PDF fixtures.
+
+`docbook/docbook-reader.docbook` is traced but not fixed: `<quote>working</quote>` renders as
+`working ` rather than `"working"`, and `2 &gt; 1` loses its `>`.
 
 ### Genuine upstream defects — 6 fixtures, safe to ignore
 
