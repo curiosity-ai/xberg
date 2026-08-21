@@ -11,7 +11,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > large `office/regression` set of real-world HTML.
 >
 > **2456 fixtures of 2942 (83.5%) match on every hard dimension**; **0 catastrophes**; 4
-> fixtures still lose content (svg, eml, epub, odt). 1040 unit tests.
+> fixtures still lose content (svg, eml, epub, odt). 1075 unit tests.
 >
 > The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
 > stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
@@ -321,6 +321,23 @@ the content-suppression test — that `.Core.cs` also owns; they agree today and
 copy. Still unported from `pdf/structure/`: `mark_validated_page_numbers`,
 `stitch_fragmented_tables`, `merge_spatial_footnote_markers`,
 `suppress_table_dominant_paragraph_spill`, and everything that depends on layout regions (ML).
+
+**The hierarchy segments are built at the wrong granularity.** This one sits upstream of two
+open gaps at once — heuristic tables and heading classification both read these segments.
+Upstream's `oxide::hierarchy::extract_all_segments` emits one `SegmentData` per pdf_oxide
+span: extracted `TopToBottom` (not column-aware), then `reorder_page_reading_order`,
+`rejoin_inline_scripts`, artifact-filtered, then `dedupe_redrawn_segments`. The port emits one
+per assembled line (`PdfStructure.SegmentsFromLines`), which is a coarser shape, and the
+difference shows up directly in table cells: on `pdf/table_document.pdf` upstream splits a
+header into the words `(`, `Ω`, `)` and lands them in the column they belong to, where a single
+`(Ω)` token falls into the next column over.
+
+Two fields of `SegmentData` are also absent: `rotation_degrees`, and `assigned_role` — the
+heading level read straight from `/StructTreeRoot`. `extract_all_segments` tries
+`extract_segments_with_structure_tree` *first*, and only falls back to font-size clustering when
+`mark_info().is_structure_reliable()` fails or the tree carries fewer than three headings. The
+port has no structure-tree path at all, so on a tagged PDF it infers what upstream reads. 74 of
+the 389 corpus PDFs carry a `/StructTreeRoot`.
 
 ---
 
