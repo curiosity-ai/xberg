@@ -26,7 +26,7 @@ internal struct HocrWord
     public readonly double YCenter => Top + Height / 2.0;
 }
 
-internal static class PdfTableReconstruct
+internal static partial class PdfTableReconstruct
 {
     private const int MaxRegionsPerPage = 20;
 
@@ -65,11 +65,8 @@ internal static class PdfTableReconstruct
                 ? PdfPath.CountRules(pagePaths[pageIdx]).Horizontal
                 : 0;
 
-            foreach (var region in regions)
-            {
-                var table = ReconstructRegionTable(region, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
-                if (table != null) tables.Add(table);
-            }
+            tables.AddRange(ReconstructPageRegionTables(
+                regions, pageHeight, pageNumber, allowSingleColumn, horizontalRules));
         }
         return tables;
     }
@@ -212,6 +209,8 @@ internal static class PdfTableReconstruct
         }
         if (current.Count > 0) regions.Add(current);
 
+        AttachAlignedNumericHeaders(regions, medianHeight, rowTolerance);
+
         // retain: >=4 words, >=3 distinct rows, >=2 distinct x columns.
         var kept = new List<List<HocrWord>>();
         foreach (var r in regions)
@@ -308,6 +307,97 @@ internal static class PdfTableReconstruct
 
     // ── Region → Table (pdf/oxide/table.rs reconstruct_region_table) ─────────
 
+    /// <summary>
+    /// Port of `reconstruct_page_region_tables`. Walks the page's regions, letting a run of
+    /// label-heavy financial sections stitch itself into one table before falling back to
+    /// per-region reconstruction.
+    /// </summary>
+    private static List<Table> ReconstructPageRegionTables(
+        List<List<HocrWord>> regions, float pageHeight, uint pageNumber,
+        bool allowSingleColumn, int horizontalRules)
+    {
+        var tables = new List<Table>();
+        int index = 0;
+        while (index < regions.Count)
+        {
+            var head = ReconstructLabelHeavyFinancialRegion(regions[index], pageHeight, pageNumber);
+            if (head is null)
+            {
+                tables.AddRange(ReconstructRegionTables(
+                    regions[index], pageHeight, pageNumber, allowSingleColumn, horizontalRules));
+                index++;
+                continue;
+            }
+
+            var (first, firstTracks, trackTolerance) = head.Value;
+            var chain = new List<Table> { first };
+            int chainEnd = index + 1;
+            while (chainEnd < regions.Count)
+            {
+                var following = ReconstructLabelHeavyFinancialRegion(regions[chainEnd], pageHeight, pageNumber);
+                if (following is null) break;
+                var (next, nextTracks, nextTolerance) = following.Value;
+                uint tolerance = Math.Max(trackTolerance, nextTolerance);
+                bool tracksAlign = firstTracks.Zip(nextTracks, (l, r) => AbsDiff(l, r) <= tolerance).All(ok => ok);
+                if (!tracksAlign || !LabelHeavyFinancialSectionsAreContiguous(
+                        regions[chainEnd - 1], regions[chainEnd], nextTracks, nextTolerance))
+                    break;
+                chain.Add(next);
+                chainEnd++;
+            }
+
+            if (chain.Count < 2)
+            {
+                tables.AddRange(ReconstructRegionTables(
+                    regions[index], pageHeight, pageNumber, allowSingleColumn, horizontalRules));
+                index++;
+                continue;
+            }
+
+            tables.Add(StitchLabelHeavyFinancialSections(chain, pageNumber));
+            index = chainEnd;
+        }
+        return tables;
+    }
+
+    /// <summary>
+    /// Port of `reconstruct_region_tables`. A region wide enough to be two tables side by side
+    /// is only split when both halves stand up as tables on their own.
+    /// </summary>
+    private static List<Table> ReconstructRegionTables(
+        List<HocrWord> region, float pageHeight, uint pageNumber,
+        bool allowSingleColumn, int horizontalRules)
+    {
+        var parent = ReconstructRegionTable(region, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
+        if (parent is null) return new List<Table>();
+        if ((parent.Cells.Count > 0 ? parent.Cells[0].Count : 0) < SideBySideMinParentColumns)
+            return new List<Table> { parent };
+
+        var split = SplitSideBySideRegion(region);
+        if (split is null) return new List<Table> { parent };
+
+        var left = ReconstructSideBySideChild(split.Value.Left, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
+        if (left is null) return new List<Table> { parent };
+        var right = ReconstructSideBySideChild(split.Value.Right, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
+        if (right is null) return new List<Table> { parent };
+        if (!SideTablesHaveIndependentShape(left, right)) return new List<Table> { parent };
+
+        var (normalizedLeft, normalizedRight) = NormalizeSideBySideFinancialTables(left, right);
+        return new List<Table> { normalizedLeft, normalizedRight };
+    }
+
+    /// <summary>One half of a side-by-side split, reconstructed with a gap wide enough that the
+    /// half's own columns survive: the parent's adaptive gap was measured across both halves.</summary>
+    private static Table? ReconstructSideBySideChild(
+        List<HocrWord> region, float pageHeight, uint pageNumber, bool allowSingleColumn, int horizontalRules)
+    {
+        if (region.Count == 0) return null;
+        var heights = region.Select(w => w.Height).OrderBy(h => h).ToList();
+        uint childGap = Math.Max(heights[heights.Count / 2], 1u) * SideBySideChildGapHeightMultiplier;
+        return ReconstructRegionTableWithColumnGap(
+            region, pageHeight, pageNumber, allowSingleColumn, childGap, horizontalRules);
+    }
+
     private static Table? ReconstructRegionTable(
         List<HocrWord> region, float pageHeight, uint pageNumber, bool allowSingleColumn, int horizontalRules = 0)
     {
@@ -315,7 +405,14 @@ internal static class PdfTableReconstruct
         uint regionRight = region.Max(w => w.Left + w.Width);
         float regionWidth = regionRight > regionLeft ? regionRight - regionLeft : 0f;
         uint colGap = HeuristicColumnGap(region, regionWidth);
+        return ReconstructRegionTableWithColumnGap(
+            region, pageHeight, pageNumber, allowSingleColumn, colGap, horizontalRules);
+    }
 
+    private static Table? ReconstructRegionTableWithColumnGap(
+        List<HocrWord> region, float pageHeight, uint pageNumber,
+        bool allowSingleColumn, uint colGap, int horizontalRules)
+    {
         var columnPositions = DetectColumns(region, colGap);
         var grid = ReconstructTable(region, colGap, 0.5);
         RepairSplitNumericTrack(grid, region, columnPositions);
@@ -327,15 +424,14 @@ internal static class PdfTableReconstruct
         if (cleaned.Count <= 1) return null;
 
         if (LooksLikeCodeListing(cleaned)) return null;
+
+        // Beyond the text-statistics gate, reject candidates that have no drawn ruling lines
+        // AND whose inferred column boundaries are not actually whitespace: continuous prose
+        // bucketed into a wide grid by vertical-only clustering has words running across those
+        // boundaries on most rows, which text statistics alone cannot see.
         if (!IsWellFormedBorderlessTable(cleaned, region, columnPositions, horizontalRules)) return null;
 
-        double imgLeft = region.Min(w => (double)w.Left);
-        double imgTop = region.Min(w => (double)w.Top);
-        double imgRight = region.Max(w => (double)(w.Left + w.Width));
-        double imgBottom = region.Max(w => (double)(w.Top + w.Height));
-        BoundingBox? bbox = null;
-        if (imgRight > imgLeft && imgBottom > imgTop)
-            bbox = new BoundingBox { X0 = imgLeft, Y0 = pageHeight - imgBottom, X1 = imgRight, Y1 = pageHeight - imgTop };
+        var bbox = RegionBoundingBox(region, pageHeight);
 
         string markdown = TableToMarkdown(cleaned);
         if (markdown.Trim().Length == 0) return null;
@@ -347,6 +443,16 @@ internal static class PdfTableReconstruct
             PageNumber = pageNumber,
             BoundingBox = bbox,
         };
+    }
+
+    private static BoundingBox? RegionBoundingBox(List<HocrWord> region, float pageHeight)
+    {
+        double imgLeft = region.Min(w => (double)w.Left);
+        double imgTop = region.Min(w => (double)w.Top);
+        double imgRight = region.Max(w => (double)(w.Left + w.Width));
+        double imgBottom = region.Max(w => (double)(w.Top + w.Height));
+        if (imgRight <= imgLeft || imgBottom <= imgTop) return null;
+        return new BoundingBox { X0 = imgLeft, Y0 = pageHeight - imgBottom, X1 = imgRight, Y1 = pageHeight - imgTop };
     }
 
     // ── Core grid reconstruction (table_core.rs) ─────────────────────────────
@@ -1158,6 +1264,8 @@ internal static class PdfTableReconstruct
     private const int DenseNumericMinRecurringTracks = 4;
     private const int DenseNumericMinTrackRowPercent = 60;
     private const int NumericHeaderMaxRows = 2;
+    private const int NumericHeaderMinTrackPercent = 60;
+    private const int NumericHeaderMinAlphaPercent = 60;
     private const int SplitNumericTrackMinRowsPerSide = 2;
     private const int SplitNumericTrackMinTotalRows = 6;
 
@@ -1244,6 +1352,58 @@ internal static class PdfTableReconstruct
             rows.Count(row => row.Any(w => IsNumericWord(w.Text) && AbsDiff(w.Left + w.Width / 2, candidate) <= xTolerance))
                 >= minRowSupport).ToList();
     }
+
+    /// <summary>
+    /// Fold a compact caption region into the numeric block it labels. Vertical clustering
+    /// splits on a blank line, so a table whose header sits one line above its data arrives
+    /// as two regions — and the header half, being one or two rows, is dropped by the
+    /// region filter before anything can use it. Merging first is what lets the column names
+    /// reach the grid.
+    /// </summary>
+    private static void AttachAlignedNumericHeaders(
+        List<List<HocrWord>> regions, uint medianHeight, uint rowTolerance)
+    {
+        int index = 1;
+        while (index < regions.Count)
+        {
+            if (IsAlignedNumericHeader(regions[index - 1], regions[index], medianHeight, rowTolerance))
+            {
+                var data = regions[index];
+                regions.RemoveAt(index);
+                regions[index - 1].AddRange(data);
+            }
+            else index++;
+        }
+    }
+
+    /// <summary>A caption belongs to the block below it when it is short, mostly words, sits
+    /// close enough to touch, and its glyphs line up with the numeric tracks underneath.</summary>
+    private static bool IsAlignedNumericHeader(
+        List<HocrWord> header, List<HocrWord> data, uint medianHeight, uint rowTolerance)
+    {
+        var dataRows = NumericRows(data, rowTolerance);
+        var recurring = LongestRecurringNumericRun(dataRows);
+        if (recurring is null) return false;
+
+        var tracks = RecurringNumericTrackCenters(recurring, medianHeight);
+        int headerRows = NumericRows(header, rowTolerance).Count;
+        if (tracks.Count < DenseNumericMinRecurringTracks || headerRows < 1 || headerRows > NumericHeaderMaxRows)
+            return false;
+
+        int alphaWords = header.Count(w => w.Text.Any(char.IsLetter));
+        if (alphaWords * 100 < header.Count * NumericHeaderMinAlphaPercent) return false;
+
+        uint headerBottom = header.Count == 0 ? 0 : header.Max(w => w.Top + w.Height);
+        uint dataTop = data.Count == 0 ? uint.MaxValue : data.Min(w => w.Top);
+        if (SaturatingSub(dataTop, headerBottom) > medianHeight * 2) return false;
+
+        uint xTolerance = Math.Max(medianHeight * 2, 12u);
+        int matched = tracks.Count(track =>
+            header.Any(w => AbsDiff(w.Left + w.Width / 2, track) <= xTolerance));
+        return matched * 100 >= tracks.Count * NumericHeaderMinTrackPercent;
+    }
+
+    private static uint SaturatingSub(uint a, uint b) => a > b ? a - b : 0u;
 
     /// <summary>
     /// Rejoin one numeric column that column detection split in two. The signature is a
@@ -1671,6 +1831,72 @@ internal static class PdfTableReconstruct
         if (nonEmpty.Count == 0) return false;
         if (nonEmpty.Any(cell => cell == "{" || cell == "}")) return true;
         int braceCount = nonEmpty.Count(cell => cell.Contains('{') || cell.Contains('}'));
-        return (double)braceCount / nonEmpty.Count >= 0.20;
+        return (double)braceCount / nonEmpty.Count >= 0.20 || LooksLikeDeclarationGrid(tableCells);
+    }
+
+    private readonly record struct ParameterRowEvidence(bool EndsWithComma, bool ClosesDeclaration, bool HasPointer);
+
+    /// <summary>
+    /// A wrapped C-style function signature: one call head on the first row, then one
+    /// parameter per row. Brace-free on its own, so the brace fraction above cannot see it,
+    /// yet the shape is exactly what column detection turns into a two-column grid. The
+    /// terminal <c>);</c> or trailing comma on every parameter row is what keeps API-reference
+    /// tables with incidental code punctuation out of this.
+    /// </summary>
+    private static bool LooksLikeDeclarationGrid(List<List<string>> tableCells)
+    {
+        if (tableCells.Count == 0) return false;
+        var firstCells = tableCells[0].Select(cell => cell.Trim()).Where(cell => cell.Length > 0).ToList();
+        if (firstCells.Count != 1 || !LooksLikeDeclarationHead(firstCells[0])) return false;
+
+        var continuationRows = tableCells.Skip(1)
+            .Where(row => row.Any(cell => cell.Trim().Length > 0)).ToList();
+        var evidence = continuationRows.Select(ParameterRowEvidenceOf).Where(e => e is not null)
+            .Select(e => e!.Value).ToList();
+        if (evidence.Count < 2 || evidence.Count != continuationRows.Count) return false;
+
+        bool hasPointer = evidence.Any(e => e.HasPointer);
+        bool hasClosingDeclaration = evidence.Any(e => e.ClosesDeclaration);
+        bool allTruncatedParameters = evidence.All(e => e.EndsWithComma);
+        return hasPointer && (hasClosingDeclaration || allTruncatedParameters);
+    }
+
+    private static ParameterRowEvidence? ParameterRowEvidenceOf(List<string> row)
+    {
+        var cells = row.Select(cell => cell.Trim()).Where(cell => cell.Length > 0).ToList();
+        if (cells.Count < 2) return null;
+        string last = cells[^1];
+
+        string parameterName;
+        bool endsWithComma = false, closesDeclaration = false;
+        if (last.EndsWith(",", StringComparison.Ordinal))
+        {
+            parameterName = last[..^1];
+            endsWithComma = true;
+        }
+        else if (last.EndsWith(");", StringComparison.Ordinal))
+        {
+            parameterName = last[..^2];
+            closesDeclaration = true;
+        }
+        else return null;
+
+        if (!LooksLikeParameterName(parameterName)) return null;
+        return new ParameterRowEvidence(endsWithComma, closesDeclaration, cells.Any(cell => cell.Contains('*')));
+    }
+
+    private static bool LooksLikeParameterName(string name)
+    {
+        name = name.Trim().TrimStart('*');
+        return name.Length > 0
+            && name.Any(char.IsLetter)
+            && name.All(c => char.IsLetterOrDigit(c) || c is '_' or '[' or ']');
+    }
+
+    private static bool LooksLikeDeclarationHead(string head)
+    {
+        if (!head.EndsWith("(", StringComparison.Ordinal)) return false;
+        return head[..^1].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .Count(token => token.Any(char.IsLetter)) >= 2;
     }
 }
