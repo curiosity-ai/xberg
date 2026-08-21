@@ -244,7 +244,12 @@ internal static partial class PdfSpatialTables
         List<TableSpan> spans, List<PdfPath> lines, TableDetectionConfig config)
     {
         var tables = DetectTablesFromIntersections(spans, lines, config);
-        return tables.Where(IsValidTable).ToList();
+        if (tables.Count > 0) return tables.Where(IsValidTable).ToList();
+
+        // A table can be ruled without its rules ever meeting: separate horizontal and
+        // vertical strokes that stop short of each other leave no corner for intersection
+        // detection to find. Clustering the rules' own coordinates still yields the grid.
+        return DetectTablesInClusters(spans, lines, config);
     }
 
     // ── Edges ────────────────────────────────────────────────────────────────
