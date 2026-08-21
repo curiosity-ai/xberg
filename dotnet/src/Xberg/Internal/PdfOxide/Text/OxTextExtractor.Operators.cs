@@ -1007,28 +1007,74 @@ internal sealed partial class OxTextExtractor
     /// <summary>
     /// Loads the fonts of a Form XObject's own /Resources into the extractor
     /// (`PdfDocument::load_fonts`, document.rs:19130). Upstream that method is four layers of
-    /// cross-page font caching around one loop; the seam lets that arrive later without the
-    /// XObject walk losing its fonts in the meantime.
+    /// cross-page font caching around one loop; the first of them is ported below, the rest
+    /// arrive through the same seam.
     /// </summary>
     internal Action<OxTextExtractor, PdfObject> LoadFontsForResources { get; set; } = DefaultLoadFonts;
+
+    /// <summary>
+    /// The fonts a /Font dictionary resolves to, keyed by that dictionary's object reference
+    /// and scoped to the document it came from — pdf_oxide's `font_set_cache`
+    /// (document.rs:19167). Pages that share a /Font dictionary, and the span and glyph
+    /// passes over one page, then parse each embedded font program once between them.
+    /// </summary>
+    /// <remarks>
+    /// Weak-keyed on the document so a cache dies with the document it describes; upstream
+    /// hangs its equivalent off the document too, behind a mutex, which the concurrent map
+    /// stands in for.
+    /// </remarks>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+        PdfDocument,
+        System.Collections.Concurrent.ConcurrentDictionary<
+            (int Number, int Generation), List<(string Name, OxFontInfo Font)>>>
+        FontSetCaches = new();
 
     private static void DefaultLoadFonts(OxTextExtractor extractor, PdfObject resources)
     {
         var doc = extractor.Document;
-        var fontDict = Ox.GetDict(doc, Ox.Dict(doc, resources), "Font");
+        PdfObject? fontEntry = Ox.Dict(doc, resources)?.Get("Font");
+        if (fontEntry is null)
+        {
+            return;
+        }
+
+        // Only a referenced /Font dictionary can be cached: an inline one has no identity to
+        // key on, and two pages' inline dictionaries are not the same object however alike.
+        var key = fontEntry as PdfRef;
+        var cache = doc is not null && key is not null ? FontSetCaches.GetOrCreateValue(doc) : null;
+
+        if (cache is not null && key is not null
+            && cache.TryGetValue((key.Number, key.Generation), out var cached))
+        {
+            foreach ((string name, OxFontInfo font) in cached)
+            {
+                extractor.AddFontShared(name, font);
+            }
+            extractor.ShareTrueTypeCmaps();
+            return;
+        }
+
+        var fontDict = Ox.Dict(doc, fontEntry);
         if (fontDict is null)
         {
             return;
         }
 
+        var loaded = new List<(string Name, OxFontInfo Font)>(fontDict.Map.Count);
         foreach (var entry in fontDict.Map)
         {
             if (OxFontInfo.FromDict(entry.Value, doc) is { } font)
             {
                 extractor.AddFontShared(entry.Key, font);
+                loaded.Add((entry.Key, font));
             }
         }
         extractor.ShareTrueTypeCmaps();
+
+        if (cache is not null && key is not null)
+        {
+            cache[(key.Number, key.Generation)] = loaded;
+        }
     }
 
     /// <summary>

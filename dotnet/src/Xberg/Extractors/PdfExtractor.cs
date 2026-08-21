@@ -383,7 +383,12 @@ public sealed class PdfExtractor : IExtractor
                     segs = structureSpans is not null
                         ? PdfOxideSegments.FromPage(structureSpans, structurePageWidth, structurePageHeight)
                         : PdfStructure.SegmentsFromLines(lines);
-                    words = PdfSpatialTables.SpansToWords(spans);
+                    // The detector is fed words, not show-operator runs (upstream calls
+                    // `extract_words`), and the per-glyph geometry needed to build them
+                    // only exists on the ported extractor's spans.
+                    words = structureSpans is not null
+                        ? PdfSpatialTables.WordsFromOxSpans(structureSpans)
+                        : PdfSpatialTables.SpansToWords(spans);
                     paths = extractor.Paths;
                 }
                 // AcroForm: interactive text-field values are stored as the widget's /V and are

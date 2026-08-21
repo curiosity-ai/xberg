@@ -54,6 +54,34 @@ public class PdfSpatialTableTests
     }
 
     [Fact]
+    public void AZeroLengthButtCappedSegmentKeepsItsDegenerateExtent()
+    {
+        // §8.4.3.3: a butt cap paints nothing at zero length. The bound upstream compares
+        // the length against is the f32 machine epsilon, not the smallest denormal — with
+        // the latter the guard never fires and the segment gains a stroke-wide box.
+        var speck = Line(180, 44, 180, 44, width: 6);
+        var rendered = speck.RenderedBbox();
+        Assert.Equal(0, rendered.Width, 6);
+        Assert.Equal(0, rendered.Height, 6);
+    }
+
+    [Fact]
+    public void AnAxisAlignedRuleKeepsItsEdgesInSinglePrecision()
+    {
+        // The rendered edges are what the table bounding box is built from, and upstream
+        // computes them in f32 throughout. A horizontal rule extends by exactly half the
+        // stroke on the cross axis and not at all along its own, whatever its length.
+        var rule = Line(73, 569.8, 543.2, 569.8, width: 1);
+        var rendered = rule.RenderedBbox();
+        Assert.Equal(73.0f, (float)rendered.X);
+        Assert.Equal(543.2f - 73.0f, (float)rendered.Width);
+        Assert.Equal(569.8f - 0.5f, (float)rendered.Y);
+        Assert.Equal(1.0f, (float)rendered.Height);
+        // `right()` is the single-precision sum of two single-precision edges.
+        Assert.Equal((float)rendered.X + (float)rendered.Width, (float)rendered.Right);
+    }
+
+    [Fact]
     public void ARuledGridBecomesATableWithItsCellsInPlace()
     {
         var paths = new List<PdfPath>

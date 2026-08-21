@@ -21,6 +21,31 @@ public struct Matrix
         m.B * C + m.D * D,
         m.A * E + m.C * F + m.E,
         m.B * E + m.D * F + m.F);
+
+    // Single-precision twins of the two above, for the path pipeline. pdf_oxide's graphics
+    // state is `f32`, so it rounds after every product and every sum; folding the same
+    // expression at double width and rounding once at the end lands a fraction of an ulp
+    // away, and that drift survives into the table bounding boxes the corpus compares.
+    public (double x, double y) TransformSingle(double x, double y)
+    {
+        float a = (float)A, b = (float)B, c = (float)C, d = (float)D, e = (float)E, f = (float)F;
+        float fx = (float)x, fy = (float)y;
+        return (a * fx + c * fy + e, b * fx + d * fy + f);
+    }
+
+    public Matrix MultiplySingle(in Matrix m)
+    {
+        float a = (float)A, b = (float)B, c = (float)C, d = (float)D, e = (float)E, f = (float)F;
+        float ma = (float)m.A, mb = (float)m.B, mc = (float)m.C;
+        float md = (float)m.D, me = (float)m.E, mf = (float)m.F;
+        return new Matrix(
+            a * ma + b * mc,
+            a * mb + b * md,
+            c * ma + d * mc,
+            c * mb + d * md,
+            e * ma + f * mc + me,
+            e * mb + f * md + mf);
+    }
 }
 
 public sealed class TextSpan
@@ -206,9 +231,9 @@ public sealed class PdfContentExtractor
                     FlushBuffer();
                     var cmMatrix = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5));
                     _gs.Ctm = cmMatrix.Multiply(_gs.Ctm);
-                    _gs.PathCtm = RoundToSingle(
+                    _gs.PathCtm =
                         new Matrix(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3), NumF(ops, 4), NumF(ops, 5))
-                            .Multiply(_gs.PathCtm));
+                            .MultiplySingle(_gs.PathCtm);
                 }
                 break;
             case "BT": FlushBuffer(); _tm = Matrix.Identity; _tlm = Matrix.Identity; break;
@@ -273,7 +298,7 @@ public sealed class PdfContentExtractor
                 break;
 
             // ── Path construction and painting (pdf_oxide `extractors::paths`) ────────
-            case "w": _gs.LineWidth = Num(ops, 0); break;
+            case "w": _gs.LineWidth = (float)Num(ops, 0); break;
             case "J": _gs.LineCap = (int)Num(ops, 0); break;
             // Path operands are read as f32 upstream, so round them here too: a
             // rectangle's far corner is `x + width` in single precision, and a double
@@ -299,17 +324,28 @@ public sealed class PdfContentExtractor
     // `PathExtractor`: the path list is device-space geometry with no matrix attached.
 
     // pdf_oxide's path pipeline is f32 end to end, and the edge coordinates a table's
-    // bounding box is built from come straight out of it. Rounding each transformed
-    // point to single precision keeps our geometry bit-comparable with the reference
-    // instead of carrying double-width CTM residue into the output.
-    private (double x, double y) TransformPath(double x, double y)
-    {
-        var (tx, ty) = _gs.PathCtm.Transform(x, y);
-        return ((float)tx, (float)ty);
-    }
+    // bounding box is built from come straight out of it.
+    private (double x, double y) TransformPath(double x, double y) =>
+        _gs.PathCtm.TransformSingle(x, y);
 
     private static Matrix RoundToSingle(in Matrix m) =>
         new((float)m.A, (float)m.B, (float)m.C, (float)m.D, (float)m.E, (float)m.F);
+
+    /// <summary>
+    /// `line_width * Matrix::stroke_scale()` (pdf_oxide `content/graphics_state.rs:93`).
+    /// The `w` operand is user-space while the recorded path is already CTM-transformed
+    /// (§8.4.3.2), so it is scaled by sqrt(|det|) — the uniform-scale approximation
+    /// renderers use — to keep the width and the bbox in one coordinate space. Computed in
+    /// single precision because the rendered bbox this feeds is compared against a
+    /// reference produced by an f32 pipeline, and a double-width residue here shows up as
+    /// a one-ulp drift in every table bounding box on the page.
+    /// </summary>
+    private static double StrokeWidthOf(GState gs)
+    {
+        float a = (float)gs.PathCtm.A, b = (float)gs.PathCtm.B;
+        float c = (float)gs.PathCtm.C, d = (float)gs.PathCtm.D;
+        return (float)gs.LineWidth * MathF.Sqrt(MathF.Abs(a * d - b * c));
+    }
 
     private void PathMoveTo(double x, double y)
     {
@@ -355,7 +391,7 @@ public sealed class PdfContentExtractor
     private void PathRectangle(double x, double y, double w, double h)
     {
         var p1 = TransformPath(x, y);
-        var p2 = TransformPath((float)(x + w), (float)(y + h));
+        var p2 = TransformPath((float)x + (float)w, (float)y + (float)h);
         _currentOps.Add(PathOp.Rect(p1.x, p1.y, (float)(p2.x - p1.x), (float)(p2.y - p1.y)));
         _pathCurrent = (p1.x, p1.y);
         _subpathStart = (p1.x, p1.y);
@@ -388,13 +424,7 @@ public sealed class PdfContentExtractor
                 Stroked = stroke,
                 Filled = fill,
                 LineCap = stroke ? _gs.LineCap : 0,
-                // The `w` operand is user-space while the path above is CTM-transformed
-                // (§8.4.3.2), so scale it by sqrt(|det|) — the uniform-scale approximation
-                // renderers use — to keep width and bbox in one coordinate space.
-                StrokeWidth = stroke
-                    ? (float)(_gs.LineWidth * Math.Sqrt(Math.Abs(
-                        _gs.PathCtm.A * _gs.PathCtm.D - _gs.PathCtm.B * _gs.PathCtm.C)))
-                    : 0.0,
+                StrokeWidth = stroke ? StrokeWidthOf(_gs) : 0.0,
             };
             // Only rules and boxes are ever consulted; glyph outlines and chart fills
             // would otherwise dominate the list on graphics-heavy pages. Rule candidates
@@ -568,7 +598,7 @@ public sealed class PdfContentExtractor
                 fm.Items[2].AsNumber() ?? 0, fm.Items[3].AsNumber() ?? 1,
                 fm.Items[4].AsNumber() ?? 0, fm.Items[5].AsNumber() ?? 0);
             _gs.Ctm = m.Multiply(_gs.Ctm);
-            _gs.PathCtm = RoundToSingle(RoundToSingle(m).Multiply(_gs.PathCtm));
+            _gs.PathCtm = RoundToSingle(m).MultiplySingle(_gs.PathCtm);
         }
         var formRes = _doc.Resolve(st.Dict.Get("Resources")).AsDict();
         try { Run(_doc.DecodeStream(st), formRes, depth + 1); } catch { }

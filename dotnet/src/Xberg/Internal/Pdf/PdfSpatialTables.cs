@@ -12,6 +12,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Xberg.Internal.PdfOxide;
+using Xberg.Internal.PdfOxide.Layout;
 using Xberg.Types;
 
 namespace Xberg.Internal.Pdf;
@@ -100,10 +102,29 @@ internal static partial class PdfSpatialTables
     private const int MergeColDiffTolerance = 2;
 
     /// <summary>
-    /// Split Tj-run spans into word-sized ones, the granularity
-    /// `extract_tables_with_config` feeds the detector (it calls `extract_words`,
-    /// not `extract_spans`). Widths are apportioned by UTF-8 byte offset, the same
-    /// approximation `segments_to_words` uses.
+    /// The words <c>extract_words</c> produces from a page's spans, in the shape the
+    /// detector consumes. The clustering, the whitespace split and the adjacency merge all
+    /// live in <see cref="OxWordExtraction"/>; this only re-shapes the result.
+    /// </summary>
+    public static List<TableSpan> WordsFromOxSpans(IReadOnlyList<OxTextSpan> spans)
+    {
+        var words = new List<TableSpan>();
+        foreach (var w in OxWordExtraction.ExtractWords(spans))
+        {
+            words.Add(new TableSpan
+            {
+                Text = w.Text,
+                Bbox = new PathRect(w.Bbox.X, w.Bbox.Y, w.Bbox.Width, w.Bbox.Height),
+                FontSize = w.AvgFontSize,
+            });
+        }
+        return words;
+    }
+
+    /// <summary>
+    /// Split Tj-run spans into word-sized ones. The fallback for the pages the ported
+    /// extractor did not run on, which have no per-glyph geometry to cluster: widths are
+    /// apportioned by UTF-8 byte offset instead.
     /// </summary>
     public static List<TableSpan> SpansToWords(List<TextSpan> spans)
     {
@@ -231,8 +252,15 @@ internal static partial class PdfSpatialTables
                 Cells = cells,
                 Markdown = markdown,
                 PageNumber = pageNumber,
+                // Single precision: the reference's far edges are the f32 sums of f32 edges.
                 BoundingBox = t.Bbox is { } bb
-                    ? new BoundingBox { X0 = bb.X, Y0 = bb.Y, X1 = bb.X + bb.Width, Y1 = bb.Y + bb.Height }
+                    ? new BoundingBox
+                    {
+                        X0 = bb.X,
+                        Y0 = bb.Y,
+                        X1 = (float)bb.X + (float)bb.Width,
+                        Y1 = (float)bb.Y + (float)bb.Height,
+                    }
                     : null,
             });
         }

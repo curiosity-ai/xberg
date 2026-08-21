@@ -1,10 +1,11 @@
 // Ported from pdf_oxide `document.rs`: `extract_spans_impl` (15460), `load_fonts` (19130),
-// `page_cannot_have_text` (9629), `may_contain_text` (9578) and
-// `extract_page_text_with_options` (15979).
+// `page_cannot_have_text` (9629), `may_contain_text` (9578), `extract_chars_impl` (16508)
+// and `extract_page_text_with_options` (15979).
 //
 // This is the page-level driver above the extractor: it decides whether a page can carry
-// text at all, loads its fonts, runs the extractor over the content stream, then drops
-// off-page spans and applies reading order.
+// text at all, loads its fonts, runs the extractor over the content stream twice — once for
+// spans, once for the glyph positions those spans are stamped with — then drops off-page
+// spans and applies reading order.
 //
 // Font loading and the `BT`/`Do` pre-scan live on the extractor itself, ported alongside
 // the operator dispatch that also needs them for Form XObjects.
@@ -31,23 +32,69 @@ internal static class OxPageExtractor
         if (page is null) return result;
 
         var spans = ExtractSpans(doc, pageIndex, page);
+
+        // Stamp the char extractor's own per-glyph x-origins onto the finished spans, so
+        // everything that decomposes a span through `to_chars` sees spec-aligned positions
+        // rather than a prefix-sum of nominal widths. Runs last, on the post-processed
+        // spans, so the alignment sees the same text the consumers do.
+        if (spans.Count > 0)
+        {
+            OxCharXOffsets.Stamp(doc, pageIndex, spans, ExtractChars(doc, pageIndex, page));
+        }
+
         OxReadingOrder.DropOffpageSpans(spans, (float)llx, (float)lly, (float)urx, (float)ury);
         result.Spans = OxReadingOrder.OrderSpansColumnAware(spans);
 
-        // `PageText.chars` is left empty: xberg assembles page text from spans alone, and
-        // `TextSpan::to_chars` exists upstream only for callers that want per-glyph boxes.
+        // `PageText.chars` is left empty: the per-glyph list is consumed by the stamp above
+        // and nothing downstream asks for it whole.
         return result;
+    }
+
+    /// <summary>
+    /// One page's glyphs, in the order `extract_chars_impl` (document.rs:16508) leaves them:
+    /// top-to-bottom, then left-to-right.
+    /// </summary>
+    private static List<OxTextChar> ExtractChars(PdfDocument doc, int pageIndex, PdfDict page)
+    {
+        var prepared = NewPageExtractor(doc, pageIndex, page);
+        if (prepared is null) return new List<OxTextChar>();
+
+        List<OxTextChar> chars;
+        try { chars = prepared.Value.Extractor.ExtractOwned(prepared.Value.Content); }
+        catch { return new List<OxTextChar>(); }
+
+        OxSpanCompare.SortStable(chars, (a, b) =>
+        {
+            int yCmp = OxSpanCompare.SafeFloatCmp(b.Bbox.Y, a.Bbox.Y);
+            return yCmp != 0 ? yCmp : OxSpanCompare.SafeFloatCmp(a.Bbox.X, b.Bbox.X);
+        });
+        return chars;
     }
 
     /// <summary>Raw spans for one page, before reading order.</summary>
     private static List<OxTextSpan> ExtractSpans(PdfDocument doc, int pageIndex, PdfDict page)
     {
-        if (PageCannotHaveText(doc, page)) return new List<OxTextSpan>();
+        var prepared = NewPageExtractor(doc, pageIndex, page);
+        if (prepared is null) return new List<OxTextSpan>();
+
+        try { return prepared.Value.Extractor.ExtractTextSpans(prepared.Value.Content); }
+        catch { return new List<OxTextSpan>(); }
+    }
+
+    /// <summary>
+    /// An extractor loaded with the page's fonts, resources and layer exclusions, plus the
+    /// page's decoded content stream — everything both extraction passes need before they
+    /// diverge. Null when the page cannot carry text at all.
+    /// </summary>
+    private static (OxTextExtractor Extractor, byte[] Content)? NewPageExtractor(
+        PdfDocument doc, int pageIndex, PdfDict page)
+    {
+        if (PageCannotHaveText(doc, page)) return null;
 
         byte[] content;
         try { content = doc.GetPageContent(pageIndex); }
-        catch { return new List<OxTextSpan>(); }
-        if (content.Length == 0 || !OxTextExtractor.MayContainText(content)) return new List<OxTextSpan>();
+        catch { return null; }
+        if (content.Length == 0 || !OxTextExtractor.MayContainText(content)) return null;
 
         var extractor = new OxTextExtractor();
         extractor.SetPageIndex(pageIndex);
@@ -61,8 +108,7 @@ internal static class OxPageExtractor
             extractor.LoadFontsForResources(extractor, resources);
         }
 
-        try { return extractor.ExtractTextSpans(content); }
-        catch { return new List<OxTextSpan>(); }
+        return (extractor, content);
     }
 
     /// <summary>

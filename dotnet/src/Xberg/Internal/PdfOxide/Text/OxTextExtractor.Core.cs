@@ -1204,12 +1204,24 @@ internal sealed partial class OxTextExtractor
         Spans.Clear();
         PlacedPdfKeep = PlacedPdfTextDominates(contentStream);
 
-        var operators = ExcludedInks.Count == 0
-            ? OxContentParser.ParseContentStreamTextOnly(contentStream)
-            : OxContentParser.ParseContentStream(contentStream);
-        foreach (var op in operators)
+        if (ExcludedInks.Count == 0)
         {
-            ExecuteOperator(op);
+            // Streamed rather than materialised, as the span pass does: the glyph pass runs
+            // over the same content stream in the same page, and a second operator list of
+            // a multi-megabyte stream is pure allocation.
+            OxContentParser.ParseAndExecuteTextOnly(contentStream, op =>
+            {
+                ExecuteOperator(op);
+                return true;
+            });
+        }
+        else
+        {
+            // Ink filtering needs the colour operators the text-only parser skips.
+            foreach (var op in OxContentParser.ParseContentStream(contentStream))
+            {
+                ExecuteOperator(op);
+            }
         }
 
         // Content streams are in rendering order, not reading order, and some PDFs render the
