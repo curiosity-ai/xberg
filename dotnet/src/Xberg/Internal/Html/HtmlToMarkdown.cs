@@ -358,9 +358,13 @@ internal static class HtmlToMarkdown
             case "wbr": case "thead": case "tbody": case "tfoot": case "tr": case "th": case "td":
             case "source": case "track": case "param": case "col": case "colgroup":
                 break; // no-op outside table context
-            case "head": case "script": case "style": case "template": case "noscript":
-            case "meta": case "link": case "base": case "title":
+            case "head": case "script": case "style":
                 break; // metadata / non-content
+            // `template`, `noscript` and a stray body `title` have no arm of their own upstream:
+            // they reach the unknown handler, which renders their children. A no-JS fallback
+            // `<img>` is the page's only copy of that image, so dropping it loses content.
+            case "meta": case "link": case "base":
+                break; // void metadata elements: no children to render
             case "html": case "body":
                 WalkChildren(node, output, ctx);
                 break;

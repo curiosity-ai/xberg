@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Xberg.Core;
 using Xberg.Internal.Html;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -62,8 +63,96 @@ public sealed class HtmlExtractor : IExtractor
 
         doc.Metadata = metadata;
         doc.MimeType = mimeType;
+        RecoverMathmlFormulas(html, doc);
         RecoverTableCaptions(html, doc);
         return doc;
+    }
+
+    /// <summary>A <c>&lt;math&gt;</c> element and its subtree.</summary>
+    private static readonly Regex MathTagRe = new(
+        @"<math\b[^>]*>.*?</math>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    /// <summary>
+    /// A <c>&lt;script type="math/tex"&gt;</c> block, which MathJax v2 pages use to carry the
+    /// LaTeX source. <c>math/tex; mode=display</c> marks display math.
+    /// </summary>
+    private static readonly Regex MathScriptRe = new(
+        @"<script[^>]*\btype\s*=\s*[""']?math/tex[^""'>]*[""']?[^>]*>(.*?)</script>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    /// <summary>An image whose class marks it as a rendered equation, the shape legacy MathJax
+    /// and MediaWiki pages use.</summary>
+    private static readonly Regex TexImgRe = new(
+        @"<img\b[^>]*\bclass\s*=\s*[""'][^""']*\b(?:tex|mwe-math-fallback-image-\w+|latex)\b[^""']*[""'][^>]*>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    /// <summary>An <c>alt</c> attribute's value.</summary>
+    private static readonly Regex AltAttrRe = new(
+        @"\balt\s*=\s*[""']([^""']*)[""']", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    /// <summary>
+    /// The <c>&lt;!-- MathML: ... --&gt;</c> comment the markdown conversion emits inline for
+    /// every <c>&lt;math&gt;</c> element it converts. It serializes the raw MathML XML and leaks
+    /// straight into the pre-rendered content; it carries no value once the equation has been
+    /// recovered as LaTeX below, so it is stripped.
+    /// </summary>
+    private static readonly Regex MathmlCommentRe = new(
+        @"<!--\s*MathML:.*?-->\s*", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+    /// <summary>
+    /// Recover MathML equations as LaTeX <c>Formula</c> elements
+    /// (`extractors/html.rs::recover_mathml_formulas`).
+    /// </summary>
+    /// <remarks>
+    /// The markdown conversion has no node kind for <c>&lt;math&gt;</c> content: a <c>math</c>
+    /// outside a paragraph is dropped by the structure walk, one nested inside a paragraph is
+    /// flattened into concatenated token text, and the rendered output additionally carries the
+    /// raw serialization comment. None of that can be repaired from the mapped structure — the
+    /// information is gone by then — so the original HTML is re-scanned here and one Formula
+    /// element appended per recovered equation.
+    /// </remarks>
+    private static void RecoverMathmlFormulas(string html, InternalDocument doc)
+    {
+        if (doc.PreRenderedContent is { } content)
+            doc.PreRenderedContent = MathmlCommentRe.Replace(content, "");
+
+        void PushFormula(string latex)
+        {
+            string trimmed = latex.Trim();
+            if (trimmed.Length == 0) return;
+            doc.Elements.Add(InternalElement.TextElement(ElementKind.Formula, trimmed, 0));
+        }
+
+        // A `math/tex` script and a `mwe-math-fallback-image` are what a page carries *instead of*
+        // MathML: MediaWiki emits the image beside the `math` element it falls back from, and
+        // MathJax v2 emits the script for pages that ship no MathML at all. Reading them on a page
+        // that already has MathML would report every equation twice. A page repeats a short
+        // formula legitimately, so the test is which carriers the page uses, not whether two
+        // formulas share their text.
+        bool hasMathml = MathTagRe.IsMatch(html);
+
+        foreach (Match m in MathTagRe.Matches(html))
+            PushFormula(MathMl.ConvertMathmlStrToLatex(m.Value));
+
+        if (hasMathml) return;
+
+        // A `math/tex` script holds the LaTeX source itself, so it needs no conversion; only its
+        // delimiters and entities come off.
+        foreach (Match m in MathScriptRe.Matches(html))
+        {
+            string raw = HtmlWalker.DecodeEntitiesFull(m.Groups[1].Value);
+            PushFormula(MathMl.StripStyleWrapper(MathMl.StripMathDelimiters(raw.Trim())));
+        }
+
+        // A rendered-equation image carries its source in `alt`, which is the only copy of the
+        // math on pages that ship no MathML.
+        foreach (Match m in TexImgRe.Matches(html))
+        {
+            var alt = AltAttrRe.Match(m.Value);
+            if (!alt.Success) continue;
+            string raw = HtmlWalker.DecodeEntitiesFull(alt.Groups[1].Value);
+            PushFormula(MathMl.StripStyleWrapper(MathMl.StripMathDelimiters(raw.Trim())));
+        }
     }
 
     /// <summary>Inner content of a <c>&lt;caption&gt;</c>, wherever it appears in the raw HTML.</summary>

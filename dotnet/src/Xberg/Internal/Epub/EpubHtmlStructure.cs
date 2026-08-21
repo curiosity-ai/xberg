@@ -8,6 +8,7 @@
 // start/width/height) and section/container tree wiring from `DocumentStructureBuilder` are omitted.
 
 using System.Text;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Internal.Epub;
@@ -219,6 +220,7 @@ internal static class EpubHtmlStructure
             if (tagContent.StartsWith('!') || tagContent.StartsWith('?')) return;
 
             bool isClosing = tagContent.StartsWith('/');
+            bool isSelfClosing = tagContent.TrimEnd().EndsWith('/');
             string content = isClosing ? tagContent.Substring(1) : tagContent;
             content = content.TrimEnd('/').Trim();
 
@@ -226,10 +228,10 @@ internal static class EpubHtmlStructure
             string tagLower = tagName.ToLowerInvariant();
 
             if (isClosing) HandleCloseTag(tagLower);
-            else HandleOpenTag(tagLower, attrsStr);
+            else HandleOpenTag(tagLower, attrsStr, isSelfClosing);
         }
 
-        private void HandleOpenTag(string tag, string attrsStr)
+        private void HandleOpenTag(string tag, string attrsStr, bool isSelfClosing)
         {
             switch (tag)
             {
@@ -382,6 +384,20 @@ internal static class EpubHtmlStructure
                         // script/style raw blocks are skipped in node→element conversion anyway.
                         _ = blockContent;
                     }
+                    break;
+                }
+                case "math":
+                {
+                    FlushParagraph();
+                    if (isSelfClosing) break;
+                    string mathClose = "</math>";
+                    int mathEnd = _src.IndexOf(mathClose, _pos, StringComparison.Ordinal);
+                    if (mathEnd < 0) break;
+                    string inner = _src.Substring(_pos, mathEnd - _pos);
+                    string rawXml = attrsStr.Length == 0 ? $"<math>{inner}</math>" : $"<math {attrsStr}>{inner}</math>";
+                    _pos = mathEnd + mathClose.Length;
+                    string latex = MathMl.ConvertMathmlStrToLatex(rawXml);
+                    if (latex.Trim().Length != 0) PushNode(NodeContent.Formula(latex));
                     break;
                 }
                 case "video": case "audio":

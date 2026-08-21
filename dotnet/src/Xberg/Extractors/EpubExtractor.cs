@@ -231,6 +231,10 @@ public sealed class EpubExtractor : IExtractor
                     builder.PushCode(content.Text ?? "", content.Language, null, null);
                     break;
 
+                case NodeContent.Tag.Formula:
+                    builder.PushFormula(content.Text ?? "", null, null);
+                    break;
+
                 case NodeContent.Tag.Image:
                 {
                     string? src = content.Src;

@@ -5,6 +5,7 @@
 using System.IO.Compression;
 using System.Text;
 using System.Xml.Linq;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Internal.Epub;
@@ -28,9 +29,12 @@ internal static class EpubContent
     };
 
     // Elements whose entire subtree is skipped.
+    //
+    // `math` is deliberately absent: its subtree is converted to LaTeX (see RenderMathElement)
+    // rather than dropped.
     private static readonly HashSet<string> SkipElements = new(StringComparer.Ordinal)
     {
-        "head", "script", "style", "svg", "math", "video", "audio", "source", "track", "object", "embed", "iframe",
+        "head", "script", "style", "svg", "video", "audio", "source", "track", "object", "embed", "iframe",
     };
 
     /// <summary>Read all body documents in spine order, downgrading per-item I/O failures to warnings.</summary>
@@ -429,6 +433,7 @@ internal static class EpubContent
             case XElement e:
             {
                 string tag = e.Name.LocalName.ToLowerInvariant();
+                if (tag == "math") { RenderMathElement(e, output); return; }
                 if (SkipElements.Contains(tag)) return;
                 if (tag == "br") { output.Append('\n'); return; }
                 if (tag == "hr")
@@ -446,6 +451,19 @@ internal static class EpubContent
                 foreach (var child in d.Nodes()) VisitNode(child, output);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Convert a <c>&lt;math&gt;</c> element to LaTeX and append it as its own <c>$$...$$</c>
+    /// block, isolated by blank lines so it survives the <c>\n\n</c> paragraph split callers use
+    /// downstream. Never leaks raw MathML tag text: an element that converts to nothing is dropped.
+    /// </summary>
+    private static void RenderMathElement(XElement node, StringBuilder output)
+    {
+        string trimmed = MathMl.ConvertMathmlNodeToLatex(node).Trim();
+        if (trimmed.Length == 0) return;
+        if (output.Length > 0 && output[^1] != '\n') output.Append('\n');
+        output.Append("\n$$").Append(trimmed).Append("$$\n\n");
     }
 
     /// <summary>Collapse inline whitespace runs to a single space. Mirrors `normalise_inline_whitespace`.</summary>

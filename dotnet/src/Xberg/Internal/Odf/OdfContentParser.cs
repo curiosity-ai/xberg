@@ -6,6 +6,7 @@
 using System.IO.Compression;
 using System.Text;
 using System.Xml.Linq;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Internal.Odf;
@@ -693,7 +694,7 @@ internal static class OdfContentParser
         return images;
     }
 
-    /// <summary>Ports `pre_extract_formulas`. Maps embedded object dirs → MathML text.</summary>
+    /// <summary>Ports `pre_extract_formulas`. Maps embedded object dirs → the formula's LaTeX.</summary>
     internal static Dictionary<string, string> PreExtractFormulas(ZipArchive archive)
     {
         var formulas = new Dictionary<string, string>();
@@ -711,7 +712,7 @@ internal static class OdfContentParser
             if (!xml.Contains("math", StringComparison.Ordinal))
                 continue;
 
-            var text = ExtractMathmlText(xml);
+            var text = MathMl.ConvertMathmlStrToLatex(xml);
             if (text.Length == 0)
                 continue;
 
@@ -720,108 +721,6 @@ internal static class OdfContentParser
             formulas[dir + "/"] = text;
         }
         return formulas;
-    }
-
-    /// <summary>Ports `extract_mathml_text`.</summary>
-    private static string ExtractMathmlText(string xml)
-    {
-        XDocument doc;
-        try
-        {
-            doc = XDocument.Parse(xml, LoadOptions.PreserveWhitespace);
-        }
-        catch
-        {
-            return "";
-        }
-        var root = doc.Root;
-        if (root is null)
-            return "";
-        var tokens = new List<string>();
-        CollectMathmlTokens(root, tokens);
-        return string.Join(" ", tokens);
-    }
-
-    /// <summary>Ports `collect_mathml_tokens`.</summary>
-    private static void CollectMathmlTokens(XElement node, List<string> tokens)
-    {
-        switch (node.Name.LocalName)
-        {
-            case "mi":
-            case "mn":
-            case "mo":
-            case "ms":
-            case "mtext":
-            {
-                var t = NodeText(node)?.Trim();
-                if (!string.IsNullOrEmpty(t))
-                    tokens.Add(t);
-                break;
-            }
-            case "mfrac":
-            {
-                var children = node.Elements().ToList();
-                if (children.Count == 2)
-                {
-                    var num = new List<string>();
-                    CollectMathmlTokens(children[0], num);
-                    var den = new List<string>();
-                    CollectMathmlTokens(children[1], den);
-                    if (num.Count > 0 || den.Count > 0)
-                    {
-                        tokens.Add($"({string.Join(" ", num)})/({string.Join(" ", den)})");
-                        return;
-                    }
-                }
-                foreach (var child in node.Elements())
-                    CollectMathmlTokens(child, tokens);
-                break;
-            }
-            case "msup":
-            {
-                var children = node.Elements().ToList();
-                if (children.Count == 2)
-                {
-                    var baseToks = new List<string>();
-                    CollectMathmlTokens(children[0], baseToks);
-                    var exp = new List<string>();
-                    CollectMathmlTokens(children[1], exp);
-                    tokens.Add($"{string.Join(" ", baseToks)}^{string.Join(" ", exp)}");
-                    return;
-                }
-                foreach (var child in node.Elements())
-                    CollectMathmlTokens(child, tokens);
-                break;
-            }
-            case "msub":
-            {
-                var children = node.Elements().ToList();
-                if (children.Count == 2)
-                {
-                    var baseToks = new List<string>();
-                    CollectMathmlTokens(children[0], baseToks);
-                    var sub = new List<string>();
-                    CollectMathmlTokens(children[1], sub);
-                    tokens.Add($"{string.Join(" ", baseToks)}_{string.Join(" ", sub)}");
-                    return;
-                }
-                foreach (var child in node.Elements())
-                    CollectMathmlTokens(child, tokens);
-                break;
-            }
-            case "msqrt":
-            {
-                var inner = new List<string>();
-                foreach (var child in node.Elements())
-                    CollectMathmlTokens(child, inner);
-                tokens.Add($"sqrt({string.Join(" ", inner)})");
-                break;
-            }
-            default:
-                foreach (var child in node.Elements())
-                    CollectMathmlTokens(child, tokens);
-                break;
-        }
     }
 
     // ── small helpers ──────────────────────────────────────────────────────
