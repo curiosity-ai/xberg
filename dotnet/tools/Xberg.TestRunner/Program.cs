@@ -132,6 +132,7 @@ foreach (var goldenPath in goldenFiles)
 
     // Rust succeeded — measure each dimension.
     bool allHard = true;
+    var failedDims = new List<string>();
     foreach (var (name, _) in Formats())
     {
         string want = golden["content"]?[name]?.GetValue<string>() ?? "";
@@ -146,7 +147,8 @@ foreach (var goldenPath in goldenFiles)
         else
         {
             dim.Mismatch++;
-            if (!soft) allHard = false;
+            if (!soft) allHard = false; else failedDims.Add("~" + name);
+            if (!soft) failedDims.Add(name);
             AddExample(examples, $"{name}", rel, want, have, opts);
             if (opts.Dump is not null)
             {
@@ -160,12 +162,14 @@ foreach (var goldenPath in goldenFiles)
 
     // Metadata + tables (structural).
     bool metaMatch = JsonEquivalent(golden["metadata"], SerializeToNode(plainDoc?.Metadata), MetadataNormalizer);
-    if (metaMatch) es.MetaMatch++; else { es.MetaMismatch++; allHard = false; AddExample(examples, "metadata", rel, Compact(golden["metadata"]), Compact(SerializeToNode(plainDoc?.Metadata)), opts); }
+    if (metaMatch) es.MetaMatch++; else { es.MetaMismatch++; allHard = false; failedDims.Add("metadata"); AddExample(examples, "metadata", rel, Compact(golden["metadata"]), Compact(SerializeToNode(plainDoc?.Metadata)), opts); }
 
     bool tablesMatch = JsonEquivalent(golden["tables"], SerializeToNode(plainDoc?.Tables), TablesNormalizer);
-    if (tablesMatch) es.TablesMatch++; else { es.TablesMismatch++; allHard = false; AddExample(examples, "tables", rel, Compact(golden["tables"]), Compact(SerializeToNode(plainDoc?.Tables)), opts); }
+    if (tablesMatch) es.TablesMatch++; else { es.TablesMismatch++; allHard = false; failedDims.Add("tables"); AddExample(examples, "tables", rel, Compact(golden["tables"]), Compact(SerializeToNode(plainDoc?.Tables)), opts); }
 
     if (allHard) { es.Ok++; stats.Ok++; if (opts.ListOk) Console.WriteLine($"  ok  {rel}"); }
+    else if (opts.ListFail)
+        Console.WriteLine($"FAIL\t{Path.GetExtension(rel).TrimStart('.').ToLowerInvariant()}\t{rel}\t{string.Join(",", failedDims)}");
 
     // ── Content-parity (separate from byte-parity) ──────────────────────────
     // Byte-parity penalises us for cosmetic and even for being-more-correct-than-Rust
@@ -431,10 +435,17 @@ static void PrintReport(Stats s, Dictionary<string, List<string>> ex, Options o)
 {
     Console.WriteLine();
     Console.WriteLine("═══ Xberg C# parity report ═══");
-    Console.WriteLine($"Fixtures compared (rust succeeded): {s.Total}");
-    Console.WriteLine($"  fully matching (hard dims):      {s.Ok}");
-    Console.WriteLine($"  both-unsupported (rust failed):  {s.BothUnsupported}");
-    Console.WriteLine($"  C# produced output, rust failed: {s.Extra}");
+    // `Total` counts every fixture walked, including those Rust itself could not extract.
+    // Only the fixtures Rust did extract are comparable, and dividing by anything else
+    // scores this port against documents upstream never read.
+    int comparable = s.Total - s.BothUnsupported - s.Extra;
+    Console.WriteLine($"Fixtures walked:                   {s.Total}");
+    Console.WriteLine($"  comparable (rust extracted):     {comparable}");
+    Console.WriteLine($"  fully matching (hard dims):      {s.Ok}" +
+        (comparable > 0 ? $"  ({100.0 * s.Ok / comparable:F1}% of comparable)" : ""));
+    Console.WriteLine($"  failing at least one hard dim:   {comparable - s.Ok}");
+    Console.WriteLine($"  rust failed, C# also empty:      {s.BothUnsupported}");
+    Console.WriteLine($"  rust failed, C# produced output: {s.Extra}");
     Console.WriteLine($"  source file missing:             {s.NoSource}");
     Console.WriteLine();
     Console.WriteLine($"{"ext",-10}{"n",5}{"ok",6}{"plain",8}{"md",8}{"html",8}{"json",8}{"meta",8}{"tables",8}");
@@ -478,6 +489,7 @@ static Options? ParseArgs(string[] args)
             case "--cluster-format": o.ClusterFormat = args[++i]; break;
             case "--strict-md": o.StrictMd = true; break;
             case "--list-ok": o.ListOk = true; break;
+            case "--list-fail": o.ListFail = true; break;
             case "--dump": o.Dump = args[++i]; break;
         }
     }
@@ -496,6 +508,7 @@ sealed class Options
     public string ClusterFormat = "plain";
     public bool StrictMd;
     public bool ListOk;
+    public bool ListFail;
     public string? Dump;
 }
 

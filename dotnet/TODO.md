@@ -188,6 +188,74 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > backup taken first (`tar czf` over `*-results-rust.json`), and delete anything the run added
 > that the backup did not have.
 
+## Every failing fixture, categorized
+
+The corpus is 2,942 fixtures. **155 of them Rust itself cannot extract** (75 where this port is
+also empty, 80 where it produces output and Rust errors), so they are not comparable in either
+direction. That leaves **2,787 comparable fixtures, 2,639 fully matching (94.7%)** and **148
+failing at least one hard dimension**. Run `--list-fail` to regenerate the list below; it prints
+one line per failing fixture with the dimensions it failed.
+
+Read the 89.7% figure that appears in older notes with that in mind — it divided by all 2,942 and
+so scored this port against documents upstream never read. The harness said "Fixtures compared
+(rust succeeded)" over a total that included the incomparable ones; that label is now fixed.
+
+### Genuine upstream defects — 6 fixtures, safe to ignore
+
+Each is traced to a specific line, not assumed.
+
+- **Hash-ordered dBASE columns** (`dbf/stations.dbf`). `extractors/dbf.rs` builds column headers
+  from `reader.fields()` in declared order, then fills each row with `record.into_iter()`, whose
+  `IntoIter` is `std::collections::hash_map::IntoIter` (dbase 0.8.0, `src/record.rs:61`). Values
+  therefore arrive in hash order and land under the wrong headers, differently on every row —
+  the golden has `blue rail-metro #0000ff Van Dorn Street` on one row and
+  `Franconia-Springfield blue #0000ff rail-metro` on the next. This port emits declared order
+  consistently and is correct.
+- **`<h0>` from a truncated heading depth** (`vendored/docling/.../multi_page.doctags.txt`), the
+  `u16` depth through `((depth as u8) + 1).min(6)` described below.
+- **UTF-16 BOM ignored** (`vendored/unstructured/xml/factbook-utf-16.xml`).
+- **Corpus drift** (`ATTRIBUTIONS.md`, `LICENSES.md`, `scripts/corpus-patterns.txt`): the fixtures
+  are `test_documents`' own docs and grew after their goldens were made.
+
+### This port's gaps — 142 fixtures
+
+**PDF, 114.** By failing dimension: 32 fail only on markdown/html plus tables, 33 add `plain`,
+28 are json-and-soft, 10 are json alone, 4 tables alone, 3 metadata. The soft-dimension mass is
+one cause — heading classification — and `tables` is the ruled/heuristic tier boundary.
+
+**HTML, 7** (`hip_13044_b`, `international_emergency_medicine`, `sinthgunt`, `taylor_swift`,
+`wiki_duck`, both `test_wikipedia` copies). Not stale goldens: those were regenerated, and what
+the fresh references exposed is that this port's HTML *table* conversion is calibrated to the
+older converter that kept newlines inside cells and rendered `<noscript>`.
+
+**Spreadsheet metadata, 3** (`xls/test_excel.xls`, `xlsx/data-with-macros.xla`,
+`data_formats/test_01.ods`). Upstream writes a per-sheet formula dump into
+`metadata.additional` — `formulas_Sheet1 = "A1=K2*L2*12; B1=B2; …"` — plus `source_uri`,
+`final_uri` and `source_index`; this port writes `sheet_count`/`sheet_names` there instead and
+extracts no formulas. `test_01.ods` additionally loses the document properties upstream reads
+(`authors`, `created_at`, `modified_at`, `created_by`, `modified_by`).
+
+**`email/empty.pst`.** Upstream emits `format: {format_type: "pst", message_count: 0}`; this port
+emits no `format` block at all for an empty PST.
+
+**`opml/opml-reader.opml`.** The `_note` attribute is dropped. Upstream keeps it inline:
+`**Nevada** (_note: I lived here *once*.\n\nLoved it.)`.
+
+**Markdown, 6.** Four (`ground_truth/pdf/160428551.md`, `french_minutes_vision.md`,
+`docling/md/2023-06-20-PV.md`, `docling/md/docling.md`) open with an HTML comment, so both
+implementations route them to the HTML extractor and differ only in the fallback paragraph's
+whitespace — the output-format gap below. Two are the corpus-drift goldens above.
+
+**MathML → LaTeX, 2** (`odt/formula.odt`, `epub/features.epub`): `extraction/mathml.rs` is
+unported.
+
+**Remaining singles**, each its own cause and none yet traced: `archives/documents.tar`,
+`archives/documents.tgz`, `docbook/docbook-reader.docbook`, `jats/sample_article.nxml`,
+`iwork/test.key`, `iwork/test.numbers`, `iwork/test.pages`, `ppt/simple.ppt`,
+`vendored/unstructured/eml/email-replace-mime-encodings-error-5.eml` (malformed MIME with no
+closed boundary), `vendored/unstructured/msg/fake-email-multiple-attachments.msg` (PDF text
+quality inside an attachment).
+
 ## Known gaps after the merge
 
 Ordered by corpus impact. Each is a real upstream behaviour the port does not yet reproduce —
