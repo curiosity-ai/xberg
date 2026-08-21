@@ -97,7 +97,29 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >   the page once. Counted as an under-extraction by the harness; it is not one.
 > - **An empty bullet before every list item on `pdf/multi_page.pdf`.** Upstream emits `- ` with
 >   nothing after it, then the item's text as a separate bold paragraph, wherever a bullet glyph
->   is its own text run. This port keeps the item and its text together.
+>   is its own text run. *No longer flagged, and no longer red*: this is not a special case
+>   upstream added, it is what `blocks_to_paragraphs` produces — the bullet and the bold text are
+>   separate spans, the gap between them is too wide for `is_inline_style_transition`, so the
+>   weight change breaks the paragraph and the lone bullet finalizes as a contentless list item.
+>   The port emits the same thing now because it ports that rule, not because it special-cases
+>   the shape. The fixture matches byte for byte.
+> - **Markdown loses the spaces that the same golden's plain text keeps** (`pdf/copy_protected.pdf`).
+>   One file, two answers: `content.plain` reads
+>   `Keywords: Document Image Analysis · Deep Learning · Layout Analysis` and `content.markdown`
+>   reads `Keywords:DocumentImageAnalysis`, from the same document and the same spans. The two
+>   paths ask different questions. `assemble_page_text` (`pdf/oxide/text.rs`) uses pdf_oxide's own
+>   space decision, with char-level context and TJ offsets; `extract_text_and_annotations`
+>   (`structure/assembly.rs`) joins two segments only when `segments_need_space`
+>   (`structure/lines.rs`) says so, which for two same-style segments on one baseline reduces to
+>   `advance_gap > next.font_size * SEGMENT_GAP_SPACE_RATIO` (0.15). That ratio exists to rejoin
+>   *kerning-run* splits inside one word (`eli` + `t`); where a producer sets every *word* as its
+>   own tight span it fuses the words instead, and the markdown contradicts the plain text of the
+>   very same extraction.
+>
+>   `segments_need_space` is ported faithfully — the port reaches the right answer because its
+>   own span geometry for this file leaves real gaps where upstream's does not, so the same rule
+>   decides differently. Reproducing upstream here would mean degrading the geometry on purpose.
+>   Permanently red on markdown and html.
 > - **`<h0>` from a truncated heading depth**
 >   (`vendored/docling/groundtruth/docling_v1/multi_page.doctags.txt`). `extractors/xml.rs`
 >   computes a heading's level as `((depth as u8) + 1).min(6)` from a `u16` depth. A DocTags
@@ -132,8 +154,7 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >
 > Measured against a *freshly generated* reference instead, `html/sinthgunt.html` now matches on
 > plain, html and json. The right fix is to regenerate the goldens (see "Re-syncing after an
-> upstream merge"), not to reverse-engineer the old converter — and the lock file should be
-> brought back in step with the workspace first, so the next regeneration is reproducible.
+> upstream merge"), not to reverse-engineer the old converter.
 
 ## Known gaps after the merge
 
@@ -155,8 +176,8 @@ not a cosmetic difference.
 
       The remaining 29 are the flagged upstream defects above (the `dc:description` fragment
       and the inherited `/MediaBox`) plus genuine scan-signal differences.
-- [ ] **PDF content (389 fixtures, 103 fully matching; plain 123/388, markdown 54/388,
-      tables 222/388).**
+- [ ] **PDF content (389 fixtures, 272 fully matching; plain 356/388, markdown 215/388,
+      html 206/388, json 315/388, tables 317/388; content-identical 95.1%, 0 catastrophes).**
       The largest remaining area, and upstream landed 127 PDF commits in this window. This is
       extraction *quality*, not a missing feature, and it does not decompose into a few
       systematic fixes — measured, not assumed:
@@ -516,26 +537,53 @@ alone. Pattern marking is a no-op, and that is faithful rather than a gap: its o
 pdf_oxide and xberg leave the mode at `Tiebreaker`. Porting `pattern_detector.rs` would be 400
 lines nothing reaches. And `.Showing.cs` re-implements three rules — the MCID scope, the artifact type and
 the content-suppression test — that `.Core.cs` also owns; they agree today and should be one
-copy. Still unported from `pdf/structure/`: `mark_validated_page_numbers`,
-`stitch_fragmented_tables`, `merge_spatial_footnote_markers`,
-`suppress_table_dominant_paragraph_spill`, and everything that depends on layout regions (ML).
+copy. Still unported from `pdf/structure/`: `stitch_fragmented_tables`,
+`merge_spatial_footnote_markers`, `suppress_table_dominant_paragraph_spill`,
+`demote_structure_annotation_headings`, `split_embedded_list_items`, the paragraph-level
+`dehyphenate_paragraphs`, and everything that depends on layout regions (ML).
 
-**The hierarchy segments are built at the wrong granularity.** This one sits upstream of two
-open gaps at once — heuristic tables and heading classification both read these segments.
-Upstream's `oxide::hierarchy::extract_all_segments` emits one `SegmentData` per pdf_oxide
-span: extracted `TopToBottom` (not column-aware), then `reorder_page_reading_order`,
-`rejoin_inline_scripts`, artifact-filtered, then `dedupe_redrawn_segments`. The port emits one
-per assembled line (`PdfStructure.SegmentsFromLines`), which is a coarser shape, and the
-difference shows up directly in table cells: on `pdf/table_document.pdf` upstream splits a
-header into the words `(`, `Ω`, `)` and lands them in the column they belong to, where a single
-`(Ω)` token falls into the next column over.
+**Measured, on the same corpus and the same base.** Going span-granular and finishing the
+structure pipeline's own passes took the PDF numbers from `219 ok / 356 plain / 62 md / 60 html
+/ 315 json / 382 meta / 239 tables` to `272 / 356 / 215 / 206 / 315 / 382 / 317`, with
+content-identical unchanged at 95.1% and catastrophes at 0. Plain, json and metadata are
+untouched by design: they do not read these segments at all. The order the levers landed in was
+`finalize_paragraph` (+9 md), `synchronize_paragraph_text_metadata` (+3), the span producer
+(+39 md, +69 tables), `segments_need_space` and `mark_validated_page_numbers` together (+83 md),
+and `list_item_is_ordered` (+14 md). Beware measuring any of this on a loaded machine: the
+per-document deadline in `PdfExtractor` drops whole pages under CPU contention, which moves
+plain and content-identical by one or two fixtures between otherwise identical runs.
 
-Two fields of `SegmentData` are also absent: `rotation_degrees`, and `assigned_role` — the
-heading level read straight from `/StructTreeRoot`. `extract_all_segments` tries
-`extract_segments_with_structure_tree` *first*, and only falls back to font-size clustering when
-`mark_info().is_structure_reliable()` fails or the tree carries fewer than three headings. The
-port has no structure-tree path at all, so on a tagged PDF it infers what upstream reads. 74 of
-the 389 corpus PDFs carry a `/StructTreeRoot`.
+**The hierarchy segments are now span-granular** (`Internal/Pdf/PdfOxideSegments.cs`), which
+was the single largest thing standing between the port and upstream's structured output. It
+sat upstream of two gaps at once, because heuristic tables and heading classification both read
+these segments. The port used to emit one `SegmentData` per assembled *line*; upstream emits
+one per pdf_oxide *span*, and a line is simply the wrong unit — a heading, a bold lead-in and
+the prose that follows it share a paragraph and must still come out as separate styled runs.
+On `pdf/multi_page.pdf` upstream writes `**IBM MT/ST (Magnetic Tape/Selectric Typewriter)** :
+Introduced in 1964…`, a bold run, a geometry-derived space and a non-bold run inside one
+paragraph, which a line-granular segment cannot represent at all. The same coarseness showed
+up in table cells: a header upstream splits into `(`, `Ω`, `)` arrived as one `(Ω)` token and
+fell into the next column over. Ported with it: the `TopToBottom` row-band order the structure
+path asks for (*not* the column-aware order the text path uses), `reorder_page_reading_order`
+with its dense-repair short-circuit, `select_reading_order` and its gutter/prose/balance gates,
+`rejoin_inline_scripts`, artifact filtering and `dedupe_redrawn_segments`.
+
+`SegmentData.rotation_degrees` is still absent, so the four places upstream asks
+`has_same_rotation` — the redraw dedupe, the inter-segment space rule, the paragraph break and
+the continuation merge — treat a rotated run as if it shared the page axis, and
+`order_segments_in_reading_frames` (which sorts each rotated run in its own upright frame) has
+no equivalent. Rotated pages are the only ones affected.
+
+**The structure-tree path is still absent, and that is the remaining half of this note.**
+`extract_all_segments` tries `extract_segments_with_structure_tree` *first* and only falls back
+to font-size clustering when `mark_info().is_structure_reliable()` fails or the tree carries
+fewer than three headings; on a tagged PDF the port infers what upstream reads. It is a
+different pipeline branch, not a producer tweak: it populates `SegmentData.assigned_role`, and
+`process_single_page` then takes the `struct_paragraphs` arm through `classify_paragraphs`
+(`classify.rs`), which the port does not have. 74 of the 389 corpus PDFs carry a
+`/StructTreeRoot` — an upper bound on the yield, not the yield, since the reliability and
+three-heading gates cut into it and none of the currently failing markdown fixtures has been
+attributed to it.
 
 ---
 
