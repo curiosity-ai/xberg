@@ -84,6 +84,12 @@ public sealed partial class OpmlExtractor : IExtractor
 
         if (text.Length == 0)
         {
+            // An outline with no `text` still carries content when it has a `_note`; only a
+            // truly empty node contributes nothing. Without this the note is the one thing on
+            // the node and it goes unread.
+            string? emptyNodeNote = node.Attribute("_note")?.Value.Trim();
+            if (!string.IsNullOrEmpty(emptyNodeNote))
+                builder.PushParagraph(ConvertInlineHtml(emptyNodeNote), new List<Xberg.Types.TextAnnotation>(), null, null);
             foreach (var c in childOutlines) BuildOutline(c, depth, builder);
             return;
         }
@@ -105,7 +111,7 @@ public sealed partial class OpmlExtractor : IExtractor
     private static Dictionary<string, string> ExtractOutlineAttributes(XElement node)
     {
         var attrs = new Dictionary<string, string>();
-        foreach (var name in new[] { "xmlUrl", "htmlUrl", "type", "description" })
+        foreach (var name in new[] { "xmlUrl", "htmlUrl", "type", "description", "_note" })
         {
             string? val = node.Attribute(name)?.Value.Trim();
             if (!string.IsNullOrEmpty(val)) attrs[name] = val;
