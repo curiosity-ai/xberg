@@ -215,4 +215,35 @@ public class MimeTests
         Assert.Equal("application/xml", Mime.DetectMimeTypeFromBytes(
             Encoding.UTF8.GetBytes("<!--never closed\n<book><title>t</title></book>")));
     }
+
+    /// <summary>
+    /// A corrupted download can staple an ISP error page in front of a real document —
+    /// `test_documents/pdf/medium.pdf` opens with 364 bytes of DNS-hijack HTML and then
+    /// `%PDF-1.4`. The opening bytes read as markup, but the file as a whole does not decode as
+    /// text, and treating it as HTML hands the PDF's raw bytes to the wrong extractor.
+    /// </summary>
+    [Fact]
+    public void AnErrorPageStapledToABinaryDocumentDoesNotMakeItHtml()
+    {
+        byte[] preamble = System.Text.Encoding.ASCII.GetBytes(
+            "<html><head><meta http-equiv=\"refresh\" content=\"0;url=http://example.invalid/\"/>" +
+            "</head><body></body></html>");
+        byte[] pdf = System.Text.Encoding.ASCII.GetBytes("%PDF-1.4\r%\u00e2\u00e3\u00cf\u00d3\r\n114 0 obj\n");
+        // A byte that cannot start a UTF-8 sequence, as a real PDF's binary comment carries.
+        var bytes = new List<byte>(preamble);
+        bytes.AddRange(pdf);
+        bytes.AddRange(new byte[] { 0xE2, 0xE3, 0xCF, 0xD3 });
+
+        Assert.Equal("application/pdf", Mime.ResolveWithContent("application/pdf", bytes.ToArray()));
+    }
+
+    /// <summary>A page that really is HTML is still HTML, whatever it goes on to contain.</summary>
+    [Fact]
+    public void AnHtmlDocumentStillOverridesAMisleadingExtension()
+    {
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(
+            "<html><head><title>t</title></head><body><p>hello</p></body></html>");
+
+        Assert.Equal("text/html", Mime.ResolveWithContent("text/plain", bytes));
+    }
 }

@@ -47,12 +47,6 @@ public static class Mime
             // else fall through to PST/text heuristics
         }
 
-        // The WHATWG sniffing table, which upstream reaches through `infer`. It runs ahead of
-        // the text heuristics below, so a document that opens with one of these — a comment
-        // included — is HTML however its markup continues, and never falls through to the
-        // generic `<` arm that would call it XML.
-        if (SniffWhatwgHtml(content)) return "text/html";
-
         // PST
         if (content.Length >= 4 && content[0] == 0x21 && content[1] == 0x42 && content[2] == 0x44 && content[3] == 0x4E)
             return "application/vnd.ms-outlook-pst";
@@ -68,6 +62,13 @@ public static class Mime
             // every tag first and the HTML test never runs — upstream's issue #235, which this
             // port had inherited. It went unnoticed while the extension always won; once content
             // can overrule the extension, every HTML file routes to the XML extractor.
+            // The WHATWG sniffing table, which upstream reaches through `infer`. It sits inside
+            // the UTF-8 branch, as upstream's own HTML test does: a file that does not decode is
+            // not a document whose opening bytes can be read as markup, whatever they spell. A
+            // corrupted download with an ISP error page stapled in front of a real PDF is exactly
+            // that, and hoisting this ahead of the decode handed those files to the HTML
+            // extractor, which emitted the PDF's raw bytes as a paragraph.
+            if (SniffWhatwgHtml(content)) return "text/html";
             if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(SkipLeadingComments(trimmed)))
                 return "text/html";
             if (trimmed.StartsWith("<?xml", StringComparison.Ordinal) || trimmed.StartsWith('<'))
