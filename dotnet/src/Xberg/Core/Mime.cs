@@ -47,6 +47,12 @@ public static class Mime
             // else fall through to PST/text heuristics
         }
 
+        // The WHATWG sniffing table, which upstream reaches through `infer`. It runs ahead of
+        // the text heuristics below, so a document that opens with one of these — a comment
+        // included — is HTML however its markup continues, and never falls through to the
+        // generic `<` arm that would call it XML.
+        if (SniffWhatwgHtml(content)) return "text/html";
+
         // PST
         if (content.Length >= 4 && content[0] == 0x21 && content[1] == 0x42 && content[2] == 0x44 && content[3] == 0x4E)
             return "application/vnd.ms-outlook-pst";
@@ -199,6 +205,37 @@ public static class Mime
 
         return HtmlFragmentElements.Contains(afterBracket[..nameLength].ToLowerInvariant());
     }
+
+    /// <summary>
+    /// The WHATWG mime-sniffing table's HTML openings, as <c>infer</c>'s <c>is_html</c>
+    /// implements them: one of these tag names, case-insensitive, after leading whitespace, and
+    /// terminated by a space or <c>&gt;</c> so that <c>&lt;HTML</c> on its own does not count.
+    /// </summary>
+    private static bool SniffWhatwgHtml(ReadOnlySpan<byte> content)
+    {
+        int i = 0;
+        while (i < content.Length && content[i] is 0x09 or 0x0A or 0x0C or 0x0D or 0x20) i++;
+        var buf = content[i..];
+        foreach (string value in WhatwgHtmlOpenings)
+        {
+            if (buf.Length <= value.Length) continue;
+            bool same = true;
+            for (int k = 0; k < value.Length && same; k++)
+            {
+                char c = (char)buf[k];
+                if (c is >= 'a' and <= 'z') c = (char)(c - 32);
+                same = c == value[k];
+            }
+            if (same && (buf[value.Length] == 0x20 || buf[value.Length] == 0x3E)) return true;
+        }
+        return false;
+    }
+
+    private static readonly string[] WhatwgHtmlOpenings =
+    {
+        "<!DOCTYPE HTML", "<HTML", "<HEAD", "<SCRIPT", "<IFRAME", "<H1", "<DIV", "<FONT",
+        "<TABLE", "<A", "<STYLE", "<TITLE", "<B", "<BODY", "<BR", "<P", "<!--",
+    };
 
     private static string? SniffMagic(ReadOnlySpan<byte> b)
     {

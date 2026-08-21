@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Xberg.Core;
 using Xberg.Internal.Commonmark;
@@ -111,6 +112,10 @@ public sealed class MarkdownExtractor : IExtractor
         uint imageCounter = 0;
         string? footnoteDefLabel = null;
         var footnoteDefText = new StringBuilder();
+        bool inDefTitle = false;
+        bool inDefDesc = false;
+        var defBuf = new StringBuilder();
+        var blockQuoteStack = new List<bool>();
 
         // annotation_starts: (kind 0=bold 1=italic 2=strike 4=link, byteStart, linkUrl, linkTitle)
         var annStarts = new List<(int kind, uint start, string? url, string? title)>();
@@ -141,7 +146,7 @@ public sealed class MarkdownExtractor : IExtractor
                     break;
                 }
                 case MdEventKind.StartParagraph:
-                    if (!inHeading && !inListItem && footnoteDefLabel is null)
+                    if (!inHeading && !inListItem && footnoteDefLabel is null && !inDefDesc)
                     {
                         paragraphText.Clear(); paragraphAnns.Clear();
                         inParagraph = true;
@@ -273,8 +278,19 @@ public sealed class MarkdownExtractor : IExtractor
                     break;
                 }
 
-                case MdEventKind.StartBlockQuote: b.PushQuoteStart(); break;
-                case MdEventKind.EndBlockQuote: b.PushQuoteEnd(); break;
+                // A GFM alert is an admonition, not a quote: it carries no quote container at
+                // all, so its body renders as ordinary blocks alongside the kind marker.
+                case MdEventKind.StartBlockQuote:
+                    if (e.Text.Length > 0) { b.PushAdmonition(e.Text, null, null); blockQuoteStack.Add(true); }
+                    else { b.PushQuoteStart(); blockQuoteStack.Add(false); }
+                    break;
+                case MdEventKind.EndBlockQuote:
+                {
+                    bool wasAlert = blockQuoteStack.Count > 0 && blockQuoteStack[^1];
+                    if (blockQuoteStack.Count > 0) blockQuoteStack.RemoveAt(blockQuoteStack.Count - 1);
+                    if (!wasAlert) b.PushQuoteEnd();
+                    break;
+                }
 
                 case MdEventKind.StartList:
                     b.PushList(e.Ordered);
@@ -397,6 +413,7 @@ public sealed class MarkdownExtractor : IExtractor
                     else if (inTableCell) currentCell.Append(e.Text);
                     else if (inListItem) AppendCode(listItemText, listItemAnns, e.Text);
                     else if (footnoteDefLabel is not null) footnoteDefText.Append(e.Text);
+                    else if (inDefTitle || inDefDesc) defBuf.Append(e.Text);
                     else if (inParagraph) AppendCode(paragraphText, paragraphAnns, e.Text);
                     break;
                 // Inline math stays in the text with its delimiters, since `$x$` reads as maths
@@ -407,6 +424,7 @@ public sealed class MarkdownExtractor : IExtractor
                     else if (inTableCell) currentCell.Append('$').Append(e.Text).Append('$');
                     else if (inListItem) listItemText.Append('$').Append(e.Text).Append('$');
                     else if (footnoteDefLabel is not null) footnoteDefText.Append('$').Append(e.Text).Append('$');
+                    else if (inDefTitle || inDefDesc) defBuf.Append('$').Append(e.Text).Append('$');
                     else if (inParagraph) paragraphText.Append('$').Append(e.Text).Append('$');
                     break;
                 case MdEventKind.DisplayMath:
@@ -422,6 +440,7 @@ public sealed class MarkdownExtractor : IExtractor
                     else if (inTableCell) currentCell.Append(e.Text);
                     else if (inListItem) listItemText.Append(e.Text);
                     else if (footnoteDefLabel is not null) footnoteDefText.Append(e.Text);
+                    else if (inDefTitle || inDefDesc) defBuf.Append(e.Text);
                     else if (inParagraph) paragraphText.Append(e.Text);
                     break;
                 case MdEventKind.SoftBreak:
@@ -430,6 +449,7 @@ public sealed class MarkdownExtractor : IExtractor
                     else if (inHeading) headingText.Append(' ');
                     else if (inListItem) listItemText.Append(' ');
                     else if (footnoteDefLabel is not null) footnoteDefText.Append(' ');
+                    else if (inDefTitle || inDefDesc) defBuf.Append(' ');
                     else if (inParagraph) paragraphText.Append(' ');
                     break;
                 case MdEventKind.FootnoteReference:
@@ -443,6 +463,7 @@ public sealed class MarkdownExtractor : IExtractor
                     else if (inTableCell) currentCell.Append(e.Text);
                     else if (inListItem) listItemText.Append(e.Text);
                     else if (footnoteDefLabel is not null) footnoteDefText.Append(e.Text);
+                    else if (inDefTitle || inDefDesc) defBuf.Append(e.Text);
                     else if (inParagraph) paragraphText.Append(e.Text);
                     else
                     {
@@ -453,6 +474,29 @@ public sealed class MarkdownExtractor : IExtractor
                 case MdEventKind.TaskListMarker:
                     if (inListItem) listItemText.Append(e.Checked ? "[x] " : "[ ] ");
                     break;
+
+                case MdEventKind.StartDefinitionListTitle:
+                    inDefTitle = true; defBuf.Clear();
+                    break;
+                case MdEventKind.EndDefinitionListTitle:
+                {
+                    inDefTitle = false;
+                    string term = defBuf.ToString().Trim();
+                    if (term.Length > 0) b.PushDefinitionTerm(term, null);
+                    defBuf.Clear();
+                    break;
+                }
+                case MdEventKind.StartDefinitionListDefinition:
+                    inDefDesc = true; defBuf.Clear();
+                    break;
+                case MdEventKind.EndDefinitionListDefinition:
+                {
+                    inDefDesc = false;
+                    string desc = defBuf.ToString().Trim();
+                    if (desc.Length > 0) b.PushDefinitionDescription(desc, null);
+                    defBuf.Clear();
+                    break;
+                }
             }
         }
 
@@ -594,17 +638,18 @@ public sealed class MarkdownExtractor : IExtractor
 
     internal static List<TextAnnotation> AdjustAnnotationsForTrim(List<TextAnnotation> annotations, string raw, string trimmed)
     {
-        int trimOffset = Encoding.UTF8.GetByteCount(raw) - Encoding.UTF8.GetByteCount(raw.TrimStart());
+        uint offset = (uint)(Encoding.UTF8.GetByteCount(raw) - Encoding.UTF8.GetByteCount(raw.TrimStart()));
         uint trimmedLen = (uint)Encoding.UTF8.GetByteCount(trimmed);
-        if (trimOffset == 0)
-            return annotations.Where(a => a.Start < a.End && a.End <= trimmedLen).ToList();
-        uint offset = (uint)trimOffset;
+        // Offsets shift left by the leading whitespace removed and are then *clamped* to the
+        // trimmed length. A span that runs into the trailing whitespace still covers real words;
+        // dropping it outright loses the formatting (upstream's #226). Only a span that collapses
+        // to an empty range — one that lay entirely inside the whitespace — is discarded.
         return annotations.Select(a => new TextAnnotation
         {
-            Start = a.Start >= offset ? a.Start - offset : 0,
-            End = a.End >= offset ? a.End - offset : 0,
+            Start = Math.Min(a.Start >= offset ? a.Start - offset : 0, trimmedLen),
+            End = Math.Min(a.End >= offset ? a.End - offset : 0, trimmedLen),
             Kind = a.Kind,
-        }).Where(a => a.Start < a.End && a.End <= trimmedLen).ToList();
+        }).Where(a => a.Start < a.End).ToList();
     }
 
     internal static (JsonNode? Yaml, string Remaining) ExtractFrontmatter(string content)
@@ -658,7 +703,18 @@ public sealed class MarkdownExtractor : IExtractor
         string? Str(string key) => yaml[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
 
         if (Str("title") is string title && m.Title is null) m.Title = title;
-        if (Str("author") is string author && m.CreatedBy is null) m.CreatedBy = author;
+
+        // `author` may be a scalar or a sequence, and the Hugo/Jekyll `authors` key is the same
+        // shape; `Metadata.Authors` is the typed home for all three. Where both keys are present
+        // `authors` wins for the list, while a scalar `author` still supplies `CreatedBy`.
+        if (yaml["author"] is JsonNode authorValue)
+        {
+            if (Str("author") is string author && m.CreatedBy is null) m.CreatedBy = author;
+            m.Authors ??= ScalarOrSequence(authorValue);
+        }
+        if (yaml["authors"] is JsonNode authorsValue && ScalarOrSequence(authorsValue) is { } authors)
+            m.Authors = authors;
+
         if (Str("date") is string date) m.CreatedAt = date;
 
         if (yaml["keywords"] is JsonNode kw)
@@ -686,7 +742,42 @@ public sealed class MarkdownExtractor : IExtractor
 
         if (Str("language") is string lang && m.Language is null) m.Language = lang;
         if (Str("version") is string ver) m.DocumentVersion = ver;
+
+        // Every top-level key without a typed field above (Hugo/Jekyll/Obsidian extras like
+        // `aliases`, `slug`, `draft`, or anything a document invents) is preserved rather than
+        // dropped, keeping its YAML shape: a sequence stays an array, not a joined string.
+        if (yaml is JsonObject obj)
+        {
+            foreach (var kv in obj)
+            {
+                if (KnownFrontmatterKeys.Contains(kv.Key)) continue;
+                m.Additional[kv.Key] = JsonSerializer.SerializeToElement(kv.Value);
+            }
+        }
         return m;
+    }
+
+    /// <summary>Frontmatter keys that have a typed home on <see cref="Metadata"/>; everything
+    /// else lands in <c>additional</c>.</summary>
+    private static readonly HashSet<string> KnownFrontmatterKeys = new(StringComparer.Ordinal)
+    {
+        "title", "author", "authors", "date", "keywords", "description", "abstract",
+        "subject", "category", "tags", "language", "version",
+    };
+
+    /// <summary>A frontmatter value read as a list of names: one entry for a scalar, its string
+    /// members for a sequence, and null for anything else or an empty sequence
+    /// (<c>yaml_scalar_or_sequence_to_strings</c>).</summary>
+    private static List<string>? ScalarOrSequence(JsonNode value)
+    {
+        if (value is JsonValue v && v.TryGetValue<string>(out var s)) return new List<string> { s };
+        if (value is JsonArray a)
+        {
+            var items = a.Where(x => x is JsonValue jv && jv.TryGetValue<string>(out _))
+                .Select(x => x!.GetValue<string>()).ToList();
+            return items.Count > 0 ? items : null;
+        }
+        return null;
     }
 
     internal static string? ExtractTitleFromContent(string content)

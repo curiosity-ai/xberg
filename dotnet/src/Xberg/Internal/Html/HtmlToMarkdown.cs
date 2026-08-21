@@ -2678,10 +2678,14 @@ internal static class HtmlDom
 
         while (pos < n)
         {
-            if (src[pos] != '<')
+            // A `<` only opens markup when a letter, `/`, `!` or `?` follows it (the HTML
+            // tag-open state); otherwise it is character data — `a <- filter(x, y > 0)` is R
+            // source, not a tag that swallows everything up to the next `>`.
+            if (src[pos] != '<' || !HtmlWalker.OpensTag(src, pos))
             {
-                int lt = src.IndexOf('<', pos);
-                if (lt < 0) lt = n;
+                int lt = pos;
+                if (src[lt] == '<') lt++;
+                while (lt < n && !(src[lt] == '<' && HtmlWalker.OpensTag(src, lt))) lt++;
                 AddChild(new HNode { Tag = null, Text = src[pos..lt] });
                 pos = lt;
                 continue;

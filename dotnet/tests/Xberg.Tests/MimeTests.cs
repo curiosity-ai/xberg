@@ -192,11 +192,27 @@ public class MimeTests
         Assert.Equal("text/html", Mime.DetectMimeTypeFromBytes(Encoding.UTF8.GetBytes(markup)));
     }
 
-    /// <summary>An unterminated comment is not a licence to guess; the file stays what it was.</summary>
+    /// <summary>
+    /// The WHATWG table upstream reaches through <c>infer</c> answers on the opening alone:
+    /// <c>&lt;!--</c> followed by a space is HTML whether or not the comment is ever closed. The
+    /// corpus depends on it — <c>ground_truth/pdf/160428551.txt</c> opens with an unterminated
+    /// <c>&lt;!-- … --</c> and upstream extracts it as HTML, not as a tag outline.
+    /// </summary>
     [Fact]
-    public void AnUnterminatedCommentDoesNotMakeMarkupHtml()
+    public void AnUnterminatedCommentStillOpensHtml()
+    {
+        Assert.Equal("text/html", Mime.DetectMimeTypeFromBytes(
+            Encoding.UTF8.GetBytes("<!-- never closed\n<book><title>t</title></book>")));
+    }
+
+    /// <summary>
+    /// The same table is strict about the delimiter: only a space or <c>&gt;</c> ends the
+    /// opening, so markup that merely begins with those four characters is not HTML.
+    /// </summary>
+    [Fact]
+    public void AnOpeningWithoutItsDelimiterIsNotHtml()
     {
         Assert.Equal("application/xml", Mime.DetectMimeTypeFromBytes(
-            Encoding.UTF8.GetBytes("<!-- never closed\n<book><title>t</title></book>")));
+            Encoding.UTF8.GetBytes("<!--never closed\n<book><title>t</title></book>")));
     }
 }

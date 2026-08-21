@@ -64,7 +64,7 @@ public sealed class HtmlWalker
                 _pos = end < 0 ? _src.Length : end + 3;
                 continue;
             }
-            if (_src[_pos] == '<') HandleTag();
+            if (_src[_pos] == '<' && OpensTag(_src, _pos)) HandleTag();
             else HandleText();
         }
         CloseParagraphContext();
@@ -77,10 +77,25 @@ public sealed class HtmlWalker
     private bool Starts(string s) => string.CompareOrdinal(_src, _pos, s, 0, s.Length) == 0 && _pos + s.Length <= _src.Length;
 
     // ── text ─────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Whether the <c>&lt;</c> at <paramref name="pos"/> opens markup. The HTML tag-open state
+    /// takes only an ASCII letter, <c>/</c>, <c>!</c> or <c>?</c>; anything else — an R
+    /// assignment arrow, a less-than sign in prose — is character data, and the <c>&lt;</c>
+    /// stands for itself.
+    /// </summary>
+    internal static bool OpensTag(string src, int pos)
+    {
+        if (pos + 1 >= src.Length) return false;
+        char c = src[pos + 1];
+        return char.IsAsciiLetter(c) || c is '/' or '!' or '?';
+    }
+
     private void HandleText()
     {
         int start = _pos;
-        while (_pos < _src.Length && _src[_pos] != '<') _pos++;
+        // A `<` that cannot open a tag is content: step over it so the scan does not stall.
+        if (_pos < _src.Length && _src[_pos] == '<') _pos++;
+        while (_pos < _src.Length && !(_src[_pos] == '<' && OpensTag(_src, _pos))) _pos++;
         string decoded = DecodeEntities(_src[start.._pos]);
 
         if (_table is not null) { _table.PushText(decoded); return; }
