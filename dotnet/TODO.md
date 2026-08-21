@@ -538,16 +538,24 @@ builds them per span, and `classify_paragraphs` where the untagged path calls
       own encoding — and the ligature slots in it — are read from `/FontFile3` rather than
       guessed at.
 
-**The native table tier is a fraction of upstream's.** `pdf_oxide`'s
-`structure/spatial_table_detector.rs` carries 73 production functions; this port has 23 of them,
-all on the intersection path. Absent entirely: the whole text-edge strategy
-(`detect_tables_from_spans`, `_column_aware`, `detect_tables_hybrid`, `detect_text_edge_columns`),
-h-rule-bounded detection (`detect_tables_from_horizontal_rules`), and the entire validation layer
-— `validate_table_structure_internal`, `passes_spatial_quality_gate`, `is_regular_lattice`,
-`has_split_modal_column_groups`, `looks_like_prose_paragraph`, `looks_like_bulleted_list`,
-`looks_like_cjk_prose`, `trim_empty_columns`, `filter_columns_by_row_coverage` — plus
-`detect_merged_cells`, `detect_header_row`, and `consolidate_adjacent_table_fragments`. The
-heuristic tier compensates for some of this, which is why the gap is not larger than it is.
+**The native table tier's real gap is the cluster fallback, and only that.** A raw function
+count says this port has 23 of `spatial_table_detector.rs`'s 73 production functions, but most of
+the difference is unreachable from xberg and counting it as a gap is wrong.
+`detect_tables_with_lines` dispatches on `(horizontal_strategy, vertical_strategy)`, and *both*
+xberg tiers set `TableStrategy::Lines` on both axes — `strict()` does, and `extract_tables_bordered`
+builds its own config that does. `relaxed()`, the only preset using `Text`, is never used by
+xberg. So the whole text-edge strategy (`detect_tables_from_spans`, `_column_aware`,
+`detect_tables_hybrid`, `detect_text_edge_columns`, `detect_tables_from_horizontal_rules`) and the
+validation layer reached only from it (`validate_table_structure_internal`,
+`passes_spatial_quality_gate`, `is_regular_lattice`, `looks_like_prose_paragraph`,
+`looks_like_bulleted_list`, `looks_like_cjk_prose`) is dead code here, in the same way pattern
+marking is.
+
+What the `(Lines, Lines)` arm actually reaches and this port lacks is the cluster fallback that
+runs when intersection detection finds nothing — a ruled table whose rules do not cross:
+`group_lines_into_clusters`, `detect_tables_in_cluster`, `cluster_values`,
+`detect_header_row_above`, and `grid_to_table` with `detect_merged_cells` and `detect_header_row`
+under it.
 
 **What the PDF port still owes.** The ruling-line tiers read their drawn paths from the older
 content interpreter, which is why both span producers still run per page; the paths belong in
