@@ -2,6 +2,7 @@
 // field-precedence rules in crates/xberg/src/pdf/oxide/metadata.rs.
 
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml;
 
 namespace Xberg.Internal.Pdf;
@@ -73,6 +74,25 @@ internal static class PdfXmp
     }
 
     /// <summary>
+    /// A private-use code point standing in for an entity reference, so a run of character data
+    /// interrupted by one stays two runs after the reader has resolved everything else.
+    /// </summary>
+    /// <remarks>
+    /// Upstream's pull parser reports an entity reference as its own event and its packet reader
+    /// ignores those events, so a value like <c>&amp;lt;div&amp;gt;…</c> reaches it as the
+    /// separate runs between the references, and a single-valued property keeps only the first.
+    /// A resolving reader would hand over one joined run instead and record a different value.
+    /// </remarks>
+    private const char EntityMark = '\uE000';
+
+    private static readonly Regex EntityReferenceRe = new(
+        @"&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z_][A-Za-z0-9._-]*);",
+        RegexOptions.Compiled);
+
+    private static string MarkEntityReferences(string content) =>
+        content.Contains('&') ? EntityReferenceRe.Replace(content, EntityMark.ToString()) : content;
+
+    /// <summary>
     /// Parse one XMP packet.
     /// </summary>
     /// <remarks>
@@ -99,7 +119,7 @@ internal static class PdfXmp
         }
         if (start < 0 || end < 0 || end < start) return null;
 
-        string content = xml.Substring(start, end + closing.Length - start);
+        string content = MarkEntityReferences(xml.Substring(start, end + closing.Length - start));
         var metadata = new XmpMetadata();
 
         var settings = new XmlReaderSettings
@@ -111,6 +131,10 @@ internal static class PdfXmp
             IgnoreWhitespace = true,
             ConformanceLevel = ConformanceLevel.Fragment,
             NameTable = new NameTable(),
+            // Real packets carry character references XML 1.0 forbids — Ghostscript writes
+            // `&#1;` into `rdf:about` — and rejecting them costs every property in the packet,
+            // including the ones that parse cleanly. Upstream's reader does not validate them.
+            CheckCharacters = false,
         };
 
         var stack = new List<string>();
@@ -131,8 +155,6 @@ internal static class PdfXmp
                     case XmlNodeType.CDATA:
                     case XmlNodeType.SignificantWhitespace:
                     {
-                        string text = reader.Value.Trim();
-                        if (text.Length == 0) break;
                         string? property = null;
                         for (int i = stack.Count - 1; i >= 0; i--)
                         {
@@ -142,7 +164,12 @@ internal static class PdfXmp
                             property = el;
                             break;
                         }
-                        if (property is not null) Assign(metadata, property, text);
+                        if (property is null) break;
+                        foreach (var run in reader.Value.Split(EntityMark))
+                        {
+                            string text = run.Trim();
+                            if (text.Length != 0) Assign(metadata, property, text);
+                        }
                         break;
                     }
                 }

@@ -51,6 +51,7 @@ internal static class OxPageExtractor
 
         var extractor = new OxTextExtractor();
         extractor.SetPageIndex(pageIndex);
+        extractor.SetExcludedLayers(PdfOptionalContent.DefaultOffOcgs(doc));
 
         var resources = page.Get("Resources");
         if (resources is not null)

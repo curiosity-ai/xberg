@@ -74,10 +74,12 @@ public class PdfXmpTests
     }
 
     [Fact]
-    public void EscapedMarkupInAValueSurvivesWhole()
+    public void EscapedMarkupInAValueKeepsOnlyItsFirstRun()
     {
-        // Some producers put escaped HTML in dc:description. It is one string, and unescaping it
-        // must not turn its tags back into structure that fragments the value.
+        // Some producers put escaped HTML in dc:description. Upstream's pull parser reports each
+        // entity reference as its own event and the packet reader ignores those, so the value
+        // arrives as the runs between them and the first one is what a single-valued property
+        // keeps.
         var xmp = PdfXmp.Parse("""
             <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
               <rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -85,7 +87,7 @@ public class PdfXmpTests
               </rdf:Description>
             </rdf:RDF>
             """);
-        Assert.Equal("<div><p>Abstract</p></div>", xmp!.DcDescription);
+        Assert.Equal("div", xmp!.DcDescription);
     }
 
     [Fact]
@@ -105,5 +107,66 @@ public class PdfXmpTests
             """);
         Assert.NotNull(xmp);
         Assert.True(xmp!.IsEmpty);
+    }
+
+    /// <summary>
+    /// Ghostscript writes character references XML 1.0 forbids into <c>rdf:about</c>. Upstream's
+    /// non-validating reader walks straight past them, so the packet's real properties must
+    /// survive.
+    /// </summary>
+    [Fact]
+    public void IllegalCharacterReferencesDoNotDiscardTheRestOfThePacket()
+    {
+        var xmp = PdfXmp.Parse("""
+            <x:xmpmeta xmlns:x="adobe:ns:meta/">
+            <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+              <rdf:Description rdf:about="doc&#1;&#8;id" xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title><rdf:Alt><rdf:li xml:lang="x-default">Kept title</rdf:li></rdf:Alt></dc:title>
+                <dc:description><rdf:Seq><rdf:li>Kept description</rdf:li></rdf:Seq></dc:description>
+              </rdf:Description>
+            </rdf:RDF>
+            </x:xmpmeta>
+            """);
+        Assert.NotNull(xmp);
+        Assert.Equal("Kept title", xmp!.DcTitle);
+        Assert.Equal("Kept description", xmp.DcDescription);
+    }
+
+    /// <summary>
+    /// An entity reference ends the run of character data it sits in, so a single-valued
+    /// property keeps only the text before the first one — upstream's reader reports the
+    /// reference as its own event and ignores it.
+    /// </summary>
+    [Fact]
+    public void AnEntityReferenceEndsTheRunItInterrupts()
+    {
+        var xmp = PdfXmp.Parse("""
+            <x:xmpmeta xmlns:x="adobe:ns:meta/">
+            <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+              <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:description><rdf:Alt><rdf:li>&lt;div&gt;Abstract text&lt;/div&gt;</rdf:li></rdf:Alt></dc:description>
+                <dc:subject><rdf:Bag><rdf:li>alpha &amp; beta</rdf:li></rdf:Bag></dc:subject>
+              </rdf:Description>
+            </rdf:RDF>
+            </x:xmpmeta>
+            """);
+        Assert.NotNull(xmp);
+        Assert.Equal("div", xmp!.DcDescription);
+        Assert.Equal(new[] { "alpha", "beta" }, xmp.DcSubject);
+    }
+
+    [Fact]
+    public void TextWithoutEntityReferencesStaysOneValue()
+    {
+        var xmp = PdfXmp.Parse("""
+            <x:xmpmeta xmlns:x="adobe:ns:meta/">
+            <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+              <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title><rdf:Alt><rdf:li>A plain, unescaped title</rdf:li></rdf:Alt></dc:title>
+              </rdf:Description>
+            </rdf:RDF>
+            </x:xmpmeta>
+            """);
+        Assert.Equal("A plain, unescaped title", xmp!.DcTitle);
     }
 }

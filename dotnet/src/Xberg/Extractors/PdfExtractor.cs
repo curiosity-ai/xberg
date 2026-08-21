@@ -87,7 +87,7 @@ public sealed class PdfExtractor : IExtractor
         else
         {
             doc = new InternalDocument("pdf");
-            foreach (var paragraph in nativeText.Split("\n\n"))
+            foreach (var paragraph in TextTransform.NormalizeLineEndings(nativeText).Split("\n\n"))
             {
                 var trimmed = paragraph.Trim();
                 if (trimmed.Length > 0)
@@ -108,7 +108,6 @@ public sealed class PdfExtractor : IExtractor
         }
 
         doc.MimeType = mimeType;
-        doc.Tables = tables;
 
         doc.Metadata = new Metadata
         {
@@ -149,6 +148,17 @@ public sealed class PdfExtractor : IExtractor
         }
         catch { }
 
+        // The structured path assembles its own table list in element order, so its indices
+        // are already the ones its `Table` elements point at; only a document that carries
+        // none takes the detected ones.
+        AttachUnrepresentedTables(doc, tables);
+        // Plain text already spells out everything the reconstructed tables were built from,
+        // so a table element there would render the same words twice. Every other shape
+        // renders a table as a grid the flat text cannot express.
+        bool documentIsStructured = structured is not null && ReferenceEquals(doc, structured);
+        InjectUnrepresentedTableElements(
+            doc, documentIsStructured || !config.OutputFormat.Equals(OutputFormat.Plain));
+
         if (meta.IsEncrypted && pdf.Decryptor is null && nativeText.Length == 0)
             doc.ProcessingWarnings.Add(new ProcessingWarning
             {
@@ -177,6 +187,122 @@ public sealed class PdfExtractor : IExtractor
             catch { }
         }
         return tables;
+    }
+
+    /// <summary>
+    /// Page-text cleanup: control-character repair, then a markup pass for the pages that
+    /// carry raw HTML.
+    /// </summary>
+    /// <remarks>
+    /// Web-to-PDF converters sometimes leave the source markup in the text layer, where the
+    /// tags read as words. Such a page is converted as HTML rather than used as-is.
+    /// </remarks>
+    internal static string ApplyTextCleanup(string text)
+    {
+        string cleaned = PdfPageText.FixControlChars(text);
+        return ContainsHtmlMarkup(cleaned) ? Internal.Html.HtmlToMarkdown.Convert(cleaned) : cleaned;
+    }
+
+    /// <summary>Whether the page text carries embedded HTML markup.</summary>
+    internal static bool ContainsHtmlMarkup(string text) =>
+        text.Contains('<')
+        && (text.Contains("</p>", StringComparison.Ordinal)
+            || text.Contains("<br", StringComparison.Ordinal)
+            || text.Contains("<p>", StringComparison.Ordinal)
+            || text.Contains("<div", StringComparison.Ordinal)
+            || text.Contains("<span", StringComparison.Ordinal)
+            || text.Contains("<table", StringComparison.Ordinal)
+            || text.Contains("<a ", StringComparison.Ordinal)
+            || text.Contains("/>", StringComparison.Ordinal));
+
+    /// <summary>Share of a table's cell tokens that must already be in the element stream
+    /// before the table counts as represented.</summary>
+    private const double MIN_TABLE_TOKEN_REPRESENTATION = 0.90;
+
+    /// <summary>Cell-token count below which the containment check abstains: on a handful of
+    /// tokens an incidental overlap with unrelated prose is likely, and injecting a duplicate
+    /// is cheaper than dropping a real table.</summary>
+    private const int MIN_TABLE_TOKENS_FOR_CONTAINMENT = 8;
+
+    private static readonly char[] AsciiPunctuation =
+        "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".ToCharArray();
+
+    /// <summary>Words with edge punctuation and case removed, so whitespace, line wrapping
+    /// and trailing punctuation do not make the same text look different.</summary>
+    internal static IEnumerable<string> NormalizedPdfTokens(string text)
+    {
+        foreach (var word in text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string trimmed = word.Trim(AsciiPunctuation).ToLowerInvariant();
+            if (trimmed.Length > 0) yield return trimmed;
+        }
+    }
+
+    /// <summary>Give a document that has no tables of its own the ones detection found.</summary>
+    internal static void AttachUnrepresentedTables(InternalDocument doc, List<Xberg.Types.Table> tables)
+    {
+        if (doc.Tables.Count != 0) return;
+        foreach (var table in tables) doc.PushTable(table);
+    }
+
+    /// <summary>Tokens the element stream already renders, as a consumable multiset.</summary>
+    internal static Dictionary<string, int> ElementTokenMultiset(InternalDocument doc)
+    {
+        var represented = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var element in doc.Elements)
+            foreach (var token in NormalizedPdfTokens(element.Text))
+                represented[token] = represented.TryGetValue(token, out var n) ? n + 1 : 1;
+        return represented;
+    }
+
+    /// <summary>
+    /// Whether a table's cell text is already carried by the element stream.
+    /// </summary>
+    /// <remarks>
+    /// Accounting is multiset based: each text occurrence backs at most one cell occurrence,
+    /// and the occurrences are consumed only when the table is judged represented, so one
+    /// table cannot mask the next. Both bailouts err toward injecting, because a duplicated
+    /// table costs precision while a dropped one costs content.
+    /// </remarks>
+    internal static bool TableIsRepresented(Xberg.Types.Table table, Dictionary<string, int> represented)
+    {
+        var tableTokens = new Dictionary<string, int>(StringComparer.Ordinal);
+        int tableTokenCount = 0;
+        foreach (var row in table.Cells)
+            foreach (var cell in row)
+                foreach (var token in NormalizedPdfTokens(cell))
+                {
+                    tableTokens[token] = tableTokens.TryGetValue(token, out var n) ? n + 1 : 1;
+                    tableTokenCount++;
+                }
+        if (tableTokenCount < MIN_TABLE_TOKENS_FOR_CONTAINMENT) return false;
+
+        int matched = 0;
+        foreach (var (token, count) in tableTokens)
+            matched += Math.Min(count, represented.TryGetValue(token, out var have) ? have : 0);
+        if ((double)matched / tableTokenCount < MIN_TABLE_TOKEN_REPRESENTATION) return false;
+
+        foreach (var (token, count) in tableTokens)
+            if (represented.TryGetValue(token, out var remaining))
+                represented[token] = Math.Max(0, remaining - count);
+        return true;
+    }
+
+    internal static void InjectUnrepresentedTableElements(InternalDocument doc, bool allowInjection)
+    {
+        if (!allowInjection) return;
+        foreach (var element in doc.Elements)
+            if (element.Kind.Tag == ElementKindTag.Table) return;
+
+        // The `Table`-element guard above only ever fires on the structured path; the flat
+        // path builds nothing but paragraphs, so every detected table would be injected on
+        // top of native text that already contains the words it was reconstructed from.
+        var represented = ElementTokenMultiset(doc);
+        for (int tableIndex = 0; tableIndex < doc.Tables.Count; tableIndex++)
+        {
+            if (TableIsRepresented(doc.Tables[tableIndex], represented)) continue;
+            doc.PushElement(InternalElement.TextElement(ElementKind.Table((uint)tableIndex), "", 0));
+        }
     }
 
     /// <summary>
@@ -264,10 +390,7 @@ public sealed class PdfExtractor : IExtractor
                 // not drawn into the content stream when no appearance stream exists. pdf_oxide
                 // surfaces them, appended after the page's content text. Mirror that here.
                 var formValues = CollectWidgetTextValues(pdf, i);
-                if (formValues.Count > 0)
-                    pageText = pageText.Length > 0
-                        ? pageText + "\n" + string.Join("\n", formValues)
-                        : string.Join("\n", formValues);
+                pageText = AppendMissingWidgetValues(pageText, formValues);
             }
             catch { pageText = ""; segs = new(); words = new(); paths = new(); }
 
@@ -275,20 +398,41 @@ public sealed class PdfExtractor : IExtractor
             pageWords.Add(words);
             pagePaths.Add(paths);
             if (i > 0) sb.Append("\n\n");
-            sb.Append(PdfPageText.FixControlChars(pageText));
+            sb.Append(ApplyTextCleanup(pageText));
         }
         return sb.ToString();
     }
 
-    // Collect interactive text/choice field values from the widgets on one page, in /Annots order.
+    /// <summary>
+    /// Append the widget values the page's own content stream does not already carry.
+    /// </summary>
+    /// <remarks>
+    /// A flattened form has its field values rendered into the content stream as ordinary text,
+    /// so appending them again would print each one twice. The containment test is a plain
+    /// substring match: the rendered appearance text and the widget's <c>/V</c> string match
+    /// verbatim in the common case, and suppressing a value that happens to be a substring of
+    /// surrounding prose is the cheaper mistake.
+    /// </remarks>
+    internal static string AppendMissingWidgetValues(string text, List<string> values)
+    {
+        foreach (var value in values)
+        {
+            if (text.Contains(value, StringComparison.Ordinal)) continue;
+            if (text.Length > 0 && !text.EndsWith('\n')) text += "\n";
+            text += value;
+        }
+        return text;
+    }
+
+    // Collect interactive text/choice field values from the widgets on one page, top to bottom.
     // /V and /FT may be inherited via the /Parent field chain; only string values (text/choice
     // fields) are surfaced — button fields store a /Name in /V and are skipped. De-duplicated by
     // fully-qualified field name so widgets that share a parent field are not counted twice.
     private static List<string> CollectWidgetTextValues(PdfDocument pdf, int pageIndex)
     {
-        var values = new List<string>();
+        var values = new List<(double MidY, string Value)>();
         var annots = pdf.Resolve(pdf.Pages[pageIndex].Get("Annots")).AsArray();
-        if (annots is null) return values;
+        if (annots is null) return new List<string>();
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var a in annots.Items)
@@ -317,8 +461,19 @@ public sealed class PdfExtractor : IExtractor
 
             string key = names.Count > 0 ? string.Join(".", names) : value;
             if (!seen.Add(key)) continue;
-            values.Add(value);
+
+            // Values are appended after all content-stream text, so the only reading order left
+            // to preserve is the widgets' own: nearest the top of the page first.
+            var rect = pdf.Resolve(widget.Get("Rect")).AsArray();
+            double midY = rect is { Items.Count: >= 4 }
+                && pdf.Resolve(rect.Items[1]).AsNumber() is { } y0
+                && pdf.Resolve(rect.Items[3]).AsNumber() is { } y1
+                ? (y0 + y1) / 2.0
+                : double.NegativeInfinity;
+            values.Add((midY, value));
         }
-        return values;
+
+        // Stable, so widgets sharing a row keep the order the /Annots array gave them.
+        return values.OrderByDescending(v => v.MidY).Select(v => v.Value).ToList();
     }
 }
