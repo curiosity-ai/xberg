@@ -10,8 +10,8 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2456 fixtures of 2942 (83.5%) match on every hard dimension**; **0 catastrophes**; 4
-> fixtures still lose content (svg, eml, epub, odt). 1075 unit tests.
+> **2564 fixtures of 2942 (87.2%) match on every hard dimension**; **0 catastrophes**; 4
+> fixtures still lose content (svg, eml, epub, odt). 1097 unit tests.
 >
 > The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
 > stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
@@ -20,6 +20,11 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > The last two passes took it from 2340 and were mostly a matter of finding things the port had
 > never implemented at all rather than tuning what it had. Ordered by what they were worth:
 >
+> - **Markdown and plain text (md 737 → 767 of 775, txt 955 → 956).** Fifteen CommonMark/GFM
+>   rules the port's pulldown-cmark stand-in had never had — lazy continuation, marker width,
+>   definition lists, wikilinks, GFM alerts, the WHATWG sniffing table — each read out of
+>   pulldown-cmark's own source first. Nine md fixtures were worth more than one rule apiece;
+>   lazy continuation alone was worth eight. See the md/txt entry under "Known gaps".
 > - **Plain text (txt 957 → 989 of 1008, plain 991/991).** The text extractor builds its
 >   document directly, which bypasses the paragraph splitter downstream, so nothing normalized
 >   its line endings: a CRLF document came out as one paragraph carrying every carriage return.
@@ -92,6 +97,19 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > - **An empty bullet before every list item on `pdf/multi_page.pdf`.** Upstream emits `- ` with
 >   nothing after it, then the item's text as a separate bold paragraph, wherever a bullet glyph
 >   is its own text run. This port keeps the item and its text together.
+> - **`<h0>` from a truncated heading depth**
+>   (`vendored/docling/groundtruth/docling_v1/multi_page.doctags.txt`). `extractors/xml.rs`
+>   computes a heading's level as `((depth as u8) + 1).min(6)` from a `u16` depth. A DocTags
+>   stream opens `<page_4><loc_15>…` tags it never closes, so the depth climbs past 255; the
+>   `as u8` truncates and `255u8 + 1` wraps to 0, so `.min(6)` returns 0. Upstream then writes a
+>   heading with no `#` at all in markdown (` loc_14`) and `<h0>loc_14</h0>` in HTML, and
+>   restarts at `#` for the next tag. This port clamps at six. One fixture, permanently red on
+>   markdown/html/json.
+> - **Stale goldens from corpus drift** (`ATTRIBUTIONS.md`, `LICENSES.md`,
+>   `scripts/corpus-patterns.txt`). These three fixtures are `test_documents`' own documentation
+>   and they grew after their goldens were generated — the golden for `LICENSES.md` stops at
+>   "Vendored sources: 6." where the file now says 7, and this port extracts the rest of the
+>   file faithfully. Nothing to fix; they pass again whenever the goldens are regenerated.
 
 ## Known gaps after the merge
 
@@ -285,6 +303,77 @@ not a cosmetic difference.
       The first three had none written; the last two were unclaimed MIME types.
 - [x] **typ 0/8 → 7/8.** Five separate missing branches; the last fixture needs `@label`
       reference resolution, which is a feature rather than a fix.
+- [x] **md 737/775 → 767, txt 955/975 → 956.** Fifteen block and inline rules the port's
+      pulldown-cmark stand-in did not have. Each was read out of pulldown-cmark 0.13.4's
+      `firstpass.rs`/`scanners.rs`/`parse.rs` (or `infer`'s `text.rs`) before it was written:
+
+      - **Lazy continuation.** A list item's paragraph continues onto an under-indented line at
+        *any* indentation, including none. Cutting the item off at its own indent left the
+        continuation to be re-read as a top-level paragraph, splitting one bullet into two
+        blocks. Worth 8 fixtures on its own — and the first attempt regressed 100, because the
+        "ordered lists interrupt a paragraph only at 1" rule governs *starting* a list, not
+        continuing one: inside a list, any sibling marker ends the item.
+      - **List-marker width.** CommonMark's N: the marker takes the whole space run for one to
+        four spaces, but only one when five or more follow — which is what leaves the rest to be
+        an indented code block. `2.  item` is a marker of width 4, not 3.
+      - **A marker on the item's own first line** (`- - text`) opens a sublist; it was being kept
+        as text, and escaped back out as `\-`.
+      - **Changing the bullet starts a new list** (`* … - … + …` is three lists, not one) — and,
+        the other way round, **a marker further left continues the list it is in**. A line that
+        fails a list item's indentation closes the item, never the list around it, and
+        `continue_list` then matches on the bullet character alone; a list that opens at column
+        two and continues at column zero is one list. Closing and reopening it put an empty list
+        between the two halves of `pdf/44498957.md`.
+      - **GFM alerts.** `> [!NOTE]` is an admonition with no quote container at all; the tag is
+        scanned right after the quote marker and must be alone on its line.
+      - **Definition lists.** `ENABLE_DEFINITION_LIST` was not implemented. A `:` at the start of
+        a line turns the paragraph above it into the term and opens a definition; further `:`
+        lines add further definitions; and a `:` interrupts an open paragraph. The one block that
+        emits no events — a thematic break — has to be remembered, or the paragraph before it
+        still looks like the last thing emitted.
+      - **Wikilinks.** `ENABLE_WIKILINKS` was missing. `[[name|label]]` shows the half after the
+        pipe; without a pipe the display text is a fresh node over the raw source range, so it
+        never passes the first pass and keeps its straight quotes. Popping the wikilink stack
+        disables enclosing links, which is why `[[1]](#cite_note-1)` is a wikilink followed by
+        literal text.
+      - **Reference-link fallback.** An inline destination that does not parse (a space in an
+        unbracketed URL) leaves the label to resolve as a shortcut reference, with the
+        parentheses staying literal.
+      - **Email autolinks** keep the bare address as the destination; only pulldown's own HTML
+        writer prepends `mailto:`, and the extractor reads the destination.
+      - **`#309` is not a heading** and ```` ```cmd``` ```` is not a fence: an ATX opening needs a
+        space after its hashes, and a backtick fence's info string may hold no backtick.
+      - **Only a "heavy" table interrupts a paragraph** — one whose header row opens with `|`.
+        A bare `Claim ID | Claim type` under a line of prose is more prose.
+      - **Soft breaks are their own event.** Folding them into the text node gave an image's alt
+        text a space the alt buffer never receives (`[![Build\nStatus](…)]` names *BuildStatus*),
+        and a hard break's backslash has to survive to the inline pass or the `**` before it is
+        not left-flanking.
+      - **Annotation trimming clamps rather than filters** (upstream's #226): a span running into
+        trimmed trailing whitespace still covers real words. Filtering it dropped whole links.
+      - **`<` only opens a tag** before a letter, `/`, `!` or `?` (the HTML tag-open state).
+        Our tokenizer took everything to the next `>`, so `a <- filter(x, y > 0)` in an R README
+        vanished.
+      - **The WHATWG sniffing table**, which upstream reaches through `infer::is_html`: a
+        document opening with `<!--` (or `<P>`, `<A `, …) is HTML however its markup continues.
+        The port had a comment-skipping approximation that reached the XML extractor whenever the
+        comment was never closed.
+
+      What is left on md is 8 fixtures. Two are the stale goldens listed above. The other six
+      are `.md` files that open with an HTML comment and so route to the HTML extractor in both
+      implementations (`fictionbook/emphasis.md`, `fictionbook/poem.md`, `pdf/160428551.md`,
+      `pdf/french_minutes_vision.md`, `docling/md/2023-06-20-PV.md`, `docling/md/docling.md`).
+      They differ only in the leading and trailing whitespace of the converter's one paragraph,
+      and they are the **html** gap above rather than a markdown one: upstream passes the output
+      format *into* `convert_html_to_markdown_with_tables`, so its plain text and its markdown
+      are two different conversions, while this port renders every format from the markdown one.
+      Pushing that paragraph untrimmed (which is what upstream does) was measured: it wins html
+      and json on those six and loses plain on the same six, with no fixture flipping either way,
+      so the trim stays until the plain conversion exists.
+
+      On txt what is left is 2, both listed above: the DocTags `<h0>` defect and one stale
+      golden. (The other 17 of the 975 txt fixtures are ones upstream itself fails on — large
+      DocTags streams — and the harness counts them separately.)
 
 ### The PDF gap, measured
 
