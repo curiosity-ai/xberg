@@ -20,6 +20,16 @@ public static class HtmlMeta
 
     public static HtmlMetadata Extract(string html)
     {
+        // The collector runs inside the conversion walk, so it sees the same stripped source the
+        // converter parses — including the canonical attribute spellings a document that needs
+        // the html5ever repair reaches the walk with.
+        html = HtmlToMarkdown.StripHiddenElements(HtmlToMarkdown.StripScriptAndStyleTags(html));
+        bool canonicalAttrs = HtmlToMarkdown.NeedsCanonicalAttributes(html);
+        string? Raw(string attrs, string name)
+        {
+            string? v = HtmlWalker.ExtractAttr(attrs, name);
+            return v is not null && canonicalAttrs ? HtmlToMarkdown.CanonicalizeAttrValue(v) : v;
+        }
         var m = new HtmlMetadata();
         int pos = 0, n = html.Length;
         int domDepth = 0;
@@ -32,35 +42,52 @@ public static class HtmlMeta
         // A heading's recorded text is the markdown its children convert to, so a permalink
         // anchor inside one is `[label](href)` rather than the label alone.
         var headingLinks = new List<(int LabelStart, string Href, string? Title, List<string[]> Attrs, List<string> Rel)>();
-        // html-to-markdown walks a table's subtree three times — once to build the grid, once to
-        // write the markdown, once for the structure — and the collector records what it sees on
-        // every pass. So a table's headings, links and images each appear three times over, in
-        // table order, not as three copies in a row. Collections inside a table are buffered and
-        // replayed when the outermost table closes; a nested table contributes to that same
-        // buffer once, since the repeat is of the whole table region rather than compounding per
-        // level of nesting.
-        int tableDepth = 0;
-        var tableHeaders = new List<object>();
-        var tableLinks = new List<object>();
-        var tableImages = new List<object>();
-        List<object> HeaderSink() => tableDepth > 0 ? tableHeaders : m.Headers;
-        List<object> LinkSink() => tableDepth > 0 ? tableLinks : m.Links;
-        List<object> ImageSink() => tableDepth > 0 ? tableImages : m.Images;
+        // html-to-markdown walks a table's subtree once per pass its handler makes over it, and
+        // the collector records what it sees on every pass. A markdown table is walked three
+        // times — a column-width pre-pass, the render, and the grid the structure collector
+        // wants — while a table the handler renders as a layout list has no width pre-pass and
+        // so is walked twice. A nested table therefore multiplies: it is re-entered once per
+        // pass of its parent, except during the width pre-pass, which stops at a nested table
+        // and measures its text instead. Collections are buffered per table and replayed into
+        // the enclosing table (or the document) when that table closes.
+        var tables = new List<TableFrame>();
+        // Text inside a table cell is written with `*`, `_` and `|` escaped, and a link's label
+        // is the markdown its children produced — so the label a cell's link records carries
+        // those escapes too.
+        int cellDepth = 0;
+        List<object> HeaderSink() => tables.Count > 0 ? tables[^1].OwnSegment(tables[^1].Headers) : m.Headers;
+        List<object> LinkSink() => tables.Count > 0 ? tables[^1].OwnSegment(tables[^1].Links) : m.Links;
+        List<object> ImageSink() => tables.Count > 0 ? tables[^1].OwnSegment(tables[^1].Images) : m.Images;
 
-        void CloseOutermostTable()
+        void CloseTable()
         {
-            for (int pass = 0; pass < 3; pass++)
+            var frame = tables[^1];
+            tables.RemoveAt(tables.Count - 1);
+            frame.CloseRow();
+            int passes = frame.Passes;
+            var headers = frame.Replay(frame.Headers, passes);
+            var links = frame.Replay(frame.Links, passes);
+            var images = frame.Replay(frame.Images, passes);
+            if (tables.Count > 0)
             {
-                m.Headers.AddRange(tableHeaders);
-                m.Links.AddRange(tableLinks);
-                m.Images.AddRange(tableImages);
+                var parent = tables[^1];
+                parent.Absorb(frame);
+                parent.Headers.Add((TableFrame.Origin.Child, headers));
+                parent.Links.Add((TableFrame.Origin.Child, links));
+                parent.Images.Add((TableFrame.Origin.Child, images));
             }
-            tableHeaders.Clear();
-            tableLinks.Clear();
-            tableImages.Clear();
+            else
+            {
+                m.Headers.AddRange(headers);
+                m.Links.AddRange(links);
+                m.Images.AddRange(images);
+            }
         }
+
         bool inAnchor = false;
         var anchorText = new StringBuilder();
+        // Open `<abbr>` expansions, appended when each one closes.
+        var abbrTitles = new List<string>();
         // The autolink test is made against the anchor's plain text, not the markdown its
         // children render to, so the two are accumulated separately.
         var anchorRawText = new StringBuilder();
@@ -112,6 +139,48 @@ public static class HtmlMeta
                 var (nameRaw, attrsStr) = HtmlWalker.SplitTagName(content);
                 string tag = nameRaw.ToLowerInvariant();
 
+                // `scan_table` reads the whole subtree of the table it is deciding about, and it
+                // reads the parsed tree — preprocessing drops nothing from it — so the scan runs
+                // for every tag inside a table, skipped regions included.
+                if (tables.Count > 0)
+                {
+                    var frame = tables[^1];
+                    if (closing)
+                    {
+                        if (tag is "td" or "th" or "cell" && cellDepth > 0) cellDepth--;
+                        if (tag is "tr" or "row") frame.CloseRow();
+                        else if (tag == "caption" && frame.CaptionDepth > 0) frame.CaptionDepth--;
+                    }
+                    else
+                    {
+                        switch (tag)
+                        {
+                            case "a": frame.LinkCount++; break;
+                            case "caption":
+                                frame.HasCaption = true;
+                                if (!selfClose) frame.CaptionDepth++;
+                                break;
+                            case "th": frame.HasHeader = true; break;
+                            case "img" or "graphic":
+                                if (HtmlWalker.ExtractAttr(attrsStr, "src") is not null
+                                    || HtmlWalker.ExtractAttr(attrsStr, "alt") is not null) frame.HasText = true;
+                                break;
+                            case "cell":
+                                if (HtmlWalker.ExtractAttr(attrsStr, "role") == "head") frame.HasHeader = true;
+                                break;
+                        }
+                        if (tag is "td" or "th" or "cell" && !selfClose) cellDepth++;
+                        if (tag is "tr" or "row") frame.OpenRow();
+                        else if (tag is "td" or "th" or "cell")
+                        {
+                            string? colspan = HtmlWalker.ExtractAttr(attrsStr, "colspan");
+                            string? rowspan = HtmlWalker.ExtractAttr(attrsStr, "rowspan");
+                            if (colspan is not null || rowspan is not null) frame.HasSpan = true;
+                            frame.AddCell(colspan is not null && int.TryParse(colspan, out int cs) && cs > 0 ? cs : 1);
+                        }
+                    }
+                }
+
                 if (closing)
                 {
                     if (skipDepth >= 0)
@@ -124,7 +193,7 @@ public static class HtmlMeta
                         continue;
                     }
                     if (tag == "pre" && preDepth > 0) preDepth--;
-                    if (tag == "table" && tableDepth > 0 && --tableDepth == 0) CloseOutermostTable();
+                    if (tag == "table" && tables.Count > 0) CloseTable();
                     if (tag is "h1" or "h2" or "h3" or "h4" or "h5" or "h6" && captureHeading != 0)
                     {
                         string text = HtmlWalker.NormalizeWhitespace(headingText.ToString());
@@ -134,7 +203,7 @@ public static class HtmlMeta
                                 Level = captureHeading, Text = text, Id = headingId,
                                 // A heading inside a table is recorded at depth 0 — the passes
                                 // that re-walk it have no enclosing tree to count.
-                                Depth = tableDepth > 0 ? 0 : headingDepthAtOpen,
+                                Depth = tables.Count > 0 ? 0 : headingDepthAtOpen,
                                 HtmlOffset = 0,
                             });
                         captureHeading = 0;
@@ -154,7 +223,7 @@ public static class HtmlMeta
                         {
                             // An anchor whose children render to nothing — an icon button built
                             // from empty spans, say — falls back to its own href for a label.
-                            string linkLabel = HtmlWalker.NormalizeWhitespace(anchorText.ToString());
+                            string linkLabel = HtmlToMarkdown.NormalizeLinkLabel(anchorText.ToString());
                             if (linkLabel.Length == 0 && anchorHref.Length > 0 && tagStart > anchorInnerStart)
                                 linkLabel = anchorHref;
                             LinkSink().Add(new Link
@@ -172,6 +241,14 @@ public static class HtmlMeta
                     else if (InlineMarker(tag) is { } closeMarker && (captureHeading != 0 || inAnchor))
                     {
                         (captureHeading != 0 ? headingText : anchorText).Append(closeMarker);
+                    }
+                    else if (tag == "abbr" && abbrTitles.Count > 0 && (captureHeading != 0 || inAnchor))
+                    {
+                        string expansion = abbrTitles[^1];
+                        abbrTitles.RemoveAt(abbrTitles.Count - 1);
+                        if (expansion.Length > 0)
+                            (captureHeading != 0 ? headingText : anchorText)
+                                .Append(" (").Append(expansion).Append(')');
                     }
                     else if (tag == "a" && captureHeading != 0 && headingLinks.Count > 0)
                     {
@@ -245,6 +322,30 @@ public static class HtmlMeta
                     continue;
                 }
 
+                // A `<br>` is a hard break in the markdown its heading or link records, and the
+                // label collapses that break back to a single space.
+                if (tag == "br" && (captureHeading != 0 || inAnchor))
+                {
+                    var target = captureHeading != 0 ? headingText : anchorText;
+                    if (captureHeading != 0)
+                    {
+                        while (target.Length > 0 && target[^1] is ' ' or '\t' or '\n') target.Length--;
+                        target.Append("  ");
+                    }
+                    else if (target.Length == 0 || target[^1] == '\n') target.Append('\n');
+                    else target.Append("  \n");
+                    continue;
+                }
+
+                // An abbreviation renders as `text (expansion)`, so a link whose label is one —
+                // the `v`/`t`/`e` of a navigation box — records the expansion as part of its text.
+                if (tag == "abbr" && (captureHeading != 0 || inAnchor) && !selfClose)
+                {
+                    abbrTitles.Add(Raw(attrsStr, "title")?.Trim() ?? "");
+                    domDepth++;
+                    continue;
+                }
+
                 // Opening / self-closing tag.
                 switch (tag)
                 {
@@ -293,7 +394,11 @@ public static class HtmlMeta
                         if (inHead) { inTitle = true; titleText.Clear(); }
                         break;
                     case "table":
-                        if (!selfClose) tableDepth++;
+                        if (!selfClose)
+                            tables.Add(new TableFrame
+                            {
+                                BorderZero = HtmlWalker.ExtractAttr(attrsStr, "border") == "0",
+                            });
                         break;
                     case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
                         captureHeading = tag[1] - '0';
@@ -307,11 +412,15 @@ public static class HtmlMeta
                     case "a" when captureHeading != 0 && HtmlWalker.ExtractAttr(attrsStr, "href") is { } headingHref:
                     {
                         headingText.Append('[');
-                        var headingAttrs = ParseAttrs(attrsStr, exclude: "href", out var headingRel);
+                        var headingAttrs = ParseAttrs(attrsStr, exclude: "href", canonicalAttrs, out var headingRel);
                         headingLinks.Add((headingText.Length, headingHref,
-                            HtmlWalker.ExtractAttr(attrsStr, "title"), headingAttrs, headingRel));
+                            Raw(attrsStr, "title"), headingAttrs, headingRel));
                         break;
                     }
+                    // An anchor with no href at all never reaches the link handler's collector:
+                    // it is a link target, and only its children are written.
+                    case "a" when HtmlWalker.ExtractAttr(attrsStr, "href") is null:
+                        break;
                     case "a":
                     {
                         inAnchor = true;
@@ -320,9 +429,9 @@ public static class HtmlMeta
                         anchorHref = ExtractAttrDecoded(attrsStr, "href") ?? "";
                         // The title is recorded as written: the link handler hands the collector
                         // the attribute's own bytes, and only the href is entity-decoded.
-                        anchorTitle = HtmlWalker.ExtractAttr(attrsStr, "title");
+                        anchorTitle = Raw(attrsStr, "title");
                         anchorInnerStart = pos;
-                        anchorAttrs = ParseAttrs(attrsStr, exclude: "href", out anchorRel);
+                        anchorAttrs = ParseAttrs(attrsStr, exclude: "href", canonicalAttrs, out anchorRel);
                         break;
                     }
                     case "img":
@@ -330,9 +439,9 @@ public static class HtmlMeta
                         // The source is recorded as written. A query string spelled
                         // `?a=1&amp;b=2` stays that way — the collector reads the attribute, it
                         // does not resolve the URL.
-                        string? src = HtmlWalker.ExtractAttr(attrsStr, "src");
-                        string? alt = HtmlWalker.ExtractAttr(attrsStr, "alt");
-                        var attrs = ParseAttrs(attrsStr, exclude: "src", out _);
+                        string? src = Raw(attrsStr, "src");
+                        string? alt = Raw(attrsStr, "alt");
+                        var attrs = ParseAttrs(attrsStr, exclude: "src", canonicalAttrs, out _);
                         // Dimensions are recorded only when the element states both, which is
                         // what makes them a size rather than half of one.
                         uint[]? dimensions =
@@ -346,7 +455,7 @@ public static class HtmlMeta
                             // An empty `alt` is the absence of alt text, not alt text that is
                             // empty, and is recorded as absent.
                             Alt = alt is { Length: > 0 } ? alt : null,
-                            Title = HtmlWalker.ExtractAttr(attrsStr, "title"),
+                            Title = Raw(attrsStr, "title"),
                             Dimensions = dimensions,
                             ImageType = ClassifyImage(src ?? ""),
                             Attributes = attrs,
@@ -407,18 +516,21 @@ public static class HtmlMeta
                 int lt = html.IndexOf('<', pos);
                 if (lt < 0) lt = n;
                 string text = html[pos..lt];
+                if (tables.Count > 0 && !tables[^1].HasText
+                    && HtmlWalker.DecodeEntities(text).Trim().Length > 0) tables[^1].HasText = true;
                 if (captureHeading != 0) headingText.Append(HtmlWalker.DecodeEntities(text));
                 else if (inAnchor)
                 {
-                    anchorText.Append(HtmlWalker.DecodeEntities(text));
-                    anchorRawText.Append(HtmlWalker.DecodeEntities(text));
+                    string decoded = HtmlWalker.DecodeEntities(text);
+                    anchorText.Append(cellDepth > 0 ? HtmlToMarkdown.EscapeCellText(decoded) : decoded);
+                    anchorRawText.Append(decoded);
                 }
                 else if (inTitle) titleText.Append(HtmlWalker.DecodeEntities(text));
                 pos = lt;
             }
         }
-        // An unclosed table still had its subtree walked three times.
-        if (tableDepth > 0) CloseOutermostTable();
+        // An unclosed table still had its subtree walked once per pass.
+        while (tables.Count > 0) CloseTable();
         ApplyHeadMetadata(m, headMetadata);
         return m;
     }
@@ -537,6 +649,108 @@ public static class HtmlMeta
         value.Split(',').Select(k => k.Trim()).Where(k => k.Length > 0);
 
     /// <summary>
+    /// One open <c>&lt;table&gt;</c>: what the collector recorded inside it, and the structural
+    /// facts `scan_table` reads to decide how the handler will render it. The scan covers the
+    /// whole subtree, nested tables included, which is why a frame absorbs its children's counts.
+    /// </summary>
+    private sealed class TableFrame
+    {
+        /// <summary>Where a run of records came from, which decides the passes it is replayed for.</summary>
+        public enum Origin { Cell, Caption, Child }
+
+        public readonly List<(Origin From, List<object> Items)> Headers = new(), Links = new(), Images = new();
+
+        /// <summary>Set while the scan is inside this table's <c>&lt;caption&gt;</c>.</summary>
+        public int CaptionDepth;
+
+        private readonly List<int> _rowCounts = new();
+        private int _openRowCells = -1;
+        public bool HasSpan, HasHeader, HasCaption, HasText, BorderZero;
+        public int NestedTables, LinkCount;
+
+        /// <summary>The list new records go into: the trailing run of this table's own items.</summary>
+        public List<object> OwnSegment(List<(Origin From, List<object> Items)> segments)
+        {
+            Origin origin = CaptionDepth > 0 ? Origin.Caption : Origin.Cell;
+            if (segments.Count == 0 || segments[^1].From != origin) segments.Add((origin, new List<object>()));
+            return segments[^1].Items;
+        }
+
+        public void OpenRow()
+        {
+            CloseRow();
+            _openRowCells = 0;
+        }
+
+        public void CloseRow()
+        {
+            if (_openRowCells < 0) return;
+            _rowCounts.Add(_openRowCells);
+            _openRowCells = -1;
+        }
+
+        public void AddCell(int colspan)
+        {
+            if (_openRowCells >= 0) _openRowCells += colspan;
+        }
+
+        /// <summary>Roll a closed nested table's scan into this one.</summary>
+        public void Absorb(TableFrame child)
+        {
+            child.CloseRow();
+            _rowCounts.AddRange(child._rowCounts);
+            NestedTables += child.NestedTables + 1;
+            LinkCount += child.LinkCount;
+            HasSpan |= child.HasSpan;
+            HasHeader |= child.HasHeader;
+            HasCaption |= child.HasCaption;
+            HasText |= child.HasText;
+        }
+
+        /// <summary>
+        /// How many times the handler walks this table's cells: three for a markdown table (the
+        /// column-width pre-pass, the render and the grid), two for one rendered as a layout
+        /// list, and one for a blank linkless table, whose render returns before walking
+        /// anything (`block/table/builder.rs`).
+        /// </summary>
+        public int Passes
+        {
+            get
+            {
+                var distinct = new HashSet<int>();
+                foreach (int c in _rowCounts) if (c > 0) distinct.Add(c);
+                bool looksLikeLayout = NestedTables > 1 || distinct.Count > 1 || (HasSpan && BorderZero);
+                bool isBlank = !HasText;
+                if (HasHeader || HasCaption) return 3;
+                if (!looksLikeLayout && !isBlank && !(_rowCounts.Count <= 2 && LinkCount >= 3)) return 3;
+                return isBlank && LinkCount == 0 ? 1 : 2;
+            }
+        }
+
+        /// <summary>
+        /// This table's records, once per pass, in table order. The width pre-pass — which only
+        /// a three-pass table has — never enters a nested table, so nothing a nested table
+        /// contributed is replayed for it.
+        /// </summary>
+        public List<object> Replay(List<(Origin From, List<object> Items)> segments, int passes)
+        {
+            // Only the render pass walks the caption: the width pre-pass and the grid both
+            // iterate rows alone. A table blank enough that the render returns before walking
+            // anything has no render pass at all.
+            int renderPass = passes == 1 ? -1 : passes - 2;
+            var result = new List<object>();
+            for (int pass = 0; pass < passes; pass++)
+                foreach (var (from, items) in segments)
+                {
+                    if (from == Origin.Child && pass == 0 && passes == 3) continue;
+                    if (from == Origin.Caption && pass != renderPass) continue;
+                    result.AddRange(items);
+                }
+            return result;
+        }
+    }
+
+    /// <summary>
     /// The label a link records. A caret-only label on a fragment link is the citation
     /// backlink Wikipedia writes; the link handler rewrites it to an arrow before the
     /// metadata collector sees it, so the recorded text carries the arrow too.
@@ -623,7 +837,7 @@ public static class HtmlMeta
         return -1;
     }
 
-    private static List<string[]> ParseAttrs(string attrs, string exclude, out List<string> rel)
+    private static List<string[]> ParseAttrs(string attrs, string exclude, bool canonical, out List<string> rel)
     {
         rel = new List<string>();
         var result = new List<string[]>();
@@ -659,6 +873,7 @@ public static class HtmlMeta
             }
             // Attribute values are recorded as written. The collector reads the attribute; it
             // does not resolve it, so `alt="\lambda&gt;0"` keeps its reference.
+            if (canonical) value = HtmlToMarkdown.CanonicalizeAttrValue(value);
             if (key.Equals("rel", StringComparison.OrdinalIgnoreCase))
                 rel.AddRange(value.Split(' ', StringSplitOptions.RemoveEmptyEntries));
             if (!key.Equals(exclude, StringComparison.OrdinalIgnoreCase))

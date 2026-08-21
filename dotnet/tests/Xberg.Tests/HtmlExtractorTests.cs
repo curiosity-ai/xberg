@@ -647,4 +647,162 @@ public class HtmlExtractorTests
         Assert.Equal("This is some text.\n", Assert.Single(plain.Elements).Text);
         Assert.Equal("[This is some text.](/start.html)\n", Assert.Single(markdown.Elements).Text);
     }
+    /// <summary>The recorded links, serialized the way the harness compares them.</summary>
+    private static string LinksJson(HtmlMetadata m) =>
+        System.Text.Json.JsonSerializer.Serialize(m.Links, new System.Text.Json.JsonSerializerOptions
+        {
+            PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.SnakeCaseLower,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+
+    /// <summary>
+    /// `<template>` and `<noscript>` have no handler of their own: they reach the unknown
+    /// handler, which renders their children. A no-JS fallback image is often a page's only
+    /// copy of that image.
+    /// </summary>
+    [Fact]
+    public void TemplateAndNoscriptContentIsRendered()
+    {
+        Assert.Equal("before\n\n![](/y.png)\n\nafter\n", HtmlToMarkdown.Convert(
+            "<p>before</p><noscript><img src=\"/y.png\" alt=\"\"></noscript><p>after</p>"));
+        Assert.Equal("a\n\ninside\n\nb\n", HtmlToMarkdown.Convert(
+            "<p>a</p><template><p>inside</p></template><p>b</p>"));
+    }
+
+    /// <summary>
+    /// A `<title>` written in the body is content, not head metadata, and renders as its text.
+    /// </summary>
+    [Fact]
+    public void ATitleOutsideTheHeadIsRendered()
+        => Assert.Equal("a\n\nStray\n\nb\n", HtmlToMarkdown.Convert("<body><p>a</p><title>Stray</title><p>b</p></body>"));
+
+    /// <summary>
+    /// `strip_hidden_elements` runs over the source text and looks for the word `hidden`
+    /// anywhere after the tag name, so a quoted attribute value containing it takes the whole
+    /// element with it. `data-hidden` and `aria-hidden` still do not match.
+    /// </summary>
+    [Fact]
+    public void AnAttributeValueContainingTheWordHiddenStripsTheElement()
+    {
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><p hidden>gone</p>"));
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><p title=\"pages with hidden wikidata\">gone</p>"));
+        Assert.Equal("kept\n\nstays\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><p data-hidden=\"1\" aria-hidden=\"true\">stays</p>"));
+    }
+
+    /// <summary>
+    /// A stripped `<style>` or `<script>` leaves a space behind when it stood between two
+    /// non-space characters — that space is what keeps the words around it apart.
+    /// </summary>
+    [Fact]
+    public void AStrippedStyleLeavesASpaceBetweenTheWordsAroundIt()
+    {
+        Assert.Equal("a b\n", HtmlToMarkdown.Convert("<p><span>a</span><style>i{}</style><span>b</span></p>"));
+        Assert.Equal("a b\n", HtmlToMarkdown.Convert("<p><span>a</span> <style>i{}</style> <span>b</span></p>"));
+    }
+
+    /// <summary>
+    /// A `<span>` pops the newline before it so an element boundary does not break a line, but
+    /// never a markdown hard break: `<td>a<br>b</td>` keeps its break even when `b` is wrapped.
+    /// </summary>
+    [Fact]
+    public void ASpanDoesNotSwallowAHardBreak()
+    {
+        var doc = Html("<table><tr><td><span>A</span><br /><span>B</span></td></tr></table>");
+        Assert.Equal(new List<string> { "A \nB" }, Assert.Single(doc.Tables).Cells[0]);
+    }
+
+    /// <summary>
+    /// A document whose block elements are misnested under inline ones — or that names a custom
+    /// element — is re-parsed through html5ever, whose serializer resolves the character
+    /// references in every attribute and writes back the canonical named forms.
+    /// </summary>
+    [Fact]
+    public void AttributesAreCanonicalizedWhenTheDocumentNeedsRepair()
+    {
+        const string link = "<a href=\"/w\" title=\"Finsch&#39;s &amp;C\">dk</a> <a href=\"/x\" title='\"Q!\"'>q</a>";
+
+        Assert.Equal("[dk](/w \"Finsch&#39;s &amp;C\") [q](/x \"\\\"Q!\\\"\")\n",
+            HtmlToMarkdown.Convert("<p>" + link + "</p>"));
+        Assert.Equal("[dk](/w \"Finsch's &amp;C\") [q](/x \"&quot;Q!&quot;\")\n\nblock\n",
+            HtmlToMarkdown.Convert("<p>" + link + "</p><span><div>block</div></span>"));
+        Assert.Equal("[dk](/w \"Finsch's &amp;C\") [q](/x \"&quot;Q!&quot;\")\n\nx\n",
+            HtmlToMarkdown.Convert("<p>" + link + "</p><my-el>x</my-el>"));
+    }
+
+    /// <summary>A table ends with a single newline, not a blank line (`block/table/mod.rs`).</summary>
+    [Fact]
+    public void ATableEndsWithOneNewline()
+        => Assert.Equal("| a |\n| --- |\n| b |\nafter\n",
+            HtmlToMarkdown.Convert("<table><tr><th>a</th></tr><tr><td>b</td></tr></table>after"));
+
+    /// <summary>
+    /// The link handler rewrites a caret-only fragment label — Wikipedia's citation backlink —
+    /// to an arrow before the metadata collector sees it, so the recorded text carries it too.
+    /// </summary>
+    [Fact]
+    public void ACiteBacklinkRecordsTheArrowItRendersAs()
+    {
+        var m = Meta("<html><body><li><a href=\"#cite_ref-2\">^</a></li></body></html>");
+        Assert.Contains("\"text\":\"\u2191\"", LinksJson(m));
+    }
+
+    /// <summary>
+    /// A link's recorded text is the markdown its children produce: an abbreviation expands to
+    /// `text (title)`, a `<br>` collapses to a space, and an anchor that renders to nothing
+    /// falls back to its own href.
+    /// </summary>
+    [Fact]
+    public void ALinkRecordsTheMarkdownItsChildrenProduce()
+    {
+        var m = Meta("<html><body>"
+            + "<a href=\"/t\" title=\"T\"><abbr title=\"View this template\">v</abbr></a>"
+            + "<a href=\"/b\">The Tortured Poets<br />Department</a>"
+            + "<a href=\"#\"><span class=\"icon\"></span></a>"
+            + "<a name=\"target\">not a link</a>"
+            + "</body></html>");
+
+        string json = LinksJson(m);
+        Assert.Contains("\"text\":\"v (View this template)\"", json);
+        Assert.Contains("\"text\":\"The Tortured Poets Department\"", json);
+        Assert.Contains("\"text\":\"#\"", json);
+        // The `name`-only anchor is a link target, not a link.
+        Assert.Equal(3, m.Links.Count);
+    }
+
+    /// <summary>
+    /// The collector records what it sees on every pass the table handler makes: three for a
+    /// markdown table, two for one rendered as a layout list, and a nested table is re-entered
+    /// once per pass of its parent except the width pre-pass, which never descends into it.
+    /// </summary>
+    [Fact]
+    public void ATablesLinksAreRecordedOncePerPassOverIt()
+    {
+        static int Count(string html, string href)
+        {
+            string json = LinksJson(Meta(html));
+            string needle = "\"href\":\"" + href + "\"";
+            int n = 0;
+            for (int i = json.IndexOf(needle, StringComparison.Ordinal); i >= 0;
+                 i = json.IndexOf(needle, i + 1, StringComparison.Ordinal)) n++;
+            return n;
+        }
+
+        const string simple = "<table><tr><td><a href=\"/a\">a</a></td></tr></table>";
+        Assert.Equal(3, Count(simple, "/a"));
+
+        // Rows of differing width read as a layout table: no width pre-pass, so two walks.
+        const string layout = "<table><tr><td><a href=\"/a\">a</a></td>"
+            + "<td><table><tr><td><a href=\"/b\">b</a></td></tr></table></td></tr></table>";
+        Assert.Equal(2, Count(layout, "/a"));
+        Assert.Equal(6, Count(layout, "/b"));
+
+        // A caption is walked by the render pass alone.
+        const string caption = "<table><caption><a href=\"/c\">c</a></caption>"
+            + "<tr><td><a href=\"/a\">a</a></td></tr></table>";
+        Assert.Equal(1, Count(caption, "/c"));
+        Assert.Equal(3, Count(caption, "/a"));
+    }
 }

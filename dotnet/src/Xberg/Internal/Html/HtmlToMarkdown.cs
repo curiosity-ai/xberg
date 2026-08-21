@@ -43,7 +43,9 @@ internal static class HtmlToMarkdown
     private static string Convert(string html, HtmlStructureCollector? structure, bool plainText = false)
     {
         html = html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
-        var root = HtmlDom.Parse(html);
+        string prepared = StripHiddenElements(StripScriptAndStyleTags(html));
+        var root = HtmlDom.Parse(prepared);
+        if (HasCustomElementTags(prepared) || HasInlineBlockMisnest(root)) MarkCanonicalAttributes(root);
 
         var sb = new StringBuilder();
         string front = ExtractFrontmatter(root);
@@ -59,6 +61,371 @@ internal static class HtmlToMarkdown
         outp = TrimLineEndWhitespace(outp);
         outp = CollapseExcessBlankLines(outp);
         return outp;
+    }
+
+    // ── html5ever repair (converter/main.rs) ────────────────────────────────
+    /// <summary>
+    /// Whether the source holds a custom element — a tag name with a hyphen in it. Upstream
+    /// re-parses such a document with html5ever (`has_custom_element_tags`), because its own
+    /// parser cannot place unknown elements.
+    /// </summary>
+    internal static bool HasCustomElementTags(string html)
+    {
+        for (int i = 0; i < html.Length; i++)
+        {
+            if (html[i] != '<') continue;
+            int j = i + 1;
+            if (j < html.Length && html[j] == '/') j++;
+            while (j < html.Length && char.IsWhiteSpace(html[j])) j++;
+            int start = j;
+            while (j < html.Length)
+            {
+                char c = html[j];
+                if (c is '>' or '/' || char.IsWhiteSpace(c))
+                {
+                    if (html.AsSpan(start, j - start).IndexOf('-') >= 0) return true;
+                    break;
+                }
+                j++;
+            }
+            i = j - 1;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a block-level element sits under an inline ancestor, or a table cell under a
+    /// paragraph (`has_inline_block_misnest`). Either shape means the lenient parse disagrees
+    /// with the HTML5 tree, and upstream re-parses the document with html5ever.
+    /// </summary>
+    internal static bool HasInlineBlockMisnest(HNode root)
+    {
+        foreach (var node in Descendants(root))
+        {
+            if (node.Tag is null) continue;
+            if (node.Tag is "td" or "tr" or "th" && HasParagraphAncestor(node)) return true;
+            if (!IsBlockLevelName(node.Tag)) continue;
+
+            bool preformatted = false;
+            for (HNode? n = node; n is not null; n = n.Parent)
+                if (n.Tag is "pre" or "code") { preformatted = true; break; }
+            if (preformatted) continue;
+
+            for (HNode? parent = node.Parent; parent is not null; parent = parent.Parent)
+                if (parent.Tag is not null && IsInlineElement(parent.Tag)
+                    && parent.Tag is not ("a" or "ins" or "del")) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a <c>&lt;p&gt;</c> encloses the node with no table boundary in between — the
+    /// shape an unclosed <c>&lt;p&gt;</c> inside a cell leaves behind.
+    /// </summary>
+    private static bool HasParagraphAncestor(HNode node)
+    {
+        for (HNode? parent = node.Parent; parent is not null; parent = parent.Parent)
+        {
+            if (parent.Tag == "p") return true;
+            if (parent.Tag is "table" or "body" or "html") return false;
+        }
+        return false;
+    }
+
+    /// <summary>Every node under this one. Iterative: a page can nest deeply enough to matter.</summary>
+    private static IEnumerable<HNode> Descendants(HNode node)
+    {
+        var stack = new Stack<HNode>();
+        for (int i = node.Children.Count - 1; i >= 0; i--) stack.Push(node.Children[i]);
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            yield return current;
+            for (int i = current.Children.Count - 1; i >= 0; i--) stack.Push(current.Children[i]);
+        }
+    }
+
+    /// <summary>Whether this document reaches the walk through the html5ever repair.</summary>
+    internal static bool NeedsCanonicalAttributes(string preparedHtml)
+        => HasCustomElementTags(preparedHtml) || HasInlineBlockMisnest(HtmlDom.Parse(preparedHtml));
+
+    /// <summary>
+    /// The repair re-parses the document and writes it back out through html5ever's serializer,
+    /// which resolves every character reference in an attribute and re-escapes the special ones.
+    /// That spelling is what the second parse — and so every handler — sees.
+    /// </summary>
+    private static void MarkCanonicalAttributes(HNode root)
+    {
+        foreach (var node in Descendants(root)) node.CanonicalAttrs = true;
+    }
+
+    /// <summary>
+    /// An attribute value as html5ever's serializer writes it: every character reference
+    /// resolved, then <c>&amp;</c>, <c>&lt;</c>, <c>&gt;</c>, <c>"</c> and a no-break space
+    /// written back as named entities.
+    /// </summary>
+    internal static string CanonicalizeAttrValue(string value)
+    {
+        string decoded = HtmlWalker.DecodeEntitiesFull(value);
+        int i = decoded.AsSpan().IndexOfAny("&<>\"\u00a0");
+        if (i < 0) return decoded;
+        var sb = new StringBuilder(decoded.Length + 8);
+        sb.Append(decoded, 0, i);
+        for (; i < decoded.Length; i++)
+        {
+            switch (decoded[i])
+            {
+                case '&': sb.Append("&amp;"); break;
+                case '<': sb.Append("&lt;"); break;
+                case '>': sb.Append("&gt;"); break;
+                case '"': sb.Append("&quot;"); break;
+                case '\u00a0': sb.Append("&nbsp;"); break;
+                default: sb.Append(decoded[i]); break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>`is_block_level_name` (utility/content.rs).</summary>
+    internal static bool IsBlockLevelName(string tag) => tag switch
+    {
+        "address" or "article" or "aside" or "blockquote" or "canvas" or "dd" or "div" or "dl"
+        or "dt" or "fieldset" or "figcaption" or "figure" or "footer" or "form" or "h1" or "h2"
+        or "h3" or "h4" or "h5" or "h6" or "header" or "hr" or "li" or "main" or "nav" or "ol"
+        or "p" or "pre" or "section" or "table" or "tfoot" or "ul" => !IsInlineElement(tag),
+        _ => false,
+    };
+
+    // ── pre-parse stripping (utility/preprocessing.rs) ──────────────────────
+    /// <summary>
+    /// Removes <c>&lt;script&gt;</c> and <c>&lt;style&gt;</c> elements from the source text
+    /// (`strip_script_and_style_tags`). A removed block leaves a space behind when it stood
+    /// between two non-space characters, which is what keeps the words around it apart:
+    /// `&lt;span&gt;&lt;style&gt;…&lt;/style&gt;&lt;cite&gt;` renders with that space. JSON-LD
+    /// scripts are kept, since their payload is document metadata, and nothing inside an
+    /// <c>&lt;svg&gt;</c> is touched — there a style element is part of the drawing.
+    /// </summary>
+    internal static string StripScriptAndStyleTags(string html)
+    {
+        if (html.IndexOf('<') < 0) return html;
+
+        StringBuilder? output = null;
+        int last = 0, idx = 0, n = html.Length, svgDepth = 0;
+        while (idx < n)
+        {
+            if (html[idx] != '<' || idx + 1 >= n) { idx++; continue; }
+
+            if (MatchesTagStart(html, idx + 1, "svg"))
+            {
+                int openEnd = FindTagEndQuoted(html, idx + 1 + 3);
+                if (openEnd > 0) { svgDepth++; idx = openEnd; continue; }
+            }
+            else if (html[idx + 1] == '/' && MatchesTagStart(html, idx + 2, "svg"))
+            {
+                int closeEnd = FindTagEndQuoted(html, idx + 2 + 3);
+                if (closeEnd > 0)
+                {
+                    if (svgDepth > 0) svgDepth--;
+                    idx = closeEnd;
+                    continue;
+                }
+            }
+
+            if (svgDepth > 0) { idx++; continue; }
+
+            if (html[idx + 1] == '/' && idx + 2 < n)
+            {
+                if (idx + 9 <= n && string.Compare(html, idx, "</script>", 0, 9, StringComparison.OrdinalIgnoreCase) == 0)
+                { idx += 9; continue; }
+                if (idx + 8 <= n && string.Compare(html, idx, "</style>", 0, 8, StringComparison.OrdinalIgnoreCase) == 0)
+                { idx += 8; continue; }
+            }
+
+            string? name = null;
+            if (idx + 7 < n && string.Compare(html, idx, "<script", 0, 7, StringComparison.OrdinalIgnoreCase) == 0
+                && html[idx + 7] is '>' or ' ' or '\t' or '\n' or '\r') name = "script";
+            else if (idx + 6 < n && string.Compare(html, idx, "<style", 0, 6, StringComparison.OrdinalIgnoreCase) == 0
+                && html[idx + 6] is '>' or ' ' or '\t' or '\n' or '\r') name = "style";
+            if (name is null) { idx++; continue; }
+
+            int tagEnd = html.IndexOf('>', idx + name.Length + 1);
+            if (tagEnd < 0) { idx++; continue; }
+            tagEnd++;
+
+            if (name == "script" && IsJsonLdScriptOpenTag(html[idx..tagEnd])) { idx++; continue; }
+
+            int closeIdx = FindCloseTag(html, tagEnd, name);
+            if (closeIdx < 0) { idx++; continue; }
+
+            output ??= new StringBuilder(html.Length);
+            output.Append(html, last, idx - last);
+            if (idx > 0 && closeIdx < n && !char.IsWhiteSpace(html[idx - 1]) && !char.IsWhiteSpace(html[closeIdx]))
+                output.Append(' ');
+            last = closeIdx;
+            idx = closeIdx;
+        }
+
+        if (output is null) return html;
+        if (last < n) output.Append(html, last, n - last);
+        return output.ToString();
+    }
+
+    /// <summary>Whether the named tag starts at <paramref name="start"/> and its name ends there.</summary>
+    private static bool MatchesTagStart(string html, int start, string tag)
+    {
+        if (start + tag.Length >= html.Length) return false;
+        if (string.Compare(html, start, tag, 0, tag.Length, StringComparison.OrdinalIgnoreCase) != 0) return false;
+        char after = html[start + tag.Length];
+        return char.IsWhiteSpace(after) || after is '>' or '/';
+    }
+
+    /// <summary>
+    /// Whether a <c>&lt;script&gt;</c> open tag declares the JSON-LD media type, which is
+    /// structured metadata rather than code and so survives the strip.
+    /// </summary>
+    private static bool IsJsonLdScriptOpenTag(string tag)
+    {
+        for (int idx = 0; idx + 4 <= tag.Length; idx++)
+        {
+            if (string.Compare(tag, idx, "type", 0, 4, StringComparison.OrdinalIgnoreCase) != 0) continue;
+            bool beforeOk = idx == 0 || char.IsWhiteSpace(tag[idx - 1]) || tag[idx - 1] is '<' or '/';
+            if (!beforeOk || idx + 4 >= tag.Length) continue;
+            char afterCh = tag[idx + 4];
+            if (!char.IsWhiteSpace(afterCh) && afterCh != '=') continue;
+
+            int i = idx + 4;
+            while (i < tag.Length && char.IsWhiteSpace(tag[i])) i++;
+            if (i >= tag.Length || tag[i] != '=') continue;
+            i++;
+            while (i < tag.Length && char.IsWhiteSpace(tag[i])) i++;
+            if (i >= tag.Length) return false;
+
+            int valueStart, valueEnd;
+            if (tag[i] is '"' or '\'')
+            {
+                char quote = tag[i];
+                valueStart = i + 1;
+                valueEnd = valueStart;
+                while (valueEnd < tag.Length && tag[valueEnd] != quote) valueEnd++;
+            }
+            else
+            {
+                valueStart = i;
+                valueEnd = i;
+                while (valueEnd < tag.Length && !char.IsWhiteSpace(tag[valueEnd]) && tag[valueEnd] != '>') valueEnd++;
+            }
+
+            string value = tag[valueStart..valueEnd];
+            int semi = value.IndexOf(';');
+            string mediaType = (semi < 0 ? value : value[..semi]).Trim();
+            return mediaType.Equals("application/ld+json", StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Removes every element carrying a <c>hidden</c> attribute along with everything up to its
+    /// first matching close tag (`strip_hidden_elements`). This runs over the source text before
+    /// anything is parsed, and the attribute is looked for by scanning the whole open tag — so a
+    /// quoted value that happens to contain the word (a category link titled "…with hidden
+    /// wikidata") takes its element with it.
+    /// </summary>
+    internal static string StripHiddenElements(string html)
+    {
+        if (html.IndexOf('<') < 0) return html;
+
+        StringBuilder? output = null;
+        int last = 0, idx = 0, n = html.Length;
+        while (idx < n)
+        {
+            if (html[idx] != '<' || idx + 1 >= n || html[idx + 1] == '/' || html[idx + 1] == '!')
+            {
+                idx++;
+                continue;
+            }
+            int tagEnd = FindTagEndQuoted(html, idx + 1);
+            if (tagEnd < 0) break;
+
+            if (!TagHasHiddenAttribute(html, idx, tagEnd)) { idx++; continue; }
+
+            int nameEnd = idx + 1;
+            while (nameEnd < n && !char.IsWhiteSpace(html[nameEnd]) && html[nameEnd] != '>' && html[nameEnd] != '/')
+                nameEnd++;
+            string name = html[(idx + 1)..nameEnd];
+
+            bool selfClosing = html.AsSpan(idx, tagEnd - idx).EndsWith("/>")
+                || name.Equals("br", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("hr", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("img", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("input", StringComparison.OrdinalIgnoreCase);
+            int removeEnd = selfClosing ? tagEnd : FindCloseTag(html, tagEnd, name);
+            if (removeEnd < 0) removeEnd = tagEnd;
+
+            output ??= new StringBuilder(html.Length);
+            output.Append(html, last, idx - last);
+            last = removeEnd;
+            idx = removeEnd;
+        }
+
+        if (output is null) return html;
+        if (last < n) output.Append(html, last, n - last);
+        return output.ToString();
+    }
+
+    /// <summary>The index just past the <c>&gt;</c> that ends a tag, ignoring quoted values.</summary>
+    private static int FindTagEndQuoted(string html, int idx)
+    {
+        char quote = '\0';
+        for (; idx < html.Length; idx++)
+        {
+            char c = html[idx];
+            if (c is '"' or '\'')
+            {
+                if (quote == c) quote = '\0';
+                else if (quote == '\0') quote = c;
+            }
+            else if (c == '>' && quote == '\0') return idx + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>The index just past the first <c>&lt;/name&gt;</c> at or after <paramref name="start"/>.</summary>
+    private static int FindCloseTag(string html, int start, string name)
+    {
+        for (int i = start; i < html.Length; i++)
+        {
+            i = html.IndexOf('<', i);
+            if (i < 0) return -1;
+            if (i + 2 + name.Length >= html.Length || html[i + 1] != '/') continue;
+            if (string.Compare(html, i + 2, name, 0, name.Length, StringComparison.OrdinalIgnoreCase) != 0) continue;
+            char after = html[i + 2 + name.Length];
+            if (after != '>' && !char.IsWhiteSpace(after)) continue;
+            int close = html.IndexOf('>', i + 2 + name.Length);
+            if (close < 0) return -1;
+            return close + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Whether an open tag carries a <c>hidden</c> attribute, judged the way upstream judges it:
+    /// the word, whitespace-delimited, anywhere after the tag name. Quoting is not considered, so
+    /// <c>data-hidden</c> and <c>aria-hidden</c> are excluded but a value's own words are not.
+    /// </summary>
+    private static bool TagHasHiddenAttribute(string html, int start, int end)
+    {
+        const string Needle = "hidden";
+        int i = start;
+        while (i < end && html[i] != ' ' && html[i] != '\t' && html[i] != '\n' && html[i] != '>') i++;
+        for (; i + Needle.Length <= end; i++)
+        {
+            if (string.Compare(html, i, Needle, 0, Needle.Length, StringComparison.OrdinalIgnoreCase) != 0) continue;
+            if (i > start && !char.IsWhiteSpace(html[i - 1])) continue;
+            if (i + Needle.Length == end) return true;
+            char after = html[i + Needle.Length];
+            if (after is ' ' or '\t' or '\n' or '\r' or '>' or '=' or '/') return true;
+        }
+        return false;
     }
 
     // ── context (mirrors converter::Context) ────────────────────────────────
@@ -866,8 +1233,16 @@ internal static class HtmlToMarkdown
 
     private static void HandleSpan(HNode node, StringBuilder output, Ctx ctx)
     {
-        // Whitespace normalization: pop a single trailing newline (typography.rs handle_span)
-        if (!ctx.InCode && EndsWith(output, "\n") && !EndsWith(output, "\n\n"))
+        // An hOCR word carries no whitespace of its own, so one is put back between words.
+        if ((node.Attr("class") ?? "").Contains("ocrx_word", StringComparison.Ordinal)
+            && output.Length > 0 && !EndsWith(output, " ") && !EndsWith(output, "\t") && !EndsWith(output, "\n"))
+            output.Append(' ');
+
+        // Whitespace normalization: pop a single trailing newline (typography.rs handle_span).
+        // A hard break ("  \n" or "\\\n") and a table row's "|\n" are structure, not stray
+        // whitespace — popping either glues this span onto the line before it.
+        if (!ctx.InCode && EndsWith(output, "\n") && !EndsWith(output, "\n\n")
+            && !EndsWith(output, "  \n") && !EndsWith(output, "\\\n") && !EndsWith(output, "|\n"))
             output.Remove(output.Length - 1, 1);
         WalkChildren(node, output, ctx);
     }
@@ -1086,7 +1461,7 @@ internal static class HtmlToMarkdown
         return (text.ToString(), sawBlock);
     }
 
-    private static string NormalizeLinkLabel(string label)
+    internal static string NormalizeLinkLabel(string label)
     {
         string collapsed = label.Replace('\n', ' ').Replace('\r', ' ');
         return NormalizeWhitespaceKeepNewlines(collapsed).Trim();
@@ -2031,12 +2406,9 @@ internal static class HtmlToMarkdown
                 else output.Append("\n\n");
             }
             output.Append(tableOutput);
-            if (!EndsWith(output, "\n\n"))
-            {
-                if (EndsWith(output, "\n")) output.Append('\n');
-                else output.Append("\n\n");
-            }
         }
+
+        if (!EndsWith(output, "\n")) output.Append('\n');
     }
 
     private static string IndentTableForList(string table, int listDepth)
@@ -2225,7 +2597,7 @@ internal static class HtmlToMarkdown
         return buf.ToString();
     }
 
-    private static string EscapeCellText(string text)
+    internal static string EscapeCellText(string text)
     {
         // Always escape * and _ inside table cells; also escape | (escape_misc=false path).
         var sb = new StringBuilder(text.Length);
@@ -2638,15 +3010,21 @@ internal sealed class HNode
 
     private Dictionary<string, string?>? _attrCache;
 
+    /// <summary>
+    /// Set on documents the html5ever repair re-serializes, whose attribute values reach the
+    /// converter in canonical form.
+    /// </summary>
+    public bool CanonicalAttrs;
+
     public string? Attr(string name)
     {
         if (Tag is null) return null;
         _attrCache ??= new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         if (_attrCache.TryGetValue(name, out var cached)) return cached;
-        // Attribute values are left as written. A real HTML5 tokenizer resolves character
-        // references in them, but the markdown writer escapes what it emits, and decoding an
-        // `alt` only to re-escape its `&` measured worse than leaving the source spelling alone.
+        // Attribute values are otherwise left as written: the lenient parser hands the handlers
+        // the source bytes, and the markdown writer escapes what it emits.
         string? v = HtmlWalker.ExtractAttr(AttrString, name);
+        if (v is not null && CanonicalAttrs) v = HtmlToMarkdown.CanonicalizeAttrValue(v);
         _attrCache[name] = v;
         return v;
     }

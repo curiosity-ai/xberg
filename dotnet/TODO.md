@@ -142,43 +142,24 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >   "Vendored sources: 6." where the file now says 7, and this port extracts the rest of the
 >   file faithfully. Nothing to fix; they pass again whenever the goldens are regenerated.
 >
-> ## Goldens the current Rust tree no longer reproduces
+> ## The goldens are 3.10.6 output, and the lock has moved past them
 >
-> A separate category from an upstream defect, and one to check before chasing any HTML failure:
-> some goldens were generated against an older `html-to-markdown-rs` than the generator now
-> resolves. The lock has since caught up — it records **3.11.2** today and `cargo build --locked`
-> succeeds — so the skew is between the *committed goldens* and the current tree, not between the
-> lock and the workspace. Whatever converter produced those goldens is no longer the one a fresh
-> run uses.
+> An earlier note here concluded these HTML goldens were stale and should be regenerated. They
+> are not. The committed `-results-rust.json` files were all written in one run on Aug 12 by
+> `dotnet/tools/xberg-reference-gen/target/release/xberg-reference-gen`, and that binary links
+> **html-to-markdown-rs 3.10.6** (`strings` on it, and the only version under the vendored
+> registry). Copy `html/sinthgunt.html`, `html/hip_13044_b.html` or
+> `vendored/docling/html/wiki_duck.html` into a scratch directory, run that binary over it, and
+> every content dimension, `tables` and the metadata come back identical to the committed file.
 >
-> Verified by regenerating: rebuild `xberg-reference-gen`, run it over a copy of the fixture, and
-> diff the fresh `-results-rust.json` against the committed one. Every HTML fixture this port
-> fixed reproduces byte-for-byte; **all seven that remain do not** —
-> `html/hip_13044_b.html`, `html/international_emergency_medicine.html`, `html/sinthgunt.html`,
-> `html/taylor_swift.html`, `vendored/docling/html/wiki_duck.html` and both copies of
-> `vendored/markitdown/test_wikipedia.html`. So does `epub/features.epub`, and
-> `epub/wasteland.epub` on markdown alone. The two visible signatures of the older converter are
-> newlines preserved inside table cells and `<noscript>` content rendered rather than skipped.
+> What moved is `dotnet/tools/xberg-reference-gen/Cargo.lock`: it records **3.11.2** today, and a
+> rebuild would resolve that instead. 3.11.2 is a different converter — `converter/main.rs` gained
+> a `"template" | "noscript" => {}` arm that 3.10.6 does not have, so a regenerated golden drops
+> `<noscript>` content — which is what the earlier "regenerated references differ" experiment was
+> seeing. **Port against 3.10.6 while these goldens stand.** Whoever regenerates the corpus has to
+> re-port the arms 3.11.x changed, `noscript`/`template` first.
 >
-> Measured against a *freshly generated* reference instead, `html/sinthgunt.html` now matches on
-> plain, html and json. The right fix is to regenerate the goldens (see "Re-syncing after an
-> upstream merge"), not to reverse-engineer the old converter.
->
-> **Confirmed with a control, and the nine are now regenerated.** Comparing golden files byte for
-> byte is useless here — serialization formatting differs on every run — so the check has to be
-> semantic, and it has to include fixtures that currently pass. Five passing controls
-> (`html/complex_table.html`, `html/html.html`, `html/simple_table.html`, `epub/epub2_cover.epub`,
-> `epub/epub2_no_cover.epub`) regenerate *semantically identical*; all nine flagged fixtures do
-> not, and not marginally: `taylor_swift.html` goes from 110 tables to 58 and 20,053 links to
-> 7,098, `hip_13044_b.html` from 16 tables to 9.
->
-> Against the refreshed goldens, html gains one fixture each on plain, html and json — and
-> *loses* three on tables, 38 to 35. That is not a regression, it is a port gap the stale goldens
-> were hiding: this port's HTML table conversion is calibrated to the older converter, which kept
-> newlines inside cells and rendered `<noscript>`. So these fixtures were never upstream's fault
-> and never belonged on an ignore list.
->
-> **A corpus-wide regeneration is NOT safe to run as-is**, and was attempted and rolled back.
+> A corpus-wide regeneration is also **not safe to run as-is**, and was attempted and rolled back.
 > Two reasons. First, `xberg-reference-gen` dies partway through: `mathemascii-0.4.0` panics on a
 > char boundary (`end byte index 6 is not a char boundary; it is inside '≤'`) parsing asciimath
 > reached through `extractors::asciidoc`, and the generator has no panic guard, so it aborts and
@@ -233,10 +214,13 @@ Each is traced to a specific line, not assumed.
 28 are json-and-soft, 10 are json alone, 4 tables alone, 3 metadata. The soft-dimension mass is
 one cause — heading classification — and `tables` is the ruled/heuristic tier boundary.
 
-**HTML, 7** (`hip_13044_b`, `international_emergency_medicine`, `sinthgunt`, `taylor_swift`,
-`wiki_duck`, both `test_wikipedia` copies). Not stale goldens: those were regenerated, and what
-the fresh references exposed is that this port's HTML *table* conversion is calibrated to the
-older converter that kept newlines inside cells and rendered `<noscript>`.
+**HTML, 0.** The seven that used to fail (`hip_13044_b`, `international_emergency_medicine`,
+`sinthgunt`, `taylor_swift`, `wiki_duck`, both `test_wikipedia` copies) now match on every
+dimension. None of it was table calibration: the causes were the two pre-parse strips
+(`strip_script_and_style_tags`, `strip_hidden_elements`), the missing `noscript`/`template`
+fall-through to the unknown handler, `handle_span` popping markdown hard breaks, a table ending
+with a blank line instead of one newline, the attribute canonicalization the html5ever repair
+leaves behind, and — for the metadata dimension — how many times a table's subtree is walked.
 
 **Spreadsheet metadata, 3** (`xls/test_excel.xls`, `xlsx/data-with-macros.xla`,
 `data_formats/test_01.ods`). Upstream writes a per-sheet formula dump into
