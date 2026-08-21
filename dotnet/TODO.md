@@ -157,6 +157,30 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > Measured against a *freshly generated* reference instead, `html/sinthgunt.html` now matches on
 > plain, html and json. The right fix is to regenerate the goldens (see "Re-syncing after an
 > upstream merge"), not to reverse-engineer the old converter.
+>
+> **Confirmed with a control, and the nine are now regenerated.** Comparing golden files byte for
+> byte is useless here — serialization formatting differs on every run — so the check has to be
+> semantic, and it has to include fixtures that currently pass. Five passing controls
+> (`html/complex_table.html`, `html/html.html`, `html/simple_table.html`, `epub/epub2_cover.epub`,
+> `epub/epub2_no_cover.epub`) regenerate *semantically identical*; all nine flagged fixtures do
+> not, and not marginally: `taylor_swift.html` goes from 110 tables to 58 and 20,053 links to
+> 7,098, `hip_13044_b.html` from 16 tables to 9.
+>
+> Against the refreshed goldens, html gains one fixture each on plain, html and json — and
+> *loses* three on tables, 38 to 35. That is not a regression, it is a port gap the stale goldens
+> were hiding: this port's HTML table conversion is calibrated to the older converter, which kept
+> newlines inside cells and rendered `<noscript>`. So these fixtures were never upstream's fault
+> and never belonged on an ignore list.
+>
+> **A corpus-wide regeneration is NOT safe to run as-is**, and was attempted and rolled back.
+> Two reasons. First, `xberg-reference-gen` dies partway through: `mathemascii-0.4.0` panics on a
+> char boundary (`end byte index 6 is not a char boundary; it is inside '≤'`) parsing asciimath
+> reached through `extractors::asciidoc`, and the generator has no panic guard, so it aborts and
+> leaves the goldens half-old and half-new. Second, a full run also *creates* ~222 goldens for
+> fixtures the Rust extractors fail on, which the committed corpus deliberately omits — that
+> changes the denominator and silently redefines every percentage in this file. Restore from a
+> backup taken first (`tar czf` over `*-results-rust.json`), and delete anything the run added
+> that the backup did not have.
 
 ## Known gaps after the merge
 

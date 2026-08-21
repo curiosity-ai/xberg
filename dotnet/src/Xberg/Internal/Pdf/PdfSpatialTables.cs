@@ -86,7 +86,7 @@ internal sealed class GridTable
     public PathRect? Bbox;
 }
 
-internal static class PdfSpatialTables
+internal static partial class PdfSpatialTables
 {
     private const double SnapTol = 3.0;
     private const double JoinTol = 3.0;
