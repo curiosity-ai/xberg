@@ -61,9 +61,7 @@ internal static class TarReader
 
                 if (ArchiveConstants.IsTextFile(path))
                 {
-                    string? text = ZipReader.TryDecodeUtf8(data);
-                    if (text is not null)
-                        result.TextContents.Add(new KeyValuePair<string, string>(path, text));
+                    result.TextContents.Add(new KeyValuePair<string, string>(path, ZipReader.DecodeArchiveText(data)));
                 }
             }
             else if (!isDir)
