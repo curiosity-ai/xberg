@@ -388,6 +388,9 @@ internal static class EpubHtmlStructure
                 }
                 case "math":
                 {
+                    // The walker is tag-level, so the subtree is taken verbatim and handed to the
+                    // MathML converter as its own document rather than walked token by token —
+                    // walking it would flatten the equation into stray inline text.
                     FlushParagraph();
                     if (isSelfClosing) break;
                     string mathClose = "</math>";

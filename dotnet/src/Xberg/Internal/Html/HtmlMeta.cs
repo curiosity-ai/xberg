@@ -66,6 +66,9 @@ public static class HtmlMeta
         var anchorRawText = new StringBuilder();
         string anchorHref = "";
         string? anchorTitle = null;
+        // Where the anchor's content starts, so an anchor that renders to nothing can still be
+        // told apart from one with no children at all.
+        int anchorInnerStart = 0;
         List<string[]> anchorAttrs = new();
         List<string> anchorRel = new();
         bool inTitle = false;
@@ -149,10 +152,15 @@ public static class HtmlMeta
                                     && rawText == anchorHref[7..]));
                         if (!isAutolink)
                         {
+                            // An anchor whose children render to nothing — an icon button built
+                            // from empty spans, say — falls back to its own href for a label.
+                            string linkLabel = HtmlWalker.NormalizeWhitespace(anchorText.ToString());
+                            if (linkLabel.Length == 0 && anchorHref.Length > 0 && tagStart > anchorInnerStart)
+                                linkLabel = anchorHref;
                             LinkSink().Add(new Link
                             {
                                 Href = anchorHref,
-                                Text = HtmlWalker.NormalizeWhitespace(anchorText.ToString()),
+                                Text = CiteBacklinkLabel(linkLabel, anchorHref),
                                 Title = anchorTitle,
                                 LinkType = ClassifyLink(anchorHref),
                                 Rel = anchorRel,
@@ -181,7 +189,7 @@ public static class HtmlMeta
                         LinkSink().Add(new Link
                         {
                             Href = linkHref,
-                            Text = label,
+                            Text = CiteBacklinkLabel(label, linkHref),
                             Title = linkTitle,
                             LinkType = ClassifyLink(linkHref),
                             Rel = linkRel,
@@ -310,7 +318,10 @@ public static class HtmlMeta
                         anchorText.Clear();
                         anchorRawText.Clear();
                         anchorHref = ExtractAttrDecoded(attrsStr, "href") ?? "";
-                        anchorTitle = ExtractAttrDecoded(attrsStr, "title");
+                        // The title is recorded as written: the link handler hands the collector
+                        // the attribute's own bytes, and only the href is entity-decoded.
+                        anchorTitle = HtmlWalker.ExtractAttr(attrsStr, "title");
+                        anchorInnerStart = pos;
                         anchorAttrs = ParseAttrs(attrsStr, exclude: "href", out anchorRel);
                         break;
                     }
@@ -524,6 +535,14 @@ public static class HtmlMeta
 
     private static IEnumerable<string> SplitKeywords(string value) =>
         value.Split(',').Select(k => k.Trim()).Where(k => k.Length > 0);
+
+    /// <summary>
+    /// The label a link records. A caret-only label on a fragment link is the citation
+    /// backlink Wikipedia writes; the link handler rewrites it to an arrow before the
+    /// metadata collector sees it, so the recorded text carries the arrow too.
+    /// </summary>
+    private static string CiteBacklinkLabel(string label, string href)
+        => label == "^" && href.StartsWith('#') ? "\u2191" : label;
 
     // Mirrors html-to-markdown's LinkMetadata::classify_link (metadata/types.rs). Note the
     // scheme checks are case-sensitive there, and "//"/"/" both classify as internal.

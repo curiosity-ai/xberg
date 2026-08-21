@@ -32,12 +32,6 @@ internal static class MathMl
     /// </summary>
     private static readonly string[] TexAnnotationEncodings = { "application/x-tex", "text/x-tex", "tex", "latex" };
 
-    /// <summary>
-    /// Pure grouping/styling wrappers: their children render in sequence with no markup of
-    /// their own.
-    /// </summary>
-    private static readonly string[] TransparentElements = { "math", "mrow", "mstyle", "mpadded", "merror" };
-
     // ── MmlNode tree ────────────────────────────────────────────────────────
     private abstract record MmlNode;
 
@@ -254,9 +248,15 @@ internal static class MathMl
                 return new Phantom(new Group(CollectChildren(node)));
             case "mtable":
                 return CollectTable(node);
+            // Pure grouping/styling wrappers: their children render in sequence with no markup
+            // of their own. An element the converter does not know degrades the same way, to its
+            // content, rather than failing the document.
+            case "math":
+            case "mrow":
+            case "mstyle":
+            case "mpadded":
+            case "merror":
             default:
-                if (TransparentElements.Contains(tag.ToLowerInvariant()))
-                    return new Group(CollectChildren(node));
                 return new Group(CollectChildren(node));
         }
     }
@@ -470,13 +470,13 @@ internal static class MathMl
 
         var rendered = operands.Select(ConvertContentNode).ToList();
 
-        if (System.Array.Find(InfixOperators, op => op.Name == name) is { Name: not null } infix)
+        if (Array.Find(InfixOperators, op => op.Name == name) is { Name: not null } infix)
         {
             // Unary minus reads as negation rather than subtraction.
             if (name == "minus" && rendered.Count == 1) return "-" + rendered[0];
             return string.Join(infix.Latex, rendered);
         }
-        if (System.Array.Find(FunctionOperators, op => op.Name == name) is { Name: not null } func)
+        if (Array.Find(FunctionOperators, op => op.Name == name) is { Name: not null } func)
             return $"{func.Latex}\\left({string.Join(", ", rendered)}\\right)";
 
         switch (name)
