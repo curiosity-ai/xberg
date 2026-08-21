@@ -10,8 +10,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2638 fixtures of 2942 (89.7%) match on every hard dimension**; **0 catastrophes**; 2
-> fixtures still lose content (eml, epub — both wanting the MathML converter). 1146 unit tests.
+> **2732 of 2787 comparable fixtures (98.0%) match on every hard dimension**; **0
+> catastrophes**; 1295 unit tests. The denominator is the fixtures Rust itself can extract —
+> 155 of the 2,942 walked, it cannot, and counting those against this port measures nothing.
 > Measured on the whole corpus in one run, which is the only figure that means anything: a
 > per-format run validated the mime sniff on md and txt while it was quietly handing three PDFs
 > to the HTML extractor.
@@ -173,23 +174,42 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 
 The corpus is 2,942 fixtures. **155 of them Rust itself cannot extract** (75 where this port is
 also empty, 80 where it produces output and Rust errors), so they are not comparable in either
-direction. That leaves **2,787 comparable fixtures, 2,678 fully matching (96.1%)** and **109
-failing at least one hard dimension** — 107 once the archive fix below is counted, which landed
-after that sweep. Run `--list-fail` to regenerate the list below; it prints
-one line per failing fixture with the dimensions it failed.
+direction. That leaves **2,787 comparable fixtures, 2,732 fully matching (98.0%)** and **55
+failing at least one hard dimension** — 54 once the docbook fix that landed after the sweep is
+counted. 0 catastrophes. Regenerate the list with `--list-fail`, which prints one line per
+failing fixture and the dimensions it failed.
 
-Read the 89.7% figure that appears in older notes with that in mind — it divided by all 2,942 and
-so scored this port against documents upstream never read. The harness said "Fixtures compared
-(rust succeeded)" over a total that included the incomparable ones; that label is now fixed.
+Older notes in this file quote percentages against 2,942. Those divided by a total including the
+incomparable fixtures and so scored this port against documents upstream never read.
 
-Closed since the first pass through this list: `opml/opml-reader.opml` (the `_note` attribute was
-never collected), `data_formats/test_01.ods` (an ODF package keeps its document properties in
-`meta.xml`, and the reader for that was already ported for ODT — ODS was simply not wired to it),
-`archives/documents.tar` and `.tgz` (`decode_archive_text` decodes lossily and always returns a
-string, where this port used a strict decode and dropped the member), and 37 PDF fixtures.
+**PDF is 33 of the 55.** The shape has flipped since the table work: 21 fail `plain` and 19 fail
+`tables`, where `tables` used to dominate. The plain group is not one cause — a two-column
+reading-order split in `pdfa_021`, a paragraph break the assembler does not take in
+`pr-138-example`, whitespace-only in `nougat_011`, and `form-test` wanting
+`inject_unrepresented_form_field_elements`.
 
-`docbook/docbook-reader.docbook` is traced but not fixed: `<quote>working</quote>` renders as
-`working ` rather than `"working"`, and `2 &gt; 1` loses its `>`.
+Three plain failures are this port's own 25 s wall-clock guard truncating the corpus's largest
+documents, not behaviour: `intel_64_…_sdm`, `algebra_topology_…` and `bayesian_data_analysis_…`
+all pass `plain` when the guard is raised to 300 s. The guard stays — it exists so a pathological
+file cannot hang extraction, and upstream simply has no deadline to match.
+
+**The other 22**, each with a named cause:
+
+- Six upstream defects, listed below.
+- `email/empty.pst` — PST is unported. One fixture, and it is empty, so it would be easy to fake
+  a `format` block for; that would be wrong for every real PST.
+- `xls/test_excel.xls`, `xlsx/data-with-macros.xla` — upstream writes a per-sheet formula dump
+  into `metadata.additional` (`formulas_Sheet1 = "A1=K2*L2*12; …"`). XLSX already collects these;
+  the legacy BIFF path needs formula-token decoding.
+- `iwork/test.key`, `test.numbers`, `test.pages`, `ppt/simple.ppt` — untraced.
+- `jats/sample_article.nxml` — needs `extraction/formula_xml.rs`, unported.
+- `epub/features.epub` — U+23DE/U+23DF become `\overbrace`/`\underbrace` here where upstream
+  keeps them literal inside `\overset`/`\underset`. Confirmed a port divergence, not a stale
+  golden: regenerating that golden reproduces the committed file byte for byte.
+- Four `.md` fixtures opening with an HTML comment — both implementations route them to the HTML
+  extractor and differ only in the fallback paragraph's whitespace.
+- `email-replace-mime-encodings-error-5.eml` — malformed MIME with no closed boundary.
+- `fake-email-multiple-attachments.msg` — PDF text quality inside an attachment.
 
 ### Genuine upstream defects — 6 fixtures, safe to ignore
 
