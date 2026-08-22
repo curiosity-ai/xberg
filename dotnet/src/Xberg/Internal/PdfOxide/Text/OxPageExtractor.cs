@@ -46,10 +46,12 @@ internal static class OxPageExtractor
         /// </summary>
         /// <remarks>
         /// The structure pipeline asks for TopToBottom where the text assembler asks for
-        /// ColumnAware, and the two differ by more than the sort: the row-aware comparator
+        /// ColumnAware, and the two differ by more than the sort. The row-aware comparator
         /// bands near-equal Y values, so spans that tie on (band, x) keep the order they
-        /// arrived in. Sorting the column-aware list would hand those ties a different
-        /// starting sequence than sorting the raw one.
+        /// arrived in, and sorting the column-aware list would hand those ties a different
+        /// starting sequence than sorting the raw one. These spans also carry no per-glyph
+        /// x-origins, because the stamp that produces them belongs to `postprocess_spans`
+        /// and the TopToBottom path never runs it.
         /// </remarks>
         public List<OxTextSpan> HierarchySpans = new();
     }
@@ -84,6 +86,16 @@ internal static class OxPageExtractor
             OxCharXOffsets.GetPageRotation(doc, pageIndex),
             ((float)llx, (float)lly, (float)urx, (float)ury));
 
+        // The hierarchy path takes its copies BEFORE the stamp below. `stamp_char_x_offsets`
+        // lives inside `postprocess_spans`, which the `ReadingOrder::TopToBottom` path never
+        // runs, so upstream's hierarchy spans carry no per-glyph origins at all and the
+        // inline-script rejoin measures character positions from the advance widths instead.
+        var hierarchySpans = new List<OxTextSpan>(spans.Count);
+        foreach (var s in spans) hierarchySpans.Add(s.Clone());
+        OxReadingOrder.DropOffpageSpans(hierarchySpans, (float)llx, (float)lly, (float)urx, (float)ury);
+        OxSpanCompare.SortSpansRowAware(hierarchySpans);
+        result.HierarchySpans = hierarchySpans;
+
         // Stamp the char extractor's own per-glyph x-origins onto the finished spans, so
         // everything that decomposes a span through `to_chars` sees spec-aligned positions
         // rather than a prefix-sum of nominal widths. Runs last, on the post-processed
@@ -91,7 +103,6 @@ internal static class OxPageExtractor
         OxCharXOffsets.Stamp(doc, pageIndex, spans, chars);
 
         OxReadingOrder.DropOffpageSpans(spans, (float)llx, (float)lly, (float)urx, (float)ury);
-        result.HierarchySpans = OxReadingOrder.ApplyReadingOrder(spans, OxReadingOrder.Mode.TopToBottom, null);
         result.Text.Spans = OxReadingOrder.OrderSpansColumnAware(spans);
 
         // `PageText.chars` is left empty: the per-glyph list is consumed by the stamp above
