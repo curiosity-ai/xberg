@@ -379,14 +379,17 @@ public sealed class PdfExtractor : IExtractor
                     double pageWidth = Math.Abs(mbUrx - mbLlx);
                     List<PdfPageText.LineSeg> lines;
                     List<Xberg.Internal.PdfOxide.OxTextSpan>? structureSpans = null;
+                    List<Xberg.Internal.PdfOxide.OxTextSpan>? wordSpans = null;
                     float structurePageWidth = 0f, structurePageHeight = 0f;
                     if (UsePortedSpans)
                     {
                         // The ported pipeline's own assembler consumes the ported spans directly:
                         // they already arrive column-aware ordered, deduplicated and merged, which
                         // is exactly the shape upstream's `assemble_page_text` receives.
-                        var oxPage = Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPageText(pdf, i);
+                        var oxResult = Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPage(pdf, i);
+                        var oxPage = oxResult.Text;
                         var oxSpans = oxPage.Spans;
+                        wordSpans = oxResult.WordSpans;
                         var assembly = Xberg.Internal.PdfOxide.Text.OxPageAssembler.Assemble(
                             oxSpans, (float)pageWidth);
                         pageText = assembly.Text;
@@ -396,7 +399,7 @@ public sealed class PdfExtractor : IExtractor
                         // The structure pipeline runs its own span pipeline over the same page —
                         // see PdfOxideSegments — so it keeps the spans whole rather than the
                         // assembler's lines.
-                        structureSpans = oxSpans;
+                        structureSpans = oxResult.HierarchySpans;
                         structurePageWidth = oxPage.PageWidth;
                         structurePageHeight = oxPage.PageHeight;
                     }
@@ -411,12 +414,13 @@ public sealed class PdfExtractor : IExtractor
                         ? PdfOxideSegments.FromPage(structureSpans, structurePageWidth, structurePageHeight)
                         : PdfStructure.SegmentsFromLines(lines);
                     // The detector is fed words, not show-operator runs (upstream calls
-                    // `extract_words`), and the per-glyph geometry needed to build them
-                    // only exists on the ported extractor's spans.
-                    words = structureSpans is not null
-                        ? PdfSpatialTables.WordsFromOxSpans(
-                            structureSpans, mbLlx, mbLly, mbUrx, mbUry,
-                            Xberg.Internal.PdfOxide.Text.OxCharXOffsets.GetPageRotation(pdf, i))
+                    // `extract_words`), and those come off their own pipeline: the word
+                    // path's spans are post-processed and ordered by `page_reading_order`,
+                    // where the text and hierarchy paths see only the off-page drop and a
+                    // sort. The per-glyph geometry the clustering needs exists only on the
+                    // ported extractor's spans.
+                    words = wordSpans is not null
+                        ? PdfSpatialTables.WordsFromOxSpans(wordSpans)
                         : PdfSpatialTables.SpansToWords(spans);
                     paths = extractor.Paths;
                 }

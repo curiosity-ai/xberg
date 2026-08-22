@@ -21,29 +21,78 @@ namespace Xberg.Internal.PdfOxide.Text;
 internal static class OxPageExtractor
 {
     /// <summary>
+    /// One page seen by both span pipelines: the text path's spans and, separately, the
+    /// word path's.
+    /// </summary>
+    /// <remarks>
+    /// Upstream runs two pipelines over the same page and they diverge early. Text and
+    /// hierarchy read `extract_spans_with_reading_order`, which drops off-page spans and
+    /// sorts. Words read `extract_words` → `pipeline::page_reading_order` → `extract_spans`,
+    /// whose `postprocess_spans` also merges drop caps, maps a /Rotate'd page's rotated
+    /// content into the displayed frame, and rewrites text (super/subscripts, combining
+    /// marks, typographic spaces). Both are served here from one content-stream pass so the
+    /// second pipeline costs no extra parse.
+    /// </remarks>
+    internal sealed class OxPage
+    {
+        /// <summary>The text and hierarchy path's spans, plus the page dimensions.</summary>
+        public OxPageText Text = new();
+
+        /// <summary>The word path's spans, as `page_reading_order` leaves them.</summary>
+        public List<OxTextSpan> WordSpans = new();
+
+        /// <summary>
+        /// The hierarchy path's spans, as `ReadingOrder::TopToBottom` leaves them.
+        /// </summary>
+        /// <remarks>
+        /// The structure pipeline asks for TopToBottom where the text assembler asks for
+        /// ColumnAware, and the two differ by more than the sort: the row-aware comparator
+        /// bands near-equal Y values, so spans that tie on (band, x) keep the order they
+        /// arrived in. Sorting the column-aware list would hand those ties a different
+        /// starting sequence than sorting the raw one.
+        /// </remarks>
+        public List<OxTextSpan> HierarchySpans = new();
+    }
+
+    /// <summary>
     /// One page's spans and glyphs, ordered as `ReadingOrder::ColumnAware` leaves them —
     /// the shape `extract_page_text_with_options` returns.
     /// </summary>
-    public static OxPageText ExtractPageText(PdfDocument doc, int pageIndex)
+    public static OxPageText ExtractPageText(PdfDocument doc, int pageIndex) =>
+        ExtractPage(doc, pageIndex).Text;
+
+    /// <summary>Both span pipelines for one page, from a single content-stream pass.</summary>
+    public static OxPage ExtractPage(PdfDocument doc, int pageIndex)
     {
         var page = pageIndex >= 0 && pageIndex < doc.PageCount ? doc.Pages[pageIndex] : null;
         var (llx, lly, urx, ury) = doc.GetPageMediaBox(pageIndex);
-        var result = new OxPageText { PageWidth = (float)urx, PageHeight = (float)ury };
+        var result = new OxPage { Text = new OxPageText { PageWidth = (float)urx, PageHeight = (float)ury } };
         if (page is null) return result;
 
         var spans = ExtractSpans(doc, pageIndex, page);
+        if (spans.Count == 0) return result;
+
+        var chars = ExtractChars(doc, pageIndex, page);
+
+        // The word path works from its own copies: `postprocess_spans` rewrites text and
+        // geometry in place, and the text path must not see either.
+        var wordSpans = new List<OxTextSpan>(spans.Count);
+        foreach (var s in spans) wordSpans.Add(s.Clone());
+        wordSpans = OxSpanPostprocess.Run(doc, pageIndex, wordSpans, chars);
+        result.WordSpans = OxPageOrder.PageReadingOrder(
+            wordSpans,
+            OxCharXOffsets.GetPageRotation(doc, pageIndex),
+            ((float)llx, (float)lly, (float)urx, (float)ury));
 
         // Stamp the char extractor's own per-glyph x-origins onto the finished spans, so
         // everything that decomposes a span through `to_chars` sees spec-aligned positions
         // rather than a prefix-sum of nominal widths. Runs last, on the post-processed
         // spans, so the alignment sees the same text the consumers do.
-        if (spans.Count > 0)
-        {
-            OxCharXOffsets.Stamp(doc, pageIndex, spans, ExtractChars(doc, pageIndex, page));
-        }
+        OxCharXOffsets.Stamp(doc, pageIndex, spans, chars);
 
         OxReadingOrder.DropOffpageSpans(spans, (float)llx, (float)lly, (float)urx, (float)ury);
-        result.Spans = OxReadingOrder.OrderSpansColumnAware(spans);
+        result.HierarchySpans = OxReadingOrder.ApplyReadingOrder(spans, OxReadingOrder.Mode.TopToBottom, null);
+        result.Text.Spans = OxReadingOrder.OrderSpansColumnAware(spans);
 
         // `PageText.chars` is left empty: the per-glyph list is consumed by the stamp above
         // and nothing downstream asks for it whole.

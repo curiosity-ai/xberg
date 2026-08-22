@@ -54,9 +54,11 @@ internal static class PdfOxideSegments
     {
         if (spans.Count == 0) return new List<SegmentData>();
 
-        // The extractor hands its caller ColumnAware order because that is what the text
-        // assembler wants; upstream's structure path asks for `TopToBottom` instead and then
-        // repairs the order itself, so re-impose the row-band sort here.
+        // The caller supplies `TopToBottom` spans — the order upstream's structure path asks
+        // for, and not the ColumnAware order the text assembler gets. The row-band sort is
+        // re-imposed anyway so the repairs below always start from the order they were
+        // written against; on an already-sorted list it is a no-op, the comparator being a
+        // total order on (Y band, X) and the sort stable.
         var work = new List<OxTextSpan>(spans.Count);
         foreach (var s in spans) work.Add(s.Clone());
         OxSpanCompare.SortSpansRowAware(work);

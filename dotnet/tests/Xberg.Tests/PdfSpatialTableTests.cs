@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using Xberg.Internal.Pdf;
+using Xberg.Internal.PdfOxide.Layout;
+using Xberg.Internal.PdfOxide.Text;
 using Xunit;
 
 namespace Xberg.Tests;
@@ -34,12 +36,12 @@ public class PdfSpatialTableTests
         };
 
     /// <summary>
-    /// A page whose runs are mostly sideways is ordered in the rotated frame upstream, and
-    /// the map back out of that frame is not the exact inverse of the map into it: the word
-    /// origins the detector measures carry a single-precision round-trip of the page width.
+    /// A page whose runs are mostly sideways is ordered in the rotated frame, and the map
+    /// back out of that frame is not the exact inverse of the map into it: the span origins
+    /// the word grid is built from carry a single-precision round-trip of the page width.
     /// </summary>
     [Fact]
-    public void SidewaysPageWordOriginsCarryTheRotatedFrameRoundTrip()
+    public void SidewaysPageSpanOriginsCarryTheRotatedFrameRoundTrip()
     {
         var spans = new List<Xberg.Internal.PdfOxide.OxTextSpan>
         {
@@ -47,20 +49,18 @@ public class PdfSpatialTableTests
             OxSpan("beta", 81.502f, 120.0f, 24.0f, 90.0f),
         };
 
-        var turned = PdfSpatialTables.WordsFromOxSpans(spans, 0.0, 0.0, 612.0, 792.0);
-        var upright = PdfSpatialTables.WordsFromOxSpans(spans);
+        var turned = OxPageOrder.PageReadingOrder(Clone(spans), 0, (0f, 0f, 612f, 792f));
 
         // 612 - (612 - 81.502) lands one ULP of the page width above 81.502.
-        Assert.Equal(81.50201416015625, turned[0].Bbox.X);
-        Assert.Equal(81.50199890136719, upright[0].Bbox.X);
+        Assert.Equal(81.50201416015625f, turned[0].Bbox.X);
         // Only the origin turns; the run's own extents describe it in its upright frame.
-        Assert.Equal(upright[0].Bbox.Width, turned[0].Bbox.Width);
-        Assert.Equal(upright[0].Bbox.Y, turned[0].Bbox.Y);
+        Assert.Equal(30.0f, turned[0].Bbox.Width);
+        Assert.Equal(10.0f, turned[0].Bbox.Height);
     }
 
     /// <summary>
-    /// The page's own <c>/Rotate</c> takes the rotated-frame branch out of play: upstream
-    /// has already mapped such a page into its displayed frame before ordering.
+    /// The page's own <c>/Rotate</c> takes the rotated-frame branch out of play:
+    /// `postprocess_spans` has already mapped such a page into its displayed frame.
     /// </summary>
     [Fact]
     public void ARotatedPageSkipsTheReadingFrameRoundTrip()
@@ -71,9 +71,9 @@ public class PdfSpatialTableTests
             OxSpan("beta", 81.502f, 120.0f, 24.0f, 90.0f),
         };
 
-        var words = PdfSpatialTables.WordsFromOxSpans(spans, 0.0, 0.0, 612.0, 792.0, pageRotation: 90);
+        var ordered = OxPageOrder.PageReadingOrder(Clone(spans), 90, (0f, 0f, 612f, 792f));
 
-        Assert.Equal(81.50199890136719, words[0].Bbox.X);
+        Assert.Equal(81.502f, ordered[0].Bbox.X);
     }
 
     /// <summary>An upright page has no rotated reading frame to round-trip through.</summary>
@@ -86,9 +86,35 @@ public class PdfSpatialTableTests
             OxSpan("beta", 81.502f, 120.0f, 24.0f, 0.0f),
         };
 
-        var words = PdfSpatialTables.WordsFromOxSpans(spans, 0.0, 0.0, 612.0, 792.0);
+        var ordered = OxPageOrder.PageReadingOrder(Clone(spans), 0, (0f, 0f, 612f, 792f));
 
-        Assert.Equal(81.50199890136719, words[0].Bbox.X);
+        Assert.Equal(81.502f, ordered[0].Bbox.X);
+    }
+
+    /// <summary>
+    /// A <c>/Rotate 90</c> page turns its rotated-content runs into the displayed frame,
+    /// where the run's advance becomes its height (`map_span_into_rotated_frame`).
+    /// </summary>
+    [Fact]
+    public void RotatedContentOnARotatedPageIsMappedIntoTheDisplayedFrame()
+    {
+        var span = OxSpan("CENTRAL", 59.57f, 166.21f, 53.34f, 90.0f);
+        span.Bbox = new Xberg.Internal.PdfOxide.OxRect(59.57f, 166.21f, 53.34f, 7.5f);
+
+        OxSpanPostprocess.MapSpanIntoRotatedFrame(span, 90, 0f, 0f, 612f, 792f);
+
+        Assert.Equal(166.21f, span.Bbox.X, 3);
+        Assert.Equal(612f - 59.57f - 53.34f, span.Bbox.Y, 3);
+        Assert.Equal(7.5f, span.Bbox.Width, 3);
+        Assert.Equal(53.34f, span.Bbox.Height, 3);
+    }
+
+    private static List<Xberg.Internal.PdfOxide.OxTextSpan> Clone(
+        List<Xberg.Internal.PdfOxide.OxTextSpan> spans)
+    {
+        var copy = new List<Xberg.Internal.PdfOxide.OxTextSpan>(spans.Count);
+        foreach (var s in spans) copy.Add(s.Clone());
+        return copy;
     }
 
     [Fact]

@@ -124,16 +124,16 @@ internal static partial class PdfSpatialTables
     /// detector consumes. The clustering, the whitespace split and the adjacency merge all
     /// live in <see cref="OxWordExtraction"/>; this only re-shapes the result.
     /// </summary>
-    /// <param name="llx">Media-box lower-left x; with the rest of the box it fixes the frame
-    /// a page of sideways text is ordered in.</param>
-    public static List<TableSpan> WordsFromOxSpans(
-        IReadOnlyList<OxTextSpan> spans,
-        double llx = 0.0, double lly = 0.0, double urx = 0.0, double ury = 0.0,
-        int pageRotation = 0)
+    /// <remarks>
+    /// The spans reaching here are the word path's own — postprocessed and ordered by
+    /// <see cref="Xberg.Internal.PdfOxide.Layout.OxPageOrder.PageReadingOrder"/> — so the
+    /// page /Rotate mapping and the rotated reading frame have already been applied to their
+    /// geometry. This is not the plain-text path's span list.
+    /// </remarks>
+    public static List<TableSpan> WordsFromOxSpans(IReadOnlyList<OxTextSpan> spans)
     {
-        var source = MapThroughRotatedReadingFrame(spans, llx, lly, urx, ury, pageRotation);
         var words = new List<TableSpan>();
-        foreach (var w in OxWordExtraction.ExtractWords(source))
+        foreach (var w in OxWordExtraction.ExtractWords(spans))
         {
             words.Add(new TableSpan
             {
@@ -143,98 +143,6 @@ internal static partial class PdfSpatialTables
             });
         }
         return words;
-    }
-
-    /// <summary>
-    /// Reproduce the geometry a page of sideways text acquires on its way through the
-    /// reading-order pipeline (<c>pipeline/page_order.rs:151</c>).
-    /// </summary>
-    /// <remarks>
-    /// When most of a page's runs share one quadrant rotation and the page itself carries no
-    /// <c>/Rotate</c>, upstream orders the page in the rotated frame: it maps every span origin
-    /// into that frame, sorts, and maps back. The two maps are not inverses in single precision
-    /// — <c>w - (w - x)</c> lands about one ULP of the page dimension away from <c>x</c>, which
-    /// the source itself notes at <c>page_order.rs:193</c> — and the word origins the table
-    /// detector is measured against carry that drift, as does the table bounding box built from
-    /// them. Ordering is not reproduced here: this path keeps its own span order and only takes
-    /// the round trip the coordinates make.
-    /// </remarks>
-    private static IReadOnlyList<OxTextSpan> MapThroughRotatedReadingFrame(
-        IReadOnlyList<OxTextSpan> spans, double llx, double lly, double urx, double ury, int pageRotation)
-    {
-        if (pageRotation != 0 || spans.Count == 0) return spans;
-        float w = (float)(urx - llx), h = (float)(ury - lly);
-        if (!(w > 0f) || !(h > 0f)) return spans;
-        if (ReadingFrameQuadrant(DominantRotation(spans)) is not int rot) return spans;
-
-        // The rotated frame swaps the page dimensions for the quarter turns.
-        (float fw, float fh) = rot % 180 == 90 ? (h, w) : (w, h);
-        int inv = (360 - rot) % 360;
-
-        var mapped = new List<OxTextSpan>(spans.Count);
-        foreach (var span in spans)
-        {
-            var (x, y) = MapOrigin(span.Bbox.X, span.Bbox.Y, rot, w, h, (float)llx, (float)lly);
-            (x, y) = MapOrigin(x, y, inv, fw, fh, (float)llx, (float)lly);
-            var copy = span.Clone();
-            copy.Bbox = new OxRect(x, y, span.Bbox.Width, span.Bbox.Height);
-            mapped.Add(copy);
-        }
-        return mapped;
-    }
-
-    /// <summary>
-    /// A span origin turned through one quadrant of the page frame (page_order.rs:170). A
-    /// rotated run stores text-local extents, so only the origin turns; the width and height
-    /// already describe the run in its own upright frame.
-    /// </summary>
-    private static (float X, float Y) MapOrigin(
-        float x, float y, int rot, float fw, float fh, float llx, float lly)
-    {
-        float rx = x - llx, ry = y - lly;
-        (float mx, float my) = rot switch
-        {
-            90 => (ry, fw - rx),
-            180 => (fw - rx, fh - ry),
-            270 => (fh - ry, rx),
-            _ => (rx, ry),
-        };
-        return (llx + mx, lly + my);
-    }
-
-    /// <summary>
-    /// The rotation at least half the page's non-blank runs share, if any (lib.rs:436).
-    /// </summary>
-    private static float? DominantRotation(IReadOnlyList<OxTextSpan> spans)
-    {
-        var groups = new List<(float Degrees, int Count)>();
-        int total = 0;
-        foreach (var span in spans)
-        {
-            if (span.Text.Trim().Length == 0) continue;
-            total++;
-            if (span.RotationDegrees == 0.0f) continue;
-            int hit = groups.FindIndex(g => MathF.Abs(g.Degrees - span.RotationDegrees) < 0.5f);
-            if (hit >= 0) groups[hit] = (groups[hit].Degrees, groups[hit].Count + 1);
-            else groups.Add((span.RotationDegrees, 1));
-        }
-        if (total == 0 || groups.Count == 0) return null;
-        var best = groups[0];
-        foreach (var g in groups) if (g.Count > best.Count) best = g;
-        return best.Count * 2 >= total ? best.Degrees : null;
-    }
-
-    /// <summary>
-    /// The display rotation that turns text of this angle upright (page_order.rs:208). A
-    /// mirrored or free-angle run has no quadrant frame.
-    /// </summary>
-    private static int? ReadingFrameQuadrant(float? degrees)
-    {
-        if (degrees is not float d) return null;
-        if (MathF.Abs(d - 90.0f) < 0.5f) return 90;
-        if (MathF.Abs(d - 180.0f) < 0.5f) return 180;
-        if (MathF.Abs(d + 90.0f) < 0.5f) return 270;
-        return null;
     }
 
     /// <summary>
