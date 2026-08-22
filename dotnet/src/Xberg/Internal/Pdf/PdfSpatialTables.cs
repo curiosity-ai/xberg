@@ -102,6 +102,15 @@ internal static partial class PdfSpatialTables
     private const int MaxTableEdges = 1500;
 
     /// <summary>Horizontal slack for the fragment consolidation's X-start and width match.</summary>
+    /// <remarks>
+    /// The consolidation these tolerances serve is not reachable yet, and deliberately so.
+    /// pdf_oxide calls it in one place only — inside the horizontal-rule-bounded branch, over
+    /// that branch's fragments and with a vertical tolerance scaled to their median row height
+    /// (`spatial_table_detector.rs:3809`). That branch is unported. Running it over the
+    /// Lines/Lines output at the abutting-fragment default instead merges tables upstream keeps
+    /// apart: measured, it cost 22 `ok` and 24 `tables` on the PDF corpus. The helpers stay for
+    /// whoever ports `detect_tables_from_horizontal_rules`; the call does not.
+    /// </remarks>
     private const double FragmentMergeXTol = 2.0;
 
     /// <summary>Vertical gap a pair of abutting fragments may leave between them.</summary>
@@ -254,7 +263,7 @@ internal static partial class PdfSpatialTables
         foreach (var p in paths) if (p.IsTablePrimitive()) lines.Add(p);
         if (lines.Count == 0) return result;
 
-        var detected = ConsolidateAdjacentTableFragments(DetectTablesWithLines(spans, lines, config));
+        var detected = DetectTablesWithLines(spans, lines, config);
         foreach (var t in detected)
         {
             // document.rs applies the same prose-rejection filter this public API gets.
