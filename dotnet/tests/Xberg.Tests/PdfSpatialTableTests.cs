@@ -22,6 +22,75 @@ public class PdfSpatialTableTests
     private static TableSpan Word(string text, double x, double y, double w = 20, double h = 10) =>
         new() { Text = text, Bbox = new PathRect(x, y, w, h), FontSize = 10 };
 
+    private static Xberg.Internal.PdfOxide.OxTextSpan OxSpan(
+        string text, float x, float y, float width, float rotation) =>
+        new()
+        {
+            Text = text,
+            Bbox = new Xberg.Internal.PdfOxide.OxRect(x, y, width, 10.0f),
+            FontSize = 10.0f,
+            RotationDegrees = rotation,
+            CharWidths = new List<float>(new float[text.Length]),
+        };
+
+    /// <summary>
+    /// A page whose runs are mostly sideways is ordered in the rotated frame upstream, and
+    /// the map back out of that frame is not the exact inverse of the map into it: the word
+    /// origins the detector measures carry a single-precision round-trip of the page width.
+    /// </summary>
+    [Fact]
+    public void SidewaysPageWordOriginsCarryTheRotatedFrameRoundTrip()
+    {
+        var spans = new List<Xberg.Internal.PdfOxide.OxTextSpan>
+        {
+            OxSpan("alpha", 81.502f, 72.0f, 30.0f, 90.0f),
+            OxSpan("beta", 81.502f, 120.0f, 24.0f, 90.0f),
+        };
+
+        var turned = PdfSpatialTables.WordsFromOxSpans(spans, 0.0, 0.0, 612.0, 792.0);
+        var upright = PdfSpatialTables.WordsFromOxSpans(spans);
+
+        // 612 - (612 - 81.502) lands one ULP of the page width above 81.502.
+        Assert.Equal(81.50201416015625, turned[0].Bbox.X);
+        Assert.Equal(81.50199890136719, upright[0].Bbox.X);
+        // Only the origin turns; the run's own extents describe it in its upright frame.
+        Assert.Equal(upright[0].Bbox.Width, turned[0].Bbox.Width);
+        Assert.Equal(upright[0].Bbox.Y, turned[0].Bbox.Y);
+    }
+
+    /// <summary>
+    /// The page's own <c>/Rotate</c> takes the rotated-frame branch out of play: upstream
+    /// has already mapped such a page into its displayed frame before ordering.
+    /// </summary>
+    [Fact]
+    public void ARotatedPageSkipsTheReadingFrameRoundTrip()
+    {
+        var spans = new List<Xberg.Internal.PdfOxide.OxTextSpan>
+        {
+            OxSpan("alpha", 81.502f, 72.0f, 30.0f, 90.0f),
+            OxSpan("beta", 81.502f, 120.0f, 24.0f, 90.0f),
+        };
+
+        var words = PdfSpatialTables.WordsFromOxSpans(spans, 0.0, 0.0, 612.0, 792.0, pageRotation: 90);
+
+        Assert.Equal(81.50199890136719, words[0].Bbox.X);
+    }
+
+    /// <summary>An upright page has no rotated reading frame to round-trip through.</summary>
+    [Fact]
+    public void AnUprightPageIsLeftAlone()
+    {
+        var spans = new List<Xberg.Internal.PdfOxide.OxTextSpan>
+        {
+            OxSpan("alpha", 81.502f, 72.0f, 30.0f, 0.0f),
+            OxSpan("beta", 81.502f, 120.0f, 24.0f, 0.0f),
+        };
+
+        var words = PdfSpatialTables.WordsFromOxSpans(spans, 0.0, 0.0, 612.0, 792.0);
+
+        Assert.Equal(81.50199890136719, words[0].Bbox.X);
+    }
+
     [Fact]
     public void ANegativeExtentRectangleIsNormalizedLikeRustsRectNew()
     {

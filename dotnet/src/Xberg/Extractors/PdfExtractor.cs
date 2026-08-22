@@ -375,7 +375,7 @@ public sealed class PdfExtractor : IExtractor
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
-                    var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
+                    var (mbLlx, mbLly, mbUrx, mbUry) = pdf.GetPageMediaBox(i);
                     double pageWidth = Math.Abs(mbUrx - mbLlx);
                     List<PdfPageText.LineSeg> lines;
                     List<Xberg.Internal.PdfOxide.OxTextSpan>? structureSpans = null;
@@ -414,7 +414,9 @@ public sealed class PdfExtractor : IExtractor
                     // `extract_words`), and the per-glyph geometry needed to build them
                     // only exists on the ported extractor's spans.
                     words = structureSpans is not null
-                        ? PdfSpatialTables.WordsFromOxSpans(structureSpans)
+                        ? PdfSpatialTables.WordsFromOxSpans(
+                            structureSpans, mbLlx, mbLly, mbUrx, mbUry,
+                            Xberg.Internal.PdfOxide.Text.OxCharXOffsets.GetPageRotation(pdf, i))
                         : PdfSpatialTables.SpansToWords(spans);
                     paths = extractor.Paths;
                 }

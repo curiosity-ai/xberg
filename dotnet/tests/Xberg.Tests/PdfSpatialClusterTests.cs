@@ -41,8 +41,33 @@ public class PdfSpatialClusterTests
     private static List<TableSpan> ThreeByTwoWords() => new()
     {
         Word("Item", 150, 685), Word("Qty", 250, 685), Word("Cost", 350, 685),
-        Word("Bolt", 150, 655), Word("12", 250, 655), Word("4.50", 350, 655),
+        // The price gets a box its four glyphs can account for. A decimal drawn far
+        // wider than its digits is read as two values straddling a column boundary and
+        // split at the dot, which is a different rule than the one under test here —
+        // `AColumnSpanningDecimalIsSplitAtItsDot` covers that one.
+        Word("Bolt", 150, 655), Word("12", 250, 655), Word("4.50", 350, 655, w: 20),
     };
+
+    /// <summary>
+    /// A run reading `N.M` whose box is far wider than its digits can account for is
+    /// two values in adjacent columns, not a decimal, and is split at the dot
+    /// (`table_extractor.rs:515`). The sailing-score sheets this comes from draw
+    /// `1` and `10` as one positioned run straddling the boundary between two columns.
+    /// </summary>
+    [Fact]
+    public void AColumnSpanningDecimalIsSplitAtItsDot()
+    {
+        var words = new List<TableSpan>
+        {
+            Word("Item", 150, 685), Word("Qty", 250, 685), Word("Cost", 350, 685),
+            Word("Bolt", 150, 655), Word("12", 250, 655), Word("4.50", 350, 655, w: 40),
+        };
+
+        var table = Assert.Single(PdfSpatialTables.DetectTablesInClusters(
+            words, ThreeByTwoGrid(), TableDetectionConfig.Strict()));
+
+        Assert.Equal("4 50", table.Rows[1].Cells[2].Text);
+    }
 
     [Fact]
     public void ClusteredRulesBecomeARowAndColumnGrid()

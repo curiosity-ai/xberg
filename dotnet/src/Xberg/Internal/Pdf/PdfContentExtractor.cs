@@ -313,8 +313,19 @@ public sealed class PdfContentExtractor
             case "S": FinalizePath(stroke: true, fill: false); break;
             case "s": PathClose(); FinalizePath(stroke: true, fill: false); break;
             case "f": case "F": case "f*": FinalizePath(stroke: false, fill: true); break;
-            case "B": case "B*": FinalizePath(stroke: true, fill: true); break;
-            case "b": case "b*": PathClose(); FinalizePath(stroke: true, fill: true); break;
+            case "b": PathClose(); FinalizePath(stroke: true, fill: true); break;
+            // `B`, `B*` and `b*` paint nothing here, and that is deliberate. The path
+            // extractor upstream (`document.rs:17590`) answers only `S`, `f`/`F`, `f*`,
+            // `b` and `n`; every other painting operator falls to its catch-all arm, which
+            // neither emits the path nor clears the operations it built up. A run of
+            // fill-and-stroke subpaths therefore accumulates until the next clip
+            // (`W n` / `W* n`) discards it or a handled operator paints all of it as one
+            // path. Painting them individually is what a renderer would do, but it is not
+            // what the detectors downstream are calibrated against: the ruling-line tiers
+            // read this list, and on a page whose producer draws every cell border as
+            // `m l l l h B*` it turns 27 primitives into 231, flooding the edge grid with
+            // rules upstream never sees.
+            case "B": case "B*": case "b*": break;
             case "n": EndPath(); break;
         }
     }

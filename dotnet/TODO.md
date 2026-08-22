@@ -176,30 +176,52 @@ The corpus is 2,942 fixtures. **155 of them Rust itself cannot extract** (75 whe
 also empty, 80 where it produces output and Rust errors), so they are not comparable in either
 direction. That leaves **2,787 comparable fixtures, 2,732 fully matching (98.0%)** and **55
 failing at least one hard dimension** — 54 once the docbook fix that landed after the sweep is
-counted. 0 catastrophes. Regenerate the list with `--list-fail`, which prints one line per
+counted, and 50 once the four PDF fixtures the path-operator and rotated-frame fixes below closed
+are taken off it (the whole-corpus figure has not been re-measured since; the PDF column has,
+per format). 0 catastrophes. Regenerate the list with `--list-fail`, which prints one line per
 failing fixture and the dimensions it failed.
 
 Older notes in this file quote percentages against 2,942. Those divided by a total including the
 incomparable fixtures and so scored this port against documents upstream never read.
 
-**PDF is 32 of the remainder**, and the corpus double-counts: `nougat_033` is the same document
-as `pdfa_008`, `nougat_046` as `pdfa_021`, and `issue-848`, `issue-140-example` and
-`pr-138-example` each appear twice, so those 32 are roughly 27 distinct documents.
+**PDF is 28 of the remainder**, and the corpus double-counts: `nougat_033` is the same document
+as `pdfa_008`, `nougat_046` as `pdfa_021`, and `issue-140-example` and `pr-138-example` each
+appear twice, so those 28 are roughly 25 distinct documents.
 
-`tables` is the largest lever again, not `plain` — `json` never fails alone, and eight fixtures
-fail nothing hard but `tables`. Known shapes, each re-verified rather than assumed:
+`tables` is the largest lever again, not `plain` — `json` never fails alone, and seven fixtures
+fail nothing hard but `tables` (plus `json`, which carries the same tables). Known shapes, each
+re-verified rather than assumed:
 
-- `issue-848` (×2) differs *only* in `bounding_box.x1`: golden `127.70124053955078` against
-  `127.70122528076172`, two f32 ULP, and since `x0` is exactly 72.0 the difference is in the
-  cluster's width. Chasing it eliminated the obvious suspects: `RenderedBbox` matches
-  `elements/path.rs:213-218` term for term including the `2.0 * (px + cx)` grouping, `ComputeBbox`
-  only takes min/max, `PathRect` rounds every edge to f32, and `Matrix.TransformSingle` already
-  computes `a*x + c*y + e` in f32, so the path coordinates are f32-valued before they are stored.
-  Whatever remains is upstream of the geometry layer. Unresolved; one document, counted twice.
+- `issue-848` (×2) — **closed.** It differed *only* in `bounding_box.x1`: golden
+  `127.70124053955078` against `127.70122528076172`, two f32 ULP. The geometry layer was
+  innocent, as the earlier sweep had established; the drift is introduced deliberately upstream.
+  `pipeline/page_order.rs:151` orders a page whose runs mostly share one quadrant rotation *in
+  that rotated frame*: it turns every span origin into the frame, sorts, and turns it back, and
+  the source itself notes at `:193` that `w - (w - x)` round-trips about one ULP of the page
+  dimension away from `x` in f32. That page's spans are 90°-rotated, so the word origins
+  `extract_words` reports — and the table box built from them — carry the drift, and
+  `81.502 → 612 - (612 - 81.502)` reproduces the golden's `x1` bit for bit. `WordsFromOxSpans`
+  now takes the same round trip (ordering is not reproduced: this path keeps its own span order).
 - `issue-140-example` (×2): upstream reports no tables, this port one, from inside the
-  intersection tier — `IsRealGrid` and `LooksLikeProseTable` are faithful. One nearby rule is
+  intersection tier — `IsRealGrid` and `LooksLikeProseTable` are faithful, and the drawn paths
+  are now byte-identical to upstream's (331 primitives, matched term for term). The words are
+  not: this is a `/Rotate 90` page, and the two sides disagree about the *frame*. Upstream's word
+  boxes are the flattened ones `postprocess_spans` leaves on a rotated page (`CENTRAL` at
+  `(166.21, 482.09)` with `height = 53.34`, an advance-length height); this port's are derotated
+  (`(59.57, 166.21)`, `height = 7.50`, the font size). Ours reads better and finds a grid where
+  upstream finds none. See the span-source note under "The PDF gap, measured". One nearby rule is
   genuinely unported: pdf_oxide abandons the spatial sweep above `MAX_TABLE_EDGES = 1500` paths
   (`document.rs:19590`). Not the cause here (that page has 331), but missing.
+- `nougat_040`/`pdfa_015` (one document), `pdfa_033`, `a_brief_introduction_…`,
+  `an_introduction_to_statistical_learning_…` and `docling/2203.01017v2` are all the *heuristic*
+  tier, not the native one: running pdf_oxide's `strict()` detector over these pages directly
+  returns nothing at all, so every table in their goldens comes from xberg's own
+  `extract_tables_heuristic`. Its inputs were checked and are not the cause —
+  `segments_to_words`, `compute_adaptive_column_gap` and `heuristic_column_gap` are faithful, and
+  on `nougat_040` the page's `extract_words` output matches upstream's 841 words exactly bar five
+  glyphs. What differs is the *segments* the tier is fed: on `nougat_040` upstream's grid comes
+  out 9 columns wide against this port's 7, and on `pdfa_033` the divergence is purely the order
+  of words inside one cell. Both point at `extract_all_segments`, not at the reconstruction.
 - `pdfa_021`/`nougat_046`: upstream splits the page at a column boundary this port reads straight
   through, cutting mid-word. That lives in pdf_oxide's XY-cut region split, upstream of the
   assembler.
@@ -356,8 +378,8 @@ not a cosmetic difference.
 
       The remaining 29 are the flagged upstream defects above (the `dc:description` fragment
       and the inherited `/MediaBox`) plus genuine scan-signal differences.
-- [ ] **PDF content (389 fixtures, 272 fully matching; plain 356/388, markdown 215/388,
-      html 206/388, json 315/388, tables 317/388; content-identical 95.1%, 0 catastrophes).**
+- [ ] **PDF content (389 fixtures, 360 fully matching; plain 368/388, markdown 227/388,
+      html 219/388, json 364/388, tables 373/388; content-identical 95.9%, 0 catastrophes).**
       The largest remaining area, and upstream landed 127 PDF commits in this window. This is
       extraction *quality*, not a missing feature, and it does not decompose into a few
       systematic fixes — measured, not assumed:
@@ -690,9 +712,9 @@ not a cosmetic difference.
 PDF was where the remaining distance was: 106 of 389 fixtures matched on every hard dimension,
 and the shortfall was not one bug but three layers. **Two of the three are now closed.**
 
-Where it stands after the segment and paragraph work: **274 of 389 fully matching**, plain
-356/388, md 217/388, html 208/388, json 315/388, metadata 382/388, tables 319/388, catastrophes
-0. The two rules that moved it furthest were both cases of the port having implemented the wrong
+Where it stands after the segment and paragraph work, and the path-operator and rotated-frame
+fixes below: **360 of 389 fully matching**, plain 368/388, md 227/388, html 219/388, json
+364/388, metadata 388/388, tables 373/388, catastrophes 0. The two rules that moved it furthest were both cases of the port having implemented the wrong
 function rather than implementing one badly — hierarchy segments built per line where upstream
 builds them per span, and `classify_paragraphs` where the untagged path calls
 `finalize_paragraph`.
@@ -749,6 +771,40 @@ The lesson is worth keeping for the next audit: a raw function-count diff betwee
 reads as a large gap and is mostly noise. Take the call closure from the entry point xberg
 actually uses, and map names by hand — a snake_case-to-PascalCase match falsely reported twelve
 of these as missing when eleven were present under different names.
+
+**Two upstream quirks the port had quietly corrected.** Both were found by dumping pdf_oxide's
+own answer for a page and diffing it against this port's, and both cost fixtures until the port
+stopped being right:
+
+- **`extract_paths` drops `B`, `B*` and `b*` entirely.** Its operator match
+  (`document.rs:17590`) answers `S`, `f`/`F`, `f*`, `b` and `n`; every other painting operator
+  falls to the catch-all `_ => {}` arm, which neither emits the path nor clears the operations
+  already built up — so a run of fill-and-stroke subpaths accumulates until the next `W n` clip
+  discards it. The XObject walker (`:18060`) has the same set. This port painted them, and on
+  `pdfa_029`, whose producer draws every cell border as `m l l l h B*`, that turned page 10's 27
+  table primitives into 231 and flooded the edge grid with rules upstream never sees. Matching
+  the omission reproduces upstream's path list exactly on every page checked, and took PDF
+  `ok` 356 → 358, `json` 361 → 364, `tables` 369 → 371 with no dimension falling.
+- **`span_text_for_cell` was unported** (`structure/table_extractor.rs:515`). It is the one
+  helper the earlier `spatial_table_detector.rs` function audit could not see, because it lives
+  in the neighbouring file; `extract_cell_text` calls it on every span it joins. A run reading
+  `N.M` whose box is far wider than its digit count can account for is two values straddling a
+  column boundary, not a decimal, and is split at the dot. It reaches `Table.rows[].cells[].text`,
+  which the validation gates read — xberg's own `cell_text_in_reading_order` overrides the text
+  whenever a cell has spans, so the split is only ever visible through those gates.
+
+**`extract_words` and `extract_page_text_with_options` are different span sources, and the port
+has only one.** `extract_tables_with_config` is fed `extract_words`, which reaches spans through
+`pipeline::page_reading_order` → `PdfDocument::extract_spans` → `postprocess_spans`; the text and
+hierarchy paths reach them through `extract_spans_with_reading_order`, which applies
+`drop_offpage_spans` and a sort and nothing else. Both start at `extract_spans_raw`, so they
+mostly agree, but not always: `postprocess_spans` runs `apply_super_sub_script_substitutions`
+(upstream's words carry `¹`/`₁`/`₂` where the text path has ASCII digits — five of 841 words on
+`nougat_040` page 2), and on a `/Rotate`d page it maps rotated content into the displayed frame,
+which is the whole of the `issue-140-example` divergence above. This port bridges one span list
+to every consumer. Closing it means giving the word path its own producer, which is a structural
+change, not a tweak; the rotated-frame round trip landed for `issue-848` is the one piece of it
+that could be lifted out on its own.
 
 **What the PDF port still owes.** The ruling-line tiers read their drawn paths from the older
 content interpreter, which is why both span producers still run per page; the paths belong in

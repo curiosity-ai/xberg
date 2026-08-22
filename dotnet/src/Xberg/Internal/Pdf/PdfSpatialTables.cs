@@ -124,10 +124,16 @@ internal static partial class PdfSpatialTables
     /// detector consumes. The clustering, the whitespace split and the adjacency merge all
     /// live in <see cref="OxWordExtraction"/>; this only re-shapes the result.
     /// </summary>
-    public static List<TableSpan> WordsFromOxSpans(IReadOnlyList<OxTextSpan> spans)
+    /// <param name="llx">Media-box lower-left x; with the rest of the box it fixes the frame
+    /// a page of sideways text is ordered in.</param>
+    public static List<TableSpan> WordsFromOxSpans(
+        IReadOnlyList<OxTextSpan> spans,
+        double llx = 0.0, double lly = 0.0, double urx = 0.0, double ury = 0.0,
+        int pageRotation = 0)
     {
+        var source = MapThroughRotatedReadingFrame(spans, llx, lly, urx, ury, pageRotation);
         var words = new List<TableSpan>();
-        foreach (var w in OxWordExtraction.ExtractWords(spans))
+        foreach (var w in OxWordExtraction.ExtractWords(source))
         {
             words.Add(new TableSpan
             {
@@ -137,6 +143,98 @@ internal static partial class PdfSpatialTables
             });
         }
         return words;
+    }
+
+    /// <summary>
+    /// Reproduce the geometry a page of sideways text acquires on its way through the
+    /// reading-order pipeline (<c>pipeline/page_order.rs:151</c>).
+    /// </summary>
+    /// <remarks>
+    /// When most of a page's runs share one quadrant rotation and the page itself carries no
+    /// <c>/Rotate</c>, upstream orders the page in the rotated frame: it maps every span origin
+    /// into that frame, sorts, and maps back. The two maps are not inverses in single precision
+    /// — <c>w - (w - x)</c> lands about one ULP of the page dimension away from <c>x</c>, which
+    /// the source itself notes at <c>page_order.rs:193</c> — and the word origins the table
+    /// detector is measured against carry that drift, as does the table bounding box built from
+    /// them. Ordering is not reproduced here: this path keeps its own span order and only takes
+    /// the round trip the coordinates make.
+    /// </remarks>
+    private static IReadOnlyList<OxTextSpan> MapThroughRotatedReadingFrame(
+        IReadOnlyList<OxTextSpan> spans, double llx, double lly, double urx, double ury, int pageRotation)
+    {
+        if (pageRotation != 0 || spans.Count == 0) return spans;
+        float w = (float)(urx - llx), h = (float)(ury - lly);
+        if (!(w > 0f) || !(h > 0f)) return spans;
+        if (ReadingFrameQuadrant(DominantRotation(spans)) is not int rot) return spans;
+
+        // The rotated frame swaps the page dimensions for the quarter turns.
+        (float fw, float fh) = rot % 180 == 90 ? (h, w) : (w, h);
+        int inv = (360 - rot) % 360;
+
+        var mapped = new List<OxTextSpan>(spans.Count);
+        foreach (var span in spans)
+        {
+            var (x, y) = MapOrigin(span.Bbox.X, span.Bbox.Y, rot, w, h, (float)llx, (float)lly);
+            (x, y) = MapOrigin(x, y, inv, fw, fh, (float)llx, (float)lly);
+            var copy = span.Clone();
+            copy.Bbox = new OxRect(x, y, span.Bbox.Width, span.Bbox.Height);
+            mapped.Add(copy);
+        }
+        return mapped;
+    }
+
+    /// <summary>
+    /// A span origin turned through one quadrant of the page frame (page_order.rs:170). A
+    /// rotated run stores text-local extents, so only the origin turns; the width and height
+    /// already describe the run in its own upright frame.
+    /// </summary>
+    private static (float X, float Y) MapOrigin(
+        float x, float y, int rot, float fw, float fh, float llx, float lly)
+    {
+        float rx = x - llx, ry = y - lly;
+        (float mx, float my) = rot switch
+        {
+            90 => (ry, fw - rx),
+            180 => (fw - rx, fh - ry),
+            270 => (fh - ry, rx),
+            _ => (rx, ry),
+        };
+        return (llx + mx, lly + my);
+    }
+
+    /// <summary>
+    /// The rotation at least half the page's non-blank runs share, if any (lib.rs:436).
+    /// </summary>
+    private static float? DominantRotation(IReadOnlyList<OxTextSpan> spans)
+    {
+        var groups = new List<(float Degrees, int Count)>();
+        int total = 0;
+        foreach (var span in spans)
+        {
+            if (span.Text.Trim().Length == 0) continue;
+            total++;
+            if (span.RotationDegrees == 0.0f) continue;
+            int hit = groups.FindIndex(g => MathF.Abs(g.Degrees - span.RotationDegrees) < 0.5f);
+            if (hit >= 0) groups[hit] = (groups[hit].Degrees, groups[hit].Count + 1);
+            else groups.Add((span.RotationDegrees, 1));
+        }
+        if (total == 0 || groups.Count == 0) return null;
+        var best = groups[0];
+        foreach (var g in groups) if (g.Count > best.Count) best = g;
+        return best.Count * 2 >= total ? best.Degrees : null;
+    }
+
+    /// <summary>
+    /// The display rotation that turns text of this angle upright (page_order.rs:208). A
+    /// mirrored or free-angle run has no quadrant frame.
+    /// </summary>
+    private static int? ReadingFrameQuadrant(float? degrees)
+    {
+        if (degrees is not float d) return null;
+        if (MathF.Abs(d - 90.0f) < 0.5f) return 90;
+        if (MathF.Abs(d - 180.0f) < 0.5f) return 180;
+        if (MathF.Abs(d + 90.0f) < 0.5f) return 270;
+        return null;
     }
 
     /// <summary>
@@ -1165,27 +1263,64 @@ internal static partial class PdfSpatialTables
 
     // ── Cell text ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The display text a span contributes to a table cell (table_extractor.rs:515).
+    /// </summary>
+    /// <remarks>
+    /// A single positioned run reading <c>N.M</c> is sometimes not a decimal at all but two
+    /// values in adjacent columns — a sailing score sheet draws <c>1</c> and <c>10</c> as one
+    /// <c>Tj</c> whose glyphs straddle the column boundary. Upstream recognises this by the
+    /// run's box being far wider than its glyph count can account for, and splits at the dot.
+    /// The `char_widths` signal the Rust also tests cannot fire here: the detector is fed
+    /// words, and the word-to-span conversion leaves that array empty
+    /// (<c>document.rs:17846</c>), so the width estimate is the 0.50em-per-digit fallback.
+    /// </remarks>
+    private static string SpanTextForCell(TableSpan span)
+    {
+        string text = span.Text;
+        int dot = text.IndexOf('.');
+        if (dot <= 0 || dot >= text.Length - 1) return text;
+        if (text.IndexOf('.', dot + 1) >= 0) return text;
+        for (int i = 0; i < dot; i++) if (text[i] < '0' || text[i] > '9') return text;
+        for (int i = dot + 1; i < text.Length; i++) if (text[i] < '0' || text[i] > '9') return text;
+
+        float fontSize = (float)span.FontSize;
+        if (!(fontSize > 0.0f)) return text;
+        // Digits are narrower than the average glyph, so 0.50em per character keeps the
+        // fallback from reporting a false positive on a run of ordinary width.
+        int charCount = text.EnumerateRunes().Count();
+        float expectedWidth = fontSize * 0.50f * charCount;
+        float gap = (float)span.Bbox.Width - expectedWidth;
+        if (gap > fontSize) return string.Concat(text.AsSpan(0, dot), " ", text.AsSpan(dot + 1));
+        return text;
+    }
+
     private static string ExtractCellText(List<int> cellSpanIndices, List<TableSpan> spans)
     {
         if (cellSpanIndices.Count == 0) return "";
         var entries = cellSpanIndices
             .Where(i => i >= 0 && i < spans.Count)
-            .Select(i => (Y: spans[i].CenterY, Span: spans[i]))
+            .Select(i => (Y: spans[i].CenterY, Span: spans[i], Text: SpanTextForCell(spans[i])))
             .ToList();
         if (entries.Count == 0) return "";
-        if (entries.Count == 1) return entries[0].Span.Text;
+        if (entries.Count == 1) return entries[0].Text;
 
         // Stable: spans sharing a baseline keep the order the cell collected them in, which
         // is the only thing that orders words within one line of a cell — nothing sorts by X.
         Xberg.Internal.PdfOxide.Layout.OxSpanCompare.SortStable(entries, (a, b) => SafeCmp(b.Y, a.Y));
 
-        var lines = new List<List<TableSpan>>();
-        var current = new List<TableSpan> { entries[0].Span };
+        var lines = new List<List<(TableSpan Span, string Text)>>();
+        var current = new List<(TableSpan, string)> { (entries[0].Span, entries[0].Text) };
         double currentY = entries[0].Y;
         for (int i = 1; i < entries.Count; i++)
         {
-            if (Math.Abs(currentY - entries[i].Y) <= 2.0) current.Add(entries[i].Span);
-            else { lines.Add(current); current = new List<TableSpan> { entries[i].Span }; currentY = entries[i].Y; }
+            if (Math.Abs(currentY - entries[i].Y) <= 2.0) current.Add((entries[i].Span, entries[i].Text));
+            else
+            {
+                lines.Add(current);
+                current = new List<(TableSpan, string)> { (entries[i].Span, entries[i].Text) };
+                currentY = entries[i].Y;
+            }
         }
         lines.Add(current);
 
@@ -1196,7 +1331,7 @@ internal static partial class PdfSpatialTables
             var line = lines[li];
             for (int i = 0; i < line.Count; i++)
             {
-                if (i > 0) sb.Append(CellSpanSeparator(line[i - 1], line[i]));
+                if (i > 0) sb.Append(CellSpanSeparator(line[i - 1].Span, line[i].Span));
                 sb.Append(line[i].Text);
             }
         }
