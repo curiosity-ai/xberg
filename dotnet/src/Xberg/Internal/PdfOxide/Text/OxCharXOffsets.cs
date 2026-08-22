@@ -10,6 +10,7 @@
 // Everything downstream that decomposes a span through `to_chars` — word extraction above
 // all, and through it the table detector's cell granularity — reads these.
 using System;
+using System.Text;
 using System.Collections.Generic;
 using System.Linq;
 using Xberg.Internal.Pdf;
@@ -47,10 +48,36 @@ internal static class OxCharXOffsets
 
         // Baseline index: char positions ordered by origin Y, so a span's baseline slice is a
         // binary-searched range instead of a scan over every glyph on the page.
-        var byY = Enumerable.Range(0, accurate.Count).ToList();
-        OxSpanCompare.SortStable(byY, (a, b) =>
-            OxSpanCompare.SafeFloatCmp(accurate[a].OriginY, accurate[b].OriginY));
-        float[] ys = byY.Select(i => accurate[i].OriginY).ToArray();
+        // Everything below is rented once for the page. The previous shape allocated the
+        // baseline index plus, for every span, a rune list, a candidate list, a nullable
+        // anchor array, an offsets array and a closure — on a document with thousands of
+        // spans per page that was the bulk of this function's cost.
+        int glyphCount = accurate.Count;
+        var ipool = System.Buffers.ArrayPool<int>.Shared;
+        var fpool = System.Buffers.ArrayPool<float>.Shared;
+        var bpool = System.Buffers.ArrayPool<bool>.Shared;
+        var byY = ipool.Rent(glyphCount);
+        var ysBuf = fpool.Rent(glyphCount);
+        int maxRunes = 0;
+        foreach (var sp in spans) maxRunes = Math.Max(maxRunes, sp.Text.Length);
+        var runes = System.Buffers.ArrayPool<Rune>.Shared.Rent(Math.Max(maxRunes, 1));
+        var assigned = fpool.Rent(Math.Max(maxRunes, 1));
+        var hasAnchor = bpool.Rent(Math.Max(maxRunes, 1));
+        var offs = fpool.Rent(Math.Max(maxRunes, 1));
+        var idx = new List<int>();
+        try
+        {
+        for (int i = 0; i < glyphCount; i++) byY[i] = i;
+        var byYSpan = byY.AsSpan(0, glyphCount);
+        // Stable by construction: the index itself breaks ties, which is what the previous
+        // SortStable guaranteed.
+        byYSpan.Sort((a, b) =>
+        {
+            int c = OxSpanCompare.SafeFloatCmp(accurate[a].OriginY, accurate[b].OriginY);
+            return c != 0 ? c : a.CompareTo(b);
+        });
+        for (int i = 0; i < glyphCount; i++) ysBuf[i] = accurate[byY[i]].OriginY;
+        var ys = ysBuf.AsSpan(0, glyphCount);
 
         foreach (var span in spans)
         {
@@ -65,8 +92,8 @@ internal static class OxCharXOffsets
             // since have been edited.
             span.CharXOffsets.Clear();
 
-            var glyphs = span.Text.EnumerateRunes().ToList();
-            int n = glyphs.Count;
+            int n = 0;
+            foreach (var r in span.Text.EnumerateRunes()) runes[n++] = r;
             if (n == 0)
             {
                 continue;
@@ -82,7 +109,7 @@ internal static class OxCharXOffsets
             int lo = PartitionPointLess(ys, span.Bbox.Y - bracket);
             int hi = PartitionPointLessOrEqual(ys, span.Bbox.Y + bracket);
 
-            var idx = new List<int>();
+            idx.Clear();
             for (int k = lo; k < hi; k++)
             {
                 int i = byY[k];
@@ -117,18 +144,18 @@ internal static class OxCharXOffsets
                 }
             }
 
-            var assigned = new float?[n];
+            hasAnchor.AsSpan(0, n).Clear();
             int li = start;
             for (int k = 0; k < n; k++)
             {
-                char g = glyphs[k].IsBmp ? (char)glyphs[k].Value : glyphs[k].ToString()[0];
+                char g = runes[k].IsBmp ? (char)runes[k].Value : runes[k].ToString()[0];
                 int j = li;
                 int steps = 0;
                 while (j < idx.Count && steps < MatchWindow)
                 {
                     if (accurate[idx[j]].Char == g)
                     {
-                        assigned[k] = accurate[idx[j]].OriginX;
+                        assigned[k] = accurate[idx[j]].OriginX; hasAnchor[k] = true;
                         li = j + 1;
                         break;
                     }
@@ -138,7 +165,8 @@ internal static class OxCharXOffsets
             }
 
             // Below 60% real anchors the run is not recognisably this span's; fall back.
-            int anchors = assigned.Count(a => a.HasValue);
+            int anchors = 0;
+            for (int k = 0; k < n; k++) if (hasAnchor[k]) anchors++;
             if (anchors * 5 < n * 3)
             {
                 continue;
@@ -149,41 +177,53 @@ internal static class OxCharXOffsets
             // nearest following one. Over the short runs between anchors the drift this
             // reintroduces is sub-point.
             List<float> cw = span.CharWidths;
-            float WidthAt(int i) => cw.Count == n ? cw[i] : span.Bbox.Width / n;
+            bool exactWidths = cw.Count == n;
+            float uniformWidth = span.Bbox.Width / n;
 
-            var offs = new float[n];
-            (int K, float X)? last = null;
+            bool haveLast = false; int lastK = 0; float lastX = 0.0f;
             for (int k = 0; k < n; k++)
             {
-                if (assigned[k] is float x)
+                if (hasAnchor[k])
                 {
-                    offs[k] = x;
-                    last = (k, x);
+                    offs[k] = assigned[k];
+                    haveLast = true; lastK = k; lastX = assigned[k];
                 }
-                else if (last is (int lk, float lx))
+                else if (haveLast)
                 {
                     float acc = 0.0f;
-                    for (int i = lk; i < k; i++) acc += WidthAt(i);
-                    offs[k] = lx + acc;
+                    for (int i = lastK; i < k; i++) acc += exactWidths ? cw[i] : uniformWidth;
+                    offs[k] = lastX + acc;
                 }
+                else offs[k] = 0.0f;
             }
-            if (!assigned[0].HasValue)
+            if (!hasAnchor[0])
             {
-                int fk = Array.FindIndex(assigned, a => a.HasValue);
+                int fk = -1;
+                for (int k = 0; k < n; k++) if (hasAnchor[k]) { fk = k; break; }
                 if (fk >= 0)
                 {
-                    float fx = assigned[fk]!.Value;
+                    float fx = assigned[fk];
                     for (int k = 0; k < fk; k++)
                     {
                         float acc = 0.0f;
-                        for (int i = k; i < fk; i++) acc += WidthAt(i);
+                        for (int i = k; i < fk; i++) acc += exactWidths ? cw[i] : uniformWidth;
                         offs[k] = fx - acc;
                     }
                 }
             }
 
             span.CharXOffsets.Clear();
-            span.CharXOffsets.AddRange(offs);
+            for (int k = 0; k < n; k++) span.CharXOffsets.Add(offs[k]);
+        }
+        }
+        finally
+        {
+            ipool.Return(byY);
+            fpool.Return(ysBuf);
+            fpool.Return(assigned);
+            fpool.Return(offs);
+            bpool.Return(hasAnchor);
+            System.Buffers.ArrayPool<Rune>.Shared.Return(runes);
         }
     }
 
@@ -201,6 +241,28 @@ internal static class OxCharXOffsets
     }
 
     /// <summary>Index of the first element not less than <paramref name="value"/>.</summary>
+    private static int PartitionPointLess(ReadOnlySpan<float> sorted, float value)
+    {
+        int lo = 0, hi = sorted.Length;
+        while (lo < hi)
+        {
+            int mid = lo + ((hi - lo) >> 1);
+            if (sorted[mid] < value) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+    private static int PartitionPointLessOrEqual(ReadOnlySpan<float> sorted, float value)
+    {
+        int lo = 0, hi = sorted.Length;
+        while (lo < hi)
+        {
+            int mid = lo + ((hi - lo) >> 1);
+            if (sorted[mid] <= value) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
     private static int PartitionPointLess(float[] sorted, float value)
     {
         int lo = 0, hi = sorted.Length;
