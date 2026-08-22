@@ -252,6 +252,13 @@ file cannot hang extraction, and upstream simply has no deadline to match.
      pairs hold the document's conventions section ("1. Locating a test", "2. Performing the
      test", "3. Scoring in the results form"). The EPUB structure walk emits none of it, so the
      definition list is dropped whole. This is the corpus's last remaining content loss.
+     One of the two causes is fixed: `EpubExtractor`'s node conversion had no `DefinitionItem`
+     arm and dropped the nodes, which is the same bug upstream's issue #127 fixed and which its
+     `~keep` comment warns about — only the `DefinitionList` and `List` *containers* are skipped
+     there. The second cause is still open and sits in the walker: the surrounding section is
+     walked (the `Conventions` heading and its lead paragraph both come through) but the `<dl>`
+     itself yields no `DefinitionItem` at all, so `PushNode` is never reached. The `<dd>` here
+     wraps its text in `<div class="ctest"><p>`, which is the obvious thing to suspect next.
   2. U+23DE/U+23DF become `\overbrace`/`\underbrace` here where upstream keeps them literal
      inside `\overset`/`\underset` — even though `over_script_command` (mathml.rs:932) does map
      U+23DE. Upstream evidently does not reach that arm for this input; which arm it takes

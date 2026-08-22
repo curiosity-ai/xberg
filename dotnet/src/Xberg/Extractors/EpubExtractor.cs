@@ -286,7 +286,16 @@ public sealed class EpubExtractor : IExtractor
                     break;
                 }
 
-                // Group{heading_text}, DefinitionList, DefinitionItem, RawBlock, MetadataBlock, List, etc.:
+                case NodeContent.Tag.DefinitionItem:
+                    // Upstream carries an explicit arm here, added by its issue #127 after these
+                    // fell into the catch-all and were dropped whole — the structure walker does
+                    // produce them for `<dl>/<dt>/<dd>`. Only `DefinitionList` and `List`, which
+                    // are containers, are skipped.
+                    builder.PushDefinitionTerm(content.Term ?? "", null);
+                    builder.PushDefinitionDescription(content.Definition ?? "", null);
+                    break;
+
+                // Group{heading_text}, DefinitionList, RawBlock, MetadataBlock, List, etc.:
                 // skipped, matching the mod.rs `_ => {}` arm.
             }
         }
