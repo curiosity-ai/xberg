@@ -44,8 +44,8 @@ internal sealed class BiffFormulaContext
 ///     so a relative <c>B2:G2</c> comes out as <c>$USN$2:$USS$2</c>.</item>
 ///   <item>Column letters come from <see cref="PushColumn"/>, which drops the most significant
 ///     digit rather than carrying it, so those names are not reversible.</item>
-///   <item>PtgAttrSpace inserts its whitespace at the start of the operand that follows it in the
-///     token stream, which is not always where Excel showed it.</item>
+///   <item>PtgAttrSpace re-inserts typed whitespace at the start of the operand on top of the
+///     stack, which is not always where the author had put it — hence <c>( L2*M2)</c>.</item>
 ///   <item>A 3d area names its sheet by indexing the sheet list with the XTI index itself, while a
 ///     3d reference resolves that index through the XTI table first.</item>
 /// </list>
@@ -145,6 +145,8 @@ internal static class BiffFormula
                     stack.Add(f.Length);
                     f.Append(SheetByXti(ctx, ixti));
                     f.Append('!');
+                    // The column word is shifted up past its two relative-reference flag bits
+                    // rather than masked, so only column A comes back as itself.
                     uint col = (ushort)(colu << 2);
                     if ((colu & 2) != 0) f.Append('$');
                     PushColumn(col, f);
@@ -286,8 +288,8 @@ internal static class BiffFormula
                         }
                         case 0x40 or 0x41:
                         {
-                            // PtgAttrSpace: whitespace the author typed, re-inserted before the
-                            // operand on top of the stack.
+                            // PtgAttrSpace: whitespace the author typed, re-inserted at the start
+                            // of the operand on top of the stack.
                             int e = Peek();
                             byte kind = U8(p);
                             char space = kind switch
