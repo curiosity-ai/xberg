@@ -45,7 +45,11 @@ internal static class HtmlToMarkdown
         html = html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
         string prepared = StripHiddenElements(StripScriptAndStyleTags(html));
         var root = HtmlDom.Parse(prepared);
-        if (HasCustomElementTags(prepared) || HasInlineBlockMisnest(root)) MarkCanonicalAttributes(root);
+        if (HasCustomElementTags(prepared) || HasInlineBlockMisnest(root))
+        {
+            MarkCanonicalAttributes(root);
+            DropLeadingDocumentWhitespace(root);
+        }
 
         var sb = new StringBuilder();
         string front = ExtractFrontmatter(root);
@@ -157,6 +161,35 @@ internal static class HtmlToMarkdown
     private static void MarkCanonicalAttributes(HNode root)
     {
         foreach (var node in Descendants(root)) node.CanonicalAttrs = true;
+    }
+
+    /// <summary>The characters the HTML5 tokenizer counts as whitespace.</summary>
+    private static readonly char[] Html5Whitespace = { ' ', '\t', '\n', '\f', '\r' };
+
+    /// <summary>
+    /// Drop the whitespace that opens the document. The HTML5 tree builder ignores whitespace
+    /// character tokens in its initial, before-html and before-head insertion modes, so a
+    /// document whose first content follows a comment or a leading blank line reaches the walk
+    /// starting at its first non-whitespace character. A repaired document is re-parsed from
+    /// that tree, so the walk never sees the whitespace that came first.
+    /// </summary>
+    private static void DropLeadingDocumentWhitespace(HNode root)
+    {
+        while (root.Children.Count > 0)
+        {
+            var first = root.Children[0];
+            if (first.Tag is not null) return;
+
+            string trimmed = first.Text.TrimStart(Html5Whitespace);
+            if (trimmed.Length > 0)
+            {
+                first.Text = trimmed;
+                return;
+            }
+
+            root.Children.RemoveAt(0);
+            for (int i = 0; i < root.Children.Count; i++) root.Children[i].Index = i;
+        }
     }
 
     /// <summary>

@@ -14,6 +14,35 @@ public class HtmlExtractorTests
     private static InternalDocument Html(string html) =>
         new HtmlExtractor().Extract(Encoding.UTF8.GetBytes(html), "text/html", new ExtractionConfig());
 
+    // ── html5ever repair: leading document whitespace ────────────────────────
+    [Fact]
+    public void Html_LeadingCommentSwallowsTheWhitespaceAfterIt()
+    {
+        // The HTML5 tree builder ignores whitespace before the first content, so the text that
+        // follows an opening comment starts at its first non-whitespace character.
+        Assert.Equal("## Heading\n\nbody\n", HtmlToMarkdown.Convert("<!-- image -->\n\n## Heading\n\nbody\n"));
+        Assert.Equal("AA\n", HtmlToMarkdown.Convert("\n\n<!-- c -->\n\nAA\n"));
+        Assert.Equal("AA\n", HtmlToMarkdown.Convert("  <!-- c -->  AA\n"));
+    }
+
+    [Fact]
+    public void Html_LeadingWhitespaceGoesWithAnyRepairedDocument()
+    {
+        // A custom element takes the same repair, and a comment anywhere in the document is
+        // enough to trigger it — the whitespace at the top goes either way.
+        Assert.Equal("y AA\n", HtmlToMarkdown.Convert("\n\n<my-tag>y</my-tag>\n\nAA\n"));
+        Assert.Equal("x\n\nAA\n", HtmlToMarkdown.Convert("\n\n<p>x</p>\n\nAA <!-- c -->\n"));
+    }
+
+    [Fact]
+    public void Html_WhitespaceAfterTheFirstContentIsUntouched()
+    {
+        // Only the whitespace before the first content is dropped; once the body is open the
+        // tree builder keeps character data as it comes.
+        Assert.Equal("x\n\nAA\n", HtmlToMarkdown.Convert("<div>x</div>\n\n<!-- c -->\n\nAA\n"));
+        Assert.Equal("x\n\nAA\n", HtmlToMarkdown.Convert("<!-- c -->\n\n<div>x</div>\n\nAA\n"));
+    }
+
     private static InternalDocument Docbook(string xml) =>
         new DocbookExtractor().Extract(Encoding.UTF8.GetBytes(xml), "application/docbook+xml", new ExtractionConfig());
 
