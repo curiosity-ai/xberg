@@ -15,19 +15,33 @@ use std::time::Instant;
 
 use xberg::{ExtractInput, ExtractionConfig, OutputFormat, extract};
 
+/// One extraction, isolated so a panic costs this file rather than the run.
+///
+/// `mathemascii` panics on a char boundary inside `≤` when the asciidoc extractor hands it
+/// certain expressions, which aborts the process partway through the corpus. The C# side
+/// catches its equivalent, so leaving this uncaught would end the benchmark early *and*
+/// measure the two sides under different failure semantics.
 async fn run_once(path: &Path) -> bool {
-    let config = ExtractionConfig {
-        output_format: OutputFormat::Plain,
-        ..Default::default()
-    };
-    match extract(ExtractInput::from_uri(path.to_string_lossy().to_string()), &config).await {
-        Ok(results) => !results.is_empty(),
-        Err(_) => false,
-    }
+    let owned = path.to_string_lossy().to_string();
+    let handle = tokio::spawn(async move {
+        let config = ExtractionConfig {
+            output_format: OutputFormat::Plain,
+            ..Default::default()
+        };
+        match extract(ExtractInput::from_uri(owned), &config).await {
+            Ok(result) => !result.results.is_empty(),
+            Err(_) => false,
+        }
+    });
+    handle.await.unwrap_or(false)
 }
 
 #[tokio::main]
 async fn main() {
+    // A panicking fixture is expected and already handled per file; its backtrace would
+    // otherwise bury the benchmark's own output.
+    std::panic::set_hook(Box::new(|_| {}));
+
     let mut iters = 5usize;
     let mut warmup = 2usize;
     let mut root: Option<String> = None;
