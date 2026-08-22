@@ -15,6 +15,7 @@ using System.Linq;
 using Xberg.Internal.Pdf;
 using Xberg.Internal.PdfOxide.Fonts;
 using Xberg.Internal.PdfOxide.Layout;
+using Xberg.Internal.PdfOxide.Structure;
 
 namespace Xberg.Internal.PdfOxide.Text;
 
@@ -71,7 +72,7 @@ internal static class OxPageExtractor
         var result = new OxPage { Text = new OxPageText { PageWidth = (float)urx, PageHeight = (float)ury } };
         if (page is null) return result;
 
-        var spans = ExtractSpans(doc, pageIndex, page);
+        var (spans, mcWins) = ExtractSpans(doc, pageIndex, page);
         if (spans.Count == 0) return result;
 
         var chars = ExtractChars(doc, pageIndex, page);
@@ -94,6 +95,7 @@ internal static class OxPageExtractor
         foreach (var s in spans) hierarchySpans.Add(s.Clone());
         OxReadingOrder.DropOffpageSpans(hierarchySpans, (float)llx, (float)lly, (float)urx, (float)ury);
         OxSpanCompare.SortSpansRowAware(hierarchySpans);
+        OxActualText.ApplyToSpans(doc, pageIndex, hierarchySpans, mcWins);
         result.HierarchySpans = hierarchySpans;
 
         // Stamp the char extractor's own per-glyph x-origins onto the finished spans, so
@@ -104,6 +106,11 @@ internal static class OxPageExtractor
 
         OxReadingOrder.DropOffpageSpans(spans, (float)llx, (float)lly, (float)urx, (float)ury);
         result.Text.Spans = OxReadingOrder.OrderSpansColumnAware(spans);
+
+        // Struct-tree-scope /ActualText (§14.9.4) is applied last, on the ordered list, the
+        // way `extract_spans_filtered_with_reading_order` closes. The word path does not get
+        // it: `postprocess_spans` never calls the applier.
+        OxActualText.ApplyToSpans(doc, pageIndex, result.Text.Spans, mcWins);
 
         // `PageText.chars` is left empty: the per-glyph list is consumed by the stamp above
         // and nothing downstream asks for it whole.
@@ -131,14 +138,23 @@ internal static class OxPageExtractor
         return chars;
     }
 
-    /// <summary>Raw spans for one page, before reading order.</summary>
-    private static List<OxTextSpan> ExtractSpans(PdfDocument doc, int pageIndex, PdfDict page)
+    /// <summary>
+    /// Raw spans for one page, before reading order, with the MCIDs whose in-stream
+    /// `BDC /ActualText` the extractor already applied — `take_mc_actualtext_mcids`, which
+    /// upstream stashes on the document for the struct-tree applier to defer to.
+    /// </summary>
+    private static (List<OxTextSpan> Spans, HashSet<int> McWins) ExtractSpans(
+        PdfDocument doc, int pageIndex, PdfDict page)
     {
         var prepared = NewPageExtractor(doc, pageIndex, page);
-        if (prepared is null) return new List<OxTextSpan>();
+        if (prepared is null) return (new List<OxTextSpan>(), new HashSet<int>());
 
-        try { return prepared.Value.Extractor.ExtractTextSpans(prepared.Value.Content); }
-        catch { return new List<OxTextSpan>(); }
+        try
+        {
+            var spans = prepared.Value.Extractor.ExtractTextSpans(prepared.Value.Content);
+            return (spans, prepared.Value.Extractor.TakeMcActualTextMcids());
+        }
+        catch { return (new List<OxTextSpan>(), new HashSet<int>()); }
     }
 
     /// <summary>
