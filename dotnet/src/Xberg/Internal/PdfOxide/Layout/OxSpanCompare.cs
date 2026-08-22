@@ -89,8 +89,35 @@ internal static class OxSpanCompare
     /// <summary>Stable sort in place — the tie-breaking behaviour Rust's `sort_by` has.</summary>
     public static void SortStable<T>(List<T> items, Comparison<T> cmp)
     {
-        var ordered = items.OrderBy(x => x, Comparer<T>.Create(cmp)).ToList();
-        for (int i = 0; i < items.Count; i++) items[i] = ordered[i];
+        int n = items.Count;
+        if (n < 2) return;
+
+        // `OrderBy(...).ToList()` is a stable sort, but it allocated a comparer, the LINQ
+        // ordering machinery, its internal buffer and a result list on every call — and this
+        // is called tens of thousands of times per document from the reading-order and table
+        // paths. Sorting an index permutation with the index itself as the tie-break gives
+        // the same ordering guarantee over rented buffers.
+        var ipool = System.Buffers.ArrayPool<int>.Shared;
+        var tpool = System.Buffers.ArrayPool<T>.Shared;
+        var idx = ipool.Rent(n);
+        var buf = tpool.Rent(n);
+        try
+        {
+            items.CopyTo(0, buf, 0, n);
+            for (int i = 0; i < n; i++) idx[i] = i;
+            idx.AsSpan(0, n).Sort((a, b) =>
+            {
+                int c = cmp(buf[a], buf[b]);
+                return c != 0 ? c : a.CompareTo(b);
+            });
+            for (int i = 0; i < n; i++) items[i] = buf[idx[i]];
+        }
+        finally
+        {
+            ipool.Return(idx);
+            // Reference elements must not be kept alive by the pooled array.
+            tpool.Return(buf, clearArray: System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+        }
     }
 
     /// <summary>
