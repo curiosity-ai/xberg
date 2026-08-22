@@ -602,6 +602,14 @@ public sealed class PdfContentExtractor
         if (_doc.Resolve(st.Dict.Get("Subtype")).AsName() != "Form") return;
         // Save state, apply form Matrix, run form content with its resources.
         _stack.Push(_gs.Clone());
+        // A Form XObject is path-isolated at both boundaries: pdf_oxide discards whatever
+        // path construction is pending on the way in and on the way out
+        // (`process_form_xobject_paths`, document.rs:18025 and :18204). Without that, a form
+        // whose subpaths are painted only by an operator the extractor does not answer
+        // (`B`, `B*`, `b*`) leaves them in the buffer, and the next `S` on the page emits
+        // them as one path — a single primitive spanning the whole form, which bridges
+        // unrelated ruling-line clusters and widens the table bounding boxes built from them.
+        if (Environment.GetEnvironmentVariable("XBERG_NO_XOBJ_PATH_ISOLATION") != "1") EndPath();
         var savedTm = _tm; var savedTlm = _tlm;
         if (_doc.Resolve(st.Dict.Get("Matrix")).AsArray() is PdfArray fm && fm.Items.Count >= 6)
         {
@@ -613,6 +621,7 @@ public sealed class PdfContentExtractor
         }
         var formRes = _doc.Resolve(st.Dict.Get("Resources")).AsDict();
         try { Run(_doc.DecodeStream(st), formRes, depth + 1); } catch { }
+        if (Environment.GetEnvironmentVariable("XBERG_NO_XOBJ_PATH_ISOLATION") != "1") EndPath();
         FlushBuffer();
         if (_stack.Count > 0) _gs = _stack.Pop();
         _tm = savedTm; _tlm = savedTlm;

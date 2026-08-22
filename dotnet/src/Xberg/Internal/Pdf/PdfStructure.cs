@@ -204,6 +204,16 @@ public static class PdfStructure
     {
         int pageCount = allPageSegments.Count;
 
+        // Fragments that row-gap region clustering split out of one physical table are joined
+        // back together on the way in, as upstream does at the head of
+        // `extract_document_structure_from_segments`. The emitted `tables[]` array is built
+        // from the unstitched list, so this must stay local to the structure pipeline.
+        if (ruledTables is not null)
+        {
+            try { if (Environment.GetEnvironmentVariable("XBERG_NO_STITCH") != "1") ruledTables = PdfTableStitch.StitchFragmentedTables(ruledTables, allPageSegments); }
+            catch { }
+        }
+
         var headingMap = BuildHeadingMap(allPageSegments, kClusters);
         float? docBodyFontSize = null;
         foreach (var (fs, lvl) in headingMap) { if (lvl is null) { docBodyFontSize = fs; break; } }
