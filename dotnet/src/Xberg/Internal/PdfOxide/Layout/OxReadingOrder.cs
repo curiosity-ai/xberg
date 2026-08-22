@@ -446,7 +446,6 @@ internal static class OxReadingOrder
         if (indices.Count == 0) return new List<List<int>>();
         if (indices.Count < MinSpansForSplit) return new List<List<int>> { SortIndices(all, indices) };
         if (depth >= MaxPartitionDepth) return new List<List<int>> { SortIndices(all, indices) };
-
         var regionKind = ClassifyRegionKind(all, indices);
 
         // Two-column-prose probe BEFORE the single-column short-circuit: a tight
@@ -512,7 +511,6 @@ internal static class OxReadingOrder
             res.AddRange(PartitionIndexedDepth(all, fs.Below, depth + 1));
             return res;
         }
-
         var secondSplit = PreferHorizontal
             ? FindVerticalSplitIndexed(all, indices)
             : FindHorizontalSplitIndexed(all, indices);
@@ -885,6 +883,30 @@ internal static class OxReadingOrder
     /// skips both splits, which is what keeps XY-cut from fragmenting body text at the
     /// density dips indentation and short last lines create.
     /// </summary>
+    /// <summary>One line's span extents, tagged with its arrival position.</summary>
+    /// <remarks>
+    /// <c>Seq</c> is what makes the pooled rewrite below equivalent to the
+    /// <c>SortedDictionary</c>-of-<c>List</c> it replaces: grouping by Y and then sorting by
+    /// left edge has to keep ties in arrival order, which a stable sort gave for free and a
+    /// span sort does not. Carrying the index and breaking ties on it restores that exactly.
+    /// </remarks>
+    private readonly struct LineEntry
+    {
+        public readonly int YKey; public readonly float Left, Right, CoreRight; public readonly int Seq;
+        public LineEntry(int yKey, float left, float right, float coreRight, int seq)
+        { YKey = yKey; Left = left; Right = right; CoreRight = coreRight; Seq = seq; }
+    }
+
+    /// <summary>
+    /// Whether a region reads as one column.
+    /// </summary>
+    /// <remarks>
+    /// This runs once per partition call — a little over 200,000 times for a 16-document
+    /// batch — and every call used to build a <c>SortedDictionary</c>, a list per line, a
+    /// copy of each of those lists, and three more lists for the cluster passes. That was the
+    /// single largest allocation source in PDF extraction. The logic is unchanged; only the
+    /// containers are, and they now come from the array pool.
+    /// </remarks>
     private static bool IsSingleColumnRegion(IReadOnlyList<OxTextSpan> all, List<int> indices)
     {
         if (indices.Count < 3) return false;
@@ -898,116 +920,166 @@ internal static class OxReadingOrder
         float regionWidth = xMax - xMin;
         if (regionWidth <= 10.0f) return true;
 
-        // core_right (char count × em) is a conservative right edge used only where
-        // adjacent bbox edges overlap, which signals extractor bbox inflation —
-        // trailing whitespace and stretched advance widths make multi-column lines look
-        // like one continuous run.
-        var lines = new SortedDictionary<int, List<(float Left, float Right, float CoreRight)>>();
-        foreach (int i in indices)
+        int n = indices.Count;
+        var pool = System.Buffers.ArrayPool<LineEntry>.Shared;
+        var fpool = System.Buffers.ArrayPool<float>.Shared;
+        var entries = pool.Rent(n);
+        var gaps = fpool.Rent(n);
+        var mins = fpool.Rent(n);
+        try
         {
-            var s = all[i];
-            int yKey = OxSpanCompare.RoundToI32(s.Bbox.Top);
-            float charCount = Math.Max(1, NonWhitespaceCount(s.Text));
-            float approxCharWidth = MathF.Max(s.FontSize * 0.45f, 2.5f);
-            float coreRight = s.Bbox.Left + charCount * approxCharWidth;
-            if (!lines.TryGetValue(yKey, out var list)) { list = new List<(float, float, float)>(); lines[yKey] = list; }
-            list.Add((s.Bbox.Left, s.Bbox.Right, coreRight));
-        }
-        if (lines.Count < 3) return false;
-
-        // A real gutter recurs at roughly the same X across lines. Sparse title pages
-        // also have wide inter-word gaps, but theirs are scattered.
-        float maxGap = MinValleyWidth;
-        var gapPositions = new List<float>();
-        foreach (var lineSpans in lines.Values)
-        {
-            var sorted = new List<(float Left, float Right, float CoreRight)>(lineSpans);
-            OxSpanCompare.SortStable(sorted, (a, b) => OxSpanCompare.SafeFloatCmp(a.Left, b.Left));
-            for (int k = 0; k + 1 < sorted.Count; k++)
+            // core_right (char count × em) is a conservative right edge used only where
+            // adjacent bbox edges overlap, which signals extractor bbox inflation —
+            // trailing whitespace and stretched advance widths make multi-column lines look
+            // like one continuous run.
+            for (int k = 0; k < n; k++)
             {
-                float bboxGap = sorted[k + 1].Left - sorted[k].Right;
-                float effectiveGap, gapEndLeft;
-                if (bboxGap < 0.0f) { effectiveGap = sorted[k + 1].Left - sorted[k].CoreRight; gapEndLeft = sorted[k].CoreRight; }
-                else { effectiveGap = bboxGap; gapEndLeft = sorted[k].Right; }
-                if (effectiveGap >= maxGap) gapPositions.Add((gapEndLeft + sorted[k + 1].Left) * 0.5f);
+                var sp = all[indices[k]];
+                float charCount = Math.Max(1, NonWhitespaceCount(sp.Text));
+                float approxCharWidth = MathF.Max(sp.FontSize * 0.45f, 2.5f);
+                entries[k] = new LineEntry(
+                    OxSpanCompare.RoundToI32(sp.Bbox.Top), sp.Bbox.Left, sp.Bbox.Right,
+                    sp.Bbox.Left + charCount * approxCharWidth, k);
             }
-        }
 
-        // A centered title/subtitle/byline block produces accidental gap clusters that
-        // look like a gutter, and reading it as columns shreds the title. The
-        // discriminator: a left-aligned layout — single OR multi-column — starts most
-        // rows at the same left margin, so the largest cluster of per-line leftmost
-        // edges covers a majority. Centered text has each line's leftmost edge
-        // scattered. A cluster fraction rather than raw spread survives rows that hold
-        // only right-column content, which inflate the spread without moving the margin.
-        bool looksCentered;
-        {
-            var mins = lines.Values.Select(ls => ls.Aggregate(float.MaxValue, (m, x) => MathF.Min(m, x.Left))).ToList();
-            if (mins.Count < 2) looksCentered = false;
+            var all_ = entries.AsSpan(0, n);
+            // Ascending Y key, arrival order within a key: the iteration order the
+            // SortedDictionary produced.
+            all_.Sort((a, b) => a.YKey != b.YKey ? a.YKey.CompareTo(b.YKey) : a.Seq.CompareTo(b.Seq));
+
+            int lineCount = 0;
+            for (int k = 0; k < n; k++) if (k == 0 || all_[k].YKey != all_[k - 1].YKey) lineCount++;
+            if (lineCount < 3) return false;
+
+            // A real gutter recurs at roughly the same X across lines. Sparse title pages
+            // also have wide inter-word gaps, but theirs are scattered.
+            float maxGap = MinValleyWidth;
+            int gapCount = 0, minCount = 0;
+            int start = 0;
+            while (start < n)
+            {
+                int stop = start;
+                while (stop < n && all_[stop].YKey == all_[start].YKey) stop++;
+                var line = all_.Slice(start, stop - start);
+                line.Sort((a, b) =>
+                {
+                    int c = OxSpanCompare.SafeFloatCmp(a.Left, b.Left);
+                    return c != 0 ? c : a.Seq.CompareTo(b.Seq);
+                });
+
+                float lineMin = float.MaxValue;
+                foreach (ref readonly var e in line) lineMin = MathF.Min(lineMin, e.Left);
+                mins[minCount++] = lineMin;
+
+                for (int k = 0; k + 1 < line.Length; k++)
+                {
+                    float bboxGap = line[k + 1].Left - line[k].Right;
+                    float effectiveGap, gapEndLeft;
+                    if (bboxGap < 0.0f) { effectiveGap = line[k + 1].Left - line[k].CoreRight; gapEndLeft = line[k].CoreRight; }
+                    else { effectiveGap = bboxGap; gapEndLeft = line[k].Right; }
+                    if (effectiveGap >= maxGap) gaps[gapCount++] = (gapEndLeft + line[k + 1].Left) * 0.5f;
+                }
+                start = stop;
+            }
+
+            // A centered title/subtitle/byline block produces accidental gap clusters that
+            // look like a gutter, and reading it as columns shreds the title. The
+            // discriminator: a left-aligned layout — single OR multi-column — starts most
+            // rows at the same left margin, so the largest cluster of per-line leftmost
+            // edges covers a majority. Centered text has each line's leftmost edge
+            // scattered. A cluster fraction rather than raw spread survives rows that hold
+            // only right-column content, which inflate the spread without moving the margin.
+            bool looksCentered;
+            if (minCount < 2) looksCentered = false;
             else
             {
                 const float tol = 10.0f;
-                var sorted = new List<float>(mins);
-                OxSpanCompare.SortStable(sorted, OxSpanCompare.SafeFloatCmp);
+                var ms = mins.AsSpan(0, minCount);
+                ms.Sort(OxSpanCompare.SafeFloatCmp);
                 int largest = 0;
-                foreach (float a in sorted)
+                foreach (float a in ms)
                 {
-                    int lo = PartitionPointLess(sorted, a - tol);
-                    int hi = PartitionPointLessOrEqual(sorted, a + tol);
+                    int lo = PartitionPointLess(ms, a - tol);
+                    int hi = PartitionPointLessOrEqual(ms, a + tol);
                     largest = Math.Max(largest, hi - lo);
                 }
-                looksCentered = largest < mins.Count * 0.5f;
+                looksCentered = largest < minCount * 0.5f;
             }
-        }
 
-        // A SMALL centered block (title page) is one column so its lines stay in
-        // top-to-bottom order; the line cap keeps a real multi-column body out.
-        if (looksCentered && lines.Count <= 6) return true;
+            // A SMALL centered block (title page) is one column so its lines stay in
+            // top-to-bottom order; the line cap keeps a real multi-column body out.
+            if (looksCentered && lineCount <= 6) return true;
 
-        if (gapPositions.Count > 0 && !looksCentered)
-        {
-            const float clusterRadius = 20.0f;
-            // 20% accommodates pages where header/footer/title rows dilute the body-line
-            // count but a real multi-column body still dominates.
-            int minCluster = Math.Max(3, lines.Count / 5);
-            var sortedGaps = new List<float>(gapPositions);
-            OxSpanCompare.SortStable(sortedGaps, OxSpanCompare.SafeFloatCmp);
-            foreach (float pos in sortedGaps)
+            if (gapCount > 0 && !looksCentered)
             {
-                int lo = PartitionPointLess(sortedGaps, pos - clusterRadius);
-                int hi = PartitionPointLessOrEqual(sortedGaps, pos + clusterRadius);
-                if (hi - lo >= minCluster) return false;
+                const float clusterRadius = 20.0f;
+                // 20% accommodates pages where header/footer/title rows dilute the body-line
+                // count but a real multi-column body still dominates.
+                int minCluster = Math.Max(3, lineCount / 5);
+                var gs = gaps.AsSpan(0, gapCount);
+                gs.Sort(OxSpanCompare.SafeFloatCmp);
+                foreach (float pos in gs)
+                {
+                    int lo = PartitionPointLess(gs, pos - clusterRadius);
+                    int hi = PartitionPointLessOrEqual(gs, pos + clusterRadius);
+                    if (hi - lo >= minCluster) return false;
+                }
             }
-        }
 
-        // No gutter anywhere: accept when most lines are wide AND densely covered.
-        float widthThreshold = regionWidth * 0.6f;
-        int wideDenseLines = 0;
-        foreach (var lineSpans in lines.Values)
-        {
-            var sorted = new List<(float Left, float Right, float CoreRight)>(lineSpans);
-            OxSpanCompare.SortStable(sorted, (a, b) => OxSpanCompare.SafeFloatCmp(a.Left, b.Left));
-            float extentLeft = sorted[0].Left;
-            float extentRight = sorted.Aggregate(float.MinValue, (m, x) => MathF.Max(m, x.Right));
-            float extent = extentRight - extentLeft;
-            if (extent < widthThreshold) continue;
-
-            // Coverage uses core_right, not bbox.right: tab-expanded table rows would
-            // otherwise score 100% coverage and pass as dense body text.
-            float covered = 0.0f;
-            float lastEnd = float.MinValue;
-            foreach (var (l, _, cr) in sorted)
+            // No gutter anywhere: accept when most lines are wide AND densely covered.
+            float widthThreshold = regionWidth * 0.6f;
+            int wideDenseLines = 0;
+            start = 0;
+            while (start < n)
             {
-                float effectiveRight = MathF.Min(cr, extentRight);
-                float start = MathF.Max(l, lastEnd);
-                if (effectiveRight > start) { covered += effectiveRight - start; lastEnd = effectiveRight; }
+                int stop = start;
+                while (stop < n && all_[stop].YKey == all_[start].YKey) stop++;
+                var line = all_.Slice(start, stop - start);   // already sorted by Left above
+                start = stop;
+
+                float extentLeft = line[0].Left;
+                float extentRight = float.MinValue;
+                foreach (ref readonly var e in line) extentRight = MathF.Max(extentRight, e.Right);
+                float extent = extentRight - extentLeft;
+                if (extent < widthThreshold) continue;
+
+                // Coverage uses core_right, not bbox.right: tab-expanded table rows would
+                // otherwise score 100% coverage and pass as dense body text.
+                float covered = 0.0f;
+                float lastEnd = float.MinValue;
+                foreach (ref readonly var e in line)
+                {
+                    float effectiveRight = MathF.Min(e.CoreRight, extentRight);
+                    float st = MathF.Max(e.Left, lastEnd);
+                    if (effectiveRight > st) { covered += effectiveRight - st; lastEnd = effectiveRight; }
+                }
+                if (covered >= extent * 0.8f) wideDenseLines++;
             }
-            if (covered >= extent * 0.8f) wideDenseLines++;
+            return wideDenseLines * 2 >= lineCount;
         }
-        return wideDenseLines * 2 >= lines.Count;
+        finally
+        {
+            pool.Return(entries);
+            fpool.Return(gaps);
+            fpool.Return(mins);
+        }
     }
 
     // Rust `slice::partition_point` over a list sorted with SafeFloatCmp.
+    private static int PartitionPointLess(ReadOnlySpan<float> sorted, float v)
+    {
+        int lo = 0, hi = sorted.Length;
+        while (lo < hi) { int m = lo + (hi - lo) / 2; if (sorted[m] < v) lo = m + 1; else hi = m; }
+        return lo;
+    }
+
+    private static int PartitionPointLessOrEqual(ReadOnlySpan<float> sorted, float v)
+    {
+        int lo = 0, hi = sorted.Length;
+        while (lo < hi) { int m = lo + (hi - lo) / 2; if (sorted[m] <= v) lo = m + 1; else hi = m; }
+        return lo;
+    }
+
     private static int PartitionPointLess(List<float> sorted, float v)
     {
         int lo = 0, hi = sorted.Count;

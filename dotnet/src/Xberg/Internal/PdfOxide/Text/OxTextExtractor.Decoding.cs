@@ -266,17 +266,36 @@ internal static class OxTextDecoding
         }
     }
 
-    private static bool TryDecodeUtf8(ReadOnlySpan<byte> bytes, out string decoded)
+    /// <summary>
+    /// Strict UTF-8 decode that reports failure rather than throwing.
+    /// </summary>
+    /// <remarks>
+    /// PDF byte strings are frequently not UTF-8 — they are PDFDocEncoding, a CMap's raw
+    /// codes, or a subset font's own byte soup — so a strict decode failing is the common
+    /// case, not the exceptional one. Driving that through `DecoderFallbackException` cost a
+    /// throw per string: instrumenting one two-document run counted 1,506 of them, peaking at
+    /// 242/sec. `Utf8.ToUtf16` answers the same question with a status code.
+    /// </remarks>
+    internal static bool TryDecodeUtf8(ReadOnlySpan<byte> bytes, out string decoded)
     {
+        if (bytes.IsEmpty) { decoded = ""; return true; }
+
+        char[]? rented = null;
+        // A UTF-8 sequence never yields more UTF-16 units than it has bytes.
+        Span<char> buf = bytes.Length <= 256
+            ? stackalloc char[256]
+            : (rented = System.Buffers.ArrayPool<char>.Shared.Rent(bytes.Length));
         try
         {
-            decoded = StrictUtf8.GetString(bytes);
+            var status = System.Text.Unicode.Utf8.ToUtf16(
+                bytes, buf, out _, out int written, replaceInvalidSequences: false, isFinalBlock: true);
+            if (status != System.Buffers.OperationStatus.Done) { decoded = ""; return false; }
+            decoded = new string(buf[..written]);
             return true;
         }
-        catch (DecoderFallbackException)
+        finally
         {
-            decoded = "";
-            return false;
+            if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
         }
     }
 

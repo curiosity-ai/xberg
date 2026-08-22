@@ -565,11 +565,9 @@ internal sealed partial class OxTextExtractor
             return DecodeUtf16(bytes, bigEndian: false);
         }
 
-        try
-        {
-            return StrictUtf8.GetString(bytes);
-        }
-        catch (DecoderFallbackException)
+        // Same reasoning as `TryDecodeUtf8`: a PDF byte string failing a strict UTF-8 decode is
+        // the ordinary case, so it is answered with a status code rather than a throw.
+        if (OxTextDecoding.TryDecodeUtf8(bytes, out string utf8)) return utf8;
         {
             var sb = new StringBuilder(bytes.Length);
             foreach (byte b in bytes)

@@ -1479,15 +1479,9 @@ internal sealed partial class OxTextExtractor
             return false;
         }
 
-        string decoded;
-        try
-        {
-            decoded = StrictUtf8.GetString(text);
-        }
-        catch (DecoderFallbackException)
-        {
-            return false;
-        }
+        // On the show-operator path, so it runs per drawn string; most PDF byte strings are
+        // not UTF-8, which made the failure path the common one and the throw the cost.
+        if (!OxTextDecoding.TryDecodeUtf8(text, out string decoded)) return false;
 
         bool hasNonLatin1 = false;
         foreach (Rune r in decoded.EnumerateRunes())
