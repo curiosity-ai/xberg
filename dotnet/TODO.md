@@ -247,9 +247,19 @@ file cannot hang extraction, and upstream simply has no deadline to match.
   the legacy BIFF path needs formula-token decoding.
 - `iwork/test.key`, `test.numbers`, `test.pages`, `ppt/simple.ppt` — untraced.
 - `jats/sample_article.nxml` — needs `extraction/formula_xml.rs`, unported.
-- `epub/features.epub` — U+23DE/U+23DF become `\overbrace`/`\underbrace` here where upstream
-  keeps them literal inside `\overset`/`\underset`. Confirmed a port divergence, not a stale
-  golden: regenerating that golden reproduces the committed file byte for byte.
+- `epub/features.epub` — three separate divergences, and the largest is not the maths one:
+  1. **Content loss, 499 chars.** `front.xhtml` carries a `<dl class="info">` whose `<dt>`/`<dd>`
+     pairs hold the document's conventions section ("1. Locating a test", "2. Performing the
+     test", "3. Scoring in the results form"). The EPUB structure walk emits none of it, so the
+     definition list is dropped whole. This is the corpus's last remaining content loss.
+  2. U+23DE/U+23DF become `\overbrace`/`\underbrace` here where upstream keeps them literal
+     inside `\overset`/`\underset` — even though `over_script_command` (mathml.rs:932) does map
+     U+23DE. Upstream evidently does not reach that arm for this input; which arm it takes
+     instead is not yet established.
+  3. `\{` where upstream emits a bare `{` opening a matrix, so this port is TeX-escaping a brace
+     upstream leaves alone.
+  Plus a small over-extraction: an `epub:switch` branch this port renders and upstream does not.
+  Not a stale golden — regenerating it reproduces the committed file byte for byte.
 - Four `.md` fixtures opening with an HTML comment (`ground_truth/pdf/160428551.md`,
   `french_minutes_vision.md`, `docling/md/2023-06-20-PV.md`, `docling.md`). Both implementations
   route them to the HTML extractor; the whole difference is **one leading space** — html gets
