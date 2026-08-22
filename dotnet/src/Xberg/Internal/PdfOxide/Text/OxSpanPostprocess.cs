@@ -34,8 +34,14 @@ internal static class OxSpanPostprocess
     //     asks `page_reading_order` for the artifact-inclusive variant, so nothing
     //     downstream of here reads the flag;
     //   * `annotation_content_spans` — the port has no annotation span source. This one WOULD
-    //     add spans (a /Text or /FreeText note's /Contents becomes words upstream), so it is
-    //     a real gap rather than a no-op, and belongs with whoever ports that source.
+    //     add spans, so it is a real gap rather than a no-op, and belongs with whoever ports
+    //     that source. Note what it actually admits, which is narrower than its name: the Rust
+    //     (`document.rs:8902`) takes only `/FreeText` and `/Stamp`, skipping `/Widget` (already
+    //     covered by `extract_widget_spans`), `/Popup`, anything flagged hidden/invisible/NoView
+    //     in `/F`, and — deliberately, with a comment saying so — `/Text` sticky notes, whose
+    //     `/Contents` is reviewer comment text shown in a pop-up rather than painted on the
+    //     page. The text comes from `/Contents`, falling back to the appearance stream, and the
+    //     span's box is `/Rect` with a font size of 12 and a sequence base of 2_000_000.
 
     /// <summary>Line-band height the super/sub-script anchor search works in.</summary>
     private const float LineBandPt = 4.0f;

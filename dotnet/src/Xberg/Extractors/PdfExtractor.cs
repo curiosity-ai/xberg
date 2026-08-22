@@ -65,6 +65,22 @@ public sealed class PdfExtractor : IExtractor
         catch { }
         foreach (var table in tables) PdfTableNormalize.RepairConsistentlyMergedNumericColumn(table);
 
+        // Upstream reduces this combined list before emitting it (`prepare_emitted_tables`):
+        // it drops empty-markdown tables, collapses same-page boxes overlapping by more than
+        // half the smaller one's area onto whichever candidate carries more content, and drops
+        // exact repeats of a page's markdown. None of that is done here, and that is a measured
+        // decision rather than an oversight. Both halves were ported and swept: the overlap
+        // pass alone cost `ok` 363 -> 360, `json` 366 -> 364 and `tables` 377 -> 374, and the
+        // empty-markdown drop plus the exact-repeat pass still cost `ok` 363 -> 361,
+        // `json` 366 -> 364 and `tables` 377 -> 375.
+        //
+        // The reason is the pass that runs immediately BEFORE them upstream and is not ported:
+        // `stitch_fragmented_tables` first joins a grid's vertically-adjacent same-column
+        // fragments into one table. Upstream therefore reaches the reduction with far fewer
+        // overlapping and repeating entries than the three tiers here produce, and running the
+        // reduction on the unstitched list discards fragments the goldens keep. These belong
+        // with the stitching pass, and only with it.
+
         // --- Build InternalDocument ---
         // For Markdown/Djot/HTML the Rust path pre-renders a *structured* document with
         // heading detection (pdf/structure/pipeline.rs). Plain/Json use the flat native
