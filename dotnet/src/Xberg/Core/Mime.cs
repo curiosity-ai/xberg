@@ -415,7 +415,7 @@ public static class Mime
         Add("application/x-fictionbook+xml", "fb2");
         Add("application/xml+opml", "opml");
         Add("application/docbook+xml", "dbk", "docbook", "docbook4", "docbook5");
-        Add("application/x-jats+xml", "jats");
+        Add("application/x-jats+xml", "jats", "nxml");
         Add("application/x-ipynb+json", "ipynb");
         Add("application/x-latex", "tex", "latex");
         Add("application/x-typst", "typst", "typ");
