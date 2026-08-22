@@ -27,6 +27,56 @@ public sealed class SegmentData
     public bool IsMonospace;
     public float BaselineY;
 
+    /// <summary>
+    /// Text-matrix rotation the span producer reported, in degrees.
+    /// </summary>
+    /// <remarks>
+    /// The producer's page-space geometry stays in <see cref="X"/>, <see cref="Y"/>,
+    /// <see cref="Width"/> and <see cref="Height"/>, which is what layout and table projection
+    /// want. Reading-order and spacing arithmetic must not use it directly: a rotated run's
+    /// width and height are flattened onto the run's own axis, not the page's, so an upright
+    /// gap or baseline comparison across one is meaningless. Use the helpers below.
+    /// </remarks>
+    public float RotationDegrees;
+
+    /// <summary>Rust <c>f32::EPSILON</c>: machine epsilon, not C#'s smallest denormal.</summary>
+    private const float F32Epsilon = 1.1920929e-7f;
+
+    /// <summary>Painted on the page's upright text axis.</summary>
+    public bool IsUnrotated => MathF.Abs(RotationDegrees) <= F32Epsilon;
+
+    /// <summary>Two segments share a reading frame, so their geometry is comparable.</summary>
+    public bool HasSameRotation(SegmentData other) =>
+        MathF.Abs(RotationDegrees - other.RotationDegrees) <= F32Epsilon;
+
+    /// <summary>Page-space origin turned into this segment's own upright reading frame:
+    /// (advance along its baseline, cross axis its visual lines stack on). The identity for an
+    /// unrotated segment.</summary>
+    public (float Advance, float Cross) UprightOrigin()
+    {
+        if (IsUnrotated) return (X, Y);
+        float radians = -RotationDegrees * MathF.PI / 180.0f;
+        float sin = MathF.Sin(radians), cos = MathF.Cos(radians);
+        return (X * cos - Y * sin, X * sin + Y * cos);
+    }
+
+    /// <summary>(start, end) along this segment's reading direction.</summary>
+    public (float Start, float End) UprightAdvanceExtent()
+    {
+        float start = UprightOrigin().Advance;
+        return (start, start + Width);
+    }
+
+    /// <summary>(low, high) along the axis its visual lines stack on.</summary>
+    public (float Low, float High) UprightCrossExtent()
+    {
+        float low = UprightOrigin().Cross;
+        return (low, low + Height);
+    }
+
+    /// <summary>Baseline coordinate in this segment's own upright frame.</summary>
+    public float UprightBaseline() => IsUnrotated ? BaselineY : UprightOrigin().Cross;
+
     public SegmentData Clone() => (SegmentData)MemberwiseClone();
 }
 
@@ -196,8 +246,15 @@ public static class PdfStructure
         var allPageParagraphs = new List<List<PdfParagraph>>(pageCount);
         for (int i = 0; i < pageCount; i++)
         {
-            var segs = FilterSegmentsByTableBboxes(allPageSegments[i], tablesByPage[i]);
-            var gapYs = ComputeParagraphGapYs(segs);
+            // Gap detection reads the page as it was drawn, before the table words are
+            // taken out: a band that a grid occupies still separates the prose above it from
+            // the prose below, and measuring the gaps on the thinned list would merge the two
+            // across the hole the table left behind (`compute_paragraph_gap_ys` is called on
+            // the unfiltered page segments upstream, `filter_segments_by_table_bboxes` only
+            // afterwards).
+            var gapYs = ComputeParagraphGapYs(allPageSegments[i]);
+            var segs = OrderSegmentsInReadingFrames(
+                FilterSegmentsByTableBboxes(allPageSegments[i], tablesByPage[i]));
             var paras = BlocksToParagraphs(segs, headingMap, gapYs);
             // Segment-level repair runs here, before paragraphs are merged, because the
             // continuation and dehyphenation rules read the last and first characters of
@@ -287,7 +344,8 @@ public static class PdfStructure
                 var p = kept[i];
                 float dxTol = Math.Max(Math.Min(p.Width, seg.Width) * 0.5f, REDRAWN_MIN_TOLERANCE_PTS);
                 float dyTol = Math.Max(Math.Min(p.Height, seg.Height) * 0.5f, REDRAWN_MIN_TOLERANCE_PTS);
-                if (p.Text == seg.Text && Math.Abs(p.X - seg.X) <= dxTol && Math.Abs(p.Y - seg.Y) <= dyTol)
+                if (p.HasSameRotation(seg)
+                    && p.Text == seg.Text && Math.Abs(p.X - seg.X) <= dxTol && Math.Abs(p.Y - seg.Y) <= dyTol)
                 {
                     prev = p; break;
                 }
@@ -573,28 +631,61 @@ public static class PdfStructure
 
     // ── Gap detection + paragraph grouping (pipeline.rs) ─────────────────────────
 
+    /// <summary>The axis gap detection stacks lines along: page Y for an upright segment, the
+    /// segment's own upright baseline for a rotated one.</summary>
+    private static float ParagraphGapAxis(SegmentData segment) =>
+        segment.IsUnrotated ? segment.Y : segment.UprightBaseline();
+
+    /// <summary>
+    /// Paragraph-gap Y positions for a page. A page carrying rotated runs is split into
+    /// maximal same-rotation groups first and each measured in its own frame: a gap between an
+    /// upright line and a sideways one is not a paragraph break, it is a change of frame, and
+    /// mixing the two axes into one sorted stack invents breaks that are not there (Rust
+    /// <c>compute_paragraph_gap_ys</c>).
+    /// </summary>
     private static List<float> ComputeParagraphGapYs(List<SegmentData> segments)
     {
         if (segments.Count < 2) return new();
-        var order = Enumerable.Range(0, segments.Count).ToList();
-        order.Sort((a, b) => segments[b].Y.CompareTo(segments[a].Y));
+        bool allUpright = true;
+        foreach (var s in segments) { if (!s.IsUnrotated) { allUpright = false; break; } }
+        if (allUpright) return ComputeParagraphGapYsInSharedFrame(segments, 0, segments.Count);
+
+        var gaps = new List<float>();
+        int groupStart = 0;
+        for (int index = 1; index <= segments.Count; index++)
+        {
+            bool endsGroup = index == segments.Count || !segments[index - 1].HasSameRotation(segments[index]);
+            if (!endsGroup) continue;
+            gaps.AddRange(ComputeParagraphGapYsInSharedFrame(segments, groupStart, index));
+            groupStart = index;
+        }
+        return gaps;
+    }
+
+    private static List<float> ComputeParagraphGapYsInSharedFrame(List<SegmentData> segments, int from, int to)
+    {
+        if (to - from < 2) return new();
+        var order = Enumerable.Range(from, to - from).ToList();
+        order.Sort((a, b) => ParagraphGapAxis(segments[b]).CompareTo(ParagraphGapAxis(segments[a])));
 
         var lines = new List<(float top, float bottom, float height, bool mono, float anchor)>();
         foreach (var i in order)
         {
             var seg = segments[i];
+            var (segBottom, segTop) = seg.IsUnrotated ? (seg.Y, seg.Y + seg.Height) : seg.UprightCrossExtent();
+            float baseline = ParagraphGapAxis(seg);
             float tol = Math.Max(seg.Height * 0.5f, 1.0f);
             if (lines.Count > 0)
             {
                 var last = lines[^1];
-                if (Math.Abs(seg.Y - last.anchor) <= tol)
+                if (Math.Abs(baseline - last.anchor) <= tol)
                 {
-                    lines[^1] = (Math.Max(last.top, seg.Y + seg.Height), Math.Min(last.bottom, seg.Y),
+                    lines[^1] = (Math.Max(last.top, segTop), Math.Min(last.bottom, segBottom),
                         Math.Max(last.height, seg.Height), last.mono && seg.IsMonospace, last.anchor);
                     continue;
                 }
             }
-            lines.Add((seg.Y + seg.Height, seg.Y, seg.Height, seg.IsMonospace, seg.Y));
+            lines.Add((segTop, segBottom, seg.Height, seg.IsMonospace, baseline));
         }
         if (lines.Count < 2) return new();
 
@@ -638,6 +729,76 @@ public static class PdfStructure
         return float.IsFinite(tightest) ? Math.Max(tightest, medianHeight) : medianHeight;
     }
 
+    /// <summary>
+    /// Repair the reading order inside each maximal rotated run without touching the upright
+    /// stream order or moving anything across a frame boundary.
+    /// </summary>
+    /// <remarks>
+    /// A sideways table or axis label arrives in the order its glyphs were painted, which the
+    /// page-axis sort upstream of here cannot fix: its rows run along page X, so a row-band sort
+    /// on page Y scatters them. Each rotated run is instead re-sorted in its own upright frame —
+    /// visual lines by descending upright baseline, then along each line's own advance axis —
+    /// while upright runs are handed back untouched, byte for byte (Rust
+    /// <c>order_segments_in_reading_frames</c>).
+    /// </remarks>
+    private static List<SegmentData> OrderSegmentsInReadingFrames(List<SegmentData> segments)
+    {
+        bool anyRotated = false;
+        foreach (var s in segments) { if (!s.IsUnrotated) { anyRotated = true; break; } }
+        if (!anyRotated) return segments;
+
+        var groups = new List<List<SegmentData>>();
+        foreach (var segment in segments)
+        {
+            if (groups.Count > 0 && groups[^1][0].HasSameRotation(segment)) groups[^1].Add(segment);
+            else groups.Add(new List<SegmentData> { segment });
+        }
+
+        var ordered = new List<SegmentData>(segments.Count);
+        foreach (var group in groups)
+        {
+            if (group[0].IsUnrotated) ordered.AddRange(group);
+            else ordered.AddRange(OrderRotatedSegmentGroup(group));
+        }
+        return ordered;
+    }
+
+    private static List<SegmentData> OrderRotatedSegmentGroup(List<SegmentData> segments)
+    {
+        var work = new List<SegmentData>(segments);
+        work.Sort((first, second) =>
+        {
+            int byBaseline = second.UprightBaseline().CompareTo(first.UprightBaseline());
+            if (byBaseline != 0) return byBaseline;
+            return first.UprightAdvanceExtent().Start.CompareTo(second.UprightAdvanceExtent().Start);
+        });
+
+        var visualLines = new List<List<SegmentData>>();
+        foreach (var segment in work)
+        {
+            bool belongsToLastLine = false;
+            if (visualLines.Count > 0)
+            {
+                var anchor = visualLines[^1][0];
+                float tolerance =
+                    Math.Max(Math.Max(anchor.Height, segment.Height), anchor.FontSize * 0.5f) * 0.5f;
+                belongsToLastLine =
+                    Math.Abs(anchor.UprightBaseline() - segment.UprightBaseline()) <= tolerance;
+            }
+            if (belongsToLastLine) visualLines[^1].Add(segment);
+            else visualLines.Add(new List<SegmentData> { segment });
+        }
+
+        var result = new List<SegmentData>(work.Count);
+        foreach (var line in visualLines)
+        {
+            line.Sort((first, second) =>
+                first.UprightAdvanceExtent().Start.CompareTo(second.UprightAdvanceExtent().Start));
+            result.AddRange(line);
+        }
+        return result;
+    }
+
     private static List<PdfParagraph> BlocksToParagraphs(List<SegmentData> lines, List<(float centroid, byte? level)> headingMap, List<float> gapYs)
     {
         if (lines.Count == 0) return new();
@@ -661,9 +822,16 @@ public static class PdfStructure
                 // paragraph with two styled runs, not two paragraphs.
                 bool boldChange = line.IsBold != prev.IsBold
                     && !IsInlineStyleTransition(currentIsSingleVisualLine, prev, line);
-                bool startsNewLine = Math.Abs(line.BaselineY - prev.BaselineY) > INLINE_STYLE_BASELINE_TOLERANCE;
-                bool hasSameLineFollower = lineIdx + 1 < lines.Count &&
-                    Math.Abs(lines[lineIdx + 1].BaselineY - line.BaselineY) <= INLINE_STYLE_BASELINE_TOLERANCE;
+                // A run drawn in a different frame always begins a new element: it is a
+                // sideways caption or axis label, never a wrapped continuation of the prose
+                // above it, and its baseline is not even on the same axis.
+                bool rotationChange = !line.HasSameRotation(prev);
+                bool startsNewLine = rotationChange
+                    || Math.Abs(line.UprightBaseline() - prev.UprightBaseline()) > INLINE_STYLE_BASELINE_TOLERANCE;
+                bool hasSameLineFollower = lineIdx + 1 < lines.Count
+                    && lines[lineIdx + 1].HasSameRotation(line)
+                    && Math.Abs(lines[lineIdx + 1].UprightBaseline() - line.UprightBaseline())
+                        <= INLINE_STYLE_BASELINE_TOLERANCE;
                 bool isList = startsNewLine
                     && (LooksLikeListItem(line.Text) || (hasSameLineFollower && IsBareListMarker(line.Text)));
                 // A numbered section heading always begins a new element. Without this term a run
@@ -676,12 +844,13 @@ public static class PdfStructure
                 bool crossedGap = false;
                 foreach (var gapY in gapYs)
                 {
+                    float previousBaseline = prev.UprightBaseline(), currentBaseline = line.UprightBaseline();
                     float upper, lower;
-                    if (prev.BaselineY > line.BaselineY) { upper = prev.BaselineY; lower = line.BaselineY; }
-                    else { upper = line.BaselineY; lower = prev.BaselineY; }
+                    if (previousBaseline > currentBaseline) { upper = previousBaseline; lower = currentBaseline; }
+                    else { upper = currentBaseline; lower = previousBaseline; }
                     if (gapY < upper && gapY > lower) { crossedGap = true; break; }
                 }
-                shouldBreak = fontChange || boldChange || isList || startsSection || crossedGap;
+                shouldBreak = rotationChange || fontChange || boldChange || isList || startsSection || crossedGap;
             }
 
             if (shouldBreak && current.Count > 0)
@@ -692,8 +861,9 @@ public static class PdfStructure
                 currentIsSingleVisualLine = true;
             }
             if (current.Count > 0)
-                currentIsSingleVisualLine &=
-                    Math.Abs(line.BaselineY - current[0].BaselineY) <= INLINE_STYLE_BASELINE_TOLERANCE;
+                currentIsSingleVisualLine &= line.HasSameRotation(current[0])
+                    && Math.Abs(line.UprightBaseline() - current[0].UprightBaseline())
+                        <= INLINE_STYLE_BASELINE_TOLERANCE;
             current.Add(line);
         }
         if (current.Count > 0)
@@ -716,18 +886,20 @@ public static class PdfStructure
     private static bool IsInlineStyleTransition(bool currentIsSingleVisualLine, SegmentData previous, SegmentData next)
     {
         if (!currentIsSingleVisualLine || previous.IsMonospace || next.IsMonospace) return false;
+        if (!previous.HasSameRotation(next)) return false;
         if (!float.IsFinite(previous.FontSize) || !float.IsFinite(next.FontSize)
             || previous.FontSize <= 0f || next.FontSize <= 0f
-            || !float.IsFinite(previous.BaselineY) || !float.IsFinite(next.BaselineY)
+            || !float.IsFinite(previous.UprightBaseline()) || !float.IsFinite(next.UprightBaseline())
             || !float.IsFinite(previous.X) || !float.IsFinite(next.X)
             || !float.IsFinite(previous.Width) || !float.IsFinite(next.Width)
             || previous.Width < 0f || next.Width < 0f)
             return false;
-        if (Math.Abs(next.BaselineY - previous.BaselineY) > INLINE_STYLE_BASELINE_TOLERANCE) return false;
+        if (Math.Abs(next.UprightBaseline() - previous.UprightBaseline()) > INLINE_STYLE_BASELINE_TOLERANCE)
+            return false;
 
         float fontSize = Math.Max(previous.FontSize, next.FontSize);
-        float previousStart = previous.X, previousEnd = previous.X + previous.Width;
-        float nextStart = next.X;
+        var (previousStart, previousEnd) = previous.UprightAdvanceExtent();
+        float nextStart = next.UprightAdvanceExtent().Start;
         float advanceGap = nextStart - previousEnd;
         return nextStart >= previousStart
             && advanceGap >= -(fontSize * INLINE_STYLE_MAX_OVERLAP_FONT_FACTOR)
@@ -769,7 +941,8 @@ public static class PdfStructure
     {
         var lines = new List<PdfLine>();
         if (segments.Count == 0) return lines;
-        float currentBaseline = segments[0].BaselineY;
+        float currentBaseline = segments[0].UprightBaseline();
+        float currentRotation = segments[0].RotationDegrees;
         var cur = new List<SegmentData>();
 
         void Flush()
@@ -789,10 +962,13 @@ public static class PdfStructure
 
         foreach (var seg in segments)
         {
-            if (Math.Abs(seg.BaselineY - currentBaseline) > 0.5f)
+            bool sameRotation = MathF.Abs(seg.RotationDegrees - currentRotation) <= 1.1920929e-7f;
+            float segmentBaseline = seg.UprightBaseline();
+            if (!sameRotation || Math.Abs(segmentBaseline - currentBaseline) > 0.5f)
             {
                 Flush();
-                currentBaseline = seg.BaselineY;
+                currentBaseline = segmentBaseline;
+                currentRotation = seg.RotationDegrees;
                 cur = new List<SegmentData>();
             }
             cur.Add(seg.Clone());
@@ -801,10 +977,64 @@ public static class PdfStructure
         return lines;
     }
 
+    /// <summary>
+    /// The flat text a paragraph's segments read as, used for classification. An all-upright
+    /// paragraph is simply its segments newline-joined; once a frame change is in play the
+    /// separator has to be decided per pair, because "the next segment is lower down the page"
+    /// stops meaning "the next line" (Rust <c>paragraph_text</c>).
+    /// </summary>
+    private static string ParagraphText(List<SegmentData> lines)
+    {
+        bool allUpright = true;
+        foreach (var s in lines) { if (!s.IsUnrotated) { allUpright = false; break; } }
+        if (allUpright) return string.Join("\n", lines.Select(l => l.Text));
+
+        var text = new StringBuilder();
+        SegmentData? previous = null;
+        foreach (var segment in lines)
+        {
+            if (previous is not null)
+            {
+                if (!previous.HasSameRotation(segment)) text.Append("\n\n");
+                else
+                {
+                    float effHeight = Math.Max(Math.Max(previous.Height, segment.Height), segment.FontSize * 0.5f);
+                    bool sameLine =
+                        Math.Abs(previous.UprightBaseline() - segment.UprightBaseline()) < effHeight * 0.5f;
+                    if (sameLine)
+                    {
+                        string previousWord = LastWhitespaceSeparatedWord(previous.Text);
+                        string nextWord = FirstWhitespaceSeparatedWord(segment.Text);
+                        if (!(text.Length > 0 && char.IsWhiteSpace(text[^1]))
+                            && !(segment.Text.Length > 0 && char.IsWhiteSpace(segment.Text[0]))
+                            && SegmentsNeedSpace(previous, previousWord, segment, nextWord))
+                            text.Append(' ');
+                    }
+                    else text.Append('\n');
+                }
+            }
+            text.Append(segment.Text);
+            previous = segment;
+        }
+        return text.ToString();
+    }
+
+    private static string LastWhitespaceSeparatedWord(string text)
+    {
+        var parts = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length > 0 ? parts[^1] : "";
+    }
+
+    private static string FirstWhitespaceSeparatedWord(string text)
+    {
+        var parts = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length > 0 ? parts[0] : "";
+    }
+
     private static PdfParagraph? FinalizeParagraph(List<SegmentData> lines, List<(float centroid, byte? level)> headingMap, float avgGap)
     {
         if (lines.Count == 0) return null;
-        string text = string.Join("\n", lines.Select(l => l.Text));
+        string text = ParagraphText(lines);
         string trimmed = text.Trim();
         if (trimmed.Length == 0) return null;
 
@@ -818,7 +1048,8 @@ public static class PdfStructure
         // one list item split across two segments — the marker alone never reads as a list.
         bool startsWithSplitListMarker = lines.Count > 1
             && IsBareListMarker(first.Text)
-            && Math.Abs(lines[1].BaselineY - first.BaselineY) <= INLINE_STYLE_BASELINE_TOLERANCE
+            && lines[1].HasSameRotation(first)
+            && Math.Abs(lines[1].UprightBaseline() - first.UprightBaseline()) <= INLINE_STYLE_BASELINE_TOLERANCE
             && lines[1].Text.Trim().Length != 0;
         bool isListCandidate = LooksLikeListItem(trimmed) || startsWithSplitListMarker;
 
@@ -978,6 +1209,7 @@ public static class PdfStructure
             // bold before anything can classify it.
             bool boldCompatible = current.IsBold == next.IsBold;
             bool continuationSignal = !EndsWithSentenceTerminator(current) || StartsWithLowercaseContinuation(next);
+            bool sameRotation = ParagraphsShareRotation(current, next);
             bool verticalGapCompatible = BaselinesWithinContinuationGap(current, next);
             // A numbered section heading starts a new element. It does not end in `.?!:;`, so the
             // continuation signal is satisfied by the *previous* heading alone — an `||` boost,
@@ -985,7 +1217,7 @@ public static class PdfStructure
             // here even after the line grouper split them.
             bool nextStartsSection = StartsNumberedSection(next);
             if (bothBody && fontsCompatible && boldCompatible && continuationSignal
-                && verticalGapCompatible && !nextStartsSection)
+                && sameRotation && verticalGapCompatible && !nextStartsSection)
             {
                 current.Text = "";
                 current.BlockBbox = UnionBlockBbox(current.BlockBbox, next.BlockBbox);
@@ -994,6 +1226,17 @@ public static class PdfStructure
             else { paragraphs.Add(current); current = next; }
         }
         paragraphs.Add(current);
+    }
+
+    /// <summary>Whether the run ending one paragraph and the run opening the next were drawn
+    /// in the same frame. Paragraphs without segments are treated as compatible, since no
+    /// frame can be read off them (Rust <c>paragraphs_share_rotation</c>).</summary>
+    private static bool ParagraphsShareRotation(PdfParagraph current, PdfParagraph next)
+    {
+        var currentLast = current.Lines.LastOrDefault()?.Segments.LastOrDefault();
+        var nextFirst = next.Lines.FirstOrDefault()?.Segments.FirstOrDefault();
+        if (currentLast is null || nextFirst is null) return true;
+        return currentLast.HasSameRotation(nextFirst);
     }
 
     /// <summary>
@@ -2499,11 +2742,15 @@ public static class PdfStructure
             || prevSeg.IsMonospace != nextSeg.IsMonospace)
             return true;
 
+        // Runs in different frames are never adjacent glyphs, whatever their page coordinates
+        // say, so they always take a separator.
+        if (!prevSeg.HasSameRotation(nextSeg)) return true;
+
         float effHeight = Math.Max(Math.Max(nextSeg.Height, prevSeg.Height), nextSeg.FontSize * 0.5f);
-        bool sameLine = Math.Abs(prevSeg.BaselineY - nextSeg.BaselineY) < effHeight * 0.5f;
+        bool sameLine = Math.Abs(prevSeg.UprightBaseline() - nextSeg.UprightBaseline()) < effHeight * 0.5f;
         if (!sameLine) return true;
 
-        float advanceGap = nextSeg.X - (prevSeg.X + prevSeg.Width);
+        float advanceGap = nextSeg.UprightAdvanceExtent().Start - prevSeg.UprightAdvanceExtent().End;
         return advanceGap > nextSeg.FontSize * SEGMENT_GAP_SPACE_RATIO;
     }
 

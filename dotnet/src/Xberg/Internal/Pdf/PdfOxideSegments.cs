@@ -85,6 +85,7 @@ internal static class PdfOxideSegments
                 IsItalic = span.IsItalic,
                 IsMonospace = span.IsMonospace,
                 BaselineY = span.Bbox.Y,
+                RotationDegrees = span.RotationDegrees,
             });
         }
         return PdfStructure.DedupeRedrawnSegments(segments);
