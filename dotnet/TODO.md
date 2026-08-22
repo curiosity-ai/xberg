@@ -320,11 +320,25 @@ file cannot hang extraction, and upstream simply has no deadline to match.
 This bounds every claim in this file, so read it before concluding anything about a failing
 fixture.
 
-`dotnet/tools/xberg-reference-gen/target/release/xberg-reference-gen` is dated **2026-08-12
+`dotnet/tools/xberg-reference-gen/target/release/xberg-reference-gen` was dated **2026-08-12
 16:44**, every golden is stamped 16:45, and **79 files under `crates/xberg/src` are newer than
-the binary**. It cannot be rebuilt in this container: `cargo build --release --offline` fails
-with `no matching package named 'mathemascii' found`, which is not vendored. So the goldens
-record what upstream did on 12 August, not what its source says today.
+the binary**. So the goldens record what upstream did on 12 August, not what its source says
+today.
+
+**This has now been settled empirically, not just argued.** `--offline` does fail on the
+unvendored `mathemascii`, but a plain `cargo build --release --locked` succeeds — it took 7m17s
+and fetched `html-to-markdown-rs` 3.11.2, which until then had never been vendored. Regenerating
+with the rebuilt binary:
+
+| fixture | committed golden | rebuilt binary |
+|---|---|---|
+| `epub/features.epub` | `\overset{⏞}` | `\overbrace` |
+| `html/sinthgunt.html` | — | does not reproduce |
+
+So both categories below are confirmed: the goldens genuinely predate current upstream, and this
+port matches the source rather than the snapshot. Note the hazard this creates — the binary in
+the tree is no longer the one that made the corpus, so a regeneration now would move every
+format at once.
 
 That makes one obvious-looking test worthless. Running the existing binary over a fixture and
 finding it reproduces the committed golden byte for byte proves only that the August binary still
@@ -337,7 +351,8 @@ A worked example of the difference it makes. `epub/features.epub` renders U+23DE
 identically, and the EPUB path reaches the same converter, so the port and *current* upstream
 agree — but commit `ec94d8c0bd` (16 August, "populate formulas for every format") postdates the
 golden. This is a third category: neither a port bug nor an upstream defect, but a golden the
-current source would not reproduce. It cannot be settled here.
+current source would not reproduce. Confirmed by the rebuild above: the fresh binary emits
+`\overbrace`, exactly as this port does.
 
 The same bound applies to the seven HTML fixtures. Their goldens are `html-to-markdown-rs`
 **3.10.6** output — the only version vendored — while the lock records 3.11.2. Porting against
