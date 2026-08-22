@@ -394,4 +394,40 @@ public class OoxmlTests
         // ...and the field contributes the value PowerPoint cached for it.
         Assert.Contains("2", texts);
     }
+
+    /// <summary>
+    /// Slide shapes are laid out top-to-bottom, and only a DrawingML <c>a:xfrm</c> counts as a
+    /// position. A <c>p:graphicFrame</c> writes <c>p:xfrm</c> instead, so a table reports no
+    /// position and sorts ahead of the body text that shares its row.
+    /// </summary>
+    [Fact]
+    public void Pptx_AGraphicFrameHasNoPositionAndLeadsItsRow()
+    {
+        const string slide =
+            "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" " +
+            "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p:cSld><p:spTree>" +
+            "<p:sp><p:nvSpPr><p:nvPr><p:ph type=\"title\"/></p:nvPr></p:nvSpPr>" +
+            "<p:spPr><a:xfrm><a:off x=\"100\" y=\"100\"/><a:ext cx=\"10\" cy=\"10\"/></a:xfrm></p:spPr>" +
+            "<p:txBody><a:p><a:r><a:t>Goals</a:t></a:r></a:p></p:txBody></p:sp>" +
+            "<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr>" +
+            "<p:spPr><a:xfrm><a:off x=\"100\" y=\"900\"/><a:ext cx=\"10\" cy=\"10\"/></a:xfrm></p:spPr>" +
+            "<p:txBody><a:p><a:r><a:t>Bullet text</a:t></a:r></a:p></p:txBody></p:sp>" +
+            "<p:graphicFrame><p:xfrm><a:off x=\"5000\" y=\"900\"/><a:ext cx=\"10\" cy=\"10\"/></p:xfrm>" +
+            "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/table\">" +
+            "<a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Cell</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl>" +
+            "</a:graphicData></a:graphic></p:graphicFrame>" +
+            "</p:spTree></p:cSld></p:sld>";
+
+        var pptx = Zip(
+            ("ppt/_rels/presentation.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
+            ("ppt/slides/slide1.xml", slide));
+
+        var doc = new PptxExtractor().Extract(pptx, PptxMime, new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        string plain = Derive.DeriveExtractionResult(doc, includeDocumentStructure: false, OutputFormat.Plain).Content;
+
+        Assert.True(plain.IndexOf("Cell", StringComparison.Ordinal)
+            < plain.IndexOf("Bullet text", StringComparison.Ordinal), plain);
+    }
 }

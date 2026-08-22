@@ -87,7 +87,16 @@ public sealed class HtmlWalker
     {
         if (pos + 1 >= src.Length) return false;
         char c = src[pos + 1];
-        return char.IsAsciiLetter(c) || c is '/' or '!' or '?';
+        // `</` and `<!` still need a name after them: `</=` and `<!5` are character data, not
+        // markup, and a page that writes them (quoted-printable mail cut mid-tag, say) must keep
+        // the text rather than lose everything up to the next `>`.
+        if (c == '/' || c == '!')
+        {
+            if (pos + 2 >= src.Length) return false;
+            char d = src[pos + 2];
+            return char.IsAsciiLetter(d) || (c == '!' && d == '-');
+        }
+        return char.IsAsciiLetter(c) || c == '?';
     }
 
     private void HandleText()
@@ -977,6 +986,10 @@ public sealed class HtmlWalker
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
             string key = attrs[ks..i];
+            // Nothing that can start a name here — a stray `=` or `/` between attributes. Step
+            // over that one character and look again; the `=` does not adopt what follows it as
+            // its value, so `<a =` + `href=…` still yields the href.
+            if (key.Length == 0) { i++; continue; }
             while (i < n && char.IsWhiteSpace(attrs[i])) i++;
             string? value = null;
             if (i < n && attrs[i] == '=')
@@ -998,7 +1011,6 @@ public sealed class HtmlWalker
                     value = attrs[vs..i];
                 }
             }
-            if (key.Length == 0) { i++; continue; }
             yield return (key, value);
         }
     }

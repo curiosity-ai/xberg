@@ -27,6 +27,11 @@ public sealed class EpubExtractor : IExtractor
 
     public int Priority => 60;
 
+    private static readonly string[] MarkupSwitchNamespaces =
+        { EpubContent.XhtmlNamespace, EpubContent.MathmlNamespace };
+
+    private static readonly string[] PlainSwitchNamespaces = { EpubContent.XhtmlNamespace };
+
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         byte[] bytes = content.ToArray();
@@ -60,6 +65,15 @@ public sealed class EpubExtractor : IExtractor
 
         var (spineDocuments, bodyWarnings) = EpubContent.ReadBodyDocuments(archive, package);
         processingWarnings.AddRange(bodyWarnings);
+
+        // `epub:switch` branches are resolved per renderer: the markup renderers draw MathML,
+        // the plain/structured path does not, so each selects a different branch (mod.rs, the
+        // MARKUP_SWITCH_NAMESPACES / PLAIN_SWITCH_NAMESPACES pair).
+        bool wantsMarkup = config.OutputFormat.Which is Core.OutputFormat.Kind.Markdown
+            or Core.OutputFormat.Kind.Djot;
+        string[] supportedNamespaces = wantsMarkup ? MarkupSwitchNamespaces : PlainSwitchNamespaces;
+        foreach (var spineDoc in spineDocuments)
+            spineDoc.Xhtml = EpubContent.ResolveEpubSwitchElements(spineDoc.Xhtml, supportedNamespaces);
 
         string? coverImagePath = package.Metadata.CoverImageHref;
         var doc = BuildInternalDocument(archive, spineDocuments, coverImagePath)

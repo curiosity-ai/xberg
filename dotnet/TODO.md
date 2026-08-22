@@ -10,8 +10,11 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2732 of 2787 comparable fixtures (98.0%) match on every hard dimension**; **0
-> catastrophes**; 1295 unit tests. The denominator is the fixtures Rust itself can extract —
+> **2755 of 2787 comparable fixtures (98.9%) match on every hard dimension**; **0
+> catastrophes**; 1401 unit tests. Only **seven** of the 32 failures are outside PDF, and six of
+> those are the flagged upstream defects; the seventh is `epub/features.epub`, whose golden
+> predates the converter it is measured against (traced below). The denominator is the fixtures
+> Rust itself can extract —
 > 155 of the 2,942 walked, it cannot, and counting those against this port measures nothing.
 > Measured on the whole corpus in one run, which is the only figure that means anything: a
 > per-format run validated the mime sniff on md and txt while it was quietly handing three PDFs
@@ -255,14 +258,27 @@ file cannot hang extraction, and upstream simply has no deadline to match.
      guarded on exactly that flag, so every `<dd>` body was accumulated and then discarded — the
      trace showed the term set and 263 characters buffered with the flag already false. The
      corpus now has **no content losses at all**.
-  2. U+23DE/U+23DF become `\overbrace`/`\underbrace` here where upstream keeps them literal
-     inside `\overset`/`\underset` — even though `over_script_command` (mathml.rs:932) does map
-     U+23DE. Upstream evidently does not reach that arm for this input; which arm it takes
-     instead is not yet established.
-  3. `\{` where upstream emits a bare `{` opening a matrix, so this port is TeX-escaping a brace
-     upstream leaves alone.
-  Plus a small over-extraction: an `epub:switch` branch this port renders and upstream does not.
-  Not a stale golden — regenerating it reproduces the committed file byte for byte.
+  2. ~~Over-extraction: an `epub:switch` branch this port renders and upstream does not.~~
+     **Closed.** `resolve_epub_switch_elements` (`extractors/epub/content.rs:215`, added
+     2026-08-01 in `b017ba20b8`) was simply unported. A switch keeps the first `epub:case` whose
+     `required-namespace` the renderer draws and cuts every other branch out of the markup by
+     byte range; the namespace set differs per renderer (`MARKUP_SWITCH_NAMESPACES` adds MathML,
+     `PLAIN_SWITCH_NAMESPACES` does not — `epub/mod.rs:38`), so plain and markdown legitimately
+     select different branches of the same switch. Ported as `EpubContent.
+     ResolveEpubSwitchElements`; the fixture's markdown dimension now matches.
+  3. **The two maths spellings are a stale golden, not a port bug**, and it is now traced. The
+     committed golden is the 2026-08-12 binary's output — re-running that binary over the fixture
+     reproduces its `content` byte for byte (only the `file`/`metadata` path fields differ) — and
+     commit **`ec94d8c0bd`** (2026-08-16, "populate formulas for every format") postdates it. At
+     `ec94d8c0bd^`, `MmlNode::Over` rendered unconditionally as `\overset{over}{base}`
+     (mathml.rs:380 of that revision) with no accent-command mapping at all, and
+     `math_symbols::render_run_text` had no structural escaping. That commit added
+     `over_script_command`/`under_script_command` — including `"\u{23DE}" => "\overbrace"`
+     (mathml.rs:932) and `"\u{23DF}" => "\underbrace"` (mathml.rs:941) — and
+     `push_mapped_char`'s `escape_tex_structural` (math_symbols.rs:101), which is what turns a
+     stretchy `<mo>{</mo>` into `\{`. This port reproduces *current* upstream on both counts, so
+     both must stay red until the goldens are regenerated. Do not "fix" either one.
+  Remaining: `plain`, `html` and `json` carry the two maths spellings above; `markdown` matches.
 - Four `.md` fixtures opening with an HTML comment (`ground_truth/pdf/160428551.md`,
   `french_minutes_vision.md`, `docling/md/2023-06-20-PV.md`, `docling.md`). Both implementations
   route them to the HTML extractor; the whole difference is **one leading space** — html gets
@@ -273,8 +289,31 @@ file cannot hang extraction, and upstream simply has no deadline to match.
   non-whitespace path, whose `skip_prefix` (`text_node.rs:162`) upstream computes with no
   is-empty check at all — so either `output` is non-empty on this side and empty upstream at
   that point, or the leading comment is consumed differently. Not settled.
-- `email-replace-mime-encodings-error-5.eml` — malformed MIME with no closed boundary.
-- `fake-email-multiple-attachments.msg` — PDF text quality inside an attachment.
+- ~~`email-replace-mime-encodings-error-5.eml` — malformed MIME with no closed boundary.~~
+  **Closed**, and it was a rule to port after all. `mail_parser`'s part decoders
+  (`parsers/mime.rs:56` `mime_part`, `decoders/quoted_printable.rs:94`) both return
+  `offset_end == usize::MAX` when a non-empty boundary never turns up before end of stream, and
+  `parsers/message.rs:243` treats that as an encoding problem: the encoding drops to `None` so
+  the part is re-read raw, its MIME type demotes from `TextHtml` to `TextOther` (text/plain
+  keeps its type), `is_inline` goes false and the boundary is cleared. The demoted type then
+  matches neither arm of the `MultipartAlternative` classifier at `:284`, so `add_to_html` and
+  `add_to_text` are both false and `:333` pushes the part onto `attachments` instead. Ported as
+  `MimePart.IsEncodingProblem`, set from the one `SplitBoundary` segment no boundary closed.
+  The attachment's raw byte count now matches the golden's `unnamed|text/html|7043` exactly.
+- ~~`fake-email-multiple-attachments.msg` — PDF text quality inside an attachment.~~ **Half
+  right, and the half that mattered was PPTX.** The hard dimensions failed on element *order*
+  inside `Engineering Onboarding.pptx`: `extraction/pptx/parser.rs:786` reads a shape's position
+  only from an `xfrm` **in the DrawingML namespace**, and a `p:graphicFrame` carries `p:xfrm`
+  instead — so upstream gives every table, chart and SmartArt frame the default `(0, 0)` and it
+  sorts to the top of its slide. This port matched `xfrm` by local name, found the real
+  coordinates, and put the slide's table after the body text that shares its row. Fixed in
+  `PptxReader.ExtractPosition`, and the slide sort is now stable (`sort_by_key` is;
+  `List.Sort` is not, and shapes with no position all share one key). Extracting that pptx
+  standalone and running the reference generator over it now matches byte for byte.
+  What is left is the soft `markdown`/`html` pair, and *that* is the PDF one: `dense_doc.pdf`
+  diverges at `theextractiveQAsetting` — upstream's markdown fuses the words this port keeps
+  apart, the same `segments_need_space` geometry difference documented for
+  `pdf/copy_protected.pdf` above, with the sides reversed.
 
 ### The goldens are frozen at 2026-08-12, and cannot be regenerated here
 
@@ -361,15 +400,16 @@ emits no `format` block at all for an empty PST.
 implementations route them to the HTML extractor and differ only in the fallback paragraph's
 whitespace — the output-format gap below. Two are the corpus-drift goldens above.
 
-**MathML → LaTeX, 2** (`odt/formula.odt`, `epub/features.epub`): `extraction/mathml.rs` is
-unported.
+**MathML → LaTeX, 0.** `extraction/mathml.rs` and `math_symbols.rs` are ported
+(`Internal/MathMarkup`); `odt/formula.odt` passes and `epub/features.epub`'s equations match
+current upstream. Its two remaining spellings are the stale golden traced above, not this.
 
 **Remaining singles**, each its own cause and none yet traced: `archives/documents.tar`,
 `archives/documents.tgz`, `docbook/docbook-reader.docbook`, `jats/sample_article.nxml`,
 `iwork/test.key`, `iwork/test.numbers`, `iwork/test.pages`, `ppt/simple.ppt`,
-`vendored/unstructured/eml/email-replace-mime-encodings-error-5.eml` (malformed MIME with no
-closed boundary), `vendored/unstructured/msg/fake-email-multiple-attachments.msg` (PDF text
-quality inside an attachment).
+`vendored/unstructured/eml/email-replace-mime-encodings-error-5.eml` and
+`vendored/unstructured/msg/fake-email-multiple-attachments.msg` (both traced and closed on every
+hard dimension — see "Every failing fixture, categorized" above).
 
 ## Known gaps after the merge
 
@@ -627,21 +667,23 @@ not a cosmetic difference.
       placeholder. `alt=""` is a deliberate "this image carries no meaning" and stays the empty
       string; treating it as absent put a column of `[Image]` through every marketing email.
 
-      The last one, `email-replace-mime-encodings-error-5.eml`, is malformed MIME recovery: no
-      boundary in it is ever closed with `--`, and `mail_parser` recovers by keeping the
-      `text/plain` alternative as the body and demoting the `text/html` one to an attachment,
-      where this port takes the HTML part. Not a rule to port — a difference in how two parsers
-      guess at a broken message.
+      **eml is 43/43 now.** The last one, `email-replace-mime-encodings-error-5.eml`, was
+      malformed MIME recovery, and it *is* a rule: `mail_parser` flags a part no boundary closes
+      as an encoding problem, re-reads it raw and demotes its type, which drops the `text/html`
+      alternative out of the body and onto `attachments` while the `text/plain` one stays the
+      message. Traced line by line in the fixture list above.
 - [x] **epub 5/9 → 8/9.** `<audio>`/`<video>` subtrees are stripped before conversion — they are
       delivery controls, and the conversion otherwise emits their source URLs and serialized
       fallback markup beside the prose. And a `<blockquote>` is recorded even though its contents
       are not inside it: the walker's nodes are flat, so the quote opens and closes at once and
       the quoted paragraph follows as a sibling (upstream #127).
-- [ ] **MathML → LaTeX (`extraction/mathml.rs`, ~1000 lines plus `math_symbols`).** Not ported.
-      It is what `odt/formula.odt` needs (`E=m\cdot c^{2}` where this port emits the concatenated
-      token text `E = m ⋅ c^2`), what `epub/features.epub`'s equation tests need, and what
-      `extractors/html.rs::recover_mathml_formulas` needs to recover a `<math>` subtree the
-      conversion library's structure has no node kind for.
+- [x] **MathML → LaTeX (`extraction/mathml.rs`, ~1000 lines plus `math_symbols`).** Ported.
+      `odt/formula.odt` reads `E=m\cdot c^{2}` and odt is 21/21. It also feeds
+      `recover_mathml_formulas`, which recovers a `<math>` subtree the conversion library's
+      structure has no node kind for. Note that the converter has moved since the goldens were
+      taken: `ec94d8c0bd` (2026-08-16) added the accent-command mapping and the TeX structural
+      escaping, so `epub/features.epub` reads `\overbrace`/`\{` where its golden — written four
+      days earlier — has `\overset{⏞}`/`{`. The port follows the source.
 - [x] **markdown tables (761/782 → 781).** A GFM table's header fixes its width; short rows are
       padded and long ones truncated, so a row's nth value stays under the nth heading.
 - [x] **AsciiDoc, ODP, WebVTT, Quarto, R Markdown.** Five formats that reached no extractor.

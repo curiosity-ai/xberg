@@ -83,4 +83,56 @@ public class EpubExtractorTests
         int quoted = doc.Elements.FindIndex(e => e.Text == "Quoted.");
         Assert.True(start >= 0 && end == start + 1 && quoted > end);
     }
+
+    private const string SwitchMarkup =
+        "<epub:switch xmlns:epub=\"http://www.idpf.org/2007/ops\">" +
+        "<epub:case required-namespace=\"http://www.w3.org/1998/Math/MathML\">" +
+        "<math xmlns=\"http://www.w3.org/1998/Math/MathML\"><mi>x</mi></math>" +
+        "</epub:case>" +
+        "<epub:default><p>Fallback.</p></epub:default>" +
+        "</epub:switch>";
+
+    /// <summary>
+    /// The plain path draws no MathML, so an <c>epub:case</c> asking for that namespace loses to
+    /// <c>epub:default</c> — and only the winning branch reaches the document.
+    /// </summary>
+    [Fact]
+    public void ASwitchCaseThePlainRendererCannotDrawSelectsTheDefault()
+    {
+        var doc = Extract("<p>Before.</p>" + SwitchMarkup, OutputFormat.Plain);
+
+        string text = string.Join("\n", doc.Elements.Select(e => e.Text));
+        Assert.Contains("Fallback.", text);
+        Assert.DoesNotContain("x", text.Replace("Before.", "").Replace("Fallback.", ""));
+    }
+
+    /// <summary>The markup renderers do draw MathML, so the case wins and the default is cut.</summary>
+    [Fact]
+    public void ASwitchCaseTheMarkupRendererCanDrawWinsOverTheDefault()
+    {
+        var doc = Extract("<p>Before.</p>" + SwitchMarkup, OutputFormat.Markdown);
+
+        string text = doc.PreRenderedContent ?? string.Join("\n", doc.Elements.Select(e => e.Text));
+        Assert.Contains("Before.", text);
+        Assert.DoesNotContain("Fallback.", text);
+    }
+
+    /// <summary>
+    /// A case whose required namespace no renderer claims is dropped whichever way the document
+    /// is rendered — a switch never emits two branches.
+    /// </summary>
+    [Fact]
+    public void AnUnknownRequiredNamespaceNeverReachesTheDocument()
+    {
+        var doc = Extract(
+            "<epub:switch xmlns:epub=\"http://www.idpf.org/2007/ops\">" +
+            "<epub:case required-namespace=\"http://example.invalid/ns\"><p>Unsupported.</p></epub:case>" +
+            "<epub:default><p>Supported.</p></epub:default>" +
+            "</epub:switch>",
+            OutputFormat.Plain);
+
+        string text = string.Join("\n", doc.Elements.Select(e => e.Text));
+        Assert.Contains("Supported.", text);
+        Assert.DoesNotContain("Unsupported.", text);
+    }
 }

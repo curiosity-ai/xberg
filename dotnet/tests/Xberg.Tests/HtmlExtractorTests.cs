@@ -834,4 +834,39 @@ public class HtmlExtractorTests
         Assert.Equal(1, Count(caption, "/c"));
         Assert.Equal(3, Count(caption, "/a"));
     }
+
+    // ── tag-open state and attribute recovery ───────────────────────────────
+    /// <summary>
+    /// `&lt;/` and `&lt;!` still need a name after them. A page cut mid-tag writes `&lt;/=` and
+    /// the text has to survive: read as markup it swallows everything up to the next `&gt;`.
+    /// </summary>
+    [Fact]
+    public void Html_AnEndTagWithNoNameIsCharacterData()
+    {
+        Assert.Equal("B</=\no:p>\n", HtmlToMarkdown.Convert("<p>B<o:p></=\no:p></p>"));
+        Assert.Equal("a <! b\n", HtmlToMarkdown.Convert("<p>a &lt;! b</p>"));
+    }
+
+    /// <summary>
+    /// A stray `=` between attributes is skipped one character at a time; it does not adopt the
+    /// next attribute as its value, so the `href` that follows it is still found.
+    /// </summary>
+    [Fact]
+    public void Html_AStrayEqualsBeforeAnAttributeDoesNotSwallowIt()
+    {
+        Assert.Equal("[x](y)\n", HtmlToMarkdown.Convert("<p><a =\nhref=y>x</a></p>"));
+        Assert.Equal("[x](y)\n", HtmlToMarkdown.Convert("<p><a href=\"y\">x</a></p>"));
+    }
+
+    /// <summary>
+    /// The serialized MathML in the comment carries resolved character references, but the four
+    /// characters that would change the markup's own shape go back out as references.
+    /// </summary>
+    [Fact]
+    public void Html_SerializedMathReEscapesTheStructuralCharacters()
+    {
+        string md = HtmlToMarkdown.Convert(
+            "<p><math><mo>&#x3E;</mo><mo>&amp;</mo><mo>&#x222B;</mo></math></p>");
+        Assert.Contains("<mo>&gt;</mo><mo>&amp;</mo><mo>∫</mo>", md);
+    }
 }

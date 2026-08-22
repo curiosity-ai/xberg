@@ -1773,14 +1773,47 @@ internal static class HtmlToMarkdown
     }
 
     /// <summary>
+    /// Re-escape a serialized text node: `&amp;`, a no-break space, `&lt;` and `&gt;` are written
+    /// back as references, everything else verbatim. Quotes are left alone.
+    /// </summary>
+    private static string EscapeSerializedText(string text)
+    {
+        int first = -1;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c == '&' || c == '<' || c == '>' || c == '\u00A0') { first = i; break; }
+        }
+        if (first < 0) return text;
+
+        var sb = new StringBuilder(text.Length + 8);
+        sb.Append(text, 0, first);
+        for (int i = first; i < text.Length; i++)
+        {
+            switch (text[i])
+            {
+                case '&': sb.Append("&amp;"); break;
+                case '\u00A0': sb.Append("&nbsp;"); break;
+                case '<': sb.Append("&lt;"); break;
+                case '>': sb.Append("&gt;"); break;
+                default: sb.Append(text[i]); break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
     /// Re-serialize an element and its subtree. A childless element closes itself with
     /// <c>&lt;tag /&gt;</c>, matching the crate's serializer.
     /// </summary>
     private static string SerializeElement(HNode node)
     {
         // Text is serialized with its character references already resolved, which is how the
-        // MathML in the comment comes out reading `⁡` rather than `&ApplyFunction;`.
-        if (node.Tag is null) return node.IsComment ? "" : HtmlWalker.DecodeEntitiesFull(node.Text);
+        // MathML in the comment comes out reading `⁡` rather than `&ApplyFunction;`, and then
+        // re-escaped: the four characters that would otherwise change the markup's shape go
+        // back out as references, so `&#x3E;` and a literal `>` both serialize as `&gt;`.
+        if (node.Tag is null)
+            return node.IsComment ? "" : EscapeSerializedText(HtmlWalker.DecodeEntitiesFull(node.Text));
 
         var sb = new StringBuilder(256);
         sb.Append('<').Append(node.Tag);
