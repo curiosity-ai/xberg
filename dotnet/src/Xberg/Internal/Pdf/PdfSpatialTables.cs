@@ -97,6 +97,15 @@ internal static partial class PdfSpatialTables
     private const double DottedMinSpan = 50.0;
     private const double DottedCoordSnap = 10.0;
     private const double LineAxisTol = 2.0;
+
+    /// <summary>Line/rect path count above which a page is a drawing, not a ruled table.</summary>
+    private const int MaxTableEdges = 1500;
+
+    /// <summary>Horizontal slack for the fragment consolidation's X-start and width match.</summary>
+    private const double FragmentMergeXTol = 2.0;
+
+    /// <summary>Vertical gap a pair of abutting fragments may leave between them.</summary>
+    private const double FragmentMergeYTol = 3.0;
     private const double SectionDividerWidthRatio = 0.80;
     private const double AdjacentTableMergeGap = 20.0;
     private const int MergeColDiffTolerance = 2;
@@ -232,11 +241,20 @@ internal static partial class PdfSpatialTables
         var result = new List<Table>();
         if (spans.Count == 0) return result;
 
+        // A page carrying thousands of line/rect paths is a drawing or a chart, not a ruled
+        // table; the collinear-join and intersection sweeps that follow are O(E²), and no real
+        // ruled table has more than a few hundred edges.
+        int edgeCount = 0;
+        foreach (var p in paths)
+            if (IsHorizontalLine(p, LineAxisTol) || IsVerticalLine(p, LineAxisTol) || IsRectangle(p))
+                edgeCount++;
+        if (edgeCount > MaxTableEdges) return result;
+
         var lines = new List<PdfPath>();
         foreach (var p in paths) if (p.IsTablePrimitive()) lines.Add(p);
         if (lines.Count == 0) return result;
 
-        var detected = DetectTablesWithLines(spans, lines, config);
+        var detected = ConsolidateAdjacentTableFragments(DetectTablesWithLines(spans, lines, config));
         foreach (var t in detected)
         {
             // document.rs applies the same prose-rejection filter this public API gets.
@@ -1025,6 +1043,62 @@ internal static partial class PdfSpatialTables
         }
         // Don't lose data when every slice came out too small.
         return result.Count == 0 ? single : result;
+    }
+
+    /// <summary>
+    /// Rejoin table fragments the line detector cut apart, before the grid-shape filters see
+    /// them. A table ruled between every pair of rows is emitted one row-strip at a time, and
+    /// each strip is too short to look like a grid; consolidated first, the whole table survives.
+    /// </summary>
+    private static List<GridTable> ConsolidateAdjacentTableFragments(List<GridTable> tables)
+    {
+        if (tables.Count < 2) return tables;
+
+        // Top of the page first: PDF y grows upward, so that is descending `Y + Height`.
+        var sorted = new List<GridTable>(tables);
+        Xberg.Internal.PdfOxide.Layout.OxSpanCompare.SortStable(sorted, (a, b) =>
+        {
+            double aTop = a.Bbox is { } ab ? ab.Y + ab.Height : double.NegativeInfinity;
+            double bTop = b.Bbox is { } bb ? bb.Y + bb.Height : double.NegativeInfinity;
+            return SafeCmp(bTop, aTop);
+        });
+
+        var consolidated = new List<GridTable>(sorted.Count);
+        foreach (var table in sorted)
+        {
+            if (consolidated.Count > 0
+                && CanMergeFragments(consolidated[^1], table, FragmentMergeXTol, FragmentMergeYTol))
+                MergeFragmentInto(consolidated[^1], table);
+            else consolidated.Add(table);
+        }
+        return consolidated;
+    }
+
+    private static bool CanMergeFragments(GridTable upper, GridTable lower, double xTol, double yTol)
+    {
+        if (upper.Bbox is not { } u || lower.Bbox is not { } l) return false;
+        if (upper.ColCount != lower.ColCount || upper.ColCount == 0) return false;
+        if (Math.Abs(u.X - l.X) > xTol) return false;
+        if (Math.Abs(u.Width - l.Width) > xTol) return false;
+
+        // `upper` sits above `lower`, so upper's bottom edge is its `Y` and lower's top edge is
+        // `Y + Height`. Ruling strokes have width, so the two may overlap slightly; only an
+        // overlap deeper than half the shorter fragment means these are not one table.
+        double gap = u.Y - (l.Y + l.Height);
+        if (gap > yTol) return false;
+        return -gap <= Math.Min(u.Height, l.Height) * 0.5;
+    }
+
+    private static void MergeFragmentInto(GridTable upper, GridTable lower)
+    {
+        if (upper.Bbox is { } ub && lower.Bbox is { } lb)
+        {
+            double x = Math.Min(ub.X, lb.X), y = Math.Min(ub.Y, lb.Y);
+            double right = Math.Max(ub.X + ub.Width, lb.X + lb.Width);
+            double top = Math.Max(ub.Y + ub.Height, lb.Y + lb.Height);
+            upper.Bbox = new PathRect(x, y, right - x, top - y);
+        }
+        upper.Rows.AddRange(lower.Rows);
     }
 
     private static void MergeVerticallyAdjacentTables(List<GridTable> tables)
