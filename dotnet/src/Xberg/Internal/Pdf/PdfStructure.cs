@@ -261,9 +261,12 @@ public static class PdfStructure
             // neighbouring segments — a trailing soft hyphen or control character left in place
             // would be read as ordinary text and change the decision.
             ApplyToAllSegments(paras, PdfTextRepair.RepairSegment);
+            DehyphenateParagraphs(paras);
+            SplitEmbeddedListItems(paras);
             SynchronizeParagraphTextMetadata(paras);
             MergeContinuationParagraphs(paras);
             SynchronizeParagraphTextMetadata(paras);
+            DemoteStructureAnnotationHeadings(paras);
             RetainPageFurnitureSafely(paras);
             allPageParagraphs.Add(paras);
         }
@@ -1187,6 +1190,243 @@ public static class PdfStructure
             para.Text = "";
             para.WordCount = ComputeWordCount("", para.Lines);
         }
+    }
+
+    /// <summary>Largest fraction of a paragraph's own right edge a line may fall short of and
+    /// still count as reaching the margin.</summary>
+    private const float FULL_LINE_FRACTION = 0.85f;
+
+    /// <summary>
+    /// Compounds whose hyphen is lexical and must survive a line break. A trailing ASCII hyphen
+    /// is otherwise indistinguishable from a discretionary wrap hyphen; matching whole pairs is
+    /// deliberately narrower than any prefix or suffix rule, so <c>soft-</c> + <c>ware</c> is
+    /// still rejoined.
+    /// </summary>
+    private static readonly (string Left, string Right)[] PRESERVED_LEXICAL_COMPOUNDS =
+    {
+        ("cost", "effective"), ("evidence", "based"), ("high", "level"), ("long", "term"),
+        ("low", "level"), ("real", "time"), ("short", "term"), ("state", "of-the-art"),
+        ("user", "defined"), ("well", "known"),
+    };
+
+    private static bool ShouldPreserveLexicalHyphen(string trailingWord, string leadingWord)
+    {
+        static string Trim(string s)
+        {
+            int start = 0, end = s.Length;
+            while (start < end && !char.IsLetterOrDigit(s[start]) && s[start] != '-') start++;
+            while (end > start && !char.IsLetterOrDigit(s[end - 1]) && s[end - 1] != '-') end--;
+            return s.Substring(start, end - start);
+        }
+        string left = Trim(trailingWord), right = Trim(leadingWord);
+        foreach (var (expectedLeft, expectedRight) in PRESERVED_LEXICAL_COMPOUNDS)
+            if (string.Equals(left, expectedLeft, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(right, expectedRight, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Rejoin words a line break split across a discretionary hyphen, at the segment level and
+    /// before the paragraphs are merged (Rust <c>dehyphenate_paragraphs</c>).
+    /// </summary>
+    /// <remarks>
+    /// The assembly layer already drops a wrap hyphen when it joins two lines' text, but that
+    /// happens too late for anything reading the segments themselves — the continuation and
+    /// list tests, and every downstream classifier — and it cannot move the second half of the
+    /// word onto the first. Here the halves are actually spliced: the trailing segment absorbs
+    /// the leading word and the following segment gives it up.
+    /// </remarks>
+    private static void DehyphenateParagraphs(List<PdfParagraph> paragraphs)
+    {
+        foreach (var para in paragraphs)
+        {
+            if (para.IsCodeBlock || para.Lines.Count < 2) continue;
+            DehyphenateParagraphLines(para);
+        }
+    }
+
+    private static void DehyphenateParagraphLines(PdfParagraph para)
+    {
+        float maxRightEdge = 0f;
+        foreach (var line in para.Lines)
+            foreach (var s in line.Segments)
+                maxRightEdge = Math.Max(maxRightEdge, s.X + s.Width);
+
+        // Without usable geometry every boundary is a candidate, gated on the hyphen alone.
+        float threshold = maxRightEdge > 0f ? maxRightEdge * FULL_LINE_FRACTION : float.NegativeInfinity;
+
+        for (int i = 0; i + 1 < para.Lines.Count; i++)
+        {
+            var trailingSegments = para.Lines[i].Segments;
+            var leadingSegments = para.Lines[i + 1].Segments;
+            if (trailingSegments.Count == 0 || leadingSegments.Count == 0) continue;
+
+            var trailingSeg = trailingSegments[^1];
+            if (maxRightEdge > 0f && trailingSeg.X + trailingSeg.Width < threshold) continue;
+
+            string trailingText = trailingSeg.Text;
+            if (trailingText.Length == 0 || !trailingText.EndsWith('-')) continue;
+            string leadingText = leadingSegments[0].Text;
+            if (leadingText.Length == 0) continue;
+
+            string leadingWord = FirstWhitespaceSeparatedWord(leadingText);
+            if (leadingWord.Length > 0 && char.IsUpper(leadingWord[0])) continue;
+
+            string trailingWord = LastWhitespaceSeparatedWord(trailingText.TrimEnd('-'));
+            if (trailingWord.Length > 0 && IsCjkChar(trailingWord[^1])) continue;
+
+            string preservedHyphen = ShouldPreserveLexicalHyphen(trailingWord, leadingWord) ? "-" : "";
+            string joinedWord = trailingWord + preservedHyphen + leadingWord;
+
+            // The characters dropped off the trailing segment are counted in UTF-8 bytes, as
+            // upstream counts them, so a word carrying multi-byte glyphs eats further back into
+            // the segment than its character count alone would.
+            int drop = System.Text.Encoding.UTF8.GetByteCount(trailingWord) + 1;
+            string withoutWord = drop >= trailingSeg.Text.Length
+                ? "" : trailingSeg.Text.Substring(0, trailingSeg.Text.Length - drop);
+            trailingSeg.Text = withoutWord + joinedWord;
+
+            var leadSeg = leadingSegments[0];
+            string rest = leadSeg.Text;
+            if (leadingWord.Length > 0)
+                while (rest.StartsWith(leadingWord, StringComparison.Ordinal))
+                    rest = rest.Substring(leadingWord.Length);
+            leadSeg.Text = rest.TrimStart();
+        }
+    }
+
+    /// <summary>
+    /// Break a body paragraph that swallowed a whole bullet list into the list items it is
+    /// made of (Rust <c>split_embedded_list_items</c>).
+    /// </summary>
+    /// <remarks>
+    /// A producer that draws its bullets as ordinary glyphs inside the running text leaves the
+    /// line grouper nothing to break on, so a five-item list arrives as one paragraph with five
+    /// bullet characters in the middle of it. Two bullets are required before the split fires,
+    /// because a single one is far more likely to be a mid-sentence separator than a list.
+    /// The pieces are rebuilt from text alone and carry no geometry, which is why the pass runs
+    /// after everything that measures the page.
+    /// </remarks>
+    private static void SplitEmbeddedListItems(List<PdfParagraph> paragraphs)
+    {
+        var old = new List<PdfParagraph>(paragraphs);
+        paragraphs.Clear();
+        foreach (var para in old)
+        {
+            if (para.HeadingLevel is not null || para.IsListItem || para.IsCodeBlock || para.IsFormula)
+            {
+                paragraphs.Add(para);
+                continue;
+            }
+
+            var pieces = new List<string>();
+            foreach (var line in para.Lines)
+                foreach (var seg in line.Segments)
+                    pieces.Add(seg.Text);
+            string fullText = string.Join(" ", pieces);
+
+            int bulletCount = 0;
+            foreach (var c in fullText) if (c is '\u2022' or '\u00B7') bulletCount++;
+            if (bulletCount < 2) { paragraphs.Add(para); continue; }
+
+            float fontSize = para.DominantFontSize;
+            bool isBold = para.IsBold;
+
+            var parts = fullText.Split('\u2022', '\u00B7');
+            // A UTF-8 bullet mis-decoded as Latin-1 leaves its lead byte stranded beside the
+            // marker; strip it where it lands rather than letting it open a list item.
+            string before = parts[0].Trim().TrimEnd('\u00C2').Trim();
+            if (before.Length > 0) paragraphs.Add(TextToParagraph(before, fontSize, isBold, false));
+            for (int i = 1; i < parts.Length; i++)
+            {
+                string itemText = parts[i].Trim().TrimStart('\u00C2').TrimEnd('\u00C2').Trim();
+                if (itemText.Length > 0) paragraphs.Add(TextToParagraph(itemText, fontSize, isBold, true));
+            }
+        }
+    }
+
+    /// <summary>A paragraph built from text alone: one zero-geometry segment per word.</summary>
+    private static PdfParagraph TextToParagraph(string text, float fontSize, bool isBold, bool isListItem)
+    {
+        var segments = new List<SegmentData>();
+        foreach (var word in text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            segments.Add(new SegmentData { Text = word, FontSize = fontSize, IsBold = isBold });
+
+        var lines = new List<PdfLine>
+        {
+            new PdfLine { Segments = segments, BaselineY = 0f, DominantFontSize = fontSize, IsBold = isBold },
+        };
+        return new PdfParagraph
+        {
+            Text = "",
+            Lines = lines,
+            DominantFontSize = fontSize,
+            IsBold = isBold,
+            IsListItem = isListItem,
+            WordCount = ComputeWordCount("", lines),
+        };
+    }
+
+    /// <summary>Structure-tree heading tags that were really parameter metadata.</summary>
+    private static readonly string[] SAL_DIRECTION_PREFIXES =
+    {
+        "__deref__inout", "__deref__out", "__deref__in", "__inout", "__out", "__in",
+    };
+
+    private static readonly string[] SAL_DIRECTION_MODIFIERS =
+    {
+        "opt", "ecount", "bcount", "full", "part", "z", "nz",
+    };
+
+    /// <summary>
+    /// Demote a heading whose whole text is a source-annotation direction such as
+    /// <c>__in</c> or <c>__out_ecount_opt(n)</c> (Rust
+    /// <c>demote_structure_annotation_headings</c>).
+    /// </summary>
+    /// <remarks>
+    /// A tagged API reference sometimes tags these annotations as headings. They are parameter
+    /// metadata, not document structure. The test is deliberately narrow — the whole paragraph
+    /// must be one annotation — and a code block keeps its classification.
+    /// </remarks>
+    private static void DemoteStructureAnnotationHeadings(List<PdfParagraph> paragraphs)
+    {
+        foreach (var para in paragraphs)
+        {
+            if (para.HeadingLevel is null || para.IsCodeBlock) continue;
+            if (IsSalDirectionAnnotation(ParagraphPlainText(para).Trim())) para.HeadingLevel = null;
+        }
+    }
+
+    private static bool IsSalDirectionAnnotation(string text)
+    {
+        string basePart;
+        int open = text.IndexOf('(');
+        if (open >= 0)
+        {
+            if (!text.EndsWith(')')) return false;
+            string arguments = text.Substring(open + 1, text.Length - open - 2);
+            if (arguments.Length == 0) return false;
+            foreach (var c in arguments)
+                if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != ',') return false;
+            basePart = text.Substring(0, open);
+        }
+        else basePart = text;
+
+        foreach (var prefix in SAL_DIRECTION_PREFIXES)
+        {
+            if (!basePart.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            string suffix = basePart.Substring(prefix.Length);
+            if (suffix.Length == 0) return true;
+            if (suffix[0] != '_') continue;
+            string modifiers = suffix.Substring(1);
+            if (modifiers.Length == 0) continue;
+            bool allKnown = true;
+            foreach (var modifier in modifiers.Split('_'))
+                if (Array.IndexOf(SAL_DIRECTION_MODIFIERS, modifier) < 0) { allKnown = false; break; }
+            if (allKnown) return true;
+        }
+        return false;
     }
 
     private static void MergeContinuationParagraphs(List<PdfParagraph> paragraphs)
