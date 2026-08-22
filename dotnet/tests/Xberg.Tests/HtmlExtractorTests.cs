@@ -43,6 +43,41 @@ public class HtmlExtractorTests
         Assert.Equal("x\n\nAA\n", HtmlToMarkdown.Convert("<!-- c -->\n\n<div>x</div>\n\nAA\n"));
     }
 
+    // ── astral-tl tokenizer shape (parser/base.rs) ───────────────────────────
+    [Fact]
+    public void Html_QuoteInAnAttributeNameDoesNotSwallowTheTag()
+    {
+        // A quote opens an attribute VALUE only right after an attribute name's `=`. Elsewhere
+        // — here in the name `y"` — it is an ordinary character, so the tag still ends at its
+        // own `>` instead of running to the next quote in the document.
+        Assert.Equal("A **z** C\n", HtmlToMarkdown.Convert("A <b x=\"1\" y\">z</b> C"));
+
+        // The PDF shape this was found on: an XML listing whose attribute names carry stray
+        // quotes. Treating each quote as a delimiter hid the tag's `>` and lost every line
+        // between it and the next quote.
+        Assert.Equal("A KEEPME\nEND\n",
+            HtmlToMarkdown.Convert("A <KSHIM NAME=\"a\" B}\">\nKEEPME\nEND"));
+    }
+
+    [Fact]
+    public void Html_ProcessingInstructionIsCharacterDataNotMarkup()
+    {
+        // `parse_tag` steps over the `<`, finds no identifier after it and gives up, leaving the
+        // rest of the instruction to be read as text rather than skipped to the next `>`.
+        Assert.Equal("?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\nHello\n",
+            HtmlToMarkdown.Convert("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<html><body><p>Hello</p></body></html>"));
+    }
+
+    [Fact]
+    public void Html_StartTagNameEndsAtTheFirstNonIdentifierCharacter()
+    {
+        // `read_ident` stops at `.`, so this is a `p` element with junk attributes — and it
+        // still breaks the paragraph. Splitting the name on whitespace instead would name the
+        // element `p."x"`, which matches nothing and emits no break.
+        Assert.Equal("head\n\ntail\n", HtmlToMarkdown.Convert("head <p.\"x\"> tail"));
+    }
+
     private static InternalDocument Docbook(string xml) =>
         new DocbookExtractor().Extract(Encoding.UTF8.GetBytes(xml), "application/docbook+xml", new ExtractionConfig());
 

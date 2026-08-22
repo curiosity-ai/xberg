@@ -3146,8 +3146,17 @@ internal static class HtmlDom
                 pos = end < 0 ? n : end + 3;
                 continue;
             }
-            // doctype / PI
-            if (pos + 1 < n && (src[pos + 1] == '!' || src[pos + 1] == '?'))
+            // A processing instruction is not markup to the reference parser. `parse_tag`
+            // (astral-tl `parser/base.rs`) steps over the `<`, finds no identifier after it and
+            // gives up, leaving the stream just past the `<` — so `?xml version="1.0"?>` comes
+            // back out as character data rather than being swallowed to the next `>`.
+            if (pos + 1 < n && src[pos + 1] == '?')
+            {
+                pos++;
+                continue;
+            }
+            // doctype
+            if (pos + 1 < n && src[pos + 1] == '!')
             {
                 int gtd = src.IndexOf('>', pos);
                 pos = gtd < 0 ? n : gtd + 1;
@@ -3163,7 +3172,11 @@ internal static class HtmlDom
             string content = isClosing ? tagContent[1..] : tagContent;
             bool selfClosing = content.TrimEnd().EndsWith('/');
             content = content.TrimEnd('/').Trim();
-            var (name, attrs) = HtmlWalker.SplitTagName(content);
+            // An END tag is `read_end` in astral-tl: the whole slice up to `>` is the name.
+            // A START tag is `read_ident`, which stops at the first non-identifier byte.
+            var (name, attrs) = isClosing
+                ? HtmlWalker.SplitTagName(content)
+                : SplitIdentTagName(content);
             string tag = name.ToLowerInvariant();
             if (tag.Length == 0) continue;
 
@@ -3281,22 +3294,97 @@ internal static class HtmlDom
         return root;
     }
 
-    // Find the '>' terminating a tag, honoring quoted attribute values.
+    /// <summary>
+    /// Find the <c>&gt;</c> terminating the tag that opens at <paramref name="lt"/>, or -1.
+    /// </summary>
+    /// <remarks>
+    /// Ported from astral-tl's <c>parse_tag</c> / <c>parse_attributes</c> / <c>read_end</c>
+    /// (<c>src/parser/base.rs</c>), the tokenizer the reference converter parses with. The rule
+    /// that matters here is positional: a quote opens an attribute VALUE only where a value may
+    /// start — immediately after an attribute name's <c>=</c>, past any spaces or newlines.
+    /// A <c>"</c> anywhere else is an ordinary character. Treating every quote as a delimiter
+    /// instead lets one stray quote in an attribute NAME — <c>&lt;KSHIM NAME="a" B}"&gt;</c> in a
+    /// PDF's XML listing — hide the tag's own <c>&gt;</c> and swallow the document up to the next
+    /// quote, which is text loss rather than a mis-parse.
+    /// </remarks>
     private static int FindTagEnd(string src, int lt)
     {
-        int i = lt + 1;
-        char quote = '\0';
-        while (i < src.Length)
+        int n = src.Length;
+
+        // `read_end`: an end tag runs to the next `>`; it parses no attributes and honours no
+        // quotes.
+        if (lt + 1 < n && src[lt + 1] == '/') return src.IndexOf('>', lt + 1);
+
+        int i = SkipTagSpace(src, lt + 1);
+        i = SkipIdent(src, i);                    // `read_ident`: the tag name
+
+        // `parse_attributes`
+        while (i < n)
         {
-            char c = src[i];
-            if (quote != '\0')
+            i = SkipTagSpace(src, i);
+            if (i >= n) return -1;
+            if (src[i] is '/' or '>') break;      // `is_closing`
+
+            int nameEnd = SkipIdent(src, i);
+            if (nameEnd == i) { i++; continue; }  // no identifier here — skip the character
+
+            i = SkipTagSpace(src, nameEnd);
+            if (i >= n || src[i] != '=') continue;   // a valueless attribute
+            i = SkipTagSpace(src, i + 1);
+            if (i >= n) return -1;
+
+            char quote = src[i];
+            if (quote is '"' or '\'')
             {
-                if (c == quote) quote = '\0';
+                int close = src.IndexOf(quote, i + 1);
+                i = close < 0 ? n : close;        // `read_to` stops ON the closing quote
             }
-            else if (c is '"' or '\'') quote = c;
-            else if (c == '>') return i;
-            i++;
+            else
+            {
+                // `read_to3([b' ', b'\n', b'>'])`: an unquoted value ends at a space, a
+                // newline or the tag's own `>`.
+                while (i < n && src[i] is not (' ' or '\n' or '>')) i++;
+            }
+
+            // "Only advance past the delimiter if we read a value."
+            if (i < n && src[i] is not ('/' or '>')) i++;
         }
-        return -1;
+
+        if (i < n && src[i] == '/') i++;          // `is_self_closing`
+        return i < n && src[i] == '>' ? i : -1;
     }
+
+    /// <summary>
+    /// Split a start tag's source into its element name and the rest, following astral-tl's
+    /// <c>read_ident</c>: the name is the leading run of identifier bytes, not everything up to
+    /// the first space. A PDF hex dump whose ASCII column renders as <c>&lt;p..."</c> is a
+    /// <c>p</c> element carrying junk attributes to the reference parser; splitting on whitespace
+    /// instead names the element <c>p..."</c>, which matches nothing and drops the block break
+    /// the paragraph carries.
+    /// </summary>
+    private static (string Name, string Attrs) SplitIdentTagName(string content)
+    {
+        int end = SkipIdent(content, 0);
+        return (content[..end], content[end..]);
+    }
+
+    /// <summary>astral-tl's <c>skip_whitespaces</c>: spaces and newlines only.</summary>
+    private static int SkipTagSpace(string src, int i)
+    {
+        while (i < src.Length && src[i] is ' ' or '\n') i++;
+        return i;
+    }
+
+    /// <summary>
+    /// astral-tl's <c>read_ident</c> run (<c>util::is_ident</c>): ASCII alphanumerics plus
+    /// <c>- _ : + /</c>.
+    /// </summary>
+    private static int SkipIdent(string src, int i)
+    {
+        while (i < src.Length && IsIdent(src[i])) i++;
+        return i;
+    }
+
+    private static bool IsIdent(char c) =>
+        char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or ':' or '+' or '/';
 }
