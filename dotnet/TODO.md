@@ -224,8 +224,16 @@ file cannot hang extraction, and upstream simply has no deadline to match.
 - `epub/features.epub` — U+23DE/U+23DF become `\overbrace`/`\underbrace` here where upstream
   keeps them literal inside `\overset`/`\underset`. Confirmed a port divergence, not a stale
   golden: regenerating that golden reproduces the committed file byte for byte.
-- Four `.md` fixtures opening with an HTML comment — both implementations route them to the HTML
-  extractor and differ only in the fallback paragraph's whitespace.
+- Four `.md` fixtures opening with an HTML comment (`ground_truth/pdf/160428551.md`,
+  `french_minutes_vision.md`, `docling/md/2023-06-20-PV.md`, `docling.md`). Both implementations
+  route them to the HTML extractor; the whole difference is **one leading space** — html gets
+  `<p> # tidylog…` where upstream has `<p># tidylog…`, and plain gains one blank first line.
+  Narrowed: the whitespace-only-node guard in `converter/text_node.rs:80` (`had_newlines` and
+  `output.is_empty()` → emit nothing) *is* ported correctly, and does not apply here because the
+  node is `\n\n# tidylog…`, not whitespace-only. The prefix space therefore comes from the
+  non-whitespace path, whose `skip_prefix` (`text_node.rs:162`) upstream computes with no
+  is-empty check at all — so either `output` is non-empty on this side and empty upstream at
+  that point, or the leading comment is consumed differently. Not settled.
 - `email-replace-mime-encodings-error-5.eml` — malformed MIME with no closed boundary.
 - `fake-email-multiple-attachments.msg` — PDF text quality inside an attachment.
 
