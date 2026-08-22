@@ -35,20 +35,26 @@ public static class XlsxReader
         var sheetNames = ReadSheetOrder(pkg);
         var shared = ReadSharedStrings(pkg);
 
-        foreach (var (name, target) in sheetNames)
+        foreach (var (name, target, _) in sheetNames)
         {
             var sheet = ProcessSheet(pkg, name, target, shared);
             wb.Sheets.Add(sheet);
+            if (CollectSheetFormulas(pkg, target) is { } formulas) wb.Metadata[$"formulas_{name}"] = formulas;
         }
 
+        if (ReadDefinedNames(pkg) is { } definedNames) wb.Metadata["defined_names"] = definedNames;
+
         ExtractMetadata(pkg, wb, sheetNames.Select(s => s.Name).ToList(), officeMetadata);
+
+        var hidden = sheetNames.Where(s => s.Hidden).Select(s => s.Name).ToList();
+        if (hidden.Count > 0) wb.Metadata["hidden_sheets"] = string.Join(", ", hidden);
         return wb;
     }
 
     // ── workbook.xml: ordered (sheet name → worksheet part path) ───────────────
-    private static List<(string Name, string Target)> ReadSheetOrder(OoxmlPackage pkg)
+    private static List<(string Name, string Target, bool Hidden)> ReadSheetOrder(OoxmlPackage pkg)
     {
-        var result = new List<(string, string)>();
+        var result = new List<(string, string, bool)>();
         var wbXml = pkg.ReadXml("xl/workbook.xml");
         if (wbXml?.Root is null) return result;
 
@@ -72,7 +78,10 @@ public static class XlsxReader
             string target = "";
             if (rid is not null && rels.TryGetValue(rid, out var t))
                 target = ResolveXlPath(t);
-            result.Add((name, target));
+            // A sheet's own content says nothing about its visibility; only the workbook's
+            // sheet list does, through `state`.
+            string state = s.Attributes().FirstOrDefault(a => a.Name.LocalName == "state")?.Value ?? "visible";
+            result.Add((name, target, !string.Equals(state, "visible", StringComparison.OrdinalIgnoreCase)));
         }
         return result;
     }
@@ -105,6 +114,85 @@ public static class XlsxReader
     }
 
     // ── worksheet → ExcelSheet ─────────────────────────────────────────────────
+    /// <summary>Entries a single sheet contributes to workbook metadata before it is truncated.</summary>
+    private const int MaxMetadataEntriesPerSheet = 200;
+
+    /// <summary>
+    /// A sheet's formulas as <c>cell=formula</c> entries.
+    /// </summary>
+    /// <remarks>
+    /// The cell reference is relative to the top-left of the block of cells that carry formulas,
+    /// not to the sheet: a lone formula anywhere on a sheet is reported as <c>A1</c>. That is
+    /// what the reference implementation's formula range gives, and the entries are a summary of
+    /// what the sheet computes rather than a map of where.
+    /// </remarks>
+    private static string? CollectSheetFormulas(OoxmlPackage pkg, string target)
+    {
+        if (target.Length == 0) return null;
+        var xml = pkg.ReadXml(target);
+        var sheetData = xml?.Root?.Elements().FirstOrDefault(e => e.Name.LocalName == "sheetData");
+        if (sheetData is null) return null;
+
+        var found = new List<(int Row, int Col, string Formula)>();
+        int autoRow = 0;
+        foreach (var row in sheetData.Elements().Where(e => e.Name.LocalName == "row"))
+        {
+            int rowIdx = ParseRowIndex(row) ?? autoRow;
+            autoRow = rowIdx + 1;
+            int autoCol = 0;
+            foreach (var c in row.Elements().Where(e => e.Name.LocalName == "c"))
+            {
+                int colIdx = ParseColIndex(c) ?? autoCol;
+                autoCol = colIdx + 1;
+                var f = c.Elements().FirstOrDefault(e => e.Name.LocalName == "f");
+                if (f is null) continue;
+                string formula = f.Value;
+                if (formula.Length == 0) continue;
+                found.Add((rowIdx, colIdx, formula));
+            }
+        }
+        if (found.Count == 0) return null;
+
+        int rowOrigin = found.Min(e => e.Row);
+        int colOrigin = found.Min(e => e.Col);
+        var entries = found
+            .Take(MaxMetadataEntriesPerSheet)
+            .Select(e => $"{CellReference(e.Row - rowOrigin, e.Col - colOrigin)}={e.Formula}");
+        return string.Join("; ", entries);
+    }
+
+    /// <summary>The workbook's defined names as <c>name=formula</c> entries.</summary>
+    private static string? ReadDefinedNames(OoxmlPackage pkg)
+    {
+        var wbXml = pkg.ReadXml("xl/workbook.xml");
+        var block = wbXml?.Root?.Elements().FirstOrDefault(e => e.Name.LocalName == "definedNames");
+        if (block is null) return null;
+
+        var entries = block.Elements()
+            .Where(e => e.Name.LocalName == "definedName")
+            .Select(e => (Name: e.Attribute("name")?.Value ?? "", Formula: e.Value))
+            .Where(e => e.Name.Length != 0)
+            .Select(e => $"{e.Name}={e.Formula}")
+            .ToList();
+        return entries.Count == 0 ? null : string.Join("; ", entries);
+    }
+
+    /// <summary>A zero-based row and column as a spreadsheet cell reference, "A1".</summary>
+    private static string CellReference(int row, int col) => ColumnLetters(col) + (row + 1).ToString(CultureInfo.InvariantCulture);
+
+    private static string ColumnLetters(int col)
+    {
+        var letters = new StringBuilder();
+        int n = col;
+        while (true)
+        {
+            letters.Insert(0, (char)('A' + n % 26));
+            n = n / 26 - 1;
+            if (n < 0) break;
+        }
+        return letters.ToString();
+    }
+
     private static ExcelSheet ProcessSheet(OoxmlPackage pkg, string name, string target, List<string> shared)
     {
         var cellsByPos = new Dictionary<(int Row, int Col), string>();

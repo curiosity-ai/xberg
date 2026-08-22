@@ -90,6 +90,23 @@ public sealed class CfbOfficeTests
         Assert.Contains("Title Slide", text);
     }
 
+    [Fact]
+    public void PptNumbersSlidesFromDeckStructure()
+    {
+        byte[]? bytes = Read("ppt/simple.ppt");
+        if (bytes is null) return;
+
+        var doc = new PptExtractor().Extract(bytes, "application/vnd.ms-powerpoint", new ExtractionConfig());
+        // Two RT_SLIDE containers in the deck, so two slide elements numbered in persist order --
+        // not one run-together block from re-splitting the rendered text.
+        var slides = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Slide).ToList();
+        Assert.Equal(2u, doc.Metadata.Pages.TotalCount);
+        Assert.Equal(new uint[] { 1u, 2u }, slides.Select(e => e.Kind.Number).ToArray());
+        Assert.Equal(new[] { "Title Slide", "Things to think about" }, slides.Select(e => e.Text).ToArray());
+        // The deck's notes containers hold no text, so no notes footnote is emitted.
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.FootnoteDefinition);
+    }
+
     // ── Xls (BIFF) ───────────────────────────────────────────────────────────────
 
     [Fact]

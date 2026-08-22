@@ -25,6 +25,8 @@ public enum MdEventKind
     InlineMath, DisplayMath,
     StartSuperscript, EndSuperscript,
     StartSubscript, EndSubscript,
+    StartDefinitionListTitle, EndDefinitionListTitle,
+    StartDefinitionListDefinition, EndDefinitionListDefinition,
 }
 
 public struct MdEvent
@@ -80,7 +82,7 @@ public static class MarkdownParser
                     inFence = false;
                 continue;
             }
-            if (indent <= 3 && (ts.StartsWith("```") || ts.StartsWith("~~~")))
+            if (indent <= 3 && IsCodeFence(ts))
             {
                 fenceChar = ts[0];
                 fenceLen = ts.TakeWhile(c => c == fenceChar).Count();
@@ -197,6 +199,10 @@ public static class MarkdownParser
     {
         int i = lo;
         int stuckAt = -1;
+        // A thematic break is the one block that leaves no event behind, so the paragraph before
+        // it would still look like the last thing emitted. pulldown sees the rule node and will
+        // not read a following `:` as a definition marker; this flag stands in for that node.
+        bool ruleSinceParagraph = false;
         while (i < hi)
         {
             // Strict-progress safety net: if a full iteration ever returns to the top without
@@ -232,6 +238,16 @@ public static class MarkdownParser
                 continue;
             }
 
+            // Definition list (pulldown-cmark ENABLE_DEFINITION_LIST). A `:` at the start of a
+            // line turns the paragraph before it into the term, and opens a definition; further
+            // `:` lines add further definitions to the same list.
+            if (indent <= 3 && trimmedStart.StartsWith(":", StringComparison.Ordinal)
+                && !ruleSinceParagraph && TryOpenDefinition(ev))
+            {
+                i = ParseDefinition(lines, i, hi, ev, indent);
+                continue;
+            }
+
             // Indented code block (>= 4 spaces of indentation). Cannot interrupt a paragraph,
             // and we are at a block boundary here.
             if (indent >= 4 || (line.Length > 0 && line[0] == '\t'))
@@ -257,7 +273,7 @@ public static class MarkdownParser
             }
 
             // Fenced code block
-            if (indent <= 3 && (trimmedStart.StartsWith("```") || trimmedStart.StartsWith("~~~")))
+            if (indent <= 3 && IsCodeFence(trimmedStart))
             {
                 char fenceChar = trimmedStart[0];
                 int fenceLen = 0;
@@ -272,14 +288,23 @@ public static class MarkdownParser
                 {
                     string cl = lines[i];
                     string cls = cl.TrimStart();
-                    if (cls.Length >= fenceLen && cls.Take(fenceLen).All(c => c == fenceChar) &&
-                        cls.Substring(fenceLen).Trim().Length == 0)
+                    // A closing fence takes at most three spaces of indentation. A fourth makes
+                    // the line code content, not a fence, so a block closed that way runs on —
+                    // which is the whole point of the rule, and what the document actually says.
+                    int closeIndent = cl.Length - cls.Length;
+                    if (closeIndent <= 3 && cls.Length >= fenceLen
+                        && cls.Take(fenceLen).All(c => c == fenceChar)
+                        && cls.Substring(fenceLen).Trim().Length == 0)
                     {
                         closed = true;
                         i++;
                         break;
                     }
-                    code.Append(cl).Append('\n');
+                    // Content lines lose the opening fence's indentation, and only that much: the
+                    // fence's own position is not part of the code, but any deeper indentation is.
+                    int strip = 0;
+                    while (strip < indent && strip < cl.Length && cl[strip] == ' ') strip++;
+                    code.Append(cl, strip, cl.Length - strip).Append('\n');
                     i++;
                 }
                 _ = closed;
@@ -298,6 +323,7 @@ public static class MarkdownParser
                     string content = trimmedStart.Substring(h).Trim();
                     // Strip optional closing sequence of #'s.
                     content = StripAtxClosing(content);
+                    content = StripHeadingAttributeBlock(content);
                     ev.Add(new MdEvent { Kind = MdEventKind.StartHeading, Level = (byte)h, Text = "", Url = "" });
                     ParseInlines(content, ev);
                     ev.Add(MdEvent.Simple(MdEventKind.EndHeading));
@@ -310,6 +336,7 @@ public static class MarkdownParser
             if (indent <= 3 && IsThematicBreak(trimmedStart))
             {
                 i++;
+                ruleSinceParagraph = true;
                 continue;
             }
 
@@ -320,7 +347,11 @@ public static class MarkdownParser
                 int newI = TryHtmlBlock(lines, i, hi);
                 if (newI > i)
                 {
-                    ev.Add(MdEvent.WithText(MdEventKind.Html, string.Join("\n", lines.GetRange(i, newI - i))));
+                    // One event per line, as pulldown-cmark emits them. The extractor records
+                    // each as its own raw block, so a `<details>` wrapper and the `<summary>` it
+                    // contains stay separate rather than fusing into one indented run.
+                    for (int h = i; h < newI; h++)
+                        ev.Add(MdEvent.WithText(MdEventKind.Html, lines[h]));
                     i = newI; continue;
                 }
             }
@@ -344,7 +375,16 @@ public static class MarkdownParser
                     else if (IsBlank(bl)) break;
                     else { inner.Add(bl); j++; } // lazy continuation
                 }
-                ev.Add(MdEvent.Simple(MdEventKind.StartBlockQuote));
+                // GFM alert (`> [!NOTE]`): the tag is scanned straight after the quote marker and
+                // must be alone on that line, which it then consumes (pulldown-cmark's
+                // `scan_blockquote_tag`, reached only under ENABLE_GFM).
+                string alert = "";
+                if (inner.Count > 0 && AlertKind(inner[0]) is string alertKind)
+                {
+                    alert = alertKind;
+                    inner.RemoveAt(0);
+                }
+                ev.Add(MdEvent.WithText(MdEventKind.StartBlockQuote, alert));
                 ParseBlocks(inner, 0, inner.Count, ev);
                 ev.Add(MdEvent.Simple(MdEventKind.EndBlockQuote));
                 i = j;
@@ -374,37 +414,58 @@ public static class MarkdownParser
                 int pind = pl.Length - pts.Length;
                 if (paraLines.Count > 0)
                 {
-                    // Paragraph interruption rules (simplified).
-                    if (pind <= 3 && (pts.StartsWith("#") || pts.StartsWith("```") || pts.StartsWith("~~~")
-                        || pts.StartsWith(">") || IsThematicBreak(pts)))
-                        break;
-                    if (pind <= 3 && pts.StartsWith("<") && TryHtmlBlock(lines, i, hi) > i)
-                        break;
-                    // A GFM table interrupts a paragraph when the current line is a header row
-                    // immediately followed by a valid delimiter row.
-                    if (pind <= 3 && pl.Contains('|') && i + 1 < hi && IsTableStart(pl, lines[i + 1]))
-                        break;
-                    // A list item can interrupt a paragraph (bullets always; ordered only when
-                    // starting at 1), provided the item is non-empty.
-                    if (pind <= 3 && TryListMarker(pts, out bool po, out int pml))
+                    // A setext underline turns everything gathered so far into a heading, and is
+                    // tested before the interruption rules: a line of `---` after paragraph
+                    // content is an underline, not the thematic break it would be on its own.
+                    if (pind <= 3 && SetextLevel(pts) is byte setextLevel)
                     {
-                        bool interrupts = pts.Substring(pml).Trim().Length > 0;
-                        if (interrupts && po)
-                        {
-                            int d = 0; while (d < pts.Length && char.IsDigit(pts[d])) d++;
-                            interrupts = d > 0 && int.TryParse(pts.Substring(0, d), out int num) && num == 1;
-                        }
-                        if (interrupts) break;
+                        i++;
+                        ev.Add(new MdEvent { Kind = MdEventKind.StartHeading, Level = setextLevel, Text = "", Url = "" });
+                        ParseInlines(StripHeadingAttributeBlock(JoinInline(paraLines)), ev);
+                        ev.Add(MdEvent.Simple(MdEventKind.EndHeading));
+                        paraLines.Clear();
+                        break;
                     }
+
+                    if (InterruptsParagraph(lines, i, hi)) break;
                 }
                 paraLines.Add(pl);
                 i++;
             }
+            if (paraLines.Count == 0) continue;
+
             string paraText = JoinInline(paraLines);
             ev.Add(MdEvent.Simple(MdEventKind.StartParagraph));
             ParseInlines(paraText, ev);
             ev.Add(MdEvent.Simple(MdEventKind.EndParagraph));
+            ruleSinceParagraph = false;
         }
+    }
+
+    /// <summary>
+    /// Remove a heading's trailing attribute block — <c># Section {#sec-intro .cls}</c> — from
+    /// its text.
+    /// </summary>
+    /// <remarks>
+    /// The block names the heading's id and classes; it is metadata about the heading, not part
+    /// of what the heading says, and leaving it in puts a literal "{#sec-intro}" in the extracted
+    /// title. Recognised only as the very last thing on the line, and only when the braces
+    /// enclose nothing that would make them something else: another brace, an angle bracket, a
+    /// backslash or a line break all mean this is ordinary text that happens to end in "}".
+    /// Ported from pulldown-cmark's <c>extract_attribute_block_content_from_header_text</c>,
+    /// which upstream enables through <c>ENABLE_HEADING_ATTRIBUTES</c>.
+    /// </remarks>
+    private static string StripHeadingAttributeBlock(string heading)
+    {
+        int ix = heading.Length;
+        while (ix > 0 && heading[ix - 1] is '\n' or '\r' or ' ' or '\t') ix--;
+        if (ix == 0 || heading[ix - 1] != '}') return heading;
+        ix--; // step before the closing brace
+
+        while (ix > 0 && heading[ix - 1] is not ('{' or '}' or '<' or '>' or '\\' or '\n' or '\r')) ix--;
+        if (ix == 0 || heading[ix - 1] != '{') return heading;
+
+        return heading[..(ix - 1)].TrimEnd();
     }
 
     private static string StripAtxClosing(string s)
@@ -414,6 +475,106 @@ public static class MarkdownParser
         if (end < s.Length && (end == 0 || s[end - 1] == ' ' || s[end - 1] == '\t'))
             return s.Substring(0, end).TrimEnd();
         return s;
+    }
+
+    /// <summary>
+    /// The heading level a setext underline gives the paragraph above it, or null if the line is
+    /// not one: a run of `=` for level 1 or `-` for level 2, with nothing else on the line.
+    /// </summary>
+    private static byte? SetextLevel(string trimmed)
+    {
+        string body = trimmed.TrimEnd();
+        if (body.Length == 0) return null;
+        char c = body[0];
+        if (c != '=' && c != '-') return null;
+        foreach (char ch in body) if (ch != c) return null;
+        return c == '=' ? (byte)1 : (byte)2;
+    }
+
+    /// <summary>
+    /// Whether the line at <paramref name="i"/> starts a block of its own, and so ends the
+    /// paragraph above it rather than continuing it (CommonMark's paragraph-interruption rules,
+    /// simplified). Setext underlines are deliberately not part of this: they turn the paragraph
+    /// above into a heading instead of interrupting it, so callers test for them first.
+    /// </summary>
+    private static bool InterruptsParagraph(List<string> lines, int i, int hi)
+    {
+        string pl = lines[i];
+        string pts = pl.TrimStart();
+        int pind = pl.Length - pts.Length;
+        if (pind > 3) return false;
+
+        if (IsAtxHeading(pts) || IsCodeFence(pts) || pts.StartsWith(">") || IsThematicBreak(pts))
+            return true;
+        // A definition marker ends the paragraph it follows, which then becomes the term
+        // (pulldown-cmark's `scan_paragraph_interrupt_no_table`, definition-list arm).
+        if (pts.StartsWith(":", StringComparison.Ordinal))
+            return true;
+        if (pts.StartsWith("<") && TryHtmlBlock(lines, i, hi) > i)
+            return true;
+        // Only a "heavy" table — one whose header row opens with a `|` — interrupts a paragraph
+        // (pulldown-cmark's `scan_paragraph_interrupt`). A pipe-separated header with no leading
+        // bar reads as more prose, which is why `Claim ID | Claim type | …` under a line of text
+        // stays in the paragraph above it.
+        if (pts.StartsWith('|') && i + 1 < hi && IsTableStart(pl, lines[i + 1]))
+            return true;
+        // A list item can interrupt a paragraph (bullets always; ordered only when starting at
+        // 1), provided the item is non-empty.
+        if (TryListMarker(pts, out bool po, out int pml))
+        {
+            bool interrupts = pts.Substring(pml).Trim().Length > 0;
+            if (interrupts && po)
+            {
+                int d = 0; while (d < pts.Length && char.IsDigit(pts[d])) d++;
+                interrupts = d > 0 && int.TryParse(pts.Substring(0, d), out int num) && num == 1;
+            }
+            if (interrupts) return true;
+        }
+        return false;
+    }
+
+    /// <summary>The GFM alert kind a blockquote's first line names — <c>[!NOTE]</c> and its four
+    /// siblings, case-insensitive and alone on the line — or null if the line is ordinary
+    /// content.</summary>
+    private static string? AlertKind(string line)
+    {
+        string s = line.Trim();
+        if (s.Length < 4 || s[0] != '[' || s[1] != '!' || s[^1] != ']') return null;
+        return s[2..^1].ToLowerInvariant() switch
+        {
+            "note" => "note",
+            "tip" => "tip",
+            "important" => "important",
+            "warning" => "warning",
+            "caution" => "caution",
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Whether a line opens a fenced code block: at least three backticks or tildes. A backtick
+    /// fence's info string may hold no backtick of its own (CommonMark §4.5) — without that rule
+    /// a one-line code span written with triple backticks, <c>```cmd```</c>, reads as a fence
+    /// that swallows the rest of the document.
+    /// </summary>
+    private static bool IsCodeFence(string trimmed)
+    {
+        if (trimmed.Length < 3) return false;
+        char c = trimmed[0];
+        if (c != '`' && c != '~') return false;
+        int run = 0;
+        while (run < trimmed.Length && trimmed[run] == c) run++;
+        if (run < 3) return false;
+        return c != '`' || trimmed.IndexOf('`', run) < 0;
+    }
+
+    /// <summary>Whether a line opens an ATX heading: one to six <c>#</c> and then a space, a tab
+    /// or the end of the line. <c>#309</c> is a number, not a heading.</summary>
+    private static bool IsAtxHeading(string trimmed)
+    {
+        int h = 0;
+        while (h < trimmed.Length && trimmed[h] == '#') h++;
+        return h >= 1 && h <= 6 && (h == trimmed.Length || trimmed[h] == ' ' || trimmed[h] == '\t');
     }
 
     private static bool IsThematicBreak(string s)
@@ -434,7 +595,7 @@ public static class MarkdownParser
         {
             // A bare marker (no following content) is a valid empty list item in CommonMark.
             if (trimmedStart.Length == 1) { markerLen = 1; return true; }
-            if (trimmedStart[1] == ' ' || trimmedStart[1] == '\t') { markerLen = 2; return true; }
+            if (trimmedStart[1] == ' ' || trimmedStart[1] == '\t') { markerLen = 1 + SpacesAfterMarker(trimmedStart, 1); return true; }
             return false;
         }
         // ordered
@@ -443,31 +604,64 @@ public static class MarkdownParser
         if (k > 0 && k <= 9 && k < trimmedStart.Length && (trimmedStart[k] == '.' || trimmedStart[k] == ')'))
         {
             if (k + 1 == trimmedStart.Length) { ordered = true; markerLen = k + 1; return true; }
-            if (trimmedStart[k + 1] == ' ' || trimmedStart[k + 1] == '\t') { ordered = true; markerLen = k + 2; return true; }
+            if (trimmedStart[k + 1] == ' ' || trimmedStart[k + 1] == '\t')
+            {
+                ordered = true;
+                markerLen = k + 1 + SpacesAfterMarker(trimmedStart, k + 1);
+                return true;
+            }
         }
         return false;
+    }
+
+    /// <summary>
+    /// The character that identifies a list's kind: the bullet for a bullet list, the delimiter
+    /// (<c>.</c> or <c>)</c>) for an ordered one. CommonMark starts a new list when it changes,
+    /// so two runs of items that differ only in their bullet are two lists, not one.
+    /// </summary>
+    private static char MarkerDelimiter(string trimmedStart)
+    {
+        char c0 = trimmedStart[0];
+        if (c0 is '-' or '*' or '+') return c0;
+        int k = 0;
+        while (k < trimmedStart.Length && char.IsDigit(trimmedStart[k])) k++;
+        return k < trimmedStart.Length ? trimmedStart[k] : '\0';
+    }
+
+    /// <summary>
+    /// How much of the whitespace run after a list marker belongs to the marker (CommonMark's
+    /// N in "a list marker of width W followed by N spaces"): all of it for one to four spaces,
+    /// but just one when five or more follow, which is what leaves the rest to be read as the
+    /// item's own indented code block. An item whose marker is the whole line takes one too.
+    /// </summary>
+    private static int SpacesAfterMarker(string trimmedStart, int afterMarker)
+    {
+        if (trimmedStart[afterMarker] == '\t') return 1;
+        int n = 0;
+        while (afterMarker + n < trimmedStart.Length && trimmedStart[afterMarker + n] == ' ') n++;
+        if (n >= 5 || afterMarker + n >= trimmedStart.Length) return 1;
+        return n;
     }
 
     private static int ParseList(List<string> lines, int start, int hi, List<MdEvent> ev, int baseIndent, bool ordered)
     {
         ev.Add(new MdEvent { Kind = MdEventKind.StartList, Ordered = ordered, Text = "", Url = "" });
         int i = start;
+        char listDelimiter = MarkerDelimiter(lines[start].TrimStart());
         while (i < hi)
         {
             string line = lines[i];
             if (IsBlank(line)) { i++; continue; }
             string ts = line.TrimStart();
             int indent = line.Length - ts.Length;
-            if (indent > baseIndent + 3 && i > start)
-            {
-                // deeply-indented continuation handled inside item collection
-            }
-            if (indent < baseIndent || !TryListMarker(ts, out bool o2, out int mlen) || o2 != ordered)
-            {
-                if (indent <= baseIndent) break;
-                // Not a new marker at this level; stop.
-                break;
-            }
+            // A marker at *any* indentation continues this list, including one further left than
+            // the list started at: pulldown-cmark's `continue_list` matches on the bullet
+            // character alone, and a line that fails a list item's indentation closes only the
+            // item, never the list around it. A list that opens indented and continues at column
+            // zero is therefore still one list.
+            if (!TryListMarker(ts, out bool o2, out int mlen) || o2 != ordered) break;
+            // A different bullet, or a different ordered delimiter, is a different list.
+            if (MarkerDelimiter(ts) != listDelimiter) break;
 
             // Collect this item's lines: marker line + subsequent lines more indented than content start.
             int contentIndent = indent + mlen;
@@ -481,9 +675,20 @@ public static class MarkdownParser
                 string cts = cl.TrimStart();
                 int cind = cl.Length - cts.Length;
                 if (cind >= contentIndent) { itemLines.Add(cl.Substring(Math.Min(contentIndent, cl.Length))); i++; continue; }
-                if (TryListMarker(cts, out _, out _) && cind >= baseIndent) break; // next item
-                if (cind <= baseIndent) break;
-                itemLines.Add(cts); i++; // lazy
+                // A marker under-indented for this item's content is the next item, whatever its
+                // number — the "ordered lists interrupt a paragraph only at 1" rule governs
+                // starting a list, not continuing one.
+                if (TryListMarker(cts, out _, out _)) break;
+                // Lazy continuation (CommonMark §5.2): while the item's last block is an open
+                // paragraph, an under-indented line that could not begin a block of its own
+                // still belongs to that paragraph — at any indentation, including none. Cutting
+                // the item off at the item's own indent instead left the continuation to be
+                // re-read as a top-level paragraph, which split one bullet into two blocks.
+                if (itemLines.Count > 0 && itemLines[^1].Trim().Length > 0 && !InterruptsParagraph(lines, i, hi))
+                {
+                    itemLines.Add(cts); i++; continue;
+                }
+                break;
             }
             // Trim trailing blanks.
             while (itemLines.Count > 0 && itemLines[^1].Trim().Length == 0) itemLines.RemoveAt(itemLines.Count - 1);
@@ -492,8 +697,6 @@ public static class MarkdownParser
             // Task list marker
             string itemJoined = string.Join("\n", itemLines);
             var taskMatch = System.Text.RegularExpressions.Regex.Match(itemJoined, @"^\[( |x|X)\]\s+");
-            bool nestedOnly = false;
-            _ = nestedOnly;
             if (HasBlockStructure(itemLines))
             {
                 ParseBlocks(itemLines, 0, itemLines.Count, ev);
@@ -543,6 +746,72 @@ public static class MarkdownParser
         return i;
     }
 
+    /// <summary>
+    /// Whether a <c>:</c> line here opens a definition, and if so retitles the block above it.
+    /// Ported from pulldown-cmark's definition-list branch in <c>firstpass.rs</c>: the marker is
+    /// only a marker when the block it follows is a paragraph (which becomes the term) or an
+    /// earlier definition of the same list (which it simply joins).
+    /// </summary>
+    private static bool TryOpenDefinition(List<MdEvent> ev)
+    {
+        if (ev.Count == 0) return false;
+        var last = ev[^1].Kind;
+        if (last == MdEventKind.EndDefinitionListDefinition) return true;
+        if (last != MdEventKind.EndParagraph) return false;
+
+        int start = ev.FindLastIndex(x => x.Kind == MdEventKind.StartParagraph);
+        if (start < 0) return false;
+        var s = ev[start]; s.Kind = MdEventKind.StartDefinitionListTitle; ev[start] = s;
+        var e = ev[^1]; e.Kind = MdEventKind.EndDefinitionListTitle; ev[^1] = e;
+        return true;
+    }
+
+    /// <summary>
+    /// Parses one definition, whose marker line begins at <paramref name="start"/>. The marker is
+    /// a <c>:</c> plus up to five spaces — or exactly one when five or more follow, so that a
+    /// definition can itself open with an indented code block — and the content indent is
+    /// measured from what the marker consumed (<c>scan_definition_list_definition_marker_with_indent</c>).
+    /// </summary>
+    private static int ParseDefinition(List<string> lines, int start, int hi, List<MdEvent> ev, int baseIndent)
+    {
+        string ts = lines[start].Substring(baseIndent);
+        int spaces = 0;
+        while (spaces < 5 && 1 + spaces < ts.Length && ts[1 + spaces] == ' ') spaces++;
+        if (spaces >= 5) spaces = 1;
+        int contentIndent = baseIndent + 1 + spaces;
+
+        var content = new List<string> { ts.Substring(Math.Min(1 + spaces, ts.Length)) };
+        int i = start + 1;
+        while (i < hi)
+        {
+            string cl = lines[i];
+            if (IsBlank(cl)) { content.Add(""); i++; continue; }
+            string cts = cl.TrimStart();
+            int cind = cl.Length - cts.Length;
+            if (cind >= contentIndent) { content.Add(cl.Substring(Math.Min(contentIndent, cl.Length))); i++; continue; }
+            // A further `:` is the next definition, never a continuation of this one.
+            if (cind <= 3 && cts.StartsWith(":", StringComparison.Ordinal)) break;
+            if (content.Count > 0 && content[^1].Trim().Length > 0 && !InterruptsParagraph(lines, i, hi))
+            {
+                content.Add(cts); i++; continue;
+            }
+            break;
+        }
+        while (content.Count > 0 && content[^1].Trim().Length == 0) content.RemoveAt(content.Count - 1);
+
+        ev.Add(MdEvent.Simple(MdEventKind.StartDefinitionListDefinition));
+        if (HasBlockStructure(content))
+        {
+            ParseBlocks(content, 0, content.Count, ev);
+        }
+        else if (content.Count > 0)
+        {
+            ParseInlines(JoinInline(content).Trim(), ev);
+        }
+        ev.Add(MdEvent.Simple(MdEventKind.EndDefinitionListDefinition));
+        return i;
+    }
+
     private static bool HasBlockStructure(List<string> itemLines)
     {
         // Detect sub-lists or multiple blocks (blank line separation) inside an item.
@@ -552,8 +821,16 @@ public static class MarkdownParser
             string l = itemLines[k];
             if (l.Trim().Length == 0) { sawBlank = true; continue; }
             string ts = l.TrimStart();
-            if (TryListMarker(ts, out _, out _) && k > 0) return true;
-            if (ts.StartsWith("```") || ts.StartsWith("~~~") || ts.StartsWith(">")) return true;
+            // A marker on the item's own first line opens a sublist too — `- - text` is an outer
+            // item whose only content is a nested list, not an item whose text begins with a
+            // dash. Treating it as text leaves the marker in the extracted string (and escaped
+            // as `\-` on the way back out to markdown).
+            if (TryListMarker(ts, out _, out _)) return true;
+            if (IsCodeFence(ts) || ts.StartsWith(">")) return true;
+            // An item whose first block is an indented code block (CommonMark's "item starting
+            // with indented code" rule) — the marker keeps one space and everything past that
+            // is code, so the item's own text is empty and the code stands as its own block.
+            if (k == 0 && AsciiIndentLen(l) >= 4) return true;
             if (sawBlank) return true;
         }
         return false;
@@ -585,33 +862,36 @@ public static class MarkdownParser
     {
         ev.Add(MdEvent.Simple(MdEventKind.StartTable));
 
-        // Header row
-        ev.Add(MdEvent.Simple(MdEventKind.StartTableRow));
-        foreach (var cell in SplitTableRow(lines[start]))
-        {
-            ev.Add(MdEvent.Simple(MdEventKind.StartTableCell));
-            ParseInlines(cell, ev);
-            ev.Add(MdEvent.Simple(MdEventKind.EndTableCell));
-        }
-        ev.Add(MdEvent.Simple(MdEventKind.EndTableRow));
+        // The header row fixes the table's width. Every other row is made to match it: a short
+        // row is padded with empty cells and a long one loses its excess, which is what GFM says
+        // and what keeps a row's nth value under the nth heading.
+        var headerCells = SplitTableRow(lines[start]);
+        int columns = headerCells.Count;
+
+        EmitRow(headerCells, columns, ev);
 
         int i = start + 2; // skip delimiter row
         while (i < hi)
         {
             string line = lines[i];
             if (IsBlank(line) || !line.Contains('|')) break;
-            ev.Add(MdEvent.Simple(MdEventKind.StartTableRow));
-            foreach (var cell in SplitTableRow(line))
-            {
-                ev.Add(MdEvent.Simple(MdEventKind.StartTableCell));
-                ParseInlines(cell, ev);
-                ev.Add(MdEvent.Simple(MdEventKind.EndTableCell));
-            }
-            ev.Add(MdEvent.Simple(MdEventKind.EndTableRow));
+            EmitRow(SplitTableRow(line), columns, ev);
             i++;
         }
         ev.Add(MdEvent.Simple(MdEventKind.EndTable));
         return i;
+    }
+
+    private static void EmitRow(List<string> cells, int columns, List<MdEvent> ev)
+    {
+        ev.Add(MdEvent.Simple(MdEventKind.StartTableRow));
+        for (int c = 0; c < columns; c++)
+        {
+            ev.Add(MdEvent.Simple(MdEventKind.StartTableCell));
+            if (c < cells.Count) ParseInlines(cells[c], ev);
+            ev.Add(MdEvent.Simple(MdEventKind.EndTableCell));
+        }
+        ev.Add(MdEvent.Simple(MdEventKind.EndTableRow));
     }
 
     private static List<string> SplitTableRow(string line)
@@ -763,13 +1043,44 @@ public static class MarkdownParser
     {
         var nodes = new LinkedList<Node>();
         var buf = new StringBuilder();
-        void Flush() { if (buf.Length > 0) { nodes.AddLast(new Node { T = NType.Text, S = buf.ToString() }); buf.Clear(); } }
+        // Verbatim: a soft break has already been split off as its own event, and spans that take
+        // their body straight from the source — math, code — never pass through here at all.
+        void Flush()
+        {
+            if (buf.Length == 0) return;
+            nodes.AddLast(new Node { T = NType.Text, S = buf.ToString() });
+            buf.Clear();
+        }
 
         int n = text.Length;
         int i = 0;
         while (i < n)
         {
             char c = text[i];
+
+            // Hard line break: a backslash at the end of a line. The backslash is the marker,
+            // not content, so it goes; the line break itself becomes the break event.
+            if (c == '\\' && i + 1 < n && text[i + 1] == '\n')
+            {
+                i++; continue;
+            }
+
+            // A line break is its own event, not a space inside the text run. Which is which
+            // matters: an image's alt text takes the text but not the break, so `[![Build\n
+            // Status](…)]` describes an image called "BuildStatus", while the space the break
+            // stands for goes to the paragraph around it.
+            if (c == '\n')
+            {
+                Flush();
+                nodes.AddLast(new Node
+                {
+                    T = NType.Opaque,
+                    Ev = new List<MdEvent> { MdEvent.Simple(MdEventKind.SoftBreak) },
+                });
+                i++;
+                while (i < n && (text[i] == ' ' || text[i] == '\t')) i++;
+                continue;
+            }
 
             // Backslash escape.
             if (c == '\\' && i + 1 < n)
@@ -845,6 +1156,32 @@ public static class MarkdownParser
                 }
             }
 
+            // Wikilink (pulldown-cmark ENABLE_WIKILINKS, `handle_wikilink` in parse.rs).
+            // `[[name]]` is a link to `name` shown as `name`; `[[name|label]]` shows `label`.
+            // Tried before the ordinary link forms because pulldown pops the wikilink stack on
+            // the `]]` and then disables every enclosing link, so `[[1]](#cite_note-1)` is a
+            // wikilink followed by literal text rather than an inline link.
+            if (c == '[' && i + 1 < n && text[i + 1] == '[' && TryParseWikilink(text, i, out var wl))
+            {
+                Flush();
+                var sub = new List<MdEvent> { new MdEvent { Kind = MdEventKind.StartLink, Url = wl.Dest, LinkTitle = null, Text = "" } };
+                if (wl.HasPothole)
+                {
+                    ParseInlines(wl.Display, sub);
+                }
+                else
+                {
+                    // Without a pipe pulldown synthesises a fresh Text node over the raw source
+                    // range, which never passed through the first pass — so the display text
+                    // keeps its straight quotes and any other unresolved punctuation.
+                    sub.Add(MdEvent.WithText(MdEventKind.Text, wl.Display));
+                }
+                sub.Add(MdEvent.Simple(MdEventKind.EndLink));
+                nodes.AddLast(new Node { T = NType.Opaque, Ev = sub });
+                i = wl.End;
+                continue;
+            }
+
             // Link / footnote reference.
             if (c == '[')
             {
@@ -905,7 +1242,10 @@ public static class MarkdownParser
                             T = NType.Opaque,
                             Ev = new List<MdEvent>
                             {
-                                new MdEvent { Kind = MdEventKind.StartLink, Url = "mailto:" + inner, LinkTitle = null, Text = "" },
+                                // pulldown-cmark keeps an email autolink's destination as the
+                                // bare address; only its own HTML writer prepends `mailto:`,
+                                // and the extractor reads the destination, not that rendering.
+                                new MdEvent { Kind = MdEventKind.StartLink, Url = inner, LinkTitle = null, Text = "" },
                                 MdEvent.WithText(MdEventKind.Text, inner),
                                 MdEvent.Simple(MdEventKind.EndLink),
                             },
@@ -1111,16 +1451,23 @@ public static class MarkdownParser
         var parts = new List<string>(lines.Count);
         for (int k = 0; k < lines.Count; k++)
         {
-            string s = lines[k].Trim();
-            if (k < lines.Count - 1)
-            {
-                int bs = 0, p = s.Length;
-                while (p > 0 && s[p - 1] == '\\') { bs++; p--; }
-                if ((bs & 1) == 1) s = s.Substring(0, s.Length - 1);
-            }
-            parts.Add(s);
+            // The trailing backslash of a hard line break stays: the inline scanner drops it
+            // when it reaches the break. Removing it here would also remove it from the
+            // delimiter-flanking test of whatever precedes it, so `**\` at the end of a line
+            // would look like emphasis followed by whitespace and never open.
+            //
+            // A continuation line's leading whitespace stays. Prose does not want it — the
+            // inline scanner drops it along with the soft break — but a display equation's
+            // indentation is part of the equation, and the math span reads its body straight out
+            // of this string. The first line has no soft break in front of it to carry its
+            // indentation away, so that one is trimmed here.
+            parts.Add(k == 0 ? lines[k].Trim() : lines[k].TrimEnd());
         }
-        return string.Join(" ", parts);
+        // Joined with newlines, not spaces. A soft line break in prose still reads as a space —
+        // the inline scanner turns it into one when it flushes a text node — but a math span
+        // takes its body verbatim from this string, and a display equation's line structure is
+        // part of the equation. Collapsing it here would leave no way to recover it.
+        return string.Join("\n", parts);
     }
 
     private static bool IsFlWhite(char c) => c == '\n' || char.IsWhiteSpace(c);
@@ -1369,6 +1716,32 @@ public static class MarkdownParser
         return i;
     }
 
+    /// <summary>A parsed <c>[[…]]</c> wikilink: its destination, its display text and the index
+    /// just past the closing <c>]]</c>.</summary>
+    private readonly record struct Wikilink(string Dest, string Display, bool HasPothole, int End);
+
+    /// <summary>
+    /// Parses a wikilink at <paramref name="open"/> (which points at the first of two
+    /// <c>[</c>). Ported from pulldown-cmark's <c>handle_wikilink</c> and
+    /// <c>scan_wikilink_pipe</c>: the body runs to the first <c>]]</c>, the first <c>|</c>
+    /// inside it splits destination from display text, and an empty destination is not a
+    /// wikilink at all.
+    /// </summary>
+    private static bool TryParseWikilink(string text, int open, out Wikilink link)
+    {
+        link = default;
+        int bodyStart = open + 2;
+        int close = text.IndexOf("]]", bodyStart, StringComparison.Ordinal);
+        if (close < 0) return false;
+        string body = text[bodyStart..close];
+        int pipe = body.IndexOf('|');
+        string dest = pipe >= 0 ? body[..pipe] : body;
+        if (dest.Length == 0) return false;
+        string display = pipe >= 0 ? body[(pipe + 1)..] : body;
+        link = new Wikilink(dest, display, pipe >= 0, close + 2);
+        return true;
+    }
+
     private static bool TryParseLink(string text, int bracket, out int labelStart, out int labelEnd,
         out string url, out string? title, out int end)
     {
@@ -1388,40 +1761,62 @@ public static class MarkdownParser
         labelEnd = i;
         int p = i + 1;
         if (p >= text.Length || text[p] != '(')
+            return TryResolveReference(text, labelStart, labelEnd, p, out url, out title, out end);
+        // An inline destination that does not parse — an unbracketed URL with a space in it,
+        // say — leaves the label to be read as a shortcut reference, with the parentheses that
+        // follow it staying literal text. CommonMark tries the forms in that order, and so does
+        // pulldown-cmark; giving up here instead left `[foo](/bar and baz)` whole on the page
+        // even when the document defines `[foo]`.
+        if (!TryParseInlineTail(text, p, out url, out title, out end))
+            return TryResolveReference(text, labelStart, labelEnd, p, out url, out title, out end);
+        return true;
+    }
+
+    /// <summary>Resolves <c>[label][ref]</c>, <c>[label][]</c> or the shortcut <c>[label]</c>
+    /// against the document's link reference definitions. <paramref name="p"/> is the index just
+    /// past the label's closing bracket.</summary>
+    private static bool TryResolveReference(string text, int labelStart, int labelEnd, int p,
+        out string url, out string? title, out int end)
+    {
+        url = ""; title = null; end = 0;
+        if (_refs is null || _refs.Count == 0) return false;
+        string labelText = text.Substring(labelStart, labelEnd - labelStart);
+        string refKey;
+        int refEnd;
+        if (p < text.Length && text[p] == '[')
         {
-            // Reference-style link: [label][ref], [label][], or shortcut [label].
-            if (_refs is null || _refs.Count == 0) return false;
-            string labelText = text.Substring(labelStart, labelEnd - labelStart);
-            string refKey;
-            int refEnd;
-            if (p < text.Length && text[p] == '[')
+            int q = p + 1;
+            var rb = new StringBuilder();
+            while (q < text.Length && text[q] != ']')
             {
-                int q = p + 1;
-                var rb = new StringBuilder();
-                while (q < text.Length && text[q] != ']')
-                {
-                    if (text[q] == '\\' && q + 1 < text.Length) { rb.Append(text[q]); rb.Append(text[q + 1]); q += 2; continue; }
-                    rb.Append(text[q]); q++;
-                }
-                if (q >= text.Length) return false;
-                string refText = rb.ToString();
-                refKey = NormalizeRefLabel(refText.Length == 0 ? labelText : refText);
-                refEnd = q + 1;
+                if (text[q] == '\\' && q + 1 < text.Length) { rb.Append(text[q]); rb.Append(text[q + 1]); q += 2; continue; }
+                rb.Append(text[q]); q++;
             }
-            else
-            {
-                refKey = NormalizeRefLabel(labelText);
-                refEnd = labelEnd + 1;
-            }
-            if (_refs.TryGetValue(refKey, out var def))
-            {
-                url = def.Url;
-                title = def.Title;
-                end = refEnd;
-                return true;
-            }
-            return false;
+            if (q >= text.Length) return false;
+            string refText = rb.ToString();
+            refKey = NormalizeRefLabel(refText.Length == 0 ? labelText : refText);
+            refEnd = q + 1;
         }
+        else
+        {
+            refKey = NormalizeRefLabel(labelText);
+            refEnd = labelEnd + 1;
+        }
+        if (_refs.TryGetValue(refKey, out var def))
+        {
+            url = def.Url;
+            title = def.Title;
+            end = refEnd;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Parses an inline link's <c>(destination "title")</c> tail, with
+    /// <paramref name="p"/> at the opening parenthesis.</summary>
+    private static bool TryParseInlineTail(string text, int p, out string url, out string? title, out int end)
+    {
+        url = ""; title = null; end = 0;
         p++;
         var sb = new StringBuilder();
         // URL (optionally <...>)

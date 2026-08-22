@@ -36,6 +36,13 @@ internal sealed class MimePart
     /// <summary>Raw body of a leaf, preserved as a Latin-1 string (each char == one byte).</summary>
     public string BodyLatin1 { get; set; } = "";
 
+    /// <summary>
+    /// The part sits inside a multipart whose boundary never closes it, so its body ran to the
+    /// end of the message. The transfer decoder gives up on such a part and the raw bytes are
+    /// kept instead, which is also what demotes the part out of the message body.
+    /// </summary>
+    public bool IsEncodingProblem { get; set; }
+
     public string? GetHeader(string name)
     {
         foreach (var (n, v) in Headers)
@@ -47,8 +54,9 @@ internal sealed class MimePart
     /// <summary>The best attachment filename: Content-Disposition filename, then Content-Type name.</summary>
     public string? AttachmentName => DispositionFilename ?? ContentTypeName;
 
-    /// <summary>Transfer-decoded raw bytes of this leaf part.</summary>
-    public byte[] DecodedBytes() => ContentTransferDecoder.Decode(TransferEncoding, BodyLatin1);
+    /// <summary>Transfer-decoded raw bytes of this leaf part (raw when the decode gave up).</summary>
+    public byte[] DecodedBytes() =>
+        ContentTransferDecoder.Decode(IsEncodingProblem ? null : TransferEncoding, BodyLatin1);
 
     /// <summary>Transfer- + charset-decoded text of this leaf part.</summary>
     public string DecodedText() => CharsetDecoder.Decode(Charset, DecodedBytes());

@@ -621,7 +621,7 @@ public sealed class MsgExtractor : IExtractor
         "\\scaps\\outline\\shadow\\imprint\\emboss\\lang1024\\sbasedon1033\\fcharset0 {\\*\\cs10 \\additive " +
         "Default Paragraph Font}");
 
-    private static byte[]? DecompressRtf(byte[] data)
+    internal static byte[]? DecompressRtf(byte[] data)
     {
         if (data.Length < 16) return null;
         int compSize = (int)OleUtil.U32(data, 0);
@@ -683,7 +683,7 @@ public sealed class MsgExtractor : IExtractor
         return output.ToArray();
     }
 
-    private static string StripRtfToPlainText(byte[] rtf)
+    internal static string StripRtfToPlainText(byte[] rtf)
     {
         string text = new UTF8Encoding(false, false).GetString(rtf);
         int len = text.Length;

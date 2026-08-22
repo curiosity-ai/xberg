@@ -120,4 +120,72 @@ public class EmailExtractorTests
             "From: =?utf-8?B?QW5kcsOp?= <andre@example.com>\r\nSubject: Hi\r\n\r\nBody.\r\n", OutputFormat.Plain);
         Assert.Contains("From: André <andre@example.com>", plain);
     }
+
+    /// <summary>
+    /// Only a *missing* description becomes the `[Image]` placeholder. `alt=""` is a deliberate
+    /// "this image carries no meaning", and a marketing email's tracking pixels and social icons
+    /// all carry one — placeholding them puts a column of `[Image]` through the message.
+    /// </summary>
+    [Fact]
+    public void AnEmptyAltIsNotAnImagePlaceholder()
+    {
+        const string eml =
+            "From: a@example.com\r\nSubject: Pixels\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n\r\n" +
+            "<html><body><p>Hi.</p><img alt=\"\" src=\"/pixel.png\"/><img src=\"/logo.png\"/></body></html>\r\n";
+
+        string plain = Extract(eml, OutputFormat.Plain);
+        Assert.Contains("Hi.", plain);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(plain, @"\[Image\]"));
+    }
+
+    /// <summary>
+    /// A message cut off mid-multipart never closes its boundary, so the transfer decoder gives
+    /// up on the last part. That part is re-read raw and demoted out of the body: the text/plain
+    /// alternative is the message, and the unfinished text/html becomes an attachment carrying
+    /// its undecoded bytes.
+    /// </summary>
+    [Fact]
+    public void AnUnclosedBoundaryDemotesTheLastPartToAnAttachment()
+    {
+        const string eml =
+            "From: a@example.com\r\nSubject: Cut off\r\nMIME-Version: 1.0\r\n" +
+            "Content-Type: multipart/alternative; boundary=\"B\"\r\n\r\n" +
+            "--B\r\nContent-Type: text/plain; charset=\"us-ascii\"\r\n" +
+            "Content-Transfer-Encoding: 7bit\r\n\r\n" +
+            "The readable body.\r\n" +
+            "--B\r\nContent-Type: text/html; charset=\"us-ascii\"\r\n" +
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\n" +
+            "<html><body><p>Soft br=\r\neak</p></body></html>\r\n";
+
+        string plain = Extract(eml, OutputFormat.Plain);
+
+        Assert.Contains("The readable body.", plain);
+        Assert.Contains("Attachments:", plain);
+        // The raw part is what the attachment holds: the quoted-printable soft break survives.
+        Assert.Contains("br=", plain);
+    }
+
+    /// <summary>
+    /// The same recovery leaves a closed boundary alone: the html alternative is still the body,
+    /// quoted-printable decoded, and nothing is reported as an attachment.
+    /// </summary>
+    [Fact]
+    public void AClosedBoundaryKeepsTheHtmlAlternativeAsTheBody()
+    {
+        const string eml =
+            "From: a@example.com\r\nSubject: Intact\r\nMIME-Version: 1.0\r\n" +
+            "Content-Type: multipart/alternative; boundary=\"B\"\r\n\r\n" +
+            "--B\r\nContent-Type: text/plain; charset=\"us-ascii\"\r\n\r\n" +
+            "Plain body.\r\n" +
+            "--B\r\nContent-Type: text/html; charset=\"us-ascii\"\r\n" +
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\n" +
+            "<html><body><p>Soft br=\r\neak</p></body></html>\r\n" +
+            "--B--\r\n";
+
+        string plain = Extract(eml, OutputFormat.Plain);
+
+        Assert.Contains("Soft break", plain);
+        Assert.DoesNotContain("Attachments:", plain);
+    }
 }

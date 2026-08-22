@@ -62,7 +62,14 @@ public static class Mime
             // every tag first and the HTML test never runs — upstream's issue #235, which this
             // port had inherited. It went unnoticed while the extension always won; once content
             // can overrule the extension, every HTML file routes to the XML extractor.
-            if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(trimmed))
+            // The WHATWG sniffing table, which upstream reaches through `infer`. It sits inside
+            // the UTF-8 branch, as upstream's own HTML test does: a file that does not decode is
+            // not a document whose opening bytes can be read as markup, whatever they spell. A
+            // corrupted download with an ISP error page stapled in front of a real PDF is exactly
+            // that, and hoisting this ahead of the decode handed those files to the HTML
+            // extractor, which emitted the PDF's raw bytes as a paragraph.
+            if (SniffWhatwgHtml(content)) return "text/html";
+            if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(SkipLeadingComments(trimmed)))
                 return "text/html";
             if (trimmed.StartsWith("<?xml", StringComparison.Ordinal) || trimmed.StartsWith('<'))
                 return "application/xml";
@@ -155,6 +162,28 @@ public static class Mime
         "tfoot", "th", "thead", "tr", "ul",
     };
 
+    /// <summary>
+    /// Skip any leading comments, so the markup test sees the document's first real tag.
+    /// </summary>
+    /// <remarks>
+    /// The WHATWG sniffing table upstream reaches through <c>infer</c> lists <c>&lt;!--</c> among
+    /// the HTML openings outright — a document that starts with a comment is HTML. Applying that
+    /// only after the content is known to be text keeps a binary file with an HTML preamble (a
+    /// captive-portal page prepended to a PDF, which the corpus has) routed by its real
+    /// signature, while a page whose first line is a <c>Last-Modified</c> note above the DOCTYPE
+    /// is recognised rather than handed to the XML extractor as a tag outline.
+    /// </remarks>
+    private static string SkipLeadingComments(string trimmed)
+    {
+        while (trimmed.StartsWith("<!--", StringComparison.Ordinal))
+        {
+            int end = trimmed.IndexOf("-->", 4, StringComparison.Ordinal);
+            if (end < 0) return trimmed;
+            trimmed = trimmed[(end + 3)..].TrimStart();
+        }
+        return trimmed;
+    }
+
     /// <summary>Whether markup opens as HTML rather than as some other XML vocabulary.</summary>
     private static bool LooksLikeHtml(string trimmed)
     {
@@ -177,6 +206,37 @@ public static class Mime
 
         return HtmlFragmentElements.Contains(afterBracket[..nameLength].ToLowerInvariant());
     }
+
+    /// <summary>
+    /// The WHATWG mime-sniffing table's HTML openings, as <c>infer</c>'s <c>is_html</c>
+    /// implements them: one of these tag names, case-insensitive, after leading whitespace, and
+    /// terminated by a space or <c>&gt;</c> so that <c>&lt;HTML</c> on its own does not count.
+    /// </summary>
+    private static bool SniffWhatwgHtml(ReadOnlySpan<byte> content)
+    {
+        int i = 0;
+        while (i < content.Length && content[i] is 0x09 or 0x0A or 0x0C or 0x0D or 0x20) i++;
+        var buf = content[i..];
+        foreach (string value in WhatwgHtmlOpenings)
+        {
+            if (buf.Length <= value.Length) continue;
+            bool same = true;
+            for (int k = 0; k < value.Length && same; k++)
+            {
+                char c = (char)buf[k];
+                if (c is >= 'a' and <= 'z') c = (char)(c - 32);
+                same = c == value[k];
+            }
+            if (same && (buf[value.Length] == 0x20 || buf[value.Length] == 0x3E)) return true;
+        }
+        return false;
+    }
+
+    private static readonly string[] WhatwgHtmlOpenings =
+    {
+        "<!DOCTYPE HTML", "<HTML", "<HEAD", "<SCRIPT", "<IFRAME", "<H1", "<DIV", "<FONT",
+        "<TABLE", "<A", "<STYLE", "<TITLE", "<B", "<BODY", "<BR", "<P", "<!--",
+    };
 
     private static string? SniffMagic(ReadOnlySpan<byte> b)
     {
@@ -278,6 +338,8 @@ public static class Mime
         Add("text/plain", "txt");
         Add("text/markdown", "md", "markdown");
         Add("text/x-commonmark", "commonmark");
+        Add("text/x-quarto", "qmd");
+        Add("text/x-r-markdown", "rmd");
         Add("text/mdx", "mdx");
         Add("text/x-djot", "djot");
         Add("application/pdf", "pdf");
@@ -302,6 +364,7 @@ public static class Mime
         Add("application/vnd.ms-excel.addin.macroEnabled.12", "xlam");
         Add("application/vnd.ms-excel.template.macroEnabled.12", "xla");
         Add("application/vnd.oasis.opendocument.spreadsheet", "ods");
+        Add("application/vnd.oasis.opendocument.presentation", "odp");
         Add("application/x-dbf", "dbf");
         Add("application/x-hwp", "hwp");
         Add("application/haansofthwpx", "hwpx");
@@ -340,6 +403,8 @@ public static class Mime
         Add("application/gzip", "gz", "tgz");
         Add("application/x-7z-compressed", "7z");
         Add("text/x-rst", "rst");
+        Add("text/asciidoc", "adoc", "asciidoc");
+        Add("text/vtt", "vtt");
         Add("text/x-org", "org");
         Add("application/epub+zip", "epub");
         Add("application/rtf", "rtf");
@@ -350,7 +415,7 @@ public static class Mime
         Add("application/x-fictionbook+xml", "fb2");
         Add("application/xml+opml", "opml");
         Add("application/docbook+xml", "dbk", "docbook", "docbook4", "docbook5");
-        Add("application/x-jats+xml", "jats");
+        Add("application/x-jats+xml", "jats", "nxml");
         Add("application/x-ipynb+json", "ipynb");
         Add("application/x-latex", "tex", "latex");
         Add("application/x-typst", "typst", "typ");

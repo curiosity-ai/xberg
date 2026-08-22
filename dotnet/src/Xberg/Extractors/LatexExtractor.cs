@@ -387,11 +387,24 @@ public sealed class LatexExtractor : IExtractor
                 b.EndList();
                 i = newI; return true;
             }
-            case "tabular":
+            // `longtable`, `tabularx` and `tabulary` hold the same `&`-separated cells as
+            // `tabular`; only their preamble differs, and that is dropped either way.
+            case "tabular": case "longtable": case "tabularx": case "tabulary":
             {
-                var (envContent, newI) = CollectEnvironment(lines, i, "tabular");
+                var (envContent, newI) = CollectEnvironment(lines, i, envName);
                 var cells = ParseTabularCells(envContent);
-                if (cells.Count > 0) b.PushTableFromCells(cells, null, null);
+                if (cells.Count > 0)
+                {
+                    var caption = ExtractCaption(envContent);
+                    var label = ExtractLabel(envContent);
+                    uint idx = b.PushTableFromCells(cells, null, null);
+                    if (label is not null) b.SetAnchor(idx, label);
+                    if (caption is not null)
+                    {
+                        uint capIdx = b.PushParagraph(caption, new(), null, null);
+                        b.PushRelationship(capIdx, RelationshipTarget.FromIndex(idx), RelationshipKind.Caption);
+                    }
+                }
                 i = newI; return true;
             }
             case "table":
@@ -521,11 +534,22 @@ public sealed class LatexExtractor : IExtractor
                         b.PushList(ordered); BuildListItems(b, envContent, ordered); b.EndList();
                         i = newI; continue;
                     }
-                    case "tabular":
+                    case "tabular": case "longtable": case "tabularx": case "tabulary":
                     {
-                        var (envContent, newI) = CollectEnvironment(lines, i, "tabular");
+                        var (envContent, newI) = CollectEnvironment(lines, i, envName);
                         var cells = ParseTabularCells(envContent);
-                        if (cells.Count > 0) b.PushTableFromCells(cells, null, null);
+                        if (cells.Count > 0)
+                        {
+                            var caption = ExtractCaption(envContent);
+                            var label = ExtractLabel(envContent);
+                            uint idx = b.PushTableFromCells(cells, null, null);
+                            if (label is not null) b.SetAnchor(idx, label);
+                            if (caption is not null)
+                            {
+                                uint capIdx = b.PushParagraph(caption, new(), null, null);
+                                b.PushRelationship(capIdx, RelationshipTarget.FromIndex(idx), RelationshipKind.Caption);
+                            }
+                        }
                         i = newI; continue;
                     }
                     case "equation": case "equation*": case "align": case "align*": case "gather": case "gather*":
@@ -784,13 +808,33 @@ public sealed class LatexExtractor : IExtractor
         }
     }
 
+    /// <summary>
+    /// Whether a line inside a table environment is scaffolding rather than a row
+    /// (`latex/utilities.rs::is_table_structural_line`) — a rule, one of longtable's
+    /// page-break markers, a caption, a label, or a nested environment's delimiter.
+    /// </summary>
+    private static bool IsTableStructuralLine(string trimmed) =>
+        trimmed.Length == 0
+        || trimmed.StartsWith("\\hline", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\toprule", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\midrule", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\bottomrule", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\endhead", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\endfirsthead", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\endfoot", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\endlastfoot", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\caption", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\label", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\begin{", StringComparison.Ordinal)
+        || trimmed.StartsWith("\\end{", StringComparison.Ordinal);
+
     private static List<List<string>> ParseTabularCells(string content)
     {
         var rows = new List<List<string>>();
         foreach (var line in MarkupHelpers.Lines(content))
         {
             string trimmed = line.Trim();
-            if (trimmed.StartsWith("\\hline") || trimmed.Length == 0 || trimmed.Contains("\\begin{tabular}") || trimmed.Contains("\\end{tabular}")) continue;
+            if (IsTableStructuralLine(trimmed)) continue;
             string rowStr = trimmed.Replace("\\\\", "").Replace("\\hline", "");
             var cells = rowStr.Split('&').Select(s => s.Trim()).Where(s => s.Length != 0).ToList();
             if (cells.Count > 0) rows.Add(cells);

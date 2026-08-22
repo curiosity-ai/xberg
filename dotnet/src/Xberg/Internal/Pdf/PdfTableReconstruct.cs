@@ -6,9 +6,9 @@
 // bounding boxes (derived from font-metric segments) are clustered into
 // vertically-contiguous regions, each region is reconstructed into a cell
 // grid, then validated/cleaned by the same prose-rejection chain the Rust
-// heuristic tier uses. Only the heuristic tier is ported — pdf_oxide's native
-// ruling-line grid detector (extract_tables_native/_bordered) has no managed
-// equivalent.
+// heuristic tier uses. The two ruling-line tiers that run before it
+// (extract_tables_native/_bordered) live in PdfSpatialTables.
+using System.Collections.Generic;
 using System.Text;
 using Xberg.Types;
 
@@ -26,7 +26,7 @@ internal struct HocrWord
     public readonly double YCenter => Top + Height / 2.0;
 }
 
-internal static class PdfTableReconstruct
+internal static partial class PdfTableReconstruct
 {
     private const int MaxRegionsPerPage = 20;
 
@@ -34,12 +34,19 @@ internal static class PdfTableReconstruct
 
     /// <summary>Port of `pdf::oxide::table::extract_tables_heuristic`. Runs the
     /// text-edge heuristic on every page's segments and returns detected tables.</summary>
-    public static List<Table> ExtractHeuristicTables(List<List<SegmentData>> allPageSegments, bool allowSingleColumn)
+    /// <param name="skipPages">1-indexed pages a higher-priority tier already covered.</param>
+    /// <param name="pagePaths">Per-page painted paths, used to count drawn rules. A page
+    /// whose producer drew rules is one where a table candidate is credible on its face;
+    /// without them the column boundaries have to prove they are whitespace.</param>
+    public static List<Table> ExtractHeuristicTables(
+        List<List<SegmentData>> allPageSegments, bool allowSingleColumn, HashSet<uint>? skipPages = null,
+        List<List<PdfPath>>? pagePaths = null)
     {
         var tables = new List<Table>();
         for (int pageIdx = 0; pageIdx < allPageSegments.Count; pageIdx++)
         {
             uint pageNumber = (uint)(pageIdx + 1);
+            if (skipPages is not null && skipPages.Contains(pageNumber)) continue;
             var segments = allPageSegments[pageIdx];
             if (segments.Count == 0) continue;
 
@@ -54,11 +61,12 @@ internal static class PdfTableReconstruct
             if (regions.Count > MaxRegionsPerPage)
                 regions = regions.GetRange(0, MaxRegionsPerPage);
 
-            foreach (var region in regions)
-            {
-                var table = ReconstructRegionTable(region, pageHeight, pageNumber, allowSingleColumn);
-                if (table != null) tables.Add(table);
-            }
+            int horizontalRules = pagePaths is not null && pageIdx < pagePaths.Count
+                ? PdfPath.CountRules(pagePaths[pageIdx]).Horizontal
+                : 0;
+
+            tables.AddRange(ReconstructPageRegionTables(
+                regions, pageHeight, pageNumber, allowSingleColumn, horizontalRules));
         }
         return tables;
     }
@@ -90,7 +98,10 @@ internal static class PdfTableReconstruct
         {
             outWords.Add(new HocrWord
             {
-                Text = trimmed,
+                // `segment_to_hocr_word` clones the segment's raw text: the whitespace
+                // test is on the trimmed form, but the word keeps whatever padding the
+                // segment carried, and the cell join adds a space of its own on top.
+                Text = seg.Text,
                 Left = RoundClamp(seg.X, 0f),
                 Top = topImage,
                 Width = RoundClamp(seg.Width, 0f),
@@ -198,6 +209,8 @@ internal static class PdfTableReconstruct
         }
         if (current.Count > 0) regions.Add(current);
 
+        AttachAlignedNumericHeaders(regions, medianHeight, rowTolerance);
+
         // retain: >=4 words, >=3 distinct rows, >=2 distinct x columns.
         var kept = new List<List<HocrWord>>();
         foreach (var r in regions)
@@ -294,30 +307,131 @@ internal static class PdfTableReconstruct
 
     // ── Region → Table (pdf/oxide/table.rs reconstruct_region_table) ─────────
 
-    private static Table? ReconstructRegionTable(List<HocrWord> region, float pageHeight, uint pageNumber, bool allowSingleColumn)
+    /// <summary>
+    /// Port of `reconstruct_page_region_tables`. Walks the page's regions, letting a run of
+    /// label-heavy financial sections stitch itself into one table before falling back to
+    /// per-region reconstruction.
+    /// </summary>
+    private static List<Table> ReconstructPageRegionTables(
+        List<List<HocrWord>> regions, float pageHeight, uint pageNumber,
+        bool allowSingleColumn, int horizontalRules)
+    {
+        var tables = new List<Table>();
+        int index = 0;
+        while (index < regions.Count)
+        {
+            var head = ReconstructLabelHeavyFinancialRegion(regions[index], pageHeight, pageNumber);
+            if (head is null)
+            {
+                tables.AddRange(ReconstructRegionTables(
+                    regions[index], pageHeight, pageNumber, allowSingleColumn, horizontalRules));
+                index++;
+                continue;
+            }
+
+            var (first, firstTracks, trackTolerance) = head.Value;
+            var chain = new List<Table> { first };
+            int chainEnd = index + 1;
+            while (chainEnd < regions.Count)
+            {
+                var following = ReconstructLabelHeavyFinancialRegion(regions[chainEnd], pageHeight, pageNumber);
+                if (following is null) break;
+                var (next, nextTracks, nextTolerance) = following.Value;
+                uint tolerance = Math.Max(trackTolerance, nextTolerance);
+                bool tracksAlign = firstTracks.Zip(nextTracks, (l, r) => AbsDiff(l, r) <= tolerance).All(ok => ok);
+                if (!tracksAlign || !LabelHeavyFinancialSectionsAreContiguous(
+                        regions[chainEnd - 1], regions[chainEnd], nextTracks, nextTolerance))
+                    break;
+                chain.Add(next);
+                chainEnd++;
+            }
+
+            if (chain.Count < 2)
+            {
+                tables.AddRange(ReconstructRegionTables(
+                    regions[index], pageHeight, pageNumber, allowSingleColumn, horizontalRules));
+                index++;
+                continue;
+            }
+
+            tables.Add(StitchLabelHeavyFinancialSections(chain, pageNumber));
+            index = chainEnd;
+        }
+        return tables;
+    }
+
+    /// <summary>
+    /// Port of `reconstruct_region_tables`. A region wide enough to be two tables side by side
+    /// is only split when both halves stand up as tables on their own.
+    /// </summary>
+    private static List<Table> ReconstructRegionTables(
+        List<HocrWord> region, float pageHeight, uint pageNumber,
+        bool allowSingleColumn, int horizontalRules)
+    {
+        var parent = ReconstructRegionTable(region, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
+        if (parent is null) return new List<Table>();
+        if ((parent.Cells.Count > 0 ? parent.Cells[0].Count : 0) < SideBySideMinParentColumns)
+            return new List<Table> { parent };
+
+        var split = SplitSideBySideRegion(region);
+        if (split is null) return new List<Table> { parent };
+
+        var left = ReconstructSideBySideChild(split.Value.Left, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
+        if (left is null) return new List<Table> { parent };
+        var right = ReconstructSideBySideChild(split.Value.Right, pageHeight, pageNumber, allowSingleColumn, horizontalRules);
+        if (right is null) return new List<Table> { parent };
+        if (!SideTablesHaveIndependentShape(left, right)) return new List<Table> { parent };
+
+        var (normalizedLeft, normalizedRight) = NormalizeSideBySideFinancialTables(left, right);
+        return new List<Table> { normalizedLeft, normalizedRight };
+    }
+
+    /// <summary>One half of a side-by-side split, reconstructed with a gap wide enough that the
+    /// half's own columns survive: the parent's adaptive gap was measured across both halves.</summary>
+    private static Table? ReconstructSideBySideChild(
+        List<HocrWord> region, float pageHeight, uint pageNumber, bool allowSingleColumn, int horizontalRules)
+    {
+        if (region.Count == 0) return null;
+        var heights = region.Select(w => w.Height).OrderBy(h => h).ToList();
+        uint childGap = Math.Max(heights[heights.Count / 2], 1u) * SideBySideChildGapHeightMultiplier;
+        return ReconstructRegionTableWithColumnGap(
+            region, pageHeight, pageNumber, allowSingleColumn, childGap, horizontalRules);
+    }
+
+    private static Table? ReconstructRegionTable(
+        List<HocrWord> region, float pageHeight, uint pageNumber, bool allowSingleColumn, int horizontalRules = 0)
     {
         uint regionLeft = region.Min(w => w.Left);
         uint regionRight = region.Max(w => w.Left + w.Width);
         float regionWidth = regionRight > regionLeft ? regionRight - regionLeft : 0f;
-        uint colGap = ComputeAdaptiveColumnGap(region, regionWidth);
+        uint colGap = HeuristicColumnGap(region, regionWidth);
+        return ReconstructRegionTableWithColumnGap(
+            region, pageHeight, pageNumber, allowSingleColumn, colGap, horizontalRules);
+    }
 
+    private static Table? ReconstructRegionTableWithColumnGap(
+        List<HocrWord> region, float pageHeight, uint pageNumber,
+        bool allowSingleColumn, uint colGap, int horizontalRules)
+    {
+        var columnPositions = DetectColumns(region, colGap);
         var grid = ReconstructTable(region, colGap, 0.5);
+        RepairSplitNumericTrack(grid, region, columnPositions);
         if (grid.Count == 0 || grid[0].Count == 0) return null;
 
         var cleaned = PostProcessTable(grid, layoutGuided: true, allowSingleColumn);
         if (cleaned == null) return null;
+        RepairHeuristicHeaderDelimiters(cleaned);
         if (cleaned.Count <= 1) return null;
 
         if (LooksLikeCodeListing(cleaned)) return null;
-        if (!IsWellFormedTable(cleaned)) return null;
 
-        double imgLeft = region.Min(w => (double)w.Left);
-        double imgTop = region.Min(w => (double)w.Top);
-        double imgRight = region.Max(w => (double)(w.Left + w.Width));
-        double imgBottom = region.Max(w => (double)(w.Top + w.Height));
-        BoundingBox? bbox = null;
-        if (imgRight > imgLeft && imgBottom > imgTop)
-            bbox = new BoundingBox { X0 = imgLeft, Y0 = pageHeight - imgBottom, X1 = imgRight, Y1 = pageHeight - imgTop };
+        // Beyond the text-statistics gate, reject candidates that have no drawn ruling lines
+        // AND whose inferred column boundaries are not actually whitespace: continuous prose
+        // bucketed into a wide grid by vertical-only clustering has words running across those
+        // boundaries on most rows, which text statistics alone cannot see.
+        if (!IsWellFormedBorderlessTable(cleaned, region, columnPositions, horizontalRules)) return null;
+
+        var bbox = RegionBoundingBox(region, pageHeight);
 
         string markdown = TableToMarkdown(cleaned);
         if (markdown.Trim().Length == 0) return null;
@@ -329,6 +443,16 @@ internal static class PdfTableReconstruct
             PageNumber = pageNumber,
             BoundingBox = bbox,
         };
+    }
+
+    private static BoundingBox? RegionBoundingBox(List<HocrWord> region, float pageHeight)
+    {
+        double imgLeft = region.Min(w => (double)w.Left);
+        double imgTop = region.Min(w => (double)w.Top);
+        double imgRight = region.Max(w => (double)(w.Left + w.Width));
+        double imgBottom = region.Max(w => (double)(w.Top + w.Height));
+        if (imgRight <= imgLeft || imgBottom <= imgTop) return null;
+        return new BoundingBox { X0 = imgLeft, Y0 = pageHeight - imgBottom, X1 = imgRight, Y1 = pageHeight - imgTop };
     }
 
     // ── Core grid reconstruction (table_core.rs) ─────────────────────────────
@@ -476,34 +600,13 @@ internal static class PdfTableReconstruct
         return RemoveEmptyRowsAndColumns(result);
     }
 
-    public static string TableToMarkdown(List<List<string>> table)
-    {
-        if (table.Count == 0) return "";
-        int numCols = table[0].Count;
-        if (numCols == 0) return "";
-
-        var sb = new StringBuilder();
-        for (int rowIdx = 0; rowIdx < table.Count; rowIdx++)
-        {
-            sb.Append('|');
-            foreach (var cell in table[rowIdx])
-            {
-                sb.Append(' ');
-                sb.Append(cell.Replace("|", "\\|"));
-                sb.Append(" |");
-            }
-            sb.Append('\n');
-            if (rowIdx == 0)
-            {
-                sb.Append('|');
-                for (int i = 0; i < numCols; i++) sb.Append(" --- |");
-                sb.Append('\n');
-            }
-        }
-        return sb.ToString();
-    }
-
-    // ── post_process_table (pdf/table_reconstruct.rs) ────────────────────────
+    /// <summary>
+    /// Render a reconstructed grid as a GFM pipe table, through the same renderer every other
+    /// source uses — so a PDF table serialises identically to one from a docx, and a ragged row
+    /// is padded out to the widest row rather than emitting fewer columns than the header.
+    /// </summary>
+    public static string TableToMarkdown(List<List<string>> table) =>
+        Xberg.Rendering.RenderCommon.RenderTableMarkdown(table);
 
     internal static List<List<string>>? PostProcessTable(List<List<string>> table, bool layoutGuided, bool allowSingleColumn)
     {
@@ -571,12 +674,7 @@ internal static class PdfTableReconstruct
         int colCount = table.Count > 0 ? table[0].Count : 0;
         if (colCount < minColumns) return null;
 
-        int dataStart = 0;
-        for (int idx = 0; idx < table.Count; idx++)
-        {
-            int digitCells = table[idx].Count(cell => cell.Any(c => c >= '0' && c <= '9'));
-            if (digitCells >= 3) { dataStart = idx; break; }
-        }
+        int dataStart = FindDataStart(table, layoutGuided);
 
         var headerRows = dataStart > 0 ? table.GetRange(0, dataStart) : new List<List<string>>();
         var dataRows = table.GetRange(dataStart, table.Count - dataStart);
@@ -627,6 +725,8 @@ internal static class PdfTableReconstruct
 
         if (processed[0].Count < 2 || processed.Count <= 1) return null;
 
+        PruneSpuriousInteriorColumn(processed, layoutGuided);
+
         int dataRowCount = processed.Count - 1;
 
         // Column sparsity check.
@@ -669,7 +769,16 @@ internal static class PdfTableReconstruct
                     if (WordCount(t) <= 2) singleWord++;
                 }
             int threshold = layoutGuided ? 85 : 70;
-            if (nonEmptyCells >= 6 && singleWord * 100 > nonEmptyCells * threshold) return null;
+            // A grid whose cells are values rather than words is tabular data however thin the
+            // cells are: an invoice's line items are one or two words each and every one of them
+            // is a number.
+            bool denseNumericGrid = IsDenseNumericGrid(processed);
+            bool denseScalarGrid = layoutGuided && IsDenseScalarGrid(processed);
+            if (!denseNumericGrid
+                && !denseScalarGrid
+                && !IsPredominantlyNumericShortGrid(processed)
+                && nonEmptyCells >= 6
+                && singleWord * 100 > nonEmptyCells * threshold) return null;
         }
 
         // Column-text-flow check (col0 → col1).
@@ -751,7 +860,12 @@ internal static class PdfTableReconstruct
                 int filledCells = 0;
                 for (int r = 1; r < processed.Count; r++)
                     foreach (var cell in processed[r]) if (cell.Trim().Length > 0) filledCells++;
-                if (totalDataCells > 0 && filledCells * 100 > totalDataCells * 80) return null;
+                // The density alone is not the signal: a 30-row ledger of three columns is dense
+                // too. What separates prose is words per cell — a table cell holds a value, a
+                // reflowed column holds a phrase.
+                if (totalDataCells > 0
+                    && filledCells * 100 > totalDataCells * 80
+                    && LooksLikeProseInColumns(processed.GetRange(1, processed.Count - 1), numCols)) return null;
             }
         }
 
@@ -856,27 +970,668 @@ internal static class PdfTableReconstruct
         return text;
     }
 
+    // ── header/column repair (pdf/table_reconstruct.rs) ─────────────────────
+
+    private const int DefaultMinDataRowDigitCells = 3;
+    private const int RepeatedDataRowCount = 3;
+    private const int RowShapeMinOverlapPercent = 80;
+    private const int SpuriousColumnMinDataRows = 20;
+    private const int SpuriousColumnMinColumns = 6;
+    private const int SpuriousColumnMinRetainedDensityPercent = 75;
+    private const int FooterMinAlphaPercent = 70;
+
+    /// <summary>
+    /// The row the data starts on. The first row carrying enough digit cells usually is it, but a
+    /// wide layout-guided table can spell its header over several lines — a units row in
+    /// parentheses under multi-word labels — and the first of those lines already looks numeric.
+    /// Where three consecutive rows of the same shape follow, that run is the data instead.
+    /// </summary>
+    private static int FindDataStart(List<List<string>> table, bool layoutGuided)
+    {
+        int firstNumericRow = 0;
+        for (int i = 0; i < table.Count; i++)
+            if (DigitCellCount(table[i]) >= DefaultMinDataRowDigitCells) { firstNumericRow = i; break; }
+
+        int columnCount = table.Count > 0 ? table[0].Count : 0;
+        if (!layoutGuided || columnCount < LargeTableMinColumns || table.Count < RepeatedDataRowCount)
+            return firstNumericRow;
+
+        int repeatedStart = -1;
+        for (int i = 0; i + RepeatedDataRowCount <= table.Count; i++)
+        {
+            bool allNumeric = true, shapesMatch = true;
+            for (int k = 0; k < RepeatedDataRowCount; k++)
+                if (DigitCellCount(table[i + k]) < DefaultMinDataRowDigitCells) { allNumeric = false; break; }
+            if (!allNumeric) continue;
+            for (int k = 0; k + 1 < RepeatedDataRowCount; k++)
+                if (!RowShapesMatch(table[i + k], table[i + k + 1])) { shapesMatch = false; break; }
+            if (shapesMatch) { repeatedStart = i; break; }
+        }
+
+        if (repeatedStart < 0) return firstNumericRow;
+        if (repeatedStart == firstNumericRow) return repeatedStart;
+
+        var continuation = table.GetRange(firstNumericRow + 1, Math.Max(0, repeatedStart - firstNumericRow - 1));
+        return LooksLikeMultilineNumericHeader(table[firstNumericRow], continuation)
+            ? repeatedStart
+            : firstNumericRow;
+    }
+
+    /// <summary>
+    /// Whether a row that looks numeric is really the first line of a wrapped header: multi-word
+    /// labels above a shorter continuation row that carries a parenthesised unit.
+    /// </summary>
+    private static bool LooksLikeMultilineNumericHeader(List<string> header, List<List<string>> continuationRows)
+    {
+        int filledHeaderCells = header.Count(c => c.Trim().Length > 0);
+        int multiwordLabels = header.Count(c =>
+        {
+            string text = c.Trim();
+            return WordCount(text) >= 2 && text.Any(char.IsLetter);
+        });
+        var continuationCells = continuationRows
+            .SelectMany(r => r).Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+        bool hasParenthesizedUnit = continuationCells.Any(c => c.StartsWith('(') && c.Contains(')'));
+
+        return continuationRows.Count > 0
+            && multiwordLabels >= 2
+            && continuationCells.Count < filledHeaderCells
+            && hasParenthesizedUnit;
+    }
+
+    private static int DigitCellCount(List<string> row) => row.Count(cell => cell.Any(char.IsAsciiDigit));
+
+    /// <summary>Whether two rows fill the same columns, within a tolerance.</summary>
+    private static bool RowShapesMatch(List<string> left, List<string> right)
+    {
+        int columnCount = Math.Max(left.Count, right.Count);
+        int union = 0, intersection = 0;
+        for (int c = 0; c < columnCount; c++)
+        {
+            bool leftFilled = c < left.Count && left[c].Trim().Length > 0;
+            bool rightFilled = c < right.Count && right[c].Trim().Length > 0;
+            if (leftFilled || rightFilled) union++;
+            if (leftFilled && rightFilled) intersection++;
+        }
+        return union > 0 && intersection * 100 >= union * RowShapeMinOverlapPercent;
+    }
+
+    /// <summary>
+    /// Drop one empty-header interior column that catches nothing but a stray footer word, in a
+    /// large otherwise-dense table. Such a track appears when a word in the footer sits at an
+    /// x-position the body never uses.
+    /// </summary>
+    private static bool PruneSpuriousInteriorColumn(List<List<string>> table, bool layoutGuided)
+    {
+        if (table.Count == 0) return false;
+        int columnCount = table[0].Count;
+        int dataRowCount = table.Count - 1;
+        if (!layoutGuided || columnCount < SpuriousColumnMinColumns || dataRowCount < SpuriousColumnMinDataRows)
+            return false;
+
+        var candidates = new List<int>();
+        for (int column = 1; column < columnCount - 1; column++)
+        {
+            if (table[0][column].Trim().Length != 0) continue;
+            var populatedRows = new List<int>();
+            for (int r = 1; r < table.Count; r++)
+                if (column < table[r].Count && table[r][column].Trim().Length > 0) populatedRows.Add(r - 1);
+            if (populatedRows.Count == 1 && populatedRows[0] == dataRowCount - 1 && LooksLikeFooterRow(table[^1]))
+                candidates.Add(column);
+        }
+        if (candidates.Count != 1) return false;
+        int spurious = candidates[0];
+
+        int retainedCells = dataRowCount * (columnCount - 1);
+        int retainedFilled = 0;
+        for (int r = 1; r < table.Count; r++)
+            for (int c = 0; c < table[r].Count; c++)
+                if (c != spurious && table[r][c].Trim().Length > 0) retainedFilled++;
+        if (retainedCells == 0
+            || retainedFilled * 100 < retainedCells * SpuriousColumnMinRetainedDensityPercent) return false;
+
+        MergeInteriorColumn(table, spurious);
+        return true;
+    }
+
+    /// <summary>A row of mostly-alphabetic multi-word text, the shape of a page footer.</summary>
+    private static bool LooksLikeFooterRow(List<string> row)
+    {
+        var nonEmpty = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+        if (nonEmpty.Count < 2 || !nonEmpty.Any(c => WordCount(c) >= 2)) return false;
+        string text = string.Join(" ", nonEmpty);
+        int alphanumeric = text.Count(char.IsLetterOrDigit);
+        int alphabetic = text.Count(char.IsLetter);
+        return alphanumeric > 0 && alphabetic * 100 >= alphanumeric * FooterMinAlphaPercent;
+    }
+
+    /// <summary>Remove a column, folding whatever text it held into whichever neighbour is fuller.</summary>
+    private static void MergeInteriorColumn(List<List<string>> table, int column)
+    {
+        int leftOccupancy = 0, rightOccupancy = 0;
+        for (int r = 1; r < table.Count; r++)
+        {
+            if (column - 1 < table[r].Count && table[r][column - 1].Trim().Length > 0) leftOccupancy++;
+            if (column + 1 < table[r].Count && table[r][column + 1].Trim().Length > 0) rightOccupancy++;
+        }
+        bool mergeRight = rightOccupancy >= leftOccupancy;
+
+        foreach (var row in table)
+        {
+            if (column >= row.Count) continue;
+            string text = row[column].Trim();
+            row.RemoveAt(column);
+            if (text.Length == 0) continue;
+            int target = mergeRight ? column : column - 1;
+            if (target < 0 || target >= row.Count) continue;
+            string existing = row[target].Trim();
+            row[target] = existing.Length == 0
+                ? text
+                : mergeRight ? $"{text} {existing}" : $"{existing} {text}";
+        }
+    }
+
+    private const int DenseScalarMinDataRows = 20;
+    private const int DenseScalarMinColumns = 6;
+    private const int DenseScalarMinFilledPercent = 75;
+    private const int DenseScalarMinCompactPercent = 90;
+    private const int DenseScalarMinDigitPercent = 25;
+    private const int DenseScalarMaxCellChars = 24;
+    private const int ShortNumericMinDataCells = 4;
+    private const int ShortNumericMinCellPercent = 60;
+    private const int ShortNumericMinRowOccupancyPercent = 85;
+
+    /// <summary>
+    /// A big grid of short cells, most of them carrying a digit — a schedule or a price list,
+    /// whose one-and-two-word cells would otherwise read as shredded prose.
+    /// </summary>
+    private static bool IsDenseScalarGrid(List<List<string>> grid)
+    {
+        if (grid.Count == 0) return false;
+        int dataRows = grid.Count - 1;
+        if (grid[0].Count < DenseScalarMinColumns || dataRows < DenseScalarMinDataRows) return false;
+
+        int totalCells = dataRows * grid[0].Count;
+        int filled = 0, compact = 0, digit = 0;
+        for (int r = 1; r < grid.Count; r++)
+            foreach (var cell in grid[r])
+            {
+                string t = cell.Trim();
+                if (t.Length == 0) continue;
+                filled++;
+                if (CharCount(t) <= DenseScalarMaxCellChars && WordCount(t) <= 2) compact++;
+                if (t.Any(char.IsAsciiDigit)) digit++;
+            }
+
+        return totalCells > 0
+            && filled * 100 >= totalCells * DenseScalarMinFilledPercent
+            && compact * 100 >= filled * DenseScalarMinCompactPercent
+            && digit * 100 >= filled * DenseScalarMinDigitPercent;
+    }
+
+    /// <summary>
+    /// Whether the data cells are overwhelmingly numeric with no size floor — a borderless
+    /// line-item table. Measured twice, over every data cell and over the substantially populated
+    /// rows only, because a wrapped description row with the rest of its columns blank drags the
+    /// pooled fraction below the bar. Either measurement clearing it grants the exemption.
+    /// </summary>
+    private static bool IsPredominantlyNumericShortGrid(List<List<string>> grid)
+    {
+        int width = grid.Count > 0 ? grid[0].Count : 0;
+        return ShortGridNumericRatioMeetsBar(grid, false)
+            || (width > 0 && ShortGridNumericRatioMeetsBar(grid, true));
+    }
+
+    private static bool ShortGridNumericRatioMeetsBar(List<List<string>> grid, bool substantiallyPopulatedRowsOnly)
+    {
+        int width = grid.Count > 0 ? grid[0].Count : 0;
+        int nonEmpty = 0, numeric = 0;
+        for (int r = 1; r < grid.Count; r++)
+        {
+            if (substantiallyPopulatedRowsOnly && !IsSubstantiallyPopulatedDataRow(grid[r], width)) continue;
+            foreach (var cell in grid[r])
+            {
+                string t = cell.Trim();
+                if (t.Length == 0) continue;
+                nonEmpty++;
+                if (IsNumericValueCell(t)) numeric++;
+            }
+        }
+        return nonEmpty >= ShortNumericMinDataCells
+            && numeric * 100 >= nonEmpty * ShortNumericMinCellPercent;
+    }
+
+    /// <summary>Whether the row fills enough of the inferred grid to be self-contained.</summary>
+    private static bool IsSubstantiallyPopulatedDataRow(List<string> row, int width)
+    {
+        if (width == 0) return false;
+        int populated = row.Take(width).Count(cell => cell.Trim().Length > 0);
+        return populated * 100 >= width * ShortNumericMinRowOccupancyPercent;
+    }
+
+    /// <summary>
+    /// Whether a dense grid of data rows is prose laid out in columns rather than a real table.
+    /// The signal is words per cell: a table cell holds a value — a number, a code, a short label
+    /// — while columned prose fills each cell with a phrase.
+    /// </summary>
+    private static bool LooksLikeProseInColumns(List<List<string>> dataRows, int numCols)
+    {
+        const double ProseWordsPerCell = 4.0;
+
+        if (numCols < 2) return false;
+        int proseRows = 0, eligibleRows = 0;
+        foreach (var row in dataRows)
+        {
+            var cells = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+            if (cells.Count < 2) continue;
+            if (cells.Sum(Utf8Len) < 15) continue;
+            eligibleRows++;
+            double avgWords = (double)cells.Sum(WordCount) / cells.Count;
+            if (avgWords >= ProseWordsPerCell) proseRows++;
+        }
+        return eligibleRows >= 3 && proseRows * 2 > eligibleRows;
+    }
+
     // ── is_well_formed_table (pdf/table_reconstruct.rs) ──────────────────────
 
-    internal static bool IsWellFormedTable(List<List<string>> grid)
+    // ── is_well_formed_table (pdf/table_reconstruct.rs) ─────────────────────
+
+    private const int DenseNumericMinDataRows = 6;
+    private const int DenseNumericMinColumns = 6;
+    private const int DenseNumericMinCellPercent = 75;
+    private const int ShortWideMaxDataRows = 2;
+    private const int ShortWideMinColumns = 6;
+    private const int ShortWideMaxEmptyCellPercent = 35;
+    private const int LargeTableMinColumns = 6;
+    private const int DefaultMaxEmptyCellPercent = 40;
+
+    /// <summary>
+    /// Whether a reconstructed grid is a real table rather than multi-column prose, a repeated
+    /// page element or low-vocabulary boilerplate. Ports <c>is_well_formed_table_core</c>.
+    /// </summary>
+    /// <param name="skipColumnarProseGuard">
+    /// Drops only the uniform-column-length prose heuristic, for callers that have already vetted
+    /// the region geometrically: a genuine key-value grid has the regular short columns that
+    /// heuristic mistakes for wrapped prose. Every other guard still applies.
+    /// </param>
+
+    // ── Heuristic column gap and grid repairs (pdf/oxide/table.rs) ───────────
+
+    private const uint DenseNumericColumnGapCap = 20;
+    private const int DenseNumericMinRecurringRows = 5;
+    private const int DenseNumericMinWordsPerRow = 3;
+    private const int DenseNumericMinRowWordPercent = 60;
+    private const int DenseNumericMinRecurringTracks = 4;
+    private const int DenseNumericMinTrackRowPercent = 60;
+    private const int NumericHeaderMaxRows = 2;
+    private const int NumericHeaderMinTrackPercent = 60;
+    private const int NumericHeaderMinAlphaPercent = 60;
+    private const int SplitNumericTrackMinRowsPerSide = 2;
+    private const int SplitNumericTrackMinTotalRows = 6;
+
+    /// <summary>
+    /// A ledger's columns sit closer together than ordinary prose, so a wide adaptive
+    /// gap would merge two numeric tracks into one column.
+    /// </summary>
+    private static uint HeuristicColumnGap(List<HocrWord> region, float regionWidth)
+    {
+        uint adaptive = ComputeAdaptiveColumnGap(region, regionWidth);
+        return IsDenseNumericRegion(region) ? Math.Min(adaptive, DenseNumericColumnGapCap) : adaptive;
+    }
+
+    private static bool IsNumericWord(string text)
+    {
+        int digits = 0, alphanumeric = 0;
+        foreach (char c in text)
+        {
+            if (char.IsAsciiDigit(c)) digits++;
+            if (char.IsLetterOrDigit(c)) alphanumeric++;
+        }
+        return digits > 0 && digits * 2 >= alphanumeric;
+    }
+
+    private static bool IsDenseNumericRegion(List<HocrWord> region)
+    {
+        if (region.Count == 0) return false;
+        var heights = region.Select(w => w.Height).OrderBy(h => h).ToList();
+        uint medianHeight = Math.Max(heights[heights.Count / 2], 1);
+        uint rowTolerance = Math.Max(medianHeight / 2, 3);
+        var rows = NumericRows(region, rowTolerance);
+        var recurring = LongestRecurringNumericRun(rows);
+        if (recurring is null) return false;
+        return RecurringNumericTrackCenters(recurring, medianHeight).Count >= DenseNumericMinRecurringTracks;
+    }
+
+    private static List<List<HocrWord>> NumericRows(List<HocrWord> region, uint rowTolerance)
+    {
+        var sorted = region.OrderBy(w => w.Top + w.Height / 2).ToList();
+        var rows = new List<List<HocrWord>>();
+        foreach (var word in sorted)
+        {
+            uint center = word.Top + word.Height / 2;
+            if (rows.Count > 0 && AbsDiff(rows[^1][0].Top + rows[^1][0].Height / 2, center) <= rowTolerance)
+                rows[^1].Add(word);
+            else rows.Add(new List<HocrWord> { word });
+        }
+        return rows;
+    }
+
+    private static bool IsNumericRow(List<HocrWord> row)
+    {
+        int numeric = row.Count(w => IsNumericWord(w.Text));
+        return numeric >= DenseNumericMinWordsPerRow
+            && numeric * 100 >= row.Count * DenseNumericMinRowWordPercent;
+    }
+
+    /// <summary>The longest unbroken run of numeric rows, if it is long enough to count.</summary>
+    private static List<List<HocrWord>>? LongestRecurringNumericRun(List<List<HocrWord>> rows)
+    {
+        int bestStart = 0, bestLen = 0, start = 0;
+        for (int index = 0; index < rows.Count; index++)
+        {
+            if (IsNumericRow(rows[index])) continue;
+            if (index - start > bestLen) { bestStart = start; bestLen = index - start; }
+            start = index + 1;
+        }
+        if (rows.Count - start > bestLen) { bestStart = start; bestLen = rows.Count - start; }
+        return bestLen >= DenseNumericMinRecurringRows ? rows.GetRange(bestStart, bestLen) : null;
+    }
+
+    private static List<uint> RecurringNumericTrackCenters(List<List<HocrWord>> rows, uint medianHeight)
+    {
+        uint xTolerance = Math.Max(medianHeight * 2, 12);
+        int minRowSupport = (rows.Count * DenseNumericMinTrackRowPercent + 99) / 100;
+
+        var candidates = rows.SelectMany(r => r).Where(w => IsNumericWord(w.Text))
+            .Select(w => w.Left + w.Width / 2).OrderBy(v => v).ToList();
+        var deduped = new List<uint>();
+        foreach (uint c in candidates)
+            if (deduped.Count == 0 || AbsDiff(deduped[^1], c) > xTolerance) deduped.Add(c);
+
+        return deduped.Where(candidate =>
+            rows.Count(row => row.Any(w => IsNumericWord(w.Text) && AbsDiff(w.Left + w.Width / 2, candidate) <= xTolerance))
+                >= minRowSupport).ToList();
+    }
+
+    /// <summary>
+    /// Fold a compact caption region into the numeric block it labels. Vertical clustering
+    /// splits on a blank line, so a table whose header sits one line above its data arrives
+    /// as two regions — and the header half, being one or two rows, is dropped by the
+    /// region filter before anything can use it. Merging first is what lets the column names
+    /// reach the grid.
+    /// </summary>
+    private static void AttachAlignedNumericHeaders(
+        List<List<HocrWord>> regions, uint medianHeight, uint rowTolerance)
+    {
+        int index = 1;
+        while (index < regions.Count)
+        {
+            if (IsAlignedNumericHeader(regions[index - 1], regions[index], medianHeight, rowTolerance))
+            {
+                var data = regions[index];
+                regions.RemoveAt(index);
+                regions[index - 1].AddRange(data);
+            }
+            else index++;
+        }
+    }
+
+    /// <summary>A caption belongs to the block below it when it is short, mostly words, sits
+    /// close enough to touch, and its glyphs line up with the numeric tracks underneath.</summary>
+    private static bool IsAlignedNumericHeader(
+        List<HocrWord> header, List<HocrWord> data, uint medianHeight, uint rowTolerance)
+    {
+        var dataRows = NumericRows(data, rowTolerance);
+        var recurring = LongestRecurringNumericRun(dataRows);
+        if (recurring is null) return false;
+
+        var tracks = RecurringNumericTrackCenters(recurring, medianHeight);
+        int headerRows = NumericRows(header, rowTolerance).Count;
+        if (tracks.Count < DenseNumericMinRecurringTracks || headerRows < 1 || headerRows > NumericHeaderMaxRows)
+            return false;
+
+        int alphaWords = header.Count(w => w.Text.Any(char.IsLetter));
+        if (alphaWords * 100 < header.Count * NumericHeaderMinAlphaPercent) return false;
+
+        uint headerBottom = header.Count == 0 ? 0 : header.Max(w => w.Top + w.Height);
+        uint dataTop = data.Count == 0 ? uint.MaxValue : data.Min(w => w.Top);
+        if (SaturatingSub(dataTop, headerBottom) > medianHeight * 2) return false;
+
+        uint xTolerance = Math.Max(medianHeight * 2, 12u);
+        int matched = tracks.Count(track =>
+            header.Any(w => AbsDiff(w.Left + w.Width / 2, track) <= xTolerance));
+        return matched * 100 >= tracks.Count * NumericHeaderMinTrackPercent;
+    }
+
+    private static uint SaturatingSub(uint a, uint b) => a > b ? a - b : 0u;
+
+    /// <summary>
+    /// Rejoin one numeric column that column detection split in two. The signature is a
+    /// pair of adjacent columns that are never both filled on the same row, whose
+    /// positions are closer together than a single numeric value is wide.
+    /// </summary>
+    private static bool RepairSplitNumericTrack(
+        List<List<string>> grid, List<HocrWord> region, List<uint> columnPositions)
+    {
+        if (grid.Count == 0 || grid[0].Count != columnPositions.Count) return false;
+
+        int found = -1;
+        for (int column = 0; column + 1 < columnPositions.Count; column++)
+        {
+            if (!IsSplitNumericTrackCandidate(grid, region, columnPositions, column)) continue;
+            if (found >= 0) return false;   // more than one candidate: not this shape
+            found = column;
+        }
+        if (found < 0) return false;
+
+        foreach (var row in grid)
+        {
+            if (found + 1 >= row.Count) continue;
+            string right = row[found + 1];
+            row.RemoveAt(found + 1);
+            if (row[found].Trim().Length == 0) row[found] = right;
+        }
+        return true;
+    }
+
+    private static bool IsSplitNumericTrackCandidate(
+        List<List<string>> grid, List<HocrWord> region, List<uint> columnPositions, int column)
+    {
+        int leftNumeric = 0, rightNumeric = 0;
+        bool leftHeader = false, rightHeader = false;
+        for (int rowIndex = 0; rowIndex < grid.Count; rowIndex++)
+        {
+            var row = grid[rowIndex];
+            if (column + 1 >= row.Count) return false;
+            string left = row[column].Trim(), right = row[column + 1].Trim();
+            if (left.Length > 0 && right.Length > 0) return false;
+            string text;
+            bool onLeft;
+            if (left.Length > 0) { text = left; onLeft = true; }
+            else if (right.Length > 0) { text = right; onLeft = false; }
+            else continue;
+
+            if (IsNumericWord(text)) { if (onLeft) leftNumeric++; else rightNumeric++; }
+            else if (rowIndex >= NumericHeaderMaxRows) return false;
+            else if (onLeft) leftHeader = true;
+            else rightHeader = true;
+        }
+
+        if (leftNumeric < SplitNumericTrackMinRowsPerSide || rightNumeric < SplitNumericTrackMinRowsPerSide
+            || leftNumeric + rightNumeric < SplitNumericTrackMinTotalRows || leftHeader == rightHeader)
+            return false;
+
+        uint separation = AbsDiff(columnPositions[column], columnPositions[column + 1]);
+        var numericWidths = new List<uint>();
+        foreach (var word in region)
+        {
+            if (!IsNumericWord(word.Text)) continue;
+            int nearest = 0;
+            uint bestDiff = AbsDiff(columnPositions[0], word.Left);
+            for (int i = 1; i < columnPositions.Count; i++)
+            {
+                uint d = AbsDiff(columnPositions[i], word.Left);
+                if (d < bestDiff) { nearest = i; bestDiff = d; }
+            }
+            if (nearest == column || nearest == column + 1) numericWidths.Add(word.Width);
+        }
+        if (numericWidths.Count == 0) return false;
+        numericWidths.Sort();
+        uint medianWidth = numericWidths[numericWidths.Count / 2];
+        return separation * 2 < medianWidth;
+    }
+
+    /// <summary>
+    /// Move a closing bracket that column detection stranded at the head of the next
+    /// header cell back onto the cell whose opener it closes.
+    /// </summary>
+    private static void RepairHeuristicHeaderDelimiters(List<List<string>> rows)
+    {
+        if (rows.Count == 0) return;
+        var header = rows[0];
+        for (int column = 0; column + 1 < header.Count; column++)
+        {
+            var closerAndRest = LeadingSingleCloser(header[column + 1]);
+            if (closerAndRest is not { } pair) continue;
+            if (UnmatchedOpener(header[column]) != MatchingOpener(pair.Closer)) continue;
+            header[column] += pair.Closer;
+            header[column + 1] = pair.Remainder;
+        }
+    }
+
+    private static (char Closer, string Remainder)? LeadingSingleCloser(string text)
+    {
+        if (text.Length == 0) return null;
+        char closer = text[0];
+        if (MatchingOpener(closer) is null) return null;
+        string remainder = text.Substring(1).TrimStart();
+        if (remainder.Length == 0 || MatchingOpener(remainder[0]) is not null) return null;
+        return (closer, remainder);
+    }
+
+    private static char? UnmatchedOpener(string text)
+    {
+        var openers = new List<char>();
+        foreach (char character in text)
+        {
+            if (character is '(' or '[' or '{') { openers.Add(character); continue; }
+            char? expected = MatchingOpener(character);
+            if (expected is null) continue;
+            if (openers.Count == 0 || openers[^1] != expected) return null;
+            openers.RemoveAt(openers.Count - 1);
+        }
+        return openers.Count > 0 ? openers[^1] : null;
+    }
+
+    private static char? MatchingOpener(char closer) => closer switch
+    {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        _ => null,
+    };
+
+    /// <summary>Fraction of (column boundary, row) pairs a word's box runs across.</summary>
+    /// <remarks>
+    /// A column boundary is the *start* of the next column, not the midpoint between two
+    /// column positions: `DetectColumns` returns each column's median left edge, so a
+    /// midpoint falls inside the left column's own text and any word wider than half the
+    /// column pitch would straddle it. Measured per row, because a column boundary is a
+    /// band of whitespace that holds on every row — one long word on one row is not prose.
+    /// </remarks>
+    internal static double StraddledBoundaryRatio(List<HocrWord> region, List<uint> columnPositions)
+    {
+        if (columnPositions.Count < 2 || region.Count == 0) return 0.0;
+
+        var rowPositions = DetectRows(region, StraddleRowThresholdRatio);
+        if (rowPositions.Count == 0) return 0.0;
+
+        var rows = new List<List<HocrWord>>(rowPositions.Count);
+        for (int i = 0; i < rowPositions.Count; i++) rows.Add(new List<HocrWord>());
+        foreach (var word in region)
+        {
+            uint yCenter = (uint)word.YCenter;
+            int best = 0;
+            uint bestDiff = AbsDiff(rowPositions[0], yCenter);
+            for (int i = 1; i < rowPositions.Count; i++)
+            {
+                uint d = AbsDiff(rowPositions[i], yCenter);
+                if (d < bestDiff) { best = i; bestDiff = d; }
+            }
+            rows[best].Add(word);
+        }
+
+        int total = 0, straddled = 0;
+        for (int b = 1; b < columnPositions.Count; b++)
+        {
+            uint boundary = columnPositions[b];
+            foreach (var row in rows)
+            {
+                total++;
+                foreach (var word in row)
+                    if (word.Left < boundary && word.Left + word.Width > boundary) { straddled++; break; }
+            }
+        }
+        return total == 0 ? 0.0 : (double)straddled / total;
+    }
+
+    /// <summary>
+    /// Well-formedness gate for the borderless heuristic path, the only caller holding raw
+    /// word geometry and the page's drawn-rule count. Drawn rules are strong enough
+    /// evidence on their own; without them, the inferred column boundaries have to be
+    /// actual whitespace, which continuous prose bucketed into a wide grid is not.
+    /// </summary>
+    internal static bool IsWellFormedBorderlessTable(
+        List<List<string>> grid, List<HocrWord> region, List<uint> columnPositions, int horizontalRules)
+    {
+        if (!IsWellFormedTable(grid)) return false;
+        if (horizontalRules > 0) return true;
+        return StraddledBoundaryRatio(region, columnPositions) < MaxStraddledBoundaryRatio;
+    }
+
+    private const double MaxStraddledBoundaryRatio = 0.60;
+
+    /// <summary>Row-grouping tolerance matching what `ReconstructTable` itself uses.</summary>
+    private const double StraddleRowThresholdRatio = 0.5;
+
+    internal static bool IsWellFormedTable(List<List<string>> grid, bool skipColumnarProseGuard = false)
     {
         if (grid.Count < 2) return false;
         int numCols = grid[0].Count;
         if (numCols < 2) return false;
 
-        // Check 0: cell density.
+        bool denseNumericGrid = IsDenseNumericGrid(grid);
+
+        // Check 0: cell density. A short, wide grid is allowed to be emptier — its shape is the
+        // evidence, not its fill — unless it is already a dense numeric grid.
+        int dataRowCount = grid.Count - 1;
+        int maxEmptyCellPercent =
+            dataRowCount <= ShortWideMaxDataRows && numCols >= ShortWideMinColumns && !denseNumericGrid
+                ? ShortWideMaxEmptyCellPercent
+                : DefaultMaxEmptyCellPercent;
         int maxCols = grid.Max(r => r.Count);
         int totalCells = grid.Count * maxCols;
         if (totalCells > 0)
         {
             int filled = grid.SelectMany(r => r).Count(cell => cell.Trim().Length > 0);
             int emptyCells = totalCells - filled;
-            if (emptyCells * 100 > totalCells * 40) return false;
+            if (emptyCells * 100 > totalCells * maxEmptyCellPercent) return false;
         }
 
         var dataRows = grid.GetRange(1, grid.Count - 1);
 
-        // Check 1: row coherence (prose detection).
+        // Check 1: a wide grid of one or two rows, every one of them a clause of a shredded
+        // semicolon-delimited list rather than table data.
+        if (dataRows.Count is >= 1 and < 3 && numCols >= LargeTableMinColumns && !denseNumericGrid)
+        {
+            if (dataRows.All(row => LooksLikeShreddedProseRow(row, numCols))) return false;
+        }
+
+        // Check 2: a one- or two-row grid that is really wrapped prose split across columns.
+        if (dataRows.Count > 0 && !denseNumericGrid && LooksLikeShortColumnedProse(dataRows, numCols))
+            return false;
+
+        // Check 3: row coherence (prose detection).
         if (dataRows.Count >= 3 && numCols >= 2)
         {
             int proseLike = 0, eligible = 0;
@@ -885,19 +1640,15 @@ internal static class PdfTableReconstruct
                 string concatenated = string.Join(" ", row.Select(c => c.Trim()).Where(c => c.Length > 0));
                 if (Utf8Len(concatenated) < 15) continue;
                 eligible++;
-                int alpha = 0;
-                foreach (var rune in concatenated.EnumerateRunes())
-                    if (System.Text.Rune.IsLetter(rune) || System.Text.Rune.IsWhiteSpace(rune)) alpha++;
-                double alphaRatio = (double)alpha / Utf8Len(concatenated);
-                if (alphaRatio > 0.8) proseLike++;
+                if (AlphaRatio(concatenated) > 0.8) proseLike++;
             }
             if (eligible >= 3 && proseLike * 2 > eligible) return false;
         }
 
-        // Check 2: column semantic uniformity.
+        // Check 4: column semantic uniformity.
         if (numCols >= 3 && dataRows.Count >= 4)
         {
-            var colStats = new (double mean, double stddev)[numCols];
+            var colStats = new (double Mean, double StdDev)[numCols];
             for (int c = 0; c < numCols; c++)
             {
                 var lengths = new List<double>();
@@ -911,30 +1662,30 @@ internal static class PdfTableReconstruct
                 double variance = lengths.Sum(l => (l - mean) * (l - mean)) / lengths.Count;
                 colStats[c] = (mean, Math.Sqrt(variance));
             }
-            var meaningful = colStats.Where(s => s.mean > 3.0).ToList();
+            var meaningful = colStats.Where(st => st.Mean > 3.0).ToList();
             if (meaningful.Count >= 3)
             {
-                double minMean = meaningful.Min(s => s.mean);
-                double maxMean = meaningful.Max(s => s.mean);
+                double minMean = meaningful.Min(st => st.Mean);
+                double maxMean = meaningful.Max(st => st.Mean);
                 bool columnsUniform = minMean > 0.0 && maxMean <= minMean * 2.0;
-                bool lowVariance = meaningful.All(s => s.mean > 0.0 && s.stddev / s.mean < 0.3);
-                if (columnsUniform && lowVariance) return false;
+                bool lowVariance = meaningful.All(st => st.Mean > 0.0 && st.StdDev / st.Mean < 0.3);
+                if (!skipColumnarProseGuard && !denseNumericGrid && columnsUniform && lowVariance) return false;
             }
         }
 
-        // Check 3: minimum meaningful content (repetitive vocabulary).
+        // Check 5: minimum meaningful content (repetitive vocabulary).
         if (numCols >= 3)
         {
-            var uniqueWords = new HashSet<string>();
+            var uniqueWords = new HashSet<string>(StringComparer.Ordinal);
             foreach (var row in dataRows)
                 foreach (var cell in row)
                     foreach (var w in SplitWhitespace(cell))
                         uniqueWords.Add(w);
             int rowCount = dataRows.Count;
-            if (rowCount >= 3 && uniqueWords.Count < rowCount * 2) return false;
+            if (!denseNumericGrid && rowCount >= 3 && uniqueWords.Count < rowCount * 2) return false;
         }
 
-        // Check 4: repeated header detection.
+        // Check 6: repeated header detection.
         {
             var header = grid[0];
             int headerMatches = dataRows.Count(row =>
@@ -945,6 +1696,133 @@ internal static class PdfTableReconstruct
         return true;
     }
 
+    /// <summary>Fraction of a string that is letters or whitespace, measured over UTF-8 bytes.</summary>
+    private static double AlphaRatio(string text)
+    {
+        int len = Utf8Len(text);
+        if (len == 0) return 0.0;
+        int alpha = 0;
+        foreach (var rune in text.EnumerateRunes())
+            if (System.Text.Rune.IsLetter(rune) || System.Text.Rune.IsWhiteSpace(rune)) alpha++;
+        return (double)alpha / len;
+    }
+
+    /// <summary>A cell holding at least one digit, and at least as many digits as other letters.</summary>
+    private static bool IsNumericValueCell(string cell)
+    {
+        int digits = cell.Count(char.IsAsciiDigit);
+        if (digits == 0) return false;
+        int alphanumeric = cell.Count(char.IsLetterOrDigit);
+        return digits * 2 >= alphanumeric;
+    }
+
+    /// <summary>A cell with letters in it that is not a numeric value — the signal of wrapped prose.</summary>
+    private static bool IsWordCell(string cell) => !IsNumericValueCell(cell) && cell.Any(char.IsLetter);
+
+    /// <summary>
+    /// A large grid whose data cells are overwhelmingly numeric. Such a grid is exempt from the
+    /// prose guards: a ledger's regular short columns look exactly like wrapped columnar prose to
+    /// them.
+    /// </summary>
+    private static bool IsDenseNumericGrid(List<List<string>> grid)
+    {
+        if (grid.Count == 0) return false;
+        if (grid[0].Count < DenseNumericMinColumns || grid.Count <= DenseNumericMinDataRows) return false;
+
+        int nonEmpty = 0, numeric = 0;
+        for (int r = 1; r < grid.Count; r++)
+            foreach (var cell in grid[r])
+            {
+                string trimmed = cell.Trim();
+                if (trimmed.Length == 0) continue;
+                nonEmpty++;
+                if (IsNumericValueCell(trimmed)) numeric++;
+            }
+
+        return nonEmpty > 0 && numeric * 100 >= nonEmpty * DenseNumericMinCellPercent;
+    }
+
+    private const int ShreddedProseMinFilledCells = 4;
+    private const double ShreddedProseMaxAvgWordsPerCell = 2.5;
+    private const int ShreddedProseMinRowTextLen = 30;
+
+    /// <summary>
+    /// Whether one data row reads as a clause of a word-shredded, semicolon-delimited prose list:
+    /// most columns filled (a real wrapped-table row leaves many empty), few words per cell, a
+    /// substantial run of text, and clause-terminal punctuation at the end.
+    /// </summary>
+    private static bool LooksLikeShreddedProseRow(List<string> row, int numCols)
+    {
+        var cells = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+        if (cells.Count < ShreddedProseMinFilledCells) return false;
+        if (numCols == 0 || cells.Count <= numCols * 0.5) return false;
+        if (cells.Sum(Utf8Len) < ShreddedProseMinRowTextLen) return false;
+
+        double avgWords = (double)cells.Sum(c => SplitWhitespace(c).Count()) / cells.Count;
+        if (avgWords > ShreddedProseMaxAvgWordsPerCell) return false;
+
+        string last = cells[^1];
+        return last.Length > 0 && last[^1] is ';' or ':' or '.' or ',';
+    }
+
+    private const double ShortProseWordsPerCell = 4.0;
+    private const double ShortProseAlphaRatio = 0.8;
+    private const int ShortProseMinConcatLen = 15;
+    private const int ShortProseNumericExemptPercent = 30;
+    private const int MinShreddedWordCells = 4;
+    private const double ShreddedMaxAvgWords = 2.5;
+    private const double ShreddedMinWordCellFraction = 0.6;
+
+    /// <summary>
+    /// Whether a short grid is a wrapped-prose passage split across columns rather than a table.
+    /// Closes the hole the row-count-gated guards leave: with one or two data rows there is no
+    /// cross-row evidence, so a reflowed paragraph reaches acceptance untouched.
+    /// </summary>
+    /// <remarks>
+    /// Two prose shapes, each judged per row: cells averaging four or more words in an alphabetic
+    /// row (columns of phrases), and a wide row of thin mostly-word cells (a line chopped into
+    /// one-word columns). A grid that is at least 30% numeric-value cells is exempt outright —
+    /// a real short table is mostly values, prose with a stray number is not.
+    /// </remarks>
+    private static bool LooksLikeShortColumnedProse(List<List<string>> dataRows, int numCols)
+    {
+        if (numCols < 2) return false;
+
+        int filledCells = 0, numericValueCells = 0;
+        foreach (var row in dataRows)
+            foreach (var cell in row)
+            {
+                string trimmed = cell.Trim();
+                if (trimmed.Length == 0) continue;
+                filledCells++;
+                if (IsNumericValueCell(trimmed)) numericValueCells++;
+            }
+        if (filledCells == 0) return false;
+        if (numericValueCells * 100 >= filledCells * ShortProseNumericExemptPercent) return false;
+
+        int eligibleRows = 0, proseRows = 0;
+        foreach (var row in dataRows)
+        {
+            var cells = row.Select(c => c.Trim()).Where(c => c.Length > 0).ToList();
+            if (cells.Count < 2) continue;
+            string concatenated = string.Join(" ", cells);
+            if (Utf8Len(concatenated) < ShortProseMinConcatLen) continue;
+            eligibleRows++;
+
+            double avgWords = (double)cells.Sum(c => SplitWhitespace(c).Count()) / cells.Count;
+            bool isPhraseProse = avgWords >= ShortProseWordsPerCell && AlphaRatio(concatenated) > ShortProseAlphaRatio;
+
+            int wordCells = cells.Count(IsWordCell);
+            bool isShreddedProse = cells.Count >= MinShreddedWordCells
+                && avgWords <= ShreddedMaxAvgWords
+                && wordCells >= cells.Count * ShreddedMinWordCellFraction;
+
+            if (isPhraseProse || isShreddedProse) proseRows++;
+        }
+
+        return eligibleRows >= 1 && proseRows * 2 > eligibleRows;
+    }
+
     // ── looks_like_code_listing (pdf/table_reconstruct.rs) ───────────────────
 
     internal static bool LooksLikeCodeListing(List<List<string>> tableCells)
@@ -953,6 +1831,72 @@ internal static class PdfTableReconstruct
         if (nonEmpty.Count == 0) return false;
         if (nonEmpty.Any(cell => cell == "{" || cell == "}")) return true;
         int braceCount = nonEmpty.Count(cell => cell.Contains('{') || cell.Contains('}'));
-        return (double)braceCount / nonEmpty.Count >= 0.20;
+        return (double)braceCount / nonEmpty.Count >= 0.20 || LooksLikeDeclarationGrid(tableCells);
+    }
+
+    private readonly record struct ParameterRowEvidence(bool EndsWithComma, bool ClosesDeclaration, bool HasPointer);
+
+    /// <summary>
+    /// A wrapped C-style function signature: one call head on the first row, then one
+    /// parameter per row. Brace-free on its own, so the brace fraction above cannot see it,
+    /// yet the shape is exactly what column detection turns into a two-column grid. The
+    /// terminal <c>);</c> or trailing comma on every parameter row is what keeps API-reference
+    /// tables with incidental code punctuation out of this.
+    /// </summary>
+    private static bool LooksLikeDeclarationGrid(List<List<string>> tableCells)
+    {
+        if (tableCells.Count == 0) return false;
+        var firstCells = tableCells[0].Select(cell => cell.Trim()).Where(cell => cell.Length > 0).ToList();
+        if (firstCells.Count != 1 || !LooksLikeDeclarationHead(firstCells[0])) return false;
+
+        var continuationRows = tableCells.Skip(1)
+            .Where(row => row.Any(cell => cell.Trim().Length > 0)).ToList();
+        var evidence = continuationRows.Select(ParameterRowEvidenceOf).Where(e => e is not null)
+            .Select(e => e!.Value).ToList();
+        if (evidence.Count < 2 || evidence.Count != continuationRows.Count) return false;
+
+        bool hasPointer = evidence.Any(e => e.HasPointer);
+        bool hasClosingDeclaration = evidence.Any(e => e.ClosesDeclaration);
+        bool allTruncatedParameters = evidence.All(e => e.EndsWithComma);
+        return hasPointer && (hasClosingDeclaration || allTruncatedParameters);
+    }
+
+    private static ParameterRowEvidence? ParameterRowEvidenceOf(List<string> row)
+    {
+        var cells = row.Select(cell => cell.Trim()).Where(cell => cell.Length > 0).ToList();
+        if (cells.Count < 2) return null;
+        string last = cells[^1];
+
+        string parameterName;
+        bool endsWithComma = false, closesDeclaration = false;
+        if (last.EndsWith(",", StringComparison.Ordinal))
+        {
+            parameterName = last[..^1];
+            endsWithComma = true;
+        }
+        else if (last.EndsWith(");", StringComparison.Ordinal))
+        {
+            parameterName = last[..^2];
+            closesDeclaration = true;
+        }
+        else return null;
+
+        if (!LooksLikeParameterName(parameterName)) return null;
+        return new ParameterRowEvidence(endsWithComma, closesDeclaration, cells.Any(cell => cell.Contains('*')));
+    }
+
+    private static bool LooksLikeParameterName(string name)
+    {
+        name = name.Trim().TrimStart('*');
+        return name.Length > 0
+            && name.Any(char.IsLetter)
+            && name.All(c => char.IsLetterOrDigit(c) || c is '_' or '[' or ']');
+    }
+
+    private static bool LooksLikeDeclarationHead(string head)
+    {
+        if (!head.EndsWith("(", StringComparison.Ordinal)) return false;
+        return head[..^1].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .Count(token => token.Any(char.IsLetter)) >= 2;
     }
 }

@@ -42,20 +42,44 @@ public sealed class PdfExtractor : IExtractor
             || config.OutputFormat.Equals(OutputFormat.Djot)
             || config.OutputFormat.Equals(OutputFormat.Html);
 
-        string nativeText = ExtractTextAndSegments(pdf, deadline, out var pageSegments);
+        string nativeText = ExtractTextAndSegments(pdf, deadline, out var pageSegments,
+            out var pageWords, out var pagePaths);
 
         // --- Metadata ---
         var meta = PdfMetadataExtractor.Extract(pdf);
         // Advisory: a document we cannot grade reports no scan evidence.
         var scanDetection = PdfScanDetect.Detect(pdf);
 
-        // --- Tables (text-layer heuristic tier) ---
-        // Mirrors the Rust three-tier detector, minus pdf_oxide's native/bordered
-        // ruling-line grid passes (no managed equivalent). Extract regardless of
-        // output format — tables live in the result independent of `content`.
-        List<Xberg.Types.Table> tables;
-        try { tables = PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false); }
-        catch { tables = new List<Xberg.Types.Table>(); }
+        // --- Tables: native → bordered → heuristic, each tier only on pages the
+        // previous one left empty (crates/xberg/src/extractors/pdf/extraction.rs).
+        // Extracted regardless of output format — tables live in the result
+        // independent of `content`.
+        var tables = new List<Xberg.Types.Table>();
+        try { tables.AddRange(ExtractRuledTables(pageWords, pagePaths, TableDetectionConfig.Strict(), null)); }
+        catch { }
+        var nativePages = new HashSet<uint>(tables.Select(t => t.PageNumber));
+        try { tables.AddRange(ExtractRuledTables(pageWords, pagePaths, TableDetectionConfig.Bordered(), nativePages)); }
+        catch { }
+        var coveredPages = new HashSet<uint>(tables.Select(t => t.PageNumber));
+        try { tables.AddRange(PdfTableReconstruct.ExtractHeuristicTables(pageSegments, allowSingleColumn: false, coveredPages, pagePaths)); }
+        catch { }
+        foreach (var table in tables) PdfTableNormalize.RepairConsistentlyMergedNumericColumn(table);
+
+        // Upstream reduces this combined list before emitting it (`prepare_emitted_tables`):
+        // it drops empty-markdown tables, collapses same-page boxes overlapping by more than
+        // half the smaller one's area onto whichever candidate carries more content, and drops
+        // exact repeats of a page's markdown. None of that is done here, and that is a measured
+        // decision rather than an oversight. Both halves were ported and swept: the overlap
+        // pass alone cost `ok` 363 -> 360, `json` 366 -> 364 and `tables` 377 -> 374, and the
+        // empty-markdown drop plus the exact-repeat pass still cost `ok` 363 -> 361,
+        // `json` 366 -> 364 and `tables` 377 -> 375.
+        //
+        // The reason is the pass that runs immediately BEFORE them upstream and is not ported:
+        // `stitch_fragmented_tables` first joins a grid's vertically-adjacent same-column
+        // fragments into one table. Upstream therefore reaches the reduction with far fewer
+        // overlapping and repeating entries than the three tiers here produce, and running the
+        // reduction on the unstitched list discards fragments the goldens keep. These belong
+        // with the stitching pass, and only with it.
 
         // --- Build InternalDocument ---
         // For Markdown/Djot/HTML the Rust path pre-renders a *structured* document with
@@ -65,7 +89,10 @@ public sealed class PdfExtractor : IExtractor
         InternalDocument? structured = null;
         if (needsStructured)
         {
-            try { structured = PdfStructure.Build(pageSegments); }
+            List<PdfOutlineEntry> outline;
+            try { outline = PdfBookmarks.ExtractOutlineEntries(pdf); }
+            catch { outline = new List<PdfOutlineEntry>(); }
+            try { structured = PdfStructure.Build(pageSegments, ruledTables: tables, outlineEntries: outline); }
             catch { structured = null; }
         }
 
@@ -76,7 +103,7 @@ public sealed class PdfExtractor : IExtractor
         else
         {
             doc = new InternalDocument("pdf");
-            foreach (var paragraph in nativeText.Split("\n\n"))
+            foreach (var paragraph in TextTransform.NormalizeLineEndings(nativeText).Split("\n\n"))
             {
                 var trimmed = paragraph.Trim();
                 if (trimmed.Length > 0)
@@ -97,7 +124,6 @@ public sealed class PdfExtractor : IExtractor
         }
 
         doc.MimeType = mimeType;
-        doc.Tables = tables;
 
         doc.Metadata = new Metadata
         {
@@ -128,6 +154,32 @@ public sealed class PdfExtractor : IExtractor
         doc.Metadata.Additional["extraction_method"] =
             System.Text.Json.JsonSerializer.SerializeToElement("native");
 
+        // /PageLabels — one display label per page, index-aligned with the page structure.
+        // Metadata has no field for it, so it rides in `additional`, as upstream does.
+        try
+        {
+            if (PdfPageLabels.ExtractAll(pdf) is { } pageLabels)
+                doc.Metadata.Additional["page_labels"] =
+                    System.Text.Json.JsonSerializer.SerializeToElement(pageLabels);
+        }
+        catch { }
+
+        // Filled AcroForm values reach `content` only through the per-page widget splice,
+        // which the structured path never sees; this puts back the ones no element carries.
+        try { InjectUnrepresentedFormFieldElements(doc, PdfFormFields.Extract(pdf)); }
+        catch { }
+
+        // The structured path assembles its own table list in element order, so its indices
+        // are already the ones its `Table` elements point at; only a document that carries
+        // none takes the detected ones.
+        AttachUnrepresentedTables(doc, tables);
+        // Plain text already spells out everything the reconstructed tables were built from,
+        // so a table element there would render the same words twice. Every other shape
+        // renders a table as a grid the flat text cannot express.
+        bool documentIsStructured = structured is not null && ReferenceEquals(doc, structured);
+        InjectUnrepresentedTableElements(
+            doc, documentIsStructured || !config.OutputFormat.Equals(OutputFormat.Plain));
+
         if (meta.IsEncrypted && pdf.Decryptor is null && nativeText.Length == 0)
             doc.ProcessingWarnings.Add(new ProcessingWarning
             {
@@ -140,12 +192,185 @@ public sealed class PdfExtractor : IExtractor
 
     // Single per-page pass: parse each page's content stream once, then derive both the
     // assembled page text (returned, joined by blank lines) and the font-metric
+    /// <summary>
+    /// Run one ruling-line tier over every page the previous tier left uncovered.
+    /// </summary>
+    private static List<Xberg.Types.Table> ExtractRuledTables(
+        List<List<TableSpan>> pageWords, List<List<PdfPath>> pagePaths,
+        TableDetectionConfig config, HashSet<uint>? skipPages)
+    {
+        var tables = new List<Xberg.Types.Table>();
+        for (int i = 0; i < pageWords.Count && i < pagePaths.Count; i++)
+        {
+            uint pageNumber = (uint)(i + 1);
+            if (skipPages is not null && skipPages.Contains(pageNumber)) continue;
+            try { tables.AddRange(PdfSpatialTables.DetectPageTables(pageWords[i], pagePaths[i], pageNumber, config)); }
+            catch { }
+        }
+        return tables;
+    }
+
+    /// <summary>
+    /// Page-text cleanup: control-character repair, then a markup pass for the pages that
+    /// carry raw HTML.
+    /// </summary>
+    /// <remarks>
+    /// Web-to-PDF converters sometimes leave the source markup in the text layer, where the
+    /// tags read as words. Such a page is converted as HTML rather than used as-is.
+    /// </remarks>
+    internal static string ApplyTextCleanup(string text)
+    {
+        string cleaned = PdfPageText.FixControlChars(text);
+        return ContainsHtmlMarkup(cleaned) ? Internal.Html.HtmlToMarkdown.Convert(cleaned) : cleaned;
+    }
+
+    /// <summary>Whether the page text carries embedded HTML markup.</summary>
+    internal static bool ContainsHtmlMarkup(string text) =>
+        text.Contains('<')
+        && (text.Contains("</p>", StringComparison.Ordinal)
+            || text.Contains("<br", StringComparison.Ordinal)
+            || text.Contains("<p>", StringComparison.Ordinal)
+            || text.Contains("<div", StringComparison.Ordinal)
+            || text.Contains("<span", StringComparison.Ordinal)
+            || text.Contains("<table", StringComparison.Ordinal)
+            || text.Contains("<a ", StringComparison.Ordinal)
+            || text.Contains("/>", StringComparison.Ordinal));
+
+    /// <summary>Share of a table's cell tokens that must already be in the element stream
+    /// before the table counts as represented.</summary>
+    private const double MIN_TABLE_TOKEN_REPRESENTATION = 0.90;
+
+    /// <summary>Cell-token count below which the containment check abstains: on a handful of
+    /// tokens an incidental overlap with unrelated prose is likely, and injecting a duplicate
+    /// is cheaper than dropping a real table.</summary>
+    private const int MIN_TABLE_TOKENS_FOR_CONTAINMENT = 8;
+
+    private static readonly char[] AsciiPunctuation =
+        "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".ToCharArray();
+
+    /// <summary>Words with edge punctuation and case removed, so whitespace, line wrapping
+    /// and trailing punctuation do not make the same text look different.</summary>
+    internal static IEnumerable<string> NormalizedPdfTokens(string text)
+    {
+        foreach (var word in text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string trimmed = word.Trim(AsciiPunctuation).ToLowerInvariant();
+            if (trimmed.Length > 0) yield return trimmed;
+        }
+    }
+
+    /// <summary>
+    /// Surface filled AcroForm values that no element already spells out, one paragraph per
+    /// field, as <c>"{full name}: {value}"</c>.
+    /// </summary>
+    /// <remarks>
+    /// The plain-text path splices widget values into the page text before it is chopped into
+    /// paragraphs, so its elements already carry them and the containment test skips them; the
+    /// structured path is built from span segments that never see that splice.
+    /// </remarks>
+    internal static void InjectUnrepresentedFormFieldElements(
+        InternalDocument doc, List<PdfAcroFormField> formFields)
+    {
+        foreach (var field in formFields)
+        {
+            string? value = field.Value;
+            if (string.IsNullOrEmpty(value)) continue;
+            if (doc.Elements.Any(element => element.Text.Contains(value, StringComparison.Ordinal))) continue;
+            string displayName = field.FullName.Length == 0 ? field.Name : field.FullName;
+            doc.PushElement(InternalElement.TextElement(ElementKind.Paragraph, $"{displayName}: {value}", 0));
+        }
+    }
+
+    /// <summary>Give a document that has no tables of its own the ones detection found.</summary>
+    internal static void AttachUnrepresentedTables(InternalDocument doc, List<Xberg.Types.Table> tables)
+    {
+        if (doc.Tables.Count != 0) return;
+        foreach (var table in tables) doc.PushTable(table);
+    }
+
+    /// <summary>Tokens the element stream already renders, as a consumable multiset.</summary>
+    internal static Dictionary<string, int> ElementTokenMultiset(InternalDocument doc)
+    {
+        var represented = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var element in doc.Elements)
+            foreach (var token in NormalizedPdfTokens(element.Text))
+                represented[token] = represented.TryGetValue(token, out var n) ? n + 1 : 1;
+        return represented;
+    }
+
+    /// <summary>
+    /// Whether a table's cell text is already carried by the element stream.
+    /// </summary>
+    /// <remarks>
+    /// Accounting is multiset based: each text occurrence backs at most one cell occurrence,
+    /// and the occurrences are consumed only when the table is judged represented, so one
+    /// table cannot mask the next. Both bailouts err toward injecting, because a duplicated
+    /// table costs precision while a dropped one costs content.
+    /// </remarks>
+    internal static bool TableIsRepresented(Xberg.Types.Table table, Dictionary<string, int> represented)
+    {
+        var tableTokens = new Dictionary<string, int>(StringComparer.Ordinal);
+        int tableTokenCount = 0;
+        foreach (var row in table.Cells)
+            foreach (var cell in row)
+                foreach (var token in NormalizedPdfTokens(cell))
+                {
+                    tableTokens[token] = tableTokens.TryGetValue(token, out var n) ? n + 1 : 1;
+                    tableTokenCount++;
+                }
+        if (tableTokenCount < MIN_TABLE_TOKENS_FOR_CONTAINMENT) return false;
+
+        int matched = 0;
+        foreach (var (token, count) in tableTokens)
+            matched += Math.Min(count, represented.TryGetValue(token, out var have) ? have : 0);
+        if ((double)matched / tableTokenCount < MIN_TABLE_TOKEN_REPRESENTATION) return false;
+
+        foreach (var (token, count) in tableTokens)
+            if (represented.TryGetValue(token, out var remaining))
+                represented[token] = Math.Max(0, remaining - count);
+        return true;
+    }
+
+    internal static void InjectUnrepresentedTableElements(InternalDocument doc, bool allowInjection)
+    {
+        if (!allowInjection) return;
+        foreach (var element in doc.Elements)
+            if (element.Kind.Tag == ElementKindTag.Table) return;
+
+        // The `Table`-element guard above only ever fires on the structured path; the flat
+        // path builds nothing but paragraphs, so every detected table would be injected on
+        // top of native text that already contains the words it was reconstructed from.
+        var represented = ElementTokenMultiset(doc);
+        for (int tableIndex = 0; tableIndex < doc.Tables.Count; tableIndex++)
+        {
+            if (TableIsRepresented(doc.Tables[tableIndex], represented)) continue;
+            doc.PushElement(InternalElement.TextElement(ElementKind.Table((uint)tableIndex), "", 0));
+        }
+    }
+
+    /// <summary>
+    /// Whether page spans come from the ported pdf_oxide pipeline rather than this port's
+    /// own content interpreter.
+    /// </summary>
+    /// <remarks>
+    /// On by default: the ported producer wins on every dimension the corpus measures.
+    /// The older interpreter stays reachable because it is still the source of the drawn
+    /// paths the table tiers read, and because a per-fixture A/B is the fastest way to
+    /// attribute a regression to the span layer.
+    /// </remarks>
+    internal static bool UsePortedSpans { get; set; } =
+        Environment.GetEnvironmentVariable("XBERG_OXIDE_SPANS") != "0";
+
     // SegmentData grid (out param) used for tables and heading structure. Mirrors Rust
     // `oxide::text::extract_text` + `oxide::hierarchy::extract_all_segments` sharing spans.
-    private static string ExtractTextAndSegments(PdfDocument pdf, long deadline, out List<List<SegmentData>> pageSegments)
+    private static string ExtractTextAndSegments(
+        PdfDocument pdf, long deadline, out List<List<SegmentData>> pageSegments,
+        out List<List<TableSpan>> pageWords, out List<List<PdfPath>> pagePaths)
     {
         int pageCount = pdf.PageCount;
         pageSegments = new List<List<SegmentData>>(pageCount);
+        pageWords = new List<List<TableSpan>>(pageCount);
+        pagePaths = new List<List<PdfPath>>(pageCount);
         var sb = new System.Text.StringBuilder();
 
         for (int i = 0; i < pageCount; i++)
@@ -156,6 +381,8 @@ public sealed class PdfExtractor : IExtractor
 
             string pageText = "";
             List<SegmentData> segs = new();
+            List<TableSpan> words = new();
+            List<PdfPath> paths = new();
             try
             {
                 byte[] contentBytes = pdf.GetPageContent(i);
@@ -164,37 +391,101 @@ public sealed class PdfExtractor : IExtractor
                     var resources = pdf.Resolve(pdf.Pages[i].Get("Resources")).AsDict();
                     var extractor = new PdfContentExtractor(pdf, deadline);
                     var spans = extractor.Extract(contentBytes, resources);
-                    var (mbLlx, _, mbUrx, _) = pdf.GetPageMediaBox(i);
-                    (pageText, var lines) = PdfPageText.AssembleWithLines(spans, Math.Abs(mbUrx - mbLlx));
-                    segs = PdfStructure.SegmentsFromLines(lines);
+                    var (mbLlx, mbLly, mbUrx, mbUry) = pdf.GetPageMediaBox(i);
+                    double pageWidth = Math.Abs(mbUrx - mbLlx);
+                    List<PdfPageText.LineSeg> lines;
+                    List<Xberg.Internal.PdfOxide.OxTextSpan>? structureSpans = null;
+                    List<Xberg.Internal.PdfOxide.OxTextSpan>? wordSpans = null;
+                    float structurePageWidth = 0f, structurePageHeight = 0f;
+                    if (UsePortedSpans)
+                    {
+                        // The ported pipeline's own assembler consumes the ported spans directly:
+                        // they already arrive column-aware ordered, deduplicated and merged, which
+                        // is exactly the shape upstream's `assemble_page_text` receives.
+                        var oxResult = Xberg.Internal.PdfOxide.Text.OxPageExtractor.ExtractPage(pdf, i);
+                        var oxPage = oxResult.Text;
+                        var oxSpans = oxPage.Spans;
+                        wordSpans = oxResult.WordSpans;
+                        var assembly = Xberg.Internal.PdfOxide.Text.OxPageAssembler.Assemble(
+                            oxSpans, (float)pageWidth);
+                        pageText = assembly.Text;
+                        lines = PdfPageText.LineSegsFromOx(assembly.Lines);
+                        // Bridged AFTER assembly, so the word grid sees the column repairs' order.
+                        spans = OxSpanBridge.ToPdfSpans(oxSpans);
+                        // The structure pipeline runs its own span pipeline over the same page —
+                        // see PdfOxideSegments — so it keeps the spans whole rather than the
+                        // assembler's lines.
+                        structureSpans = oxResult.HierarchySpans;
+                        structurePageWidth = oxPage.PageWidth;
+                        structurePageHeight = oxPage.PageHeight;
+                    }
+                    else
+                    {
+                        (pageText, lines) = PdfPageText.AssembleWithLines(spans, pageWidth);
+                    }
+                    // The older interpreter still runs either way: its `Paths` are what the
+                    // ruling-line table tiers read, and nothing in the ported pipeline collects
+                    // those yet.
+                    segs = structureSpans is not null
+                        ? PdfOxideSegments.FromPage(structureSpans, structurePageWidth, structurePageHeight)
+                        : PdfStructure.SegmentsFromLines(lines);
+                    // The detector is fed words, not show-operator runs (upstream calls
+                    // `extract_words`), and those come off their own pipeline: the word
+                    // path's spans are post-processed and ordered by `page_reading_order`,
+                    // where the text and hierarchy paths see only the off-page drop and a
+                    // sort. The per-glyph geometry the clustering needs exists only on the
+                    // ported extractor's spans.
+                    words = wordSpans is not null
+                        ? PdfSpatialTables.WordsFromOxSpans(wordSpans)
+                        : PdfSpatialTables.SpansToWords(spans);
+                    paths = extractor.Paths;
                 }
                 // AcroForm: interactive text-field values are stored as the widget's /V and are
                 // not drawn into the content stream when no appearance stream exists. pdf_oxide
                 // surfaces them, appended after the page's content text. Mirror that here.
                 var formValues = CollectWidgetTextValues(pdf, i);
-                if (formValues.Count > 0)
-                    pageText = pageText.Length > 0
-                        ? pageText + "\n" + string.Join("\n", formValues)
-                        : string.Join("\n", formValues);
+                pageText = AppendMissingWidgetValues(pageText, formValues);
             }
-            catch { pageText = ""; segs = new(); }
+            catch { pageText = ""; segs = new(); words = new(); paths = new(); }
 
             pageSegments.Add(segs);
+            pageWords.Add(words);
+            pagePaths.Add(paths);
             if (i > 0) sb.Append("\n\n");
-            sb.Append(PdfPageText.FixControlChars(pageText));
+            sb.Append(ApplyTextCleanup(pageText));
         }
         return sb.ToString();
     }
 
-    // Collect interactive text/choice field values from the widgets on one page, in /Annots order.
-    // /V and /FT may be inherited via the /Parent field chain; only string values (text/choice
-    // fields) are surfaced — button fields store a /Name in /V and are skipped. De-duplicated by
-    // fully-qualified field name so widgets that share a parent field are not counted twice.
+    /// <summary>
+    /// Append the widget values the page's own content stream does not already carry.
+    /// </summary>
+    /// <remarks>
+    /// A flattened form has its field values rendered into the content stream as ordinary text,
+    /// so appending them again would print each one twice. The containment test is a plain
+    /// substring match: the rendered appearance text and the widget's <c>/V</c> string match
+    /// verbatim in the common case, and suppressing a value that happens to be a substring of
+    /// surrounding prose is the cheaper mistake.
+    /// </remarks>
+    internal static string AppendMissingWidgetValues(string text, List<string> values)
+    {
+        foreach (var value in values)
+        {
+            if (text.Contains(value, StringComparison.Ordinal)) continue;
+            if (text.Length > 0 && !text.EndsWith('\n')) text += "\n";
+            text += value;
+        }
+        return text;
+    }
+
+    // Collect the /V of every Widget annotation on one page, top to bottom. /V may be inherited
+    // via the /Parent field chain. De-duplicated by fully-qualified field name so widgets that
+    // share a parent field are not counted twice.
     private static List<string> CollectWidgetTextValues(PdfDocument pdf, int pageIndex)
     {
-        var values = new List<string>();
+        var values = new List<(double MidY, string Value)>();
         var annots = pdf.Resolve(pdf.Pages[pageIndex].Get("Annots")).AsArray();
-        if (annots is null) return values;
+        if (annots is null) return new List<string>();
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var a in annots.Items)
@@ -203,28 +494,55 @@ public sealed class PdfExtractor : IExtractor
             if (widget is null) continue;
             if (pdf.Resolve(widget.Get("Subtype")).AsName() != "Widget") continue;
 
-            string? ft = null;
-            byte[]? vbytes = null;
+            string? raw = null;
             var names = new List<string>();
             var node = widget;
             for (int guard = 0; node is not null && guard < 32; guard++)
             {
-                ft ??= pdf.Resolve(node.Get("FT")).AsName();
-                vbytes ??= pdf.Resolve(node.Get("V")).AsStringBytes();
+                raw ??= AnnotationStringValue(pdf.Resolve(node.Get("V")));
                 var t = pdf.Resolve(node.Get("T")).AsStringBytes();
                 if (t is not null) names.Insert(0, PdfMetadataExtractor.DecodePdfString(t) ?? "");
                 node = pdf.Resolve(node.Get("Parent")).AsDict();
             }
 
-            if (vbytes is null) continue;                       // no value set
-            if (ft is not null && ft != "Tx" && ft != "Ch") continue; // not a text/choice field
-            string? value = PdfMetadataExtractor.DecodePdfString(vbytes);
-            if (string.IsNullOrEmpty(value)) continue;
+            if (raw is null) continue;                          // no value set
+            string value = raw.Trim();
+            if (value.Length == 0) continue;
 
             string key = names.Count > 0 ? string.Join(".", names) : value;
             if (!seen.Add(key)) continue;
-            values.Add(value);
+
+            // Values are appended after all content-stream text, so the only reading order left
+            // to preserve is the widgets' own: nearest the top of the page first.
+            var rect = pdf.Resolve(widget.Get("Rect")).AsArray();
+            double midY = rect is { Items.Count: >= 4 }
+                && pdf.Resolve(rect.Items[1]).AsNumber() is { } y0
+                && pdf.Resolve(rect.Items[3]).AsNumber() is { } y1
+                ? (y0 + y1) / 2.0
+                : double.NegativeInfinity;
+            values.Add((midY, value));
         }
-        return values;
+
+        // Stable, so widgets sharing a row keep the order the /Annots array gave them.
+        return values.OrderByDescending(v => v.MidY).Select(v => v.Value).ToList();
     }
+
+    /// <summary>
+    /// An annotation entry read as the string the widget splice appends.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not the text-string decoding of ISO 32000-1 §7.9.2.2: the annotation layer
+    /// reads the bytes as UTF-8 and replaces what does not decode, so a UTF-16BE value reaches
+    /// the page text with its byte-order mark as replacement characters. The document-level
+    /// AcroForm model (<see cref="PdfFormFields"/>) is the one that decodes properly, and the
+    /// two disagreeing is what leaves a UTF-16 value unrepresented for the injection pass.
+    /// </remarks>
+    private static string? AnnotationStringValue(PdfObject? value) => value switch
+    {
+        PdfString s => System.Text.Encoding.UTF8.GetString(s.Bytes),
+        PdfName n => n.Value,
+        PdfNumber { IsInteger: true } n => ((long)n.Value).ToString(System.Globalization.CultureInfo.InvariantCulture),
+        PdfNumber n => n.Value.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+        _ => null,
+    };
 }

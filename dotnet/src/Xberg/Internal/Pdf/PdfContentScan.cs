@@ -142,7 +142,8 @@ internal static class PdfContentScan
 
         if (subtype == "Image")
         {
-            AddImage(walk, ctm, CodecOf(doc, st.Dict));
+            if (CarriesColorSpace(st.Dict, inline: false))
+                AddImage(walk, ctm, CodecOf(doc, st.Dict));
             return;
         }
         if (subtype != "Form") return;
@@ -176,7 +177,8 @@ internal static class PdfContentScan
             if (tok == "ID") break;
         }
 
-        AddImage(walk, ctm, CodecOf(doc, dict, inline: true));
+        if (CarriesColorSpace(dict, inline: true))
+            AddImage(walk, ctm, CodecOf(doc, dict, inline: true));
         SkipToEndOfInlineImage(lex);
     }
 
@@ -209,15 +211,27 @@ internal static class PdfContentScan
             Math.Max(Math.Max(x0, x1), Math.Max(x2, x3)),
             Math.Max(Math.Max(y0, y1), Math.Max(y2, y3))));
 
-        // CCITT/JBIG2 win over anything already seen; otherwise the first codec sticks.
+        // CCITT wins over anything already seen; otherwise the first codec sticks.
         walk.Codec = (walk.Codec, codec) switch
         {
             (ImageCodecClass.None, var x) => x,
             (_, ImageCodecClass.Ccitt) => ImageCodecClass.Ccitt,
-            (_, ImageCodecClass.Jbig2) => ImageCodecClass.Jbig2,
             (var cur, _) => cur,
         };
     }
+
+    /// <summary>
+    /// Whether the image dictionary names a colour space, which is what decides whether the
+    /// reference extracts the image at all.
+    /// </summary>
+    /// <remarks>
+    /// A stencil mask (<c>/ImageMask true</c>) carries no <c>/ColorSpace</c>, and pdf_oxide's
+    /// image extractor rejects any image dictionary without one, so masks reach neither the
+    /// coverage sum nor the codec vote — a page of CCITT masks over a JPEG photo grades as a
+    /// photo, not as a fax.
+    /// </remarks>
+    private static bool CarriesColorSpace(PdfDict dict, bool inline) =>
+        dict.Has("ColorSpace") || (inline && dict.Has("CS"));
 
     private static ImageCodecClass CodecOf(PdfDocument doc, PdfDict dict, bool inline = false)
     {
@@ -233,8 +247,11 @@ internal static class PdfContentScan
             switch (n)
             {
                 case "CCITTFaxDecode" or "CCF": return ImageCodecClass.Ccitt;
-                case "JBIG2Decode": return ImageCodecClass.Jbig2;
                 case "DCTDecode" or "DCT" or "JPXDecode": return ImageCodecClass.Dct;
+                // JBIG2 is deliberately absent. pdf_oxide's page classifier asks each image only
+                // whether it carries CCITT parameters and whether its data decodes as JPEG, so a
+                // JBIG2 image comes back as `Other` and never earns the bilevel-codec bonus.
+                // Naming it here would score four scanned fixtures 0.10 above the reference.
             }
         }
         return ImageCodecClass.Other;

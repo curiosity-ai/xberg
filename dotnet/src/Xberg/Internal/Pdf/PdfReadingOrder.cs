@@ -722,8 +722,10 @@ internal static class PdfReadingOrder
         }
         int mid = n / 2;
         if (mid <= 0 || mid >= n) return null;
-        int leftPeak = 0; for (int i = 1; i < mid; i++) if (SafeCmp(smoothed[i], smoothed[leftPeak]) > 0) leftPeak = i;
-        int rightPeak = mid; for (int i = mid + 1; i < n; i++) if (SafeCmp(smoothed[i], smoothed[rightPeak]) > 0) rightPeak = i;
+        // Strongest peak in each half, the last of equally strong ones (`max_by`); the trough
+        // between them below keeps the first of equal minima (`min_by`).
+        int leftPeak = 0; for (int i = 1; i < mid; i++) if (SafeCmp(smoothed[i], smoothed[leftPeak]) >= 0) leftPeak = i;
+        int rightPeak = mid; for (int i = mid + 1; i < n; i++) if (SafeCmp(smoothed[i], smoothed[rightPeak]) >= 0) rightPeak = i;
         if (smoothed[leftPeak] == 0.0 || smoothed[rightPeak] == 0.0) return null;
 
         int searchStart = Math.Min(leftPeak, rightPeak) + 1;
@@ -858,11 +860,14 @@ internal static class PdfReadingOrder
             merged.Add((seg.Item1, seg.Item2));
         }
         if (merged.Count == 0) return null;
+        // Widest valley wins, and the LAST of equally wide ones: `Iterator::max_by` keeps the
+        // last maximum, and on a page whose gutter ties with an interior gap the choice
+        // decides which side of the region the column cut lands on.
         (int s, int e, double w)? best = null;
         foreach (var (s, e) in merged)
         {
             double w = e - s;
-            if (best is null || SafeCmp(w, best.Value.w) > 0) best = (s, e, w);
+            if (best is null || SafeCmp(w, best.Value.w) >= 0) best = (s, e, w);
         }
         return best;
     }

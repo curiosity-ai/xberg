@@ -71,6 +71,7 @@ public sealed class DocxExtractor : IExtractor
                     byte? headingLevel = DocxReader.ResolveHeadingLevel(para.StyleId);
                     bool isQuote = IsQuoteStyle(para.StyleId);
 
+                    uint? elementIdx = null;
                     if (headingLevel is { } level)
                     {
                         // Headings do not emit standalone math formulas (matches Rust).
@@ -78,6 +79,7 @@ public sealed class DocxExtractor : IExtractor
                         string headingText = text.Length == 0 ? RunsToMarkdown(para.Runs) : text;
                         uint headingIdx = b.PushHeading(level, headingText, null, null);
                         if (annotations.Count > 0) b.SetAnnotations(headingIdx, annotations);
+                        elementIdx = headingIdx;
                     }
                     else if (isQuote)
                     {
@@ -86,7 +88,7 @@ public sealed class DocxExtractor : IExtractor
                         if (text.Length != 0)
                         {
                             b.PushQuoteStart();
-                            b.PushParagraph(text, annotations, null, null);
+                            elementIdx = b.PushParagraph(text, annotations, null, null);
                             b.PushQuoteEnd();
                         }
                     }
@@ -117,14 +119,46 @@ public sealed class DocxExtractor : IExtractor
                                 for (long i = 0; i < currentNesting - nlvl; i++) { b.EndList(); openListCount = Math.Max(0, openListCount - 1); }
                                 currentNesting = nlvl;
                             }
-                            b.PushListItem(text, currentListOrdered, annotations, null, null);
+                            elementIdx = b.PushListItem(text, currentListOrdered, annotations, null, null);
                         }
                     }
                     else
                     {
                         CloseLists();
                         foreach (var f in mathFormulas) b.PushFormula(f, null, null);
-                        if (text.Length != 0) b.PushParagraph(text, annotations, null, null);
+                        if (text.Length != 0) elementIdx = b.PushParagraph(text, annotations, null, null);
+                    }
+
+                    if (elementIdx is { } sourceIdx)
+                    {
+                        foreach (var run in para.Runs)
+                        {
+                            if (run.MathLatex is not null || run.Text.Length == 0) continue;
+                            if (run.HyperlinkUrl is not { } url) continue;
+                            if (url.StartsWith('#'))
+                                b.PushRelationship(
+                                    sourceIdx,
+                                    RelationshipTarget.FromKey(url.TrimStart('#')),
+                                    RelationshipKind.InternalLink);
+                            b.PushUri(new ExtractedUri { Url = url, Label = run.Text, Kind = UriKind.Hyperlink });
+                        }
+
+                        // Footnote and endnote markers were written into the run text as `[^N]`
+                        // when the reference was walked; the definitions live in a separate part,
+                        // so the reference elements are recovered by scanning the assembled text.
+                        foreach (var refId in ScanMarkers(text, "[^"))
+                        {
+                            if (refId.Length == 0 || !refId.All(char.IsAsciiDigit)) continue;
+                            b.PushFootnoteRef(refId, $"fn{refId}", null);
+                        }
+
+                        // Comment markers (`[cmt:N]`) work the same way, but get their own element
+                        // kind so a consumer can tell a reviewer comment from an authored footnote.
+                        foreach (var commentId in ScanMarkers(text, "[cmt:"))
+                        {
+                            if (commentId.Length == 0) continue;
+                            b.PushCommentRef(commentId, $"cmt{commentId}", null);
+                        }
                     }
                     break;
                 }
@@ -142,6 +176,14 @@ public sealed class DocxExtractor : IExtractor
                 {
                     var draw = el.Drawing!;
                     uint idx = drawingIndex++;
+                    // A text box contributes one paragraph carrying all of its lines: its inner
+                    // `w:p` elements are layout, not document structure, so they must not become
+                    // headings or list items of their own.
+                    if (draw.TextBoxContent is { } boxText && boxText.Trim().Length != 0)
+                    {
+                        CloseLists();
+                        b.PushParagraph(boxText, new(), null, null);
+                    }
                     if (draw.ImageRid is null) break; // textbox shapes etc.
                     CloseLists();
                     var elem = InternalElement.TextElement(ElementKind.Image(idx), draw.Description ?? "", 0);
@@ -175,6 +217,17 @@ public sealed class DocxExtractor : IExtractor
                 uint idx = b.PushFootnoteDefinition(text, $"fn{note.Id}", null);
                 b.SetLayer(idx, ContentLayer.Footnote);
             }
+        }
+
+        // A comment has the same shape as a footnote — a marker in the body and a definition
+        // elsewhere — but a reader needs to tell a reviewer's remark from an authored note, so it
+        // gets its own kind rather than sharing the footnote's.
+        foreach (var comment in doc.Comments)
+        {
+            string text = string.Join(" ", comment.Paragraphs.Select(p => RunsToMarkdown(p.Runs)));
+            if (text.Length == 0) continue;
+            uint idx = b.PushCommentDefinition(text, $"cmt{comment.Id}", null);
+            b.SetLayer(idx, ContentLayer.Footnote);
         }
 
         return b.Build();
@@ -224,6 +277,19 @@ public sealed class DocxExtractor : IExtractor
         };
     }
 
+    /// <summary>
+    /// Ports <c>Paragraph::to_text</c>: run text with each math run replaced by its LaTeX. This is
+    /// the text the page-boundary offsets are measured against, and unlike
+    /// <see cref="CollectText"/> it counts equations — a document made mostly of formulas would
+    /// otherwise report boundaries far short of its real length.
+    /// </summary>
+    private static string ParagraphPlainText(List<DocxRun> runs)
+    {
+        var sb = new StringBuilder();
+        foreach (var run in runs) sb.Append(run.MathLatex ?? run.Text);
+        return sb.ToString();
+    }
+
     private sealed record BoundaryDto(int ByteStart, int ByteEnd, uint PageNumber);
     private sealed record PageInfoDto(uint Number);
 
@@ -244,7 +310,7 @@ public sealed class DocxExtractor : IExtractor
             switch (el.Kind)
             {
                 case DocElementKind.Paragraph:
-                    var t = CollectText(el.Paragraph!.Runs);
+                    var t = ParagraphPlainText(el.Paragraph!.Runs);
                     if (t.Length > 0) { EnsureBlank(); sb.Append(t); }
                     break;
                 case DocElementKind.Table:
@@ -273,7 +339,7 @@ public sealed class DocxExtractor : IExtractor
         sb.Append("\n\n");
         foreach (var note in notes)
         {
-            string text = string.Join(" ", note.Paragraphs.Select(p => CollectText(p.Runs)).Where(s => s.Length > 0));
+            string text = string.Join(" ", note.Paragraphs.Select(p => ParagraphPlainText(p.Runs)).Where(s => s.Length > 0));
             if (text.Length > 0) sb.Append($"{note.Id}: {text}\n");
         }
     }
@@ -289,7 +355,7 @@ public sealed class DocxExtractor : IExtractor
             {
                 string text = cell.VMergeContinue
                     ? ""
-                    : string.Join(" ", cell.Paragraphs.Select(p => CollectText(p.Runs))).Trim();
+                    : string.Join(" ", cell.Paragraphs.Select(p => ParagraphPlainText(p.Runs))).Trim();
                 for (int s = 0; s < cell.GridSpan; s++) rowCells.Add(text);
             }
             cells.Add(rowCells);
@@ -308,6 +374,24 @@ public sealed class DocxExtractor : IExtractor
         if (style is null) return false;
         var lower = style.ToLowerInvariant();
         return lower is "quote" or "blockquote" or "intenseq" or "intensequote" || lower.Contains("quote");
+    }
+
+    /// <summary>
+    /// Yield the payload of every <c>{prefix}…]</c> marker in <paramref name="text"/>, scanning
+    /// left to right and resuming after each closing bracket. An unterminated marker ends the scan.
+    /// </summary>
+    private static IEnumerable<string> ScanMarkers(string text, string prefix)
+    {
+        int searchStart = 0;
+        while (searchStart <= text.Length)
+        {
+            int start = text.IndexOf(prefix, searchStart, StringComparison.Ordinal);
+            if (start < 0) yield break;
+            int end = text.IndexOf(']', start);
+            if (end < 0) yield break;
+            yield return text[(start + prefix.Length)..end];
+            searchStart = end + 1;
+        }
     }
 
     /// <summary>Plain text: concatenate non-math run text.</summary>

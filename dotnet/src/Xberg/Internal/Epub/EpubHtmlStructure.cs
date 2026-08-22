@@ -8,6 +8,7 @@
 // start/width/height) and section/container tree wiring from `DocumentStructureBuilder` are omitted.
 
 using System.Text;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Internal.Epub;
@@ -219,6 +220,7 @@ internal static class EpubHtmlStructure
             if (tagContent.StartsWith('!') || tagContent.StartsWith('?')) return;
 
             bool isClosing = tagContent.StartsWith('/');
+            bool isSelfClosing = tagContent.TrimEnd().EndsWith('/');
             string content = isClosing ? tagContent.Substring(1) : tagContent;
             content = content.TrimEnd('/').Trim();
 
@@ -226,10 +228,10 @@ internal static class EpubHtmlStructure
             string tagLower = tagName.ToLowerInvariant();
 
             if (isClosing) HandleCloseTag(tagLower);
-            else HandleOpenTag(tagLower, attrsStr);
+            else HandleOpenTag(tagLower, attrsStr, isSelfClosing);
         }
 
-        private void HandleOpenTag(string tag, string attrsStr)
+        private void HandleOpenTag(string tag, string attrsStr, bool isSelfClosing)
         {
             switch (tag)
             {
@@ -384,6 +386,23 @@ internal static class EpubHtmlStructure
                     }
                     break;
                 }
+                case "math":
+                {
+                    // The walker is tag-level, so the subtree is taken verbatim and handed to the
+                    // MathML converter as its own document rather than walked token by token —
+                    // walking it would flatten the equation into stray inline text.
+                    FlushParagraph();
+                    if (isSelfClosing) break;
+                    string mathClose = "</math>";
+                    int mathEnd = _src.IndexOf(mathClose, _pos, StringComparison.Ordinal);
+                    if (mathEnd < 0) break;
+                    string inner = _src.Substring(_pos, mathEnd - _pos);
+                    string rawXml = attrsStr.Length == 0 ? $"<math>{inner}</math>" : $"<math {attrsStr}>{inner}</math>";
+                    _pos = mathEnd + mathClose.Length;
+                    string latex = MathMl.ConvertMathmlStrToLatex(rawXml);
+                    if (latex.Trim().Length != 0) PushNode(NodeContent.Formula(latex));
+                    break;
+                }
                 case "video": case "audio":
                 {
                     string closeTag = $"</{tag}>";
@@ -482,7 +501,9 @@ internal static class EpubHtmlStructure
                     _inDt = false;
                     break;
                 case "dd":
-                    _inDd = false;
+                    // `FlushDefinitionItem` is what emits the term/definition pair, and it keys
+                    // off `_inDd`. Clearing the flag first left it with nothing to do, so every
+                    // `<dd>` body was accumulated and then thrown away.
                     FlushDefinitionItem();
                     break;
                 case "figure":

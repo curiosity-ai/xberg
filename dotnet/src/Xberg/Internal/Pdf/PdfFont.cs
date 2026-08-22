@@ -101,8 +101,45 @@ public sealed class PdfFont
             diffs = doc.Resolve(ed.Get("Differences")).AsArray();
         }
 
-        baseEnc = PdfEncodings.ByName(baseName)
-            ?? (f.Subtype == "TrueType" && !symbolic ? PdfEncodings.WinAnsi : PdfEncodings.Standard);
+        // A Type 1 program carries its own encoding, which ISO 32000-1 §9.6.6.1 makes the
+        // implicit base whenever the font dictionary names none. It is also the only place the
+        // ligature slots of a TeX font are declared.
+        var progEnc = (f.Subtype is "Type1" or "MMType1" && descriptor is not null)
+            ? Fonts.Type1Encoding.Parse(LoadFontProgram(descriptor, doc) ?? [])
+            : null;
+
+        bool customEncoding = diffs != null;
+        if (baseName is not null && PdfEncodings.ByName(baseName) is { } named)
+        {
+            baseEnc = named;
+            // A named encoding plus an embedded program: the program's non-standard slots (a
+            // space moved to 0xCA, say) win over the name, unless the program is really a subset
+            // font's private glyph ordering — overlaying one of those turns every mapped code
+            // into mojibake, so it is left alone.
+            if (progEnc is not null && encObj is PdfName && !LooksLikeSubsetCipher(progEnc, named))
+            {
+                var merged = new string[256];
+                Array.Copy(named, merged, 256);
+                foreach (var (code, text) in progEnc) merged[code] = text;
+                baseEnc = merged;
+                customEncoding = true;
+            }
+        }
+        else if (progEnc is not null)
+        {
+            // No usable named encoding: the program's encoding is the base. When an /Encoding
+            // dictionary omits /BaseEncoding this is what §9.6.6.1 asks for, and with no
+            // /Encoding at all upstream takes the program's map whole — codes it does not
+            // declare stay unmapped.
+            var built = new string[256];
+            foreach (var (code, text) in progEnc) built[code] = text;
+            baseEnc = built;
+            customEncoding = true;
+        }
+        else
+        {
+            baseEnc = f.Subtype == "TrueType" && !symbolic ? PdfEncodings.WinAnsi : PdfEncodings.Standard;
+        }
         // Type3 FontMatrix
         if (f.Subtype == "Type3" && doc.Resolve(fontDict.Get("FontMatrix")).AsArray() is PdfArray fm && fm.Items.Count >= 1)
         {
@@ -129,6 +166,12 @@ public sealed class PdfFont
                 }
             }
         }
+
+        // Upstream expands ligature codepoints on every lookup through a *custom* encoding —
+        // one reached through /Differences or through an embedded program — and never through a
+        // plain named encoding or a ToUnicode CMap.
+        if (customEncoding)
+            for (int c = 0; c < 256; c++) enc[c] = ExpandLigature(enc[c]);
 
         // Symbolic standard fonts: per spec 9.6.6.1 (and pdf_oxide's priority order) a
         // symbolic font named *Symbol* / *Zapf* / *Dingbat* maps through its BUILT-IN
@@ -252,10 +295,70 @@ public sealed class PdfFont
         }
     }
 
-    // Note: pdf_oxide only expands ligature chars (U+FB00–06 → "fi"/"fl"…) when the
-    // mapping comes from a parsed embedded font-program encoding — NOT from ToUnicode.
-    // Since this port doesn't parse embedded CFF/TrueType programs, we return the raw
-    // Unicode (matching pdf_oxide's ToUnicode path, which is the common case).
+    /// <summary>
+    /// The decoded bytes of the descriptor's embedded font program, or <c>null</c> when there is
+    /// none. <c>/FontFile2</c> (TrueType) and <c>/FontFile3</c> (CFF) come first because a
+    /// descriptor carrying one of those is describing that program, whatever the /Subtype says.
+    /// </summary>
+    private static byte[]? LoadFontProgram(PdfDict descriptor, PdfDocument doc)
+    {
+        foreach (var key in (ReadOnlySpan<string>)["FontFile2", "FontFile3", "FontFile"])
+        {
+            if (descriptor.Get(key) is null) continue;
+            if (doc.Resolve(descriptor.Get(key)) is not PdfStream st) continue;
+            try { return doc.DecodeStream(st); }
+            catch { return null; }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Whether an embedded program's built-in encoding is a subset font's private glyph ordering
+    /// rather than a real text encoding, judged by how often it agrees with the named encoding
+    /// the producer declared: a real encoding agrees on most shared codes, a re-indexed cipher on
+    /// almost none.
+    /// </summary>
+    private static bool LooksLikeSubsetCipher(Dictionary<int, string> progEnc, string[] named)
+    {
+        int agree = 0, overlap = 0;
+        foreach (var (code, text) in progEnc)
+        {
+            if (code < 0 || code > 255) continue;
+            string s = named[code];
+            if (string.IsNullOrEmpty(s)) continue;
+            overlap++;
+            if (s == text) agree++;
+        }
+        return overlap > 0 && (float)agree / overlap < 0.5f;
+    }
+
+    /// <summary>
+    /// A ligature codepoint spelled out, or the text unchanged.
+    /// </summary>
+    /// <remarks>
+    /// This applies to <em>encoding</em>-derived mappings only, never to ToUnicode. A ToUnicode
+    /// CMap is the font's own statement about what a code means and is taken at its word, but an
+    /// encoding reaches Unicode through a glyph name, and the glyph named <c>fi</c> is the letters
+    /// `f` and `i` set as one shape rather than a character anybody wrote. Upstream draws the line
+    /// in the same place.
+    /// </remarks>
+    private static string ExpandLigature(string? text)
+    {
+        if (string.IsNullOrEmpty(text) || text.Length != 1) return text ?? "";
+        return text[0] switch
+        {
+            '\uFB00' => "ff",
+            '\uFB01' => "fi",
+            '\uFB02' => "fl",
+            '\uFB03' => "ffi",
+            '\uFB04' => "ffl",
+            '\uFB05' or '\uFB06' => "st",
+            _ => text,
+        };
+    }
+
+    // A ligature reaching us through ToUnicode is returned as the font wrote it; only the
+    // encoding-derived mappings above are expanded. See ExpandLigature.
     public string CharToUnicode(int code)
     {
         if (_toUnicode != null)

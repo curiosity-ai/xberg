@@ -21,12 +21,14 @@ public sealed class RstExtractor : IExtractor
         bool injectPlaceholders = true;
 
         var metadata = ExtractMetadata(text);
-        var tables = ExtractTables(text);
 
+        // Tables are parsed in place inside BuildInternalDocument, which produces table elements
+        // positioned where the table actually sits. A second pass raw-pushing the same tables
+        // added an unreferenced — and for grid tables less accurate — duplicate of every one of
+        // them without contributing anything to the rendered output.
         var doc = BuildInternalDocument(text, injectPlaceholders);
         doc.MimeType = mimeType;
         doc.Metadata = metadata;
-        foreach (var t in tables) doc.PushTable(t);
         return doc;
     }
 
@@ -207,58 +209,6 @@ public sealed class RstExtractor : IExtractor
     }
 
     // ── tables ────────────────────────────────────────────────────────────
-
-    private static List<Table> ExtractTables(string content)
-    {
-        var tables = new List<Table>();
-        var lines = MarkupHelpers.Lines(content);
-        int i = 0;
-        while (i < lines.Count)
-        {
-            string trimmed = lines[i].Trim();
-            if (IsSimpleTableSeparator(trimmed))
-            {
-                var tableLines = new List<string> { lines[i] };
-                i++;
-                while (i < lines.Count)
-                {
-                    string tl = lines[i].Trim();
-                    if (tl.Length == 0) break;
-                    tableLines.Add(lines[i]);
-                    i++;
-                    if (IsSimpleTableSeparator(tl)) break;
-                }
-                var cells = ParseSimpleTableCells(tableLines);
-                if (cells.Count > 0)
-                    tables.Add(new Table { Cells = cells, Markdown = CellsToMarkdown(cells), PageNumber = 1 });
-                continue;
-            }
-            if (trimmed.StartsWith('+') && trimmed.EndsWith('+') && trimmed.Contains('-'))
-            {
-                var t = ParseGridTable(lines, ref i);
-                if (t is not null) { tables.Add(t); continue; }
-            }
-            i++;
-        }
-        return tables;
-    }
-
-    private static Table? ParseGridTable(List<string> lines, ref int i)
-    {
-        var cells = new List<List<string>>();
-        while (i < lines.Count && (lines[i].Contains('|') || lines[i].Trim().StartsWith('+')))
-        {
-            string line = lines[i].Trim('|', '+');
-            if (line.Length != 0)
-            {
-                var row = line.Split('|').Select(s => s.Trim()).ToList();
-                if (row.Count > 0) cells.Add(row);
-            }
-            i++;
-        }
-        if (cells.Count == 0) return null;
-        return new Table { Cells = cells, Markdown = CellsToMarkdown(cells), PageNumber = 1 };
-    }
 
     private static bool IsSimpleTableSeparator(string line)
     {
@@ -745,8 +695,38 @@ public sealed class RstExtractor : IExtractor
 
             if (trimmed.StartsWith(".. ") || trimmed == "..")
             {
+                // A directive this parser does not handle still has a body, and that body is
+                // document text. A comment's body is not. The two look alike, so they are told
+                // apart by shape: a directive's name is a single word immediately followed by
+                // `::`, which `.. some comment text` never is.
+                string afterDots = trimmed.StartsWith(".. ") ? trimmed[3..] : "";
+                int marker = afterDots.IndexOf("::", StringComparison.Ordinal);
+                bool isDirective = trimmed != ".." && marker > 0
+                    && !afterDots[..marker].Any(char.IsWhiteSpace);
+
                 i++;
-                while (i < lines.Count && (lines[i].StartsWith("   ") || lines[i].StartsWith("\t") || lines[i].Length == 0)) i++;
+                var bodyText = new StringBuilder();
+                while (i < lines.Count)
+                {
+                    string l = lines[i];
+                    if (l.Length == 0)
+                    {
+                        // A blank line ends the body once there is one; before that it is just
+                        // the gap between the directive line and its content.
+                        if (bodyText.Length > 0) break;
+                        i++;
+                        continue;
+                    }
+                    if (!l.StartsWith("   ") && !l.StartsWith("\t")) break;
+                    if (bodyText.Length > 0) bodyText.Append(' ');
+                    bodyText.Append(l.Trim());
+                    i++;
+                }
+                if (isDirective && bodyText.Length > 0)
+                {
+                    var (stripped, annotations) = ParseInlineMarkup(bodyText.ToString());
+                    b.PushParagraph(stripped, annotations, null, null);
+                }
                 continue;
             }
 

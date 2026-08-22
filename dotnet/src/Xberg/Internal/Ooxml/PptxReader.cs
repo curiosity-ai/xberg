@@ -253,18 +253,31 @@ public static class PptxReader
         return new SlideElement { Kind = SlideKind.Image, ImageId = embed, Description = descr };
     }
 
+    /// <summary>
+    /// A paragraph's runs (`extraction/pptx/parser.rs::parse_paragraph`).
+    /// </summary>
+    /// <remarks>
+    /// Besides `a:r`, two siblings carry text: `a:br`, an explicit in-paragraph line break, and
+    /// `a:fld`, a field — a slide number or date — whose rendered value PowerPoint caches in a
+    /// nested `a:t`, so it reads exactly like a run.
+    /// </remarks>
     private static List<Run> ParseParagraph(XElement p, bool addNewLine)
     {
-        var runNodes = p.Elements().Where(e => e.Name.LocalName == "r").ToList();
-        var runs = new List<Run>(runNodes.Count);
-        for (int i = 0; i < runNodes.Count; i++)
+        var runs = new List<Run>();
+        foreach (var child in p.Elements())
         {
-            var run = ParseRun(runNodes[i]);
-            if (addNewLine && i == runNodes.Count - 1) run.Text += "\n";
-            runs.Add(run);
+            switch (child.Name.LocalName)
+            {
+                case "r": runs.Add(ParseRun(child)); break;
+                case "br": runs.Add(LineBreakRun()); break;
+                case "fld": runs.Add(ParseRun(child)); break;
+            }
         }
+        if (addNewLine && runs.Count > 0) runs[^1].Text += "\n";
         return runs;
     }
+
+    private static Run LineBreakRun() => new() { Text = "\n" };
 
     private static Run ParseRun(XElement r)
     {
@@ -286,16 +299,24 @@ public static class PptxReader
         return run;
     }
 
+    /// <summary>
+    /// The shape's offset and extent, read only from a DrawingML <c>a:xfrm</c>. A
+    /// <c>p:graphicFrame</c> carries its transform as <c>p:xfrm</c> instead, so a table, chart or
+    /// SmartArt frame reports no position at all and sorts to the top of its slide.
+    /// </summary>
     private static Position ExtractPosition(XElement node)
     {
-        var xfrm = node.Descendants().FirstOrDefault(n => n.Name.LocalName == "xfrm");
+        var xfrm = node.Descendants()
+            .FirstOrDefault(n => n.Name.LocalName == "xfrm" && n.Name.NamespaceName == DrawingMlNamespace);
         if (xfrm is null) return default;
-        var off = xfrm.Elements().FirstOrDefault(n => n.Name.LocalName == "off");
+        var off = xfrm.Elements()
+            .FirstOrDefault(n => n.Name.LocalName == "off" && n.Name.NamespaceName == DrawingMlNamespace);
         if (off is null) return default;
         if (!long.TryParse(off.Attribute("x")?.Value, out var x)) return default;
         if (!long.TryParse(off.Attribute("y")?.Value, out var y)) return default;
         long cx = 0, cy = 0;
-        var ext = xfrm.Elements().FirstOrDefault(n => n.Name.LocalName == "ext");
+        var ext = xfrm.Elements()
+            .FirstOrDefault(n => n.Name.LocalName == "ext" && n.Name.NamespaceName == DrawingMlNamespace);
         if (ext is not null)
         {
             long.TryParse(ext.Attribute("cx")?.Value, out cx);
@@ -308,13 +329,12 @@ public static class PptxReader
     private static string SlideToMarkdown(List<SlideElement> elements, bool plain, bool injectPlaceholders)
     {
         var builder = new ContentBuilder(plain);
-        var order = Enumerable.Range(0, elements.Count).ToList();
-        order.Sort((a, b) =>
-        {
-            var pa = elements[a].Pos; var pb = elements[b].Pos;
-            int c = pa.Y.CompareTo(pb.Y);
-            return c != 0 ? c : pa.X.CompareTo(pb.X);
-        });
+        // Top-to-bottom then left-to-right, and the sort has to be stable: shapes that report no
+        // position at all share one key, and document order is all that separates them.
+        var order = Enumerable.Range(0, elements.Count)
+            .OrderBy(i => elements[i].Pos.Y)
+            .ThenBy(i => elements[i].Pos.X)
+            .ToList();
 
         int? titleIdx = null;
         foreach (var idx in order)

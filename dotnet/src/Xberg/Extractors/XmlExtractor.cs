@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Xberg.Core;
 using Xberg.Types;
@@ -79,7 +80,9 @@ public sealed class XmlExtractor : IExtractor
                 }
                 case EventKind.CData:
                 {
-                    if (isSvg && !stack.Any(SvgTextElements.Contains)) break;
+                    // No SVG text-element filter here: upstream guards only the `Text` arm, so a
+                    // CDATA section — which is how an SVG carries its script and style bodies —
+                    // is kept wherever it appears.
                     string trimmed = ev.Text.Trim();
                     if (trimmed.Length == 0) break;
                     doc.PushElement(MakeElement(ElementKind.Paragraph, trimmed, depth, index++, null));
@@ -204,10 +207,10 @@ public sealed class XmlExtractor : IExtractor
             {
                 int lt = s.IndexOf('<', i);
                 if (lt < 0) lt = n;
-                // quick-xml emits entity references (&name; / &#..;) as separate GeneralRef
-                // events; the build path ignores them, so a run of text is split around each
-                // entity into independent Text events.
-                int seg = i;
+                // An entity reference is part of the text it sits in, not a boundary in it:
+                // "Trinidad &amp; Tobado" is one country's name. The reference is resolved and
+                // the run stays whole.
+                var run = new StringBuilder(lt - i);
                 for (int j = i; j < lt; j++)
                 {
                     if (s[j] == '&')
@@ -215,13 +218,14 @@ public sealed class XmlExtractor : IExtractor
                         int semi = FindEntityEnd(s, j, lt);
                         if (semi > 0)
                         {
-                            if (j > seg) yield return new XmlEvent(EventKind.Text, "", s.Substring(seg, j - seg), null);
-                            j = semi;      // loop's j++ moves past ';'
-                            seg = semi + 1;
+                            run.Append(ResolveEntity(s.AsSpan(j + 1, semi - j - 1)));
+                            j = semi;      // the loop's j++ moves past ';'
+                            continue;
                         }
                     }
+                    run.Append(s[j]);
                 }
-                if (lt > seg) yield return new XmlEvent(EventKind.Text, "", s.Substring(seg, lt - seg), null);
+                if (run.Length > 0) yield return new XmlEvent(EventKind.Text, "", run.ToString(), null);
                 i = lt;
             }
         }
@@ -311,6 +315,37 @@ public sealed class XmlExtractor : IExtractor
 
     // Return the index of the terminating ';' of an entity reference starting at '&' (index a),
     // or -1 if the run is not a well-formed entity name (then '&' is treated as literal text).
+    /// <summary>
+    /// The text a character or entity reference stands for. An unknown name resolves to nothing,
+    /// because a reference this parser cannot resolve names something the document did not carry
+    /// inline, and its literal spelling is not that thing.
+    /// </summary>
+    private static string ResolveEntity(ReadOnlySpan<char> name)
+    {
+        if (name.Length > 1 && name[0] == '#')
+        {
+            var digits = name[1..];
+            bool hex = digits.Length > 0 && (digits[0] == 'x' || digits[0] == 'X');
+            if (hex) digits = digits[1..];
+            if (digits.Length == 0) return "";
+            if (!int.TryParse(digits, hex ? NumberStyles.HexNumber : NumberStyles.None,
+                    CultureInfo.InvariantCulture, out int code))
+                return "";
+            if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) return "";
+            return char.ConvertFromUtf32(code);
+        }
+        return name switch
+        {
+            "amp" => "&",
+            "lt" => "<",
+            "gt" => ">",
+            "quot" => "\"",
+            "apos" => "'",
+            "nbsp" => "\u00A0",
+            _ => "",
+        };
+    }
+
     private static int FindEntityEnd(string s, int a, int limit)
     {
         int j = a + 1;

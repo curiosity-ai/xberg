@@ -5,6 +5,7 @@
 using System.IO.Compression;
 using System.Text;
 using System.Xml.Linq;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Internal.Epub;
@@ -28,9 +29,12 @@ internal static class EpubContent
     };
 
     // Elements whose entire subtree is skipped.
+    //
+    // `math` is deliberately absent: its subtree is converted to LaTeX (see RenderMathElement)
+    // rather than dropped.
     private static readonly HashSet<string> SkipElements = new(StringComparer.Ordinal)
     {
-        "head", "script", "style", "svg", "math", "video", "audio", "source", "track", "object", "embed", "iframe",
+        "head", "script", "style", "svg", "video", "audio", "source", "track", "object", "embed", "iframe",
     };
 
     /// <summary>Read all body documents in spine order, downgrading per-item I/O failures to warnings.</summary>
@@ -92,7 +96,8 @@ internal static class EpubContent
             }
 
             string normalizedXhtml = NormalizeXhtml(rawXhtml);
-            string renderXhtml = StripSpecializedNavigationSections(StripDocumentHead(normalizedXhtml));
+            string renderXhtml = StripEmbeddedMediaElements(
+                StripSpecializedNavigationSections(StripDocumentHead(normalizedXhtml)));
 
             if (guideTocCandidate && LooksLikeNavigationDocument(renderXhtml))
                 continue;
@@ -187,8 +192,213 @@ internal static class EpubContent
         return -1;
     }
 
+    /// <summary>EPUB structural semantics namespace (`epub:` prefix).</summary>
+    public const string EpubNamespace = "http://www.idpf.org/2007/ops";
+
+    /// <summary>XHTML namespace, always a supported switch-case namespace.</summary>
+    public const string XhtmlNamespace = "http://www.w3.org/1999/xhtml";
+
+    /// <summary>MathML namespace, supported only by the markup renderers.</summary>
+    public const string MathmlNamespace = "http://www.w3.org/1998/Math/MathML";
+
+    /// <summary>
+    /// Resolve deprecated EPUB 3 <c>epub:switch</c> elements to the branch this renderer draws.
+    /// Mirrors `resolve_epub_switch_elements`: the first <c>epub:case</c> whose
+    /// <c>required-namespace</c> is one the renderer handles wins, otherwise <c>epub:default</c>,
+    /// and every other branch is cut out of the markup by byte range. Markup that does not parse
+    /// as XML is returned untouched.
+    /// </summary>
+    public static string ResolveEpubSwitchElements(string xhtml, IReadOnlyList<string> supportedNamespaces)
+    {
+        List<XmlElementSpan>? elements = ScanElementSpans(xhtml);
+        if (elements is null)
+            return xhtml;
+
+        var removedRanges = new List<(int Start, int End)>();
+        for (int i = 0; i < elements.Count; i++)
+        {
+            if (!IsEpubElement(elements[i], "switch"))
+                continue;
+
+            int selected = -1;
+            for (int c = i + 1; c < elements.Count; c++)
+            {
+                var child = elements[c];
+                if (child.Parent != i) continue;
+                if (!IsEpubElement(child, "case")) continue;
+                if (child.RequiredNamespace is not { } required) continue;
+                foreach (string supported in supportedNamespaces)
+                {
+                    if (required.Trim() == supported) { selected = c; break; }
+                }
+                if (selected >= 0) break;
+            }
+
+            if (selected < 0)
+            {
+                for (int c = i + 1; c < elements.Count; c++)
+                {
+                    if (elements[c].Parent == i && IsEpubElement(elements[c], "default")) { selected = c; break; }
+                }
+            }
+
+            for (int c = i + 1; c < elements.Count; c++)
+            {
+                var child = elements[c];
+                if (child.Parent != i) continue;
+                if (!IsEpubElement(child, "case") && !IsEpubElement(child, "default")) continue;
+                if (c == selected) continue;
+                removedRanges.Add((child.Start, child.End));
+            }
+        }
+
+        if (removedRanges.Count == 0)
+            return xhtml;
+
+        removedRanges.Sort((left, right) =>
+            left.Start != right.Start ? left.Start.CompareTo(right.Start) : right.End.CompareTo(left.End));
+
+        var outerRanges = new List<(int Start, int End)>(removedRanges.Count);
+        foreach (var range in removedRanges)
+        {
+            if (outerRanges.Count == 0 || range.Start >= outerRanges[^1].End)
+                outerRanges.Add(range);
+        }
+
+        var resolved = new StringBuilder(xhtml);
+        for (int i = outerRanges.Count - 1; i >= 0; i--)
+            resolved.Remove(outerRanges[i].Start, outerRanges[i].End - outerRanges[i].Start);
+        return resolved.ToString();
+    }
+
+    private static bool IsEpubElement(XmlElementSpan element, string localName) =>
+        element.NamespaceUri == EpubNamespace
+        && string.Equals(element.LocalName, localName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>One element of the parsed document, with the source range its markup occupies.</summary>
+    private readonly record struct XmlElementSpan(
+        string NamespaceUri, string LocalName, string? RequiredNamespace, int Parent, int Start, int End);
+
+    /// <summary>
+    /// Walk the document in order, recording every element's namespace, parent and source range.
+    /// Returns null when the markup is not well-formed XML, which is the signal to leave it alone.
+    /// </summary>
+    private static List<XmlElementSpan>? ScanElementSpans(string xhtml)
+    {
+        var lineStarts = new List<int> { 0 };
+        for (int i = 0; i < xhtml.Length; i++)
+        {
+            if (xhtml[i] == '\n') lineStarts.Add(i + 1);
+        }
+
+        int Offset(int line, int column)
+        {
+            if (line < 1 || line > lineStarts.Count) return -1;
+            int offset = lineStarts[line - 1] + column - 1;
+            return offset >= 0 && offset <= xhtml.Length ? offset : -1;
+        }
+
+        var settings = new System.Xml.XmlReaderSettings
+        {
+            DtdProcessing = System.Xml.DtdProcessing.Ignore,
+            IgnoreComments = false,
+            IgnoreWhitespace = false,
+            CheckCharacters = false,
+        };
+
+        var elements = new List<XmlElementSpan>();
+        var openParents = new Stack<int>();
+        var starts = new Dictionary<int, (string Ns, string Local, string? Required, int Parent, int Start)>();
+
+        try
+        {
+            using var reader = System.Xml.XmlReader.Create(new StringReader(xhtml), settings);
+            var lineInfo = (System.Xml.IXmlLineInfo)reader;
+            while (reader.Read())
+            {
+                if (reader.NodeType == System.Xml.XmlNodeType.Element)
+                {
+                    // The reader reports the position of the element *name*, one past the `<`.
+                    int start = Offset(lineInfo.LineNumber, lineInfo.LinePosition) - 1;
+                    if (start < 0 || start >= xhtml.Length || xhtml[start] != '<') return null;
+
+                    int index = elements.Count;
+                    string ns = reader.NamespaceURI;
+                    string local = reader.LocalName;
+                    string? required = reader.GetAttribute("required-namespace");
+                    int parent = openParents.Count > 0 ? openParents.Peek() : -1;
+                    elements.Add(default);
+                    starts[index] = (ns, local, required, parent, start);
+
+                    if (reader.IsEmptyElement)
+                    {
+                        int end = FindTagEnd(xhtml, start);
+                        if (end < 0) return null;
+                        elements[index] = new XmlElementSpan(ns, local, required, parent, start, end);
+                        starts.Remove(index);
+                    }
+                    else
+                    {
+                        openParents.Push(index);
+                    }
+                }
+                else if (reader.NodeType == System.Xml.XmlNodeType.EndElement)
+                {
+                    if (openParents.Count == 0) return null;
+                    int index = openParents.Pop();
+                    // The reader reports the name inside `</name>`, two past the `<`.
+                    int tagStart = Offset(lineInfo.LineNumber, lineInfo.LinePosition) - 2;
+                    if (tagStart < 0) return null;
+                    int end = FindTagEnd(xhtml, tagStart);
+                    if (end < 0) return null;
+                    var record = starts[index];
+                    elements[index] = new XmlElementSpan(
+                        record.Ns, record.Local, record.Required, record.Parent, record.Start, end);
+                    starts.Remove(index);
+                }
+            }
+        }
+        catch (System.Xml.XmlException)
+        {
+            return null;
+        }
+
+        return starts.Count == 0 && openParents.Count == 0 ? elements : null;
+    }
+
+    /// <summary>Index one past the `&gt;` closing the tag that starts at <paramref name="from"/>.</summary>
+    private static int FindTagEnd(string s, int from)
+    {
+        char quote = '\0';
+        for (int i = from; i < s.Length; i++)
+        {
+            char ch = s[i];
+            if (quote != '\0')
+            {
+                if (ch == quote) quote = '\0';
+            }
+            else if (ch == '"' || ch == '\'')
+            {
+                quote = ch;
+            }
+            else if (ch == '>')
+            {
+                return i + 1;
+            }
+        }
+        return -1;
+    }
+
     /// <summary>Remove the entire &lt;head&gt; element. Mirrors `strip_document_head`.</summary>
     public static string StripDocumentHead(string xhtml) => StripElements(xhtml, "head", _ => true);
+
+    /// <summary>
+    /// Remove &lt;audio&gt; and &lt;video&gt; subtrees (`strip_embedded_media_elements`). They are
+    /// delivery controls rather than book text, and the HTML conversion would otherwise emit
+    /// their source URLs and the serialized fallback markup alongside the prose.
+    /// </summary>
+    public static string StripEmbeddedMediaElements(string xhtml) =>
+        StripElements(StripElements(xhtml, "audio", _ => true), "video", _ => true);
 
     /// <summary>Remove specialized navigation &lt;nav&gt; sections (toc/landmarks/page-list).</summary>
     public static string StripSpecializedNavigationSections(string xhtml) =>
@@ -420,6 +630,7 @@ internal static class EpubContent
             case XElement e:
             {
                 string tag = e.Name.LocalName.ToLowerInvariant();
+                if (tag == "math") { RenderMathElement(e, output); return; }
                 if (SkipElements.Contains(tag)) return;
                 if (tag == "br") { output.Append('\n'); return; }
                 if (tag == "hr")
@@ -437,6 +648,19 @@ internal static class EpubContent
                 foreach (var child in d.Nodes()) VisitNode(child, output);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Convert a <c>&lt;math&gt;</c> element to LaTeX and append it as its own <c>$$...$$</c>
+    /// block, isolated by blank lines so it survives the <c>\n\n</c> paragraph split callers use
+    /// downstream. Never leaks raw MathML tag text: an element that converts to nothing is dropped.
+    /// </summary>
+    private static void RenderMathElement(XElement node, StringBuilder output)
+    {
+        string trimmed = MathMl.ConvertMathmlNodeToLatex(node).Trim();
+        if (trimmed.Length == 0) return;
+        if (output.Length > 0 && output[^1] != '\n') output.Append('\n');
+        output.Append("\n$$").Append(trimmed).Append("$$\n\n");
     }
 
     /// <summary>Collapse inline whitespace runs to a single space. Mirrors `normalise_inline_whitespace`.</summary>

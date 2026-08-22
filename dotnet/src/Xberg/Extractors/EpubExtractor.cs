@@ -27,6 +27,11 @@ public sealed class EpubExtractor : IExtractor
 
     public int Priority => 60;
 
+    private static readonly string[] MarkupSwitchNamespaces =
+        { EpubContent.XhtmlNamespace, EpubContent.MathmlNamespace };
+
+    private static readonly string[] PlainSwitchNamespaces = { EpubContent.XhtmlNamespace };
+
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         byte[] bytes = content.ToArray();
@@ -60,6 +65,15 @@ public sealed class EpubExtractor : IExtractor
 
         var (spineDocuments, bodyWarnings) = EpubContent.ReadBodyDocuments(archive, package);
         processingWarnings.AddRange(bodyWarnings);
+
+        // `epub:switch` branches are resolved per renderer: the markup renderers draw MathML,
+        // the plain/structured path does not, so each selects a different branch (mod.rs, the
+        // MARKUP_SWITCH_NAMESPACES / PLAIN_SWITCH_NAMESPACES pair).
+        bool wantsMarkup = config.OutputFormat.Which is Core.OutputFormat.Kind.Markdown
+            or Core.OutputFormat.Kind.Djot;
+        string[] supportedNamespaces = wantsMarkup ? MarkupSwitchNamespaces : PlainSwitchNamespaces;
+        foreach (var spineDoc in spineDocuments)
+            spineDoc.Xhtml = EpubContent.ResolveEpubSwitchElements(spineDoc.Xhtml, supportedNamespaces);
 
         string? coverImagePath = package.Metadata.CoverImageHref;
         var doc = BuildInternalDocument(archive, spineDocuments, coverImagePath)
@@ -185,8 +199,14 @@ public sealed class EpubExtractor : IExtractor
 
             switch (content.Which)
             {
+                // The blockquote container is recorded even though its contents are not inside it
+                // (issue #127): upstream brackets the span the node claims as children, and this
+                // walker's nodes are flat, so the quote opens and closes at once and the quoted
+                // paragraph follows it as a sibling.
                 case NodeContent.Tag.Quote:
-                    continue; // handled via parent tracking upstream; skip here
+                    builder.PushQuoteStart();
+                    builder.PushQuoteEnd();
+                    continue;
 
                 case NodeContent.Tag.Heading:
                     builder.PushHeading(content.Level, content.Text ?? "", null, null);
@@ -223,6 +243,10 @@ public sealed class EpubExtractor : IExtractor
 
                 case NodeContent.Tag.Code:
                     builder.PushCode(content.Text ?? "", content.Language, null, null);
+                    break;
+
+                case NodeContent.Tag.Formula:
+                    builder.PushFormula(content.Text ?? "", null, null);
                     break;
 
                 case NodeContent.Tag.Image:
@@ -276,7 +300,16 @@ public sealed class EpubExtractor : IExtractor
                     break;
                 }
 
-                // Group{heading_text}, DefinitionList, DefinitionItem, RawBlock, MetadataBlock, List, etc.:
+                case NodeContent.Tag.DefinitionItem:
+                    // Upstream carries an explicit arm here, added by its issue #127 after these
+                    // fell into the catch-all and were dropped whole — the structure walker does
+                    // produce them for `<dl>/<dt>/<dd>`. Only `DefinitionList` and `List`, which
+                    // are containers, are skipped.
+                    builder.PushDefinitionTerm(content.Term ?? "", null);
+                    builder.PushDefinitionDescription(content.Definition ?? "", null);
+                    break;
+
+                // Group{heading_text}, DefinitionList, RawBlock, MetadataBlock, List, etc.:
                 // skipped, matching the mod.rs `_ => {}` arm.
             }
         }

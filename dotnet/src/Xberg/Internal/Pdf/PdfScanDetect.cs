@@ -91,22 +91,27 @@ internal static class PdfScanDetect
     };
 
     /// <summary>Grade one page's evidence. Pure, so it is testable without a document.</summary>
+    /// <remarks>
+    /// The terms accumulate in single precision because the reference does, and the sum is
+    /// reported verbatim: 0.50 + 0.35 + 0.05 lands on 0.90000004 in float and 0.9 in double, and
+    /// the two serialize to visibly different numbers.
+    /// </remarks>
     public static double ScorePage(PageScanSignals s)
     {
         if (s.ImageCoverage < ImageCoverageMin) return 0.0;
 
-        double score = ScoreFullPageRaster;
+        float score = (float)ScoreFullPageRaster;
 
         if (s.GlyphCount == 0 || s.InvisibleTextRatio >= InvisibleTextMin)
-            score += ScoreNoVisibleText;
+            score += (float)ScoreNoVisibleText;
 
         if (s.Codec is ImageCodecClass.Ccitt or ImageCodecClass.Jbig2)
-            score += ScoreBilevelCodec;
+            score += (float)ScoreBilevelCodec;
 
         if (s.ProducerPrior == ProducerPrior.Scanner)
-            score += ScoreScannerProducer;
+            score += (float)ScoreScannerProducer;
 
-        return Math.Clamp(score, 0.0, 1.0);
+        return Math.Clamp(score, 0f, 1f);
     }
 
     /// <summary>

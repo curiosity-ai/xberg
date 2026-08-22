@@ -19,6 +19,8 @@ public sealed partial class TypstExtractor : IExtractor
     // The hash is optional: inside `#figure(...)` the call is written bare, as `image("…")`.
     [GeneratedRegex(@"#?image\(""([^""]*)""")] private static partial Regex ImageRe();
     [GeneratedRegex(@"columns:\s*(\d+)")] private static partial Regex ColumnsRe();
+    [GeneratedRegex(@"#cite\(<([^>]+)>\)")] private static partial Regex CiteRe();
+    [GeneratedRegex(@"(^|[\s(])@([A-Za-z][A-Za-z0-9_:.-]*)")] private static partial Regex AtCiteRe();
     [GeneratedRegex(@"^#link\(""([^""]*)""\)\[([^\]]*)\]")] private static partial Regex LinkRe();
     [GeneratedRegex(@"keywords:\s*(?:""([^""]*)""|(\([^)]*\)))")] private static partial Regex KeywordsRe();
     [GeneratedRegex(@"""([^""]*)""")] private static partial Regex QuotedItemRe();
@@ -386,7 +388,8 @@ public sealed partial class TypstExtractor : IExtractor
     private static void FlushParagraph(StringBuilder buf, InternalDocumentBuilder builder)
     {
         if (buf.Length == 0) return;
-        var (text, annotations) = ParseInlineAnnotations(buf.ToString().Trim());
+        var (resolved, citationKeys) = ExtractCitations(buf.ToString().Trim());
+        var (text, annotations) = ParseInlineAnnotations(resolved);
         byte[] tb = Encoding.UTF8.GetBytes(text);
         foreach (var ann in annotations)
         {
@@ -399,7 +402,35 @@ public sealed partial class TypstExtractor : IExtractor
             builder.PushUri(MarkupHelpers.Hyperlink(url, label));
         }
         builder.PushParagraph(text, annotations, null, null);
+        // Each citation follows the paragraph that made it, so the prose keeps its marker and the
+        // reference is still addressable on its own.
+        foreach (string key in citationKeys) builder.PushCitation(key, key, null);
         buf.Clear();
+    }
+
+    /// <summary>
+    /// Replace Typst's citation forms with a readable <c>[key]</c> marker and return the keys.
+    /// </summary>
+    /// <remarks>
+    /// A reference is written <c>#cite(&lt;key&gt;)</c> or, far more often, <c>@key</c>. Leaving
+    /// the raw form in the text puts Typst source into the prose; dropping it loses the
+    /// reference. The <c>@</c> form must be preceded by the start of the text, whitespace or an
+    /// opening parenthesis, so an email address is not read as a citation.
+    /// </remarks>
+    private static (string Text, List<string> Keys) ExtractCitations(string raw)
+    {
+        var keys = new List<string>();
+        string afterCite = CiteRe().Replace(raw, m =>
+        {
+            keys.Add(m.Groups[1].Value);
+            return $"[{m.Groups[1].Value}]";
+        });
+        string afterAt = AtCiteRe().Replace(afterCite, m =>
+        {
+            keys.Add(m.Groups[2].Value);
+            return $"{m.Groups[1].Value}[{m.Groups[2].Value}]";
+        });
+        return (afterAt, keys);
     }
 
     private static void EmitTable(string tableStr, InternalDocumentBuilder builder)

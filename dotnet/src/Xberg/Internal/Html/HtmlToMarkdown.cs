@@ -14,23 +14,451 @@ namespace Xberg.Internal.Html;
 internal static class HtmlToMarkdown
 {
     // ── public entry ─────────────────────────────────────────────────────────
-    public static string Convert(string html)
+    public static string Convert(string html) => Convert(html, null);
+
+    /// <summary>
+    /// Convert to markdown, and report the document structure the conversion saw.
+    /// </summary>
+    /// <remarks>
+    /// The structure is collected during the same walk rather than derived from a second one, so
+    /// each node carries the markdown its block rendered to.
+    /// </remarks>
+    public static string ConvertWithStructure(string html, out HtmlStructureCollector structure)
+        => ConvertWithStructure(html, plainText: false, out structure);
+
+    /// <summary>
+    /// Convert and report the structure, optionally returning plain text instead of markdown.
+    /// </summary>
+    /// <remarks>
+    /// `converter/main.rs` runs the markdown walk either way — that walk is what fills the
+    /// structure collector — and only swaps the returned string for
+    /// <see cref="HtmlPlainText"/>'s when the caller asked for plain output.
+    /// </remarks>
+    public static string ConvertWithStructure(string html, bool plainText, out HtmlStructureCollector structure)
+    {
+        structure = new HtmlStructureCollector();
+        return Convert(html, structure, plainText);
+    }
+
+    private static string Convert(string html, HtmlStructureCollector? structure, bool plainText = false)
     {
         html = html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
-        var root = HtmlDom.Parse(html);
+        string prepared = StripHiddenElements(StripScriptAndStyleTags(html));
+        var root = HtmlDom.Parse(prepared);
+        if (HasCustomElementTags(prepared) || HasInlineBlockMisnest(root))
+        {
+            MarkCanonicalAttributes(root);
+            DropLeadingDocumentWhitespace(root);
+        }
 
         var sb = new StringBuilder();
         string front = ExtractFrontmatter(root);
         sb.Append(front);
 
-        var ctx = new Ctx();
+        var ctx = new Ctx { Structure = structure };
         foreach (var child in root.Children)
             WalkNode(child, sb, ctx);
+
+        if (plainText) return HtmlPlainText.Extract(root);
 
         string outp = sb.ToString();
         outp = TrimLineEndWhitespace(outp);
         outp = CollapseExcessBlankLines(outp);
         return outp;
+    }
+
+    // ── html5ever repair (converter/main.rs) ────────────────────────────────
+    /// <summary>
+    /// Whether the source holds a custom element — a tag name with a hyphen in it. Upstream
+    /// re-parses such a document with html5ever (`has_custom_element_tags`), because its own
+    /// parser cannot place unknown elements.
+    /// </summary>
+    internal static bool HasCustomElementTags(string html)
+    {
+        for (int i = 0; i < html.Length; i++)
+        {
+            if (html[i] != '<') continue;
+            int j = i + 1;
+            if (j < html.Length && html[j] == '/') j++;
+            while (j < html.Length && char.IsWhiteSpace(html[j])) j++;
+            int start = j;
+            while (j < html.Length)
+            {
+                char c = html[j];
+                if (c is '>' or '/' || char.IsWhiteSpace(c))
+                {
+                    if (html.AsSpan(start, j - start).IndexOf('-') >= 0) return true;
+                    break;
+                }
+                j++;
+            }
+            i = j - 1;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a block-level element sits under an inline ancestor, or a table cell under a
+    /// paragraph (`has_inline_block_misnest`). Either shape means the lenient parse disagrees
+    /// with the HTML5 tree, and upstream re-parses the document with html5ever.
+    /// </summary>
+    internal static bool HasInlineBlockMisnest(HNode root)
+    {
+        foreach (var node in Descendants(root))
+        {
+            if (node.Tag is null) continue;
+            if (node.Tag is "td" or "tr" or "th" && HasParagraphAncestor(node)) return true;
+            if (!IsBlockLevelName(node.Tag)) continue;
+
+            bool preformatted = false;
+            for (HNode? n = node; n is not null; n = n.Parent)
+                if (n.Tag is "pre" or "code") { preformatted = true; break; }
+            if (preformatted) continue;
+
+            for (HNode? parent = node.Parent; parent is not null; parent = parent.Parent)
+                if (parent.Tag is not null && IsInlineElement(parent.Tag)
+                    && parent.Tag is not ("a" or "ins" or "del")) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a <c>&lt;p&gt;</c> encloses the node with no table boundary in between — the
+    /// shape an unclosed <c>&lt;p&gt;</c> inside a cell leaves behind.
+    /// </summary>
+    private static bool HasParagraphAncestor(HNode node)
+    {
+        for (HNode? parent = node.Parent; parent is not null; parent = parent.Parent)
+        {
+            if (parent.Tag == "p") return true;
+            if (parent.Tag is "table" or "body" or "html") return false;
+        }
+        return false;
+    }
+
+    /// <summary>Every node under this one. Iterative: a page can nest deeply enough to matter.</summary>
+    private static IEnumerable<HNode> Descendants(HNode node)
+    {
+        var stack = new Stack<HNode>();
+        for (int i = node.Children.Count - 1; i >= 0; i--) stack.Push(node.Children[i]);
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            yield return current;
+            for (int i = current.Children.Count - 1; i >= 0; i--) stack.Push(current.Children[i]);
+        }
+    }
+
+    /// <summary>Whether this document reaches the walk through the html5ever repair.</summary>
+    internal static bool NeedsCanonicalAttributes(string preparedHtml)
+        => HasCustomElementTags(preparedHtml) || HasInlineBlockMisnest(HtmlDom.Parse(preparedHtml));
+
+    /// <summary>
+    /// The repair re-parses the document and writes it back out through html5ever's serializer,
+    /// which resolves every character reference in an attribute and re-escapes the special ones.
+    /// That spelling is what the second parse — and so every handler — sees.
+    /// </summary>
+    private static void MarkCanonicalAttributes(HNode root)
+    {
+        foreach (var node in Descendants(root)) node.CanonicalAttrs = true;
+    }
+
+    /// <summary>The characters the HTML5 tokenizer counts as whitespace.</summary>
+    private static readonly char[] Html5Whitespace = { ' ', '\t', '\n', '\f', '\r' };
+
+    /// <summary>
+    /// Drop the whitespace that opens the document. The HTML5 tree builder ignores whitespace
+    /// character tokens in its initial, before-html and before-head insertion modes, so a
+    /// document whose first content follows a comment or a leading blank line reaches the walk
+    /// starting at its first non-whitespace character. A repaired document is re-parsed from
+    /// that tree, so the walk never sees the whitespace that came first.
+    /// </summary>
+    private static void DropLeadingDocumentWhitespace(HNode root)
+    {
+        while (root.Children.Count > 0)
+        {
+            var first = root.Children[0];
+            if (first.Tag is not null) return;
+
+            string trimmed = first.Text.TrimStart(Html5Whitespace);
+            if (trimmed.Length > 0)
+            {
+                first.Text = trimmed;
+                return;
+            }
+
+            root.Children.RemoveAt(0);
+            for (int i = 0; i < root.Children.Count; i++) root.Children[i].Index = i;
+        }
+    }
+
+    /// <summary>
+    /// An attribute value as html5ever's serializer writes it: every character reference
+    /// resolved, then <c>&amp;</c>, <c>&lt;</c>, <c>&gt;</c>, <c>"</c> and a no-break space
+    /// written back as named entities.
+    /// </summary>
+    internal static string CanonicalizeAttrValue(string value)
+    {
+        string decoded = HtmlWalker.DecodeEntitiesFull(value);
+        int i = decoded.AsSpan().IndexOfAny("&<>\"\u00a0");
+        if (i < 0) return decoded;
+        var sb = new StringBuilder(decoded.Length + 8);
+        sb.Append(decoded, 0, i);
+        for (; i < decoded.Length; i++)
+        {
+            switch (decoded[i])
+            {
+                case '&': sb.Append("&amp;"); break;
+                case '<': sb.Append("&lt;"); break;
+                case '>': sb.Append("&gt;"); break;
+                case '"': sb.Append("&quot;"); break;
+                case '\u00a0': sb.Append("&nbsp;"); break;
+                default: sb.Append(decoded[i]); break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>`is_block_level_name` (utility/content.rs).</summary>
+    internal static bool IsBlockLevelName(string tag) => tag switch
+    {
+        "address" or "article" or "aside" or "blockquote" or "canvas" or "dd" or "div" or "dl"
+        or "dt" or "fieldset" or "figcaption" or "figure" or "footer" or "form" or "h1" or "h2"
+        or "h3" or "h4" or "h5" or "h6" or "header" or "hr" or "li" or "main" or "nav" or "ol"
+        or "p" or "pre" or "section" or "table" or "tfoot" or "ul" => !IsInlineElement(tag),
+        _ => false,
+    };
+
+    // ── pre-parse stripping (utility/preprocessing.rs) ──────────────────────
+    /// <summary>
+    /// Removes <c>&lt;script&gt;</c> and <c>&lt;style&gt;</c> elements from the source text
+    /// (`strip_script_and_style_tags`). A removed block leaves a space behind when it stood
+    /// between two non-space characters, which is what keeps the words around it apart:
+    /// `&lt;span&gt;&lt;style&gt;…&lt;/style&gt;&lt;cite&gt;` renders with that space. JSON-LD
+    /// scripts are kept, since their payload is document metadata, and nothing inside an
+    /// <c>&lt;svg&gt;</c> is touched — there a style element is part of the drawing.
+    /// </summary>
+    internal static string StripScriptAndStyleTags(string html)
+    {
+        if (html.IndexOf('<') < 0) return html;
+
+        StringBuilder? output = null;
+        int last = 0, idx = 0, n = html.Length, svgDepth = 0;
+        while (idx < n)
+        {
+            if (html[idx] != '<' || idx + 1 >= n) { idx++; continue; }
+
+            if (MatchesTagStart(html, idx + 1, "svg"))
+            {
+                int openEnd = FindTagEndQuoted(html, idx + 1 + 3);
+                if (openEnd > 0) { svgDepth++; idx = openEnd; continue; }
+            }
+            else if (html[idx + 1] == '/' && MatchesTagStart(html, idx + 2, "svg"))
+            {
+                int closeEnd = FindTagEndQuoted(html, idx + 2 + 3);
+                if (closeEnd > 0)
+                {
+                    if (svgDepth > 0) svgDepth--;
+                    idx = closeEnd;
+                    continue;
+                }
+            }
+
+            if (svgDepth > 0) { idx++; continue; }
+
+            if (html[idx + 1] == '/' && idx + 2 < n)
+            {
+                if (idx + 9 <= n && string.Compare(html, idx, "</script>", 0, 9, StringComparison.OrdinalIgnoreCase) == 0)
+                { idx += 9; continue; }
+                if (idx + 8 <= n && string.Compare(html, idx, "</style>", 0, 8, StringComparison.OrdinalIgnoreCase) == 0)
+                { idx += 8; continue; }
+            }
+
+            string? name = null;
+            if (idx + 7 < n && string.Compare(html, idx, "<script", 0, 7, StringComparison.OrdinalIgnoreCase) == 0
+                && html[idx + 7] is '>' or ' ' or '\t' or '\n' or '\r') name = "script";
+            else if (idx + 6 < n && string.Compare(html, idx, "<style", 0, 6, StringComparison.OrdinalIgnoreCase) == 0
+                && html[idx + 6] is '>' or ' ' or '\t' or '\n' or '\r') name = "style";
+            if (name is null) { idx++; continue; }
+
+            int tagEnd = html.IndexOf('>', idx + name.Length + 1);
+            if (tagEnd < 0) { idx++; continue; }
+            tagEnd++;
+
+            if (name == "script" && IsJsonLdScriptOpenTag(html[idx..tagEnd])) { idx++; continue; }
+
+            int closeIdx = FindCloseTag(html, tagEnd, name);
+            if (closeIdx < 0) { idx++; continue; }
+
+            output ??= new StringBuilder(html.Length);
+            output.Append(html, last, idx - last);
+            if (idx > 0 && closeIdx < n && !char.IsWhiteSpace(html[idx - 1]) && !char.IsWhiteSpace(html[closeIdx]))
+                output.Append(' ');
+            last = closeIdx;
+            idx = closeIdx;
+        }
+
+        if (output is null) return html;
+        if (last < n) output.Append(html, last, n - last);
+        return output.ToString();
+    }
+
+    /// <summary>Whether the named tag starts at <paramref name="start"/> and its name ends there.</summary>
+    private static bool MatchesTagStart(string html, int start, string tag)
+    {
+        if (start + tag.Length >= html.Length) return false;
+        if (string.Compare(html, start, tag, 0, tag.Length, StringComparison.OrdinalIgnoreCase) != 0) return false;
+        char after = html[start + tag.Length];
+        return char.IsWhiteSpace(after) || after is '>' or '/';
+    }
+
+    /// <summary>
+    /// Whether a <c>&lt;script&gt;</c> open tag declares the JSON-LD media type, which is
+    /// structured metadata rather than code and so survives the strip.
+    /// </summary>
+    private static bool IsJsonLdScriptOpenTag(string tag)
+    {
+        for (int idx = 0; idx + 4 <= tag.Length; idx++)
+        {
+            if (string.Compare(tag, idx, "type", 0, 4, StringComparison.OrdinalIgnoreCase) != 0) continue;
+            bool beforeOk = idx == 0 || char.IsWhiteSpace(tag[idx - 1]) || tag[idx - 1] is '<' or '/';
+            if (!beforeOk || idx + 4 >= tag.Length) continue;
+            char afterCh = tag[idx + 4];
+            if (!char.IsWhiteSpace(afterCh) && afterCh != '=') continue;
+
+            int i = idx + 4;
+            while (i < tag.Length && char.IsWhiteSpace(tag[i])) i++;
+            if (i >= tag.Length || tag[i] != '=') continue;
+            i++;
+            while (i < tag.Length && char.IsWhiteSpace(tag[i])) i++;
+            if (i >= tag.Length) return false;
+
+            int valueStart, valueEnd;
+            if (tag[i] is '"' or '\'')
+            {
+                char quote = tag[i];
+                valueStart = i + 1;
+                valueEnd = valueStart;
+                while (valueEnd < tag.Length && tag[valueEnd] != quote) valueEnd++;
+            }
+            else
+            {
+                valueStart = i;
+                valueEnd = i;
+                while (valueEnd < tag.Length && !char.IsWhiteSpace(tag[valueEnd]) && tag[valueEnd] != '>') valueEnd++;
+            }
+
+            string value = tag[valueStart..valueEnd];
+            int semi = value.IndexOf(';');
+            string mediaType = (semi < 0 ? value : value[..semi]).Trim();
+            return mediaType.Equals("application/ld+json", StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Removes every element carrying a <c>hidden</c> attribute along with everything up to its
+    /// first matching close tag (`strip_hidden_elements`). This runs over the source text before
+    /// anything is parsed, and the attribute is looked for by scanning the whole open tag — so a
+    /// quoted value that happens to contain the word (a category link titled "…with hidden
+    /// wikidata") takes its element with it.
+    /// </summary>
+    internal static string StripHiddenElements(string html)
+    {
+        if (html.IndexOf('<') < 0) return html;
+
+        StringBuilder? output = null;
+        int last = 0, idx = 0, n = html.Length;
+        while (idx < n)
+        {
+            if (html[idx] != '<' || idx + 1 >= n || html[idx + 1] == '/' || html[idx + 1] == '!')
+            {
+                idx++;
+                continue;
+            }
+            int tagEnd = FindTagEndQuoted(html, idx + 1);
+            if (tagEnd < 0) break;
+
+            if (!TagHasHiddenAttribute(html, idx, tagEnd)) { idx++; continue; }
+
+            int nameEnd = idx + 1;
+            while (nameEnd < n && !char.IsWhiteSpace(html[nameEnd]) && html[nameEnd] != '>' && html[nameEnd] != '/')
+                nameEnd++;
+            string name = html[(idx + 1)..nameEnd];
+
+            bool selfClosing = html.AsSpan(idx, tagEnd - idx).EndsWith("/>")
+                || name.Equals("br", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("hr", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("img", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("input", StringComparison.OrdinalIgnoreCase);
+            int removeEnd = selfClosing ? tagEnd : FindCloseTag(html, tagEnd, name);
+            if (removeEnd < 0) removeEnd = tagEnd;
+
+            output ??= new StringBuilder(html.Length);
+            output.Append(html, last, idx - last);
+            last = removeEnd;
+            idx = removeEnd;
+        }
+
+        if (output is null) return html;
+        if (last < n) output.Append(html, last, n - last);
+        return output.ToString();
+    }
+
+    /// <summary>The index just past the <c>&gt;</c> that ends a tag, ignoring quoted values.</summary>
+    private static int FindTagEndQuoted(string html, int idx)
+    {
+        char quote = '\0';
+        for (; idx < html.Length; idx++)
+        {
+            char c = html[idx];
+            if (c is '"' or '\'')
+            {
+                if (quote == c) quote = '\0';
+                else if (quote == '\0') quote = c;
+            }
+            else if (c == '>' && quote == '\0') return idx + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>The index just past the first <c>&lt;/name&gt;</c> at or after <paramref name="start"/>.</summary>
+    private static int FindCloseTag(string html, int start, string name)
+    {
+        for (int i = start; i < html.Length; i++)
+        {
+            i = html.IndexOf('<', i);
+            if (i < 0) return -1;
+            if (i + 2 + name.Length >= html.Length || html[i + 1] != '/') continue;
+            if (string.Compare(html, i + 2, name, 0, name.Length, StringComparison.OrdinalIgnoreCase) != 0) continue;
+            char after = html[i + 2 + name.Length];
+            if (after != '>' && !char.IsWhiteSpace(after)) continue;
+            int close = html.IndexOf('>', i + 2 + name.Length);
+            if (close < 0) return -1;
+            return close + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Whether an open tag carries a <c>hidden</c> attribute, judged the way upstream judges it:
+    /// the word, whitespace-delimited, anywhere after the tag name. Quoting is not considered, so
+    /// <c>data-hidden</c> and <c>aria-hidden</c> are excluded but a value's own words are not.
+    /// </summary>
+    private static bool TagHasHiddenAttribute(string html, int start, int end)
+    {
+        const string Needle = "hidden";
+        int i = start;
+        while (i < end && html[i] != ' ' && html[i] != '\t' && html[i] != '\n' && html[i] != '>') i++;
+        for (; i + Needle.Length <= end; i++)
+        {
+            if (string.Compare(html, i, Needle, 0, Needle.Length, StringComparison.OrdinalIgnoreCase) != 0) continue;
+            if (i > start && !char.IsWhiteSpace(html[i - 1])) continue;
+            if (i + Needle.Length == end) return true;
+            char after = html[i + Needle.Length];
+            if (after is ' ' or '\t' or '\n' or '\r' or '>' or '=' or '/') return true;
+        }
+        return false;
     }
 
     // ── context (mirrors converter::Context) ────────────────────────────────
@@ -62,6 +490,9 @@ internal static class HtmlToMarkdown
         // When set, every <img> handled reports its (alt, src) to this sink (mirrors the crate's
         // structure collector `push_image`), so images inside table cells become image nodes.
         public Action<string?, string>? ImageEmit { get; init; }
+        // When set, the block handlers report what they emit to this collector as they emit it,
+        // which is how a node's text comes to be the markdown that block produced.
+        public HtmlStructureCollector? Structure { get; init; }
     }
 
     // ── table grid emission (structure collector) ────────────────────────────
@@ -235,14 +666,20 @@ internal static class HtmlToMarkdown
             case "ins":      // inserted text → ==…== (marks.rs handle_inserted)
                 HandleHighlight(node, output, ctx);
                 break;
-            case "u": case "small": case "abbr": case "bdi": case "bdo":
+            case "u": case "small": case "bdi": case "bdo":
             case "rb": case "rtc":
                 WalkChildren(node, output, ctx);
+                break;
+            case "abbr":
+                HandleAbbr(node, output, ctx);
                 break;
             case "sub": case "sup":
                 HandleSubSup(node, output, ctx);
                 break;
-            case "var": case "dfn": case "cite":
+            // `<cite>` has a handler in `semantic/attributes.rs` that italicizes it, but
+            // `converter/main.rs` never dispatches to it — the tag falls through to the unknown
+            // handler, so a citation keeps its own inline markup and gains none.
+            case "var": case "dfn":
                 HandleEmphasis(node, output, ctx);
                 break;
             case "q":
@@ -321,19 +758,33 @@ internal static class HtmlToMarkdown
             case "wbr": case "thead": case "tbody": case "tfoot": case "tr": case "th": case "td":
             case "source": case "track": case "param": case "col": case "colgroup":
                 break; // no-op outside table context
-            case "head": case "script": case "style": case "template": case "noscript":
-            case "meta": case "link": case "base": case "title":
+            case "head": case "script": case "style":
                 break; // metadata / non-content
+            // `template`, `noscript` and a stray body `title` have no arm of their own upstream:
+            // they reach the unknown handler, which renders their children. A no-JS fallback
+            // `<img>` is the page's only copy of that image, so dropping it loses content.
+            case "meta": case "link": case "base":
+                break; // void metadata elements: no children to render
             case "html": case "body":
                 WalkChildren(node, output, ctx);
                 break;
-            case "audio": case "video": case "picture": case "iframe": case "svg": case "math":
+            case "math":
+                HandleMath(node, output, ctx);
+                break;
+            case "svg":
+                HandleSvg(node, output, ctx);
+                break;
+            case "audio": case "video": case "picture": case "iframe":
+                HandleMedia(tag, node, output, ctx);
+                break;
             case "object": case "embed": case "canvas": case "map": case "area":
-                break; // media handlers: not ported (no output for defaults)
+                HandleUnknown(node, output, ctx);  // no arm upstream either — the unknown handler
+                break;
             case "form": case "fieldset": case "legend": case "label": case "input":
             case "textarea": case "select": case "option": case "optgroup": case "button":
             case "progress": case "meter": case "output": case "datalist":
-                break; // forms removed by Standard preprocessing / no output
+                HandleFormElement(tag, node, output, ctx);
+                break;
             default:
                 HandleUnknown(node, output, ctx);
                 break;
@@ -346,13 +797,8 @@ internal static class HtmlToMarkdown
     }
 
     // ── preprocessing drop (preprocessing_helpers::should_drop_for_preprocessing) ─
-    private static bool ShouldDrop(string tag, HNode node)
-    {
-        if (tag == "form") return true;
-        if (tag == "nav") return true;
-        if (tag is "header" or "footer" or "aside") return HasNavigationHint(node);
-        return false;
-    }
+    private static bool ShouldDrop(string tag, HNode node) => ShouldDropForPreprocessing(
+        tag, node.Attr("role"), node.Attr("aria-label"), node.Attr("class"), node.Attr("id"));
 
     private static readonly string[] NavKeywords =
     {
@@ -363,18 +809,35 @@ internal static class HtmlToMarkdown
         "vector-header", "vector-footer",
     };
 
-    private static bool HasNavigationHint(HNode node)
+    private static bool HasNavigationHint(HNode node) =>
+        HasNavigationHint(node.Attr("role"), node.Attr("aria-label"), node.Attr("class"), node.Attr("id"));
+
+    /// <summary>
+    /// Whether an element's attributes mark it as navigation chrome. Shared with the metadata
+    /// scanner, which sees attribute strings rather than nodes but has to drop exactly what
+    /// preprocessing drops — otherwise a sidebar's heading is collected as a document heading.
+    /// </summary>
+    internal static bool HasNavigationHint(string? role, string? ariaLabel, string? cls, string? id)
     {
-        string? role = node.Attr("role");
         if (role is not null && role is "navigation" or "menubar" or "tablist" or "toolbar") return true;
-        string? aria = node.Attr("aria-label");
-        if (aria is not null)
+        if (ariaLabel is not null)
         {
-            string lower = aria.ToLowerInvariant();
+            string lower = ariaLabel.ToLowerInvariant();
             foreach (var kw in new[] { "navigation", "menu", "contents", "table of contents", "toc" })
                 if (lower.Contains(kw, StringComparison.Ordinal)) return true;
         }
-        return AttrTokenMatches(node.Attr("class")) || AttrTokenMatches(node.Attr("id"));
+        return AttrTokenMatches(cls) || AttrTokenMatches(id);
+    }
+
+    /// <summary>
+    /// Whether preprocessing removes this element outright: every form and every nav, and a
+    /// header, footer or aside that carries a navigation hint.
+    /// </summary>
+    internal static bool ShouldDropForPreprocessing(string tag, string? role, string? ariaLabel, string? cls, string? id)
+    {
+        if (tag is "form" or "nav") return true;
+        if (tag is "header" or "footer" or "aside") return HasNavigationHint(role, ariaLabel, cls, id);
+        return false;
     }
 
     private static bool AttrTokenMatches(string? value)
@@ -392,7 +855,7 @@ internal static class HtmlToMarkdown
     // ── text node (converter/text_node.rs, Normalized whitespace mode, no escaping) ─
     private static void ProcessTextNode(HNode node, StringBuilder output, Ctx ctx)
     {
-        string text = HtmlWalker.DecodeEntities(node.Text);
+        string text = HtmlWalker.DecodeEntitiesFull(node.Text);
         if (text.Length == 0) return;
 
         bool hadNewlines = text.Contains('\n');
@@ -520,6 +983,9 @@ internal static class HtmlToMarkdown
         if (trimmed.Length == 0) return;
         string normalized = NormalizeHeadingText(trimmed);
         PushHeading(output, ctx, level, normalized);
+
+        // A heading in a table cell is part of the cell's content, not a heading of the document.
+        if (!ctx.InTableCell) ctx.Structure?.PushHeading((byte)level, normalized);
     }
 
     private static string NormalizeHeadingText(string text)
@@ -618,6 +1084,9 @@ internal static class HtmlToMarkdown
         bool hasContent = output.Length > contentStart;
         if (hasContent && !ctx.ConvertAsInline && !ctx.InTableCell)
             output.Append("\n\n");
+
+        if (hasContent && !ctx.InTableCell && !ctx.InListItem && !ctx.ConvertAsInline)
+            ctx.Structure?.PushParagraph(output.ToString(contentStart, output.Length - contentStart).Trim());
     }
 
     private static bool IsEmptyInlineElement(HNode n) =>
@@ -797,8 +1266,16 @@ internal static class HtmlToMarkdown
 
     private static void HandleSpan(HNode node, StringBuilder output, Ctx ctx)
     {
-        // Whitespace normalization: pop a single trailing newline (typography.rs handle_span)
-        if (!ctx.InCode && EndsWith(output, "\n") && !EndsWith(output, "\n\n"))
+        // An hOCR word carries no whitespace of its own, so one is put back between words.
+        if ((node.Attr("class") ?? "").Contains("ocrx_word", StringComparison.Ordinal)
+            && output.Length > 0 && !EndsWith(output, " ") && !EndsWith(output, "\t") && !EndsWith(output, "\n"))
+            output.Append(' ');
+
+        // Whitespace normalization: pop a single trailing newline (typography.rs handle_span).
+        // A hard break ("  \n" or "\\\n") and a table row's "|\n" are structure, not stray
+        // whitespace — popping either glues this span onto the line before it.
+        if (!ctx.InCode && EndsWith(output, "\n") && !EndsWith(output, "\n\n")
+            && !EndsWith(output, "  \n") && !EndsWith(output, "\\\n") && !EndsWith(output, "|\n"))
             output.Remove(output.Length - 1, 1);
         WalkChildren(node, output, ctx);
     }
@@ -875,7 +1352,7 @@ internal static class HtmlToMarkdown
             return;
         }
 
-        string href = SanitizeMarkdownUrl(HtmlWalker.DecodeEntities(hrefRaw));
+        string href = SanitizeMarkdownUrl(HtmlWalker.DecodeEntitiesFull(hrefRaw));
 
         if (ctx.InLink) { WalkChildren(node, output, ctx); return; }
 
@@ -1010,14 +1487,14 @@ internal static class HtmlToMarkdown
         {
             var n = stack.Pop();
             if (n.IsComment) continue;
-            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntities(n.Text)); continue; }
+            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntitiesFull(n.Text)); continue; }
             if (BlockLevelForLabel.Contains(n.Tag)) { sawBlock = true; continue; }
             for (int i = n.Children.Count - 1; i >= 0; i--) stack.Push(n.Children[i]);
         }
         return (text.ToString(), sawBlock);
     }
 
-    private static string NormalizeLinkLabel(string label)
+    internal static string NormalizeLinkLabel(string label)
     {
         string collapsed = label.Replace('\n', ' ').Replace('\r', ' ');
         return NormalizeWhitespaceKeepNewlines(collapsed).Trim();
@@ -1069,6 +1546,296 @@ internal static class HtmlToMarkdown
         return url[parenStart..relEnd];
     }
 
+    // ── MathML (media/svg.rs) ────────────────────────────────────────────────
+    /// <summary>
+    /// Emit a `&lt;math&gt;` element as its serialized source in an HTML comment followed by its
+    /// text content, which is what the extractor reads the equations back out of.
+    /// </summary>
+    private static void HandleMath(HNode node, StringBuilder output, Ctx ctx)
+    {
+        string textContent = CollectRawText(node).Trim();
+        if (textContent.Length == 0) return;
+
+        bool isDisplayBlock = node.Attr("display") == "block";
+        bool separated = isDisplayBlock && !ctx.InParagraph && !ctx.ConvertAsInline;
+
+        if (separated) output.Append("\n\n");
+        output.Append("<!-- MathML: ").Append(SerializeElement(node)).Append(" --> ").Append(textContent);
+        if (separated) output.Append("\n\n");
+    }
+
+    /// <summary>
+    /// An abbreviation spells itself out: its text, then its <c>title</c> in parentheses
+    /// (`inline/semantic/typography.rs::handle_abbreviation`).
+    /// </summary>
+    private static void HandleAbbr(HNode node, StringBuilder output, Ctx ctx)
+    {
+        var content = new StringBuilder();
+        foreach (var c in node.Children) WalkNode(c, content, ctx);
+        string trimmed = content.ToString().Trim();
+        if (trimmed.Length == 0) return;
+        output.Append(trimmed);
+        string title = (node.Attr("title") ?? "").Trim();
+        if (title.Length > 0) output.Append(" (").Append(title).Append(')');
+    }
+
+    // ── embedded media (media/embedded.rs) ───────────────────────────────────
+    /// <summary>
+    /// A media element markdown cannot embed becomes a link to its source, plus whatever
+    /// fallback content it wrapped; a <c>&lt;picture&gt;</c> reduces to the first
+    /// <c>&lt;img&gt;</c> it holds (`converter/media/embedded.rs`).
+    /// </summary>
+    private static void HandleMedia(string tag, HNode node, StringBuilder output, Ctx ctx)
+    {
+        if (tag == "picture")
+        {
+            foreach (var child in node.Children)
+            {
+                if (child.Tag != "img") continue;
+                WalkNode(child, output, ctx);
+                return;
+            }
+            return;
+        }
+
+        string src = node.Attr("src") ?? "";
+        if (tag != "iframe" && src.Length == 0)
+        {
+            foreach (var child in node.Children)
+            {
+                if (child.Tag != "source") continue;
+                src = child.Attr("src") ?? "";
+                break;
+            }
+        }
+
+        if (src.Length > 0)
+        {
+            output.Append('[').Append(src).Append("](").Append(src).Append(')');
+            if (!ctx.InParagraph && !ctx.ConvertAsInline) output.Append("\n\n");
+        }
+
+        if (tag == "iframe") return;
+
+        // Everything that is not a `<source>` is the element's no-support fallback.
+        var fallback = new StringBuilder();
+        foreach (var child in node.Children)
+        {
+            if (child.Tag == "source") continue;
+            WalkNode(child, fallback, ctx);
+        }
+        if (fallback.Length > 0)
+        {
+            output.Append(fallback.ToString().Trim());
+            if (!ctx.InParagraph && !ctx.ConvertAsInline) output.Append("\n\n");
+        }
+    }
+
+    // ── form elements (form/elements.rs) ─────────────────────────────────────
+    /// <summary>
+    /// A form control has no markdown of its own, but the text and images inside it do, so each
+    /// handler renders its children and differs only in the spacing it adds
+    /// (`converter/form/elements.rs::handle`). `&lt;form&gt;` itself never reaches here —
+    /// preprocessing drops it — but the rest are ordinary page furniture.
+    /// </summary>
+    private static void HandleFormElement(string tag, HNode node, StringBuilder output, Ctx ctx)
+    {
+        switch (tag)
+        {
+            // Collected, trimmed and set off by blank lines; an empty one disappears.
+            case "form":
+            case "fieldset":
+            {
+                if (ctx.ConvertAsInline) { WalkChildren(node, output, ctx); return; }
+                var content = new StringBuilder();
+                foreach (var c in node.Children) WalkNode(c, content, ctx);
+                string trimmed = content.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                if (output.Length > 0 && !EndsWith(output, "\n\n")) output.Append("\n\n");
+                output.Append(trimmed).Append("\n\n");
+                return;
+            }
+
+            // A fieldset's caption reads as bold text.
+            case "legend":
+            {
+                var content = new StringBuilder();
+                var legendCtx = ctx.ConvertAsInline ? ctx : ctx with { InStrong = true };
+                foreach (var c in node.Children) WalkNode(c, content, legendCtx);
+                string trimmed = content.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                if (ctx.ConvertAsInline) output.Append(trimmed);
+                else output.Append("**").Append(trimmed).Append("**").Append("\n\n");
+                return;
+            }
+
+            case "label":
+            {
+                var content = new StringBuilder();
+                foreach (var c in node.Children) WalkNode(c, content, ctx);
+                string trimmed = content.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                output.Append(trimmed);
+                if (!ctx.ConvertAsInline) output.Append("\n\n");
+                return;
+            }
+
+            // An <input> carries no text content, so it contributes nothing.
+            case "input":
+                return;
+
+            // A group's label reads as bold text, then its options follow.
+            case "optgroup":
+            {
+                string label = node.Attr("label") ?? "";
+                if (label.Length > 0) output.Append("**").Append(label).Append("**").Append('\n');
+                WalkChildren(node, output, ctx);
+                return;
+            }
+
+            case "option":
+            {
+                bool selected = node.Attr("selected") is not null;
+                var text = new StringBuilder();
+                foreach (var c in node.Children) WalkNode(c, text, ctx);
+                string trimmed = text.ToString().Trim();
+                if (trimmed.Length == 0) return;
+                if (selected && !ctx.ConvertAsInline) output.Append("* ");
+                output.Append(trimmed);
+                if (!ctx.ConvertAsInline) output.Append('\n');
+                return;
+            }
+
+            // The rest render in place and only differ in the separator they leave behind.
+            default:
+            {
+                int startLen = output.Length;
+                WalkChildren(node, output, ctx);
+                if (ctx.ConvertAsInline || output.Length == startLen) return;
+                output.Append(tag is "select" or "datalist" ? "\n" : "\n\n");
+                return;
+            }
+        }
+    }
+
+    // ── svg (media/svg.rs) ───────────────────────────────────────────────────
+    /// <summary>
+    /// An inline <c>&lt;svg&gt;</c> becomes an image whose source is the serialized subtree as a
+    /// base64 data URI (`media/svg.rs::handle_svg`); in inline context only its title is kept.
+    /// </summary>
+    /// <summary>
+    /// The image markdown one <c>&lt;svg&gt;</c> element's markup converts to, for the metadata
+    /// scanner, which sees source text rather than a tree.
+    /// </summary>
+    internal static string RenderSvgImage(string svgMarkup)
+    {
+        var root = HtmlDom.Parse(svgMarkup);
+        foreach (var child in root.Children)
+        {
+            if (child.Tag != "svg") continue;
+            var sb = new StringBuilder();
+            HandleSvg(child, sb, new Ctx());
+            return sb.ToString();
+        }
+        return "";
+    }
+
+    private static void HandleSvg(HNode node, StringBuilder output, Ctx ctx)
+    {
+        string title = "SVG Image";
+        foreach (var child in node.Children)
+        {
+            if (child.Tag == "title") { title = TextContent(child).Trim(); break; }
+        }
+
+        if (ctx.ConvertAsInline) { output.Append(title); return; }
+
+        string svgHtml = SerializeElement(node);
+        string base64 = System.Convert.ToBase64String(Encoding.UTF8.GetBytes(svgHtml));
+        output.Append("![").Append(title).Append("](data:image/svg+xml;base64,").Append(base64).Append(')');
+    }
+
+    /// <summary>The concatenated text of a node's descendants, entity references resolved.</summary>
+    private static string CollectRawText(HNode node)
+    {
+        var sb = new StringBuilder();
+        void Walk(HNode n)
+        {
+            foreach (var c in n.Children)
+            {
+                if (c.IsComment) continue;
+                if (c.Tag is null) sb.Append(HtmlWalker.DecodeEntitiesFull(c.Text));
+                else Walk(c);
+            }
+        }
+        Walk(node);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Re-escape a serialized text node: `&amp;`, a no-break space, `&lt;` and `&gt;` are written
+    /// back as references, everything else verbatim. Quotes are left alone.
+    /// </summary>
+    private static string EscapeSerializedText(string text)
+    {
+        int first = -1;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c == '&' || c == '<' || c == '>' || c == '\u00A0') { first = i; break; }
+        }
+        if (first < 0) return text;
+
+        var sb = new StringBuilder(text.Length + 8);
+        sb.Append(text, 0, first);
+        for (int i = first; i < text.Length; i++)
+        {
+            switch (text[i])
+            {
+                case '&': sb.Append("&amp;"); break;
+                case '\u00A0': sb.Append("&nbsp;"); break;
+                case '<': sb.Append("&lt;"); break;
+                case '>': sb.Append("&gt;"); break;
+                default: sb.Append(text[i]); break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Re-serialize an element and its subtree. A childless element closes itself with
+    /// <c>&lt;tag /&gt;</c>, matching the crate's serializer.
+    /// </summary>
+    private static string SerializeElement(HNode node)
+    {
+        // Text is serialized with its character references already resolved, which is how the
+        // MathML in the comment comes out reading `⁡` rather than `&ApplyFunction;`, and then
+        // re-escaped: the four characters that would otherwise change the markup's shape go
+        // back out as references, so `&#x3E;` and a literal `>` both serialize as `&gt;`.
+        if (node.Tag is null)
+            return node.IsComment ? "" : EscapeSerializedText(HtmlWalker.DecodeEntitiesFull(node.Text));
+
+        var sb = new StringBuilder(256);
+        sb.Append('<').Append(node.Tag);
+        // Attributes come out sorted by name: the parser upstream serializes from keeps them in
+        // a sorted map, so `stretchy="false" scriptlevel="+1"` is written the other way round.
+        foreach (var (key, value) in HtmlWalker.EnumerateAttributes(node.AttrString)
+                     .OrderBy(a => a.Key, StringComparer.Ordinal))
+        {
+            sb.Append(' ').Append(SvgAttrs.Canonical(key) ?? key);
+            // A bare attribute and `attr=""` are HTML5-equivalent; upstream writes both bare.
+            // The value goes out as written — the serializer does not re-escape it.
+            if (!string.IsNullOrEmpty(value)) sb.Append("=\"").Append(value).Append('"');
+        }
+
+        if (node.Children.Count == 0) { sb.Append(" />"); return sb.ToString(); }
+
+        sb.Append('>');
+        foreach (var child in node.Children) sb.Append(SerializeElement(child));
+        sb.Append("</").Append(node.Tag).Append('>');
+        return sb.ToString();
+    }
+
     // ── image (handlers/image.rs) ────────────────────────────────────────────
     private static void HandleImg(HNode node, StringBuilder output, Ctx ctx)
     {
@@ -1079,6 +1846,7 @@ internal static class HtmlToMarkdown
         // Structure-collector side effect: report every <img> so cell images become nodes
         // (the crate's push_image runs unconditionally, once per handler invocation).
         ctx.ImageEmit?.Invoke(alt.Length == 0 ? null : alt, src);
+        ctx.Structure?.PushImage(src, alt);
 
         bool shouldUseAltText = ctx.ConvertAsInline || ctx.InHeading;
         if (shouldUseAltText) { output.Append(alt); return; }
@@ -1152,7 +1920,9 @@ internal static class HtmlToMarkdown
         return "";
     }
 
-    // ── pre (block/preformatted.rs) ──────────────────────────────────────────
+    // ── pre (handlers/code_block.rs) ─────────────────────────────────────────
+    // `block/preformatted.rs` carries a second, subtly different copy of this handler, but
+    // nothing dispatches to it — `converter/main.rs` routes `<pre>` to `handlers::handle_pre`.
     private static void HandlePre(HNode node, StringBuilder output, Ctx ctx)
     {
         var cctx = ctx with { InCode = true };
@@ -1168,7 +1938,7 @@ internal static class HtmlToMarkdown
         string core = s.Trim('\n');
         bool whitespaceOnly = core.Trim().Length == 0;
 
-        string coreText = leading > 0 ? DedentCodeBlock(core) : core;
+        string coreText = DedentCodeBlock(core);
         string processed;
         if (whitespaceOnly)
         {
@@ -1191,6 +1961,8 @@ internal static class HtmlToMarkdown
         output.Append(processed.TrimEnd('\n'));
         output.Append('\n');
         output.Append("```").Append("\n\n");
+
+        ctx.Structure?.PushCode(processed, language);
     }
 
     private static string? ExtractLanguageFromPre(HNode node)
@@ -1215,6 +1987,12 @@ internal static class HtmlToMarkdown
         return null;
     }
 
+    /// <summary>
+    /// Strip the common leading whitespace from every line of a code block
+    /// (`converter/text/processing.rs::dedent_code_block`). A whitespace-only line is kept
+    /// verbatim rather than blanked: the markdown output has its line ends trimmed globally
+    /// afterwards, but the structure collector's Code node keeps those spaces.
+    /// </summary>
     private static string DedentCodeBlock(string content)
     {
         var lines = content.Split('\n');
@@ -1232,7 +2010,7 @@ internal static class HtmlToMarkdown
         {
             if (i > 0) sb.Append('\n');
             var line = lines[i];
-            if (line.Trim().Length == 0) continue;
+            if (line.Trim().Length == 0) { sb.Append(line); continue; }
             int cut = 0, remaining = minIndent;
             while (remaining > 0 && cut < line.Length && char.IsWhiteSpace(line[cut])) { cut++; remaining--; }
             sb.Append(line[cut..]);
@@ -1290,6 +2068,8 @@ internal static class HtmlToMarkdown
             PrevItemHadBlocks = false,
         };
 
+        if (!ctx.InTableCell) ctx.Structure?.PushListStart(ordered);
+
         foreach (var child in node.Children)
         {
             if (child.Tag is null && !child.IsComment && child.Text.Trim().Length == 0) continue;
@@ -1297,6 +2077,8 @@ internal static class HtmlToMarkdown
             WalkNode(child, output, listCtx);
             if (ordered && child.Tag == "li") counter++;
         }
+
+        if (!ctx.InTableCell) ctx.Structure?.PushListEnd();
 
         AddNestedListTrailingSeparator(output, ctx);
     }
@@ -1372,12 +2154,14 @@ internal static class HtmlToMarkdown
 
         // task lists: find checkbox
         var checkbox = FindCheckbox(node);
+        int itemStart;
         if (checkbox is not null)
         {
             output.Append("- ").Append(checkbox.Value.check ? "[x]" : "[ ]");
             var taskText = new StringBuilder();
             RenderLiContentSkippingCheckbox(node, taskText, liCtx, checkbox.Value.node);
             output.Append(' ');
+            itemStart = output.Length;
             string trimmedTask = taskText.ToString().Trim();
             if (trimmedTask.Length > 0) output.Append(trimmedTask);
         }
@@ -1394,11 +2178,15 @@ internal static class HtmlToMarkdown
                 }
             }
 
+            itemStart = output.Length;
             foreach (var child in node.Children)
                 WalkNode(child, output, liCtx);
 
             TrimTrailingWhitespace(output);
         }
+
+        if (!ctx.InTableCell && itemStart <= output.Length)
+            ctx.Structure?.PushListItem(output.ToString(itemStart, output.Length - itemStart).Trim());
 
         if (!ctx.InTableCell)
         {
@@ -1581,7 +2369,7 @@ internal static class HtmlToMarkdown
         if (node.IsComment) return;
         if (node.Tag is null)
         {
-            if (!scan.HasText && HtmlWalker.DecodeEntities(node.Text).Trim().Length > 0)
+            if (!scan.HasText && HtmlWalker.DecodeEntitiesFull(node.Text).Trim().Length > 0)
                 scan.HasText = true;
             return;
         }
@@ -1664,6 +2452,7 @@ internal static class HtmlToMarkdown
             var grid = CollectGrid(node, ctx);
             ctx.TableEmit(grid);
         }
+        if (ctx.Structure is not null) ctx.Structure.PushTable(CollectGrid(node, ctx));
 
         if (ctx.InListItem)
         {
@@ -1683,12 +2472,9 @@ internal static class HtmlToMarkdown
                 else output.Append("\n\n");
             }
             output.Append(tableOutput);
-            if (!EndsWith(output, "\n\n"))
-            {
-                if (EndsWith(output, "\n")) output.Append('\n');
-                else output.Append("\n\n");
-            }
         }
+
+        if (!EndsWith(output, "\n")) output.Append('\n');
     }
 
     private static string IndentTableForList(string table, int listDepth)
@@ -1877,7 +2663,7 @@ internal static class HtmlToMarkdown
         return buf.ToString();
     }
 
-    private static string EscapeCellText(string text)
+    internal static string EscapeCellText(string text)
     {
         // Always escape * and _ inside table cells; also escape | (escape_misc=false path).
         var sb = new StringBuilder(text.Length);
@@ -2059,7 +2845,7 @@ internal static class HtmlToMarkdown
     {
         var sb = new StringBuilder();
         AppendTextContent(node, sb);
-        return HtmlWalker.DecodeEntities(sb.ToString());
+        return HtmlWalker.DecodeEntitiesFull(sb.ToString());
     }
 
     private static void AppendTextContent(HNode node, StringBuilder sb)
@@ -2290,12 +3076,21 @@ internal sealed class HNode
 
     private Dictionary<string, string?>? _attrCache;
 
+    /// <summary>
+    /// Set on documents the html5ever repair re-serializes, whose attribute values reach the
+    /// converter in canonical form.
+    /// </summary>
+    public bool CanonicalAttrs;
+
     public string? Attr(string name)
     {
         if (Tag is null) return null;
         _attrCache ??= new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         if (_attrCache.TryGetValue(name, out var cached)) return cached;
+        // Attribute values are otherwise left as written: the lenient parser hands the handlers
+        // the source bytes, and the markdown writer escapes what it emits.
         string? v = HtmlWalker.ExtractAttr(AttrString, name);
+        if (v is not null && CanonicalAttrs) v = HtmlToMarkdown.CanonicalizeAttrValue(v);
         _attrCache[name] = v;
         return v;
     }
@@ -2331,10 +3126,14 @@ internal static class HtmlDom
 
         while (pos < n)
         {
-            if (src[pos] != '<')
+            // A `<` only opens markup when a letter, `/`, `!` or `?` follows it (the HTML
+            // tag-open state); otherwise it is character data — `a <- filter(x, y > 0)` is R
+            // source, not a tag that swallows everything up to the next `>`.
+            if (src[pos] != '<' || !HtmlWalker.OpensTag(src, pos))
             {
-                int lt = src.IndexOf('<', pos);
-                if (lt < 0) lt = n;
+                int lt = pos;
+                if (src[lt] == '<') lt++;
+                while (lt < n && !(src[lt] == '<' && HtmlWalker.OpensTag(src, lt))) lt++;
                 AddChild(new HNode { Tag = null, Text = src[pos..lt] });
                 pos = lt;
                 continue;
@@ -2382,6 +3181,14 @@ internal static class HtmlDom
                 continue;
             }
 
+            // `<body>` closes an unterminated `<head>`. Without this the body nests inside the
+            // head, and head content is deliberately not content — the whole document is lost.
+            if (tag is "body")
+            {
+                for (int i = stack.Count - 1; i >= 1; i--)
+                    if (stack[i].Tag == "head") { stack.RemoveRange(i, stack.Count - i); break; }
+            }
+
             // implied close of li/dt/dd (normalize_unclosed_list_items) and p-in-p leniency
             if (tag is "li")
             {
@@ -2397,6 +3204,38 @@ internal static class HtmlDom
                 {
                     if (stack[i].Tag is "dt" or "dd") { stack.RemoveRange(i, stack.Count - i); break; }
                     if (stack[i].Tag == "dl") break;
+                }
+            }
+            else if (tag is "td" or "th" or "tr" or "thead" or "tbody" or "tfoot")
+            {
+                // Table sections close each other the way the HTML5 insertion modes say, and a
+                // cell that opens with no row around it gets one. Old hand-written pages write
+                // `<table><td>…</td><td>…</td></table>`, and without the implied row every cell
+                // hangs off the table where no consumer looks for it — on one fixture that is the
+                // table holding 99% of the document.
+                for (int i = stack.Count - 1; i >= 1; i--)
+                {
+                    string? open = stack[i].Tag;
+                    if (open is "table") break;
+                    if (tag is "td" or "th")
+                    {
+                        if (open is "tr") break;
+                        if (open is "td" or "th") { stack.RemoveRange(i, stack.Count - i); break; }
+                    }
+                    else if (open is "tr" or "td" or "th"
+                             || (tag is "thead" or "tbody" or "tfoot" && open is "thead" or "tbody" or "tfoot"))
+                    {
+                        stack.RemoveRange(i, stack.Count - i);
+                    }
+                    else break;
+                }
+
+                if (tag is "td" or "th" && stack[^1].Tag is not "tr"
+                    && stack[^1].Tag is "table" or "thead" or "tbody" or "tfoot")
+                {
+                    var impliedRow = new HNode { Tag = "tr", AttrString = "" };
+                    AddChild(impliedRow);
+                    stack.Add(impliedRow);
                 }
             }
 

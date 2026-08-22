@@ -44,8 +44,11 @@ public sealed class OdtExtractor : IExtractor
         return doc;
     }
 
-    // Mirrors the metadata_map construction + field mapping in Rust `extract_content`.
-    private static Metadata BuildMetadata(OdtProperties props)
+    /// <summary>
+    /// Map ODF document properties onto the common metadata shape. Shared with the presentation
+    /// extractor, which reads the same <c>meta.xml</c> schema.
+    /// </summary>
+    internal static Metadata BuildMetadata(OdtProperties props)
     {
         static JsonElement S(string s) => JsonSerializer.SerializeToElement(s);
         static JsonElement N(long n) => JsonSerializer.SerializeToElement(n);
