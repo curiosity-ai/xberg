@@ -182,11 +182,29 @@ failing fixture and the dimensions it failed.
 Older notes in this file quote percentages against 2,942. Those divided by a total including the
 incomparable fixtures and so scored this port against documents upstream never read.
 
-**PDF is 33 of the 55.** The shape has flipped since the table work: 21 fail `plain` and 19 fail
-`tables`, where `tables` used to dominate. The plain group is not one cause — a two-column
-reading-order split in `pdfa_021`, a paragraph break the assembler does not take in
-`pr-138-example`, whitespace-only in `nougat_011`, and `form-test` wanting
-`inject_unrepresented_form_field_elements`.
+**PDF is 32 of the remainder**, and the corpus double-counts: `nougat_033` is the same document
+as `pdfa_008`, `nougat_046` as `pdfa_021`, and `issue-848`, `issue-140-example` and
+`pr-138-example` each appear twice, so those 32 are roughly 27 distinct documents.
+
+`tables` is the largest lever again, not `plain` — `json` never fails alone, and eight fixtures
+fail nothing hard but `tables`. Known shapes, each re-verified rather than assumed:
+
+- `issue-848` (×2) differs *only* in `bounding_box.x1`, by exactly one f32 ULP, from the
+  line-cluster path unioning its rect in double where pdf_oxide unions in f32. Converting the
+  path/cluster geometry layer to f32 closes both; it is a wide change.
+- `issue-140-example` (×2): upstream reports no tables, this port one, from inside the
+  intersection tier — `IsRealGrid` and `LooksLikeProseTable` are faithful. One nearby rule is
+  genuinely unported: pdf_oxide abandons the spatial sweep above `MAX_TABLE_EDGES = 1500` paths
+  (`document.rs:19590`). Not the cause here (that page has 331), but missing.
+- `pdfa_021`/`nougat_046`: upstream splits the page at a column boundary this port reads straight
+  through, cutting mid-word. That lives in pdf_oxide's XY-cut region split, upstream of the
+  assembler.
+- `pr-138-example` (×2): the separator rule is a branch-for-branch match and the geometry helpers
+  match exactly, so the trailing space is inside the span's own text — span production, not the
+  separator.
+- `nougat_011`, and `nougat_033`/`pdfa_008` tipping the other way, all sit on
+  `span_start - previous_end > span.font_size * 0.15` with bbox widths differing by well under
+  one glyph advance. Font metrics, not a missing rule.
 
 Three plain failures are this port's own 25 s wall-clock guard truncating the corpus's largest
 documents, not behaviour: `intel_64_…_sdm`, `algebra_topology_…` and `bayesian_data_analysis_…`
