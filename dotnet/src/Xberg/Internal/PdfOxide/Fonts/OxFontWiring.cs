@@ -121,11 +121,8 @@ internal static class OxFontWiring
             return cmap is null ? null : new TrueTypeCMapAdapter(cmap);
         }
 
-        /// <summary>
-        /// The TrueType port reads the `cmap` table, not `post` glyph names, so this tier
-        /// is unavailable and the caller falls through to the next one.
-        /// </summary>
-        public IReadOnlyList<string?>? GlyphNames(byte[] fontData) => null;
+        public IReadOnlyList<string?>? GlyphNames(byte[] fontData) =>
+            OxEmbeddedGlyphNames.ForFontData(fontData);
     }
 
     private sealed class TrueTypeCMapAdapter : IOxTrueTypeCMap

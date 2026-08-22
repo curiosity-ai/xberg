@@ -649,6 +649,266 @@ internal static class OxCffEncoding
     }
 
     /// <summary>
+    /// Predefined charset 1 (Expert), Adobe Technical Note #5176 Appendix C: GID &#8594; SID.
+    /// </summary>
+    private static readonly ushort[] ExpertCharset =
+    {
+        0, 1, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 13, 14, 15, 99,
+        239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 27, 28, 249, 250, 251, 252,
+        253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 109, 110,
+        267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282,
+        283, 284, 285, 286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298,
+        299, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314,
+        315, 316, 317, 318, 158, 155, 163, 319, 320, 321, 322, 323, 324, 325, 326, 150,
+        164, 169, 327, 328, 329, 330, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340,
+        341, 342, 343, 344, 345, 346, 347, 348, 349, 350, 351, 352, 353, 354, 355, 356,
+        357, 358, 359, 360, 361, 362, 363, 364, 365, 366, 367, 368, 369, 370, 371, 372,
+        373, 374, 375, 376, 377, 378,
+    };
+
+    /// <summary>Predefined charset 2 (Expert Subset), Adobe Technical Note #5176 Appendix C.</summary>
+    private static readonly ushort[] ExpertSubsetCharset =
+    {
+        0, 1, 231, 232, 235, 236, 237, 238, 13, 14, 15, 99, 239, 240, 241, 242,
+        243, 244, 245, 246, 247, 248, 27, 28, 249, 250, 251, 253, 254, 255, 256, 257,
+        258, 259, 260, 261, 262, 263, 264, 265, 266, 109, 110, 267, 268, 269, 270, 272,
+        300, 301, 302, 305, 314, 315, 158, 155, 163, 320, 321, 322, 323, 324, 325, 326,
+        150, 164, 169, 327, 328, 329, 330, 331, 332, 333, 334, 335, 336, 337, 338, 339,
+        340, 341, 342, 343, 344, 345, 346,
+    };
+
+    /// <summary>
+    /// The font program's own glyph names indexed by GID, read from the CFF charset.
+    ///
+    /// This is the CFF half of the embedded-glyph-name lookup that §9.10.2 Priority 3c and the
+    /// Item 1 punctuation recovery both consult; the `post` half lives in
+    /// <see cref="OxEmbeddedGlyphNames"/>. Returns null when the data holds no parseable CFF
+    /// and for CID-keyed CFFs, whose charset enumerates CIDs rather than string IDs.
+    /// </summary>
+    internal static string?[]? GlyphNamesByGid(ReadOnlySpan<byte> fontData)
+    {
+        if (fontData.Length < 4)
+        {
+            return null;
+        }
+
+        ReadOnlySpan<byte> cff = fontData[0] == 1 ? fontData : ExtractCffFromOpenType(fontData);
+        if (cff.Length < 4 || cff[0] != 1)
+        {
+            return null;
+        }
+
+        int hdrSize = cff[2];
+        if (!TryParseIndex(cff, hdrSize, out _, out int afterName))
+        {
+            return null;
+        }
+        if (!TryParseIndex(cff, afterName, out List<CffRange> topDicts, out int afterTopDict) ||
+            topDicts.Count == 0)
+        {
+            return null;
+        }
+        if (!TryParseIndex(cff, afterTopDict, out List<CffRange> stringIndex, out _))
+        {
+            return null;
+        }
+
+        CffRange td = topDicts[0];
+        (int charStringsOffset, int charsetOffset, bool hasRos) =
+            ParseTopDictForCharset(cff[td.Start..td.End]);
+
+        // A CID-keyed font's charset holds CIDs, so it names no glyphs.
+        if (hasRos || charStringsOffset == 0)
+        {
+            return null;
+        }
+
+        // "The number of glyphs is the value of the count field in the CharStrings INDEX."
+        if (ReadIndexCount(cff, charStringsOffset) is not { } count || count == 0 || count > ushort.MaxValue)
+        {
+            return null;
+        }
+
+        int[]? sids = CharsetGidToSid(cff, charsetOffset, (int)count);
+        if (sids is null)
+        {
+            return null;
+        }
+
+        var names = new string?[sids.Length];
+        for (int gid = 0; gid < sids.Length; gid++)
+        {
+            if (sids[gid] >= 0)
+            {
+                names[gid] = ResolveGlyphName((ushort)sids[gid], cff, stringIndex);
+            }
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// Top DICT scan for the charset lookup: the CharStrings and charset offsets plus whether
+    /// the font declares a /ROS, which marks it CID-keyed.
+    /// </summary>
+    private static (int CharStringsOffset, int CharsetOffset, bool HasRos)
+        ParseTopDictForCharset(ReadOnlySpan<byte> dictData)
+    {
+        int charStringsOffset = 0;
+        int charsetOffset = 0;
+        bool hasRos = false;
+
+        int pos = 0;
+        var operandStack = new List<int>();
+
+        while (pos < dictData.Length)
+        {
+            byte b0 = dictData[pos];
+            if (b0 <= 21)
+            {
+                ushort op;
+                if (b0 == 12)
+                {
+                    pos++;
+                    if (pos >= dictData.Length)
+                    {
+                        break;
+                    }
+                    op = (ushort)((12 << 8) | dictData[pos]);
+                }
+                else
+                {
+                    op = b0;
+                }
+
+                if (op == ((12 << 8) | 30))
+                {
+                    hasRos = true;
+                }
+                else if (operandStack.Count > 0)
+                {
+                    int last = operandStack[^1];
+                    switch (op)
+                    {
+                        case 15: charsetOffset = last; break;
+                        case 17: charStringsOffset = last; break;
+                    }
+                }
+
+                operandStack.Clear();
+                pos++;
+            }
+            else if (TryParseDictOperand(dictData, pos, out int val, out int consumed))
+            {
+                operandStack.Add(val);
+                pos += consumed;
+            }
+            else
+            {
+                pos++;
+            }
+        }
+
+        return (charStringsOffset, charsetOffset, hasRos);
+    }
+
+    /// <summary>
+    /// GID &#8594; SID for the whole font, with -1 where the charset names no glyph. Offsets
+    /// 0/1/2 select the predefined ISOAdobe / Expert / Expert Subset charsets; anything else
+    /// is a charset table at that offset. Returns null when the table is malformed or runs
+    /// short of <paramref name="numGlyphs"/> entries, which is what makes the whole CFF
+    /// unreadable rather than partially named.
+    /// </summary>
+    private static int[]? CharsetGidToSid(ReadOnlySpan<byte> data, int charsetOffset, int numGlyphs)
+    {
+        var sids = new int[numGlyphs];
+
+        switch (charsetOffset)
+        {
+            case 0: // ISOAdobe: the first 229 SIDs in order.
+                for (int gid = 0; gid < numGlyphs; gid++)
+                {
+                    sids[gid] = gid <= 228 ? gid : -1;
+                }
+                return sids;
+
+            case 1:
+                return FromPredefinedCharset(ExpertCharset, sids);
+
+            case 2:
+                return FromPredefinedCharset(ExpertSubsetCharset, sids);
+        }
+
+        if (charsetOffset < 0 || charsetOffset >= data.Length)
+        {
+            return null;
+        }
+
+        byte format = data[charsetOffset];
+        int pos = charsetOffset + 1;
+        // .notdef is never listed; it is GID 0 and SID 0 by definition.
+        int remaining = numGlyphs - 1;
+        int next = 1;
+
+        switch (format)
+        {
+            case 0:
+                if (pos + (2L * remaining) > data.Length)
+                {
+                    return null;
+                }
+                for (int i = 0; i < remaining; i++)
+                {
+                    sids[next++] = (data[pos] << 8) | data[pos + 1];
+                    pos += 2;
+                }
+                return sids;
+
+            case 1:
+            case 2:
+            {
+                int leftSize = format == 1 ? 1 : 2;
+                while (remaining > 0)
+                {
+                    if (pos + 2 + leftSize > data.Length)
+                    {
+                        return null;
+                    }
+                    int first = (data[pos] << 8) | data[pos + 1];
+                    int left = leftSize == 1 ? data[pos + 2] : (data[pos + 2] << 8) | data[pos + 3];
+                    pos += 2 + leftSize;
+
+                    int run = left + 1;
+                    if (run > remaining)
+                    {
+                        // The ranges must tile the glyph count exactly; a run past the end
+                        // means the table does not describe this font.
+                        return null;
+                    }
+                    for (int i = 0; i < run; i++)
+                    {
+                        int sid = first + i;
+                        sids[next++] = sid <= ushort.MaxValue ? sid : -1;
+                    }
+                    remaining -= run;
+                }
+                return sids;
+            }
+
+            default:
+                return null;
+        }
+    }
+
+    private static int[] FromPredefinedCharset(ushort[] charset, int[] sids)
+    {
+        for (int gid = 0; gid < sids.Length; gid++)
+        {
+            sids[gid] = gid < charset.Length ? charset[gid] : -1;
+        }
+        return sids;
+    }
+
+    /// <summary>
     /// Extract the "CFF " table from an OpenType (sfnt) wrapper, or an empty span if the
     /// data is not an sfnt container.
     /// </summary>

@@ -1005,29 +1005,36 @@ internal sealed partial class OxTextExtractor
     private IOxXObjectCaches? _xobjectCaches;
 
     /// <summary>
-    /// Loads the fonts of a Form XObject's own /Resources into the extractor
-    /// (`PdfDocument::load_fonts`, document.rs:19130). Upstream that method is four layers of
-    /// cross-page font caching around one loop; the first of them is ported below, the rest
-    /// arrive through the same seam.
+    /// Loads the fonts of a page's or Form XObject's own /Resources into the extractor
+    /// (`PdfDocument::load_fonts`, document.rs:19130). Upstream that method wraps one loop in
+    /// several layers of cross-page font caching; the two that decide what a page's font
+    /// aliases resolve to are ported below, the rest arrive through the same seam.
     /// </summary>
     internal Action<OxTextExtractor, PdfObject> LoadFontsForResources { get; set; } = DefaultLoadFonts;
 
     /// <summary>
-    /// The fonts a /Font dictionary resolves to, keyed by that dictionary's object reference
-    /// and scoped to the document it came from — pdf_oxide's `font_set_cache`
-    /// (document.rs:19167). Pages that share a /Font dictionary, and the span and glyph
-    /// passes over one page, then parse each embedded font program once between them.
+    /// The two font-set caches a document carries: pdf_oxide's `font_set_cache`, keyed by the
+    /// /Font dictionary's object reference (document.rs:19167), and its `font_fingerprint_cache`,
+    /// keyed by the (alias &#8594; object reference) mapping the dictionary spells out
+    /// (document.rs:19188). Pages that share a /Font dictionary — and the span and glyph passes
+    /// over one page — then parse each embedded font program once between them.
     /// </summary>
+    private sealed class FontSetCache
+    {
+        public readonly System.Collections.Concurrent.ConcurrentDictionary<
+            (int Number, int Generation), List<(string Name, OxFontInfo Font)>> ByRef = new();
+
+        public readonly System.Collections.Concurrent.ConcurrentDictionary<
+            string, List<(string Name, OxFontInfo Font)>> ByFingerprint = new();
+    }
+
     /// <remarks>
     /// Weak-keyed on the document so a cache dies with the document it describes; upstream
     /// hangs its equivalent off the document too, behind a mutex, which the concurrent map
     /// stands in for.
     /// </remarks>
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
-        PdfDocument,
-        System.Collections.Concurrent.ConcurrentDictionary<
-            (int Number, int Generation), List<(string Name, OxFontInfo Font)>>>
-        FontSetCaches = new();
+        PdfDocument, FontSetCache> FontSetCaches = new();
 
     private static void DefaultLoadFonts(OxTextExtractor extractor, PdfObject resources)
     {
@@ -1038,19 +1045,13 @@ internal sealed partial class OxTextExtractor
             return;
         }
 
-        // Only a referenced /Font dictionary can be cached: an inline one has no identity to
-        // key on, and two pages' inline dictionaries are not the same object however alike.
         var key = fontEntry as PdfRef;
-        var cache = doc is not null && key is not null ? FontSetCaches.GetOrCreateValue(doc) : null;
+        var cache = doc is not null ? FontSetCaches.GetOrCreateValue(doc) : null;
 
         if (cache is not null && key is not null
-            && cache.TryGetValue((key.Number, key.Generation), out var cached))
+            && cache.ByRef.TryGetValue((key.Number, key.Generation), out var cachedByRef))
         {
-            foreach ((string name, OxFontInfo font) in cached)
-            {
-                extractor.AddFontShared(name, font);
-            }
-            extractor.ShareTrueTypeCmaps();
+            ApplyCachedFontSet(extractor, cachedByRef);
             return;
         }
 
@@ -1060,21 +1061,70 @@ internal sealed partial class OxTextExtractor
             return;
         }
 
-        var loaded = new List<(string Name, OxFontInfo Font)>(fontDict.Map.Count);
-        foreach (var entry in fontDict.Map)
+        // Sorted by alias: which font donates a TrueType cmap to which depends on the order
+        // they are loaded, so the dictionary's own ordering must not decide the text.
+        var entries = new List<KeyValuePair<string, PdfObject>>(fontDict.Map);
+        entries.Sort(static (a, b) => string.CompareOrdinal(a.Key, b.Key));
+
+        string fingerprint = FontDictFingerprint(entries);
+        if (cache is not null && cache.ByFingerprint.TryGetValue(fingerprint, out var cachedByPrint))
+        {
+            ApplyCachedFontSet(extractor, cachedByPrint);
+            return;
+        }
+
+        foreach (var entry in entries)
         {
             if (OxFontInfo.FromDict(entry.Value, doc) is { } font)
             {
                 extractor.AddFontShared(entry.Key, font);
-                loaded.Add((entry.Key, font));
             }
         }
         extractor.ShareTrueTypeCmaps();
 
-        if (cache is not null && key is not null)
+        if (cache is not null)
         {
-            cache[(key.Number, key.Generation)] = loaded;
+            // What both layers store is the extractor's whole font set, not just this call's
+            // additions: a /Font dictionary loaded on top of a page's fonts caches the page's
+            // fonts with it, and a later resources dictionary that fingerprints the same way
+            // inherits all of them.
+            var fontSet = extractor.GetFontSet();
+            if (key is not null)
+            {
+                cache.ByRef[(key.Number, key.Generation)] = fontSet;
+            }
+            cache.ByFingerprint[fingerprint] = fontSet;
         }
+    }
+
+    private static void ApplyCachedFontSet(
+        OxTextExtractor extractor, List<(string Name, OxFontInfo Font)> set)
+    {
+        foreach ((string name, OxFontInfo font) in set)
+        {
+            extractor.AddFontShared(name, font);
+        }
+        extractor.ShareTrueTypeCmaps();
+    }
+
+    /// <summary>
+    /// The alias &#8594; object-reference mapping a /Font dictionary spells out, as a key. An
+    /// entry that is not a reference contributes its alias alone, so two dictionaries whose
+    /// inline font objects differ still fingerprint alike — the identity upstream hashes.
+    /// </summary>
+    private static string FontDictFingerprint(List<KeyValuePair<string, PdfObject>> sortedEntries)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var entry in sortedEntries)
+        {
+            sb.Append(entry.Key);
+            if (entry.Value is PdfRef r)
+            {
+                sb.Append(':').Append(r.Number).Append(':').Append(r.Generation);
+            }
+            sb.Append('\u0000');
+        }
+        return sb.ToString();
     }
 
     /// <summary>
