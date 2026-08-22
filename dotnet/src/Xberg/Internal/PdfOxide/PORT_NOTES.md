@@ -59,6 +59,18 @@ breaks everyone else's build.
 
 ## Wiring
 
-Nothing here is called from `PdfExtractor` until the whole pipeline lands and is
-measured against the corpus. Until then this namespace is dead code that must
-compile and be covered by unit tests.
+`PdfExtractor` reaches this namespace through `OxPageExtractor.ExtractPage`, which serves
+**three** span consumers from one content-stream pass, because upstream has three and they
+diverge:
+
+| Consumer | Upstream entry point | What it gets |
+|---|---|---|
+| plain text / json | `extract_spans_with_reading_order(ColumnAware)` | off-page drop, then XY-cut |
+| hierarchy (`SegmentData`) | `extract_spans_with_reading_order(TopToBottom)` | off-page drop, then the row-band sort, and no per-glyph x-origins |
+| words (the table detector) | `extract_words` → `page_reading_order` → `extract_spans` | all of `postprocess_spans`, then the canonical reading order |
+
+Only the word path runs `postprocess_spans` (`OxSpanPostprocess`), so only its spans carry
+the super/subscript substitutions, the combining-mark compositions and — on a `/Rotate`d
+page — geometry mapped into the displayed frame. Feeding one list to all three is what the
+port did before, and it is the wrong shape: every rule downstream of each entry point is
+calibrated to the spans that entry point produces.
