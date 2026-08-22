@@ -189,9 +189,13 @@ as `pdfa_008`, `nougat_046` as `pdfa_021`, and `issue-848`, `issue-140-example` 
 `tables` is the largest lever again, not `plain` — `json` never fails alone, and eight fixtures
 fail nothing hard but `tables`. Known shapes, each re-verified rather than assumed:
 
-- `issue-848` (×2) differs *only* in `bounding_box.x1`, by exactly one f32 ULP, from the
-  line-cluster path unioning its rect in double where pdf_oxide unions in f32. Converting the
-  path/cluster geometry layer to f32 closes both; it is a wide change.
+- `issue-848` (×2) differs *only* in `bounding_box.x1`: golden `127.70124053955078` against
+  `127.70122528076172`, two f32 ULP, and since `x0` is exactly 72.0 the difference is in the
+  cluster's width. Chasing it eliminated the obvious suspects: `RenderedBbox` matches
+  `elements/path.rs:213-218` term for term including the `2.0 * (px + cx)` grouping, `ComputeBbox`
+  only takes min/max, `PathRect` rounds every edge to f32, and `Matrix.TransformSingle` already
+  computes `a*x + c*y + e` in f32, so the path coordinates are f32-valued before they are stored.
+  Whatever remains is upstream of the geometry layer. Unresolved; one document, counted twice.
 - `issue-140-example` (×2): upstream reports no tables, this port one, from inside the
   intersection tier — `IsRealGrid` and `LooksLikeProseTable` are faithful. One nearby rule is
   genuinely unported: pdf_oxide abandons the spatial sweep above `MAX_TABLE_EDGES = 1500` paths
