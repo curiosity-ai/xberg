@@ -8,9 +8,10 @@
 // spans through `page_reading_order`, never through the plain-text path's
 // `extract_spans_with_reading_order`. The tiers resolve as follows here:
 //
-//   1. Logical structure order (`/StructTreeRoot`) — not reachable: the struct-tree
-//      traversal is unported, which is the same position the Rust takes for an untagged
-//      or `/Suspects true` document.
+//   1. Logical structure order (`/StructTreeRoot`) — ported, in
+//      <see cref="OxStructureOrder"/>: a tagged, non-suspect page is ordered by its MCID
+//      pre-order, with the XY-cut kept for the spans the tree does not cover and for an
+//      MCID sequence that zigzags across columns.
 //   2. Article threads (`/Threads`) — not reachable either: `page_article_bead_rects`
 //      only supplies bead rectangles behind a multi-column + order-divergence gate and
 //      fails closed to the geometric tier without them.
@@ -31,8 +32,14 @@ internal static class OxPageOrder
     /// <param name="spans">The page's spans as `postprocess_spans` left them.</param>
     /// <param name="pageRotation">The page's /Rotate, normalized to [0, 360).</param>
     /// <param name="mediaBox">MediaBox corners, which fix the rotated reading frame.</param>
+    /// <param name="mcidOrder">
+    /// The page's logical-structure MCID sequence (`ReadingOrderContext::mcid_order`), or
+    /// null for an untagged or suspect document, which is what sends the page down the
+    /// geometric tier.
+    /// </param>
     public static List<OxTextSpan> PageReadingOrder(
-        List<OxTextSpan> spans, int pageRotation, (float Llx, float Lly, float Urx, float Ury) mediaBox)
+        List<OxTextSpan> spans, int pageRotation, (float Llx, float Lly, float Urx, float Ury) mediaBox,
+        IReadOnlyList<int>? mcidOrder = null)
     {
         if (spans.Count == 0) return new List<OxTextSpan>();
 
@@ -45,7 +52,7 @@ internal static class OxPageOrder
             // A dominant rotation — a landscape table typeset on a portrait page — reorders
             // the WHOLE page in the rotated reading frame.
             if (ReadingFrameQuadrant(DominantRotation(spans)) is int rot)
-                return OrderInRotatedFrame(spans, mediaBox, rot);
+                return OrderInRotatedFrame(spans, mediaBox, rot, mcidOrder);
 
             // Otherwise mirror the span path's per-span rotation firewall: rotated minority
             // runs (margin stamps, figure labels) break the axis-aligned assumptions of the
@@ -55,26 +62,28 @@ internal static class OxPageOrder
             {
                 var rotated = spans.Where(s => s.RotationDegrees != 0.0f).ToList();
                 var upright = spans.Where(s => s.RotationDegrees == 0.0f).ToList();
-                var ordered = upright.Count == 0 ? new List<OxTextSpan>() : Process(upright);
+                var ordered = upright.Count == 0 ? new List<OxTextSpan>() : Process(upright, mcidOrder);
                 ordered.AddRange(OxReadingOrder.OrderRotatedBlocks(rotated));
                 return ordered;
             }
         }
 
-        return Process(spans);
+        return Process(spans, mcidOrder);
     }
 
     /// <summary>
     /// The pipeline's own ordering step (`TextPipeline::process`): tategaki when the page is
     /// vertical-majority, the geometric XY-cut otherwise, then the RTL word-run reversal.
     /// </summary>
-    private static List<OxTextSpan> Process(List<OxTextSpan> spans)
+    private static List<OxTextSpan> Process(List<OxTextSpan> spans, IReadOnlyList<int>? mcidOrder)
     {
         // A vertical-majority page always wins over the configured strategy: none of the
         // left-to-right strategies can produce right-to-left column ordering correctly.
         var ordered = OxReadingOrder.IsTategakiPage(spans)
             ? OxSpanCompare.SortVerticalTategaki(spans, s => s.Bbox)
-            : OxReadingOrder.OrderSpansColumnAware(spans);
+            : mcidOrder is { Count: > 0 }
+                ? OxStructureOrder.Apply(spans, mcidOrder)
+                : OxReadingOrder.OrderSpansColumnAware(spans);
         ReorderRtlWordRuns(ordered);
         return ordered;
     }
@@ -138,7 +147,8 @@ internal static class OxPageOrder
     /// measured from them.
     /// </remarks>
     private static List<OxTextSpan> OrderInRotatedFrame(
-        List<OxTextSpan> spans, (float Llx, float Lly, float Urx, float Ury) mediaBox, int rot)
+        List<OxTextSpan> spans, (float Llx, float Lly, float Urx, float Ury) mediaBox, int rot,
+        IReadOnlyList<int>? mcidOrder)
     {
         float llx = mediaBox.Llx, lly = mediaBox.Lly;
         float w = mediaBox.Urx - llx, h = mediaBox.Ury - lly;
@@ -149,7 +159,7 @@ internal static class OxPageOrder
             s.Bbox = new OxRect(x, y, s.Bbox.Width, s.Bbox.Height);
         }
 
-        var ordered = Process(spans);
+        var ordered = Process(spans, mcidOrder);
 
         // Inverse map: the opposite quadrant applied with the rotated frame's dimensions,
         // which the quarter turns swap.

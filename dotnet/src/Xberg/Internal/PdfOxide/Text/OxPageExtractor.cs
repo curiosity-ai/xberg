@@ -85,7 +85,8 @@ internal static class OxPageExtractor
         result.WordSpans = OxPageOrder.PageReadingOrder(
             wordSpans,
             OxCharXOffsets.GetPageRotation(doc, pageIndex),
-            ((float)llx, (float)lly, (float)urx, (float)ury));
+            ((float)llx, (float)lly, (float)urx, (float)ury),
+            OxStructureOrder.McidOrderForPage(doc, pageIndex));
 
         // The hierarchy path takes its copies BEFORE the stamp below. `stamp_char_x_offsets`
         // lives inside `postprocess_spans`, which the `ReadingOrder::TopToBottom` path never
