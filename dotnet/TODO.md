@@ -366,6 +366,37 @@ the generator, regenerate, and re-measure. Expect the generator to abort partway
 and a full run also creates ~222 goldens for fixtures the extractors fail on, which changes the
 denominator. Back up `*-results-rust.json` first.
 
+### The 21 remaining failures, classified
+
+Re-derived with `--list-fail` rather than carried forward, because the running count had gone
+stale: earlier notes said "about eleven port gaps", and the real figure is **four**. Several
+fixtures counted there were later shown to be order-dependent goldens.
+
+- **7 upstream defects / corpus drift** — `ATTRIBUTIONS.md`, `LICENSES.md`,
+  `scripts/corpus-patterns.txt`, the DocTags `<h0>` depth truncation, `factbook-utf-16.xml`'s
+  BOM, `dbf/stations.dbf`'s hash-ordered columns, and `epub/features.epub`'s stale golden.
+- **7 order-dependent goldens** — `nougat_011`, `nougat_012`, `nougat_046`, `pdfa_021`,
+  `pdfa_027`, `pdfa_031`, `pdfa_044`. pdf_oxide's process-global font cache makes upstream's
+  output a function of what was extracted before it, so no single-document-per-process consumer
+  can reproduce these.
+- **3 wall-clock truncations** — `bayesian_data_analysis`, the Intel SDM, `algebra_topology`.
+  All three pass `plain` when the 25 s guard is raised to 300 s.
+- **4 genuine port gaps**, all PDF:
+  - `right_to_left_03` (tables). Traced this pass: the **intersection** tier produces two
+    candidate grids, of which one survives `IsValidTable` under the bordered config's
+    `min_table_columns = 2` and none under strict's 3. `IsValidTable` is a faithful port of
+    `is_valid_table` and the surviving 10x4 grid passes it legitimately — roughly half its
+    cells are empty, under the 0.6 bar, and the two-column continuation guard does not apply at
+    four columns. So the divergence is in intersection grid *construction*, upstream of every
+    gate, not in the validation. `regular_row_ratio` is not the cause: its three other call
+    sites live in `detect_tables_from_spans`, which xberg's `(Lines, Lines)` configs never
+    reach, and the one live site in `detect_tables_in_cluster` is ported.
+  - `2203.01017v2` (tables) — one fragment's bounding box differs by 1.67pt.
+  - `2305.03393v1` (plain) — upstream emits an empty markdown table where this port emits the
+    prose; the golden matches neither.
+  - `proof_of_concept_or_gtfo_v13` (plain, json) — line joins inside code-listing regions,
+    15 diff lines.
+
 ### Genuine upstream defects — 6 fixtures, safe to ignore
 
 Each is traced to a specific line, not assumed.
