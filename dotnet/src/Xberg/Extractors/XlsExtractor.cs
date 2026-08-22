@@ -49,6 +49,12 @@ public sealed class XlsExtractor : IExtractor
             ["sheet_names"] = JsonStr(FormatSheetNames(sheetNames)),
         };
 
+        foreach (var sheet in sheets)
+        {
+            if (BiffFormula.CollectSheetFormulas(sheet.Formulas) is { } formulas)
+                additional[$"formulas_{sheet.Name}"] = JsonStr(formulas);
+        }
+
         doc.Metadata = new Metadata
         {
             Format = FormatMetadata.Excel(excelMeta),
