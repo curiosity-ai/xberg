@@ -501,7 +501,9 @@ internal static class EpubHtmlStructure
                     _inDt = false;
                     break;
                 case "dd":
-                    _inDd = false;
+                    // `FlushDefinitionItem` is what emits the term/definition pair, and it keys
+                    // off `_inDd`. Clearing the flag first left it with nothing to do, so every
+                    // `<dd>` body was accumulated and then thrown away.
                     FlushDefinitionItem();
                     break;
                 case "figure":
