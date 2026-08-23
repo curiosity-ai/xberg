@@ -18,13 +18,12 @@ public sealed class PdfExtractor : IExtractor
 
     public int Priority => 50;
 
-    // Per-document wall-clock guard so pathological files cannot hang extraction.
-    private const int MaxSecondsPerDocument = 25;
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         byte[] bytes = content.ToArray();
-        long deadline = DateTime.UtcNow.Ticks + TimeSpan.FromSeconds(MaxSecondsPerDocument).Ticks;
+        // Per-document wall-clock guard so pathological files cannot hang extraction.
+        long deadline = config.Options.PdfDeadlineFromNow();
 
         PdfDocument pdf;
         try { pdf = PdfDocument.Open(bytes); }
@@ -42,7 +41,7 @@ public sealed class PdfExtractor : IExtractor
             || config.OutputFormat.Equals(OutputFormat.Djot)
             || config.OutputFormat.Equals(OutputFormat.Html);
 
-        string nativeText = ExtractTextAndSegments(pdf, deadline, out var pageSegments,
+        string nativeText = ExtractTextAndSegments(pdf, deadline, config.Options, out var pageSegments,
             out var pageWords, out var pagePaths);
 
         // --- Metadata ---
@@ -348,23 +347,13 @@ public sealed class PdfExtractor : IExtractor
         }
     }
 
-    /// <summary>
-    /// Whether page spans come from the ported pdf_oxide pipeline rather than this port's
-    /// own content interpreter.
-    /// </summary>
-    /// <remarks>
-    /// On by default: the ported producer wins on every dimension the corpus measures.
-    /// The older interpreter stays reachable because it is still the source of the drawn
-    /// paths the table tiers read, and because a per-fixture A/B is the fastest way to
-    /// attribute a regression to the span layer.
-    /// </remarks>
-    internal static bool UsePortedSpans { get; set; } =
-        Environment.GetEnvironmentVariable("XBERG_OXIDE_SPANS") != "0";
+
 
     // SegmentData grid (out param) used for tables and heading structure. Mirrors Rust
     // `oxide::text::extract_text` + `oxide::hierarchy::extract_all_segments` sharing spans.
     private static string ExtractTextAndSegments(
-        PdfDocument pdf, long deadline, out List<List<SegmentData>> pageSegments,
+        PdfDocument pdf, long deadline, XbergOptions options,
+        out List<List<SegmentData>> pageSegments,
         out List<List<TableSpan>> pageWords, out List<List<PdfPath>> pagePaths)
     {
         int pageCount = pdf.PageCount;
@@ -397,7 +386,7 @@ public sealed class PdfExtractor : IExtractor
                     List<Xberg.Internal.PdfOxide.OxTextSpan>? structureSpans = null;
                     List<Xberg.Internal.PdfOxide.OxTextSpan>? wordSpans = null;
                     float structurePageWidth = 0f, structurePageHeight = 0f;
-                    if (UsePortedSpans)
+                    if (options.UsePortedPdfSpans)
                     {
                         // The ported pipeline's own assembler consumes the ported spans directly:
                         // they already arrive column-aware ordered, deduplicated and merged, which

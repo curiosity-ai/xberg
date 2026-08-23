@@ -44,6 +44,11 @@ var files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
 Console.Error.WriteLine($"[cs] {files.Count} files, warmup={warmup}, iters={iters}");
 
 var extractor = new Extractor();
+// The library never reads the environment itself — a knob hidden behind an env var inside
+// library code is invisible to whoever links it. Harnesses opt in explicitly, which is what
+// lets one variable drive this port and the Rust original through the same comparison.
+XbergOptions.Default = XbergOptions.FromEnvironment();
+
 var config = new ExtractionConfig { OutputFormat = OutputFormat.Plain };
 
 // A run counts as OK only if it produced output; a file both sides fail on is still timed,

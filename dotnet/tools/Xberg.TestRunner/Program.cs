@@ -19,6 +19,11 @@ using Xberg.Types;
 //     --strict-md         count markdown/html mismatches as failures (default: soft/reported)
 //     --list-ok           also list fixtures that fully match
 
+// The library never reads the environment itself — a knob hidden behind an env var inside
+// library code is invisible to whoever links it. Harnesses opt in explicitly, which is what
+// lets one variable drive this port and the Rust original through the same comparison.
+XbergOptions.Default = XbergOptions.FromEnvironment();
+
 // Single-file extract mode: `--extract <file> [--format plain|markdown|html|json]`
 // Prints the C# extractor's output for one file (used to build the quality gallery).
 if (args.Length >= 2 && args[0] == "--extract")

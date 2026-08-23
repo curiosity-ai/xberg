@@ -85,6 +85,14 @@ public sealed class ExtractionConfig
     // Content-relevant option stubs (defaults; extractors read these later).
     public bool ExtractImages { get; set; } = true;
     public bool ExtractTables { get; set; } = true;
+
+    /// <summary>
+    /// Port-local behavioural knobs (deadlines, implementation switches). Defaults to
+    /// <see cref="XbergOptions.Default"/>. Not part of the wire format: everything above mirrors
+    /// upstream's config field for field, and these have no upstream counterpart.
+    /// </summary>
+    [JsonIgnore]
+    public XbergOptions Options { get; set; } = XbergOptions.Default;
 }
 
 /// <summary>Kind of extraction input. Serialized as bare snake_case string.</summary>

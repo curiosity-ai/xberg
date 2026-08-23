@@ -147,7 +147,7 @@ public class PdfTableStitchTests
     [Fact]
     public void ColumnwiseMergeJoinsEveryNonEmptyCellInRowOrder()
     {
-        var merged = PdfTableStitch.MergeRowsColumnwise(new List<List<string>>
+        var merged = PdfTableReconstruct.MergeRowsColumnwise(new List<List<string>>
         {
             new() { "one", "  ", "x" },
             new() { "two", "b", "" },
@@ -159,7 +159,7 @@ public class PdfTableStitchTests
     [Fact]
     public void ColumnwiseMergeTruncatesRowsWiderThanTheColumnCount()
     {
-        var merged = PdfTableStitch.MergeRowsColumnwise(new List<List<string>>
+        var merged = PdfTableReconstruct.MergeRowsColumnwise(new List<List<string>>
         {
             new() { "a", "b", "c", "d" },
         }, 2);
