@@ -387,30 +387,67 @@ nothing from 155), **2770 fully matching on the hard dimensions — 99.4% of com
   `scripts/corpus-patterns.txt`, the DocTags `<h0>` depth truncation
   (`multi_page.doctags.txt`), `factbook-utf-16.xml`'s BOM, `dbf/stations.dbf`'s hash-ordered
   columns, and `epub/features.epub`'s stale golden.
-- **2 large documents, part truncation and part real** — the Intel SDM and `algebra_topology`.
-  Raising the guard (`XbergOptions.PdfMaxSecondsPerDocument`, formerly a `const`) to 600 s and
-  re-sweeping settles what the deadline was hiding: the Intel SDM's `plain` and `json` pass once
-  it is allowed to finish, but its `tables` still fails, and `algebra_topology` still fails both
-  `json` and `tables`. So these are *not* purely deadline artifacts, as an earlier revision of
-  this section claimed — there is a residual divergence on the table tiers for both, not yet
-  traced. `bayesian_data_analysis` genuinely is deadline-only: it fails all four hard dimensions
-  at 25 s and passes all four at 300 s, which is also why it wanders in and out of the failing
-  list between runs on a loaded machine.
+- **2 large documents with a table-tier divergence** — the Intel SDM (`tables` only) and
+  `algebra_topology` (`json` and `tables`). Both now pass `plain`, and the SDM passes `json` too,
+  once the guard stops truncating them; what remains is real. Traced below.
 
-  The deadline-free PDF line, the first measured with that variable removed, is
-  `389  378 380/388 305/388 305/388 379/388 388/388 384/388` — `plain` and `json` each one
-  better than the same tree at 25 s.
-- **1 deliberate non-port** — `2305.03393v1` (`plain`, `json`). That page's text layer literally
-  contains HTML table markup, and upstream's `html-to-markdown-rs` leaves the unclosed `<td>`
-  open: it swallows the rest of the page's prose into that cell and then drops it, rendering
-  `|  |` / `| --- |`. Reduced to a pure HTML fixture with no PDF involved:
-  `before\n<table> <tr> </tr> <td> </table>\nafter text here\n` gives upstream
-  `"before\n\n|  |\n| --- |\n"` against this port's `"before\n\nafter text here\n"`, identical
-  under both `TierStrategy::Auto` and `Tier2`. Matching it means making an unclosed `<td>`
-  absorb and discard the remainder of any document in the shared HTML converter. No `.html`
-  fixture in the corpus has an unclosed `td`/`th` (0 of 42) and exactly one PDF golden shows the
-  swallow, so this buys one fixture at the cost of silent content loss on real input. Not
-  ported, on purpose. This fixture's `markdown` and `html` *are* byte-identical.
+### The wall-clock guard, and why it was hiding this
+
+Profiling settled that neither large document is stuck or pathological. Both terminate and scale
+linearly: the 4778-page Intel SDM extracts fully in ~55 s at ~9 ms/page, the 1962-page
+`algebra_topology` in ~39 s at ~20 ms/page, with no page behaving differently from its
+neighbours. Where the SDM's time goes: page loop 45.1 s of 55 s, then tables:heuristic 6.4 s,
+scan-detect 1.7 s, the ruled tiers 1.6 s. Inside the loop each page takes three content-stream
+passes — `ExtractChars` 9.0 s, `ExtractSpans` 5.8 s, and the old interpreter 3.2 s for the drawn
+paths the table tiers still read — plus `WordsFromOxSpans` at 10.4 s. Two plausible causes were
+measured and ruled out: the old interpreter running alongside the ported pipeline is 7%, not the
+bulk; and font loading, despite 9556 `LoadFontsForResources` calls, is 0.5 s total because the
+CMap cache already absorbs it.
+
+For scale, upstream's own generator takes ~105 s per extraction on that same file (419 s for its
+four formats), so this port is roughly twice as fast. Its nominal 45 s guard never fires, because
+`extract` is CPU-bound synchronous work inside an async fn and tokio has no await point at which
+to cancel it — so the goldens for these files are complete ~105 s extractions that no 25 s guard
+here could reproduce.
+
+The guard is now `clamp(25 + 0.05 * pages, 25, 3600)` seconds
+(`XbergOptions.PdfBaseSeconds` / `PdfMillisecondsPerPage` / `PdfMaxSecondsPerDocument`). That
+removed the last source of measurement noise: the flat 120 s, the 600 s no-guard and the shipped
+scaled guard all produce the identical PDF line
+`389  378 380/388 305/388 305/388 379/388 388/388 384/388` and the identical ten failures, where
+25 s moved totals by one to three fixtures between runs of identical code.
+
+### The remaining table divergence — column boundaries, not detection
+
+Detection is exact: `algebra_topology` produces 1701 tables on the same 1033 pages as the golden,
+zero surplus, zero missing. Only **5 of 1701** differ, all in where column boundaries fall — same
+words, split at different x positions — plus one bounding box 2 pt out.
+
+The mechanism is a cliff in `compute_adaptive_column_gap`
+(`pdf/structure/regions/tables.rs:294`). The threshold comes from one of two branches:
+
+    any gap >= 40  ->  clamp(median(large_gaps) / 2, 20, 60)
+    otherwise      ->  clamp(median(all_gaps)  * 3, 20, 60)
+
+which typically land 2-3x apart. The affected regions sit exactly on that boundary — page 807 has
+gaps of 39 and 40 straddling the cutoff, page 1194 has
+`[33,33,33,34,34,34,34,34,38,38,38,38,39,41,42,43,44,48]`, and one page 1183 region has 2 outlier
+gaps out of 51 swinging the threshold from 20 to 60. A sub-unit difference in one word's integer
+x coordinate flips membership in `large_gaps` and changes the column granularity of the table.
+
+Ruled out by inspection and measurement: the gap function itself (both C# copies are faithful to
+Rust, sort stability included), the rounding mode (`MidpointRounding.AwayFromZero` correctly
+matches Rust's `.round()`, which is the obvious banker's-rounding trap and is not present), and
+any difference in table count or page distribution.
+
+Not yet established: why the word coordinates differ from Rust's at all. Closing it needs a
+Rust-side word dump for one page — the probe-crate approach that settled `right_to_left_03`.
+
+Found while tracing, and fixed separately because it is a real divergence in its own right:
+`SplitSegmentToWords` took its origin from raw page-space `seg.X`/`seg.Y` where upstream uses
+`seg.upright_origin()` in both `segment_to_hocr_word` and `split_segment_to_words`. Identity for
+an unrotated segment, so it is invisible here and is *not* the cause of the 5 tables; wrong axis
+for a rotated run.
 
 ### The four port gaps, and what each turned out to be
 
