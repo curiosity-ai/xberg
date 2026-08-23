@@ -387,9 +387,19 @@ nothing from 155), **2770 fully matching on the hard dimensions — 99.4% of com
   `scripts/corpus-patterns.txt`, the DocTags `<h0>` depth truncation
   (`multi_page.doctags.txt`), `factbook-utf-16.xml`'s BOM, `dbf/stations.dbf`'s hash-ordered
   columns, and `epub/features.epub`'s stale golden.
-- **2 wall-clock truncations** — the Intel SDM and `algebra_topology`. Both pass `plain` when
-  the 25 s `MaxSecondsPerDocument` guard is raised to 300 s. `bayesian_data_analysis` was a
-  third until this pass and now passes outright.
+- **2 large documents, part truncation and part real** — the Intel SDM and `algebra_topology`.
+  Raising the guard (`XbergOptions.PdfMaxSecondsPerDocument`, formerly a `const`) to 600 s and
+  re-sweeping settles what the deadline was hiding: the Intel SDM's `plain` and `json` pass once
+  it is allowed to finish, but its `tables` still fails, and `algebra_topology` still fails both
+  `json` and `tables`. So these are *not* purely deadline artifacts, as an earlier revision of
+  this section claimed — there is a residual divergence on the table tiers for both, not yet
+  traced. `bayesian_data_analysis` genuinely is deadline-only: it fails all four hard dimensions
+  at 25 s and passes all four at 300 s, which is also why it wanders in and out of the failing
+  list between runs on a loaded machine.
+
+  The deadline-free PDF line, the first measured with that variable removed, is
+  `389  378 380/388 305/388 305/388 379/388 388/388 384/388` — `plain` and `json` each one
+  better than the same tree at 25 s.
 - **1 deliberate non-port** — `2305.03393v1` (`plain`, `json`). That page's text layer literally
   contains HTML table markup, and upstream's `html-to-markdown-rs` leaves the unclosed `<td>`
   open: it swallows the rest of the page's prose into that cell and then drops it, rendering
