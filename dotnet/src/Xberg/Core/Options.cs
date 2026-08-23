@@ -47,13 +47,23 @@ public sealed class XbergOptions
     /// cannot hang extraction. Zero or negative disables the guard entirely.
     /// </summary>
     /// <remarks>
-    /// The default of 25 s is a guard, not a target, and it is load-sensitive: a handful of very
-    /// large corpus fixtures (the Intel SDM, `algebra_topology`) trip it on a busy machine and
-    /// extract fully on a quiet one, which moves parity totals by one to three fixtures between
-    /// runs of identical code. Raise it when measuring, rather than reading a single run's last
-    /// digit as signal.
+    /// <para>
+    /// This is a guard against pathological input, not a throughput target, so it is set well
+    /// clear of what legitimate documents need. Measured: the 4778-page Intel SDM extracts fully
+    /// in ~55 s and the 1962-page `algebra_topology` in ~39 s, both scaling linearly at roughly
+    /// 9-20 ms per page with no pathological page. The former default of 25 s cut both off
+    /// mid-document, which is why they failed `plain` and drifted in and out of the corpus
+    /// failure list between runs of identical code on a loaded machine.
+    /// </para>
+    /// <para>
+    /// For scale: upstream's own golden generator takes ~105 s per extraction on that same Intel
+    /// SDM — this port is roughly twice as fast — and its nominal 45 s guard never fires there,
+    /// because `extract` is CPU-bound synchronous work inside an async fn and tokio has no await
+    /// point at which to cancel it. A 25 s guard here could therefore never reproduce goldens
+    /// that were themselves produced by a 105 s run.
+    /// </para>
     /// </remarks>
-    public int PdfMaxSecondsPerDocument { get; init; } = 25;
+    public int PdfMaxSecondsPerDocument { get; init; } = 120;
 
     /// <summary>
     /// Absolute tick deadline for a document starting now, or <see cref="long.MaxValue"/> when

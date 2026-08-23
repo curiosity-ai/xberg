@@ -13,7 +13,7 @@ public class XbergOptionsTests
     {
         var options = new XbergOptions();
         Assert.True(options.UsePortedPdfSpans);
-        Assert.Equal(25, options.PdfMaxSecondsPerDocument);
+        Assert.Equal(120, options.PdfMaxSecondsPerDocument);
     }
 
     [Fact]
@@ -82,8 +82,8 @@ public class XbergOptionsTests
     [Theory]
     [InlineData("300", 300)]
     [InlineData("0", 0)]
-    [InlineData(null, 25)]
-    [InlineData("not-a-number", 25)]   // unparseable leaves the default in place
+    [InlineData(null, 120)]
+    [InlineData("not-a-number", 120)]   // unparseable leaves the default in place
     public void FromEnvironmentReadsNumbers(string? value, int expected)
     {
         WithEnvironment("XBERG_PDF_MAX_SECONDS", value, () =>
