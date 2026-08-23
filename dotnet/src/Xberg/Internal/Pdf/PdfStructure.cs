@@ -210,7 +210,7 @@ public static class PdfStructure
         // from the unstitched list, so this must stay local to the structure pipeline.
         if (ruledTables is not null)
         {
-            try { if (Environment.GetEnvironmentVariable("XBERG_NO_STITCH") != "1") ruledTables = PdfTableStitch.StitchFragmentedTables(ruledTables, allPageSegments); }
+            try { ruledTables = PdfTableStitch.StitchFragmentedTables(ruledTables, allPageSegments); }
             catch { }
         }
 

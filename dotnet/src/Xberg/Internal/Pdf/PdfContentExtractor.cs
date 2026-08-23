@@ -609,7 +609,7 @@ public sealed class PdfContentExtractor
         // (`B`, `B*`, `b*`) leaves them in the buffer, and the next `S` on the page emits
         // them as one path — a single primitive spanning the whole form, which bridges
         // unrelated ruling-line clusters and widens the table bounding boxes built from them.
-        if (Environment.GetEnvironmentVariable("XBERG_NO_XOBJ_PATH_ISOLATION") != "1") EndPath();
+        EndPath();
         var savedTm = _tm; var savedTlm = _tlm;
         if (_doc.Resolve(st.Dict.Get("Matrix")).AsArray() is PdfArray fm && fm.Items.Count >= 6)
         {
@@ -621,7 +621,7 @@ public sealed class PdfContentExtractor
         }
         var formRes = _doc.Resolve(st.Dict.Get("Resources")).AsDict();
         try { Run(_doc.DecodeStream(st), formRes, depth + 1); } catch { }
-        if (Environment.GetEnvironmentVariable("XBERG_NO_XOBJ_PATH_ISOLATION") != "1") EndPath();
+        EndPath();
         FlushBuffer();
         if (_stack.Count > 0) _gs = _stack.Pop();
         _tm = savedTm; _tlm = savedTlm;
