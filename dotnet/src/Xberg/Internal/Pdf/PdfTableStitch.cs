@@ -149,7 +149,7 @@ internal static class PdfTableStitch
 
         var rows = new List<List<string>>(chain.Count);
         foreach (var table in chain)
-            rows.Add(MergeRowsColumnwise(table.Cells, columnCount));
+            rows.Add(PdfTableReconstruct.MergeRowsColumnwise(table.Cells, columnCount));
 
         // `page_number.saturating_sub(1)`: an unnumbered fragment reads page 0's segments,
         // as upstream does, rather than skipping recovery.
@@ -167,26 +167,6 @@ internal static class PdfTableStitch
         };
     }
 
-    /// <summary>
-    /// Port of `pdf::table_reconstruct::merge_rows_columnwise`: one row whose i-th cell is the
-    /// space-joined text of every non-empty i-th cell across <paramref name="rows"/>.
-    /// </summary>
-    internal static List<string> MergeRowsColumnwise(List<List<string>> rows, int columnCount)
-    {
-        var merged = new List<string>(columnCount);
-        for (int i = 0; i < columnCount; i++) merged.Add("");
-        foreach (var row in rows)
-        {
-            int limit = Math.Min(row.Count, columnCount);
-            for (int idx = 0; idx < limit; idx++)
-            {
-                string trimmed = row[idx].Trim();
-                if (trimmed.Length == 0) continue;
-                merged[idx] = merged[idx].Length == 0 ? trimmed : merged[idx] + " " + trimmed;
-            }
-        }
-        return merged;
-    }
 
     /// <summary>
     /// Recover trailing data rows that never became their own table fragment, by scanning the
@@ -228,7 +208,7 @@ internal static class PdfTableStitch
             var grid = PdfTableReconstruct.ReconstructTable(entityWords, colGap, 0.5);
             if (grid.Count == 0 || grid[0].Count != columnCount) break;
 
-            var mergedRow = MergeRowsColumnwise(grid, columnCount);
+            var mergedRow = PdfTableReconstruct.MergeRowsColumnwise(grid, columnCount);
             if (mergedRow.All(cell => cell.Trim().Length == 0)) break;
 
             float entityBottomPdfY = pageHeight - entityBottomImageY;

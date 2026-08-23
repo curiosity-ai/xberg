@@ -632,6 +632,30 @@ internal static partial class PdfTableReconstruct
         return n;
     }
 
+    /// <summary>
+    /// Port of `pdf/table_reconstruct.rs:158` `merge_rows_columnwise`: collapse
+    /// <paramref name="rows"/> into a single row whose i-th cell is the space-joined text of
+    /// every non-empty i-th cell. Upstream has one such function with two callers — the
+    /// header merge below, and the fragmented-table stitch in `PdfTableStitch` — so this is
+    /// deliberately shared rather than inlined at either site.
+    /// </summary>
+    internal static List<string> MergeRowsColumnwise(List<List<string>> rows, int columnCount)
+    {
+        var merged = new List<string>(columnCount);
+        for (int i = 0; i < columnCount; i++) merged.Add("");
+        foreach (var row in rows)
+        {
+            int limit = Math.Min(row.Count, columnCount);
+            for (int idx = 0; idx < limit; idx++)
+            {
+                string trimmed = row[idx].Trim();
+                if (trimmed.Length == 0) continue;
+                merged[idx] = merged[idx].Length == 0 ? trimmed : merged[idx] + " " + trimmed;
+            }
+        }
+        return merged;
+    }
+
     private static List<List<string>>? PostProcessTableInner(List<List<string>> table, int minColumns, bool layoutGuided)
     {
         table = table.Where(row => row.Any(cell => cell.Trim().Length > 0)).Select(r => new List<string>(r)).ToList();
@@ -692,16 +716,7 @@ internal static partial class PdfTableReconstruct
         int columnCount = (headerRows.Count > 0 ? headerRows[0] : (dataRows.Count > 0 ? dataRows[0] : new List<string>())).Count;
         if (columnCount == 0) return null;
 
-        var header = new List<string>();
-        for (int i = 0; i < columnCount; i++) header.Add("");
-        foreach (var row in headerRows)
-            for (int idx = 0; idx < row.Count && idx < columnCount; idx++)
-            {
-                string t = row[idx].Trim();
-                if (t.Length == 0) continue;
-                if (header[idx].Length > 0) header[idx] += " ";
-                header[idx] += t;
-            }
+        var header = MergeRowsColumnwise(headerRows, columnCount);
 
         var processed = new List<List<string>> { header };
         processed.AddRange(dataRows);
