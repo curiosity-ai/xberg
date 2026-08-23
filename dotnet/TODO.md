@@ -10,11 +10,12 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
 > large `office/regression` set of real-world HTML.
 >
-> **2755 of 2787 comparable fixtures (98.9%) match on every hard dimension**; **0
-> catastrophes**; 1401 unit tests. Only **seven** of the 32 failures are outside PDF, and six of
-> those are the flagged upstream defects; the seventh is `epub/features.epub`, whose golden
-> predates the converter it is measured against (traced below). The denominator is the fixtures
-> Rust itself can extract —
+> **2770 of 2787 comparable fixtures (99.4%) match on every hard dimension**; **0
+> catastrophes**; **0 content losses**; 1466 unit tests. **Genuine port gaps: 0** — every one of
+> the 17 remaining failures is an order-dependent golden (7), an upstream defect or corpus drift
+> (7), a wall-clock truncation (2), or one deliberate non-port where matching upstream would
+> cost silent content loss (1). Classified fixture by fixture below. The denominator is the
+> fixtures Rust itself can extract —
 > 155 of the 2,942 walked, it cannot, and counting those against this port measures nothing.
 > Measured on the whole corpus in one run, which is the only figure that means anything: a
 > per-format run validated the mime sniff on md and txt while it was quietly handing three PDFs
@@ -366,36 +367,67 @@ the generator, regenerate, and re-measure. Expect the generator to abort partway
 and a full run also creates ~222 goldens for fixtures the extractors fail on, which changes the
 denominator. Back up `*-results-rust.json` first.
 
-### The 21 remaining failures, classified
+### The 17 remaining failures, classified
 
-Re-derived with `--list-fail` rather than carried forward, because the running count had gone
-stale: earlier notes said "about eleven port gaps", and the real figure is **four**. Several
-fixtures counted there were later shown to be order-dependent goldens.
+Re-derived with `--list-fail` on the current tree rather than carried forward — the running
+count has gone stale twice now (it read "about eleven port gaps" long after the real figure was
+four). Corpus totals behind this: 2942 fixtures walked, 2787 comparable (Rust itself extracts
+nothing from 155), **2770 fully matching on the hard dimensions — 99.4% of comparable**.
+0 catastrophes, 0 content losses.
 
-- **7 upstream defects / corpus drift** — `ATTRIBUTIONS.md`, `LICENSES.md`,
-  `scripts/corpus-patterns.txt`, the DocTags `<h0>` depth truncation, `factbook-utf-16.xml`'s
-  BOM, `dbf/stations.dbf`'s hash-ordered columns, and `epub/features.epub`'s stale golden.
+**Genuine port gaps: 0.** All four are closed; see the per-gap notes below.
+
 - **7 order-dependent goldens** — `nougat_011`, `nougat_012`, `nougat_046`, `pdfa_021`,
-  `pdfa_027`, `pdfa_031`, `pdfa_044`. pdf_oxide's process-global font cache makes upstream's
-  output a function of what was extracted before it, so no single-document-per-process consumer
-  can reproduce these.
-- **3 wall-clock truncations** — `bayesian_data_analysis`, the Intel SDM, `algebra_topology`.
-  All three pass `plain` when the 25 s guard is raised to 300 s.
-- **4 genuine port gaps**, all PDF:
-  - `right_to_left_03` (tables). Traced this pass: the **intersection** tier produces two
-    candidate grids, of which one survives `IsValidTable` under the bordered config's
-    `min_table_columns = 2` and none under strict's 3. `IsValidTable` is a faithful port of
-    `is_valid_table` and the surviving 10x4 grid passes it legitimately — roughly half its
-    cells are empty, under the 0.6 bar, and the two-column continuation guard does not apply at
-    four columns. So the divergence is in intersection grid *construction*, upstream of every
-    gate, not in the validation. `regular_row_ratio` is not the cause: its three other call
-    sites live in `detect_tables_from_spans`, which xberg's `(Lines, Lines)` configs never
-    reach, and the one live site in `detect_tables_in_cluster` is ported.
-  - `2203.01017v2` (tables) — one fragment's bounding box differs by 1.67pt.
-  - `2305.03393v1` (plain) — upstream emits an empty markdown table where this port emits the
-    prose; the golden matches neither.
-  - `proof_of_concept_or_gtfo_v13` (plain, json) — line joins inside code-listing regions,
-    15 diff lines.
+  `pdfa_027`, `pdfa_031`, `pdfa_044`. pdf_oxide keeps a process-global font cache
+  (`fonts/global_cache.rs:111`), so upstream's output is a function of what was extracted before
+  it in the same process, and no single-document-per-process consumer can reproduce these.
+  Measured directly: `nougat_011` yields 30143 chars alone, 30213 after `pdfa_044`, against a
+  golden of 30147.
+- **7 upstream defects / corpus drift** — `ATTRIBUTIONS.md`, `LICENSES.md`,
+  `scripts/corpus-patterns.txt`, the DocTags `<h0>` depth truncation
+  (`multi_page.doctags.txt`), `factbook-utf-16.xml`'s BOM, `dbf/stations.dbf`'s hash-ordered
+  columns, and `epub/features.epub`'s stale golden.
+- **2 wall-clock truncations** — the Intel SDM and `algebra_topology`. Both pass `plain` when
+  the 25 s `MaxSecondsPerDocument` guard is raised to 300 s. `bayesian_data_analysis` was a
+  third until this pass and now passes outright.
+- **1 deliberate non-port** — `2305.03393v1` (`plain`, `json`). That page's text layer literally
+  contains HTML table markup, and upstream's `html-to-markdown-rs` leaves the unclosed `<td>`
+  open: it swallows the rest of the page's prose into that cell and then drops it, rendering
+  `|  |` / `| --- |`. Reduced to a pure HTML fixture with no PDF involved:
+  `before\n<table> <tr> </tr> <td> </table>\nafter text here\n` gives upstream
+  `"before\n\n|  |\n| --- |\n"` against this port's `"before\n\nafter text here\n"`, identical
+  under both `TierStrategy::Auto` and `Tier2`. Matching it means making an unclosed `<td>`
+  absorb and discard the remainder of any document in the shared HTML converter. No `.html`
+  fixture in the corpus has an unclosed `td`/`th` (0 of 42) and exactly one PDF golden shows the
+  swallow, so this buys one fixture at the cost of silent content loss on real input. Not
+  ported, on purpose. This fixture's `markdown` and `html` *are* byte-identical.
+
+### The four port gaps, and what each turned out to be
+
+None was where the first hypothesis said it was; each was found by dumping both sides and
+diffing, not by reasoning from the fixture.
+
+- `right_to_left_03` (tables) — **not** the intersection tier, which a probe crate built against
+  real pdf_oxide 0.3.77 proved faithful at every stage (137 lines → 42 H / 32 V edges → 136
+  intersections → 72 cells → 9 groups, identical bbox). The spans feeding it differed: this is a
+  tagged Word-2016 file whose struct tree is trustworthy, so upstream takes the logical
+  structure-order tier, which the port had unported and fell through to the geometric XY-cut.
+  In structure order `مدارک` lands beside the date glyphs and `merge_adjacent_words` fuses them
+  into one word spanning both columns, pushing empty cells to 0.75 — past the 0.6 bar in
+  `is_valid_table`, so the spurious table dies. Ported `pipeline/reading_order/structure_tree.rs`
+  plus the `/MarkInfo /Suspects` gate.
+- `2203.01017v2` (tables) — the brief had the sign inverted; the port was 1.67 pt *wider*, not
+  narrower. pdf_oxide discards pending path construction at **both** Form XObject boundaries
+  (`document.rs:18025`, `:18204`); the port had neither, so nine Bézier circles painted with
+  `B*` leaked out of the form as one 56-op primitive spanning the whole figure, bridging
+  unrelated ruling-line clusters and dragging `cluster.bbox.x` with them.
+- `2305.03393v1` — two independent gaps. `stitch_fragmented_tables` (`pipeline.rs:2553-2843`)
+  was documented in `PdfExtractor.cs` as knowingly unported; now ported, which makes this
+  fixture's `markdown` and `html` byte-identical. The residual `plain`/`json` diff is the
+  html-to-markdown behavior above, deliberately not ported.
+- `proof_of_concept_or_gtfo_v13` (plain, json) — not XY-cut region splitting: all 197 spans were
+  byte-identical to Rust. Three HTML tokenizer bugs, fixed by porting astral-tl 0.7.11's
+  `parse_tag`/`parse_attributes` in place of the approximated `>`-scanner.
 
 ### Genuine upstream defects — 6 fixtures, safe to ignore
 
@@ -414,11 +446,15 @@ Each is traced to a specific line, not assumed.
 - **Corpus drift** (`ATTRIBUTIONS.md`, `LICENSES.md`, `scripts/corpus-patterns.txt`): the fixtures
   are `test_documents`' own docs and grew after their goldens were made.
 
-### This port's gaps — 142 fixtures
+### This port's gaps — 17 fixtures
 
-**PDF, 114.** By failing dimension: 32 fail only on markdown/html plus tables, 33 add `plain`,
-28 are json-and-soft, 10 are json alone, 4 tables alone, 3 metadata. The soft-dimension mass is
-one cause — heading classification — and `tables` is the ruled/heuristic tier boundary.
+Superseded by "The 17 remaining failures, classified" above; kept for the per-format detail on
+the non-PDF ones, which is still current.
+
+**PDF, 10**, all classified above as order-dependent goldens or wall-clock truncations — down
+from 114 when this section was first written. The PDF line now reads
+`389  378 379/388 305/388 305/388 378/388 388/388 384/388` (n, ok, plain, md, html, json,
+metadata, tables).
 
 **HTML, 0.** The seven that used to fail (`hip_13044_b`, `international_emergency_medicine`,
 `sinthgunt`, `taylor_swift`, `wiki_duck`, both `test_wikipedia` copies) now match on every
