@@ -89,7 +89,12 @@ internal static partial class PdfTableReconstruct
         string trimmed = seg.Text.Trim();
         if (trimmed.Length == 0) return;
 
-        uint topImage = RoundClamp(pageHeight - (seg.Y + seg.Height), 0f);
+        // The segment's own upright frame, not raw page-space x/y: `advance` is the position
+        // along the run's reading axis, which the per-word interpolation below advances along
+        // via `fracStart * seg.Width`. For an unrotated segment this is the identity, so only
+        // rotated runs are affected — but for those, raw x/y is the wrong axis entirely.
+        var (advance, cross) = seg.UprightOrigin();
+        uint topImage = RoundClamp(pageHeight - (cross + seg.Height), 0f);
 
         // Fast path: single word (no interior whitespace).
         bool hasWs = false;
@@ -102,7 +107,7 @@ internal static partial class PdfTableReconstruct
                 // test is on the trimmed form, but the word keeps whatever padding the
                 // segment carried, and the cell join adds a space of its own on top.
                 Text = seg.Text,
-                Left = RoundClamp(seg.X, 0f),
+                Left = RoundClamp(advance, 0f),
                 Top = topImage,
                 Width = RoundClamp(seg.Width, 0f),
                 Height = RoundClamp(seg.Height, 0f),
@@ -131,7 +136,7 @@ internal static partial class PdfTableReconstruct
             outWords.Add(new HocrWord
             {
                 Text = word,
-                Left = RoundClamp(seg.X + fracStart * seg.Width, 0f),
+                Left = RoundClamp(advance + fracStart * seg.Width, 0f),
                 Top = topImage,
                 Width = RoundClamp(fracWidth * seg.Width, 1f),
                 Height = segHeight,
