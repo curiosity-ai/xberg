@@ -12,6 +12,9 @@ namespace Xberg.Internal.Toml;
 /// </summary>
 internal static class TomlParser
 {
+    /// <summary>The key a TOML datetime is serialized under when it becomes JSON.</summary>
+    private const string DatetimeKey = "$__toml_private_datetime";
+
     public static JsonObject Parse(string text)
     {
         var root = new JsonObject();
@@ -54,7 +57,46 @@ internal static class TomlParser
             }
         }
 
-        return root;
+        return SortKeys(root);
+    }
+
+    /// <summary>
+    /// Rebuild every table with its keys in sorted order.
+    /// </summary>
+    /// <remarks>
+    /// A TOML table is a sorted map, not an ordered one: two documents that differ only in the
+    /// order their keys were written parse to the same value, and the serialized form is sorted.
+    /// Preserving file order instead makes the extracted text depend on how the file was typed.
+    /// </remarks>
+    private static JsonObject SortKeys(JsonObject table)
+    {
+        var sorted = new JsonObject();
+        foreach (var key in table.Select(kv => kv.Key).OrderBy(k => k, StringComparer.Ordinal))
+        {
+            var value = table[key];
+            table[key] = null;   // detach before re-parenting; a node has one parent
+            sorted[key] = SortNode(value);
+        }
+        return sorted;
+    }
+
+    private static JsonNode? SortNode(JsonNode? node) => node switch
+    {
+        JsonObject obj => SortKeys(obj),
+        JsonArray arr => SortArray(arr),
+        _ => node,
+    };
+
+    private static JsonArray SortArray(JsonArray array)
+    {
+        var rebuilt = new JsonArray();
+        for (int idx = 0; idx < array.Count; idx++)
+        {
+            var item = array[idx];
+            array[idx] = null;
+            rebuilt.Add(SortNode(item));
+        }
+        return rebuilt;
     }
 
     // ── table navigation ──────────────────────────────────────────────────
@@ -266,12 +308,28 @@ internal static class TomlParser
         if (tok == "true") return JsonValue.Create(true);
         if (tok == "false") return JsonValue.Create(false);
 
-        // Datetime (offset/local date/time): keep as string (never a keyword field).
+        // A datetime is its own TOML type, not a string. Serialized to JSON it becomes a
+        // one-entry table under the reserved key the reference serializer uses, which is how a
+        // consumer can tell a timestamp from a string that looks like one.
         if (tok.Length >= 8 && char.IsDigit(tok[0]) && (LooksDate(tok) || LooksTime(tok)))
-            return JsonValue.Create(tok);
+            return new JsonObject { [DatetimeKey] = JsonValue.Create(tok) };
 
         string cleaned = tok.Replace("_", "");
         if (TryParseInteger(cleaned, out long l)) return JsonValue.Create(l);
+        // A float keeps the lexeme it was written with, so 80.0 stays a float rather than
+        // becoming the integer 80 — TOML distinguishes the two types, and so does the output.
+        // JSON has no leading `+`; dropping it changes nothing about the value.
+        string jsonForm = cleaned.StartsWith('+') ? cleaned[1..] : cleaned;
+        if (jsonForm.IndexOfAny(new[] { '.', 'e', 'E' }) >= 0
+            && double.TryParse(jsonForm, NumberStyles.Float, CultureInfo.InvariantCulture, out double magnitude)
+            && double.IsFinite(magnitude))
+        {
+            try
+            {
+                if (JsonNode.Parse(jsonForm) is JsonValue parsed) return parsed;
+            }
+            catch (System.Text.Json.JsonException) { }
+        }
         if (double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out double d))
             return JsonValue.Create(d);
         if (cleaned is "inf" or "+inf") return JsonValue.Create(double.PositiveInfinity);

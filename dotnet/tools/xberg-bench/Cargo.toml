@@ -1,0 +1,38 @@
+# Standalone workspace, mirroring xberg-reference-gen: a dev-only helper that lives under
+# dotnet/ without being registered in the root xberg workspace. Deliberately carries no
+# `[patch.crates-io]` — the benchmark must measure the released pdf_oxide the library
+# actually depends on, not a locally instrumented copy.
+[workspace]
+
+[package]
+name = "xberg-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "xberg-bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+xberg = { path = "../../../crates/xberg", default-features = false, features = [
+    "tokio-runtime",
+    "office",
+    "excel",
+    "pdf",
+    "html",
+    "xml",
+    "email",
+    "archives",
+    "hwp",
+    "hwpx",
+    "iwork",
+    "mdx",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+walkdir = "2"

@@ -64,12 +64,30 @@ public class DataXmlTests
     }
 
     [Fact]
-    public void EntityReferences_SplitText()
+    public void AnEntityReferenceIsPartOfTheTextAroundIt()
     {
-        // quick-xml emits general references as separate events; text is split around them.
+        // A reference is a spelling of a character, not a boundary: this is one country's name.
         var doc = Extract("<root>Trinidad &amp; Tobago</root>");
         var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
-        Assert.Equal(new[] { "Trinidad", "Tobago" }, paras);
+        Assert.Equal(new[] { "Trinidad & Tobago" }, paras);
+    }
+
+    [Fact]
+    public void CharacterReferencesResolveInBothDecimalAndHex()
+    {
+        var doc = Extract("<root>caf&#233; and caf&#xE9;</root>");
+        var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
+        Assert.Equal(new[] { "café and café" }, paras);
+    }
+
+    [Fact]
+    public void AnUnresolvableReferenceContributesNothing()
+    {
+        // A reference this parser cannot resolve names something the document did not carry
+        // inline, and its literal spelling is not that thing.
+        var doc = Extract("<root>before &unknownentity; after</root>");
+        var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
+        Assert.Equal(new[] { "before  after" }, paras);
     }
 
     [Fact]
@@ -87,5 +105,20 @@ public class DataXmlTests
     {
         var mimes = new XmlExtractor().SupportedMimeTypes.ToList();
         Assert.Equal(new[] { "application/xml", "text/xml", "image/svg+xml", "application/x-endnote+xml" }, mimes);
+    }
+
+    /// <summary>
+    /// The SVG text-element filter guards only text nodes. A CDATA section — which is how an SVG
+    /// carries its script and style bodies — is kept wherever it appears; on one flamegraph
+    /// fixture that is half the document.
+    /// </summary>
+    [Fact]
+    public void SvgKeepsCdataOutsideTextElements()
+    {
+        var doc = Extract("<svg><script type=\"text/ecmascript\"><![CDATA[var a = 1;]]></script>" +
+                          "<rect/><text>Visible</text></svg>", "image/svg+xml");
+        var paras = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).Select(e => e.Text).ToList();
+        Assert.Contains("var a = 1;", paras);
+        Assert.Contains("Visible", paras);
     }
 }

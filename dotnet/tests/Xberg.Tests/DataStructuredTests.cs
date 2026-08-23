@@ -84,14 +84,84 @@ public class DataStructuredTests
     [Fact]
     public void Toml_TablesAndDottedKeys()
     {
+        // A TOML table is a sorted map, not an ordered one: two documents differing only in the
+        // order their keys were typed parse to the same value, so the keys come out sorted.
         string src = "[package]\nname = \"xberg\"\nversion = \"1.0\"\ncount = 3\n";
         var doc = Extract(src, "application/toml");
         Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Code);
-        Assert.Equal("package\nname: xberg\n\nversion: 1.0\n\ncount: 3", PlainRender(doc));
+        Assert.Equal("package\ncount: 3\n\nname: xberg\n\nversion: 1.0", PlainRender(doc));
         Assert.Equal("toml", doc.Metadata.Additional["data_format"].GetString());
         Assert.True(doc.Metadata.Additional.ContainsKey("package.name"));
         Assert.True(doc.Metadata.Additional.ContainsKey("package.version"));
         Assert.False(doc.Metadata.Additional.ContainsKey("package.count"));
+    }
+
+    [Fact]
+    public void ATomlDatetimeIsNotAString()
+    {
+        // A datetime is its own TOML type. In the JSON rendering it is a one-entry table under
+        // the reserved key, which is how a consumer tells a timestamp from a string that looks
+        // like one; the flattened view is built from the parsed value, where it is just a
+        // datetime, so the wrapper is not part of its path.
+        var doc = Extract("[meta]\ncreated = 2025-02-05\n", "application/toml");
+        var flattened = doc.Metadata.Additional["flattened_fields"].EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Contains("meta.created: 2025-02-05", flattened);
+    }
+
+    [Fact]
+    public void ATomlFloatKeepsItsPointInTheContentButNotInTheFlattenedView()
+    {
+        var doc = Extract("[alerts]\ncpu = 80.0\ncount = 80\n", "application/toml");
+        // The rendered content distinguishes the two types.
+        string plain = PlainRender(doc);
+        Assert.Contains("cpu: 80.0", plain);
+        Assert.Contains("count: 80", plain);
+        // The flattened view is the parsed value's own spelling, where a float has no forced point.
+        var flattened = doc.Metadata.Additional["flattened_fields"].EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Contains("alerts.cpu: 80", flattened);
+    }
+
+    /// <summary>
+    /// YAML is deserialized into a serde JSON value first, so its floats print serde's way:
+    /// always with a fractional part. TOML is flattened from its own value type, whose float
+    /// prints through Rust's `Display for f64` and drops the trailing `.0`.
+    /// </summary>
+    [Fact]
+    public void AYamlFloatKeepsItsPointInTheFlattenedViewWhereATomlOneDoesNot()
+    {
+        var yaml = Extract("size:\n  height: 397.0\n  width: 397\n", "application/yaml");
+        var flattened = yaml.Metadata.Additional["flattened_fields"].EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Contains("size.height: 397.0", flattened);
+        Assert.Contains("size.width: 397", flattened);
+    }
+
+    /// <summary>
+    /// A double-quoted YAML scalar resolves its escapes. The numeric forms matter as much as the
+    /// named ones: leaving `’` alone puts the characters `u2019` into the text.
+    /// </summary>
+    [Fact]
+    public void AQuotedYamlScalarResolvesItsEscapes()
+    {
+        string plain = Plain("orig: \"Let\\u2019s swim!\\tnow\"\n", "application/yaml");
+        Assert.Contains("orig: Let’s swim!\tnow", plain);
+    }
+
+    /// <summary>
+    /// A double-quoted scalar may run past the end of its line: a plain break folds to one space,
+    /// and a break the writer escaped with a trailing backslash folds to nothing. Without the
+    /// fold the scalar never closes and the rest of the document parses as though inside it.
+    /// </summary>
+    [Fact]
+    public void AQuotedYamlScalarFoldsAcrossLines()
+    {
+        string plain = Plain(
+            "a: \"one\\\n  \\ two\"\nb: \"three\n  four\"\nc: tail\n", "application/yaml");
+        Assert.Contains("a: one two", plain);
+        Assert.Contains("b: three four", plain);
+        Assert.Contains("c: tail", plain);
     }
 
     [Theory]

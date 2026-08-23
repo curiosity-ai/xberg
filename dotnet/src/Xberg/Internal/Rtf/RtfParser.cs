@@ -603,8 +603,33 @@ internal static class RtfParser
         public List<bool> HiddenStack = new() { false };
         public FormattingTracker Fmt = new();
 
+        /// <summary>ANSI codepage for `\'hh` escapes. RTF defaults to 1252 unless `\ansicpgN` says
+        /// otherwise; scoped like the other document properties.</summary>
+        public List<uint> AnsiCodepageStack = new() { 1252u };
+
+        /// <summary>Active font id, set by `\fN`. Its `\fcharsetN` outranks `\ansicpg`.</summary>
+        public List<ushort?> FontIdStack = new() { null };
+
+        /// <summary>Document default font from `\deffN` — declared once, so not scoped.</summary>
+        public ushort? DefaultFontId;
+
+        /// <summary>Font id → Windows codepage, from the font table's `\fcharsetN`/`\cpgN`.</summary>
+        public Dictionary<ushort, uint> FontCharsets = new();
+
         public bool Hidden => HiddenStack.Count > 0 && HiddenStack[^1];
         public int Uc => UcStack.Count > 0 ? UcStack[^1] : 1;
+
+        /// <summary>
+        /// The codepage a `\'hh` run decodes with: the active font's charset (an explicit `\fN`
+        /// in scope, else the `\deffN` default), then `\ansicpg`, then RTF's default of 1252.
+        /// </summary>
+        public uint DecodeCodepage()
+        {
+            ushort? fontId = FontIdStack.Count > 0 ? FontIdStack[^1] : null;
+            fontId ??= DefaultFontId;
+            if (fontId is { } id && FontCharsets.TryGetValue(id, out uint fromFont)) return fromFont;
+            return AnsiCodepageStack.Count > 0 ? AnsiCodepageStack[^1] : 1252u;
+        }
     }
 
     private static void EnsureTable(TextState st)
@@ -628,6 +653,7 @@ internal static class RtfParser
     {
         var colorTable = ParseRtfColorTable(content);
         var st = new TextState { Plain = plain, Chars = new CharCursor(content) };
+        st.FontCharsets = RtfEncoding.ParseFontCharsetTable(content);
         var chars = st.Chars;
 
         // list-marker destination tracking
@@ -668,6 +694,8 @@ internal static class RtfParser
                 st.GroupHasText.Add(false);
                 st.UcStack.Add(st.Uc);
                 st.HiddenStack.Add(st.Hidden);
+                st.AnsiCodepageStack.Add(st.AnsiCodepageStack.Count > 0 ? st.AnsiCodepageStack[^1] : 1252u);
+                st.FontIdStack.Add(st.FontIdStack.Count > 0 ? st.FontIdStack[^1] : null);
                 st.Fmt.Push();
                 st.PendingBoundarySpace = false;
             }
@@ -679,6 +707,8 @@ internal static class RtfParser
                 st.Fmt.Pop(st.Result.Len);
                 if (st.UcStack.Count > 1) st.UcStack.RemoveAt(st.UcStack.Count - 1);
                 if (st.HiddenStack.Count > 1) st.HiddenStack.RemoveAt(st.HiddenStack.Count - 1);
+                if (st.AnsiCodepageStack.Count > 1) st.AnsiCodepageStack.RemoveAt(st.AnsiCodepageStack.Count - 1);
+                if (st.FontIdStack.Count > 1) st.FontIdStack.RemoveAt(st.FontIdStack.Count - 1);
                 if (skipDepth > 0 && groupDepth < skipDepth) skipDepth = 0;
 
                 if (inListtext && groupDepth < listtextDepth)
@@ -751,16 +781,27 @@ internal static class RtfParser
                     byte? decodedByte = (h1 >= 0 && h2 >= 0)
                         ? RtfEncoding.ParseHexByte((byte)(h1 & 0xFF), (byte)(h2 & 0xFF))
                         : null;
-                    if (inFootnote && decodedByte is byte fb)
-                        footnoteBuf.Append(RtfEncoding.DecodeWindows1252(fb));
+                    // A run of adjacent escapes is decoded as one byte string: a multi-byte
+                    // codepage such as 932 spells one character across two `\'hh` escapes, and
+                    // decoding them one at a time turns it into two replacement characters.
+                    List<byte>? runBytes = null;
+                    if (decodedByte is byte first)
+                    {
+                        runBytes = new List<byte> { first };
+                        while (RtfEncoding.ConsumeAdjacentHexEscape(chars) is byte more) runBytes.Add(more);
+                    }
+                    string? decodedRun = runBytes is null
+                        ? null
+                        : RtfEncoding.DecodeAnsiBytes(runBytes, st.DecodeCodepage());
+                    if (inFootnote && decodedRun is not null)
+                        footnoteBuf.Append(decodedRun);
                     if (skipDepth > 0) continue;
                     if (st.Hidden) continue;
-                    if (decodedByte is byte b2)
+                    if (decodedRun is not null)
                     {
-                        char decoded = RtfEncoding.DecodeWindows1252(b2);
                         if (st.Table is { InRow: true } ts)
                         {
-                            ts.CurrentCell.Append(decoded);
+                            ts.CurrentCell.Append(decodedRun);
                         }
                         else
                         {
@@ -768,7 +809,7 @@ internal static class RtfParser
                                 st.Result.PushChar(' ');
                             st.PendingBoundarySpace = false;
                             st.ParaMetaEmitted = false;
-                            st.Result.PushChar(decoded);
+                            foreach (char dc in decodedRun) st.Result.PushChar(dc);
                             MarkLast(st.GroupHasText);
                         }
                     }
@@ -847,6 +888,16 @@ internal static class RtfParser
                             continue;
                         }
                     }
+
+                    // Codepage selection is document state, tracked whether or not the group it
+                    // appears in contributes text — `\ansicpg` sits in the header, and `\deff`
+                    // often does too.
+                    if (controlWord == "ansicpg" && param is int cpv && cpv > 0 && st.AnsiCodepageStack.Count > 0)
+                        st.AnsiCodepageStack[^1] = (uint)cpv;
+                    if (controlWord == "f" && param is int fv && st.FontIdStack.Count > 0)
+                        st.FontIdStack[^1] = (ushort)Math.Max(0, fv);
+                    if (controlWord == "deff" && param is int dfv)
+                        st.DefaultFontId = (ushort)Math.Max(0, dfv);
 
                     if (skipDepth > 0)
                     {

@@ -25,11 +25,12 @@ public sealed class FictionBookExtractor : IExtractor
         string xml = Encoding.UTF8.GetString(content);
 
         var metadata = ExtractMetadata(xml);
-        var tables = ExtractTablesFromBody(xml);
+        // Tables are parsed in place during the body walk. A separate pass raw-pushing them
+        // recorded the data without a matching Table element, so no renderer emitted them and
+        // every table's text was missing from the extracted document.
         var doc = BuildInternalDocument(xml);
         doc.MimeType = mimeType;
         doc.Metadata = metadata;
-        foreach (var t in tables) doc.PushTable(t);
         return doc;
     }
 
@@ -182,28 +183,6 @@ public sealed class FictionBookExtractor : IExtractor
 
     // ── tables ──────────────────────────────────────────────────────────────
 
-    private static List<Table> ExtractTablesFromBody(string xml)
-    {
-        var reader = new Reader(xml);
-        var tables = new List<Table>();
-        uint tableIndex = 0;
-        while (true)
-        {
-            var ev = reader.Read();
-            if (ev.Kind == EvKind.Eof) break;
-            if (ev.Kind == EvKind.Start && ev.Name == "table")
-            {
-                var cells = ExtractTable(reader);
-                if (cells.Count > 0)
-                {
-                    tables.Add(new Table { Cells = cells, Markdown = "", PageNumber = tableIndex + 1 });
-                    tableIndex++;
-                }
-            }
-        }
-        return tables;
-    }
-
     private static List<List<string>> ExtractTable(Reader reader)
     {
         var table = new List<List<string>>();
@@ -289,18 +268,53 @@ public sealed class FictionBookExtractor : IExtractor
         return string.Join("\n", lines);
     }
 
-    private static (string, List<TextAnnotation>) ExtractParagraphWithAnnotations(Reader reader)
+    /// <summary>
+    /// Read one paragraph, pushing it — and any footnote reference inside it — onto the builder.
+    /// </summary>
+    /// <remarks>
+    /// A footnote reference is an element of its own, not a marker in the prose, so the paragraph
+    /// is closed before it and reopened after: what precedes the reference is a paragraph, the
+    /// reference is a reference, and what follows is another paragraph.
+    /// </remarks>
+    private static void ExtractParagraphWithAnnotations(Reader reader, InternalDocumentBuilder builder)
     {
         var text = new Utf8Buf();
         var anns = new List<TextAnnotation>();
         int depth = 0;
         var formatStack = new Stack<(string tag, uint start)>();
 
+        // A split flushes what has been read so far verbatim; only the paragraph's own end
+        // trims it. The text after a footnote reference opens with the space that separated it
+        // from the marker, and that space is part of the sentence.
+        void FlushParagraph(bool trim)
+        {
+            string t = text.ToString();
+            if (trim) t = t.Trim();
+            if (t.Length != 0) builder.PushParagraph(t, new List<TextAnnotation>(anns), null, null);
+            text = new Utf8Buf();
+            anns.Clear();
+        }
+
         while (true)
         {
             var ev = reader.Read();
             if (ev.Kind == EvKind.Start)
             {
+                // `<a l:href="#id">` inside a paragraph is a footnote reference; the id is the
+                // note it points at and the element's text is the marker the reader sees.
+                if (ev.Name == "a")
+                {
+                    string href = ev.Attributes
+                        .Where(a => a.Item1 is "l:href" or "xlink:href" or "href")
+                        .Select(a => a.Item2).FirstOrDefault() ?? "";
+                    if (href.StartsWith('#') && href.Length > 1)
+                    {
+                        FlushParagraph(trim: false);
+                        builder.PushFootnoteRef(ExtractInlineLabel(reader), href[1..], null);
+                        continue;
+                    }
+                }
+
                 depth++;
                 if (ev.Name is "emphasis" or "strong" or "strikethrough" or "code")
                     formatStack.Push((ev.Name, text.Len));
@@ -343,7 +357,29 @@ public sealed class FictionBookExtractor : IExtractor
             }
             else if (ev.Kind == EvKind.Eof) break;
         }
-        return (text.ToString().Trim(), anns);
+        FlushParagraph(trim: true);
+    }
+
+    /// <summary>The visible text of an inline element, read to its closing tag.</summary>
+    private static string ExtractInlineLabel(Reader reader)
+    {
+        var label = new StringBuilder();
+        int depth = 1;
+        while (true)
+        {
+            var ev = reader.Read();
+            if (ev.Kind == EvKind.Start) depth++;
+            else if (ev.Kind == EvKind.End) { depth--; if (depth == 0) break; }
+            else if (ev.Kind == EvKind.Text)
+            {
+                string trimmed = ev.Text.Trim();
+                if (trimmed.Length == 0) continue;
+                if (label.Length != 0) label.Append(' ');
+                label.Append(trimmed);
+            }
+            else if (ev.Kind == EvKind.Eof) break;
+        }
+        return label.ToString();
     }
 
     private static bool EndsWithSpace(Utf8Buf buf)
@@ -388,7 +424,14 @@ public sealed class FictionBookExtractor : IExtractor
             if (ev.Kind == EvKind.Start)
             {
                 string tag = ev.Name;
-                if (tag == "body")
+                if (tag == "table")
+                {
+                    // A table is nested directly inside the body, so parsing it here keeps it
+                    // where the document put it.
+                    var cells = ExtractTable(reader);
+                    if (cells.Count > 0) builder.PushTableFromCells(cells, null, null);
+                }
+                else if (tag == "body")
                 {
                     bool isNotes = ev.Attributes.Any(a => a.Item1 == "name" && a.Item2 == "notes");
                     if (isNotes) isNotesBody = true; else inBody = true;
@@ -405,13 +448,11 @@ public sealed class FictionBookExtractor : IExtractor
                 }
                 else if (tag == "p" && inBody && !isNotesBody)
                 {
-                    var (text, annotations) = ExtractParagraphWithAnnotations(reader);
-                    if (text.Length != 0) builder.PushParagraph(text, annotations, null, null);
+                    ExtractParagraphWithAnnotations(reader, builder);
                 }
                 else if (tag == "v" && inBody && !isNotesBody)
                 {
-                    var (text, annotations) = ExtractParagraphWithAnnotations(reader);
-                    if (text.Length != 0) builder.PushParagraph(text, annotations, null, null);
+                    ExtractParagraphWithAnnotations(reader, builder);
                 }
                 else if (tag == "subtitle" && inBody && !isNotesBody)
                 {
@@ -444,11 +485,20 @@ public sealed class FictionBookExtractor : IExtractor
                 }
                 else if (tag == "section" && isNotesBody)
                 {
+                    // The note's own id is what its `<a href="#id">` reference in the body names,
+                    // so it is the key that pairs the two. A synthetic one is used only where the
+                    // document omits the id, rather than dropping unreferenceable content.
+                    string noteId = ev.Attributes.Where(a => a.Item1 == "id").Select(a => a.Item2).FirstOrDefault() ?? "";
                     string text = ExtractFootnoteText(reader);
                     if (text.Length != 0)
                     {
-                        footnoteCounter++;
-                        builder.PushFootnoteDefinition(text, $"fn-{footnoteCounter}", null);
+                        string key = noteId;
+                        if (key.Length == 0)
+                        {
+                            footnoteCounter++;
+                            key = $"fn-{footnoteCounter}";
+                        }
+                        builder.PushFootnoteDefinition(text, key, null);
                     }
                 }
             }
@@ -562,9 +612,18 @@ public sealed class FictionBookExtractor : IExtractor
             }
         }
 
+        /// <summary>
+        /// Emit one text run for a stretch of character data, resolving entity references into
+        /// it.
+        /// </summary>
+        /// <remarks>
+        /// A reference is a spelling of a character, not a boundary in the text: splitting at
+        /// one turns "2 &amp;gt; 1" into three runs, and the whitespace rules that join runs then
+        /// see edges that were never there.
+        /// </remarks>
         private void TokenizeText(int from, int to)
         {
-            int seg = from;
+            var run = new StringBuilder(to - from);
             int j = from;
             while (j < to)
             {
@@ -573,17 +632,15 @@ public sealed class FictionBookExtractor : IExtractor
                     int semi = FindEntityEnd(j, to);
                     if (semi > 0)
                     {
-                        if (j > seg) _pending.Enqueue(new Ev(EvKind.Text, "", _s.Substring(seg, j - seg), Empty));
-                        string refName = _s.Substring(j + 1, semi - (j + 1));
-                        _pending.Enqueue(new Ev(EvKind.GeneralRef, refName, "", Empty));
+                        run.Append(ResolveGeneralRef(_s.Substring(j + 1, semi - (j + 1))));
                         j = semi + 1;
-                        seg = j;
                         continue;
                     }
                 }
+                run.Append(_s[j]);
                 j++;
             }
-            if (to > seg) _pending.Enqueue(new Ev(EvKind.Text, "", _s.Substring(seg, to - seg), Empty));
+            if (run.Length > 0) _pending.Enqueue(new Ev(EvKind.Text, "", run.ToString(), Empty));
         }
 
         private int FindEntityEnd(int a, int limit)

@@ -20,12 +20,13 @@ public sealed class OrgExtractor : IExtractor
     {
         string text = Encoding.UTF8.GetString(content);
         var metadata = ExtractMetadata(text);
-        var tables = ExtractTables(text);
 
+        // Tables are parsed in place while the document is built, which produces table elements
+        // positioned where the table sits. A second raw pass pushed each of them again, so every
+        // org table was reported twice and neither copy was the one the renderers referenced.
         var doc = BuildInternalDocument(text);
         doc.MimeType = mimeType;
         doc.Metadata = metadata;
-        foreach (var t in tables) doc.PushTable(t);
         return doc;
     }
 
@@ -268,16 +269,24 @@ public sealed class OrgExtractor : IExtractor
             if (trimmed.StartsWith('|') && trimmed.EndsWith('|'))
             {
                 var tableCells = new List<List<string>>();
+                // An org table only has a header if the source drew a rule under its first row.
+                // A rule before any row is decoration, not a header separator.
+                bool hasHeaderSeparator = false;
                 while (i < lines.Count)
                 {
                     string t = lines[i].Trim();
                     if (!t.StartsWith('|') || !t.EndsWith('|')) break;
-                    if (t.Contains("---") || t.Contains("+-")) { i++; continue; }
+                    if (IsOrgTableHorizontalLine(t))
+                    {
+                        hasHeaderSeparator |= tableCells.Count > 0;
+                        i++;
+                        continue;
+                    }
                     var cells = t.Split('|').Select(c => c.Trim()).Where(c => c.Length != 0).ToList();
                     if (cells.Count > 0) tableCells.Add(cells);
                     i++;
                 }
-                if (tableCells.Count > 0) b.PushTableFromCells(tableCells, null, null);
+                if (tableCells.Count > 0) PushOrgTable(b, tableCells, hasHeaderSeparator);
                 continue;
             }
 
@@ -444,6 +453,48 @@ public sealed class OrgExtractor : IExtractor
         if (IsOrgListItem(trimmed)) return true;
         if (trimmed.StartsWith("[fn:")) return true;
         return false;
+    }
+
+    /// <summary>A rule line: pipes, dashes and column separators, and nothing else.</summary>
+    private static bool IsOrgTableHorizontalLine(string line)
+    {
+        string t = line.Trim();
+        if (!t.StartsWith('|') || !t.EndsWith('|') || t.Length < 2) return false;
+        string inner = t[1..^1];
+        foreach (string segment in inner.Split('+'))
+        {
+            if (segment.Length == 0) return false;
+            foreach (char c in segment) if (c != '-') return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Push an org table, recording whether the source declared a header row.
+    /// </summary>
+    /// <remarks>
+    /// A table whose first row is data has no header, and rendering it as one would relabel that
+    /// record as the column names. The renderer reads that from whether Columns is set.
+    /// </remarks>
+    private static void PushOrgTable(InternalDocumentBuilder b, List<List<string>> cells, bool hasHeader)
+    {
+        // The table's own markdown gets an empty header row when the source declared none, since
+        // a pipe table always has one and the alternative is promoting a data row into it.
+        var markdownCells = cells.Select(r => new List<string>(r)).ToList();
+        if (!hasHeader)
+        {
+            int columnCount = cells.Count == 0 ? 0 : cells.Max(r => r.Count);
+            markdownCells.Insert(0, Enumerable.Repeat("", columnCount).ToList());
+        }
+
+        b.PushTable(new Table
+        {
+            Cells = cells.Select(r => new List<string>(r)).ToList(),
+            Markdown = InternalDocumentBuilder.CellsToMarkdown(markdownCells),
+            PageNumber = 0,
+            BoundingBox = null,
+            Columns = hasHeader ? new List<string>(cells[0]) : null,
+        }, null, null);
     }
 
     private static bool IsOrgListItem(string line)

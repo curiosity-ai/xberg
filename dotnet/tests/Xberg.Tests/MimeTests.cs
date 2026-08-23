@@ -178,4 +178,72 @@ public class MimeTests
     {
         Assert.Equal("text/markdown", Mime.ResolveWithContent("text/markdown", ReadOnlySpan<byte>.Empty));
     }
+
+    /// <summary>
+    /// A page whose first line is a comment — a `Last-Modified` note above the DOCTYPE, as three
+    /// of the regression fixtures have — is still HTML. Without skipping it the DOCTYPE is never
+    /// seen and the file reaches the XML extractor, which renders it as an indented tag outline.
+    /// </summary>
+    [Theory]
+    [InlineData("<!-- Last-Modified: Mon, 22 Sep 2008 -->\n<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\">\n<html><body><p>hi</p></body></html>")]
+    [InlineData("<!-- one --><!-- two -->\n<HTML>\n<HEAD><TITLE>t</TITLE></HEAD><BODY>x</BODY>")]
+    public void CommentPrefixedMarkupIsStillHtml(string markup)
+    {
+        Assert.Equal("text/html", Mime.DetectMimeTypeFromBytes(Encoding.UTF8.GetBytes(markup)));
+    }
+
+    /// <summary>
+    /// The WHATWG table upstream reaches through <c>infer</c> answers on the opening alone:
+    /// <c>&lt;!--</c> followed by a space is HTML whether or not the comment is ever closed. The
+    /// corpus depends on it — <c>ground_truth/pdf/160428551.txt</c> opens with an unterminated
+    /// <c>&lt;!-- … --</c> and upstream extracts it as HTML, not as a tag outline.
+    /// </summary>
+    [Fact]
+    public void AnUnterminatedCommentStillOpensHtml()
+    {
+        Assert.Equal("text/html", Mime.DetectMimeTypeFromBytes(
+            Encoding.UTF8.GetBytes("<!-- never closed\n<book><title>t</title></book>")));
+    }
+
+    /// <summary>
+    /// The same table is strict about the delimiter: only a space or <c>&gt;</c> ends the
+    /// opening, so markup that merely begins with those four characters is not HTML.
+    /// </summary>
+    [Fact]
+    public void AnOpeningWithoutItsDelimiterIsNotHtml()
+    {
+        Assert.Equal("application/xml", Mime.DetectMimeTypeFromBytes(
+            Encoding.UTF8.GetBytes("<!--never closed\n<book><title>t</title></book>")));
+    }
+
+    /// <summary>
+    /// A corrupted download can staple an ISP error page in front of a real document —
+    /// `test_documents/pdf/medium.pdf` opens with 364 bytes of DNS-hijack HTML and then
+    /// `%PDF-1.4`. The opening bytes read as markup, but the file as a whole does not decode as
+    /// text, and treating it as HTML hands the PDF's raw bytes to the wrong extractor.
+    /// </summary>
+    [Fact]
+    public void AnErrorPageStapledToABinaryDocumentDoesNotMakeItHtml()
+    {
+        byte[] preamble = System.Text.Encoding.ASCII.GetBytes(
+            "<html><head><meta http-equiv=\"refresh\" content=\"0;url=http://example.invalid/\"/>" +
+            "</head><body></body></html>");
+        byte[] pdf = System.Text.Encoding.ASCII.GetBytes("%PDF-1.4\r%\u00e2\u00e3\u00cf\u00d3\r\n114 0 obj\n");
+        // A byte that cannot start a UTF-8 sequence, as a real PDF's binary comment carries.
+        var bytes = new List<byte>(preamble);
+        bytes.AddRange(pdf);
+        bytes.AddRange(new byte[] { 0xE2, 0xE3, 0xCF, 0xD3 });
+
+        Assert.Equal("application/pdf", Mime.ResolveWithContent("application/pdf", bytes.ToArray()));
+    }
+
+    /// <summary>A page that really is HTML is still HTML, whatever it goes on to contain.</summary>
+    [Fact]
+    public void AnHtmlDocumentStillOverridesAMisleadingExtension()
+    {
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(
+            "<html><head><title>t</title></head><body><p>hello</p></body></html>");
+
+        Assert.Equal("text/html", Mime.ResolveWithContent("text/plain", bytes));
+    }
 }

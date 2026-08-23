@@ -42,7 +42,14 @@ public static class PdfPageText
 
     /// <summary>Assemble + line segments from ONE ordering pass (the ordering —
     /// presort, run merge, XY-cut, column repair — dominates cost on large documents).</summary>
-    public static (string text, List<LineSeg> lines) AssembleWithLines(List<TextSpan> spans, double pageWidth = 0)
+    /// <remarks>
+    /// This is the path for spans from the older content interpreter only. Spans from the
+    /// ported pdf_oxide extractor go to <c>OxPageAssembler</c> instead, which is the faithful
+    /// port of the same upstream assembler and does not re-derive an ordering the producer
+    /// already established.
+    /// </remarks>
+    public static (string text, List<LineSeg> lines) AssembleWithLines(
+        List<TextSpan> spans, double pageWidth = 0)
     {
         var ordering = OrderViaRuns(spans, pageWidth);
         return (AssembleOrdered(ordering), BuildLineSegmentsOrdered(ordering));
@@ -117,7 +124,8 @@ public static class PdfPageText
     // extractors/text.rs), order the runs with XY-cut, then flatten back to the original
     // spans in run order. Runs are used ONLY for reading-order geometry; assembly still
     // walks the original spans so spacing/line-break decisions are unchanged.
-    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(List<TextSpan> spans, double pageWidth = 0)
+    private static (List<TextSpan> ordered, List<TextSpan> orderedRuns) OrderViaRuns(
+        List<TextSpan> spans, double pageWidth = 0)
     {
         // pdf_oxide sorts spans into reading order (rounded-Y descending, X
         // ascending, column-aware) BEFORE merge_adjacent_spans (extractors/
@@ -131,6 +139,10 @@ public static class PdfPageText
         // TextExtractor::deduplicate_overlapping_spans, which runs right
         // AFTER sort_spans_by_reading_order and BEFORE merge_adjacent_spans.
         spans = DeduplicateOverlappingSpans(spans);
+
+        // Off-baseline glyphs go back onto the words they modify before anything groups spans
+        // into lines; a raised digit left on its own drifts to wherever its baseline band sorts.
+        PdfSubSuperscript.Merge(spans);
 
         var runs = new List<TextSpan>();
         var members = new List<List<int>>();
@@ -221,6 +233,48 @@ public static class PdfPageText
         public bool IsBold, IsItalic, IsMonospace;
     }
 
+    /// <summary>
+    /// The ported assembler's lines in the shape the structure/heading pipeline consumes.
+    /// Text comes from the assembly verbatim, so a segment always reads exactly as the
+    /// corresponding stretch of page text does; only the geometry is re-derived here.
+    /// </summary>
+    internal static List<LineSeg> LineSegsFromOx(
+        List<Xberg.Internal.PdfOxide.Text.OxPageAssembler.AssembledLine> lines)
+    {
+        var segs = new List<LineSeg>(lines.Count);
+        foreach (var line in lines)
+        {
+            double minX = double.MaxValue, maxRight = double.MinValue, maxHeight = 0, maxFont = 0;
+            int boldCount = 0, italicCount = 0, count = 0;
+            bool allMono = true;
+            foreach (var s in line.Spans)
+            {
+                minX = Math.Min(minX, s.Bbox.X);
+                maxRight = Math.Max(maxRight, s.Bbox.X + s.Bbox.Width);
+                maxHeight = Math.Max(maxHeight, s.Bbox.Height);
+                maxFont = Math.Max(maxFont, s.FontSize);
+                // pdf_oxide grades weight on the CSS scale; semibold and up reads as bold.
+                if ((int)s.FontWeight >= 600) boldCount++;
+                if (s.IsItalic) italicCount++;
+                allMono &= s.IsMonospace;
+                count++;
+            }
+            segs.Add(new LineSeg
+            {
+                Text = line.Text,
+                X = minX == double.MaxValue ? 0 : minX,
+                Y = line.Spans.Count > 0 ? line.Spans[0].Bbox.Y : 0,
+                Width = (maxRight == double.MinValue ? 0 : maxRight) - (minX == double.MaxValue ? 0 : minX),
+                Height = maxHeight,
+                FontSize = maxFont,
+                IsBold = boldCount * 2 > count,
+                IsItalic = italicCount * 2 > count,
+                IsMonospace = count > 0 && allMono,
+            });
+        }
+        return segs;
+    }
+
     /// <summary>Assemble a page's spans into visual lines with the SAME reading-order and
     /// intra-line spacing rules as <see cref="Assemble"/> (including the glyph-fragmentation
     /// rebuild). Feeds the structure/heading pipeline so its text matches the plain path.</summary>
@@ -277,19 +331,26 @@ public static class PdfPageText
         double minX = double.MaxValue, maxRight = double.MinValue, maxHeight = 0, maxFont = 0;
         int boldCount = 0, italicCount = 0, count = 0; bool allMono = true;
         double prevEndX = double.NegativeInfinity;
+        double prevFontSize = 0;
         double fontSize = group.Count == 0 ? 0 : group.Max(s => s.FontSize);
         foreach (var s in group)
         {
             if (!double.IsNegativeInfinity(prevEndX))
             {
                 double gap = s.X - prevEndX;
-                double threshold = byXThreshold ? fontSize * 0.5 : s.FontSize * 0.15;
+                // The gap is judged against the larger of the two spans, not the current one
+                // alone: where a small run follows a large one — a hyphen after body text, a
+                // word split across a font change — the smaller size lowers the bar enough that
+                // ordinary kerning reads as a word break, and `10-week` comes out `10 -week`.
+                double pairFontSize = Math.Max(1.0, Math.Max(prevFontSize, s.FontSize));
+                double threshold = byXThreshold ? fontSize * 0.5 : pairFontSize * 0.15;
                 if (gap > threshold && !SuppressGapSpace(sb, s.Text, gap, s.FontSize))
                     sb.Append(' ');
             }
             // Dedupe literal space across span boundary (pdf_oxide merge guard).
             sb.Append(s.Text);
             prevEndX = s.X + s.Width;
+            prevFontSize = s.FontSize;
             minX = Math.Min(minX, s.X);
             maxRight = Math.Max(maxRight, s.X + s.Width);
             maxHeight = Math.Max(maxHeight, s.Height);
@@ -318,6 +379,8 @@ public static class PdfPageText
     {
         Text = s.Text, X = s.X, Y = s.Y, Width = s.Width, Height = s.Height,
         FontSize = s.FontSize, IsBold = s.IsBold, IsItalic = s.IsItalic, IsMonospace = s.IsMonospace,
+        FontName = s.FontName, RotationDegrees = s.RotationDegrees, TextRiseRatio = s.TextRiseRatio,
+        Sequence = s.Sequence,
     };
 
     // Port of is_fragmented_span_list (oxide/text.rs).

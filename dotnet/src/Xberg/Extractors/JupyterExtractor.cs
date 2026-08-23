@@ -54,17 +54,31 @@ public sealed class JupyterExtractor : IExtractor
                 var cell = cells[idx] as JsonObject;
                 string cellType = (cell?["cell_type"] as JsonValue)?.ToString() ?? "unknown";
                 var entry = new JsonObject { ["index"] = idx, ["cell_type"] = cellType };
-                if (cellType == "code" && cell is not null && cell.TryGetPropertyValue("execution_count", out var ec))
-                    entry["execution_count"] = ec?.DeepClone();
+                // Whatever the cell carries of these, whatever its type — a markdown cell has an
+                // id too, and reporting it only for code cells lost it for most of a notebook.
+                foreach (var key in new[] { "id", "execution_count" })
+                    if (cell is not null && cell.TryGetPropertyValue(key, out var value))
+                        entry[key] = value?.DeepClone();
                 var tags = (cell?["metadata"] as JsonObject)?["tags"] as JsonArray;
                 if (tags is not null && tags.Count > 0)
                     entry["tags"] = tags.DeepClone();
+                if (cell?["outputs"] as JsonArray is { Count: > 0 } cellOutputs)
+                {
+                    var outputsMeta = new JsonArray();
+                    for (int oi = 0; oi < cellOutputs.Count; oi++)
+                        outputsMeta.Add(OutputMetadata(cellOutputs[oi] as JsonObject, oi));
+                    entry["outputs"] = outputsMeta;
+                }
                 cellsMeta.Add(entry);
             }
             additional["cells"] = cellsMeta;
         }
 
-        var doc = BuildInternalDocument(notebook);
+        // Plain and structured output take an output's text/plain repr and nothing else. The
+        // richer representations are markup, and rendering them into a plain document would put
+        // HTML tags in it.
+        bool plain = config.OutputFormat.Which is OutputFormat.Kind.Plain or OutputFormat.Kind.Structured;
+        var doc = BuildInternalDocument(notebook, plain);
         doc.MimeType = mimeType;
         doc.Metadata = new Metadata { Language = languageName };
         foreach (var (k, v) in additional)
@@ -72,7 +86,7 @@ public sealed class JupyterExtractor : IExtractor
         return doc;
     }
 
-    private static InternalDocument BuildInternalDocument(JsonObject notebook)
+    private static InternalDocument BuildInternalDocument(JsonObject notebook, bool plain)
     {
         var builder = new InternalDocumentBuilder("jupyter");
         var cells = notebook["cells"] as JsonArray;
@@ -82,8 +96,6 @@ public sealed class JupyterExtractor : IExtractor
             (((notebook["metadata"] as JsonObject)?["kernelspec"] as JsonObject)?["language"] as JsonValue)?.ToString()
             ?? (((notebook["metadata"] as JsonObject)?["language_info"] as JsonObject)?["name"] as JsonValue)?.ToString();
 
-        if (kernelLang is not null) builder.PushParagraph($"[kernel_language: {kernelLang}]", new(), null, null);
-
         foreach (var cellNode in cells)
         {
             var cell = cellNode as JsonObject;
@@ -92,88 +104,60 @@ public sealed class JupyterExtractor : IExtractor
             string sourceText = ExtractSource(cell["source"]);
             string trimmed = sourceText.Trim();
 
-            if (cell["id"] is JsonValue idv && idv.TryGetValue(out string? cellId) && cellId is not null)
-                builder.PushParagraph($"[cell_id: {cellId}]", new(), null, null);
-
+            // A cell's id, tags and execution count are metadata: they are recorded on the
+            // element and in the document's metadata, and are not content. Emitting them as
+            // paragraphs put `[cell_id: 0ad1fbe7-…]` into the extracted text of every notebook.
             var tags = (cell["metadata"] as JsonObject)?["tags"] as JsonArray;
-            if (tags is not null && tags.Count > 0)
-            {
-                var tagStrs = tags.Select(t => (t as JsonValue)?.ToString()).Where(s => s is not null).Select(s => s!).ToList();
-                if (tagStrs.Count > 0) builder.PushParagraph($"[tags: {string.Join(",", tagStrs)}]", new(), null, null);
-            }
 
-            if (trimmed.Length == 0) continue;
+            // A cell is only empty if it has nothing else to contribute either: a code cell's
+            // source may have been stripped while its saved outputs still carry real content.
+            var cellOutputs = cell["outputs"] as JsonArray;
+            bool hasOutputs = cellType == "code" && cellOutputs is { Count: > 0 };
+            bool hasAttachments = cell["attachments"] is JsonObject att && att.Count > 0;
+            if (trimmed.Length == 0 && !hasOutputs && !hasAttachments) continue;
 
             switch (cellType)
             {
                 case "markdown":
                 {
-                    var paraBuf = new StringBuilder();
-                    foreach (var line in MarkupHelpers.Lines(trimmed))
-                    {
-                        var heading = ParseHeadingLine(line);
-                        if (heading is not null)
-                        {
-                            string flushed = paraBuf.ToString().Trim();
-                            if (flushed.Length != 0)
-                            {
-                                var (stripped, anns) = ScanMarkdownInline(flushed);
-                                builder.PushParagraph(stripped, anns, null, null);
-                            }
-                            paraBuf.Clear();
-                            if (heading.Value.text.Length != 0) builder.PushHeading(heading.Value.level, heading.Value.text, null, null);
-                        }
-                        else
-                        {
-                            if (paraBuf.Length != 0) paraBuf.Append('\n');
-                            paraBuf.Append(line);
-                        }
-                    }
-                    string flushed2 = paraBuf.ToString().Trim();
-                    if (flushed2.Length != 0)
-                    {
-                        var (stripped, anns) = ScanMarkdownInline(flushed2);
-                        builder.PushParagraph(stripped, anns, null, null);
-                    }
+                    // Parsed by the markdown parser proper, not an ad-hoc line scan: a cell is
+                    // markdown, so it gets the same treatment a .md file would — smart
+                    // punctuation, emphasis, lists and all.
+                    var cellEvents = Internal.Commonmark.MarkdownParser.Parse(trimmed);
+                    builder.AppendDocument(MarkdownExtractor.BuildInternalDocument(cellEvents, null, "jupyter"));
                     break;
                 }
                 case "code":
                 {
-                    uint idx = builder.PushCode(trimmed, kernelLang, null, null);
-                    var attrs = new Dictionary<string, string>();
-                    if (cell.TryGetPropertyValue("execution_count", out var ec))
+                    // A code cell with no source contributes only its outputs. An empty code
+                    // element for it leaves a blank block between the cell before it and that
+                    // output. The outputs still belong to the document, so this guards the code
+                    // element alone rather than the whole cell.
+                    if (trimmed.Length != 0)
                     {
-                        if (ec is JsonValue ecv && ecv.GetValueKind() == JsonValueKind.Number) attrs["execution_count"] = ecv.ToJsonString();
-                        else if (ec is null || ec.GetValueKind() == JsonValueKind.Null) attrs["execution_count"] = "null";
+                        uint idx = builder.PushCode(trimmed, kernelLang, null, null);
+                        var attrs = new Dictionary<string, string>();
+                        if (cell.TryGetPropertyValue("execution_count", out var ec))
+                        {
+                            if (ec is JsonValue ecv && ecv.GetValueKind() == JsonValueKind.Number) attrs["execution_count"] = ecv.ToJsonString();
+                            else if (ec is null || ec.GetValueKind() == JsonValueKind.Null) attrs["execution_count"] = "null";
+                        }
+                        if (tags is not null && tags.Count > 0)
+                        {
+                            var tagStrs = tags.Select(t => (t as JsonValue)?.ToString()).Where(s => s is not null).Select(s => s!).ToList();
+                            attrs["tags"] = string.Join(",", tagStrs);
+                        }
+                        if (attrs.Count > 0) builder.SetAttributes(idx, attrs);
                     }
-                    if (tags is not null && tags.Count > 0)
-                    {
-                        var tagStrs = tags.Select(t => (t as JsonValue)?.ToString()).Where(s => s is not null).Select(s => s!).ToList();
-                        attrs["tags"] = string.Join(",", tagStrs);
-                    }
-                    if (attrs.Count > 0) builder.SetAttributes(idx, attrs);
 
-                    if (cell.TryGetPropertyValue("execution_count", out var ec2))
-                    {
-                        if (ec2 is JsonValue ecv2 && ecv2.GetValueKind() == JsonValueKind.Number)
-                            builder.PushParagraph($"execution_count: {ecv2.ToJsonString()}", new(), null, null);
-                        else if (ec2 is null || ec2.GetValueKind() == JsonValueKind.Null)
-                            builder.PushParagraph("execution_count: null", new(), null, null);
-                    }
-
+                    // Each output contributes the richest representation it carries.
                     var outputs = cell["outputs"] as JsonArray;
                     if (outputs is not null)
                     {
                         foreach (var outNode in outputs)
                         {
-                            var output = outNode as JsonObject;
-                            if (output is null) continue;
-                            string outputType = (output["output_type"] as JsonValue)?.ToString() ?? "unknown";
-                            builder.PushParagraph($"[output_type: {outputType}]", new(), null, null);
-                            if (output["data"] as JsonObject is JsonObject data)
-                                foreach (var kv in data) builder.PushParagraph($"[mime: {kv.Key}]", new(), null, null);
-                            string outputText = CollectOutputText(output).Trim();
-                            if (outputText.Length != 0) builder.PushParagraph(outputText, new(), null, null);
+                            if (outNode is not JsonObject output) continue;
+                            PushOutputElement(builder, output, plain);
                         }
                     }
                     break;
@@ -185,6 +169,27 @@ public sealed class JupyterExtractor : IExtractor
         }
 
         return builder.Build();
+    }
+
+    /// <summary>What an output records about itself, as distinct from the text it carries.</summary>
+    private static JsonObject OutputMetadata(JsonObject? output, int index)
+    {
+        var entry = new JsonObject { ["index"] = index };
+        if (output is null) return entry;
+
+        if (output.TryGetPropertyValue("output_type", out var outputType))
+            entry["output_type"] = outputType?.DeepClone();
+        foreach (var key in new[] { "name", "execution_count", "ename", "evalue" })
+            if (output.TryGetPropertyValue(key, out var value))
+                entry[key] = value?.DeepClone();
+        if (output["data"] as JsonObject is JsonObject data)
+        {
+            var mimeTypes = new JsonArray();
+            foreach (var mime in data.Select(kv => kv.Key).OrderBy(k => k, StringComparer.Ordinal))
+                mimeTypes.Add(mime);
+            entry["mime_types"] = mimeTypes;
+        }
+        return entry;
     }
 
     private static string ExtractSource(JsonNode? source)
@@ -199,6 +204,64 @@ public sealed class JupyterExtractor : IExtractor
         return "";
     }
 
+    /// <summary>
+    /// Emit one output as whichever of its representations says the most.
+    /// </summary>
+    /// <remarks>
+    /// An output ships the same result under several MIME types, and the text/plain one is often
+    /// a placeholder for an object — "&lt;IPython.core.display.HTML object&gt;" — where the
+    /// text/html one is the output as its author meant it to be seen.
+    /// <para>
+    /// text/latex is deliberately not preferred. Upstream's current source takes it as a formula,
+    /// but the reference outputs this port is validated against predate that and keep the
+    /// text/plain repr — <c>z₀</c> rather than <c>$$z_{0}$$</c> — for every output carrying both.
+    /// </para>
+    /// </remarks>
+    private static void PushOutputElement(InternalDocumentBuilder builder, JsonObject output, bool plain)
+    {
+        string outputType = (output["output_type"] as JsonValue)?.ToString() ?? "";
+        switch (outputType)
+        {
+            case "stream":
+            {
+                string text = output.TryGetPropertyValue("text", out var t) ? ExtractSource(t).Trim() : "";
+                if (text.Length != 0) builder.PushParagraph(text, new(), null, null);
+                break;
+            }
+            case "execute_result":
+            case "display_data":
+            case "update_display_data":
+            {
+                if (output["data"] is not JsonObject data) break;
+                if (!plain)
+                {
+                    if (data.TryGetPropertyValue("text/html", out var html))
+                    {
+                        string text = ExtractSource(html).Trim();
+                        if (text.Length != 0) { builder.PushRawBlock("html", text, null); break; }
+                    }
+                    if (data.TryGetPropertyValue("text/markdown", out var md))
+                    {
+                        string text = ExtractSource(md).Trim();
+                        if (text.Length != 0) { builder.PushParagraph(text, new(), null, null); break; }
+                    }
+                }
+                if (data.TryGetPropertyValue("text/plain", out var p))
+                {
+                    string text = ExtractSource(p).Trim();
+                    if (text.Length != 0) builder.PushParagraph(text, new(), null, null);
+                }
+                break;
+            }
+            case "error":
+            {
+                string text = CollectOutputText(output).Trim();
+                if (text.Length != 0) builder.PushParagraph(text, new(), null, null);
+                break;
+            }
+        }
+    }
+
     private static string CollectOutputText(JsonObject output)
     {
         string outputType = (output["output_type"] as JsonValue)?.ToString() ?? "";
@@ -208,13 +271,25 @@ public sealed class JupyterExtractor : IExtractor
                 return output.TryGetPropertyValue("text", out var t) ? ExtractSource(t) : "";
             case "execute_result":
             case "display_data":
+            case "update_display_data":
                 if (output["data"] as JsonObject is JsonObject data && data.TryGetPropertyValue("text/plain", out var p))
                     return ExtractSource(p);
                 return "";
             case "error":
+            {
+                // The traceback is the useful part of an error and belongs with it.
                 string ename = (output["ename"] as JsonValue)?.ToString() ?? "Unknown";
                 string evalue = (output["evalue"] as JsonValue)?.ToString() ?? "";
-                return $"Error ({ename}): {evalue}";
+                var text = new StringBuilder($"Error ({ename}): {evalue}");
+                if (output["traceback"] is JsonArray traceback)
+                {
+                    text.Append("\nTraceback:");
+                    foreach (var line in traceback)
+                        if (line is JsonValue lv && lv.TryGetValue(out string? ls) && ls is not null)
+                            text.Append('\n').Append(ls);
+                }
+                return text.ToString();
+            }
             default:
                 return "";
         }

@@ -48,6 +48,14 @@ public sealed class DocxDrawing
 {
     public string? ImageRid;
     public string? Description;
+
+    /// <summary>
+    /// Visible text of a <c>w:txbxContent</c> subtree reached through this drawing — the
+    /// DrawingML <c>wps:txbx</c> path or the VML <c>v:textbox</c> path. Paragraphs are joined
+    /// with newlines and surfaced as a single paragraph, so a text box never contributes
+    /// headings or list structure of its own.
+    /// </summary>
+    public string? TextBoxContent;
 }
 
 public enum DocElementKind { Paragraph, Table, Drawing, PageBreak }
@@ -74,6 +82,8 @@ public sealed class DocxDocument
     public List<List<DocxParagraph>> Footers = new();
     public List<DocxNote> Footnotes = new();
     public List<DocxNote> Endnotes = new();
+    /// <summary>Reviewer comments from <c>word/comments.xml</c>, keyed by their own id.</summary>
+    public List<DocxNote> Comments = new();
     public Dictionary<(long NumId, long Level), bool> NumberingOrdered = new(); // true = numbered
     public Dictionary<string, string> ImageRelationships = new(); // rId -> target (word/-relative)
 }
@@ -122,6 +132,9 @@ public static class DocxReader
         // Footnotes / endnotes
         doc.Footnotes = ReadNotes(pkg, "word/footnotes.xml", "footnote", rels);
         doc.Endnotes = ReadNotes(pkg, "word/endnotes.xml", "endnote", rels);
+        // A comment has the same shape as a note — an id and a body — but lives in its own part
+        // and is somebody's remark about the document rather than part of it.
+        doc.Comments = ReadNotes(pkg, "word/comments.xml", "comment", rels);
         return doc;
     }
 
@@ -198,15 +211,24 @@ public static class DocxReader
                 case "endnoteReference":
                     pb.TextSinceBreak = true;
                     break;
-                case "txbxContent":
-                    // Text-box content. Rust's flat event reader keeps the VML (`<w:pict>`) copy but
-                    // drops the DrawingML (`<w:drawing>`) copy — `parse_drawing` consumes the whole
-                    // `<w:drawing>` subtree. `<mc:AlternateContent>` carries both (Choice=DrawingML,
-                    // Fallback=VML), so emitting only VML matches Rust and avoids double-counting.
-                    if (e.Ancestors().Any(a => a.Name.LocalName == "pict"))
-                        foreach (var tp in e.Elements().Where(x => x.Name.LocalName == "p"))
-                            doc.Elements.Add(new DocElement { Kind = DocElementKind.Paragraph, Paragraph = ParseParagraph(tp, rels) });
+                // Legacy VML text box. `<mc:AlternateContent>` carries the same shape twice
+                // (Choice=DrawingML, Fallback=VML), so the fallback copy is dropped — the
+                // DrawingML copy inside `<w:drawing>` is the one that is kept, and taking both
+                // would emit the text box twice. A `w:pict` only becomes an element when it
+                // actually holds text; a picture-only one has nothing to contribute here.
+                case "pict":
+                {
+                    if (e.Ancestors().Any(a => a.Name.LocalName == "Fallback")) break;
+                    var boxes = e.Descendants().Where(x => x.Name.LocalName == "txbxContent").ToList();
+                    if (boxes.Count == 0) break;
+                    string boxText = CollectTxbxContentText(boxes[^1]);
+                    if (boxText.Length == 0) break;
+                    var pictDraw = new DocxDrawing { TextBoxContent = boxText };
+                    doc.Drawings.Add(pictDraw);
+                    doc.Elements.Add(new DocElement { Kind = DocElementKind.Drawing, Drawing = pictDraw });
+                    pb.TextSinceBreak = true;
                     break;
+                }
                 // Word writes this hint at the start of the first run on a page *it* rendered —
                 // including, redundantly, right after an authored `<w:br w:type="page"/>` that
                 // already recorded the same transition (GH#1416). It is the only page-break signal
@@ -334,6 +356,15 @@ public static class DocxReader
                     var id = child.Attributes().FirstOrDefault(a => a.Name.LocalName == "id")?.Value;
                     if (id is not null && id != "0" && id != "1") run.Text += $"[^{id}]";
                     break;
+                // A reviewer's comment is anchored to a point in the text, and that anchor is
+                // part of what the paragraph says: without a marker there is nothing to say the
+                // comment was attached here rather than anywhere else in it.
+                case "commentReference":
+                {
+                    var commentId = child.Attributes().FirstOrDefault(a => a.Name.LocalName == "id")?.Value;
+                    if (commentId is not null) run.Text += $"[cmt:{commentId}]";
+                    break;
+                }
             }
         }
         return run;
@@ -358,7 +389,46 @@ public static class DocxReader
             if (string.IsNullOrEmpty(descr)) descr = docPr.Attribute("name")?.Value;
             draw.Description = string.IsNullOrEmpty(descr) ? null : descr;
         }
+        foreach (var txbx in drawing.Descendants().Where(e => e.Name.LocalName == "txbxContent"))
+        {
+            string text = CollectTxbxContentText(txbx);
+            if (text.Length != 0) draw.TextBoxContent = text;
+        }
         return draw;
+    }
+
+    /// <summary>
+    /// Collect the visible text of a <c>w:txbxContent</c> subtree: each <c>w:p</c> contributes one
+    /// line, with <c>w:tab</c> and <c>w:br</c> mapped to a tab and a newline. Empty paragraphs are
+    /// dropped and the rest joined with newlines.
+    /// </summary>
+    private static string CollectTxbxContentText(XElement txbx)
+    {
+        var paragraphs = new List<string>();
+        var current = new StringBuilder();
+
+        void Walk(XElement el)
+        {
+            foreach (var child in el.Elements())
+            {
+                switch (child.Name.LocalName)
+                {
+                    case "t": current.Append(child.Value); break;
+                    case "tab": current.Append('\t'); break;
+                    case "br": current.Append('\n'); break;
+                    default: Walk(child); break;
+                }
+                if (child.Name.LocalName == "p")
+                {
+                    paragraphs.Add(current.ToString());
+                    current.Clear();
+                }
+            }
+        }
+
+        Walk(txbx);
+        if (current.Length > 0) paragraphs.Add(current.ToString());
+        return string.Join("\n", paragraphs.Where(p => p.Length != 0));
     }
 
     // ── tables ───────────────────────────────────────────────────────────────
@@ -426,7 +496,9 @@ public static class DocxReader
         foreach (var n in root.Elements().Where(e => e.Name.LocalName == kind))
         {
             var id = n.Attributes().FirstOrDefault(a => a.Name.LocalName == "id")?.Value ?? "";
-            if (id is "-1" or "0" or "1") continue;
+            // A footnotes part reserves ids -1, 0 and 1 for the separator marks Word writes into
+            // every document; a comments part numbers its comments from 0 and reserves nothing.
+            if (kind != "comment" && id is "-1" or "0" or "1") continue;
             var note = new DocxNote { Id = id };
             foreach (var p in n.Elements().Where(e => e.Name.LocalName == "p"))
                 note.Paragraphs.Add(ParseParagraph(p, rels));

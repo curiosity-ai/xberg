@@ -25,4 +25,40 @@ internal static class Encodings
         if (Interlocked.Exchange(ref _registered, 1) == 0)
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
     }
+
+    /// <summary>
+    /// The encoding for a Windows code-page number (`text/windows_codepage.rs`).
+    /// </summary>
+    /// <remarks>
+    /// The Mac script code pages are remapped: the CJK ones to their Windows equivalents, and the
+    /// rest to the nearest Windows code page for the same script, because the WHATWG encoding set
+    /// upstream draws on has no entry for them. An unknown number falls back to Windows-1252,
+    /// which is what RTF assumes when it says nothing.
+    /// </remarks>
+    internal static Encoding ForWindowsCodepage(uint codepage)
+    {
+        uint mapped = codepage switch
+        {
+            10001 => 932,
+            10002 => 950,
+            10003 => 949,
+            10008 => 936,
+            10007 => 10017,
+            10004 => 1256,
+            10005 => 1255,
+            10006 => 1253,
+            10021 => 874,
+            10029 => 1250,
+            10081 => 1254,
+            _ => codepage,
+        };
+        try
+        {
+            return Encoding.GetEncoding((int)mapped);
+        }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException)
+        {
+            return Encoding.GetEncoding(1252);
+        }
+    }
 }

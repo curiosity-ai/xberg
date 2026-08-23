@@ -272,4 +272,162 @@ public class OoxmlTests
         Assert.Equal("**B**", doc.Tables[0].Cells[0][1]); // runs_to_markdown wraps bold
         Assert.Equal("docx", doc.Metadata.Format!.FormatType);
     }
+
+    /// <summary>
+    /// A reviewer comment leaves a `[cmt:N]` marker in the body and its body text in
+    /// `word/comments.xml`; the marker becomes a `CommentRef` element and the body a
+    /// `CommentDefinition`, so a consumer can tell a comment from an authored footnote.
+    /// </summary>
+    [Fact]
+    public void Docx_CommentsBecomeCommentRefAndDefinitionElements()
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>" +
+                "<w:p><w:r><w:t>Annotated sentence.</w:t></w:r>" +
+                "<w:r><w:commentReference w:id=\"7\"/></w:r></w:p>" +
+                "</w:body></w:document>"),
+            ("word/comments.xml",
+                "<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">" +
+                "<w:comment w:id=\"7\"><w:p><w:r><w:t>Please rephrase.</w:t></w:r></w:p></w:comment>" +
+                "</w:comments>"));
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        var refElem = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.CommentRef);
+        Assert.Equal("7", refElem.Text);
+        Assert.Equal("cmt7", refElem.Anchor);
+
+        var def = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.CommentDefinition);
+        Assert.Equal("Please rephrase.", def.Text);
+        Assert.Equal("cmt7", def.Anchor);
+
+        // The comment body is not part of the flow, but it is not dropped either: it is
+        // rendered at the end, the way a footnote definition is.
+        Assert.Contains("Please rephrase.", Render(doc, OutputFormat.Markdown));
+        Assert.Contains("Annotated sentence.[cmt:7]", Render(doc, OutputFormat.Plain));
+    }
+
+    /// <summary>
+    /// The paragraphs inside a text box are layout, not document structure: they collapse into a
+    /// single paragraph whose lines are newline-separated, so a numbered `w:p` inside a shape
+    /// cannot turn into a list item of the surrounding document.
+    /// </summary>
+    [Fact]
+    public void Docx_TextBoxParagraphsCollapseIntoOneParagraph()
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:v=\"urn:schemas-microsoft-com:vml\"><w:body>" +
+                "<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent>" +
+                "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>" +
+                "<w:r><w:t>First line</w:t></w:r></w:p>" +
+                "<w:p><w:r><w:t>Second line</w:t></w:r></w:p>" +
+                "</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>" +
+                "</w:body></w:document>"));
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        var paragraphs = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).ToList();
+        Assert.Single(paragraphs);
+        Assert.Equal("First line\nSecond line", paragraphs[0].Text);
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.ListItem);
+    }
+
+    /// <summary>
+    /// `mc:AlternateContent` stores a shape twice — DrawingML in `mc:Choice`, VML in
+    /// `mc:Fallback`. Only the DrawingML copy is kept, or the text box would be extracted twice.
+    /// </summary>
+    [Fact]
+    public void Docx_AlternateContentTextBoxIsNotEmittedTwice()
+    {
+        const string txbx = "<w:txbxContent><w:p><w:r><w:t>Boxed</w:t></w:r></w:p></w:txbxContent>";
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" " +
+                "xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" " +
+                "xmlns:v=\"urn:schemas-microsoft-com:vml\" " +
+                "xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><w:body>" +
+                "<w:p><w:r><mc:AlternateContent>" +
+                "<mc:Choice Requires=\"wps\"><w:drawing><wps:wsp><wps:txbx>" + txbx +
+                "</wps:txbx></wps:wsp></w:drawing></mc:Choice>" +
+                "<mc:Fallback><w:pict><v:shape><v:textbox>" + txbx +
+                "</v:textbox></v:shape></w:pict></mc:Fallback>" +
+                "</mc:AlternateContent></w:r></w:p>" +
+                "</w:body></w:document>"));
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        var paragraphs = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph).ToList();
+        Assert.Single(paragraphs);
+        Assert.Equal("Boxed", paragraphs[0].Text);
+    }
+
+    /// <summary>
+    /// Two siblings of `a:r` carry text too: `a:br`, an explicit in-paragraph line break, and
+    /// `a:fld`, a field — a slide number, say — whose rendered value PowerPoint caches in a
+    /// nested `a:t`. Reading only `a:r` runs the two halves of a break together and loses the
+    /// field outright.
+    /// </summary>
+    [Fact]
+    public void Pptx_LineBreaksSplitRunsAndFieldsKeepTheirCachedText()
+    {
+        var pptx = Zip(
+            ("ppt/_rels/presentation.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
+            ("ppt/slides/slide1.xml",
+                "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" " +
+                "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p:cSld><p:spTree>" +
+                "<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr><p:txBody><a:p>" +
+                "<a:r><a:t>Company A</a:t></a:r><a:br/><a:r><a:t>Product is more expensive</a:t></a:r>" +
+                "</a:p></p:txBody></p:sp>" +
+                "<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr><p:txBody><a:p>" +
+                "<a:fld id=\"{1}\" type=\"slidenum\"><a:t>2</a:t></a:fld>" +
+                "</a:p></p:txBody></p:sp>" +
+                "</p:spTree></p:cSld></p:sld>"));
+
+        var doc = new PptxExtractor().Extract(pptx, PptxMime, new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        var texts = doc.Elements.Select(e => e.Text).ToList();
+        // The break separates the two halves rather than running them together...
+        Assert.Contains(texts, t => t.StartsWith("Company A", StringComparison.Ordinal)
+                                    && t.EndsWith("Product is more expensive", StringComparison.Ordinal)
+                                    && t != "Company AProduct is more expensive");
+        // ...and the field contributes the value PowerPoint cached for it.
+        Assert.Contains("2", texts);
+    }
+
+    /// <summary>
+    /// Slide shapes are laid out top-to-bottom, and only a DrawingML <c>a:xfrm</c> counts as a
+    /// position. A <c>p:graphicFrame</c> writes <c>p:xfrm</c> instead, so a table reports no
+    /// position and sorts ahead of the body text that shares its row.
+    /// </summary>
+    [Fact]
+    public void Pptx_AGraphicFrameHasNoPositionAndLeadsItsRow()
+    {
+        const string slide =
+            "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" " +
+            "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p:cSld><p:spTree>" +
+            "<p:sp><p:nvSpPr><p:nvPr><p:ph type=\"title\"/></p:nvPr></p:nvSpPr>" +
+            "<p:spPr><a:xfrm><a:off x=\"100\" y=\"100\"/><a:ext cx=\"10\" cy=\"10\"/></a:xfrm></p:spPr>" +
+            "<p:txBody><a:p><a:r><a:t>Goals</a:t></a:r></a:p></p:txBody></p:sp>" +
+            "<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr>" +
+            "<p:spPr><a:xfrm><a:off x=\"100\" y=\"900\"/><a:ext cx=\"10\" cy=\"10\"/></a:xfrm></p:spPr>" +
+            "<p:txBody><a:p><a:r><a:t>Bullet text</a:t></a:r></a:p></p:txBody></p:sp>" +
+            "<p:graphicFrame><p:xfrm><a:off x=\"5000\" y=\"900\"/><a:ext cx=\"10\" cy=\"10\"/></p:xfrm>" +
+            "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/table\">" +
+            "<a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Cell</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl>" +
+            "</a:graphicData></a:graphic></p:graphicFrame>" +
+            "</p:spTree></p:cSld></p:sld>";
+
+        var pptx = Zip(
+            ("ppt/_rels/presentation.xml.rels",
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>"),
+            ("ppt/slides/slide1.xml", slide));
+
+        var doc = new PptxExtractor().Extract(pptx, PptxMime, new ExtractionConfig { OutputFormat = OutputFormat.Plain });
+        string plain = Derive.DeriveExtractionResult(doc, includeDocumentStructure: false, OutputFormat.Plain).Content;
+
+        Assert.True(plain.IndexOf("Cell", StringComparison.Ordinal)
+            < plain.IndexOf("Bullet text", StringComparison.Ordinal), plain);
+    }
 }

@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Xml.Linq;
 using Xberg.Core;
 using Xberg.Types;
+using Xberg.Internal.Odf;
 
 namespace Xberg.Extractors;
 
@@ -23,7 +24,10 @@ public sealed class OdsExtractor : IExtractor
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
-        var sheets = ReadSheets(content.ToArray());
+        byte[] bytes = content.ToArray();
+        var sheets = ReadSheets(bytes);
+
+        var props = ReadOfficeProperties(bytes);
 
         var doc = BuildInternalDocument(sheets);
         doc.MimeType = mimeType;
@@ -31,7 +35,7 @@ public sealed class OdsExtractor : IExtractor
         var sheetNames = sheets.Select(s => s.Name).ToList();
         var excelMeta = new ExcelMetadata { SheetCount = (uint)sheets.Count, SheetNames = sheetNames };
 
-        // Metadata dict (calamine `extract_metadata`): sheet_count + sheet_names, no office metadata for ODS.
+        // Metadata dict (calamine `extract_metadata`): sheet_count + sheet_names.
         string namesStr;
         if (sheetNames.Count <= 5)
             namesStr = string.Join(", ", sheetNames);
@@ -49,12 +53,48 @@ public sealed class OdsExtractor : IExtractor
             ["sheet_names"] = JsonSerializer.SerializeToElement(namesStr),
         };
 
+        // ODF splits authorship the other way round from OOXML: `meta:initial-creator` is who
+        // created the document and `dc:creator` is who last touched it, where OOXML's
+        // `dc:creator` is the original author. Map by role, and fall back to `dc:creator` for
+        // the author when a producer omits `meta:initial-creator`.
+        string? author = !string.IsNullOrEmpty(props?.InitialCreator) ? props!.InitialCreator : props?.Creator;
+
         doc.Metadata = new Metadata
         {
             Format = FormatMetadata.Excel(excelMeta),
+            Title = Blank(props?.Title),
+            Subject = Blank(props?.Subject),
+            Language = Blank(props?.Language),
+            CreatedAt = Blank(props?.CreationDate),
+            ModifiedAt = Blank(props?.Date),
+            CreatedBy = Blank(author),
+            ModifiedBy = Blank(props?.Creator),
+            Authors = Blank(author) is { } a ? new List<string> { a } : null,
             Additional = additional,
         };
         return doc;
+    }
+
+    private static string? Blank(string? v) => string.IsNullOrEmpty(v) ? null : v;
+
+    /// <summary>
+    /// An `.ods` is an ODF package, not an OOXML one: its document properties live in
+    /// `meta.xml`, which the OOXML reader does not look at, so without this every ODS came
+    /// back with no title, author or dates.
+    /// </summary>
+    private static OdtProperties? ReadOfficeProperties(byte[] bytes)
+    {
+        try
+        {
+            using var stream = new MemoryStream(bytes, writable: false);
+            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            return Xberg.Internal.Odf.OdfMetadata.Extract(archive);
+        }
+        catch
+        {
+            // A spreadsheet whose meta.xml is absent or malformed still has its sheets.
+            return null;
+        }
     }
 
     // ── document building (mirrors XlsxExtractor.BuildInternalDocument) ─────────

@@ -21,6 +21,31 @@ public struct Matrix
         m.B * C + m.D * D,
         m.A * E + m.C * F + m.E,
         m.B * E + m.D * F + m.F);
+
+    // Single-precision twins of the two above, for the path pipeline. pdf_oxide's graphics
+    // state is `f32`, so it rounds after every product and every sum; folding the same
+    // expression at double width and rounding once at the end lands a fraction of an ulp
+    // away, and that drift survives into the table bounding boxes the corpus compares.
+    public (double x, double y) TransformSingle(double x, double y)
+    {
+        float a = (float)A, b = (float)B, c = (float)C, d = (float)D, e = (float)E, f = (float)F;
+        float fx = (float)x, fy = (float)y;
+        return (a * fx + c * fy + e, b * fx + d * fy + f);
+    }
+
+    public Matrix MultiplySingle(in Matrix m)
+    {
+        float a = (float)A, b = (float)B, c = (float)C, d = (float)D, e = (float)E, f = (float)F;
+        float ma = (float)m.A, mb = (float)m.B, mc = (float)m.C;
+        float md = (float)m.D, me = (float)m.E, mf = (float)m.F;
+        return new Matrix(
+            a * ma + b * mc,
+            a * mb + b * md,
+            c * ma + d * mc,
+            c * mb + d * md,
+            e * ma + f * mc + me,
+            e * mb + f * md + mf);
+    }
 }
 
 public sealed class TextSpan
@@ -32,8 +57,22 @@ public sealed class TextSpan
     public bool IsItalic;
     public bool IsMonospace;
 
+    /// <summary>The font's <c>/BaseFont</c> name. A change of it across a span boundary is a
+    /// font-run transition, which producers frequently leave without an explicit space glyph.</summary>
+    public string FontName = "";
+
     /// <summary>Text-matrix rotation in degrees; 0 for upright text.</summary>
     public double RotationDegrees;
+
+    /// <summary>
+    /// The Text Rise operator's shift (ISO 32000-1 §9.3.7 `Ts`) as a fraction of the font size.
+    /// A producer that raises or lowers a run this way has said outright that it is a super- or
+    /// subscript, whatever its size or characters.
+    /// </summary>
+    public double TextRiseRatio;
+
+    /// <summary>Emission order within the page, used to break ties in a stable way.</summary>
+    public int Sequence;
 
     // Geometry accessors mirroring pdf_oxide Rect (PDF coords: Y grows up).
     public double Left => X;
@@ -56,6 +95,12 @@ public sealed class PdfContentExtractor
         public double FontSize;
         public double Rise;
         public PdfFont? Font;
+        public double LineWidth = 1.0;
+        public int LineCap;
+        // pdf_oxide's path extractor carries its own f32 graphics state, and rounding
+        // the product after every concatenation is what makes `.23999999 3.125 cm cm`
+        // land on exactly 0.75. Keeping it separate leaves the text CTM alone.
+        public Matrix PathCtm = Matrix.Identity;
         public GState Clone() => (GState)MemberwiseClone();
     }
 
@@ -74,10 +119,12 @@ public sealed class PdfContentExtractor
     {
         public StringBuilder Text = new();
         public double StartX, StartY;          // user-space origin at buffer start
+        public double RiseRatio;               // Ts shift ÷ font size at buffer start
         public double AccumWidth;              // text-space width (incl. Tz)
         public double UserHScale;              // sqrt(a²+c²) of combined matrix
         public double EffFontSize;             // font_size * sqrt(b²+d²)
         public bool IsBold, IsItalic, IsMonospace;
+        public string FontName = "";
         public bool HasRtl;
         public double RotationDegrees;         // atan2(b, a) of the combined matrix
     }
@@ -86,6 +133,15 @@ public sealed class PdfContentExtractor
 
     // pdf_oxide TextExtractionConfig::default().space_insertion_threshold.
     private const double SpaceInsertionThreshold = -120.0;
+
+    // Painted paths, in device space. Ruling-line table detection reads these; text
+    // extraction ignores them, so collection costs one list append per painting operator.
+    private readonly List<PdfPath> _paths = new();
+    private List<PathOp> _currentOps = new();
+    private (double X, double Y)? _subpathStart;
+
+    /// <summary>Paths painted by the content processed so far (pdf_oxide `extract_paths`).</summary>
+    public List<PdfPath> Paths => _paths;
 
     public PdfContentExtractor(PdfDocument doc, long deadlineTicks) { _doc = doc; _deadline = deadlineTicks; }
 
@@ -161,6 +217,8 @@ public sealed class PdfContentExtractor
 
     private static double Num(List<PdfObject> ops, int i) => i < ops.Count ? (ops[i].AsNumber() ?? 0) : 0;
 
+    private static float NumF(List<PdfObject> ops, int i) => (float)Num(ops, i);
+
     private void Execute(string op, List<PdfObject> ops, Dictionary<string, PdfFont> fonts, PdfDict? xobjects, int depth)
     {
         switch (op)
@@ -171,7 +229,11 @@ public sealed class PdfContentExtractor
                 if (ops.Count >= 6)
                 {
                     FlushBuffer();
-                    _gs.Ctm = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5)).Multiply(_gs.Ctm);
+                    var cmMatrix = new Matrix(Num(ops, 0), Num(ops, 1), Num(ops, 2), Num(ops, 3), Num(ops, 4), Num(ops, 5));
+                    _gs.Ctm = cmMatrix.Multiply(_gs.Ctm);
+                    _gs.PathCtm =
+                        new Matrix(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3), NumF(ops, 4), NumF(ops, 5))
+                            .MultiplySingle(_gs.PathCtm);
                 }
                 break;
             case "BT": FlushBuffer(); _tm = Matrix.Identity; _tlm = Matrix.Identity; break;
@@ -234,8 +296,160 @@ public sealed class PdfContentExtractor
                 FlushBuffer();
                 if (ops.Count >= 1 && ops[0] is PdfName xn) DoXObject(xn.Value, xobjects, depth);
                 break;
+
+            // ── Path construction and painting (pdf_oxide `extractors::paths`) ────────
+            case "w": _gs.LineWidth = (float)Num(ops, 0); break;
+            case "J": _gs.LineCap = (int)Num(ops, 0); break;
+            // Path operands are read as f32 upstream, so round them here too: a
+            // rectangle's far corner is `x + width` in single precision, and a double
+            // sum rounded afterwards is not the same number.
+            case "m": PathMoveTo(NumF(ops, 0), NumF(ops, 1)); break;
+            case "l": PathLineTo(NumF(ops, 0), NumF(ops, 1)); break;
+            case "c": PathCurveTo(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3), NumF(ops, 4), NumF(ops, 5)); break;
+            case "v": PathCurveToV(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3)); break;
+            case "y": PathCurveToY(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3)); break;
+            case "re": PathRectangle(NumF(ops, 0), NumF(ops, 1), NumF(ops, 2), NumF(ops, 3)); break;
+            case "h": PathClose(); break;
+            case "S": FinalizePath(stroke: true, fill: false); break;
+            case "s": PathClose(); FinalizePath(stroke: true, fill: false); break;
+            case "f": case "F": case "f*": FinalizePath(stroke: false, fill: true); break;
+            case "b": PathClose(); FinalizePath(stroke: true, fill: true); break;
+            // `B`, `B*` and `b*` paint nothing here, and that is deliberate. The path
+            // extractor upstream (`document.rs:17590`) answers only `S`, `f`/`F`, `f*`,
+            // `b` and `n`; every other painting operator falls to its catch-all arm, which
+            // neither emits the path nor clears the operations it built up. A run of
+            // fill-and-stroke subpaths therefore accumulates until the next clip
+            // (`W n` / `W* n`) discards it or a handled operator paints all of it as one
+            // path. Painting them individually is what a renderer would do, but it is not
+            // what the detectors downstream are calibrated against: the ruling-line tiers
+            // read this list, and on a page whose producer draws every cell border as
+            // `m l l l h B*` it turns 27 primitives into 231, flooding the edge grid with
+            // rules upstream never sees.
+            case "B": case "B*": case "b*": break;
+            case "n": EndPath(); break;
         }
     }
+
+    // ── Path construction ────────────────────────────────────────────────────────
+    // Points are CTM-transformed as they are recorded, matching pdf_oxide's
+    // `PathExtractor`: the path list is device-space geometry with no matrix attached.
+
+    // pdf_oxide's path pipeline is f32 end to end, and the edge coordinates a table's
+    // bounding box is built from come straight out of it.
+    private (double x, double y) TransformPath(double x, double y) =>
+        _gs.PathCtm.TransformSingle(x, y);
+
+    private static Matrix RoundToSingle(in Matrix m) =>
+        new((float)m.A, (float)m.B, (float)m.C, (float)m.D, (float)m.E, (float)m.F);
+
+    /// <summary>
+    /// `line_width * Matrix::stroke_scale()` (pdf_oxide `content/graphics_state.rs:93`).
+    /// The `w` operand is user-space while the recorded path is already CTM-transformed
+    /// (§8.4.3.2), so it is scaled by sqrt(|det|) — the uniform-scale approximation
+    /// renderers use — to keep the width and the bbox in one coordinate space. Computed in
+    /// single precision because the rendered bbox this feeds is compared against a
+    /// reference produced by an f32 pipeline, and a double-width residue here shows up as
+    /// a one-ulp drift in every table bounding box on the page.
+    /// </summary>
+    private static double StrokeWidthOf(GState gs)
+    {
+        float a = (float)gs.PathCtm.A, b = (float)gs.PathCtm.B;
+        float c = (float)gs.PathCtm.C, d = (float)gs.PathCtm.D;
+        return (float)gs.LineWidth * MathF.Sqrt(MathF.Abs(a * d - b * c));
+    }
+
+    private void PathMoveTo(double x, double y)
+    {
+        var (tx, ty) = TransformPath(x, y);
+        _currentOps.Add(PathOp.MoveTo(tx, ty));
+        _pathCurrent = (tx, ty);
+        _subpathStart = (tx, ty);
+    }
+
+    private void PathLineTo(double x, double y)
+    {
+        var (tx, ty) = TransformPath(x, y);
+        _currentOps.Add(PathOp.LineTo(tx, ty));
+        _pathCurrent = (tx, ty);
+    }
+
+    private void PathCurveTo(double x1, double y1, double x2, double y2, double x3, double y3)
+    {
+        var p1 = TransformPath(x1, y1);
+        var p2 = TransformPath(x2, y2);
+        var p3 = TransformPath(x3, y3);
+        _currentOps.Add(PathOp.CurveTo(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y));
+        _pathCurrent = (p3.x, p3.y);
+    }
+
+    private void PathCurveToV(double x2, double y2, double x3, double y3)
+    {
+        var p1 = _pathCurrent ?? (0.0, 0.0);
+        var p2 = TransformPath(x2, y2);
+        var p3 = TransformPath(x3, y3);
+        _currentOps.Add(PathOp.CurveTo(p1.Item1, p1.Item2, p2.x, p2.y, p3.x, p3.y));
+        _pathCurrent = (p3.x, p3.y);
+    }
+
+    private void PathCurveToY(double x1, double y1, double x3, double y3)
+    {
+        var p1 = TransformPath(x1, y1);
+        var p3 = TransformPath(x3, y3);
+        _currentOps.Add(PathOp.CurveTo(p1.x, p1.y, p3.x, p3.y, p3.x, p3.y));
+        _pathCurrent = (p3.x, p3.y);
+    }
+
+    private void PathRectangle(double x, double y, double w, double h)
+    {
+        var p1 = TransformPath(x, y);
+        var p2 = TransformPath((float)x + (float)w, (float)y + (float)h);
+        _currentOps.Add(PathOp.Rect(p1.x, p1.y, (float)(p2.x - p1.x), (float)(p2.y - p1.y)));
+        _pathCurrent = (p1.x, p1.y);
+        _subpathStart = (p1.x, p1.y);
+    }
+
+    private void PathClose()
+    {
+        _currentOps.Add(PathOp.Close);
+        if (_subpathStart is { } s) _pathCurrent = s;
+    }
+
+    private void EndPath()
+    {
+        _currentOps.Clear();
+        _pathCurrent = null;
+        _subpathStart = null;
+    }
+
+    private void FinalizePath(bool stroke, bool fill)
+    {
+        if (_currentOps.Count == 0) return;
+        // Cap the collected set: a chart or map can paint tens of thousands of paths,
+        // none of which is a table rule, and the detector is quadratic in edge count.
+        if (_paths.Count < MaxPaths)
+        {
+            var candidate = new PdfPath
+            {
+                Operations = _currentOps,
+                Bbox = PdfPath.ComputeBbox(_currentOps),
+                Stroked = stroke,
+                Filled = fill,
+                LineCap = stroke ? _gs.LineCap : 0,
+                StrokeWidth = stroke ? StrokeWidthOf(_gs) : 0.0,
+            };
+            // Only rules and boxes are ever consulted; glyph outlines and chart fills
+            // would otherwise dominate the list on graphics-heavy pages. Rule candidates
+            // are kept alongside primitives because the borderless-table gate counts
+            // drawn rules over a slightly wider thickness band.
+            if (candidate.IsTablePrimitive() || candidate.IsRuleCandidate()) _paths.Add(candidate);
+        }
+        _currentOps = new List<PathOp>();
+        _pathCurrent = null;
+        _subpathStart = null;
+    }
+
+    private const int MaxPaths = 20000;
+    private (double, double)? _pathCurrent;
 
     // TJ array (pdf_oxide process_tj_array_tiebreaker): accumulate all strings
     // into one span; only offsets below SpaceInsertionThreshold split the span
@@ -292,7 +506,9 @@ public sealed class PdfContentExtractor
             IsBold = false,
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = false,
+            FontName = _gs.Font?.BaseFont ?? "",
             RotationDegrees = RotationOf(combined),
+            Sequence = _spans.Count,
         });
     }
 
@@ -309,6 +525,8 @@ public sealed class PdfContentExtractor
             IsBold = _gs.Font?.IsBold ?? false,
             IsItalic = _gs.Font?.IsItalic ?? false,
             IsMonospace = _gs.Font?.IsMonospace ?? false,
+            FontName = _gs.Font?.BaseFont ?? "",
+            RiseRatio = _gs.FontSize != 0 ? _gs.Rise / _gs.FontSize : 0,
         };
     }
 
@@ -334,7 +552,10 @@ public sealed class PdfContentExtractor
             IsBold = b.IsBold,
             IsItalic = b.IsItalic,
             IsMonospace = b.IsMonospace,
+            FontName = b.FontName,
             RotationDegrees = b.RotationDegrees,
+            TextRiseRatio = b.RiseRatio,
+            Sequence = _spans.Count,
         });
     }
 
@@ -381,6 +602,14 @@ public sealed class PdfContentExtractor
         if (_doc.Resolve(st.Dict.Get("Subtype")).AsName() != "Form") return;
         // Save state, apply form Matrix, run form content with its resources.
         _stack.Push(_gs.Clone());
+        // A Form XObject is path-isolated at both boundaries: pdf_oxide discards whatever
+        // path construction is pending on the way in and on the way out
+        // (`process_form_xobject_paths`, document.rs:18025 and :18204). Without that, a form
+        // whose subpaths are painted only by an operator the extractor does not answer
+        // (`B`, `B*`, `b*`) leaves them in the buffer, and the next `S` on the page emits
+        // them as one path — a single primitive spanning the whole form, which bridges
+        // unrelated ruling-line clusters and widens the table bounding boxes built from them.
+        EndPath();
         var savedTm = _tm; var savedTlm = _tlm;
         if (_doc.Resolve(st.Dict.Get("Matrix")).AsArray() is PdfArray fm && fm.Items.Count >= 6)
         {
@@ -388,9 +617,11 @@ public sealed class PdfContentExtractor
                 fm.Items[2].AsNumber() ?? 0, fm.Items[3].AsNumber() ?? 1,
                 fm.Items[4].AsNumber() ?? 0, fm.Items[5].AsNumber() ?? 0);
             _gs.Ctm = m.Multiply(_gs.Ctm);
+            _gs.PathCtm = RoundToSingle(m).MultiplySingle(_gs.PathCtm);
         }
         var formRes = _doc.Resolve(st.Dict.Get("Resources")).AsDict();
         try { Run(_doc.DecodeStream(st), formRes, depth + 1); } catch { }
+        EndPath();
         FlushBuffer();
         if (_stack.Count > 0) _gs = _stack.Pop();
         _tm = savedTm; _tlm = savedTlm;

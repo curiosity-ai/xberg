@@ -64,20 +64,47 @@ public sealed class HtmlWalker
                 _pos = end < 0 ? _src.Length : end + 3;
                 continue;
             }
-            if (_src[_pos] == '<') HandleTag();
+            if (_src[_pos] == '<' && OpensTag(_src, _pos)) HandleTag();
             else HandleText();
         }
         CloseParagraphContext();
         while (_groupStack.Count > 0) { _b.PushGroupEnd(); _groupStack.RemoveAt(_groupStack.Count - 1); }
+
+        if (_b.NodeCount == 0 && _discarded.Length != 0)
+            _b.PushParagraph(_discarded.ToString(), new(), null, null);
     }
 
     private bool Starts(string s) => string.CompareOrdinal(_src, _pos, s, 0, s.Length) == 0 && _pos + s.Length <= _src.Length;
 
     // ── text ─────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Whether the <c>&lt;</c> at <paramref name="pos"/> opens markup. The HTML tag-open state
+    /// takes only an ASCII letter, <c>/</c>, <c>!</c> or <c>?</c>; anything else — an R
+    /// assignment arrow, a less-than sign in prose — is character data, and the <c>&lt;</c>
+    /// stands for itself.
+    /// </summary>
+    internal static bool OpensTag(string src, int pos)
+    {
+        if (pos + 1 >= src.Length) return false;
+        char c = src[pos + 1];
+        // `</` and `<!` still need a name after them: `</=` and `<!5` are character data, not
+        // markup, and a page that writes them (quoted-printable mail cut mid-tag, say) must keep
+        // the text rather than lose everything up to the next `>`.
+        if (c == '/' || c == '!')
+        {
+            if (pos + 2 >= src.Length) return false;
+            char d = src[pos + 2];
+            return char.IsAsciiLetter(d) || (c == '!' && d == '-');
+        }
+        return char.IsAsciiLetter(c) || c == '?';
+    }
+
     private void HandleText()
     {
         int start = _pos;
-        while (_pos < _src.Length && _src[_pos] != '<') _pos++;
+        // A `<` that cannot open a tag is content: step over it so the scan does not stall.
+        if (_pos < _src.Length && _src[_pos] == '<') _pos++;
+        while (_pos < _src.Length && !(_src[_pos] == '<' && OpensTag(_src, _pos))) _pos++;
         string decoded = DecodeEntities(_src[start.._pos]);
 
         if (_table is not null) { _table.PushText(decoded); return; }
@@ -141,7 +168,10 @@ public sealed class HtmlWalker
             }
             if (_lastWasSpace)
             {
-                if (target.Length > 0 && target[^1] != ' ' && target[^1] != '\n') target.Append(' ');
+                // A pending word-break space is dropped after a line break, including the `<br>`
+                // sentinel: the source newline that follows `<br>` is layout, and keeping it
+                // indents the next line by one space.
+                if (target.Length > 0 && target[^1] is not (' ' or '\n' or '\x01')) target.Append(' ');
                 _lastWasSpace = false;
             }
             target.Append(c);
@@ -223,9 +253,15 @@ public sealed class HtmlWalker
         {
             case "head":
             {
-                // Skip the entire head — metadata is handled by a separate scan.
+                // Skip the head — metadata is handled by a separate scan. `<body>` closes it
+                // implicitly, which matters: a document with no `</head>` at all is not one
+                // whose head runs to the last byte, and treating it that way swallowed the
+                // whole file.
                 int close = _src.IndexOf("</head>", _pos, StringComparison.OrdinalIgnoreCase);
-                _pos = close < 0 ? _src.Length : close + "</head>".Length;
+                int body = _src.IndexOf("<body", _pos, StringComparison.OrdinalIgnoreCase);
+                if (close >= 0 && (body < 0 || close < body)) _pos = close + "</head>".Length;
+                else if (body >= 0) _pos = body;
+                else _pos = _src.Length;
                 break;
             }
             case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
@@ -656,8 +692,25 @@ public sealed class HtmlWalker
         DiscardParagraph();
     }
 
+    /// <summary>
+    /// Loose text seen outside any `<p>`, kept only in case the document turns out to have no
+    /// structure at all. Emitting it eagerly is measurably wrong — this walker buffers text in
+    /// places upstream does not, and flushing every block boundary costs far more fixtures than
+    /// it fixes — but a document that produces *nothing* has clearly lost everything, and the
+    /// corpus has several: plain text under an .html name, and markdown whose only wrapper is a
+    /// raw `<div>`.
+    /// </summary>
+    private readonly StringBuilder _discarded = new();
+
     private void DiscardParagraph()
     {
+        string text = _textBuf.ToString().Replace('\x01', '\n').Trim();
+        if (text.Length != 0)
+        {
+            if (_discarded.Length != 0) _discarded.Append('\n');
+            _discarded.Append(text);
+        }
+
         ClearTextBuf();
         _annotations.Clear();
         _inlineStack.Clear();
@@ -919,7 +972,11 @@ public sealed class HtmlWalker
     // Quote-aware attribute lookup: tokenizes the attribute string so a `name=` sequence inside
     // a quoted value (e.g. `?title=` in an href query string) is never mistaken for the attribute.
     // Returns null when absent, "" when present with an empty/omitted value.
-    internal static string? ExtractAttr(string attrs, string name)
+    /// <summary>
+    /// The element's attributes in source order, each as its name and its value (null when the
+    /// attribute was written with no value at all).
+    /// </summary>
+    internal static IEnumerable<(string Key, string? Value)> EnumerateAttributes(string attrs)
     {
         int i = 0, n = attrs.Length;
         while (i < n)
@@ -929,6 +986,10 @@ public sealed class HtmlWalker
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
             string key = attrs[ks..i];
+            // Nothing that can start a name here — a stray `=` or `/` between attributes. Step
+            // over that one character and look again; the `=` does not adopt what follows it as
+            // its value, so `<a =` + `href=…` still yields the href.
+            if (key.Length == 0) { i++; continue; }
             while (i < n && char.IsWhiteSpace(attrs[i])) i++;
             string? value = null;
             if (i < n && attrs[i] == '=')
@@ -950,9 +1011,14 @@ public sealed class HtmlWalker
                     value = attrs[vs..i];
                 }
             }
-            if (key.Length == 0) { i++; continue; }
-            if (key.Equals(name, StringComparison.OrdinalIgnoreCase)) return value ?? "";
+            yield return (key, value);
         }
+    }
+
+    internal static string? ExtractAttr(string attrs, string name)
+    {
+        foreach (var (key, value) in EnumerateAttributes(attrs))
+            if (key.Equals(name, StringComparison.OrdinalIgnoreCase)) return value ?? "";
         return null;
     }
 
@@ -965,6 +1031,65 @@ public sealed class HtmlWalker
             if (c.StartsWith("lang-", StringComparison.Ordinal)) return c["lang-".Length..];
         }
         return null;
+    }
+
+    /// <summary>
+    /// Resolve every named character reference in the WHATWG table, plus numeric references.
+    /// </summary>
+    /// <remarks>
+    /// This is the decoder the HTML-to-markdown converter needs: upstream runs that path through
+    /// a real HTML5 parser, so a page writing <c>&amp;deg;</c> or <c>&amp;oacute;</c> arrives with
+    /// the character already resolved. <see cref="DecodeEntities"/> stays deliberately small
+    /// because the structure walker it serves ports a Rust function that knows only a few dozen
+    /// names, and widening it there would diverge from the reference the other way.
+    /// </remarks>
+    internal static string DecodeEntitiesFull(string s)
+    {
+        if (!s.Contains('&')) return s;
+        var outp = new StringBuilder(s.Length);
+        int i = 0;
+        while (i < s.Length)
+        {
+            char c = s[i++];
+            if (c != '&') { outp.Append(c); continue; }
+
+            int semi = s.IndexOf(';', i);
+            if (semi < 0 || semi - i > HtmlEntityTable.MaxNameLength) { outp.Append('&'); continue; }
+            string name = s[i..semi];
+            if (name.Length == 0) { outp.Append('&'); continue; }
+
+            if (HtmlEntityTable.Named.TryGetValue(name, out var mapped))
+            {
+                outp.Append(mapped);
+                i = semi + 1;
+                continue;
+            }
+
+            if (name[0] == '#' && DecodeNumericReference(name) is { } numeric)
+            {
+                outp.Append(numeric);
+                i = semi + 1;
+                continue;
+            }
+
+            outp.Append('&');
+        }
+        return outp.ToString();
+    }
+
+    private static string? DecodeNumericReference(string name)
+    {
+        string num = name[1..];
+        int cp;
+        if (num.StartsWith('x') || num.StartsWith('X'))
+        {
+            if (!int.TryParse(num[1..], System.Globalization.NumberStyles.HexNumber, null, out cp)) return null;
+        }
+        else if (!int.TryParse(num, out cp)) return null;
+
+        if (cp < 0 || cp > 0x10FFFF) return null;
+        try { return char.ConvertFromUtf32(cp); }
+        catch { return null; }
     }
 
     internal static string DecodeEntities(string s)

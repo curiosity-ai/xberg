@@ -110,10 +110,30 @@ public sealed class XlsxExtractor : IExtractor
         return doc;
     }
 
+    /// <summary>
+    /// The sheets the workbook hides.
+    /// </summary>
+    /// <remarks>
+    /// A sheet's own content carries no visibility flag; only the workbook's sheet list says
+    /// which are hidden, and the reader records that as metadata.
+    /// </remarks>
+    private static HashSet<string> HiddenSheetNames(ExcelWorkbook workbook) =>
+        workbook.Metadata.TryGetValue("hidden_sheets", out string? names)
+            ? new HashSet<string>(names.Split(", "), StringComparer.Ordinal)
+            : new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The suffix a hidden sheet's heading carries, so hidden content stays distinguishable from
+    /// visible content in the extracted text.
+    /// </summary>
+    private static string HiddenSuffix(HashSet<string> hiddenSheets, string sheetName) =>
+        hiddenSheets.Contains(sheetName) ? " (hidden)" : "";
+
     private static InternalDocument BuildInternalDocument(ExcelWorkbook workbook)
     {
         var builder = new InternalDocumentBuilder("excel");
         var pages = new List<PageContent>(workbook.Sheets.Count);
+        var hiddenSheets = HiddenSheetNames(workbook);
 
         for (int i = 0; i < workbook.Sheets.Count; i++)
         {
@@ -124,7 +144,7 @@ public sealed class XlsxExtractor : IExtractor
             if (sheet.TableCells is { Count: > 0 } cells)
             {
                 if (sheet.Name.Length > 0)
-                    builder.PushHeading(2, sheet.Name, null, null);
+                    builder.PushHeading(2, sheet.Name + HiddenSuffix(hiddenSheets, sheet.Name), null, null);
                 builder.PushTableFromCells(cells, pageNumber, null);
 
                 string pageContent = sheet.Name.Length == 0

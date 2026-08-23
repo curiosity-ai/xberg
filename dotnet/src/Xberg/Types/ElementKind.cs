@@ -22,6 +22,8 @@ public enum ElementKindTag
     Code,
     Formula,
     FootnoteDefinition,
+    CommentDefinition,
+    CommentRef,
     FootnoteRef,
     Citation,
     Slide,
@@ -81,6 +83,11 @@ public readonly struct ElementKind : IEquatable<ElementKind>
     public static readonly ElementKind Code = new(ElementKindTag.Code);
     public static readonly ElementKind Formula = new(ElementKindTag.Formula);
     public static readonly ElementKind FootnoteDefinition = new(ElementKindTag.FootnoteDefinition);
+    /// <summary>A reviewer's comment body. Distinct from a footnote definition: the two have the
+    /// same shape but a reader needs to tell an authored note from someone else's remark.</summary>
+    public static readonly ElementKind CommentDefinition = new(ElementKindTag.CommentDefinition);
+    /// <summary>The point in the text a reviewer's comment is anchored to.</summary>
+    public static readonly ElementKind CommentRef = new(ElementKindTag.CommentRef);
     public static readonly ElementKind FootnoteRef = new(ElementKindTag.FootnoteRef);
     public static readonly ElementKind Citation = new(ElementKindTag.Citation);
     public static ElementKind Slide(uint number) => new(ElementKindTag.Slide, number: number);
@@ -110,6 +117,8 @@ public readonly struct ElementKind : IEquatable<ElementKind>
         ElementKindTag.Code => "code",
         ElementKindTag.Formula => "formula",
         ElementKindTag.FootnoteDefinition => "footnote_definition",
+        ElementKindTag.CommentDefinition => "comment_definition",
+        ElementKindTag.CommentRef => "comment_ref",
         ElementKindTag.FootnoteRef => "footnote_ref",
         ElementKindTag.Citation => "citation",
         ElementKindTag.Slide => "slide",
@@ -168,6 +177,8 @@ public sealed class ElementKindConverter : JsonConverter<ElementKind>
                 "Code" => ElementKind.Code,
                 "Formula" => ElementKind.Formula,
                 "FootnoteDefinition" => ElementKind.FootnoteDefinition,
+                "CommentDefinition" => ElementKind.CommentDefinition,
+                "CommentRef" => ElementKind.CommentRef,
                 "FootnoteRef" => ElementKind.FootnoteRef,
                 "Citation" => ElementKind.Citation,
                 "DefinitionTerm" => ElementKind.DefinitionTerm,

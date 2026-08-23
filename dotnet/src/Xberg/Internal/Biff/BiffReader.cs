@@ -18,6 +18,12 @@ internal static class BiffReader
         public string Name = "";
         public long StreamPos;
         public List<List<string>>? Cells;
+
+        /// <summary>
+        /// Decoded formula text, on a grid bounded by the cells that carry formulas rather than by
+        /// the used range — the two grids do not share an origin.
+        /// </summary>
+        public List<List<string>>? Formulas;
     }
 
     private const int BOF = 0x0809;
@@ -37,25 +43,31 @@ internal static class BiffReader
     private const int BOOLERR = 0x0205;
     private const int FORMULA = 0x0006;
     private const int STRING_REC = 0x0207;
+    private const int NAME = 0x0018;
+    private const int EXTERNSHEET = 0x0017;
 
     public static List<Sheet> ReadSheets(CompoundFile comp)
     {
         byte[] wb = comp.TryReadStream("/Workbook") ?? comp.TryReadStream("/Book")
             ?? throw new InvalidDataException("No Workbook/Book stream in XLS");
 
-        var (sst, sheets) = ParseGlobals(wb);
+        var (sst, sheets, ctx) = ParseGlobals(wb);
         foreach (var sheet in sheets)
-            sheet.Cells = ParseSheet(wb, (int)sheet.StreamPos, sst);
+        {
+            var (cells, formulas) = ParseSheet(wb, (int)sheet.StreamPos, sst, ctx);
+            sheet.Cells = cells;
+            sheet.Formulas = formulas;
+        }
         return sheets;
     }
 
     // ── globals substream: BoundSheet + SST ─────────────────────────────────────
-    private static (List<string> Sst, List<Sheet> Sheets) ParseGlobals(byte[] wb)
+    private static (List<string> Sst, List<Sheet> Sheets, BiffFormulaContext Ctx) ParseGlobals(byte[] wb)
     {
         var sheets = new List<Sheet>();
         var sst = new List<string>();
+        var ctx = new BiffFormulaContext();
         int pos = 0;
-        // Skip the initial globals BOF.
         while (pos + 4 <= wb.Length)
         {
             int type = U16(wb, pos);
@@ -63,11 +75,28 @@ internal static class BiffReader
             int dataStart = pos + 4;
             if (dataStart + len > wb.Length) break;
 
-            if (type == BOUNDSHEET8)
+            if (type == BOF)
+            {
+                ctx.Biff = BiffVersionOf(wb, dataStart, len);
+                pos = dataStart + len;
+            }
+            else if (type == BOUNDSHEET8)
             {
                 long lbPlyPos = U32(wb, dataStart);
                 var s = new Sheet { StreamPos = lbPlyPos, Name = ReadShortXlString(wb, dataStart + 6) };
                 sheets.Add(s);
+                ctx.SheetNames.Add(s.Name);
+                pos = dataStart + len;
+            }
+            else if (type == NAME)
+            {
+                // Lbl: only the name itself is referenced by formulas, not its own expression.
+                ctx.DefinedNames.Add(ReadDefinedName(wb, dataStart, len, ctx.Biff));
+                pos = dataStart + len;
+            }
+            else if (type == EXTERNSHEET)
+            {
+                ParseExternSheet(wb, dataStart, len, ctx);
                 pos = dataStart + len;
             }
             else if (type == SST)
@@ -95,7 +124,74 @@ internal static class BiffReader
                 pos = dataStart + len;
             }
         }
-        return (sst, sheets);
+
+        // Before BIFF8 the formula tokens carry sheet indices directly, so give them an
+        // identity XTI table to look through.
+        if (ctx.IsPreBiff8 && ctx.XtiItabFirst.Count == 0)
+        {
+            for (int i = 0; i < sheets.Count; i++) ctx.XtiItabFirst.Add((short)i);
+        }
+        return (sst, sheets, ctx);
+    }
+
+    /// <summary>BOF [MS-XLS 2.4.21]: the version word, with the document type as a tie-breaker.</summary>
+    private static BiffVersion BiffVersionOf(byte[] wb, int dataStart, int len)
+    {
+        int version = len >= 2 ? U16(wb, dataStart) : 0;
+        int dt = len >= 4 ? U16(wb, dataStart + 2) : 0;
+        return version switch
+        {
+            0x0200 or 0x0002 or 0x0007 => BiffVersion.Biff2,
+            0x0300 => BiffVersion.Biff3,
+            0x0400 => BiffVersion.Biff4,
+            0x0500 => BiffVersion.Biff5,
+            0x0600 => BiffVersion.Biff8,
+            0 => dt == 0x1000 ? BiffVersion.Biff5 : BiffVersion.Biff8,
+            _ => BiffVersion.Biff8,
+        };
+    }
+
+    /// <summary>Lbl [MS-XLS 2.4.150]: a defined name, whose text starts at a fixed offset.</summary>
+    private static string ReadDefinedName(byte[] wb, int dataStart, int len, BiffVersion biff)
+    {
+        if (len < 15) return "";
+        int cch = wb[dataStart + 3];
+        int at = dataStart + 14;
+        var sb = new StringBuilder(cch);
+        if (biff == BiffVersion.Biff8)
+        {
+            // A flags byte, then cch bytes of text — UTF-16 when the low bit is set.
+            bool highByte = (wb[at] & 0x01) != 0;
+            int available = Math.Max(0, Math.Min(cch, dataStart + len - (at + 1)));
+            int p = at + 1;
+            if (highByte)
+            {
+                for (int i = 0; i + 1 < available; i += 2) sb.Append((char)(ushort)(wb[p + i] | (wb[p + i + 1] << 8)));
+            }
+            else
+            {
+                for (int i = 0; i < available; i++) sb.Append((char)wb[p + i]);
+            }
+        }
+        else
+        {
+            int available = Math.Max(0, Math.Min(cch, dataStart + len - at));
+            for (int i = 0; i < available; i++) sb.Append((char)wb[at + i]);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>ExternSheet [MS-XLS 2.4.106]: the XTI table that BIFF8 3d references index into.</summary>
+    private static void ParseExternSheet(byte[] wb, int dataStart, int len, BiffFormulaContext ctx)
+    {
+        if (ctx.Biff != BiffVersion.Biff8 || len < 2) return;
+        int cxti = U16(wb, dataStart);
+        for (int i = 0; i < cxti; i++)
+        {
+            int at = dataStart + 2 + i * 6;
+            if (at + 6 > dataStart + len) break;
+            ctx.XtiItabFirst.Add((short)U16(wb, at + 2));
+        }
     }
 
     private static void ParseSst(byte[] wb, List<(int Start, int Len)> segments, List<string> sst)
@@ -155,9 +251,11 @@ internal static class BiffReader
     }
 
     // ── worksheet substream: cells ──────────────────────────────────────────────
-    private static List<List<string>>? ParseSheet(byte[] wb, int start, List<string> sst)
+    private static (List<List<string>>? Cells, List<List<string>>? Formulas) ParseSheet(
+        byte[] wb, int start, List<string> sst, BiffFormulaContext ctx)
     {
         var cells = new List<(int Row, int Col, string Val)>();
+        var formulas = new List<(int Row, int Col, string Val)>();
         int pos = start;
         // Expect a BOF at the sheet start.
         bool started = false;
@@ -241,6 +339,9 @@ internal static class BiffReader
                 case FORMULA:
                 {
                     int row = U16(wb, d), col = U16(wb, d + 2);
+                    // The expression follows the 20-byte header. A shared or array formula decodes
+                    // to empty text but still occupies its cell, which fixes where the grid starts.
+                    formulas.Add((row, col, BiffFormula.Parse(wb, d + 20, d + len, ctx, row, col)));
                     // Cached result: 8 bytes at d+6.
                     if (wb[d + 12] == 0xFF && wb[d + 13] == 0xFF)
                     {
@@ -272,7 +373,7 @@ internal static class BiffReader
             pos = d + len;
         }
 
-        return BuildGrid(cells);
+        return (BuildGrid(cells), BuildGrid(formulas));
     }
 
     private static void AddCell(List<(int, int, string)> cells, int row, int col, string val)

@@ -173,6 +173,16 @@ public static class JsonRenderer
                         FootnoteDefinitionNode(elem.Text, elem.Anchor));
                     break;
 
+                case ElementKindTag.CommentRef:
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote, CommentRefNode(elem.Anchor));
+                    break;
+
+                case ElementKindTag.CommentDefinition:
+                    FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
+                    PushToCurrent(rootBody, sectionStack, ref openBlockquote,
+                        CommentDefinitionNode(elem.Text, elem.Anchor));
+                    break;
+
                 case ElementKindTag.Citation:
                     FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);
                     PushToCurrent(rootBody, sectionStack, ref openBlockquote,
@@ -240,6 +250,8 @@ public static class JsonRenderer
         {
             if (elem.Kind.Tag == ElementKindTag.FootnoteDefinition && !RenderCommon.IsBodyElement(elem))
                 rootBody.Add(FootnoteDefinitionNode(elem.Text, elem.Anchor));
+            if (elem.Kind.Tag == ElementKindTag.CommentDefinition && !RenderCommon.IsBodyElement(elem))
+                rootBody.Add(CommentDefinitionNode(elem.Text, elem.Anchor));
         }
 
         var result = new JsonObject();
@@ -312,6 +324,20 @@ public static class JsonRenderer
         if (number is { } n) o["number"] = n;
         if (id is not null) o["id"] = id;
         return o;
+    }
+
+    private static JsonObject CommentRefNode(string? id)
+    {
+        var node = new JsonObject { ["type"] = "comment_ref" };
+        if (id is not null) node["id"] = id;
+        return node;
+    }
+
+    private static JsonObject CommentDefinitionNode(string text, string? id)
+    {
+        var node = new JsonObject { ["type"] = "comment_definition", ["text"] = text };
+        if (id is not null) node["id"] = id;
+        return node;
     }
 
     private static JsonObject FootnoteDefinitionNode(string text, string? id)

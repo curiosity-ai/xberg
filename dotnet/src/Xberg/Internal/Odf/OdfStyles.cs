@@ -33,6 +33,32 @@ internal static class OdfStyles
     }
 
     /// <summary>Build a map from style-name to resolved formatting properties. Mirrors Rust `build_style_map`.</summary>
+    /// <summary>
+    /// Map each declared list style's name to whether it numbers its items.
+    /// </summary>
+    /// <remarks>
+    /// A list element says only which style it uses; whether that style is numbered or bulleted
+    /// is declared once, here, by whether any of its levels is a
+    /// <c>text:list-level-style-number</c>. Without the map every list reads as bulleted, which
+    /// silently rewrites every numbered list in every document.
+    /// </remarks>
+    public static Dictionary<string, bool> BuildListStyleMap(XElement root)
+    {
+        var styles = new Dictionary<string, bool>(StringComparer.Ordinal);
+        foreach (var child in root.Elements())
+        {
+            if (child.Name.LocalName is not ("automatic-styles" or "styles")) continue;
+            foreach (var styleNode in child.Elements())
+            {
+                if (styleNode.Name.LocalName != "list-style") continue;
+                string? name = Attr(styleNode, "name");
+                if (name is null) continue;
+                styles[name] = styleNode.Elements().Any(l => l.Name.LocalName == "list-level-style-number");
+            }
+        }
+        return styles;
+    }
+
     public static Dictionary<string, OdtStyleProps> BuildStyleMap(XElement root)
     {
         var styles = new Dictionary<string, OdtStyleProps>();

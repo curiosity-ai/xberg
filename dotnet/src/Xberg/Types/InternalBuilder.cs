@@ -94,6 +94,12 @@ public sealed class InternalDocumentBuilder
     public uint PushFootnoteDefinition(string text, string key, uint? page) =>
         PushSimple(ElementKind.FootnoteDefinition, text, page, null, new(), null, key);
 
+    public uint PushCommentDefinition(string text, string key, uint? page) =>
+        PushSimple(ElementKind.CommentDefinition, text, page, null, new(), null, key);
+
+    public uint PushCommentRef(string marker, string key, uint? page) =>
+        PushSimple(ElementKind.CommentRef, marker, page, null, new(), null, key);
+
     public uint PushCitation(string text, string key, uint? page) =>
         PushSimple(ElementKind.Citation, text, page, null, new(), null, key);
 
@@ -181,6 +187,42 @@ public sealed class InternalDocumentBuilder
         return _doc.PushElement(element);
     }
 
+    /// <summary>
+    /// Append another document's contents to this one, rebasing every index it carries.
+    /// <para>
+    /// A document assembled elsewhere numbers its tables, images and elements from zero, so its
+    /// elements' table and image indices — and its relationships' element indices — have to be
+    /// shifted by what this document already holds, or they would point at the wrong rows.
+    /// </para>
+    /// </summary>
+    public void AppendDocument(InternalDocument other)
+    {
+        uint tableOffset = (uint)_doc.Tables.Count;
+        uint imageOffset = (uint)_doc.Images.Count;
+        uint elementOffset = (uint)_doc.Elements.Count;
+
+        _doc.Tables.AddRange(other.Tables);
+        _doc.Images.AddRange(other.Images);
+        _doc.Uris.AddRange(other.Uris);
+
+        foreach (var element in other.Elements)
+        {
+            if (element.Kind.Tag == ElementKindTag.Table)
+                element.Kind = ElementKind.Table(element.Kind.TableIndex + tableOffset);
+            else if (element.Kind.Tag == ElementKindTag.Image && element.Kind.ImageIndex != uint.MaxValue)
+                element.Kind = ElementKind.Image(element.Kind.ImageIndex + imageOffset);
+            PushElement(element);
+        }
+
+        foreach (var relationship in other.Relationships)
+        {
+            relationship.Source += elementOffset;
+            if (relationship.Target.Index is uint index)
+                relationship.Target = RelationshipTarget.FromIndex(index + elementOffset);
+            _doc.PushRelationship(relationship);
+        }
+    }
+
     // --- container helpers ---
 
     private void PushContainerStart(ElementKind kind, uint? page, Dictionary<string, string>? attrs)
@@ -231,25 +273,37 @@ public sealed class InternalDocumentBuilder
 
     private static Dictionary<string, string> SingleAttr(string key, string val) => new() { [key] = val };
 
+    /// <summary>
+    /// Render cells as a GFM pipe table.
+    /// </summary>
+    /// <remarks>
+    /// Every row is padded to the widest row's column count: a pipe table's columns are positional,
+    /// so a short row would otherwise leave the cells after it reading under the wrong headings.
+    /// The delimiter row follows the first row whether or not any rows follow, since a table with
+    /// one row is still a table and without the delimiter it is not one at all.
+    /// </remarks>
     internal static string CellsToMarkdown(IReadOnlyList<List<string>> cells)
     {
         if (cells.Count == 0) return "";
+        int numCols = cells.Max(r => r.Count);
+        if (numCols == 0) return "";
+
         var md = new StringBuilder();
         for (int rowIdx = 0; rowIdx < cells.Count; rowIdx++)
         {
             var row = cells[rowIdx];
             md.Append('|');
-            foreach (var cell in row)
+            for (int col = 0; col < numCols; col++)
             {
                 md.Append(' ');
-                md.Append(cell);
+                if (col < row.Count) md.Append(row[col]);
                 md.Append(" |");
             }
             md.Append('\n');
-            if (rowIdx == 0 && cells.Count > 1)
+            if (rowIdx == 0)
             {
                 md.Append('|');
-                for (int i = 0; i < row.Count; i++) md.Append(" --- |");
+                for (int i = 0; i < numCols; i++) md.Append(" --- |");
                 md.Append('\n');
             }
         }

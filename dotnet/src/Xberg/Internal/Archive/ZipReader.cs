@@ -35,9 +35,7 @@ internal static class ZipReader
             // Text content for text-typed entries.
             if (ArchiveConstants.IsTextFile(path))
             {
-                string? text = TryDecodeUtf8(raw);
-                if (text is not null)
-                    result.TextContents.Add(new KeyValuePair<string, string>(path, text));
+                result.TextContents.Add(new KeyValuePair<string, string>(path, DecodeArchiveText(raw)));
             }
         }
 
@@ -67,5 +65,18 @@ internal static class ZipReader
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Port of `decode_archive_text`. A member that reaches here has already been judged
+    /// textual by its extension, so failing to decode it is not grounds for dropping it —
+    /// the bytes are substituted and the member still appears. An AppleDouble sidecar named
+    /// `._something.txt` is the case that makes the difference visible: it is binary under a
+    /// text extension, and skipping it loses a member the archive listing still announces.
+    /// </summary>
+    internal static string DecodeArchiveText(byte[] data)
+    {
+        string text = TryDecodeUtf8(data) ?? Encoding.UTF8.GetString(data);
+        return text.Length > 0 && text[0] == '\uFEFF' ? text[1..] : text;
     }
 }

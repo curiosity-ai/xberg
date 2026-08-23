@@ -265,4 +265,126 @@ public class MarkdownExtractorTests
         var para = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph);
         Assert.Equal("a ~x~~ b", para.Text);
     }
+
+    // ── setext headings ───────────────────────────────────────────────────────
+
+    /// <summary>Text underlined with `=` or `-` is a heading, not a paragraph.</summary>
+    [Fact]
+    public void SetextUnderlinesMakeHeadings()
+    {
+        var doc = Extract("Lorem ipsum\n===========\n\nBody.\n\nSub\n---\n");
+
+        var headings = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Heading).ToList();
+        Assert.Equal(2, headings.Count);
+        Assert.Equal(("Lorem ipsum", 1), (headings[0].Text, (int)headings[0].Kind.Level));
+        Assert.Equal(("Sub", 2), (headings[1].Text, (int)headings[1].Kind.Level));
+    }
+
+    /// <summary>
+    /// A line of `---` is an underline only after paragraph content; standing alone it stays the
+    /// thematic break it would otherwise be.
+    /// </summary>
+    [Fact]
+    public void ADashRuleWithNoParagraphAboveIsNotAHeading()
+    {
+        var doc = Extract("---\n\nBody.\n");
+        Assert.DoesNotContain(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading);
+    }
+
+    /// <summary>A setext heading takes the whole paragraph above it, however many lines.</summary>
+    [Fact]
+    public void SetextHeadingTakesEveryLineOfItsParagraph()
+    {
+        var doc = Extract("First line\nsecond line\n=====\n");
+        var heading = Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Heading);
+        Assert.Equal("First line second line", heading.Text);
+    }
+}
+
+/// <summary>
+/// How a GFM table's rows are squared up against its header.
+/// </summary>
+public class MarkdownTableShapeTests
+{
+    private static Table Parse(string markdown)
+    {
+        var doc = new MarkdownExtractor().Extract(
+            Encoding.UTF8.GetBytes(markdown), "text/markdown", new ExtractionConfig());
+        return doc.Tables.Single();
+    }
+
+    [Fact]
+    public void AShortRowIsPaddedToTheHeadersWidth()
+    {
+        // Without the padding a row's second value slides under the fourth heading.
+        var table = Parse("""
+            | A | B | C | D |
+            | --- | --- | --- | --- |
+            | 1 | 2.78% |
+            """);
+        Assert.Equal(new[] { "1", "2.78%", "", "" }, table.Cells[1]);
+    }
+
+    [Fact]
+    public void ALongRowLosesItsExcess()
+    {
+        var table = Parse("""
+            | A | B |
+            | --- | --- |
+            | 1 | 2 | 3 | 4 |
+            """);
+        Assert.Equal(new[] { "1", "2" }, table.Cells[1]);
+    }
+
+    [Fact]
+    public void AWellFormedRowIsUnchanged()
+    {
+        var table = Parse("""
+            | A | B |
+            | --- | --- |
+            | 1 | 2 |
+            """);
+        Assert.Equal(new[] { "A", "B" }, table.Cells[0]);
+        Assert.Equal(new[] { "1", "2" }, table.Cells[1]);
+    }
+}
+
+/// <summary>
+/// What a fenced code block's info string contributes.
+/// </summary>
+public class MarkdownFenceInfoTests
+{
+    private static string? Language(string markdown)
+    {
+        var doc = new MarkdownExtractor().Extract(
+            Encoding.UTF8.GetBytes(markdown), "text/markdown", new ExtractionConfig());
+        var code = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Code);
+        return code.Attributes is { } a && a.TryGetValue("language", out var lang) ? lang : null;
+    }
+
+    [Fact]
+    public void OnlyTheFirstTokenIsTheLanguage()
+    {
+        // The rest of an info string is renderer options, not part of the language name.
+        Assert.Equal("mdx-invalid", Language("```mdx-invalid chrome=no\ncode\n```\n"));
+        Assert.Equal("js", Language("```js,live\ncode\n```\n"));
+    }
+
+    [Fact]
+    public void PandocBracesAndALeadingDotAreNotPartOfTheName()
+    {
+        Assert.Equal("python", Language("```{.python}\ncode\n```\n"));
+    }
+
+    [Fact]
+    public void AFenceWithNoInfoStringNamesNoLanguage()
+    {
+        Assert.Null(Language("```\ncode\n```\n"));
+    }
+
+    [Fact]
+    public void APlainLanguageIsUnchanged()
+    {
+        Assert.Equal("rust", Language("```rust\ncode\n```\n"));
+    }
 }

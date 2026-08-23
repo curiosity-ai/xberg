@@ -23,6 +23,16 @@ public sealed class MdxExtractor : IExtractor
     private static readonly Regex JsxExprLineRe = new(@"^\s*\{.*\}\s*$", RegexOptions.Compiled);
     private static readonly Regex JsxInlineCommentRe = new(@"\s*\{/\*.*?\*/\}", RegexOptions.Compiled);
 
+    /// <summary>
+    /// An inline JSX expression left in prose once tags and comments are gone, as in
+    /// <c>The count is {count} today.</c>
+    /// </summary>
+    /// <remarks>
+    /// It has to open with a JavaScript identifier character so it cannot swallow Pandoc or
+    /// Quarto heading-attribute and fenced-div syntax — <c>{#id}</c>, <c>{.class}</c>.
+    /// </remarks>
+    private static readonly Regex InlineJsxExprRe = new(@"\{[A-Za-z_$][^{}]*\}", RegexOptions.Compiled);
+
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         string text = Encoding.UTF8.GetString(content);
@@ -86,18 +96,32 @@ public sealed class MdxExtractor : IExtractor
                 if (depth > 0) skipBlockDepth = depth;
                 continue;
             }
-            if (JsxExprLineRe.IsMatch(trimmed)) continue;
-
-            string withoutComments = JsxInlineCommentRe.Replace(line, "");
-            string processed = JsxTagRe.Replace(withoutComments, "");
-            string processedTrimmed = processed.Trim();
-
-            if (processedTrimmed.Length == 0 && trimmed.Length > 0)
+            // A standalone `{expression}` line is recorded before being dropped, rather than
+            // silently discarded. A JSX *comment* is not: it carries no content, and recording
+            // it would put `{/* … */}` back into the output through the raw block, which is the
+            // very thing stripping is for.
+            if (JsxExprLineRe.IsMatch(trimmed))
             {
-                foreach (Match m in JsxTagRe.Matches(withoutComments))
-                    jsxBlocks.Add(m.Value);
+                if (JsxInlineCommentRe.Replace(trimmed, "").Trim().Length != 0)
+                    jsxBlocks.Add(trimmed);
                 continue;
             }
+
+            string withoutComments = JsxInlineCommentRe.Replace(line, "");
+
+            // Component tags are recorded wherever they match, not only when stripping empties
+            // the whole line: an inline component in the middle of a sentence — `See <Chart
+            // data={data} /> below.` — kept the line non-empty and lost its props entirely.
+            foreach (Match m in JsxTagRe.Matches(withoutComments))
+                jsxBlocks.Add(m.Value);
+
+            string processed = JsxTagRe.Replace(withoutComments, "");
+            if (processed.Trim().Length == 0 && trimmed.Length > 0) continue;
+
+            // Expressions still sitting in prose after the tags went are recorded too.
+            foreach (Match m in InlineJsxExprRe.Matches(processed))
+                jsxBlocks.Add(m.Value);
+            processed = InlineJsxExprRe.Replace(processed, "");
 
             result.Append(processed).Append('\n');
         }

@@ -2,6 +2,7 @@ using System.Text;
 using Xberg.Core;
 using Xberg.Extractors;
 using Xberg.Internal.Pdf;
+using Xberg.Internal.Pdf.Fonts;
 using Xberg.Types;
 using Xunit;
 
@@ -527,5 +528,349 @@ public class PdfExtractorTests
         };
         var kept = PdfPageText.DeduplicateOverlappingSpans(spans);
         Assert.Equal(2, kept.Count);
+    }
+
+    // ── super/subscript reattachment (pdf_oxide merge_sub_superscript_spans) ──
+
+    /// <summary>
+    /// A producer sets `H2SO4` as a base plus small raised digits. Nothing keeps those digits
+    /// beside the word once spans are sorted into baseline bands, so they drift — a formula loses
+    /// its subscripts and they resurface elsewhere on the page.
+    /// </summary>
+    [Fact]
+    public void SubscriptDigitsMergeIntoTheirBase()
+    {
+        var spans = new List<TextSpan>
+        {
+            Span("H", 100, 200, 8, 10),
+            Span("2", 108, 197, 4, 6),
+            Span("SO", 112, 200, 16, 10),
+            Span("4", 128, 197, 4, 6),
+        };
+
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(new[] { "H2", "SO4" }, spans.Select(s => s.Text));
+    }
+
+    /// <summary>A span far from any base keeps its place rather than being dragged onto one.</summary>
+    [Fact]
+    public void ADetachedDigitIsNotMerged()
+    {
+        var spans = new List<TextSpan>
+        {
+            Span("H", 100, 200, 8, 10),
+            // Well past the base's advance edge: a different word's marker, not this one's.
+            Span("2", 300, 197, 4, 6),
+        };
+
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(2, spans.Count);
+    }
+
+    /// <summary>
+    /// An ordinary lowercase word is not a subscript host, or every digit following prose would
+    /// be glued onto the preceding word.
+    /// </summary>
+    [Fact]
+    public void ProseIsNotASubscriptHost()
+    {
+        var spans = new List<TextSpan>
+        {
+            Span("of", 100, 200, 12, 10),
+            Span("2", 112, 197, 4, 6),
+        };
+
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(2, spans.Count);
+    }
+
+    /// <summary>
+    /// A run the producer raised with the Text Rise operator is a superscript on its own say-so,
+    /// whatever its size — the shift is the statement, not the metrics.
+    /// </summary>
+    [Fact]
+    public void TextRiseMarksASuperscriptRegardlessOfSize()
+    {
+        var baseSpan = Span("x", 100, 200, 8, 10);
+        var raised = Span("*", 108, 203, 5, 10);
+        raised.TextRiseRatio = 0.33;
+
+        var spans = new List<TextSpan> { baseSpan, raised };
+        PdfSubSuperscript.Merge(spans);
+
+        Assert.Equal(new[] { "x*" }, spans.Select(s => s.Text));
+    }
+}
+
+/// <summary>
+/// Tests for the Type 1 built-in encoding reader (<see cref="Type1Encoding"/>).
+/// </summary>
+public class Type1EncodingTests
+{
+    private static byte[] Bytes(string s) => System.Text.Encoding.ASCII.GetBytes(s);
+
+    /// <summary>
+    /// The ligature slots of a TeX font live at codes 11-15, which no named encoding assigns —
+    /// the program's own array is the only place they are declared.
+    /// </summary>
+    [Fact]
+    public void Parse_ReadsDupPutEntriesIncludingLigatureSlots()
+    {
+        var map = Type1Encoding.Parse(Bytes(
+            "%!PS-AdobeFont-1.0: CMR9 003.002\n" +
+            "/Encoding 256 array\n" +
+            "0 1 255 {1 index exch /.notdef put} for\n" +
+            "dup 11 /ff put\ndup 12 /fi put\ndup 13 /fl put\ndup 14 /ffi put\ndup 15 /ffl put\n" +
+            "dup 65 /A put\ndup 48 /zero put\ndup 123 /endash put\n" +
+            "readonly def\ncurrentfile eexec\n"));
+
+        Assert.NotNull(map);
+        Assert.Equal("ﬀ", map![11]);
+        Assert.Equal("ﬁ", map[12]);
+        Assert.Equal("ﬂ", map[13]);
+        Assert.Equal("ﬃ", map[14]);
+        Assert.Equal("ﬄ", map[15]);
+        Assert.Equal("A", map[65]);
+        Assert.Equal("0", map[48]);
+        Assert.Equal("–", map[123]);
+    }
+
+    /// <summary>
+    /// A program that just names a predefined encoding declares nothing of its own; the caller's
+    /// handling of that name is already right, so there is no map to return.
+    /// </summary>
+    [Fact]
+    public void Parse_ReturnsNullForPredefinedOrAbsentEncoding()
+    {
+        Assert.Null(Type1Encoding.Parse(Bytes("/Encoding StandardEncoding def\n")));
+        Assert.Null(Type1Encoding.Parse(Bytes("no encoding here")));
+        Assert.Null(Type1Encoding.Parse([]));
+    }
+}
+
+/// <summary>
+/// Tests for ordered-list marker recognition (<see cref="PdfListMarker"/>) and the line
+/// classification built on it.
+/// </summary>
+public class PdfListMarkerTests
+{
+    [Theory]
+    [InlineData("1. first", 1)]
+    [InlineData("  12) twelfth", 12)]
+    [InlineData("(7) seventh", 7)]
+    [InlineData("[3] bracketed", 3)]
+    public void Parse_ExposesNumericValueForNumericMarkers(string source, int expected)
+    {
+        var marker = PdfListMarker.Parse(source);
+        Assert.NotNull(marker);
+        Assert.Equal(expected, marker!.Value.NumericValue);
+        Assert.True(marker.Value.HasContent);
+        Assert.True(marker.Value.HasSeparator);
+    }
+
+    [Theory]
+    [InlineData("a. alpha", "alpha")]
+    [InlineData("I. Roman", "Roman")]
+    [InlineData("(1) parenthesized", "parenthesized")]
+    [InlineData("  12) numeric", "numeric")]
+    public void Parse_ReportsWhereTheContentStarts(string source, string expected)
+    {
+        var marker = PdfListMarker.Parse(source);
+        Assert.NotNull(marker);
+        Assert.Equal(expected, source[marker!.Value.ContentStart..]);
+    }
+
+    /// <summary>
+    /// The three-digit cap is what keeps a year from opening a list: in
+    /// "…delivered on January 23,\n2023. A total of 3 trucks…" the second line would otherwise
+    /// become an ordered item and split the sentence in two.
+    /// </summary>
+    [Fact]
+    public void Parse_RejectsNumbersTooLongToBeMarkers()
+    {
+        Assert.Null(PdfListMarker.Parse("2023. A total of 3 trucks were used for 15 hours."));
+        Assert.Null(PdfListMarker.Parse("1234) not a marker"));
+        Assert.NotNull(PdfListMarker.Parse("123. still a marker"));
+    }
+
+    /// <summary>An author's initial is not a list marker, but only in a byline's company.</summary>
+    [Fact]
+    public void IsProbableAuthorByline_NeedsASurnameCommaAndASecondInitial()
+    {
+        Assert.True(PdfListMarker.IsProbableAuthorByline("A. Smith, B. Jones et al."));
+        Assert.False(PdfListMarker.IsProbableAuthorByline("A. First item in a list"));
+    }
+}
+
+/// <summary>
+/// Tests for the reconstructed-grid admission test (<see cref="PdfTableReconstruct"/>).
+/// </summary>
+public class PdfTableWellFormednessTests
+{
+    private static List<List<string>> Grid(params string[][] rows) =>
+        rows.Select(r => r.ToList()).ToList();
+
+    /// <summary>A plain two-column grid of short values is a table.</summary>
+    [Fact]
+    public void AShortValueGridIsATable()
+    {
+        Assert.True(PdfTableReconstruct.IsWellFormedTable(Grid(
+            ["Region", "Units"],
+            ["North", "412"],
+            ["South", "377"],
+            ["West", "1,204"])));
+    }
+
+    /// <summary>
+    /// A single paragraph chopped into one-word columns has no cross-row evidence to average
+    /// over, which is why the row-count-gated guards miss it and it needs its own.
+    /// </summary>
+    [Fact]
+    public void ALineShreddedIntoWordColumnsIsNotATable()
+    {
+        Assert.False(PdfTableReconstruct.IsWellFormedTable(Grid(
+            ["the", "quick", "brown", "fox", "jumps"],
+            ["over", "the", "lazy", "dog", "again"])));
+    }
+
+    /// <summary>
+    /// A ledger's regular short columns look exactly like wrapped columnar prose to the
+    /// uniformity guard, so a grid this numeric is exempt from it.
+    /// </summary>
+    [Fact]
+    public void ADenseNumericLedgerSurvivesTheProseGuards()
+    {
+        var rows = new List<List<string>> { new() { "Acct", "Q1", "Q2", "Q3", "Q4", "Total" } };
+        for (int i = 0; i < 8; i++)
+            rows.Add(new List<string> { $"100{i}", "1,204", "1,318", "1,127", "1,402", "5,051" });
+
+        Assert.True(PdfTableReconstruct.IsWellFormedTable(rows));
+    }
+
+    /// <summary>A header repeated in the body is a page element caught on every page.</summary>
+    [Fact]
+    public void ARepeatedHeaderIsNotATable()
+    {
+        Assert.False(PdfTableReconstruct.IsWellFormedTable(Grid(
+            ["Name", "Value"],
+            ["Name", "Value"],
+            ["Name", "Value"])));
+    }
+}
+
+/// <summary>
+/// Tests for the collapsed-column repair (<see cref="PdfTableNormalize"/>).
+/// </summary>
+public class PdfTableNormalizeTests
+{
+    private static Table WideTable(string mergedCell, int dataRows = 8)
+    {
+        var header = new List<string>();
+        for (int c = 0; c < 18; c++) header.Add(c is 8 or 9 ? "Amount" : $"C{c}");
+
+        var cells = new List<List<string>> { header };
+        for (int r = 0; r < dataRows; r++)
+        {
+            var row = new List<string>();
+            for (int c = 0; c < 18; c++) row.Add(c == 8 ? mergedCell : "1,204");
+            cells.Add(row);
+        }
+        return new Table { Cells = cells };
+    }
+
+    /// <summary>
+    /// Two adjacent numeric columns can come back merged into one cell holding the value twice.
+    /// The repair splits them and widens the header to match.
+    /// </summary>
+    [Fact]
+    public void ARepeatedNumericCellIsSplitBackIntoTwoColumns()
+    {
+        var table = WideTable("1,204   1,204");
+
+        Assert.True(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(table));
+        Assert.Equal(19, table.Cells[0].Count);
+        Assert.Equal("1,204", table.Cells[1][8]);
+        Assert.Equal("1,204", table.Cells[1][9]);
+    }
+
+    /// <summary>
+    /// The repair is deliberately narrow. A cell whose halves differ is two real values, not one
+    /// value counted twice, and a narrow table is left alone whatever its cells look like.
+    /// </summary>
+    [Fact]
+    public void UnequalHalvesAndNarrowTablesAreLeftAlone()
+    {
+        Assert.False(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(WideTable("1,204   9,999")));
+        Assert.False(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(WideTable("1,204   1,204", dataRows: 3)));
+        Assert.False(PdfTableNormalize.RepairConsistentlyMergedNumericColumn(
+            new Table { Cells = new List<List<string>> { new() { "a", "b" }, new() { "1  1", "2" } } }));
+    }
+}
+
+/// <summary>
+/// Tests for geometric table-region recovery (<see cref="PdfLayoutTables"/>).
+/// </summary>
+public class PdfGeometricTableTests
+{
+    private static List<HocrWord> Words(params (string Text, uint Left, uint Top)[] items) =>
+        items.Select(w => new HocrWord
+        {
+            Text = w.Text,
+            Left = w.Left,
+            Top = w.Top,
+            Width = (uint)(w.Text.Length * 6),
+            Height = 10,
+            Confidence = 1.0,
+        }).ToList();
+
+    /// <summary>
+    /// Three rows of three column-aligned numeric cells is the shape this fallback exists for:
+    /// a borderless line-item table no ruling line marks out.
+    /// </summary>
+    [Fact]
+    public void ANumericColumnAlignedBandBecomesATableRegion()
+    {
+        var words = new List<HocrWord>();
+        for (uint row = 0; row < 4; row++)
+            for (uint col = 0; col < 3; col++)
+                words.AddRange(Words(($"{row}{col}0.00", 100 + col * 120, 100 + row * 20)));
+
+        var hints = PdfLayoutTables.DetectGeometricTableHints(words, 792f);
+
+        Assert.Single(hints);
+        Assert.True(hints[0].Top > hints[0].Bottom, "hint is in PDF bottom-origin coordinates");
+    }
+
+    /// <summary>
+    /// Dense two-column body text is the dominant false positive this fallback has to refuse. It
+    /// is neither numeric nor sparse, so neither admission path takes it however well its words
+    /// happen to line up.
+    /// </summary>
+    [Fact]
+    public void DenseTwoColumnProseIsNotATableRegion()
+    {
+        string[] left = ["The", "quick", "brown", "fox", "jumps", "over"];
+        string[] right = ["the", "lazy", "dog", "while", "birds", "sing"];
+        var words = new List<HocrWord>();
+        for (uint row = 0; row < 6; row++)
+        {
+            uint x = 72;
+            foreach (string w in left) { words.AddRange(Words((w, x, 100 + row * 14))); x += (uint)(w.Length * 6 + 4); }
+            x = 320;
+            foreach (string w in right) { words.AddRange(Words((w, x, 100 + row * 14))); x += (uint)(w.Length * 6 + 4); }
+        }
+
+        Assert.Empty(PdfLayoutTables.DetectGeometricTableHints(words, 792f));
+    }
+
+    /// <summary>Fewer than three rows is not a band, whatever its columns look like.</summary>
+    [Fact]
+    public void ASingleRowIsNotATableRegion()
+    {
+        var words = Words(("100.00", 100, 100), ("200.00", 220, 100), ("300.00", 340, 100));
+        Assert.Empty(PdfLayoutTables.DetectGeometricTableHints(words, 792f));
     }
 }

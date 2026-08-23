@@ -126,6 +126,8 @@ public static class PlainRenderer
 
                 case ElementKindTag.FootnoteRef:
                 case ElementKindTag.FootnoteDefinition:
+                case ElementKindTag.CommentRef:
+                case ElementKindTag.CommentDefinition:
                     // Skipped in body pass.
                     break;
 
@@ -219,6 +221,24 @@ public static class PlainRenderer
             foreach (var elem in doc.Elements)
             {
                 if (elem.Kind.Tag == ElementKindTag.FootnoteDefinition && elem.Layer == ContentLayer.Footnote)
+                {
+                    sb.Append(elem.Text);
+                    sb.Append("\n\n");
+                }
+            }
+        }
+
+        // A comment body is furniture rather than body flow, exactly as a footnote definition
+        // is, so it is surfaced the same way rather than silently dropped now that it no longer
+        // shares the footnote kind.
+        bool hasComments = doc.Elements.Any(e =>
+            e.Kind.Tag == ElementKindTag.CommentDefinition && e.Layer == ContentLayer.Footnote);
+        if (hasComments)
+        {
+            sb.Append('\n');
+            foreach (var elem in doc.Elements)
+            {
+                if (elem.Kind.Tag == ElementKindTag.CommentDefinition && elem.Layer == ContentLayer.Footnote)
                 {
                     sb.Append(elem.Text);
                     sb.Append("\n\n");

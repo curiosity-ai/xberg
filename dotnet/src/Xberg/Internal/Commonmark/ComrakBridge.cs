@@ -172,7 +172,15 @@ internal static class ComrakBridge
                     {
                         var table = doc.Tables[ti];
                         if (table.Cells.Count > 0)
-                            parent.Append(BuildTable(table.Cells));
+                        {
+                            // Most formats mark their header row by writing one. A CSV, an org
+                            // table or a typst table has a first row that may be data, and the
+                            // extractor says which by whether it recorded `Columns`. Promoting
+                            // that row anyway labels the first record as the column names.
+                            bool hasHeader = doc.SourceFormat is not ("csv" or "orgmode" or "typst")
+                                || table.Columns is not null;
+                            parent.Append(BuildTable(table.Cells, hasHeader));
+                        }
                         else if (table.Markdown.Trim().Length > 0)
                         {
                             var para = new MdNode(NodeType.Paragraph);
@@ -230,7 +238,10 @@ internal static class ComrakBridge
                 }
                 case ElementKindTag.FootnoteDefinition:
                 case ElementKindTag.Citation:
+                case ElementKindTag.CommentDefinition:
                     break; // rendered at the end
+                case ElementKindTag.CommentRef:
+                    break;
                 case ElementKindTag.PageBreak:
                     break;
                 case ElementKindTag.Slide:
@@ -422,6 +433,24 @@ internal static class ComrakBridge
             }
         }
 
+        // Comment definitions are not tracked by the footnote collector, so they are surfaced
+        // the same way citations are above — keyed by anchor — rather than dropped.
+        foreach (var elem in doc.Elements)
+        {
+            if (elem.Kind.Tag == ElementKindTag.CommentDefinition)
+            {
+                string key = elem.Anchor ?? "?";
+                var fndef = new MdNode(NodeType.FootnoteDefinition)
+                {
+                    FootnoteDefinition = new NodeFootnoteDefinition { Name = key, TotalReferences = 1 },
+                };
+                var para = new MdNode(NodeType.Paragraph);
+                para.Append(MkText(elem.Text));
+                fndef.Append(para);
+                root.Append(fndef);
+            }
+        }
+
         return root;
     }
 
@@ -442,10 +471,16 @@ internal static class ComrakBridge
     private static MdNode MkText(string text) =>
         new(NodeType.Text) { Literal = RenderCommon.NormalizeInlineText(text) };
 
-    private static MdNode BuildTable(IReadOnlyList<List<string>> cells)
+    /// <summary>
+    /// Build a pipe table. When <paramref name="hasHeader"/> is false an empty header row is
+    /// synthesized ahead of the data, since GFM has no headerless table and promoting the first
+    /// data row would relabel it as the column names.
+    /// </summary>
+    private static MdNode BuildTable(IReadOnlyList<List<string>> cells, bool hasHeader = true)
     {
         int numCols = cells.Count > 0 ? cells.Max(r => r.Count) : 0;
         int nonEmpty = cells.Sum(r => r.Count(c => c.Length > 0));
+        int syntheticHeaderRows = hasHeader ? 0 : 1;
 
         var tableNode = new MdNode(NodeType.Table)
         {
@@ -453,15 +488,22 @@ internal static class ComrakBridge
             {
                 Alignments = Enumerable.Repeat(TableAlignment.None, numCols).ToList(),
                 NumColumns = numCols,
-                NumRows = cells.Count,
+                NumRows = cells.Count + syntheticHeaderRows,
                 NumNonemptyCells = nonEmpty,
             },
         };
 
+        if (!hasHeader)
+        {
+            var emptyHeader = new MdNode(NodeType.TableRow) { TableRowHeader = true };
+            for (int col = 0; col < numCols; col++) emptyHeader.Append(new MdNode(NodeType.TableCell));
+            tableNode.Append(emptyHeader);
+        }
+
         for (int rowIdx = 0; rowIdx < cells.Count; rowIdx++)
         {
             var row = cells[rowIdx];
-            var rowNode = new MdNode(NodeType.TableRow) { TableRowHeader = rowIdx == 0 };
+            var rowNode = new MdNode(NodeType.TableRow) { TableRowHeader = hasHeader && rowIdx == 0 };
             for (int col = 0; col < numCols; col++)
             {
                 var cellNode = new MdNode(NodeType.TableCell);

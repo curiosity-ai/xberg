@@ -18,7 +18,7 @@ internal static class MimeParser
         byte[] data = MaybeTranscodeUtf16(rawData) ?? rawData;
 
         string latin1 = Encoding.Latin1.GetString(data);
-        MimePart root = ParsePart(latin1);
+        MimePart root = ParsePart(latin1, unterminated: false);
 
         string? subject = DecodeHeaderOpt(root.GetHeader("Subject"));
 
@@ -50,7 +50,7 @@ internal static class MimeParser
         var textParts = new List<MimePart>();
         var htmlParts = new List<MimePart>();
         var attachmentParts = new List<MimePart>();
-        Collect(root, textParts, htmlParts, attachmentParts);
+        Collect(root, null, textParts, htmlParts, attachmentParts);
 
         bool hasGenuineText = textParts.Count > 0;
         bool hasGenuineHtml = htmlParts.Count > 0;
@@ -141,13 +141,28 @@ internal static class MimeParser
     // Part tree parsing
     // -----------------------------------------------------------------------
 
-    private static void Collect(MimePart p, List<MimePart> text, List<MimePart> html, List<MimePart> attach)
+    private static void Collect(MimePart p, MimePart? parent, List<MimePart> text, List<MimePart> html, List<MimePart> attach)
     {
         if (p.IsMultipart)
         {
-            foreach (var child in p.Children) Collect(child, text, html, attach);
+            foreach (var child in p.Children) Collect(child, p, text, html, attach);
             return;
         }
+
+        // A part the boundary never closed is re-read raw and demoted: its media type becomes
+        // "text, other" unless it was text/plain, and it stops counting as inline content. Only
+        // a text/plain still holding its slot in a multipart/alternative stays in the body; every
+        // other shape falls through to the attachment list.
+        if (p.IsEncodingProblem)
+        {
+            bool keepsBodySlot = p.ContentType == "text/plain"
+                && parent is not null
+                && string.Equals(parent.ContentType, "multipart/alternative", StringComparison.Ordinal);
+            if (keepsBodySlot) text.Add(p);
+            else attach.Add(p);
+            return;
+        }
+
         string disp = (p.Disposition ?? "").Trim().ToLowerInvariant();
         if (disp == "attachment") { attach.Add(p); return; }
         if (p.ContentType == "text/plain") { text.Add(p); return; }
@@ -155,7 +170,7 @@ internal static class MimeParser
         attach.Add(p);
     }
 
-    private static MimePart ParsePart(string latin1)
+    private static MimePart ParsePart(string latin1, bool unterminated)
     {
         var part = new MimePart();
 
@@ -195,12 +210,13 @@ internal static class MimeParser
 
         if (part.IsMultipart)
         {
-            foreach (var seg in SplitBoundary(bodyStr, part.Boundary!))
-                part.Children.Add(ParsePart(seg));
+            foreach (var (segment, terminated) in SplitBoundary(bodyStr, part.Boundary!))
+                part.Children.Add(ParsePart(segment, unterminated: !terminated));
         }
         else
         {
             part.BodyLatin1 = bodyStr;
+            part.IsEncodingProblem = unterminated;
         }
 
         return part;
@@ -245,8 +261,12 @@ internal static class MimeParser
         Flush();
     }
 
-    /// <summary>Split a multipart body on its boundary, dropping preamble and epilogue.</summary>
-    private static List<string> SplitBoundary(string body, string boundary)
+    /// <summary>
+    /// Split a multipart body on its boundary, dropping preamble and epilogue. Each segment says
+    /// whether a boundary actually closed it; the last one does not when the message is cut off,
+    /// and it then keeps every byte to the end, trailing newline included.
+    /// </summary>
+    private static List<(string Segment, bool Terminated)> SplitBoundary(string body, string boundary)
     {
         string marker = "--" + boundary;
         var markerPositions = new List<int>();
@@ -260,7 +280,7 @@ internal static class MimeParser
             searchFrom = idx + marker.Length;
         }
 
-        var segments = new List<string>();
+        var segments = new List<(string Segment, bool Terminated)>();
         for (int k = 0; k < markerPositions.Count; k++)
         {
             int start = markerPositions[k];
@@ -273,16 +293,20 @@ internal static class MimeParser
             if (nl < 0) break; // no content follows the marker line
             int contentStart = nl + 1;
 
-            int contentEnd = (k + 1 < markerPositions.Count) ? markerPositions[k + 1] : body.Length;
-            // Strip one trailing newline (and optional CR) that belongs to the next delimiter.
+            bool terminated = k + 1 < markerPositions.Count;
+            int contentEnd = terminated ? markerPositions[k + 1] : body.Length;
             int end = contentEnd;
-            if (end > contentStart && body[end - 1] == '\n')
+            if (terminated)
             {
-                end--;
-                if (end > contentStart && body[end - 1] == '\r') end--;
+                // Strip one trailing newline (and optional CR) that belongs to the next delimiter.
+                if (end > contentStart && body[end - 1] == '\n')
+                {
+                    end--;
+                    if (end > contentStart && body[end - 1] == '\r') end--;
+                }
             }
             if (end < contentStart) end = contentStart;
-            segments.Add(body.Substring(contentStart, end - contentStart));
+            segments.Add((body.Substring(contentStart, end - contentStart), terminated));
         }
         return segments;
     }

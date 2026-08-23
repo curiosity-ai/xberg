@@ -427,26 +427,50 @@ public sealed class PdfDocument
         {
             if (_pages != null) return _pages;
             _pages = new List<PdfDict>();
+            _pageRefs = new List<PdfRef?>();
             var cat = Catalog;
             var pagesRoot = Resolve(cat?.Get("Pages")).AsDict();
             var visited = new HashSet<PdfDict>();
-            if (pagesRoot != null) CollectPages(pagesRoot, new PdfDict(), visited, 0);
+            if (pagesRoot != null) CollectPages(pagesRoot, new PdfDict(), visited, 0, null);
             if (_pages.Count == 0) FallbackCollectPages();
             return _pages;
         }
     }
 
+    private List<PdfRef?>? _pageRefs;
+
+    /// <summary>
+    /// One-based page number for each page's indirect reference, for destinations that
+    /// name a page object (outline items, link annotations).
+    /// </summary>
+    public Dictionary<PdfRef, int> PageNumbersByRef
+    {
+        get
+        {
+            _ = Pages;
+            var map = new Dictionary<PdfRef, int>();
+            if (_pageRefs is null) return map;
+            for (int i = 0; i < _pageRefs.Count; i++)
+                if (_pageRefs[i] is { } r) map[r] = i + 1;
+            return map;
+        }
+    }
+
     private static readonly string[] InheritableKeys = { "Resources", "MediaBox", "CropBox", "Rotate" };
 
-    private void CollectPages(PdfDict node, PdfDict inherited, HashSet<PdfDict> visited, int depth)
+    private void CollectPages(PdfDict node, PdfDict inherited, HashSet<PdfDict> visited, int depth, PdfRef? nodeRef)
     {
         if (depth > 100 || _pages!.Count > 100000) return;
         if (!visited.Add(node)) return;
         string? type = node.Get("Type").AsName();
-        // Build effective inherited attributes.
+        // Build effective inherited attributes. When two Pages nodes on the same root path both
+        // name one, the *outer* one wins: the reference walks the tree once per page into a map
+        // it only ever fills in, so whichever ancestor is reached first is the one a leaf below
+        // sees. ISO 32000-1 §7.7.3.4 gives the nearest ancestor instead, but matching the
+        // reference is what keeps a page's size and resources the same on both sides.
         var eff = new PdfDict();
         foreach (var kv in inherited.Map) eff.Map[kv.Key] = kv.Value;
-        foreach (var k in InheritableKeys) if (node.Has(k)) eff.Map[k] = node.Map[k];
+        foreach (var k in InheritableKeys) if (node.Has(k) && !eff.Has(k)) eff.Map[k] = node.Map[k];
 
         if (type == "Page" || (type == null && node.Has("Contents") && !node.Has("Kids")))
         {
@@ -454,6 +478,7 @@ public sealed class PdfDocument
             foreach (var kv in node.Map) page.Map[kv.Key] = kv.Value;
             foreach (var k in InheritableKeys) if (!page.Has(k) && eff.Has(k)) page.Map[k] = eff.Map[k];
             _pages!.Add(page);
+            _pageRefs?.Add(nodeRef);
             return;
         }
         var kids = Resolve(node.Get("Kids")).AsArray();
@@ -461,7 +486,7 @@ public sealed class PdfDocument
         foreach (var kid in kids.Items)
         {
             var kd = Resolve(kid).AsDict();
-            if (kd != null) CollectPages(kd, eff, visited, depth + 1);
+            if (kd != null) CollectPages(kd, eff, visited, depth + 1, kid as PdfRef);
         }
     }
 
@@ -473,7 +498,10 @@ public sealed class PdfDocument
             var o = LoadObject(num, _xref[num].Gen);
             var d = o.AsDict();
             if (d != null && d.Get("Type").AsName() == "Page")
+            {
                 _pages!.Add(d);
+                _pageRefs?.Add(new PdfRef(num, _xref[num].Gen));
+            }
         }
     }
 
