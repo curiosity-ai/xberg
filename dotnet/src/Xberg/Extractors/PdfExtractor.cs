@@ -22,8 +22,6 @@ public sealed class PdfExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         byte[] bytes = content.ToArray();
-        // Per-document wall-clock guard so pathological files cannot hang extraction.
-        long deadline = config.Options.PdfDeadlineFromNow();
 
         PdfDocument pdf;
         try { pdf = PdfDocument.Open(bytes); }
@@ -32,6 +30,11 @@ public sealed class PdfExtractor : IExtractor
         int pageCount = pdf.PageCount;
         if (pageCount == 0)
             throw new InvalidDataException("pdf has no readable pages");
+
+        // Per-document wall-clock guard so pathological files cannot hang extraction. Scaled by
+        // page count, so it is computed here rather than before the open: a fixed budget either
+        // starves a large document or lets a small broken one spin for just as long.
+        long deadline = config.Options.PdfDeadlineFromNow(pageCount);
 
         // --- Single per-page content pass: page text + font-metric segments ---
         // Content-stream parsing dominates cost, so parse each page exactly once and

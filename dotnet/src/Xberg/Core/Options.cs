@@ -43,36 +43,64 @@ public sealed class XbergOptions
     public bool UsePortedPdfSpans { get; init; } = true;
 
     /// <summary>
-    /// Per-document wall-clock guard for PDF extraction, in seconds, so a pathological file
-    /// cannot hang extraction. Zero or negative disables the guard entirely.
+    /// Fixed part of the per-document wall-clock guard for PDF extraction, in seconds. Also the
+    /// floor: a one-page document still gets this long.
     /// </summary>
-    /// <remarks>
-    /// <para>
-    /// This is a guard against pathological input, not a throughput target, so it is set well
-    /// clear of what legitimate documents need. Measured: the 4778-page Intel SDM extracts fully
-    /// in ~55 s and the 1962-page `algebra_topology` in ~39 s, both scaling linearly at roughly
-    /// 9-20 ms per page with no pathological page. The former default of 25 s cut both off
-    /// mid-document, which is why they failed `plain` and drifted in and out of the corpus
-    /// failure list between runs of identical code on a loaded machine.
-    /// </para>
-    /// <para>
-    /// For scale: upstream's own golden generator takes ~105 s per extraction on that same Intel
-    /// SDM — this port is roughly twice as fast — and its nominal 45 s guard never fires there,
-    /// because `extract` is CPU-bound synchronous work inside an async fn and tokio has no await
-    /// point at which to cancel it. A 25 s guard here could therefore never reproduce goldens
-    /// that were themselves produced by a 105 s run.
-    /// </para>
-    /// </remarks>
-    public int PdfMaxSecondsPerDocument { get; init; } = 120;
+    public int PdfBaseSeconds { get; init; } = 25;
 
     /// <summary>
-    /// Absolute tick deadline for a document starting now, or <see cref="long.MaxValue"/> when
-    /// <see cref="PdfMaxSecondsPerDocument"/> disables the guard.
+    /// Per-page allowance added to <see cref="PdfBaseSeconds"/>, in milliseconds, so the guard
+    /// scales with the work a document actually represents.
     /// </summary>
-    internal long PdfDeadlineFromNow() =>
-        PdfMaxSecondsPerDocument <= 0
-            ? long.MaxValue
-            : DateTime.UtcNow.Ticks + TimeSpan.FromSeconds(PdfMaxSecondsPerDocument).Ticks;
+    /// <remarks>
+    /// Measured on the corpus, extraction is linear in page count at roughly 9-20 ms per page
+    /// (the 4778-page Intel SDM extracts fully in ~55 s, the 1962-page `algebra_topology` in
+    /// ~39 s), with no page behaving differently from its neighbours. 50 ms/page leaves about
+    /// 2.5x headroom over the worst rate observed while still bounding a document that has
+    /// genuinely stopped making progress.
+    /// </remarks>
+    public double PdfMillisecondsPerPage { get; init; } = 50.0;
+
+    /// <summary>
+    /// Ceiling on the computed guard, in seconds, however many pages a document has. Zero or
+    /// negative disables the guard entirely.
+    /// </summary>
+    public int PdfMaxSecondsPerDocument { get; init; } = 3600;
+
+    /// <summary>
+    /// The wall-clock budget for a document of <paramref name="pageCount"/> pages, in seconds:
+    /// <see cref="PdfBaseSeconds"/> plus <see cref="PdfMillisecondsPerPage"/> per page, clamped
+    /// to <see cref="PdfMaxSecondsPerDocument"/>.
+    /// </summary>
+    /// <remarks>
+    /// A fixed guard cannot serve both ends of this corpus: 25 s is generous for the median
+    /// fixture and cuts a 4778-page manual off mid-document, while a flat budget large enough
+    /// for the manual lets a small pathological file spin for just as long. Scaling by page
+    /// count gives each document a budget proportional to the work it represents.
+    ///
+    /// For scale at the top end: upstream's own generator takes ~105 s per extraction on that
+    /// Intel SDM — this port is roughly twice as fast — and its nominal 45 s guard never fires,
+    /// because `extract` is CPU-bound synchronous work inside an async fn and tokio has no await
+    /// point at which to cancel it. Goldens for such files are complete ~105 s extractions, so a
+    /// guard that trips earlier cannot reproduce them however correct the extraction is.
+    /// </remarks>
+    internal double PdfBudgetSeconds(int pageCount)
+    {
+        double budget = PdfBaseSeconds + (PdfMillisecondsPerPage * Math.Max(pageCount, 0) / 1000.0);
+        return Math.Clamp(budget, PdfBaseSeconds, PdfMaxSecondsPerDocument);
+    }
+
+    /// <summary>
+    /// Absolute tick deadline for a document of <paramref name="pageCount"/> pages starting now,
+    /// or <see cref="long.MaxValue"/> when <see cref="PdfMaxSecondsPerDocument"/> disables the
+    /// guard.
+    /// </summary>
+    internal long PdfDeadlineFromNow(int pageCount)
+    {
+        if (PdfMaxSecondsPerDocument <= 0) return long.MaxValue;
+        double seconds = PdfBudgetSeconds(pageCount);
+        return DateTime.UtcNow.Ticks + (long)(seconds * TimeSpan.TicksPerSecond);
+    }
 
     /// <summary>
     /// Build options from <c>XBERG_*</c> environment variables, for test harnesses that drive
@@ -91,8 +119,12 @@ public sealed class XbergOptions
         {
             UsePortedPdfSpans =
                 Flag("XBERG_OXIDE_SPANS") ?? defaults.UsePortedPdfSpans,
+            PdfBaseSeconds =
+                Integer("XBERG_PDF_BASE_SECONDS") ?? defaults.PdfBaseSeconds,
+            PdfMillisecondsPerPage =
+                Number("XBERG_PDF_MS_PER_PAGE") ?? defaults.PdfMillisecondsPerPage,
             PdfMaxSecondsPerDocument =
-                Number("XBERG_PDF_MAX_SECONDS") ?? defaults.PdfMaxSecondsPerDocument,
+                Integer("XBERG_PDF_MAX_SECONDS") ?? defaults.PdfMaxSecondsPerDocument,
         };
 
         static bool? Flag(string name) => Environment.GetEnvironmentVariable(name) switch
@@ -102,7 +134,12 @@ public sealed class XbergOptions
             _ => true,
         };
 
-        static int? Number(string name) =>
+        static int? Integer(string name) =>
             int.TryParse(Environment.GetEnvironmentVariable(name), out int v) ? v : null;
+
+        static double? Number(string name) =>
+            double.TryParse(Environment.GetEnvironmentVariable(name),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double v) ? v : null;
     }
 }

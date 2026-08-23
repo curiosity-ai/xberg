@@ -13,7 +13,43 @@ public class XbergOptionsTests
     {
         var options = new XbergOptions();
         Assert.True(options.UsePortedPdfSpans);
-        Assert.Equal(120, options.PdfMaxSecondsPerDocument);
+        Assert.Equal(25, options.PdfBaseSeconds);
+        Assert.Equal(50.0, options.PdfMillisecondsPerPage);
+        Assert.Equal(3600, options.PdfMaxSecondsPerDocument);
+    }
+
+    [Theory]
+    [InlineData(0, 25.0)]        // floor: even a zero-page document gets the base
+    [InlineData(1, 25.05)]
+    [InlineData(1962, 123.1)]    // algebra_topology, which needs ~39 s
+    [InlineData(4778, 263.9)]    // the Intel SDM, which needs ~55 s
+    public void BudgetScalesWithPageCount(int pageCount, double expectedSeconds)
+    {
+        Assert.Equal(expectedSeconds, new XbergOptions().PdfBudgetSeconds(pageCount), 3);
+    }
+
+    [Fact]
+    public void BudgetIsCappedHoweverManyPages()
+    {
+        var options = new XbergOptions();
+        Assert.Equal(3600, options.PdfBudgetSeconds(10_000_000));
+        // The cap binds from roughly 71,500 pages up; below that the scaling is live.
+        Assert.True(options.PdfBudgetSeconds(70_000) < 3600);
+    }
+
+    [Fact]
+    public void BudgetCoversTheCorpusWorstCasesWithHeadroom()
+    {
+        // Measured wall clock for a full extraction of each, on a quiet machine.
+        var options = new XbergOptions();
+        Assert.True(options.PdfBudgetSeconds(4778) > 55.0 * 2, "Intel SDM needs ~55 s");
+        Assert.True(options.PdfBudgetSeconds(1962) > 39.0 * 2, "algebra_topology needs ~39 s");
+    }
+
+    [Fact]
+    public void NegativePageCountFallsBackToTheBase()
+    {
+        Assert.Equal(25.0, new XbergOptions().PdfBudgetSeconds(-1), 3);
     }
 
     [Fact]
@@ -48,22 +84,23 @@ public class XbergOptionsTests
     }
 
     [Fact]
-    public void NonPositiveDeadlineDisablesTheGuard()
+    public void NonPositiveCapDisablesTheGuard()
     {
-        // A guard of "0 seconds" would otherwise mean "every document is already too late".
-        Assert.Equal(long.MaxValue, new XbergOptions { PdfMaxSecondsPerDocument = 0 }.PdfDeadlineFromNow());
-        Assert.Equal(long.MaxValue, new XbergOptions { PdfMaxSecondsPerDocument = -1 }.PdfDeadlineFromNow());
+        // A cap of "0 seconds" would otherwise mean "every document is already too late".
+        Assert.Equal(long.MaxValue, new XbergOptions { PdfMaxSecondsPerDocument = 0 }.PdfDeadlineFromNow(10));
+        Assert.Equal(long.MaxValue, new XbergOptions { PdfMaxSecondsPerDocument = -1 }.PdfDeadlineFromNow(10));
     }
 
     [Fact]
-    public void PositiveDeadlineIsInTheFutureAndScalesWithTheSetting()
+    public void DeadlineIsInTheFutureAndGrowsWithPageCount()
     {
         long now = DateTime.UtcNow.Ticks;
-        long shortDeadline = new XbergOptions { PdfMaxSecondsPerDocument = 1 }.PdfDeadlineFromNow();
-        long longDeadline = new XbergOptions { PdfMaxSecondsPerDocument = 300 }.PdfDeadlineFromNow();
+        var options = new XbergOptions();
+        long small = options.PdfDeadlineFromNow(1);
+        long large = options.PdfDeadlineFromNow(5000);
 
-        Assert.True(shortDeadline > now);
-        Assert.True(longDeadline > shortDeadline);
+        Assert.True(small > now);
+        Assert.True(large > small);
     }
 
     [Theory]
@@ -82,12 +119,29 @@ public class XbergOptionsTests
     [Theory]
     [InlineData("300", 300)]
     [InlineData("0", 0)]
-    [InlineData(null, 120)]
-    [InlineData("not-a-number", 120)]   // unparseable leaves the default in place
+    [InlineData(null, 3600)]
+    [InlineData("not-a-number", 3600)]   // unparseable leaves the default in place
     public void FromEnvironmentReadsNumbers(string? value, int expected)
     {
         WithEnvironment("XBERG_PDF_MAX_SECONDS", value, () =>
             Assert.Equal(expected, XbergOptions.FromEnvironment().PdfMaxSecondsPerDocument));
+    }
+
+    [Theory]
+    [InlineData("10", 10.0)]
+    [InlineData("0.5", 0.5)]            // fractional ms/page must survive the round trip
+    [InlineData(null, 50.0)]
+    public void FromEnvironmentReadsThePerPageAllowance(string? value, double expected)
+    {
+        WithEnvironment("XBERG_PDF_MS_PER_PAGE", value, () =>
+            Assert.Equal(expected, XbergOptions.FromEnvironment().PdfMillisecondsPerPage));
+    }
+
+    [Fact]
+    public void FromEnvironmentReadsTheBase()
+    {
+        WithEnvironment("XBERG_PDF_BASE_SECONDS", "90", () =>
+            Assert.Equal(90, XbergOptions.FromEnvironment().PdfBaseSeconds));
     }
 
     [Fact]
@@ -101,6 +155,8 @@ public class XbergOptionsTests
                 var options = XbergOptions.FromEnvironment();
                 Assert.Equal(300, options.PdfMaxSecondsPerDocument);
                 Assert.True(options.UsePortedPdfSpans);
+                Assert.Equal(25, options.PdfBaseSeconds);
+                Assert.Equal(50.0, options.PdfMillisecondsPerPage);
             });
         });
     }
