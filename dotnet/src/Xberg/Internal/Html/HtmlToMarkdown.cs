@@ -471,6 +471,14 @@ internal static class HtmlToMarkdown
         public bool InOrderedList { get; init; }
         public int ListCounter { get; init; }
         public int ListDepth { get; init; }
+        /// <summary>
+        /// Cumulative width of every ancestor <c>&lt;li&gt;</c>'s own marker — the column at
+        /// which this item's content starts. An ordered marker is wider than a bullet
+        /// (<c>"10. "</c> is 4 columns), and a nested list has to be indented to its parent
+        /// marker's actual content column or CommonMark reads it as a sibling rather than
+        /// nested content.
+        /// </summary>
+        public int ListIndentColumns { get; init; }
         public int UlDepth { get; init; }
         public bool LooseList { get; init; }
         public bool PrevItemHadBlocks { get; init; }
@@ -1073,7 +1081,9 @@ internal static class HtmlToMarkdown
         else if (isListContinuation)
         {
             if (!EndsWith(output, " ") && !EndsWith(output, "\n")) output.Append(' ');
-            output.Append(' ', 4 * ctx.ListDepth);
+            // The column this item's own content starts at, not a uniform per-depth offset
+            // that ignores how wide an ordered marker is.
+            output.Append(' ', ctx.ListIndentColumns);
         }
         else if (needsLeadingSep)
         {
@@ -2218,7 +2228,7 @@ internal static class HtmlToMarkdown
     private static void HandleLi(HNode node, StringBuilder output, Ctx ctx)
     {
         if (ctx.ListDepth > 0)
-            output.Append(' ', ctx.ListDepth * 2);
+            output.Append(' ', ctx.ListIndentColumns);
 
         bool hasBlockChildren = false;
         foreach (var child in node.Children)
@@ -2230,10 +2240,23 @@ internal static class HtmlToMarkdown
             }
         }
 
-        var liCtx = ctx with { InListItem = true, ListDepth = ctx.ListDepth + 1 };
-
         // task lists: find checkbox
         var checkbox = FindCheckbox(node);
+
+        // This item's own marker width, which is what descendants — nested lists and
+        // continuation content — indent by. A bullet or task marker is always 2 columns
+        // ("- "); an ordered marker's width follows its counter's digit count ("1. " is 3,
+        // "10. " is 4). The configured indent width is a floor, not the literal width.
+        int ownMarkerWidth = checkbox is not null || !ctx.InOrderedList
+            ? 2
+            : Math.Max(2, $"{ctx.ListCounter}. ".Length);
+
+        var liCtx = ctx with
+        {
+            InListItem = true,
+            ListDepth = ctx.ListDepth + 1,
+            ListIndentColumns = ctx.ListIndentColumns + ownMarkerWidth,
+        };
         int itemStart;
         if (checkbox is not null)
         {
@@ -2444,7 +2467,65 @@ internal static class HtmlToMarkdown
         public int NestedTableCount, LinkCount;
     }
 
-    private static void ScanTableNode(HNode node, bool isRoot, TableScan scan)
+    /// <summary>
+    /// Scan a table for the signals the layout-table heuristic reads.
+    /// </summary>
+    /// <remarks>
+    /// The two groups come from different subtrees. <c>HasText</c>, <c>LinkCount</c>,
+    /// <c>HasHeader</c> and <c>HasCaption</c> answer "is there any semantic content here at
+    /// all", so they are gathered from the whole subtree, nested tables included.
+    /// <c>RowCounts</c>, <c>NestedTableCount</c> and <c>HasSpan</c> feed the layout decision
+    /// and describe only <em>this</em> table's own structure — a straight chain of
+    /// one-nested-table-per-cell tables is not a layout table, and counting the inner
+    /// tables' rows as if they were this one's is what used to make it look like one.
+    /// </remarks>
+    private static TableScan ScanTable(HNode node)
+    {
+        var scan = new TableScan();
+        ScanOwnStructure(node, scan);
+        AccumulateContent(node, scan);
+        return scan;
+    }
+
+    /// <summary>
+    /// Collect the table's own direct row/cell structure: per-row cell counts, whether any
+    /// cell spans, and how many <c>&lt;table&gt;</c> elements are nested directly inside it.
+    /// A nested table's own subtree is never walked — none of these fields count content past
+    /// that boundary anyway.
+    /// </summary>
+    private static void ScanOwnStructure(HNode root, TableScan scan)
+    {
+        var work = new Stack<HNode>();
+        for (int i = root.Children.Count - 1; i >= 0; i--) work.Push(root.Children[i]);
+        while (work.Count > 0)
+        {
+            var n = work.Pop();
+            if (n.IsComment || n.Tag is null) continue;
+            if (n.Tag == "table") { scan.NestedTableCount++; continue; }
+            if (n.Tag == "tr")
+            {
+                int cellCount = 0;
+                foreach (var child in n.Children)
+                {
+                    if (child.Tag is "td" or "th")
+                    {
+                        cellCount += GetColspan(child);
+                        if (child.Attr("colspan") is not null || child.Attr("rowspan") is not null)
+                            scan.HasSpan = true;
+                    }
+                }
+                scan.RowCounts.Add(cellCount);
+                // Still descend into the row's cells — not their counts, already taken above —
+                // so a `<table>` inside a `<td>` is found and counted. Only a nested `<table>`
+                // tag itself stops this walk.
+            }
+            for (int i = n.Children.Count - 1; i >= 0; i--) work.Push(n.Children[i]);
+        }
+    }
+
+    /// <summary>Fold the whole subtree's semantic content — text, links, headers, caption —
+    /// into the scan, crossing nested-table boundaries.</summary>
+    private static void AccumulateContent(HNode node, TableScan scan)
     {
         if (node.IsComment) return;
         if (node.Tag is null)
@@ -2461,26 +2542,8 @@ internal static class HtmlToMarkdown
             case "img":
                 if (node.Attr("src") is not null || node.Attr("alt") is not null) scan.HasText = true;
                 break;
-            case "table":
-                if (!isRoot) scan.NestedTableCount++;
-                break;
-            case "tr":
-            {
-                int cellCount = 0;
-                foreach (var child in node.Children)
-                {
-                    if (child.Tag is "td" or "th")
-                    {
-                        cellCount += GetColspan(child);
-                        if (child.Attr("colspan") is not null || child.Attr("rowspan") is not null)
-                            scan.HasSpan = true;
-                    }
-                }
-                scan.RowCounts.Add(cellCount);
-                break;
-            }
         }
-        foreach (var c in node.Children) ScanTableNode(c, false, scan);
+        foreach (var c in node.Children) AccumulateContent(c, scan);
     }
 
     private static int GetColspan(HNode cell)
@@ -2573,8 +2636,7 @@ internal static class HtmlToMarkdown
 
     private static void HandleTable(HNode node, StringBuilder output, Ctx ctx)
     {
-        var scan = new TableScan();
-        ScanTableNode(node, true, scan);
+        var scan = ScanTable(node);
 
         var distinctCounts = scan.RowCounts.Where(c => c > 0).Distinct().ToList();
         bool hasBorderZero = node.Attr("border") == "0";
