@@ -587,7 +587,10 @@ internal static class HtmlToMarkdown
                     var t = new StringBuilder();
                     foreach (var tc in child.Children)
                         if (tc.Tag is null && !tc.IsComment) t.Append(tc.Text);
-                    string title = t.ToString().Trim();
+                    // Upstream reads the raw text here, but its parser hands the head to the
+                    // converter with character references already resolved; this port's reader
+                    // does not, so `&mdash;` would reach the front matter as its source spelling.
+                    string title = HtmlWalker.DecodeEntitiesFull(t.ToString()).Trim();
                     if (title.Length > 0) metadata["title"] = title;
                     break;
                 }
@@ -2331,15 +2334,21 @@ internal static class HtmlToMarkdown
         }
         else
         {
-            if (!ctx.InTableCell)
+            if (ctx.InTableCell)
             {
-                if (ctx.InOrderedList) output.Append(ctx.ListCounter).Append(". ");
-                else
-                {
-                    const string bullets = "-*+";
-                    int idx = ctx.UlDepth > 0 ? (ctx.UlDepth - 1) % bullets.Length : 0;
-                    output.Append(bullets[idx]).Append(' ');
-                }
+                // A GFM pipe cell cannot hold block content, so sibling `<li>`s inside one lose
+                // their marker (below) and would otherwise run together with no separator at
+                // all. The same leading-separator helper that runs before the enclosing
+                // `<ul>`/`<ol>` gives each item the `<br>` boundary already established for
+                // `<p>`/`<div>` siblings in a cell.
+                AddListLeadingSeparator(output, ctx);
+            }
+            else if (ctx.InOrderedList) output.Append(ctx.ListCounter).Append(". ");
+            else
+            {
+                const string bullets = "-*+";
+                int idx = ctx.UlDepth > 0 ? (ctx.UlDepth - 1) % bullets.Length : 0;
+                output.Append(bullets[idx]).Append(' ');
             }
 
             itemStart = output.Length;
