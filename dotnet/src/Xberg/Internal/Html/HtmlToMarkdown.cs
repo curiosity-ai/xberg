@@ -760,9 +760,14 @@ internal static class HtmlToMarkdown
                 break; // no-op outside table context
             case "head": case "script": case "style":
                 break; // metadata / non-content
-            // `template`, `noscript` and a stray body `title` have no arm of their own upstream:
-            // they reach the unknown handler, which renders their children. A no-JS fallback
-            // `<img>` is the page's only copy of that image, so dropping it loses content.
+            // `<template>` is an inert, unrendered document fragment per the HTML spec, and
+            // `<noscript>` content only renders with scripting disabled — never true for a
+            // Markdown conversion, which mirrors a scripting-enabled browser. Neither may reach
+            // the output, even though a no-JS fallback `<img>` is sometimes the page's only copy
+            // of that image. A stray body `title` still has no arm of its own upstream: it
+            // reaches the unknown handler, which renders its children.
+            case "template": case "noscript":
+                break; // inert / scripting-disabled-only content
             case "meta": case "link": case "base":
                 break; // void metadata elements: no children to render
             case "html": case "body":
@@ -897,7 +902,9 @@ internal static class HtmlToMarkdown
         }
         else if (ctx.InTableCell)
         {
-            string normalized = NormalizeWhitespaceKeepNewlines(text);
+            // A table cell cannot hold a hard line break, so unlike the block-level
+            // normalizer this folds `\n` and `\r` into the run before collapsing.
+            string normalized = NormalizeCellWhitespace(text);
             processed = EscapeCellText(normalized);
         }
         else
@@ -1049,13 +1056,19 @@ internal static class HtmlToMarkdown
         bool isListContinuation = ctx.InListItem && output.Length > 0
             && !EndsWith(output, "* ") && !EndsWith(output, "- ") && !EndsWith(output, ". ");
         bool afterCodeBlock = EndsWith(output, "```\n");
+        // Inside a blockquote, sibling blocks (heading, list, table, pre) manage their own
+        // trailing spacing and self-terminate without a blank line. The case that still needs
+        // a separator is a paragraph straight after bare inline text, which leaves no trailing
+        // newline at all — without one the "> " prefixing pass merges the two into a single
+        // line. Requiring *no* trailing newline (rather than no blank line) keeps the compact
+        // heading-then-paragraph style intact.
         bool needsLeadingSep = !ctx.InTableCell && !ctx.InListItem && !ctx.ConvertAsInline
-            && ctx.BlockquoteDepth == 0 && output.Length > 0 && !EndsWith(output, "\n\n") && !afterCodeBlock;
+            && output.Length > 0 && !afterCodeBlock
+            && (ctx.BlockquoteDepth > 0 ? !EndsWith(output, "\n") : !EndsWith(output, "\n\n"));
 
         if (isTableContinuation)
         {
-            TrimTrailingWhitespace(output);
-            output.Append("<br>");
+            EmitTableCellBreak(output);
         }
         else if (isListContinuation)
         {
@@ -1107,8 +1120,7 @@ internal static class HtmlToMarkdown
 
         if (isTableContinuation)
         {
-            TrimTrailingWhitespace(output);
-            output.Append("  \n");   // NewlineStyle::Spaces, br_in_tables=false
+            EmitTableCellBreak(output);
         }
         else if (isListContinuation)
         {
@@ -1429,22 +1441,71 @@ internal static class HtmlToMarkdown
     private static void AppendMarkdownLink(StringBuilder output, string label, string href, string? title)
     {
         output.Append('[').Append(label).Append("](");
-        if (href.Length == 0) output.Append("<>");
-        else if (href.Contains(' ') || href.Contains('\n')) output.Append('<').Append(href).Append('>');
-        else
-        {
-            int open = href.Count(c => c == '(');
-            int close = href.Count(c => c == ')');
-            if (open == close) output.Append(href);
-            else output.Append(href.Replace("(", "\\(").Replace(")", "\\)"));
-        }
+        AppendUrlDestination(output, href);
         if (title is not null)
         {
             output.Append(" \"");
-            output.Append(title.Contains('"') ? title.Replace("\"", "\\\"") : title);
+            AppendEscapedMarkdownTitle(output, title);
             output.Append('"');
         }
         output.Append(')');
+    }
+
+    /// <summary>
+    /// Whether every <c>)</c> in a destination is matched by a preceding <c>(</c>, and every
+    /// <c>(</c> is closed. A raw Markdown destination may hold parentheses only as a properly
+    /// nested balanced pair (CommonMark 6.3) — counting the two separately calls <c>")("</c>
+    /// balanced, which it is not.
+    /// </summary>
+    private static bool ParensAreBalanced(string href)
+    {
+        int depth = 0;
+        foreach (char c in href)
+        {
+            if (c == '(') depth++;
+            else if (c == ')' && --depth < 0) return false;
+        }
+        return depth == 0;
+    }
+
+    /// <summary>
+    /// Append a Markdown destination — the <c>(...)</c> body, without the parens themselves.
+    /// Shared by the link and image handlers so a destination is treated the same whichever
+    /// element produced it.
+    /// </summary>
+    private static void AppendUrlDestination(StringBuilder output, string dest)
+    {
+        if (dest.Length == 0) { output.Append("<>"); return; }
+        if (dest.Contains(' ') || dest.Contains('\n'))
+        {
+            // An angle-bracket destination may hold raw parentheses, but a raw `<`, `>` or an
+            // unescaped `\` — which would otherwise merge with the next escaped character and
+            // un-escape it — closes the wrap early, so all three are escaped inside it.
+            output.Append('<');
+            foreach (char c in dest)
+            {
+                if (c == '\\') output.Append("\\\\");
+                else if (c == '<') output.Append("\\<");
+                else if (c == '>') output.Append("\\>");
+                else output.Append(c);
+            }
+            output.Append('>');
+            return;
+        }
+        if (ParensAreBalanced(dest)) output.Append(dest);
+        else output.Append(dest.Replace("(", "\\(").Replace(")", "\\)"));
+    }
+
+    /// <summary>
+    /// Escape a title for interpolation into a double-quoted <c>"..."</c>. Backslashes go first:
+    /// a title ending in a literal <c>\</c> would otherwise make the closing <c>"</c> read as an
+    /// escaped quote, letting the title — and the destination after it — run into the rest of
+    /// the document.
+    /// </summary>
+    private static void AppendEscapedMarkdownTitle(StringBuilder output, string text)
+    {
+        if (!text.Contains('\\') && !text.Contains('"')) { output.Append(text); return; }
+        output.Append(text.Replace("\\", "\\\\").Replace("\"", "\\\""));
     }
 
     private static (int level, HNode node)? FindSingleHeadingChild(HNode node)
@@ -1851,18 +1912,32 @@ internal static class HtmlToMarkdown
         bool shouldUseAltText = ctx.ConvertAsInline || ctx.InHeading;
         if (shouldUseAltText) { output.Append(alt); return; }
 
-        output.Append("![").Append(alt).Append("](");
-        if (src.Length == 0) output.Append("<>");
-        else if (src.Contains(' ') || src.Contains('\n')) output.Append('<').Append(src).Append('>');
-        else
+        // The alt text is escaped like a link label: an inert `alt` holding `]` and `(` would
+        // otherwise close the image early and open a second, attacker-controlled link.
+        output.Append("![").Append(EscapeLinkLabel(alt)).Append("](");
+        AppendUrlDestination(output, src);
+        if (title is not null)
         {
-            int open = src.Count(c => c == '(');
-            int close = src.Count(c => c == ')');
-            if (open == close) output.Append(src);
-            else output.Append(src.Replace("(", "\\(").Replace(")", "\\)"));
+            output.Append(" \"");
+            AppendEscapedMarkdownTitle(output, title);
+            output.Append('"');
         }
-        if (title is not null) output.Append(" \"").Append(title).Append('"');
         output.Append(')');
+    }
+
+    /// <summary>
+    /// Emit a line break for a <c>&lt;br&gt;</c>, <c>&lt;div&gt;</c> or <c>&lt;p&gt;</c>
+    /// continuation inside a table cell. A cell cannot contain a hard line break — neither
+    /// newline style is valid there, and a raw newline splits the row's pipe syntax across
+    /// physical lines — so the newline style is never consulted: source whitespace before the
+    /// break is trimmed and the continuation collapses to a single space (this port's options
+    /// leave <c>br_in_tables</c> off). The emptiness guard suppresses a leading space when the
+    /// continuation is the cell's first content.
+    /// </summary>
+    private static void EmitTableCellBreak(StringBuilder output)
+    {
+        TrimTrailingWhitespace(output);
+        if (output.Length > 0) output.Append(' ');
     }
 
     // ── br / hr ──────────────────────────────────────────────────────────────
@@ -1872,6 +1947,11 @@ internal static class HtmlToMarkdown
         {
             TrimTrailingWhitespace(output);
             output.Append("  ");
+        }
+        else if (ctx.InTableCell)
+        {
+            // Shared with div/p continuations inside a cell.
+            EmitTableCellBreak(output);
         }
         else if (output.Length == 0 || EndsWith(output, "\n")) output.Append('\n');
         else output.Append("  \n");
@@ -2875,6 +2955,18 @@ internal static class HtmlToMarkdown
             else { sb.Append(ch); prevWasSpace = false; }
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Normalize whitespace inside a Markdown table cell. A cell cannot contain a hard line
+    /// break, so unlike <see cref="NormalizeWhitespaceKeepNewlines"/> — which keeps <c>\n</c>
+    /// for block-level rendering — this folds <c>\n</c> and <c>\r</c> into the run before
+    /// collapsing consecutive whitespace to one ASCII space.
+    /// </summary>
+    internal static string NormalizeCellWhitespace(string text)
+    {
+        if (!text.Contains('\n') && !text.Contains('\r')) return NormalizeWhitespaceKeepNewlines(text);
+        return NormalizeWhitespaceKeepNewlines(text.Replace('\n', ' ').Replace('\r', ' '));
     }
 
     private static bool IsUnicodeSpace(char ch) => ch is '\u00A0' or '\u1680'

@@ -725,11 +725,11 @@ public class HtmlExtractorTests
     /// copy of that image.
     /// </summary>
     [Fact]
-    public void TemplateAndNoscriptContentIsRendered()
+    public void TemplateAndNoscriptContentIsDropped()
     {
-        Assert.Equal("before\n\n![](/y.png)\n\nafter\n", HtmlToMarkdown.Convert(
+        Assert.Equal("before\n\nafter\n", HtmlToMarkdown.Convert(
             "<p>before</p><noscript><img src=\"/y.png\" alt=\"\"></noscript><p>after</p>"));
-        Assert.Equal("a\n\ninside\n\nb\n", HtmlToMarkdown.Convert(
+        Assert.Equal("a\n\nb\n", HtmlToMarkdown.Convert(
             "<p>a</p><template><p>inside</p></template><p>b</p>"));
     }
 
@@ -768,14 +768,15 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
-    /// A `<span>` pops the newline before it so an element boundary does not break a line, but
-    /// never a markdown hard break: `<td>a<br>b</td>` keeps its break even when `b` is wrapped.
+    /// A `<br>` inside a table cell collapses to a single space: a GFM cell cannot hold a hard
+    /// break, so neither newline style is emitted there and the source whitespace around the
+    /// break is trimmed rather than leaked.
     /// </summary>
     [Fact]
-    public void ASpanDoesNotSwallowAHardBreak()
+    public void ABrInATableCellCollapsesToASpace()
     {
         var doc = Html("<table><tr><td><span>A</span><br /><span>B</span></td></tr></table>");
-        Assert.Equal(new List<string> { "A \nB" }, Assert.Single(doc.Tables).Cells[0]);
+        Assert.Equal(new List<string> { "A B" }, Assert.Single(doc.Tables).Cells[0]);
     }
 
     /// <summary>
