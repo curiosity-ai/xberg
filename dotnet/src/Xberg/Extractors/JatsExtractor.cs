@@ -147,7 +147,29 @@ public sealed class JatsExtractor : IExtractor
                         foreach (var latex in paraFormulas) builder.PushFormula(latex, null, null);
                         break;
                     }
-                    case "fig" when inBody: ExtractText(reader); break;
+                    case "fig" when inBody:
+                    {
+                        var (label, caption, href) = ExtractFigContent(reader);
+                        string captionFull = (label, caption) switch
+                        {
+                            (not null, not null) => $"{label}: {caption}",
+                            (not null, null) => label,
+                            (null, not null) => caption,
+                            _ => "",
+                        };
+                        if (captionFull.Length == 0 && href is null) break;
+                        string display = (href, captionFull.Length == 0) switch
+                        {
+                            (not null, false) => $"![{captionFull}]({href})",
+                            (not null, true) => $"![]({href})",
+                            (null, false) => captionFull,
+                            _ => "",
+                        };
+                        if (display.Length > 0) builder.PushParagraph(display, new(), null, null);
+                        if (href is not null)
+                            builder.PushUri(new ExtractedUri { Url = href, Label = captionFull.Length == 0 ? null : captionFull, Kind = UriKind.Image });
+                        break;
+                    }
                     case "disp-formula" when inBody:
                     case "inline-formula" when inBody:
                     {
@@ -265,6 +287,9 @@ public sealed class JatsExtractor : IExtractor
         var volume = new StringBuilder();
         var fpage = new StringBuilder();
         var lpage = new StringBuilder();
+        var doi = new StringBuilder();
+        var publisherName = new StringBuilder();
+        var publisherLoc = new StringBuilder();
         string currentTag = "";
         var mixed = new StringBuilder();
 
@@ -284,7 +309,17 @@ public sealed class JatsExtractor : IExtractor
                     case "name" when inPersonGroup: inName = true; surname.Clear(); given.Clear(); break;
                     case "surname": case "given-names": case "article-title": case "source":
                     case "year": case "volume": case "fpage": case "lpage":
+                    case "publisher-name": case "publisher-loc":
                         if (inElementCitation) currentTag = tag; break;
+                    // A reference carries its DOI as `<pub-id pub-id-type="doi">`, so the
+                    // identifier's type lives in an attribute rather than in the element name.
+                    case "pub-id": case "article-id":
+                    {
+                        if (!inElementCitation) break;
+                        foreach (var (key, value) in ev.Attrs ?? new List<(string, string)>())
+                            if (key == "pub-id-type" && value == "doi") currentTag = "pub-id-doi";
+                        break;
+                    }
                 }
             }
             else if (ev.Kind == XmlEv.End)
@@ -327,6 +362,9 @@ public sealed class JatsExtractor : IExtractor
                             case "volume": volume.Append(trimmed); break;
                             case "fpage": fpage.Append(trimmed); break;
                             case "lpage": lpage.Append(trimmed); break;
+                            case "pub-id-doi": doi.Append(trimmed); break;
+                            case "publisher-name": publisherName.Append(trimmed); break;
+                            case "publisher-loc": publisherLoc.Append(trimmed); break;
                         }
                     }
                 }
@@ -343,7 +381,94 @@ public sealed class JatsExtractor : IExtractor
         if (volume.Length > 0) { citation.Append(';'); citation.Append(volume); }
         if (fpage.Length > 0) { citation.Append(':'); citation.Append(fpage); if (lpage.Length > 0) { citation.Append('-'); citation.Append(lpage); } }
         if (citation.Length > 0 && citation[^1] != '.') citation.Append('.');
+        if (publisherLoc.Length > 0 || publisherName.Length > 0)
+        {
+            if (citation.Length > 0) citation.Append(' ');
+            if (publisherLoc.Length > 0) citation.Append(publisherLoc);
+            if (publisherLoc.Length > 0 && publisherName.Length > 0) citation.Append(": ");
+            if (publisherName.Length > 0) citation.Append(publisherName);
+            citation.Append('.');
+        }
+        if (doi.Length > 0)
+        {
+            if (citation.Length > 0) citation.Append(' ');
+            citation.Append("DOI: ").Append(doi).Append('.');
+        }
         return citation.ToString().Trim();
+    }
+
+    // ── extract_fig_content (parser.rs) ──────────────────────────────────────
+    /// <summary>
+    /// Read a JATS <c>&lt;fig&gt;</c> element and return its label, caption text and graphic
+    /// reference, so the caller can pair the caption with the image instead of dropping or
+    /// flattening them.
+    /// </summary>
+    private static (string? label, string? caption, string? href) ExtractFigContent(XmlPullReader reader)
+    {
+        int depth = 0;
+        bool inCaption = false;
+        string currentTag = "";
+        var label = new StringBuilder();
+        var caption = new StringBuilder();
+        string? href = null;
+
+        // `xlink:href` is the usual spelling, but a namespace-less document writes plain
+        // `href` and another prefix is legal, so any `*:href` counts.
+        void ReadGraphicHref(XmlToken tag)
+        {
+            foreach (var (key, value) in tag.Attrs ?? new List<(string, string)>())
+                if (key == "xlink:href" || key.EndsWith(":href", StringComparison.Ordinal) || key == "href")
+                    href = value;
+        }
+
+        while (true)
+        {
+            var ev = reader.Read();
+            if (ev.Kind == XmlEv.Eof) break;
+            if (ev.Kind == XmlEv.Start)
+            {
+                depth++;
+                switch (ev.Name)
+                {
+                    case "caption": inCaption = true; break;
+                    case "label": case "title": case "p": currentTag = ev.Name; break;
+                    case "graphic": ReadGraphicHref(ev); break;
+                }
+            }
+            // `<graphic xlink:href="..."/>` is almost always self-closing, which the reader
+            // reports as a standalone Empty token with no matching End, so it needs its own
+            // arm or the href is silently dropped.
+            else if (ev.Kind == XmlEv.Empty)
+            {
+                if (ev.Name == "graphic") ReadGraphicHref(ev);
+            }
+            else if (ev.Kind == XmlEv.End)
+            {
+                if (depth == 0) break;
+                if (ev.Name == "caption") inCaption = false;
+                currentTag = "";
+                depth--;
+            }
+            else if (ev.Kind == XmlEv.Text)
+            {
+                string trimmed = ev.Text.Trim();
+                if (trimmed.Length == 0) continue;
+                if (currentTag == "label")
+                {
+                    if (label.Length > 0) label.Append(' ');
+                    label.Append(trimmed);
+                }
+                else if (inCaption && (currentTag == "title" || currentTag == "p"))
+                {
+                    if (caption.Length > 0) caption.Append(' ');
+                    caption.Append(trimmed);
+                }
+            }
+        }
+
+        return (label.Length == 0 ? null : label.ToString(),
+                caption.Length == 0 ? null : caption.ToString(),
+                href);
     }
 
     // ── extract_para_with_annotations_jats (mod.rs) ──────────────────────────
