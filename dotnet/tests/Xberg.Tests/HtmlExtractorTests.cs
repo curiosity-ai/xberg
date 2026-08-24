@@ -751,19 +751,37 @@ public class HtmlExtractorTests
         => Assert.Equal("a\n\nStray\n\nb\n", HtmlToMarkdown.Convert("<body><p>a</p><title>Stray</title><p>b</p></body>"));
 
     /// <summary>
-    /// `strip_hidden_elements` runs over the source text and looks for the word `hidden`
-    /// anywhere after the tag name, so a quoted attribute value containing it takes the whole
-    /// element with it. `data-hidden` and `aria-hidden` still do not match.
+    /// `strip_hidden_elements` walks name=value pairs rather than scanning the tag's text for
+    /// the word `hidden`, so a quoted value containing it no longer takes the whole visible
+    /// element with it. `data-hidden` and `aria-hidden` are different names and never matched.
     /// </summary>
     [Fact]
-    public void AnAttributeValueContainingTheWordHiddenStripsTheElement()
+    public void OnlyTheHiddenAttributeItselfStripsTheElement()
     {
         Assert.Equal("kept\n", HtmlToMarkdown.Convert(
             "<p>kept</p><p hidden>gone</p>"));
-        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
-            "<p>kept</p><p title=\"pages with hidden wikidata\">gone</p>"));
+        Assert.Equal("kept\n\nstays\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><p title=\"pages with hidden wikidata\">stays</p>"));
         Assert.Equal("kept\n\nstays\n", HtmlToMarkdown.Convert(
             "<p>kept</p><p data-hidden=\"1\" aria-hidden=\"true\">stays</p>"));
+    }
+
+    /// <summary>
+    /// An inline `style` that hides the element strips it too. The last declaration for a
+    /// property wins, so `display:none; display:block` is visible, and a comment before the
+    /// property name does not defeat the check.
+    /// </summary>
+    [Fact]
+    public void AnInlineStyleThatHidesTheElementStripsIt()
+    {
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"display: none\">gone</div>"));
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"visibility:hidden\">gone</div>"));
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"/* note */ display:none\">gone</div>"));
+        Assert.Equal("kept\n\nshown\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"display:none; display:block\">shown</div>"));
     }
 
     /// <summary>

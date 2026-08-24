@@ -406,7 +406,8 @@ internal static class HtmlToMarkdown
             int tagEnd = FindTagEndQuoted(html, idx + 1);
             if (tagEnd < 0) break;
 
-            if (!TagHasHiddenAttribute(html, idx, tagEnd)) { idx++; continue; }
+            if (!TagHasHiddenAttribute(html, idx, tagEnd) && !TagHasHiddenStyle(html, idx, tagEnd))
+            { idx++; continue; }
 
             int nameEnd = idx + 1;
             while (nameEnd < n && !char.IsWhiteSpace(html[nameEnd]) && html[nameEnd] != '>' && html[nameEnd] != '/')
@@ -472,20 +473,113 @@ internal static class HtmlToMarkdown
     /// the word, whitespace-delimited, anywhere after the tag name. Quoting is not considered, so
     /// <c>data-hidden</c> and <c>aria-hidden</c> are excluded but a value's own words are not.
     /// </summary>
+    /// <summary>
+    /// Whether an opening tag carries the <c>hidden</c> attribute.
+    /// </summary>
+    /// <remarks>
+    /// Walks name=value pairs rather than scanning the tag's raw text for the word: a plain
+    /// substring scan also matches inside a quoted <em>value</em>, so
+    /// <c>&lt;div title="… hidden from search engines"&gt;</c> read as hidden and took the whole
+    /// visible element with it. <c>data-hidden</c> and <c>aria-hidden</c> are different names and
+    /// do not match.
+    /// </remarks>
     private static bool TagHasHiddenAttribute(string html, int start, int end)
     {
-        const string Needle = "hidden";
-        int i = start;
-        while (i < end && html[i] != ' ' && html[i] != '\t' && html[i] != '\n' && html[i] != '>') i++;
-        for (; i + Needle.Length <= end; i++)
-        {
-            if (string.Compare(html, i, Needle, 0, Needle.Length, StringComparison.OrdinalIgnoreCase) != 0) continue;
-            if (i > start && !char.IsWhiteSpace(html[i - 1])) continue;
-            if (i + Needle.Length == end) return true;
-            char after = html[i + Needle.Length];
-            if (after is ' ' or '\t' or '\n' or '\r' or '>' or '=' or '/') return true;
-        }
+        foreach (var (name, _) in TagAttributes(html, start, end))
+            if (name.Equals("hidden", StringComparison.OrdinalIgnoreCase)) return true;
         return false;
+    }
+
+    /// <summary>Walk an opening tag's name=value pairs, skipping the element name.</summary>
+    private static IEnumerable<(string Name, string? Value)> TagAttributes(string html, int start, int end)
+    {
+        int i = start;
+        while (i < end && !char.IsWhiteSpace(html[i]) && html[i] != '>') i++;
+        while (i < end)
+        {
+            while (i < end && (char.IsWhiteSpace(html[i]) || html[i] == '/')) i++;
+            if (i >= end || html[i] == '>') yield break;
+
+            int nameStart = i;
+            while (i < end && !char.IsWhiteSpace(html[i]) && html[i] != '=' && html[i] != '>' && html[i] != '/') i++;
+            string name = html[nameStart..i];
+
+            while (i < end && char.IsWhiteSpace(html[i])) i++;
+            string? value = null;
+            if (i < end && html[i] == '=')
+            {
+                i++;
+                while (i < end && char.IsWhiteSpace(html[i])) i++;
+                if (i < end && (html[i] == '"' || html[i] == '\''))
+                {
+                    char quote = html[i++];
+                    int vs = i;
+                    while (i < end && html[i] != quote) i++;
+                    value = html[vs..i];
+                    if (i < end) i++;
+                }
+                else
+                {
+                    int vs = i;
+                    while (i < end && !char.IsWhiteSpace(html[i]) && html[i] != '>') i++;
+                    value = html[vs..i];
+                }
+            }
+            yield return (name, value);
+        }
+    }
+
+    /// <summary>
+    /// Whether an opening tag's inline <c>style</c> hides the element with
+    /// <c>display: none</c> or <c>visibility: hidden</c>.
+    /// </summary>
+    /// <remarks>
+    /// A targeted declaration scan, not a CSS parser. Within one declaration block the
+    /// <em>last</em> declaration for a property wins, so <c>display:none; display:block</c> is
+    /// visible; <c>!important</c> is a priority flag rather than part of the value; and a
+    /// <c>/* … */</c> comment before the property name would otherwise shift the first
+    /// <c>:</c> and silently defeat the whole check.
+    /// </remarks>
+    private static bool TagHasHiddenStyle(string html, int start, int end)
+    {
+        string? style = null;
+        foreach (var (name, value) in TagAttributes(html, start, end))
+            if (name.Equals("style", StringComparison.OrdinalIgnoreCase)) { style = value; break; }
+        if (style is null) return false;
+
+        bool displayHides = false, visibilityHides = false;
+        foreach (var raw in style.Split(';'))
+        {
+            string cleaned = StripCssComments(raw);
+            int colon = cleaned.IndexOf(':');
+            if (colon < 0) continue;
+            string property = cleaned[..colon].Trim();
+            string value = cleaned[(colon + 1)..].Split('!')[0].Trim();
+            if (property.Equals("display", StringComparison.OrdinalIgnoreCase))
+                displayHides = value.Equals("none", StringComparison.OrdinalIgnoreCase);
+            else if (property.Equals("visibility", StringComparison.OrdinalIgnoreCase))
+                visibilityHides = value.Equals("hidden", StringComparison.OrdinalIgnoreCase);
+        }
+        return displayHides || visibilityHides;
+    }
+
+    /// <summary>Remove <c>/* … */</c> comments from one CSS declaration.</summary>
+    private static string StripCssComments(string declaration)
+    {
+        if (!declaration.Contains("/*", StringComparison.Ordinal)) return declaration;
+        var sb = new StringBuilder(declaration.Length);
+        string rest = declaration;
+        while (true)
+        {
+            int start = rest.IndexOf("/*", StringComparison.Ordinal);
+            if (start < 0) break;
+            sb.Append(rest, 0, start);
+            int end = rest.IndexOf("*/", start + 2, StringComparison.Ordinal);
+            if (end < 0) { rest = ""; break; }
+            rest = rest[(end + 2)..];
+        }
+        sb.Append(rest);
+        return sb.ToString();
     }
 
     // ── context (mirrors converter::Context) ────────────────────────────────
