@@ -485,9 +485,13 @@ public static class HtmlMeta
                         // Inline context — a heading, or a cell of a table the handler renders
                         // as a list — degrades the image to its alt text.
                         bool inlineImage = captureHeading != 0 || tables.Exists(t => t.Layout);
+                        // The title rides along in the markdown, exactly as the image handler
+                        // writes it: `![alt](src "title")`.
+                        string? imgTitle = Raw(attrsStr, "title");
                         string rendered = inlineImage
                             ? alt ?? ""
-                            : "![" + (alt ?? "") + "](" + (src ?? "") + ")";
+                            : "![" + (alt ?? "") + "](" + (src ?? "")
+                              + (imgTitle is { Length: > 0 } ? " \"" + imgTitle + "\"" : "") + ")";
                         if (inAnchor) anchorText.Append(rendered);
                         else if (captureHeading != 0) headingText.Append(rendered);
                         break;
@@ -911,6 +915,10 @@ public static class HtmlMeta
             // `a` carrying an attribute named `u`.
             if (key.StartsWith('<')) key = key.TrimStart('<');
             if (key.Length == 0) { i++; continue; }
+            // Recorded lower-case: the parser upstream collects from stores names folded, so
+            // `<IMG ALIGN=…>` records `align`. That is only the record — the converter's own
+            // attribute lookups stay case-sensitive, which is why `<A HREF=…>` still has no href.
+            key = key.ToLowerInvariant();
             while (i < n && char.IsWhiteSpace(attrs[i])) i++;
             string value = "";
             if (i < n && attrs[i] == '=')
@@ -935,7 +943,7 @@ public static class HtmlMeta
             // Attribute values are recorded as written. The collector reads the attribute; it
             // does not resolve it, so `alt="\lambda&gt;0"` keeps its reference.
             if (canonical) value = HtmlToMarkdown.CanonicalizeAttrValue(value);
-            if (key.Equals("rel", StringComparison.OrdinalIgnoreCase))
+            if (key == "rel")
                 rel.AddRange(value.Split(' ', StringSplitOptions.RemoveEmptyEntries));
             if (!key.Equals(exclude, StringComparison.OrdinalIgnoreCase))
                 result.Add(new[] { key, value });
