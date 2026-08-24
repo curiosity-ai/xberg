@@ -556,10 +556,10 @@ public static class HtmlMeta
                     anchorText.Append(cellDepth > 0 ? HtmlToMarkdown.EscapeCellText(decoded) : decoded);
                     anchorRawText.Append(decoded);
                 }
-                // The head reaches the converter with its character references resolved, so the
-                // title is decoded against the full WHATWG table rather than the small one the
-                // structure walker's own Rust function knows.
-                else if (inTitle) titleText.Append(HtmlWalker.DecodeEntitiesFull(text));
+                // Read as written. Only a document that reaches the walk through the html5ever
+                // repair arrives with its references resolved, and there the serializer's own
+                // spelling is what the collector sees — `&deg;` becomes `°`, `&nbsp;` stays.
+                else if (inTitle) titleText.Append(canonicalAttrs ? HtmlToMarkdown.CanonicalizeText(text) : text);
                 pos = lt;
             }
         }

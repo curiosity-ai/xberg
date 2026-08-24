@@ -477,14 +477,24 @@ public class HtmlExtractorTests
 
     /// <summary>
     /// A title is trimmed but not collapsed: one written with two spaces between its halves
-    /// keeps them, and its entities are resolved.
+    /// keeps them. Its references are read as written — only a document that reaches the walk
+    /// through the html5ever repair arrives with them resolved, and there the serializer's own
+    /// spelling is what is recorded, so `&amp;mdash;` becomes an em dash while `&amp;nbsp;`
+    /// stays as it was written.
     /// </summary>
     [Fact]
-    public void ATitleKeepsItsInternalSpacing()
+    public void ATitleKeepsItsInternalSpacingAndItsReferencesAsWritten()
     {
         Assert.Equal(
-            "Understanding Output \u2014 aequitas  documentation",
+            "Understanding Output &mdash; aequitas  documentation",
             Meta("<html><head><title>\n  Understanding Output &mdash; aequitas  documentation\n</title></head></html>").Title);
+
+        // A block misnested under an inline ancestor is one of the conditions that sends a
+        // document through the repair.
+        Assert.Equal(
+            "A\u00b0B \u2014 C&nbsp;D",
+            Meta("<html><head><title>A&deg;B &mdash; C&nbsp;D</title></head>"
+                 + "<body><p><em><div>b</div></em></p></body></html>").Title);
     }
 
     /// <summary>

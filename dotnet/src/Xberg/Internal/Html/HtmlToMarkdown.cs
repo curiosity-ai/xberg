@@ -197,6 +197,33 @@ internal static class HtmlToMarkdown
     /// resolved, then <c>&amp;</c>, <c>&lt;</c>, <c>&gt;</c>, <c>"</c> and a no-break space
     /// written back as named entities.
     /// </summary>
+    /// <summary>
+    /// The spelling text reaches the walk with on the html5ever repair path: references
+    /// resolved by the parse, then the ones its serializer writes back put back. A `"` is not
+    /// among them in text — only in an attribute value — so this is not
+    /// <see cref="CanonicalizeAttrValue"/>.
+    /// </summary>
+    internal static string CanonicalizeText(string value)
+    {
+        string decoded = HtmlWalker.DecodeEntitiesFull(value);
+        int i = decoded.AsSpan().IndexOfAny("&<>\u00a0");
+        if (i < 0) return decoded;
+        var sb = new StringBuilder(decoded.Length + 8);
+        sb.Append(decoded, 0, i);
+        for (; i < decoded.Length; i++)
+        {
+            switch (decoded[i])
+            {
+                case '&': sb.Append("&amp;"); break;
+                case '<': sb.Append("&lt;"); break;
+                case '>': sb.Append("&gt;"); break;
+                case '\u00a0': sb.Append("&nbsp;"); break;
+                default: sb.Append(decoded[i]); break;
+            }
+        }
+        return sb.ToString();
+    }
+
     internal static string CanonicalizeAttrValue(string value)
     {
         string decoded = HtmlWalker.DecodeEntitiesFull(value);
@@ -587,10 +614,10 @@ internal static class HtmlToMarkdown
                     var t = new StringBuilder();
                     foreach (var tc in child.Children)
                         if (tc.Tag is null && !tc.IsComment) t.Append(tc.Text);
-                    // Upstream reads the raw text here, but its parser hands the head to the
-                    // converter with character references already resolved; this port's reader
-                    // does not, so `&mdash;` would reach the front matter as its source spelling.
-                    string title = HtmlWalker.DecodeEntitiesFull(t.ToString()).Trim();
+                    // Read as written. Only a document that reaches the walk through the
+                    // html5ever repair arrives with its references resolved, and there the
+                    // serializer's own spelling is what the converter sees.
+                    string title = (child.CanonicalAttrs ? CanonicalizeText(t.ToString()) : t.ToString()).Trim();
                     if (title.Length > 0) metadata["title"] = title;
                     break;
                 }
