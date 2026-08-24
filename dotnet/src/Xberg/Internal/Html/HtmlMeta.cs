@@ -538,6 +538,19 @@ public static class HtmlMeta
                         pos = close < 0 ? n : after;
                         continue;
                     }
+                    // `<template>` content is an inert, unrendered document fragment per the HTML
+                    // spec, and `<noscript>` content only renders with scripting disabled, which a
+                    // Markdown conversion never is. The converter skips both subtrees outright, so
+                    // nothing inside them is part of the document — including the images and links
+                    // this pass collects. Skipping them here is what keeps a tracking pixel in
+                    // `<noscript>` out of the image list.
+                    case "template":
+                    case "noscript":
+                    {
+                        int end = FindElementEnd(html, tagStart, tag);
+                        pos = end < 0 ? n : end;
+                        continue;
+                    }
                 }
 
                 if (!Void.Contains(tag) && !selfClose) domDepth++;

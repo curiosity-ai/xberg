@@ -410,6 +410,37 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
+    /// `<template>` holds an inert document fragment and `<noscript>` only renders with
+    /// scripting disabled, which a Markdown conversion never is. The converter skips both
+    /// subtrees, so nothing inside them belongs to the document — including the images and links
+    /// this pass collects. Wikipedia ships a 1×1 tracking pixel in `<noscript>` on every page,
+    /// which is what this was over-counting.
+    /// </summary>
+    [Fact]
+    public void ImagesAndLinksInsideInertSubtreesAreNotCollected()
+    {
+        var m = Meta("<html><body>" +
+                     "<img src=\"real.png\" alt=\"real\">" +
+                     "<a href=\"/real\">real</a>" +
+                     "<noscript><img src=\"pixel.gif\" alt=\"\"><a href=\"/tracked\">t</a></noscript>" +
+                     "<template><img src=\"tpl.png\"><a href=\"/tpl\">x</a></template>" +
+                     "</body></html>");
+
+        // The collected entries are private records, so they are checked through the shape they
+        // serialize to — which is also what reaches the golden.
+        string images = System.Text.Json.JsonSerializer.Serialize(m.Images);
+        string links = System.Text.Json.JsonSerializer.Serialize(m.Links);
+        Assert.Single(m.Images);
+        Assert.Single(m.Links);
+        Assert.Contains("real.png", images);
+        Assert.DoesNotContain("pixel.gif", images);
+        Assert.DoesNotContain("tpl.png", images);
+        Assert.Contains("/real", links);
+        Assert.DoesNotContain("/tracked", links);
+        Assert.DoesNotContain("/tpl", links);
+    }
+
+    /// <summary>
     /// Preprocessing removes navigation and form subtrees before anything is collected, so a
     /// sidebar's heading is not one of the document's headings.
     /// </summary>
