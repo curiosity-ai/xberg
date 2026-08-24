@@ -133,6 +133,10 @@ public sealed class RstExtractor : IExtractor
                 }
                 if (directive.StartsWith("math::"))
                 {
+                    // Upstream's text path emits the block as `$$…$$` here (it used to write a
+                    // literal `math: ` prose marker). Only this pass's metadata side effects are
+                    // consumed, so the block is still just skipped; the formula itself is built
+                    // on the builder path below, which does carry the `aligned` wrapper.
                     i++;
                     while (i < lines.Count && (lines[i].StartsWith("   ") || lines[i].Length == 0)) i++;
                     continue;
@@ -144,6 +148,19 @@ public sealed class RstExtractor : IExtractor
 
             i++;
         }
+    }
+
+    /// <summary>
+    /// Wrap a <c>.. math::</c> block that uses alignment columns in an <c>aligned</c>
+    /// environment. Sphinx renders such a block inside an align environment, so a bare
+    /// <c>E &amp;= mc^2 \\ F &amp;= \pi E</c> is only valid LaTeX with the wrapper.
+    /// </summary>
+    internal static string WrapAlignedMath(string content)
+    {
+        bool hasAlignment = content.Contains('&') && !content.Contains("\\&");
+        return hasAlignment && !content.Contains("\\begin{")
+            ? $"\\begin{{aligned}}{content}\\end{{aligned}}"
+            : content;
     }
 
     private static (string? key, string? value) ParseFieldListLine(string line)
@@ -619,7 +636,7 @@ public sealed class RstExtractor : IExtractor
                 {
                     if (lines[i].Length == 0)
                     {
-                        if (mathContent.Length != 0) { b.PushFormula(mathContent, null, null); mathContent = ""; }
+                        if (mathContent.Length != 0) { b.PushFormula(WrapAlignedMath(mathContent), null, null); mathContent = ""; }
                     }
                     else
                     {
@@ -628,7 +645,7 @@ public sealed class RstExtractor : IExtractor
                     }
                     i++;
                 }
-                if (mathContent.Length != 0) b.PushFormula(mathContent, null, null);
+                if (mathContent.Length != 0) b.PushFormula(WrapAlignedMath(mathContent), null, null);
                 continue;
             }
 

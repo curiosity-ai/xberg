@@ -221,7 +221,14 @@ public sealed class OrgExtractor : IExtractor
                 {
                     string t = lines[i].Trim();
                     if (t.StartsWith("#+END_QUOTE") || t.StartsWith("#+end_quote")) { i++; break; }
-                    if (t.Length != 0) b.PushParagraph(t, new(), null, null);
+                    if (t.Length != 0)
+                    {
+                        // A quote keeps its lines separate, so only math that fits on one line
+                        // leaves the text here.
+                        var (lineText, quoteMath) = SplitDisplayMath(t);
+                        PushDisplayMath(b, quoteMath);
+                        if (lineText.Trim().Length != 0) b.PushParagraph(lineText, new(), null, null);
+                    }
                     i++;
                 }
                 b.PushQuoteEnd();
@@ -311,7 +318,10 @@ public sealed class OrgExtractor : IExtractor
                             if (rawNext.StartsWith(" ") || rawNext.StartsWith("\t")) { parts.Add(nextT); i++; }
                             else break;
                         }
-                        b.PushListItem(string.Join(" ", parts), isOrdered, new(), null, null);
+                        var (joinedItem, itemMath) = SplitDisplayMath(string.Join(" ", parts));
+                        PushDisplayMath(b, itemMath);
+                        if (joinedItem.Trim().Length != 0)
+                            b.PushListItem(joinedItem, isOrdered, new(), null, null);
                     }
                     else break;
                 }
@@ -371,6 +381,13 @@ public sealed class OrgExtractor : IExtractor
                 }
 
                 string joinedRaw = string.Join(" ", paraRaw);
+                // Math leaves the text before the markup parser runs: Org markup characters
+                // (`_`, `/`, `=`) also occur inside LaTeX.
+                var (joinedWithoutMath, paraMath) = SplitDisplayMath(joinedRaw);
+                PushDisplayMath(b, paraMath);
+                if (joinedWithoutMath.Trim().Length == 0) { i = next; continue; }
+                joinedRaw = joinedWithoutMath;
+
                 var footnoteRefs = FindFootnoteReferences(joinedRaw);
                 var (stripped, annotations) = ParseInlineMarkup(joinedRaw);
                 byte[] strippedBytes = Encoding.UTF8.GetBytes(stripped);
@@ -591,6 +608,109 @@ public sealed class OrgExtractor : IExtractor
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Pull display math out of a block of Org text.
+    /// </summary>
+    /// <returns>
+    /// The text without its math, and the LaTeX of every fragment removed, in the order the
+    /// fragments appeared.
+    /// </returns>
+    /// <remarks>
+    /// Org writes display math as <c>\[…\]</c>, <c>$$…$$</c>, or a LaTeX math environment, and
+    /// each becomes a formula element. Inline math (<c>\(…\)</c>, <c>$…$</c>) stays in the
+    /// text, as it does for markdown: it belongs to the sentence around it.
+    /// </remarks>
+    private static (string Text, List<string> Formulas) SplitDisplayMath(string raw)
+    {
+        var formulas = new List<string>();
+        var text = new StringBuilder();
+        int pos = 0;
+        while (true)
+        {
+            var hit = NextDisplayMath(raw, pos);
+            if (hit is null) break;
+            var (start, latex, resume) = hit.Value;
+            text.Append(raw, pos, start - pos);
+            formulas.Add(latex);
+            pos = resume;
+        }
+        if (formulas.Count == 0) return (raw, formulas);
+        text.Append(raw, pos, raw.Length - pos);
+
+        return (string.Join(" ", text.ToString().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)), formulas);
+    }
+
+    /// <summary>
+    /// Locate the first display-math fragment at or after <paramref name="from"/>: its start
+    /// offset, its LaTeX, and the offset just past its closing delimiter. An unclosed fragment
+    /// is not math — the text keeps it.
+    /// </summary>
+    private static (int Start, string Latex, int Resume)? NextDisplayMath(string text, int from)
+    {
+        int search = from;
+        while (search < text.Length)
+        {
+            int start = text.IndexOfAny(DisplayMathStarts, search);
+            if (start < 0) return null;
+
+            if (StartsAt(text, start, "\\[") )
+            {
+                int end = text.IndexOf("\\]", start + 2, StringComparison.Ordinal);
+                if (end >= 0)
+                    return (start, text[(start + 2)..end].Trim(), end + 2);
+            }
+            else if (StartsAt(text, start, "$$"))
+            {
+                int end = text.IndexOf("$$", start + 2, StringComparison.Ordinal);
+                if (end >= 0)
+                    return (start, text[(start + 2)..end].Trim(), end + 2);
+            }
+            else if (StartsAt(text, start, "\\begin{"))
+            {
+                int nameEnd = start + 7 < text.Length ? text.IndexOf('}', start + 7) : -1;
+                if (nameEnd >= 0)
+                {
+                    string name = text[(start + 7)..nameEnd];
+                    if (IsMathEnvironment(name))
+                    {
+                        string closing = $"\\end{{{name}}}";
+                        int end = text.IndexOf(closing, nameEnd + 1, StringComparison.Ordinal);
+                        if (end >= 0)
+                        {
+                            string inner = text[(nameEnd + 1)..end];
+                            return (start, $"\\begin{{{name}}}{inner}\\end{{{name}}}", end + closing.Length);
+                        }
+                    }
+                }
+            }
+
+            search = start + 1;
+        }
+        return null;
+    }
+
+    private static readonly char[] DisplayMathStarts = { '\\', '$' };
+
+    private static bool StartsAt(string text, int index, string value) =>
+        index + value.Length <= text.Length
+        && string.CompareOrdinal(text, index, value, 0, value.Length) == 0;
+
+    /// <summary>The LaTeX environments whose body is display math.</summary>
+    private static bool IsMathEnvironment(string name) => name switch
+    {
+        "equation" or "equation*" or "align" or "align*" or "gather" or "gather*"
+            or "multline" or "multline*" or "eqnarray" or "eqnarray*" or "math"
+            or "displaymath" or "flalign" or "flalign*" or "cases" => true,
+        _ => false,
+    };
+
+    /// <summary>Emit one formula element per LaTeX fragment, in order.</summary>
+    private static void PushDisplayMath(InternalDocumentBuilder b, List<string> formulas)
+    {
+        foreach (var latex in formulas)
+            if (latex.Length != 0) b.PushFormula(latex, null, null);
     }
 
     private static (string, List<TextAnnotation>) ParseInlineMarkup(string raw)
