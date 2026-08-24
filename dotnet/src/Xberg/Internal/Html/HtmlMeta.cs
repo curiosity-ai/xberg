@@ -124,8 +124,7 @@ public static class HtmlMeta
             {
                 if (string.CompareOrdinal(html, pos, "<!--", 0, 4) == 0)
                 {
-                    int e = html.IndexOf("-->", pos + 4, StringComparison.Ordinal);
-                    pos = e < 0 ? n : e + 3;
+                    pos = HtmlWalker.CommentEnd(html, pos);
                     continue;
                 }
                 int tagStart = pos;

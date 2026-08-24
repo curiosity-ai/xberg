@@ -3535,8 +3535,7 @@ internal static class HtmlDom
             // comment
             if (pos + 3 < n && src[pos + 1] == '!' && src[pos + 2] == '-' && src[pos + 3] == '-')
             {
-                int end = src.IndexOf("-->", pos + 4, StringComparison.Ordinal);
-                pos = end < 0 ? n : end + 3;
+                pos = HtmlWalker.CommentEnd(src, pos);
                 continue;
             }
             // A processing instruction is not markup to the reference parser. `parse_tag`

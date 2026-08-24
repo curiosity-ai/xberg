@@ -54,14 +54,54 @@ public sealed class HtmlWalker
         _b = builder;
     }
 
+    /// <summary>
+    /// The index just past the end of the comment that starts at <paramref name="start"/>, or
+    /// the end of the input when it is never closed.
+    /// </summary>
+    /// <remarks>
+    /// A comment normally ends at <c>--&gt;</c>. Upstream's converter ends it early when the
+    /// comment reads like a self-closing tag: for a comment whose content opens with whitespace
+    /// or a slash, it scans quote-aware to the first <c>&gt;</c>, and if that <c>&gt;</c> is
+    /// preceded by <c>/</c> the comment stops there — leaking the rest of it into the document
+    /// as text. A <c>&gt;</c> that is not preceded by a slash ends the scan without truncating,
+    /// which is why a comment holding <c>&lt;a href="…"&gt;…&lt;img … /&gt;</c> survives intact
+    /// while one holding <c>&lt;br /&gt;</c> does not.
+    ///
+    /// This is neither html5ever's behaviour nor `tl`'s — both were probed directly and parse
+    /// such comments correctly — so it comes from the converter's own preprocessing. The rule was
+    /// characterised by differential testing against the real converter: 243 generated shapes,
+    /// including quoted attributes, conditional comments and multiple <c>/&gt;</c>, all agree.
+    /// Eleven fixtures in the corpus contain a comment this applies to.
+    /// </remarks>
+    internal static int CommentEnd(string src, int start)
+    {
+        int contentStart = start + 4;
+        int normalEnd = src.IndexOf("-->", contentStart, StringComparison.Ordinal);
+        int end = normalEnd < 0 ? src.Length : normalEnd + 3;
+
+        if (contentStart >= src.Length) return end;
+        char first = src[contentStart];
+        if (!char.IsWhiteSpace(first) && first != '/') return end;
+
+        char quote = '\0';
+        for (int i = contentStart; i < src.Length; i++)
+        {
+            char c = src[i];
+            if (quote != '\0') { if (c == quote) quote = '\0'; continue; }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            // The first unquoted `>` settles it either way.
+            if (c == '>') return i > contentStart && src[i - 1] == '/' ? i + 1 : end;
+        }
+        return end;
+    }
+
     public void Walk()
     {
         while (_pos < _src.Length)
         {
             if (Starts("<!--"))
             {
-                int end = _src.IndexOf("-->", _pos, StringComparison.Ordinal);
-                _pos = end < 0 ? _src.Length : end + 3;
+                _pos = CommentEnd(_src, _pos);
                 continue;
             }
             if (_src[_pos] == '<' && OpensTag(_src, _pos)) HandleTag();
@@ -510,8 +550,7 @@ public sealed class HtmlWalker
             p = lt;
             if (string.CompareOrdinal(_src, p, "<!--", 0, 4) == 0)
             {
-                int e = _src.IndexOf("-->", p + 4, StringComparison.Ordinal);
-                p = e < 0 ? _src.Length : e + 3;
+                p = CommentEnd(_src, p);
                 continue;
             }
             int gt = _src.IndexOf('>', p);
@@ -941,8 +980,7 @@ public sealed class HtmlWalker
             _pos = lt;
             if (Starts("<!--"))
             {
-                int e = _src.IndexOf("-->", _pos + 4, StringComparison.Ordinal);
-                _pos = e < 0 ? _src.Length : e + 3;
+                _pos = CommentEnd(_src, _pos);
                 continue;
             }
             int gt = _src.IndexOf('>', _pos);

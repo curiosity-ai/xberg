@@ -410,6 +410,35 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
+    /// Upstream's converter ends a comment early when it reads like a self-closing tag: for a
+    /// comment opening with whitespace or a slash, it scans quote-aware to the first `>` and
+    /// stops there if that `>` is preceded by `/`. The rest of the comment then leaks into the
+    /// document as text. Neither html5ever nor `tl` does this — both were probed directly — but
+    /// the goldens record it, so the port reproduces it. The expectations below were measured
+    /// against the real converter.
+    /// </summary>
+    [Theory]
+    // Opens with whitespace and the first unquoted `>` closes a self-closing tag: ends there.
+    [InlineData("<!-- x <br /> y -->", " y -->")]
+    [InlineData("<!-- /> y -->", " y -->")]
+    [InlineData("<!--/>-->", "-->")]
+    // Opens with a non-space, so the rule never applies and the comment runs to `-->`.
+    [InlineData("<!--x <br /> y-->", "")]
+    [InlineData("<!--<br />y-->", "")]
+    // The first unquoted `>` is a plain tag close, which ends the scan without truncating.
+    [InlineData("<!-- <a href=\"q/>r\">z</a> -->", "")]
+    [InlineData("<!-- <a href=\"i\"><img src=\"i\" /></a> -->", "")]
+    // A conditional comment opens with `[`.
+    [InlineData("<!--[if IE]><br /><![endif]-->", "")]
+    // No `>` at all before the close.
+    [InlineData("<!-- plain -->", "")]
+    public void ACommentReadingAsASelfClosingTagEndsEarly(string comment, string leaked)
+    {
+        int end = HtmlWalker.CommentEnd(comment, 0);
+        Assert.Equal(leaked, comment[end..]);
+    }
+
+    /// <summary>
     /// `<template>` holds an inert document fragment and `<noscript>` only renders with
     /// scripting disabled, which a Markdown conversion never is. The converter skips both
     /// subtrees, so nothing inside them belongs to the document — including the images and links
