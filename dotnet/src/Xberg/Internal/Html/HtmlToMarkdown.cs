@@ -550,7 +550,11 @@ internal static class HtmlToMarkdown
     private static string RenderCellForGrid(HNode cell, Ctx ctx)
     {
         var buf = new StringBuilder();
-        var cctx = ctx with { InTableCell = true };
+        // The collectors are detached for this walk. It runs after the table has already been
+        // rendered — and recorded — and exists only to fill the grid returned from the text it
+        // builds; leaving them attached records every link, image and nested table in a cell a
+        // second time, into the very structure this walk is building.
+        var cctx = ctx with { InTableCell = true, Structure = null, ImageEmit = null, TableEmit = null };
         foreach (var c in cell.Children) WalkNode(c, buf, cctx);
         return NormalizeWhitespaceKeepNewlines(buf.ToString()).Trim();
     }
@@ -1333,6 +1337,49 @@ internal static class HtmlToMarkdown
         }
     }
 
+    /// <summary>Length of the longest consecutive run of <paramref name="marker"/>.</summary>
+    private static int LongestConsecutiveRun(string content, char marker)
+    {
+        int max = 0, cur = 0;
+        foreach (char c in content)
+        {
+            if (c == marker) { cur++; if (cur > max) max = cur; }
+            else cur = 0;
+        }
+        return max;
+    }
+
+    /// <summary>Minimum length of a Markdown code fence per CommonMark.</summary>
+    private const int MinFenceLength = 3;
+
+    /// <summary>
+    /// The smallest backtick-run length, from 1 up, that does not occur as a run inside
+    /// <paramref name="content"/>.
+    /// </summary>
+    /// <remarks>
+    /// CommonMark closes an inline code span at the next backtick string of the <em>same</em>
+    /// length as the opening delimiter (6.1) — a longer or shorter run never matches — so the
+    /// delimiter only has to avoid a run length that actually appears. Taking the longest run
+    /// plus one over-escapes: content holding one length-2 run and no length-1 run is fine with
+    /// a single backtick. A fenced block is the other rule, and needs the longest run plus one,
+    /// because its close matches on <em>any</em> run at least as long as the fence.
+    /// </remarks>
+    private static int MinSafeCodeSpanDelimiterLength(string content)
+    {
+        var runLengths = new HashSet<int>();
+        int cur = 0;
+        foreach (char c in content)
+        {
+            if (c == '`') cur++;
+            else { if (cur > 0) runLengths.Add(cur); cur = 0; }
+        }
+        if (cur > 0) runLengths.Add(cur);
+
+        int candidate = 1;
+        while (runLengths.Contains(candidate)) candidate++;
+        return candidate;
+    }
+
     private static void RenderCodeWithEscaping(string trimmed, StringBuilder output)
     {
         bool containsBacktick = trimmed.Contains('`');
@@ -1343,17 +1390,7 @@ internal static class HtmlToMarkdown
             || first == '`' || last == '`'
             || (first == ' ' && last == ' ' && containsBacktick);
 
-        int numBackticks = 1;
-        if (containsBacktick)
-        {
-            int max = 0, cur = 0;
-            foreach (char c in trimmed)
-            {
-                if (c == '`') { cur++; if (cur > max) max = cur; }
-                else cur = 0;
-            }
-            numBackticks = max == 1 ? 2 : 1;
-        }
+        int numBackticks = containsBacktick ? MinSafeCodeSpanDelimiterLength(trimmed) : 1;
 
         output.Append('`', numBackticks);
         if (needsDelimiterSpaces) output.Append(' ');
@@ -1378,7 +1415,11 @@ internal static class HtmlToMarkdown
 
         if (ctx.InLink) { WalkChildren(node, output, ctx); return; }
 
-        string rawText = NormalizeWhitespaceKeepNewlines(TextContent(node)).Trim();
+        var (inlineLabel, sawBlock) = CollectLinkLabelText(node);
+        // Without block descendants that sweep visited exactly the nodes the whole-subtree text
+        // would, and decoded them the same way, so its text is reused rather than walking the
+        // `<a>` a second time.
+        string rawText = NormalizeWhitespaceKeepNewlines(sawBlock ? TextContent(node) : inlineLabel).Trim();
 
         bool isAutolink = href.Length > 0 && HasUriScheme(href)
             && (rawText == href || (href.StartsWith("mailto:", StringComparison.Ordinal) && rawText == href[7..]));
@@ -1408,7 +1449,6 @@ internal static class HtmlToMarkdown
             }
         }
 
-        var (inlineLabel, sawBlock) = CollectLinkLabelText(node);
         string label;
         if (sawBlock)
         {
@@ -1436,8 +1476,8 @@ internal static class HtmlToMarkdown
             label = NormalizeLinkLabel(content.ToString());
         }
 
-        if (label.Length == 0 && sawBlock)
-            label = NormalizeLinkLabel(NormalizeWhitespaceKeepNewlines(TextContent(node)));
+        // `rawText` is already the whole-subtree text when `sawBlock`, so this one fallback
+        // covers both the block and the inline case.
         if (label.Length == 0 && rawText.Length > 0)
             label = NormalizeLinkLabel(rawText);
         if (label.Length == 0 && href.Length > 0 && node.Children.Count > 0)
@@ -1669,20 +1709,23 @@ internal static class HtmlToMarkdown
             return;
         }
 
-        string src = node.Attr("src") ?? "";
-        if (tag != "iframe" && src.Length == 0)
+        string rawSrc = node.Attr("src") ?? "";
+        if (tag != "iframe" && rawSrc.Length == 0)
         {
             foreach (var child in node.Children)
             {
                 if (child.Tag != "source") continue;
-                src = child.Attr("src") ?? "";
+                rawSrc = child.Attr("src") ?? "";
                 break;
             }
         }
+        string src = SanitizeMarkdownUrl(rawSrc);
 
         if (src.Length > 0)
         {
-            output.Append('[').Append(src).Append("](").Append(src).Append(')');
+            // The src doubles as the label, so it goes through the same escaping an `<a href>`
+            // gets in both positions rather than being spliced in raw.
+            AppendMarkdownLink(output, EscapeLinkLabel(src), src, null);
             if (!ctx.InParagraph && !ctx.ConvertAsInline) output.Append("\n\n");
         }
 
@@ -1823,7 +1866,7 @@ internal static class HtmlToMarkdown
 
         string svgHtml = SerializeElement(node);
         string base64 = System.Convert.ToBase64String(Encoding.UTF8.GetBytes(svgHtml));
-        output.Append("![").Append(title).Append("](data:image/svg+xml;base64,").Append(base64).Append(')');
+        output.Append("![").Append(EscapeLinkLabel(title)).Append("](data:image/svg+xml;base64,").Append(base64).Append(')');
     }
 
     /// <summary>The concatenated text of a node's descendants, entity references resolved.</summary>
@@ -1895,8 +1938,10 @@ internal static class HtmlToMarkdown
         {
             sb.Append(' ').Append(SvgAttrs.Canonical(key) ?? key);
             // A bare attribute and `attr=""` are HTML5-equivalent; upstream writes both bare.
-            // The value goes out as written — the serializer does not re-escape it.
-            if (!string.IsNullOrEmpty(value)) sb.Append("=\"").Append(value).Append('"');
+            // A `"` in the value is the one character re-escaped on the way out: written raw it
+            // would close the attribute early.
+            if (!string.IsNullOrEmpty(value))
+                sb.Append("=\"").Append(value!.Contains('"') ? value.Replace("\"", "&quot;") : value).Append('"');
         }
 
         if (node.Children.Count == 0) { sb.Append(" />"); return sb.ToString(); }
@@ -2045,12 +2090,16 @@ internal static class HtmlToMarkdown
             if (EndsWith(output, "\n")) output.Append('\n');
             else output.Append("\n\n");
         }
-        output.Append("```");
+        // The fence has to be strictly longer than the longest backtick run inside the content,
+        // or it terminates early and the rest of the document is swallowed into the block
+        // (CommonMark 4.5).
+        int fenceLength = Math.Max(LongestConsecutiveRun(processed, '`') + 1, MinFenceLength);
+        output.Append('`', fenceLength);
         if (language is not null) output.Append(language);
         output.Append('\n');
         output.Append(processed.TrimEnd('\n'));
         output.Append('\n');
-        output.Append("```").Append("\n\n");
+        output.Append('`', fenceLength).Append("\n\n");
 
         ctx.Structure?.PushCode(processed, language);
     }
@@ -2120,16 +2169,28 @@ internal static class HtmlToMarkdown
         string trimmedContent = content.ToString().Trim();
         if (trimmedContent.Length == 0) return;
 
-        if (ctx.BlockquoteDepth > 0) output.Append("\n\n\n");
+        if (ctx.BlockquoteDepth > 0)
+        {
+            if (output.Length > 0)
+            {
+                while (output.Length > 0 && output[^1] == '\n') output.Length--;
+                output.Append("\n\n");
+            }
+        }
         else if (output.Length > 0)
         {
             if (EndsWith(output, "\n\n")) output.Remove(output.Length - 1, 1);
             else if (!EndsWith(output, "\n")) output.Append("\n\n");
         }
 
+        // Blank out whitespace-only lines, but keep the leading whitespace on a real content
+        // line — code-block indentation and nested list markers are what makes a quoted block
+        // child still read as that block.
         foreach (var line in trimmedContent.Split('\n'))
         {
-            output.Append("> ").Append(line.Trim()).Append('\n');
+            output.Append("> ");
+            if (line.Trim().Length > 0) output.Append(line);
+            output.Append('\n');
         }
         output.Append('\n');
     }
