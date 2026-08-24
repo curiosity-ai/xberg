@@ -429,6 +429,30 @@ comments) plus two structural fixes (its issues #13, #453, #454, #455). Ported s
   it), and emphasis leaves its whitespace outside the delimiters in recorded markdown.
 - A `<li>` inside a table cell takes a `<br>` boundary; the head `<title>` is entity-decoded.
 
+### Tried and reverted: excluding a nested list from its parent item's recorded text
+
+`office/regression/000_000059.html` records a nav menu's submenu items where upstream records
+only the top-level ones, and reducing it looked like a clean rule:
+`<ul><li>one<ul><li>n1</li><li>n2</li></ul></li><li>two</li></ul>` records `["one","two"]`
+upstream and `["one\n  * n1\n  * n2","two"]` here. Implemented — the nested list notes the output
+span it writes and the item that holds it leaves that span out — the reduction matched exactly
+and the corpus fell: html ok 74 -> 69, plain 97 -> 93, json 100 -> 96.
+
+The rule flips on whitespace. Write the same markup the way a real document does —
+
+```
+<ul>
+  <li>
+    one
+    <ul>
+      <li>n1</li>
+```
+
+— and upstream records `["one\n  * n1\n  * n2","two"]`, keeping the nested markdown. Every
+corpus fixture is formatted that way, so this port's unconditional "keep it" is right for all
+of them and the reduction was the outlier. Whatever 059 is doing, it is not this; do not re-derive
+the rule from a minified reduction.
+
 Not yet ported, in rough order of expected value: the tier-1 router/scanner changes (168 + 654
 lines, and they decide which documents take the fast path at all), the rest of
 `block/table/builder.rs` and `cells.rs` (129 + 170 — the `CellTextCache` reuse path, which this
