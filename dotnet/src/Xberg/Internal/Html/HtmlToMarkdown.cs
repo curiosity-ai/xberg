@@ -3236,14 +3236,27 @@ internal sealed class HNode
     /// </summary>
     public bool CanonicalAttrs;
 
+    /// <summary>
+    /// Look up an attribute by exact name.
+    /// </summary>
+    /// <remarks>
+    /// Case-sensitive on the ordinary path, because the converter this ports is: the lenient
+    /// parser feeding it keeps attribute names as written and every lookup is an exact match,
+    /// so <c>&lt;A HREF=…&gt;</c> reaches the link handler with no href at all and degrades to
+    /// its label. A repaired document is the exception — html5ever's serializer writes every
+    /// name back lowercase, so there the match ignores case to stand in for that rewrite.
+    /// </remarks>
     public string? Attr(string name)
     {
         if (Tag is null) return null;
-        _attrCache ??= new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        _attrCache ??= new Dictionary<string, string?>(
+            CanonicalAttrs ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         if (_attrCache.TryGetValue(name, out var cached)) return cached;
         // Attribute values are otherwise left as written: the lenient parser hands the handlers
         // the source bytes, and the markdown writer escapes what it emits.
-        string? v = HtmlWalker.ExtractAttr(AttrString, name);
+        string? v = CanonicalAttrs
+            ? HtmlWalker.ExtractAttr(AttrString, name)
+            : HtmlWalker.ExtractAttrExact(AttrString, name);
         if (v is not null && CanonicalAttrs) v = HtmlToMarkdown.CanonicalizeAttrValue(v);
         _attrCache[name] = v;
         return v;

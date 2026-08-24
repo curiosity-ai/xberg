@@ -1022,6 +1022,18 @@ public sealed class HtmlWalker
         return null;
     }
 
+    /// <summary>
+    /// Attribute lookup by exact name, for the markdown converter — the crate it ports matches
+    /// attribute names case-sensitively, so an uppercase <c>HREF</c> or <c>SRC</c> is simply not
+    /// there as far as its handlers are concerned.
+    /// </summary>
+    internal static string? ExtractAttrExact(string attrs, string name)
+    {
+        foreach (var (key, value) in EnumerateAttributes(attrs))
+            if (key.Equals(name, StringComparison.Ordinal)) return value ?? "";
+        return null;
+    }
+
     private static string? ExtractLanguageFromClass(string? cls)
     {
         if (cls is null) return null;
