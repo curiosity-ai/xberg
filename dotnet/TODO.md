@@ -38,18 +38,27 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > |---|---|---|
 > | fixtures walked | 3165 | 3165 |
 > | comparable (Rust extracts something) | 3007 | 3007 |
-> | **matching on every hard dimension** | **2839 (94.4%)** | **2877 (95.7%)** |
-> | failing at least one | 168 | 130 |
+> | **matching on every hard dimension** | **2839 (94.4%)** | **2889 (96.1%)** |
+> | failing at least one | 168 | 118 |
 > | catastrophes | 0 | 0 |
 > | content losses | 3 (html) | 3 (html) |
 >
-> The 130 remaining, by format: **html 93**, pdf 9, typ 6, adoc 6, xml 5, rst 2, jats 2, docx 2,
+> The 118 remaining, by format: **html 81**, pdf 9, typ 6, adoc 6, xml 5, rst 2, jats 2, docx 2,
 > and one each in txt, qmd, odt, mdx, dbf. html is the converter upgrade's tail; typ and adoc
 > need parsers this port does not have; the pdf set is the one classified below.
 >
 > Formats brought back to full parity since the regeneration: org (7 -> 12 of 12), ipynb
-> (7 -> 16 of 16), docbook (3 -> 4 of 4). Improved: html (15 -> 64 of 157 — 48 after the first
-> slice), xml (5 -> 10 of 15), rst (11 -> 13 of 15).
+> (7 -> 16 of 16), docbook (3 -> 4 of 4). Improved: html (15 -> 76 of 157), xml (5 -> 10 of 15),
+> rst (11 -> 13 of 15).
+>
+> **What is left in html, by failing dimension** (157 comparable, `--strict-md`: ok 76, plain 97,
+> markdown 111, html 105, json 100, metadata 94, tables 117). The cheap systematic rules are
+> spent; what remains is dominated by **parser recovery** — this port's lenient tokenizer and
+> `tl` build different trees from malformed markup, which shows up as heading `depth` off by a
+> few, an extra or missing image, and whole documents diverging. `office/regression/000_000202.html`
+> is the clearest specimen: `<A NAME="000000"</A>` (no closing bracket) truncates upstream's
+> output at five lines where this port recovers and emits 413. Fixing that class means aligning
+> the tree builders, not adding rules.
 >
 > The last figure measured against the **old** goldens, kept for reference only: 2770 of 2787
 > comparable fixtures (99.4%) on every hard dimension. It is not comparable with the table
