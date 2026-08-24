@@ -108,6 +108,11 @@ public sealed class DocbookExtractor : IExtractor
             if (ev.Kind == XmlEv.Start)
             {
                 string tag = StripNamespace(ev.Name);
+                // `<programlisting language="glsl">` names the code block's language, which
+                // becomes the fence's info string.
+                string? languageAttr = null;
+                foreach (var (key, value) in ev.Attrs ?? new List<(string, string)>())
+                    if (key == "language") languageAttr = value;
                 switch (tag)
                 {
                     case "info": case "articleinfo": case "bookinfo": case "chapterinfo":
@@ -131,9 +136,13 @@ public sealed class DocbookExtractor : IExtractor
                             }
                         }
                         break;
-                    case "para":
+                    case "para": case "simpara":
                     {
                         var (text, anns, paraFormulas) = ExtractParaWithAnnotations(reader);
+                        // DocBook puts the equations a sentence refers to ahead of the sentence,
+                        // where JATS puts them after it. A paragraph that is only an equation has
+                        // no text, and still has its formula.
+                        foreach (var latex in paraFormulas) builder.PushFormula(latex, null, null);
                         if (text.Length > 0)
                         {
                             foreach (var ann in anns)
@@ -141,10 +150,6 @@ public sealed class DocbookExtractor : IExtractor
                                     builder.PushUri(new ExtractedUri { Url = ann.Kind.Url!, Label = SliceLabel(text, ann.Start, ann.End), Kind = UriKind.Hyperlink });
                             builder.PushParagraph(text, anns, null, null);
                         }
-                        // The equation belongs where the sentence put it, so it follows the block
-                        // that holds it. A paragraph that is only an equation has no text, and
-                        // still has its formula.
-                        foreach (var latex in paraFormulas) builder.PushFormula(latex, null, null);
                         break;
                     }
                     case "equation": case "informalequation": case "inlineequation":
@@ -159,7 +164,7 @@ public sealed class DocbookExtractor : IExtractor
                     case "programlisting": case "screen":
                     {
                         string t = ExtractElementText(reader);
-                        if (t.Length > 0) builder.PushCode(t, null, null, null);
+                        if (t.Length > 0) builder.PushCode(t, languageAttr, null, null);
                         break;
                     }
                     case "itemizedlist":
