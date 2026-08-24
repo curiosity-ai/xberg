@@ -909,11 +909,7 @@ public static class HtmlMeta
             if (i >= n) break;
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>') i++;
-            string key = attrs[ks..i];
-            // A `<` cannot open an attribute name: a tag left unterminated runs the next
-            // element's opening bracket into its own attribute list, so `<a href="…"<u>` is one
-            // `a` carrying an attribute named `u`.
-            if (key.StartsWith('<')) key = key.TrimStart('<');
+            string key = HtmlWalker.TrimAttributeNameStart(attrs[ks..i]);
             if (key.Length == 0) { i++; continue; }
             // Recorded lower-case: the parser upstream collects from stores names folded, so
             // `<IMG ALIGN=…>` records `align`. That is only the record — the converter's own

@@ -976,6 +976,28 @@ public sealed class HtmlWalker
     /// The element's attributes in source order, each as its name and its value (null when the
     /// attribute was written with no value at all).
     /// </summary>
+    /// <summary>
+    /// Drop the leading characters an attribute name cannot begin with.
+    /// </summary>
+    /// <remarks>
+    /// The parser upstream discards them rather than keeping them in the name, which is what a
+    /// stray character in a tag comes down to: <c>&lt;a href="…" \&gt;</c> has no third
+    /// attribute at all, <c>&lt;a href="…"&lt;u&gt;</c> — a tag left unterminated, running the
+    /// next element's bracket into its own attribute list — carries one named <c>u</c>, and
+    /// <c>@click</c> records as <c>click</c>. A name may still start with <c>_</c>, <c>:</c>,
+    /// <c>-</c> or a digit, all of which real documents use.
+    /// </remarks>
+    internal static string TrimAttributeNameStart(string key)
+    {
+        int i = 0;
+        while (i < key.Length && !IsAttributeNameStart(key[i])) i++;
+        return i == 0 ? key : key[i..];
+    }
+
+    private static bool IsAttributeNameStart(char c) =>
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+        || c == '_' || c == ':' || c == '-';
+
     internal static IEnumerable<(string Key, string? Value)> EnumerateAttributes(string attrs)
     {
         int i = 0, n = attrs.Length;
@@ -985,11 +1007,7 @@ public sealed class HtmlWalker
             if (i >= n) break;
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
-            string key = attrs[ks..i];
-            // A `<` cannot open an attribute name, and a tag left unterminated runs the next
-            // element's opening bracket into its own attribute list: `<a href="…"<u>` is one
-            // `a` carrying an attribute named `u`, not `<u`.
-            if (key.StartsWith('<')) key = key.TrimStart('<');
+            string key = TrimAttributeNameStart(attrs[ks..i]);
             // Nothing that can start a name here — a stray `=` or `/` between attributes. Step
             // over that one character and look again; the `=` does not adopt what follows it as
             // its value, so `<a =` + `href=…` still yields the href.
