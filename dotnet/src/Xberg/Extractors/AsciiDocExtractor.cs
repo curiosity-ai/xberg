@@ -3,6 +3,7 @@
 using System.Text;
 using System.Text.Json;
 using Xberg.Core;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -44,7 +45,10 @@ public sealed class AsciiDocExtractor : IExtractor
             {
                 LineCount = (uint)CountLines(source),
                 WordCount = (uint)body.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length,
-                CharacterCount = (uint)body.Length,
+                // Rust counts `body.chars()` — Unicode scalar values, so a non-BMP character
+                // counts once where `string.Length` counts its two UTF-16 code units. These
+                // documents are full of them: `𝜎` and `𝜏` come out of the maths.
+                CharacterCount = (uint)body.EnumerateRunes().Count(),
                 Headers = parser.Headers.Count > 0 ? parser.Headers : null,
                 Links = parser.Links.Count > 0 ? parser.Links : null,
                 CodeBlocks = parser.CodeBlocks.Count > 0 ? parser.CodeBlocks : null,
@@ -197,6 +201,11 @@ internal sealed class AsciiDocParser
         }
         if (trimmed.StartsWith("|===", StringComparison.Ordinal)) { ParseTable(); return; }
         if (SectionLevel(trimmed) is { } level) { ParseSectionHeading(level, trimmed); return; }
+        if (IsDelimiter(trimmed, '+') && PendingMathNotation() is { } blockNotation)
+        {
+            ParseMathBlock(trimmed, blockNotation);
+            return;
+        }
         if (IsDelimiter(trimmed, '-') || IsDelimiter(trimmed, '.')) { ParseVerbatimBlock(trimmed); return; }
         if (IsDelimiter(trimmed, '_')) { ParseQuoteBlock(trimmed); return; }
         if (IsDelimiter(trimmed, '=')) { ParseExampleBlock(trimmed); return; }
@@ -219,6 +228,112 @@ internal sealed class AsciiDocParser
         Headers.Add(text);
         _index++;
         ClearPending();
+    }
+
+    // ── math ─────────────────────────────────────────────────────────────────
+
+    /// <summary>Which notation a math macro or block carries.</summary>
+    private enum MathNotation { Latex, AsciiMath }
+
+    /// <summary>
+    /// The math notation a pending <c>[latexmath]</c>, <c>[asciimath]</c> or <c>[stem]</c> block
+    /// attribute selects. <c>stem</c> follows the document's <c>:stem:</c> attribute, which
+    /// AsciiDoc defines as AsciiMath unless the document names <c>latexmath</c>.
+    /// </summary>
+    private MathNotation? PendingMathNotation()
+    {
+        if (_pendingAttrs.Count == 0) return null;
+        string first = _pendingAttrs[0].Split(',')[0].Trim().ToLowerInvariant();
+        return first switch
+        {
+            "latexmath" => MathNotation.Latex,
+            "asciimath" => MathNotation.AsciiMath,
+            "stem" => StemNotation(),
+            _ => null,
+        };
+    }
+
+    /// <summary>What <c>stem</c> means in this document.</summary>
+    private MathNotation StemNotation()
+    {
+        if (_attributes.TryGetValue("stem", out string? value))
+        {
+            string v = value.Trim().ToLowerInvariant();
+            if (v == "latexmath" || v == "latex") return MathNotation.Latex;
+        }
+        return MathNotation.AsciiMath;
+    }
+
+    /// <summary>
+    /// Parse a <c>++++</c> passthrough block that a math attribute introduced. The body is one
+    /// display equation, so it becomes a formula element.
+    /// </summary>
+    private void ParseMathBlock(string delimiter, MathNotation notation)
+    {
+        CloseLists();
+        _index++;
+        var (body, terminated) = CollectUntilDelimiter(delimiter);
+        if (!terminated) Warn("unterminated delimited block closed at end of input");
+        string? latex = MathToLatex(body.Trim(), notation);
+        if (!string.IsNullOrEmpty(latex)) _builder.PushFormula(latex!, null, null);
+        ClearPending();
+    }
+
+    /// <summary>
+    /// Convert math in <paramref name="notation"/> to LaTeX. LaTeX passes through with its
+    /// delimiters removed, since the formula element holds bare LaTeX; AsciiMath goes through
+    /// the shared converter.
+    /// </summary>
+    private static string? MathToLatex(string source, MathNotation notation)
+    {
+        if (source.Length == 0) return null;
+        if (notation == MathNotation.Latex)
+        {
+            string bare = MathMl.StripMathDelimiters(source).Trim();
+            return bare.Length == 0 ? null : bare;
+        }
+        return AsciiMath.ConvertToLatex(source);
+    }
+
+    /// <summary>
+    /// Parse an inline math macro: <c>latexmath:[…]</c>, <c>asciimath:[…]</c> or
+    /// <c>stem:[…]</c>, whose notation the document's <c>:stem:</c> attribute selects.
+    /// </summary>
+    /// <remarks>
+    /// Returns the consumed length, the macro's content and its notation. The content may hold
+    /// nested brackets, so the scan tracks depth.
+    /// </remarks>
+    private (int Consumed, string Source, MathNotation Notation)? ParseMathMacro(string text, int pos)
+    {
+        string? name = null;
+        MathNotation notation = MathNotation.Latex;
+        foreach (var (candidate, kind) in new[]
+                 {
+                     ("latexmath", MathNotation.Latex),
+                     ("asciimath", MathNotation.AsciiMath),
+                     ("stem", StemNotation()),
+                 })
+        {
+            string prefix = candidate + ":[";
+            if (string.CompareOrdinal(text, pos, prefix, 0, prefix.Length) != 0) continue;
+            name = candidate;
+            notation = kind;
+            break;
+        }
+        if (name is null) return null;
+
+        int open = pos + name.Length + 2;
+        int depth = 1;
+        for (int i = open; i < text.Length; i++)
+        {
+            if (text[i] == '[') depth++;
+            else if (text[i] == ']')
+            {
+                depth--;
+                if (depth == 0) return (i + 1 - pos, text[open..i], notation);
+            }
+        }
+        return null;
     }
 
     /// <summary>A <c>----</c> listing block or a <c>....</c> literal block: verbatim code.</summary>
@@ -517,6 +632,16 @@ internal sealed class AsciiDocParser
 
         while (pos < substituted.Length)
         {
+            // An inline math macro stays in the sentence, as inline math does for markdown,
+            // but reaches the text as LaTeX between `$` delimiters rather than as the raw macro.
+            if (ParseMathMacro(substituted, pos) is { } math)
+            {
+                string? latex = MathToLatex(math.Source, math.Notation);
+                if (latex is not null) outBuf.Append('$').Append(latex).Append('$');
+                pos += math.Consumed;
+                atBoundary = false;
+                continue;
+            }
             if (ParseLinkMacro(substituted, pos) is { } link)
             {
                 uint start = (uint)Utf8Length(outBuf);

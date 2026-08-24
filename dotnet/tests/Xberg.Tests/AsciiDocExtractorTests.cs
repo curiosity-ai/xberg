@@ -179,15 +179,58 @@ public class AsciiDocExtractorTests
     }
 
     [Fact]
-    public void MathMacrosReachTheTextVerbatim()
+    public void AnInlineMathMacroReachesTheTextAsDelimitedLatex()
     {
-        // Upstream's current source converts latexmath:/asciimath:/stem: macros to LaTeX between
-        // `$` delimiters and turns a `[latexmath]` + `++++` block into a formula element. The
-        // reference outputs this port is validated against predate that, and the AsciiMath
-        // conversion needs a converter the port does not have, so the macros are left as written
-        // — which loses no text.
-        var doc = Parse("The tuples stem:[B_\"FROM\"^\"out\"] are output.\n");
-        Assert.Contains("stem:[B_\"FROM\"^\"out\"]",
-            doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Paragraph).Text);
+        // Inline math stays in the sentence, as it does for markdown, but reaches the text as
+        // delimited LaTeX rather than as the raw macro.
+        Assert.Equal(new[] { "The value $E = mc^2$ holds." },
+            TextsOf(Parse("The value latexmath:[E = mc^2] holds.\n"), ElementKindTag.Paragraph));
+        Assert.Empty(TextsOf(Parse("The value latexmath:[E = mc^2] holds.\n"), ElementKindTag.Formula));
+    }
+
+    [Fact]
+    public void AnInlineStemMacroIsConvertedFromAsciiMath()
+    {
+        Assert.Equal(new[] { "Take $\\sqrt{4}$ as given." },
+            TextsOf(Parse("Take stem:[sqrt(4)] as given.\n"), ElementKindTag.Paragraph));
+        Assert.Equal(new[] { "The tuples $B_{\\text{FROM}}^{\\text{out}}$ are output." },
+            TextsOf(Parse("The tuples stem:[B_\"FROM\"^\"out\"] are output.\n"), ElementKindTag.Paragraph));
+    }
+
+    [Fact]
+    public void AMathMacroMayHoldBracketsOfItsOwn()
+    {
+        Assert.Equal(new[] { "Given $a[i] + b$ throughout." },
+            TextsOf(Parse("Given latexmath:[a[i] + b] throughout.\n"), ElementKindTag.Paragraph));
+    }
+
+    [Fact]
+    public void ALatexMathBlockBecomesAFormula()
+    {
+        Assert.Equal(new[] { "\\int_0^1 x\\,dx = \\frac{1}{2}" },
+            TextsOf(Parse("[latexmath]\n++++\n\\int_0^1 x\\,dx = \\frac{1}{2}\n++++\n"),
+                    ElementKindTag.Formula));
+    }
+
+    [Fact]
+    public void AStemBlockIsAsciiMathUnlessTheDocumentSaysOtherwise()
+    {
+        // `stem` follows the document's `:stem:` attribute, which AsciiDoc defines as AsciiMath
+        // unless the document names `latexmath`. An `[asciimath]` block names its own notation
+        // whatever that attribute says.
+        Assert.Equal(new[] { "\\sqrt{4}=2" },
+            TextsOf(Parse("[stem]\n++++\nsqrt(4) = 2\n++++\n"), ElementKindTag.Formula));
+        Assert.Equal(new[] { "\\sqrt{4}=2" },
+            TextsOf(Parse("= Doc\n:stem: latexmath\n\n[asciimath]\n++++\nsqrt(4) = 2\n++++\n"),
+                    ElementKindTag.Formula));
+        Assert.Equal(new[] { "\\alpha + \\beta" },
+            TextsOf(Parse("= Doc\n:stem: latexmath\n\n[stem]\n++++\n\\alpha + \\beta\n++++\n"),
+                    ElementKindTag.Formula));
+    }
+
+    [Fact]
+    public void APassthroughBlockWithNoMathAttributeIsNotMath()
+    {
+        Assert.Empty(TextsOf(Parse("++++\n<hr/>\n++++\n"), ElementKindTag.Formula));
     }
 }

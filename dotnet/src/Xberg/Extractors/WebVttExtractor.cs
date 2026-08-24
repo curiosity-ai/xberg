@@ -82,7 +82,8 @@ public sealed class WebVttExtractor : IExtractor
         {
             LineCount = (uint)CountLines(bodyText),
             WordCount = (uint)bodyText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length,
-            CharacterCount = (uint)bodyText.Length,
+            // Unicode scalar values, as Rust's `chars()` counts them — not UTF-16 code units.
+            CharacterCount = (uint)bodyText.EnumerateRunes().Count(),
             // WebVTT has no headings, hyperlinks or code blocks to report.
         });
         builder.SetMetadata(metadata);
