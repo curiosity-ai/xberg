@@ -2738,7 +2738,17 @@ internal static class HtmlToMarkdown
         // width pre-pass
         var colWidths = new List<int>();
         var prepassRowspan = new int?[totalCols];
-        var prepassCtx = ctx with { MeasureWidthOnly = true };
+        // The pre-pass runs with its collectors detached: measuring a column's width is an
+        // internal detail and must not show up in the result. Upstream keeps them here only when
+        // it can reuse this pass's markdown verbatim in the render, which it cannot while a
+        // structure collector is installed — and this port's options always install one.
+        var prepassCtx = ctx with
+        {
+            MeasureWidthOnly = true,
+            Structure = null,
+            ImageEmit = null,
+            TableEmit = null,
+        };
         foreach (var row in TableRows(node))
             CollectRowCellWidths(row, prepassCtx, colWidths, prepassRowspan);
 

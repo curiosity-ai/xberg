@@ -838,12 +838,14 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
-    /// The collector records what it sees on every pass the table handler makes: three for a
-    /// markdown table, two for one rendered as a layout list, and a nested table is re-entered
-    /// once per pass of its parent except the width pre-pass, which never descends into it.
+    /// A table's links are recorded once, however many times the handler walks its cells. The
+    /// width pre-pass and the grid walk both run with the collectors detached — the first
+    /// because a column measurement is an internal detail, the second because the render has
+    /// already recorded the same cells — so the render is the only pass that records, and a
+    /// nested table is recorded once too rather than once per pass of its parent.
     /// </summary>
     [Fact]
-    public void ATablesLinksAreRecordedOncePerPassOverIt()
+    public void ATablesLinksAreRecordedOnceHoweverManyPassesWalkIt()
     {
         static int Count(string html, string href)
         {
@@ -856,19 +858,19 @@ public class HtmlExtractorTests
         }
 
         const string simple = "<table><tr><td><a href=\"/a\">a</a></td></tr></table>";
-        Assert.Equal(3, Count(simple, "/a"));
+        Assert.Equal(1, Count(simple, "/a"));
 
-        // Rows of differing width read as a layout table: no width pre-pass, so two walks.
+        // Rows of differing width read as a layout table, which has no width pre-pass. The
+        // nested table's link is recorded once as well.
         const string layout = "<table><tr><td><a href=\"/a\">a</a></td>"
             + "<td><table><tr><td><a href=\"/b\">b</a></td></tr></table></td></tr></table>";
-        Assert.Equal(2, Count(layout, "/a"));
-        Assert.Equal(6, Count(layout, "/b"));
+        Assert.Equal(1, Count(layout, "/a"));
+        Assert.Equal(1, Count(layout, "/b"));
 
-        // A caption is walked by the render pass alone.
         const string caption = "<table><caption><a href=\"/c\">c</a></caption>"
             + "<tr><td><a href=\"/a\">a</a></td></tr></table>";
         Assert.Equal(1, Count(caption, "/c"));
-        Assert.Equal(3, Count(caption, "/a"));
+        Assert.Equal(1, Count(caption, "/a"));
     }
 
     // ── tag-open state and attribute recovery ───────────────────────────────

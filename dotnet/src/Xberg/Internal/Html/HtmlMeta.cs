@@ -708,24 +708,20 @@ public static class HtmlMeta
         }
 
         /// <summary>
-        /// How many times the handler walks this table's cells: three for a markdown table (the
-        /// column-width pre-pass, the render and the grid), two for one rendered as a layout
-        /// list, and one for a blank linkless table, whose render returns before walking
-        /// anything (`block/table/builder.rs`).
+        /// How many times a walk that records reaches this table's cells.
         /// </summary>
-        public int Passes
-        {
-            get
-            {
-                var distinct = new HashSet<int>();
-                foreach (int c in _rowCounts) if (c > 0) distinct.Add(c);
-                bool looksLikeLayout = NestedTables > 1 || distinct.Count > 1 || (HasSpan && BorderZero);
-                bool isBlank = !HasText;
-                if (HasHeader || HasCaption) return 3;
-                if (!looksLikeLayout && !isBlank && !(_rowCounts.Count <= 2 && LinkCount >= 3)) return 3;
-                return isBlank && LinkCount == 0 ? 1 : 2;
-            }
-        }
+        /// <remarks>
+        /// The handler still walks a table up to three times — a column-width pre-pass, the
+        /// render, and the grid the structure collector wants — but since 3.11.0 only one of
+        /// those walks carries the collectors. The pre-pass detaches them (its measurement is an
+        /// internal detail and must not be visible in the result) and so does the grid walk
+        /// (which runs after the render has already recorded the same cells), leaving the render
+        /// as the single recording pass. Upstream keeps the pre-pass's handles instead when it
+        /// can reuse the pre-pass's markdown verbatim, but that requires no structure collector,
+        /// and this port's options always install one — so it is the render either way, and one
+        /// walk either way.
+        /// </remarks>
+        public int Passes => 1;
 
         /// <summary>
         /// This table's records, once per pass, in table order. The width pre-pass — which only
@@ -734,18 +730,12 @@ public static class HtmlMeta
         /// </summary>
         public List<object> Replay(List<(Origin From, List<object> Items)> segments, int passes)
         {
-            // Only the render pass walks the caption: the width pre-pass and the grid both
-            // iterate rows alone. A table blank enough that the render returns before walking
-            // anything has no render pass at all.
-            int renderPass = passes == 1 ? -1 : passes - 2;
+            // The render is the only pass that records, and it walks the caption as well as the
+            // rows, so every segment is replayed exactly `passes` times in table order.
             var result = new List<object>();
             for (int pass = 0; pass < passes; pass++)
-                foreach (var (from, items) in segments)
-                {
-                    if (from == Origin.Child && pass == 0 && passes == 3) continue;
-                    if (from == Origin.Caption && pass != renderPass) continue;
+                foreach (var (_, items) in segments)
                     result.AddRange(items);
-                }
             return result;
         }
     }
