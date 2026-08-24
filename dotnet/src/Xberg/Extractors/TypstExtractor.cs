@@ -243,21 +243,29 @@ public sealed partial class TypstExtractor : IExtractor
                 continue;
             }
 
-            if (trimmed.StartsWith('$') && trimmed.EndsWith('$') && trimmed.Length > 1)
-            {
-                FlushParagraph(paragraphBuf, builder);
-                string math = trimmed.Trim('$').Trim();
-                if (math.Length != 0) builder.PushFormula(math, null, null);
-                continue;
-            }
-
             if (trimmed.StartsWith('$') && trimmed.Length > 1)
             {
                 FlushParagraph(paragraphBuf, builder);
-                inDisplayMath = true;
-                mathBuf.Clear();
-                string openingContent = trimmed.Substring(1).Trim();
-                if (openingContent.Length != 0) mathBuf.Append(openingContent);
+                string rest = trimmed.Substring(1);
+                int close = rest.IndexOf('$');
+                if (close >= 0)
+                {
+                    // The line closes its own math. Whatever follows the closing `$` is ordinary
+                    // text — a trailing comma inside a table call, a code span, prose. Treating
+                    // such a line as the start of a block swallowed all of it up to the next `$`
+                    // somewhere further down the document.
+                    string math = rest[..close].Trim();
+                    if (math.Length != 0) builder.PushFormula(math, null, null);
+                    string after = rest[(close + 1)..].Trim();
+                    if (after.Length != 0) paragraphBuf.Append(after).Append(' ');
+                }
+                else
+                {
+                    inDisplayMath = true;
+                    mathBuf.Clear();
+                    string openingContent = rest.Trim();
+                    if (openingContent.Length != 0) mathBuf.Append(openingContent);
+                }
                 continue;
             }
 
