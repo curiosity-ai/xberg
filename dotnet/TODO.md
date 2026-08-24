@@ -6,26 +6,38 @@ Each format is "done" when the `Xberg.TestRunner` output matches the locally gen
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
-> **Status.** Goldens are generated for **3165 fixtures**, the corpus having grown when the
-> August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
-> large `office/regression` set of real-world HTML.
+> **Status — read this before trusting any number below.** The goldens are **not committed**,
+> and a fresh container starts without them. They were regenerated on 2026-08-24 against the
+> current Rust tree: 3165 fixtures, one sorted single-process run, `failed=0`.
 >
-> **2770 of 2787 comparable fixtures (99.4%) match on every hard dimension**; **0
-> catastrophes**; **0 content losses**; 1466 unit tests. **Genuine port gaps: 0** — every one of
-> the 17 remaining failures is an order-dependent golden (7), an upstream defect or corpus drift
-> (7), a wall-clock truncation (2), or one deliberate non-port where matching upstream would
-> cost silent content loss (1). Classified fixture by fixture below. The denominator is the
-> fixtures Rust itself can extract —
-> 155 of the 2,942 walked, it cannot, and counting those against this port measures nothing.
-> Measured on the whole corpus in one run, which is the only figure that means anything: a
-> per-format run validated the mime sniff on md and txt while it was quietly handing three PDFs
-> to the HTML extractor.
+> **That regeneration moved the target.** Every figure in the rest of this file was measured
+> against goldens generated on **2026-08-12**, and 18 commits have landed under `crates/` since.
+> Two of them matter most:
+>
+> - **`13cdad2f` upgraded `html-to-markdown-rs` from 3.10.6 to the 3.11 line** — 5327 lines of
+>   converter diff. This port was written against 3.10.6, so the HTML fixtures went from nearly
+>   all passing to nearly all failing overnight. Porting that upgrade is the open work; see
+>   "The 3.11 converter upgrade" below.
+> - **`ec94d8c0` (#1414) populates formulas for every format** — ~10k lines across docx, odt,
+>   orgmode, pptx, rst, typst, jats and pdf. `$$…$$` inline math now leaves the paragraph and
+>   becomes its own Formula element; `org/math/latex_0d83c6.org` is the shortest example.
+>
+> Also fixed here: `dotnet/tools/xberg-reference-gen`'s own lock had drifted to
+> **html-to-markdown-rs 3.11.2** where the root workspace lock resolves **3.11.0** — 362 lines
+> apart across the converter, so goldens generated from it would have encoded a converter
+> upstream does not ship. It is pinned to the root lock now, and `--precise` is the way to keep
+> it there after any dependency bump. `pdf_oxide` (0.3.77) and `comrak` (0.54.0) match on both
+> sides. The generator also walks sorted (it was readdir order, which is irreproducible against
+> a process-global font cache) and runs each fixture on its own task, so a backend parser's
+> panic costs one golden rather than aborting the run.
+>
+> The last figure measured against the **old** goldens, kept for reference only: 2770 of 2787
+> comparable fixtures (99.4%) on every hard dimension, 0 catastrophes, 0 content losses.
+> Re-derive rather than carry forward — the running count in this file has gone stale twice.
 >
 > Read the last digit with care. `PdfExtractor` enforces a per-document wall-clock deadline and
-> drops whole pages when it trips, so a loaded machine moves the total by one to three fixtures
-> between runs of identical code — two consecutive runs here gave 2639 and 2638, and PDF `ok`
-> 274 and 273, with nothing changed in between. Treat a single-fixture move as noise and measure
-> a real change on a quiet machine.
+> drops whole pages when it trips, so a loaded machine can move the total between runs of
+> identical code. Do not run a sweep and a build at the same time.
 >
 > The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
 > stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
@@ -316,58 +328,85 @@ file cannot hang extraction, and upstream simply has no deadline to match.
   apart, the same `segments_need_space` geometry difference documented for
   `pdf/copy_protected.pdf` above, with the sides reversed.
 
-### The goldens are frozen at 2026-08-12, and cannot be regenerated here
+### The goldens were regenerated on 2026-08-24 — what that changed
 
 This bounds every claim in this file, so read it before concluding anything about a failing
 fixture.
 
-`dotnet/tools/xberg-reference-gen/target/release/xberg-reference-gen` was dated **2026-08-12
-16:44**, every golden is stamped 16:45, and **79 files under `crates/xberg/src` are newer than
-the binary**. So the goldens record what upstream did on 12 August, not what its source says
-today.
+The corpus was previously frozen at goldens generated on **2026-08-12**, which the last session
+could not regenerate (no network). That is done now: `cargo build --release --locked` succeeds
+and takes about 7 minutes, and one sorted single-process run over `test_documents` produced
+**3165 goldens, `failed=0`**. The generator no longer aborts on the `mathemascii` char-boundary
+panic — `xberg` already catches it as a blocking-pool `JoinError` and turns it into a captured
+extraction error, and the per-fixture task guard added here covers anything that does not.
 
-**This has now been settled empirically, not just argued.** `--offline` does fail on the
-unvendored `mathemascii`, but a plain `cargo build --release --locked` succeeds — it took 7m17s
-and fetched `html-to-markdown-rs` 3.11.2, which until then had never been vendored. Regenerating
-with the rebuilt binary:
+**Regenerating moved everything at once**, exactly as the old note warned it would. The 18
+commits under `crates/` since 12 August include two large behavioural ones:
 
-| fixture | committed golden | rebuilt binary |
-|---|---|---|
-| `epub/features.epub` | `\overset{⏞}` | `\overbrace` |
-| `html/sinthgunt.html` | — | does not reproduce |
+- **`13cdad2f`** upgraded `html-to-markdown-rs` **3.10.6 → the 3.11 line**. The old note
+  predicted `"template" | "noscript"` would need re-porting; it is one arm out of 5327 diff
+  lines. See "The 3.11 converter upgrade" below.
+- **`ec94d8c0` (#1414)** populates formulas for every format, ~10k lines across docx, odt,
+  orgmode, pptx, rst, typst, jats and pdf. This is also what the old note's `epub/features.epub`
+  `\overbrace` entry was tracking: that fixture's golden is current now, and the port matches
+  what the source does rather than what the August snapshot did.
 
-So both categories below are confirmed: the goldens genuinely predate current upstream, and this
-port matches the source rather than the snapshot. Note the hazard this creates — the binary in
-the tree is no longer the one that made the corpus, so a regeneration now would move every
-format at once.
+Two hazards the old note raised are settled rather than inherited:
 
-That makes one obvious-looking test worthless. Running the existing binary over a fixture and
-finding it reproduces the committed golden byte for byte proves only that the August binary still
-agrees with itself — it says nothing about whether current source would agree. This was used
-here to argue a golden was current, and the argument does not hold.
+- **Version drift in the generator's own lock.** It is a standalone workspace, so its lock
+  floats independently of the root's — and it had reached **3.11.2** where the root lock
+  resolves **3.11.0**. The two differ by 362 lines across `text_node`, `main_helpers`, the
+  tier-1 router and scanner, and `block/preformatted.rs` (which 3.11.2 removes). Goldens built
+  from it would have encoded a converter upstream does not ship, and every HTML fixture would
+  have been ported against the wrong target. Pinned with `cargo update -p … --precise`; do the
+  same after any dependency bump. `pdf_oxide` 0.3.77 and `comrak` 0.54.0 match on both sides.
+- **Reproducibility of the run itself.** `WalkDir`'s default is readdir order, and `xberg` keeps
+  a process-global font cache, so a run's output depended on filesystem ordering. The walk is
+  sorted now.
 
-A worked example of the difference it makes. `epub/features.epub` renders U+23DE/U+23DF as
-`\overbrace`/`\underbrace` in this port, where the golden keeps them literal inside
-`\overset`/`\underset`. Both sides' `over_script_command` map U+23DE to `\overbrace`
-identically, and the EPUB path reaches the same converter, so the port and *current* upstream
-agree — but commit `ec94d8c0bd` (16 August, "populate formulas for every format") postdates the
-golden. This is a third category: neither a port bug nor an upstream defect, but a golden the
-current source would not reproduce. Confirmed by the rebuild above: the fresh binary emits
-`\overbrace`, exactly as this port does.
+The ~222 extra goldens the old note feared (for fixtures the extractors fail on) are simply
+present, and the harness counts them as `rust failed` rather than against the port.
 
-The same bound applies to the seven HTML fixtures. Their goldens are `html-to-markdown-rs`
-**3.10.6** output — the only version vendored — while the lock records 3.11.2. Porting against
-3.10.6 is what took html to 41/41, and that is correct *while these goldens stand*; 3.11.0 added
-a `"template" | "noscript" => {}` dispatch arm that 3.10.6 lacks, so a regenerated corpus would
-need those arms re-ported in the other direction.
+### The 3.11 converter upgrade
 
-**To settle any of this**, restore network access, `cargo update`/vendor `mathemascii`, rebuild
-the generator, regenerate, and re-measure. Expect the generator to abort partway: it panics in
-`mathemascii-0.4.0/src/scanner.rs:48` on a char boundary inside `≤` via the asciidoc extractor,
-and a full run also creates ~222 goldens for fixtures the extractors fail on, which changes the
-denominator. Back up `*-results-rust.json` first.
+The largest open work item. `html-to-markdown-rs` 3.10.6 → 3.11.0 is 5327 lines across the
+converter, and it is mostly a security-hardening release ("audit #23"/"audit #24" in its own
+comments) plus two structural fixes (its issues #13, #453, #454, #455). Ported so far:
+
+- `<template>` and `<noscript>` are dropped rather than rendered.
+- A table cell can no longer hold a hard line break: `<br>`, `<div>` and `<p>` continuations all
+  collapse to one space through a shared `EmitTableCellBreak`, and cell text folds `\n`/`\r`
+  before collapsing whitespace.
+- Link and image destinations share one writer: balanced-paren detection replaces the naive
+  open-count-equals-close-count test, `\`/`<`/`>` are escaped inside an angle-bracket
+  destination, titles escape backslashes before quotes, and image alt text is escaped as a link
+  label.
+- The table scan is two passes: own structure (row counts, nested-table count, spans) stops at a
+  nested `<table>`; whole-subtree content (text, links, headers, caption) does not.
+- List content indents to its marker's content column (`ListIndentColumns`), not a flat
+  four-spaces-per-level.
+- Attribute names match case-sensitively outside the html5ever repair path — `<A HREF>` reaches
+  the link handler with no href and degrades to its label.
+- Code fences size themselves to their content, in both the fenced-block and inline-span
+  directions (opposite rules — CommonMark 4.5 vs 6.1).
+- Blockquote lines keep their leading whitespace; nested quotes separate by trimming to one
+  blank line.
+- SVG/MathML attribute values escape `"`; SVG data-URI titles and media `src` labels are escaped.
+- The table-grid walk runs with its collectors detached, so a cell's links, images and nested
+  tables are not recorded a second time.
+
+Not yet ported, in rough order of expected value: the tier-1 router/scanner changes (168 + 654
+lines, and they decide which documents take the fast path at all), `block/table/builder.rs` and
+`cells.rs` (129 + 170), `strip_hidden_elements`' nesting-aware closing-tag scan, and
+`parse_ordered_list_start`'s clamping.
 
 ### The 17 remaining failures, classified
+
+> **Stale as of the 2026-08-24 regeneration.** This classification was measured against the
+> 2026-08-12 goldens. The PDF entries below (order-dependent goldens, the two large documents,
+> the deliberate non-port) still describe real behaviour; the counts and the HTML entries do
+> not, because the converter upgrade moved them. Re-derive with `--list-fail` before quoting
+> any figure here.
 
 Re-derived with `--list-fail` on the current tree rather than carried forward — the running
 count has gone stale twice now (it read "about eleven port gaps" long after the real figure was
@@ -440,14 +479,28 @@ Rust, sort stability included), the rounding mode (`MidpointRounding.AwayFromZer
 matches Rust's `.round()`, which is the obvious banker's-rounding trap and is not present), and
 any difference in table count or page distribution.
 
-Not yet established: why the word coordinates differ from Rust's at all. Closing it needs a
-Rust-side word dump for one page — the probe-crate approach that settled `right_to_left_03`.
+**Ruled out since, by measurement rather than reading: the spans themselves.** A probe crate
+built against the real `pdf_oxide 0.3.77` dumps
+`extract_page_text_with_options(page, ReadingOrder::TopToBottom)` — the exact call
+`extract_segments_from_page_inner` makes — for one page. On `algebra_topology` page 807 all 348
+spans are **byte-identical** to the ported pipeline's `HierarchySpans`: text, bbox and
+`rotation_degrees`. They stay identical when the probe walks every earlier page first, so the
+process-global font cache does not move them either. Whatever the 5 tables differ by, it enters
+after the spans — in `PdfOxideSegments.FromPage`'s reorder/rejoin, or in the table tiers
+themselves. Rebuild the probe in the scratchpad with `pdf_oxide = "=0.3.77"` and
+`CARGO_TARGET_DIR` pointed at the reference generator's target directory so the dependency is
+not compiled twice; dump C# spans through a scratch project whose `AssemblyName` is
+`Xberg.Tests`, which is how it reaches the internals without touching the repo.
 
-Found while tracing, and fixed separately because it is a real divergence in its own right:
-`SplitSegmentToWords` took its origin from raw page-space `seg.X`/`seg.Y` where upstream uses
-`seg.upright_origin()` in both `segment_to_hocr_word` and `split_segment_to_words`. Identity for
-an unrotated segment, so it is invisible here and is *not* the cause of the 5 tables; wrong axis
-for a rotated run.
+**Settled: the upright-frame revert was fitting the port to stale goldens.** `988b17ba14` made
+`SplitSegmentToWords` take its origin from `seg.UprightOrigin()` — where upstream's
+`segment_to_hocr_word` and `split_segment_to_words` both do — and `048aade8fc` reverted it
+because the corpus lost nine fixtures on `tables`. The measurement was right and the conclusion
+was wrong: upstream added that call in **`fd53e448` on 2026-08-13**, one day *after* the goldens
+being measured against were generated. The open question the revert recorded — whether the
+ported spans carry different rotation values — is answered no by the probe above:
+`senate-expenditures` page 1 has 1052 of its 1054 spans rotated and every one matches. The
+change is re-applied.
 
 ### The four port gaps, and what each turned out to be
 
