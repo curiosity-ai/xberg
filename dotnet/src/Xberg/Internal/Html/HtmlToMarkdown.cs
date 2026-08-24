@@ -205,7 +205,7 @@ internal static class HtmlToMarkdown
     /// </summary>
     internal static string CanonicalizeText(string value)
     {
-        string decoded = HtmlWalker.DecodeEntitiesFull(value);
+        string decoded = HtmlWalker.DecodeEntitiesFull(value, true);
         int i = decoded.AsSpan().IndexOfAny("&<>\u00a0");
         if (i < 0) return decoded;
         var sb = new StringBuilder(decoded.Length + 8);
@@ -226,7 +226,7 @@ internal static class HtmlToMarkdown
 
     internal static string CanonicalizeAttrValue(string value)
     {
-        string decoded = HtmlWalker.DecodeEntitiesFull(value);
+        string decoded = HtmlWalker.DecodeEntitiesFull(value, true);
         int i = decoded.AsSpan().IndexOfAny("&<>\"\u00a0");
         if (i < 0) return decoded;
         var sb = new StringBuilder(decoded.Length + 8);
@@ -996,7 +996,7 @@ internal static class HtmlToMarkdown
     // ── text node (converter/text_node.rs, Normalized whitespace mode, no escaping) ─
     private static void ProcessTextNode(HNode node, StringBuilder output, Ctx ctx)
     {
-        string text = HtmlWalker.DecodeEntitiesFull(node.Text);
+        string text = HtmlWalker.DecodeEntitiesFull(node.Text, node.CanonicalAttrs);
         if (text.Length == 0) return;
 
         bool hadNewlines = text.Contains('\n');
@@ -1722,7 +1722,7 @@ internal static class HtmlToMarkdown
         {
             var n = stack.Pop();
             if (n.IsComment) continue;
-            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntitiesFull(n.Text)); continue; }
+            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntitiesFull(n.Text, n.CanonicalAttrs)); continue; }
             if (BlockLevelForLabel.Contains(n.Tag)) { sawBlock = true; continue; }
             for (int i = n.Children.Count - 1; i >= 0; i--) stack.Push(n.Children[i]);
         }
@@ -2002,7 +2002,7 @@ internal static class HtmlToMarkdown
             foreach (var c in n.Children)
             {
                 if (c.IsComment) continue;
-                if (c.Tag is null) sb.Append(HtmlWalker.DecodeEntitiesFull(c.Text));
+                if (c.Tag is null) sb.Append(HtmlWalker.DecodeEntitiesFull(c.Text, c.CanonicalAttrs));
                 else Walk(c);
             }
         }
@@ -2051,7 +2051,7 @@ internal static class HtmlToMarkdown
         // re-escaped: the four characters that would otherwise change the markup's shape go
         // back out as references, so `&#x3E;` and a literal `>` both serialize as `&gt;`.
         if (node.Tag is null)
-            return node.IsComment ? "" : EscapeSerializedText(HtmlWalker.DecodeEntitiesFull(node.Text));
+            return node.IsComment ? "" : EscapeSerializedText(HtmlWalker.DecodeEntitiesFull(node.Text, node.CanonicalAttrs));
 
         var sb = new StringBuilder(256);
         sb.Append('<').Append(node.Tag);
@@ -2721,7 +2721,7 @@ internal static class HtmlToMarkdown
         if (node.IsComment) return;
         if (node.Tag is null)
         {
-            if (!scan.HasText && HtmlWalker.DecodeEntitiesFull(node.Text).Trim().Length > 0)
+            if (!scan.HasText && HtmlWalker.DecodeEntitiesFull(node.Text, node.CanonicalAttrs).Trim().Length > 0)
                 scan.HasText = true;
             return;
         }

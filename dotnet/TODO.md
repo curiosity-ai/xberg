@@ -38,8 +38,8 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > |---|---|---|
 > | fixtures walked | 3165 | 3165 |
 > | comparable (Rust extracts something) | 3007 | 3007 |
-> | **matching on every hard dimension** | **2839 (94.4%)** | **2889 (96.1%)** |
-> | failing at least one | 168 | 118 |
+> | **matching on every hard dimension** | **2839 (94.4%)** | **2841 (94.5%)** |
+> | failing at least one | 168 | 166 |
 > | catastrophes | 0 | 0 |
 > | content losses | 3 (html) | 3 (html) |
 >
@@ -51,14 +51,39 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > (7 -> 16 of 16), docbook (3 -> 4 of 4). Improved: html (15 -> 76 of 157), xml (5 -> 10 of 15),
 > rst (11 -> 13 of 15).
 >
-> **What is left in html, by failing dimension** (157 comparable, `--strict-md`: ok 76, plain 97,
-> markdown 111, html 105, json 100, metadata 94, tables 117). The cheap systematic rules are
-> spent; what remains is dominated by **parser recovery** — this port's lenient tokenizer and
-> `tl` build different trees from malformed markup, which shows up as heading `depth` off by a
-> few, an extra or missing image, and whole documents diverging. `office/regression/000_000202.html`
-> is the clearest specimen: `<A NAME="000000"</A>` (no closing bracket) truncates upstream's
-> output at five lines where this port recovers and emits 413. Fixing that class means aligning
-> the tree builders, not adding rules.
+> **What is left in html** (157 comparable, `--strict-md`: ok 83, plain 102, markdown 117,
+> html 111, json 105, metadata 101, tables 122).
+>
+> An earlier revision of this note said the tail was "dominated by parser recovery" and that
+> "the cheap systematic rules are spent". Both were wrong, and the triage below them was
+> measured rather than reasoned this time. Across the 83 fixtures failing before this pass:
+> **20 had byte-identical text** and failed on metadata alone, **21 differed by one to three
+> hunks**, 21 by four to twelve, and only **12 diverged wholesale**. Recovery is a sixth of the
+> tail, not the bulk of it. Three systematic rules found by measuring rather than reading have
+> since taken it from 74 to 83:
+>
+> - **Inert subtrees in the metadata pass.** The converter skips `<template>` and `<noscript>`
+>   outright, and its metadata collector runs inside that walk. This port collects metadata
+>   separately and skipped only `<script>`/`<style>`, so every Wikipedia page contributed its
+>   1x1 `<noscript>` tracking pixel to the image list. Six fixtures were off by exactly one
+>   image, three by exactly one link.
+> - **Comment end.** Upstream truncates a comment that reads like a self-closing tag; see the
+>   entry below on `office/regression/000_000413.html`.
+> - **C1 numeric character references.** `&#146;` is U+2019, not U+0092 — the HTML5 tokenizer's
+>   replacement table — but only on the html5ever repair path, which is where the port already
+>   models canonical spelling. Seven fixtures.
+>
+> The recovery class is still real. `office/regression/000_000202.html` is its clearest
+> specimen: `<A NAME="000000"</A>` (no closing bracket) truncates upstream's output at five
+> lines where this port recovers and emits 413. Closing that class means aligning the tree
+> builders, not adding rules — but it is a dozen fixtures, so measure the rest first.
+>
+> A probe against the real converter is the tool that made this tractable and is worth
+> rebuilding: `htmlprobe` (see the scratchpad pattern in "Re-syncing after an upstream merge")
+> links `html-to-markdown-rs` directly with the options `extraction/html/converter.rs` sets, so
+> any fragment can be put to the reference in isolation. Two of the three rules above were
+> characterised by differential testing against it, and the first spelling of the comment rule
+> was wrong in a way only that testing caught.
 >
 > The last figure measured against the **old** goldens, kept for reference only: 2770 of 2787
 > comparable fixtures (99.4%) on every hard dimension. It is not comparable with the table
@@ -137,6 +162,13 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > - **Escaped markup in XMP `dc:description`.** quick-xml emits an entity reference as its own
 >   event, splitting the text run, so upstream keeps only the first fragment — `div` for a value
 >   that is a whole HTML document. This port returns the value. Four PDF fixtures.
+> - **A comment ending at `/>`** (`office/regression/000_000413.html` and ten others). Upstream's
+>   converter truncates a comment that reads like a self-closing tag: for a comment opening with
+>   whitespace or a slash it scans quote-aware to the first `>`, and stops there if that `>` is
+>   preceded by `/`. The rest of the comment reaches the document as text. This is neither
+>   html5ever's behaviour nor `tl`'s — both were probed directly on the same input — so it comes
+>   from the converter's own preprocessing. Reproduced rather than flagged, because eleven
+>   fixtures turn on it and there is no reading of the goldens that does not encode it.
 > - **Inherited `/MediaBox`** (`pdf/pdfa_034.pdf`). ISO 32000-1 §7.7.3.4 inherits from the
 >   nearest ancestor that defines the attribute; on a document with two nested `Pages` nodes
 >   upstream reports the root's A4 box where the page's own parent says Letter.

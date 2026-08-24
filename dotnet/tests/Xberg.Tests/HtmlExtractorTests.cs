@@ -410,6 +410,40 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
+    /// A numeric character reference in the C1 range names a Windows-1252 character rather than
+    /// the control it nominally points at — the HTML5 tokenizer's replacement table of §13.2.5.80.
+    /// Only a document that reaches the walk through the html5ever repair gets that: the
+    /// converter's own fast path decodes `&#146;` to U+0092 and leaves it there. `<my-el>` is what
+    /// puts this document on the repair path, since a tag name holding a hyphen is a custom
+    /// element. Measured against the real converter across the whole 0x80-0x9F range.
+    /// </summary>
+    [Theory]
+    [InlineData("&#146;", "\u2019")]
+    [InlineData("&#145;", "\u2018")]
+    [InlineData("&#151;", "\u2014")]
+    [InlineData("&#128;", "\u20ac")]
+    [InlineData("&#159;", "\u0178")]
+    // The five code points the table leaves alone.
+    [InlineData("&#129;", "\u0081")]
+    [InlineData("&#141;", "\u008d")]
+    [InlineData("&#143;", "\u008f")]
+    [InlineData("&#144;", "\u0090")]
+    [InlineData("&#157;", "\u009d")]
+    public void ACOneReferenceResolvesThroughTheWindows1252TableOnTheRepairPath(string reference, string expected)
+    {
+        var doc = Html($"<html><body><my-el></my-el><p>x{reference}y</p></body></html>");
+        Assert.Contains($"x{expected}y", string.Join("\n", doc.Elements.Select(e => e.Text)));
+    }
+
+    /// <summary>Without the repair, the same reference keeps its C1 code point.</summary>
+    [Fact]
+    public void TheSameReferenceKeepsItsCodePointOffTheRepairPath()
+    {
+        var doc = Html("<html><body><p>x&#146;y</p></body></html>");
+        Assert.Contains("x\u0092y", string.Join("\n", doc.Elements.Select(e => e.Text)));
+    }
+
+    /// <summary>
     /// Upstream's converter ends a comment early when it reads like a self-closing tag: for a
     /// comment opening with whitespace or a slash, it scans quote-aware to the first `>` and
     /// stops there if that `>` is preceded by `/`. The rest of the comment then leaks into the

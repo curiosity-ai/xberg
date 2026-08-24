@@ -1115,7 +1115,15 @@ public sealed class HtmlWalker
     /// because the structure walker it serves ports a Rust function that knows only a few dozen
     /// names, and widening it there would diverge from the reference the other way.
     /// </remarks>
-    internal static string DecodeEntitiesFull(string s)
+    internal static string DecodeEntitiesFull(string s) => DecodeEntitiesFull(s, false);
+
+    /// <param name="html5NumericTable">
+    /// Resolve a numeric reference the way the HTML5 tokenizer does, through the replacement
+    /// table of §13.2.5.80. Only a document that reaches the walk through the html5ever repair
+    /// gets this: the converter's own fast path decodes <c>&amp;#146;</c> to U+0092 and leaves it
+    /// there, where the repair resolves it to U+2019.
+    /// </param>
+    internal static string DecodeEntitiesFull(string s, bool html5NumericTable)
     {
         if (!s.Contains('&')) return s;
         var outp = new StringBuilder(s.Length);
@@ -1137,7 +1145,7 @@ public sealed class HtmlWalker
                 continue;
             }
 
-            if (name[0] == '#' && DecodeNumericReference(name) is { } numeric)
+            if (name[0] == '#' && DecodeNumericReference(name, html5NumericTable) is { } numeric)
             {
                 outp.Append(numeric);
                 i = semi + 1;
@@ -1149,7 +1157,22 @@ public sealed class HtmlWalker
         return outp.ToString();
     }
 
-    private static string? DecodeNumericReference(string name)
+    /// <summary>
+    /// The HTML5 tokenizer's numeric character reference replacement table (§13.2.5.80). A
+    /// reference in the C1 range names a Windows-1252 character rather than the control it
+    /// nominally points at, because that is what the pages doing it meant.
+    /// </summary>
+    private static readonly Dictionary<int, int> Html5NumericReplacements = new()
+    {
+        [0x00] = 0xFFFD, [0x80] = 0x20AC, [0x82] = 0x201A, [0x83] = 0x0192, [0x84] = 0x201E,
+        [0x85] = 0x2026, [0x86] = 0x2020, [0x87] = 0x2021, [0x88] = 0x02C6, [0x89] = 0x2030,
+        [0x8A] = 0x0160, [0x8B] = 0x2039, [0x8C] = 0x0152, [0x8E] = 0x017D, [0x91] = 0x2018,
+        [0x92] = 0x2019, [0x93] = 0x201C, [0x94] = 0x201D, [0x95] = 0x2022, [0x96] = 0x2013,
+        [0x97] = 0x2014, [0x98] = 0x02DC, [0x99] = 0x2122, [0x9A] = 0x0161, [0x9B] = 0x203A,
+        [0x9C] = 0x0153, [0x9E] = 0x017E, [0x9F] = 0x0178,
+    };
+
+    private static string? DecodeNumericReference(string name, bool html5NumericTable = false)
     {
         string num = name[1..];
         int cp;
@@ -1160,6 +1183,8 @@ public sealed class HtmlWalker
         else if (!int.TryParse(num, out cp)) return null;
 
         if (cp < 0 || cp > 0x10FFFF) return null;
+        if (html5NumericTable && Html5NumericReplacements.TryGetValue(cp, out int replacement))
+            cp = replacement;
         try { return char.ConvertFromUtf32(cp); }
         catch { return null; }
     }
