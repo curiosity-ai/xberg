@@ -1,3 +1,7 @@
+// Derived from `mathemascii` 0.4.0 and `alemat` 0.8.0 (Copyright Nadir Fejzic), licensed under
+// the Apache License 2.0. This file is generated from those crates' sources and is a modified
+// work; see ../../../../THIRD_PARTY_NOTICES.md and ../../../../third_party/LICENSE-Apache-2.0.txt.
+//
 // The symbol tables of `mathemascii` 0.4.0, resolved through `alemat` 0.8.0's own
 // `Ident::…`/`Operator::…` constructors. Generated from the two crates' sources rather than
 // transcribed, so every character is the one the goldens were produced with.

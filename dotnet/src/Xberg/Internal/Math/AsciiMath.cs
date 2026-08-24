@@ -1,3 +1,8 @@
+// Derived from `mathemascii` 0.4.0 and `alemat` 0.8.0 (Copyright Nadir Fejzic,
+// https://github.com/nfejzic/mathemascii, https://github.com/nfejzic/alemat), both licensed under
+// the Apache License 2.0. This file is a modified translation of those crates into C#; see
+// ../../../../THIRD_PARTY_NOTICES.md and ../../../../third_party/LICENSE-Apache-2.0.txt.
+//
 // Ported from the `mathemascii` 0.4.0 crate and the slice of `alemat` 0.8.0 it renders through,
 // which together are how upstream turns AsciiMath into MathML
 // (crates/xberg/src/extraction/asciimath.rs). The MathML then goes through this port's shared

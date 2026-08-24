@@ -1,3 +1,8 @@
+// Derived from `mathemascii` 0.4.0 (Copyright Nadir Fejzic, https://github.com/nfejzic/mathemascii),
+// licensed under the Apache License 2.0. This file is a modified translation of that crate's
+// scanner and lexer into C#; see ../../../../THIRD_PARTY_NOTICES.md and
+// ../../../../third_party/LICENSE-Apache-2.0.txt.
+//
 // Ported from the `mathemascii` 0.4.0 crate, which upstream uses to turn AsciiMath into MathML
 // (crates/xberg/src/extraction/asciimath.rs). This file is the crate's scanner and lexer; the
 // parser and the MathML writer are in AsciiMath.cs.
