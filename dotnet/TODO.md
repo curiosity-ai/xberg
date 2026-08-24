@@ -140,10 +140,6 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > - **Inherited `/MediaBox`** (`pdf/pdfa_034.pdf`). ISO 32000-1 §7.7.3.4 inherits from the
 >   nearest ancestor that defines the attribute; on a document with two nested `Pages` nodes
 >   upstream reports the root's A4 box where the page's own parent says Letter.
-> - **AsciiDoc math macros.** Upstream's current source converts `latexmath:`/`asciimath:`/
->   `stem:` and `[latexmath]` + `++++` blocks; the reference outputs predate that and carry them
->   verbatim. The port matches the references, which is also what the AsciiMath path can do
->   without a converter it does not have.
 > - **`H2SO4` on `pdf/embedded_images_tables.pdf`**, where upstream reads `H SO4`.
 > - **Duplicated body text on `office/regression/000_000213.html`.** A 7 KB page extracts to
 >   39 KB upstream, with one paragraph repeated ten times. The page leaves `<p>` and `<a>`
@@ -488,15 +484,37 @@ Beyond the converter upgrade, `ec94d8c0` (#1414) moved five other formats. Porte
 - **typst** — a line that opens and closes its own math is one formula; it used to become the
   start of a display block and swallow everything up to the next `$` in the document.
 
-Two are **not** ported, both because they need a parser this port does not have:
+Both maths converters are **now ported**, and with them every adoc and typ fixture:
 
-- **asciidoc (0 of 6).** Upstream converts `stem:[…]`, `latexmath:[…]` and `asciimath:[…]` to
-  LaTeX through the `mathemascii` crate — `stem:[B_"FROM"^"out"]` becomes
-  `$B_{\text{FROM}}^{\text{out}}$`. Every adoc fixture in the corpus is a maths one, so all six
-  fail on it. An AsciiMath parser is the whole job.
-- **typst (6 of 12).** The same shape: upstream added a 540-line Typst-math-to-LaTeX converter
-  built on `typst-syntax`'s own parser. The scanner fix above removes the content loss, so what
-  remains is purely the notation (`2 pi sqrt(l / g)` against `2 \pi \sqrt{\frac{l}{g}}`).
+- **asciidoc (0 -> 6 of 6).** `mathemascii` 0.4.0 (scanner, lexer, parser, AST) and the slice of
+  `alemat` 0.8.0 it renders MathML through, both translated to C# under
+  `src/Xberg/Internal/Math/AsciiMath*.cs`, with the AsciiDoc extractor's inline macros and
+  `++++` math blocks wired to them. The MathML then goes through this port's existing
+  MathML-to-LaTeX converter — the same indirection upstream chose, so AsciiMath inherits that
+  converter's fixes. Validated against a probe built on the real crate: 322 expressions — every
+  `stem:`/`asciimath:` macro and math-block body in the corpus, plus the crate's own test
+  inputs — render byte-identical MathML, panics included.
+- **typst (6 -> 12 of 12).** The math-mode slice of `typst-syntax` 0.15.1 — its scanner, lexer,
+  syntax tree and parser — translated to C# under `src/Xberg/Internal/Math/Typst*.cs`, plus the
+  540-line render walk. Validated the same way: 486 of the 487 `$…$` spans in the corpus parse
+  to a tree identical to the crate's own, the last being a documentation placeholder that
+  renders the same either way.
+
+Both crates are Apache-2.0, where everything else the port derives from is MIT or dual
+`MIT OR Apache-2.0`. See `dotnet/THIRD_PARTY_NOTICES.md`: the derived files stay under
+Apache-2.0, which is why `<Packagelicense>MIT</Packagelicense>` in `Xberg.csproj` no longer
+describes the whole assembly.
+
+Two reductions, both recorded in the file headers:
+
+- The AsciiMath port raises an exception where the crate panics — on a multi-byte character
+  (`Symbol::as_str` slices by byte while indexing by character) and on `cancel` (left
+  `unimplemented!()`). Upstream contains those panics and drops the equation rather than the
+  document; the port does the same, in the same place.
+- Typst's **code mode**, which math enters at a `#`, is reduced to the shapes a `#` takes inside
+  math. The crate's full code grammar is the other two-thirds of its parser, and none of it
+  reaches the output: the converter renders a `Hash` as nothing and drops `Named` and `Spread`
+  arguments whole, so only where the code expression *ends* has to be right.
 
 ### The 17 remaining failures, classified
 

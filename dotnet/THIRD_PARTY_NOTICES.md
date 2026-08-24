@@ -26,11 +26,20 @@ crates ships a `NOTICE` file, so §4(d) does not apply.
 - Derived files: `src/Xberg/Internal/Math/TypstKind.cs`,
   `src/Xberg/Internal/Math/TypstLexer.cs`,
   `src/Xberg/Internal/Math/TypstNode.cs`,
-  `src/Xberg/Internal/Math/TypstParser.cs`
+  `src/Xberg/Internal/Math/TypstParser.cs`,
+  and the `default_math_class` overrides in
+  `src/Xberg/Internal/Math/TypstMathClass.cs` (from `typst-utils` 0.15.1, also
+  Apache-2.0 and also by The Typst Project Developers)
 - Modifications: the math-mode slice of the crate's lexer, syntax tree, and
-  parser translated to C#. Markup and code mode, spans, incremental reparsing,
-  memoization, and diagnostics are omitted; only what `parse_math` reaches is
-  ported.
+  parser translated to C#. Markup mode, spans, the newline modes, incremental
+  reparsing, memoization and diagnostics are omitted; only what `parse_math`
+  reaches is ported. Code mode, which math enters at a `#`, is reduced to the
+  shapes a `#` takes inside math — literals, names, field accesses, calls with
+  named and spread arguments, bracketed groups, let bindings, set and show
+  rules, and closures — with other keywords consumed rather than modelled.
+  Validated at 486 of 487 trees identical to the crate's own parser over every
+  `$…$` span in the corpus, the last being a documentation placeholder that
+  renders the same either way.
 
 ## mathemascii 0.4.0 — Apache-2.0
 

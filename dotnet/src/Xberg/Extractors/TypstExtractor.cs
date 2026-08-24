@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Xberg.Core;
 using Xberg.Internal.Markup;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -132,7 +133,7 @@ public sealed partial class TypstExtractor : IExtractor
                     inDisplayMath = false;
                     string mathText = mathBuf.ToString().Trim();
                     mathBuf.Clear();
-                    if (mathText.Length != 0) builder.PushFormula(mathText, null, null);
+                    if (mathText.Length != 0) builder.PushFormula(TypstMath.ConvertToLatex(mathText), null, null);
                 }
                 else
                 {
@@ -255,7 +256,7 @@ public sealed partial class TypstExtractor : IExtractor
                     // such a line as the start of a block swallowed all of it up to the next `$`
                     // somewhere further down the document.
                     string math = rest[..close].Trim();
-                    if (math.Length != 0) builder.PushFormula(math, null, null);
+                    if (math.Length != 0) builder.PushFormula(TypstMath.ConvertToLatex(math), null, null);
                     string after = rest[(close + 1)..].Trim();
                     if (after.Length != 0) paragraphBuf.Append(after).Append(' ');
                 }
@@ -357,7 +358,7 @@ public sealed partial class TypstExtractor : IExtractor
         if (inDisplayMath)
         {
             string trailingMath = mathBuf.ToString().Trim();
-            if (trailingMath.Length != 0) builder.PushFormula(trailingMath, null, null);
+            if (trailingMath.Length != 0) builder.PushFormula(TypstMath.ConvertToLatex(trailingMath), null, null);
         }
 
         if (activeList is not null) builder.EndList();

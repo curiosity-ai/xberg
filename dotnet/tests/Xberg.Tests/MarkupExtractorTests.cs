@@ -67,7 +67,9 @@ public class MarkupExtractorTests
     {
         var doc = Extract(new TypstExtractor(), "Before\n\n$\nx^2 + y^2\n= r^2\n$\n\nAfter\n", "application/x-typst");
         var formula = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Formula);
-        Assert.Equal("x^2 + y^2\n= r^2", formula.Text);
+        // The converter collapses the source's line breaks: the formula is one expression, not
+        // two lines of one.
+        Assert.Equal("x^2 + y^2 = r^2", formula.Text);
         Assert.Contains(doc.Elements, e => e.Kind.Tag == ElementKindTag.Paragraph && e.Text == "After");
     }
 
@@ -76,7 +78,7 @@ public class MarkupExtractorTests
     {
         var doc = Extract(new TypstExtractor(), "$ a + b\nc + d\n", "application/x-typst");
         var formula = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Formula);
-        Assert.Equal("a + b\nc + d", formula.Text);
+        Assert.Equal("a + b c + d", formula.Text);
     }
 
     [Fact]
