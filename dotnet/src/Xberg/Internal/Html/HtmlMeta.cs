@@ -85,6 +85,9 @@ public static class HtmlMeta
         }
 
         bool inAnchor = false;
+        // Where each open inline marker was written, so its whitespace can be moved outside the
+        // delimiters when it closes.
+        var openMarkers = new List<(StringBuilder Buffer, string Marker, int At)>();
         var anchorText = new StringBuilder();
         // Open `<abbr>` expansions, appended when each one closes.
         var abbrTitles = new List<string>();
@@ -201,9 +204,11 @@ public static class HtmlMeta
                             HeaderSink().Add(new Header
                             {
                                 Level = captureHeading, Text = text, Id = headingId,
-                                // A heading inside a table is recorded at depth 0 — the passes
-                                // that re-walk it have no enclosing tree to count.
-                                Depth = tables.Count > 0 ? 0 : headingDepthAtOpen,
+                                // A heading inside a table carries its real DOM depth. It read 0
+                                // while the re-walks that recorded it started from a fresh tree;
+                                // since 3.11.0 the render is the only pass that records, and it
+                                // walks the cell at the table's own depth.
+                                Depth = headingDepthAtOpen,
                                 HtmlOffset = 0,
                             });
                         captureHeading = 0;
@@ -240,7 +245,8 @@ public static class HtmlMeta
                     }
                     else if (InlineMarker(tag) is { } closeMarker && (captureHeading != 0 || inAnchor))
                     {
-                        (captureHeading != 0 ? headingText : anchorText).Append(closeMarker);
+                        var target = captureHeading != 0 ? headingText : anchorText;
+                        CloseInlineMarker(openMarkers, target, closeMarker);
                     }
                     else if (tag == "abbr" && abbrTitles.Count > 0 && (captureHeading != 0 || inAnchor))
                     {
@@ -317,7 +323,9 @@ public static class HtmlMeta
                 // Emphasis inside a heading or a link is part of the markdown those record.
                 if (InlineMarker(tag) is { } openMarker && (captureHeading != 0 || inAnchor) && !selfClose)
                 {
-                    (captureHeading != 0 ? headingText : anchorText).Append(openMarker);
+                    var target = captureHeading != 0 ? headingText : anchorText;
+                    openMarkers.Add((target, openMarker, target.Length));
+                    target.Append(openMarker);
                     domDepth++;
                     continue;
                 }
@@ -557,6 +565,40 @@ public static class HtmlMeta
             if (k < html.Length && html[k] == '>') return (close, k + 1);
             search = close + 1;
         }
+    }
+
+    /// <summary>
+    /// Close an emphasis span, leaving its whitespace outside the delimiters.
+    /// </summary>
+    /// <remarks>
+    /// <c>&lt;b&gt;label &lt;/b&gt;</c> is <c>**label** </c>, not <c>**label **</c> — a delimiter
+    /// with a space against its inner edge is not emphasis at all in CommonMark, so the
+    /// converter chomps the span and re-emits the whitespace outside. The recorded markdown has
+    /// to match what the converter wrote.
+    /// </remarks>
+    private static void CloseInlineMarker(
+        List<(StringBuilder Buffer, string Marker, int At)> open, StringBuilder target, string marker)
+    {
+        int idx = open.FindLastIndex(o => ReferenceEquals(o.Buffer, target) && o.Marker == marker);
+        if (idx < 0) { target.Append(marker); return; }
+        var (_, openMarker, at) = open[idx];
+        open.RemoveAt(idx);
+
+        int contentStart = at + openMarker.Length;
+        if (contentStart > target.Length) { target.Append(marker); return; }
+        string content = target.ToString(contentStart, target.Length - contentStart);
+        string trimmed = content.Trim();
+        if (trimmed.Length == 0)
+        {
+            // Nothing but whitespace between the delimiters: neither delimiter survives.
+            target.Length = at;
+            target.Append(content);
+            return;
+        }
+        string lead = content[..(content.Length - content.TrimStart().Length)];
+        string trail = content[content.TrimEnd().Length..];
+        target.Length = at;
+        target.Append(lead).Append(openMarker).Append(trimmed).Append(marker).Append(trail);
     }
 
     /// <summary>The markdown delimiter an inline element is written with, or null.</summary>
