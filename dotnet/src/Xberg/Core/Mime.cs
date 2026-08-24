@@ -43,7 +43,20 @@ public static class Mime
                 if (office is not null) return office;
             }
             if (SupportedMimeTypes.Contains(magic) || magic.StartsWith("image/"))
+            {
+                // The magic sniff reads the `<?xml` declaration and stops at generic XML, so the
+                // vocabulary check has to run before that result is returned. A caller may pass a
+                // truncated header, so decode lossily: a split multi-byte character must not
+                // suppress the check.
+                if (IsGenericXmlMime(magic))
+                {
+                    string prolog = System.Text.Encoding.UTF8.GetString(
+                        content[..Math.Min(content.Length, 8192)]);
+                    string? vocabulary = XmlVocabulary(prolog.TrimStart());
+                    if (vocabulary is not null) return vocabulary;
+                }
                 return magic;
+            }
             // else fall through to PST/text heuristics
         }
 
@@ -72,7 +85,7 @@ public static class Mime
             if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(SkipLeadingComments(trimmed)))
                 return "text/html";
             if (trimmed.StartsWith("<?xml", StringComparison.Ordinal) || trimmed.StartsWith('<'))
-                return "application/xml";
+                return XmlVocabulary(trimmed) ?? "application/xml";
             if (trimmed.StartsWith("%PDF", StringComparison.Ordinal))
                 return "application/pdf";
             return "text/plain";
@@ -122,6 +135,118 @@ public static class Mime
 
     /// <summary>How much of a file upstream reads when checking content against the extension.</summary>
     private const int MagicHeaderBytes = 4096;
+
+    private const string DocbookMimeType = "application/docbook+xml";
+    private const string JatsMimeType = "application/x-jats+xml";
+
+    /// <summary>
+    /// The XML vocabulary <paramref name="trimmed"/> declares, if it declares one.
+    /// </summary>
+    /// <remarks>
+    /// Real DocBook and JATS documents use the <c>.xml</c> extension, so the extension map alone
+    /// routes them to the generic XML extractor and their structure and equations are lost. The
+    /// test is structural rather than a search of the text: a public identifier counts only
+    /// inside the DOCTYPE declaration, and a namespace only when the root element declares it, so
+    /// a stylesheet, schema or catalog that merely names DocBook keeps its generic routing.
+    /// </remarks>
+    private static string? XmlVocabulary(string trimmed)
+    {
+        string? doctype = DeclarationOf(trimmed, "<!DOCTYPE");
+        if (doctype is not null)
+        {
+            if (doctype.Contains("//OASIS//DTD DocBook", StringComparison.Ordinal)) return DocbookMimeType;
+            if (doctype.Contains("//NLM//DTD JATS", StringComparison.Ordinal)
+                || doctype.Contains("//NLM//DTD Journal", StringComparison.Ordinal)) return JatsMimeType;
+        }
+        string? root = RootStartTag(trimmed);
+        if (root is null) return null;
+        return RootIsInNamespace(root, "http://docbook.org/ns/docbook") ? DocbookMimeType : null;
+    }
+
+    /// <summary>
+    /// Whether the root element itself belongs to <paramref name="ns"/>. A declaration alone
+    /// proves nothing — an XSL stylesheet that transforms DocBook binds the namespace on its own
+    /// root — so the element belongs to it only when the binding it carries is the one its name
+    /// uses.
+    /// </summary>
+    private static bool RootIsInNamespace(string root, string ns)
+    {
+        string name = root.TrimStart('<').Split(' ', '\t', '\n', '\r', '>', '/')[0];
+        int colon = name.IndexOf(':');
+        string binding = colon >= 0 ? $"xmlns:{name[..colon]}=" : "xmlns=";
+        int start = root.IndexOf(binding, StringComparison.Ordinal);
+        if (start < 0) return false;
+        string value = root[(start + binding.Length)..];
+        if (value.Length == 0) return false;
+        char quote = value[0];
+        if (quote != '"' && quote != '\'') return false;
+        int end = value.IndexOf(quote, 1);
+        return end > 0 && value[1..end] == ns;
+    }
+
+    /// <summary>
+    /// The declaration beginning with <paramref name="opener"/>, delimiters included. An internal
+    /// subset may hold a <c>&gt;</c> inside its brackets, so the scan tracks bracket depth rather
+    /// than searching for a <c>]</c> anywhere in the document — a <c>]</c> in the body would
+    /// otherwise stretch the declaration over the whole file.
+    /// </summary>
+    private static string? DeclarationOf(string trimmed, string opener)
+    {
+        int start = trimmed.IndexOf(opener, StringComparison.Ordinal);
+        if (start < 0) return null;
+        string rest = trimmed[start..];
+        int end = DoctypeEnd(rest[opener.Length..]);
+        return end < 0 ? null : rest[..(opener.Length + end)];
+    }
+
+    /// <summary>
+    /// The offset of the <c>&gt;</c> that closes a <c>&lt;!DOCTYPE</c> declaration whose tail
+    /// starts at <paramref name="tail"/>, or -1 when it never closes.
+    /// </summary>
+    private static int DoctypeEnd(string tail)
+    {
+        int bracketDepth = 0;
+        for (int i = 0; i < tail.Length; i++)
+        {
+            char c = tail[i];
+            if (c == '[') bracketDepth++;
+            else if (c == ']') { if (bracketDepth > 0) bracketDepth--; }
+            else if (c == '>' && bracketDepth == 0) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>The document's root start tag, skipping declarations and processing instructions.</summary>
+    private static string? RootStartTag(string trimmed)
+    {
+        string rest = trimmed;
+        while (true)
+        {
+            int open = rest.IndexOf('<');
+            if (open < 0) return null;
+            rest = rest[open..];
+            if (rest.StartsWith("<?", StringComparison.Ordinal) || rest.StartsWith("<!", StringComparison.Ordinal))
+            {
+                int skip;
+                if (rest.StartsWith("<!DOCTYPE", StringComparison.Ordinal))
+                {
+                    string? decl = DeclarationOf(rest, "<!DOCTYPE");
+                    if (decl is null) return null;
+                    skip = decl.Length;
+                }
+                else
+                {
+                    skip = rest.IndexOf('>');
+                    if (skip < 0) return null;
+                }
+                if (skip + 1 > rest.Length) return null;
+                rest = rest[(skip + 1)..];
+                continue;
+            }
+            int close = rest.IndexOf('>');
+            return close < 0 ? null : rest[..(close + 1)];
+        }
+    }
 
     private static bool IsGenericXmlMime(string mime) => mime is "application/xml" or "text/xml";
 

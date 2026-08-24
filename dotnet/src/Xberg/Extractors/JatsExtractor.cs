@@ -1,5 +1,6 @@
 using System.Text;
 using Xberg.Core;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -114,8 +115,12 @@ public sealed class JatsExtractor : IExtractor
                     }
                     case "p" when inAbstract:
                     {
-                        var (t, anns) = ExtractParaWithAnnotations(reader);
+                        var (t, anns, paraFormulas) = ExtractParaWithAnnotations(reader);
                         if (t.Length > 0) builder.PushParagraph(t, anns, null, null);
+                        // The equation belongs where the sentence put it, so it follows the
+                        // block that holds it. A paragraph that is only an equation has no
+                        // text, and still has its formula.
+                        foreach (var latex in paraFormulas) builder.PushFormula(latex, null, null);
                         break;
                     }
                     case "body": inBody = true; secDepth = 0; break;
@@ -128,7 +133,7 @@ public sealed class JatsExtractor : IExtractor
                     }
                     case "p" when inBody:
                     {
-                        var (t, anns) = ExtractParaWithAnnotations(reader);
+                        var (t, anns, paraFormulas) = ExtractParaWithAnnotations(reader);
                         if (t.Length > 0)
                         {
                             foreach (var ann in anns)
@@ -136,14 +141,18 @@ public sealed class JatsExtractor : IExtractor
                                     builder.PushUri(new ExtractedUri { Url = ann.Kind.Url!, Label = SliceLabel(t, ann.Start, ann.End), Kind = UriKind.Hyperlink });
                             builder.PushParagraph(t, anns, null, null);
                         }
+                        // The equation belongs where the sentence put it, so it follows the
+                        // block that holds it. A paragraph that is only an equation has no
+                        // text, and still has its formula.
+                        foreach (var latex in paraFormulas) builder.PushFormula(latex, null, null);
                         break;
                     }
                     case "fig" when inBody: ExtractText(reader); break;
                     case "disp-formula" when inBody:
                     case "inline-formula" when inBody:
                     {
-                        string t = ExtractText(reader);
-                        if (t.Length > 0) builder.PushFormula(t, null, null);
+                        string latex = FormulaXml.ExtractFormulaLatex(reader, JatsFormulaElements);
+                        if (latex.Length > 0) builder.PushFormula(latex, null, null);
                         break;
                     }
                     case "back": inBack = true; break;
@@ -156,8 +165,12 @@ public sealed class JatsExtractor : IExtractor
                     }
                     case "p" when inBack && !inRefList:
                     {
-                        var (t, anns) = ExtractParaWithAnnotations(reader);
+                        var (t, anns, paraFormulas) = ExtractParaWithAnnotations(reader);
                         if (t.Length > 0) builder.PushParagraph(t, anns, null, null);
+                        // The equation belongs where the sentence put it, so it follows the
+                        // block that holds it. A paragraph that is only an equation has no
+                        // text, and still has its formula.
+                        foreach (var latex in paraFormulas) builder.PushFormula(latex, null, null);
                         break;
                     }
                     case "table": inTable = true; currentTable.Clear(); break;
@@ -334,10 +347,14 @@ public sealed class JatsExtractor : IExtractor
     }
 
     // ── extract_para_with_annotations_jats (mod.rs) ──────────────────────────
-    private static (string text, List<TextAnnotation> anns) ExtractParaWithAnnotations(XmlPullReader reader)
+    /// <summary>JATS writes verbatim TeX in `tex-math` and the equation number in `label`.</summary>
+    private static readonly FormulaElements JatsFormulaElements = new("tex-math", "label");
+
+    private static (string text, List<TextAnnotation> anns, List<string> formulas) ExtractParaWithAnnotations(XmlPullReader reader)
     {
         var text = new StringBuilder();
         var anns = new List<TextAnnotation>();
+        var formulas = new List<string>();
         int depth = 0;
         var stack = new List<(string Kind, int OpenDepth, int Start, string? Href)>();
 
@@ -350,6 +367,17 @@ public sealed class JatsExtractor : IExtractor
                 depth++;
                 switch (ev.Name)
                 {
+                    // An article writes its equation inside the sentence that refers to it. The
+                    // equation belongs in the formula list, so it is captured here rather than
+                    // flattened into the prose.
+                    case "disp-formula":
+                    case "inline-formula":
+                    {
+                        string latex = FormulaXml.ExtractFormulaLatex(reader, JatsFormulaElements);
+                        depth--;
+                        if (latex.Trim().Length > 0) formulas.Add(latex.Trim());
+                        break;
+                    }
                     case "italic": stack.Add(("italic", depth, Utf8Len(text), null)); break;
                     case "bold": stack.Add(("bold", depth, Utf8Len(text), null)); break;
                     case "underline": stack.Add(("underline", depth, Utf8Len(text), null)); break;
@@ -399,7 +427,7 @@ public sealed class JatsExtractor : IExtractor
                 if (trimmed.Length > 0) { if (text.Length > 0) text.Append(' '); text.Append(trimmed); }
             }
         }
-        return (text.ToString().Trim(), anns);
+        return (text.ToString().Trim(), anns, formulas);
     }
 
     private static TextAnnotation MakeAnnotation(string kind, uint start, uint end, string? href) => kind switch

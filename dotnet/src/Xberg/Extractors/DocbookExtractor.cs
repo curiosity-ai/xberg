@@ -1,5 +1,6 @@
 using System.Text;
 using Xberg.Core;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -132,7 +133,7 @@ public sealed class DocbookExtractor : IExtractor
                         break;
                     case "para":
                     {
-                        var (text, anns) = ExtractParaWithAnnotations(reader);
+                        var (text, anns, paraFormulas) = ExtractParaWithAnnotations(reader);
                         if (text.Length > 0)
                         {
                             foreach (var ann in anns)
@@ -140,6 +141,19 @@ public sealed class DocbookExtractor : IExtractor
                                     builder.PushUri(new ExtractedUri { Url = ann.Kind.Url!, Label = SliceLabel(text, ann.Start, ann.End), Kind = UriKind.Hyperlink });
                             builder.PushParagraph(text, anns, null, null);
                         }
+                        // The equation belongs where the sentence put it, so it follows the block
+                        // that holds it. A paragraph that is only an equation has no text, and
+                        // still has its formula.
+                        foreach (var latex in paraFormulas) builder.PushFormula(latex, null, null);
+                        break;
+                    }
+                    case "equation": case "informalequation": case "inlineequation":
+                    {
+                        // DocBook writes an equation as MathML, as verbatim TeX in `alt`, or as
+                        // plain text. An `<equation>` also takes a `<title>`, which is a caption
+                        // rather than an equation number, so it stays out of the LaTeX.
+                        string latex = FormulaXml.ExtractFormulaLatex(reader, DocbookFormulaElements);
+                        if (latex.Trim().Length > 0) builder.PushFormula(latex.Trim(), null, null);
                         break;
                     }
                     case "programlisting": case "screen":
@@ -335,10 +349,14 @@ public sealed class DocbookExtractor : IExtractor
         return caption;
     }
 
-    private static (string text, List<TextAnnotation> anns) ExtractParaWithAnnotations(XmlPullReader reader)
+    /// <summary>DocBook writes verbatim TeX in `alt` and has no equation-number element.</summary>
+    private static readonly FormulaElements DocbookFormulaElements = new("alt", null);
+
+    private static (string text, List<TextAnnotation> anns, List<string> formulas) ExtractParaWithAnnotations(XmlPullReader reader)
     {
         var text = new StringBuilder();
         var anns = new List<TextAnnotation>();
+        var formulas = new List<string>();
         int depth = 0;
         // (kind, openDepth, startByte, href)
         var stack = new List<(string Kind, int OpenDepth, int Start, string? Href)>();
@@ -353,6 +371,16 @@ public sealed class DocbookExtractor : IExtractor
                 string tag = StripNamespace(ev.Name);
                 switch (tag)
                 {
+                    // A paragraph carries its equations inline. The formula belongs in the
+                    // formula list, so it is captured here rather than flattened into the
+                    // sentence.
+                    case "equation": case "informalequation": case "inlineequation":
+                    {
+                        string latex = FormulaXml.ExtractFormulaLatex(reader, DocbookFormulaElements);
+                        depth--;
+                        if (latex.Trim().Length > 0) formulas.Add(latex.Trim());
+                        break;
+                    }
                     case "emphasis":
                     {
                         string role = "";
@@ -415,7 +443,7 @@ public sealed class DocbookExtractor : IExtractor
                 if (trimmed.Length > 0) { if (text.Length > 0) text.Append(' '); text.Append(trimmed); }
             }
         }
-        return (text.ToString().Trim(), anns);
+        return (text.ToString().Trim(), anns, formulas);
     }
 
     private static TextAnnotation MakeAnnotation(string kind, uint start, uint end, string? href) => kind switch
