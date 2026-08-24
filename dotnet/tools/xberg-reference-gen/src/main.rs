@@ -6,7 +6,7 @@
 //! CLI diffs its own extraction output against these golden files.
 //!
 //! Usage:
-//!   xberg-reference-gen <root-dir> [--overwrite]
+//!   xberg-reference-gen <root-dir> [--overwrite] [--filter <substr>]
 
 use std::path::{Path, PathBuf};
 
@@ -55,15 +55,23 @@ struct ReferenceOutput {
 
 #[tokio::main]
 async fn main() {
-    let mut args = std::env::args().skip(1);
-    let root = match args.next() {
-        Some(r) => PathBuf::from(r),
-        None => {
-            eprintln!("usage: xberg-reference-gen <root-dir> [--overwrite]");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let root = match args.first() {
+        Some(r) if !r.starts_with("--") => PathBuf::from(r),
+        _ => {
+            eprintln!("usage: xberg-reference-gen <root-dir> [--overwrite] [--filter <substr>]");
             std::process::exit(2);
         }
     };
-    let overwrite = args.any(|a| a == "--overwrite");
+    let overwrite = args.iter().any(|a| a == "--overwrite");
+    // `--filter <substr>`: restrict the walk to fixtures whose path contains <substr>.
+    // Regenerating one document is otherwise a whole-corpus run; the C# harness has the
+    // same flag, so the two sides can be pointed at the same fixture with the same words.
+    let filter = args
+        .iter()
+        .position(|a| a == "--filter")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
     if !root.is_dir() {
         eprintln!("error: {} is not a directory", root.display());
@@ -75,12 +83,20 @@ async fn main() {
     let mut skipped = 0usize;
     let mut failed = 0usize;
 
+    // Sorted walk. `xberg` keeps a process-global font cache, so a document's output
+    // depends on what was extracted before it in the same process: readdir order would
+    // make a run irreproducible on its own machine, let alone across two.
     let entries: Vec<PathBuf> = walkdir::WalkDir::new(&root)
+        .sort_by_file_name()
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
         .filter(|p| is_candidate(p))
+        .filter(|p| match &filter {
+            Some(f) => p.to_string_lossy().contains(f.as_str()),
+            None => true,
+        })
         .collect();
 
     for path in entries {
@@ -97,7 +113,21 @@ async fn main() {
             .to_string_lossy()
             .replace('\\', "/");
 
-        match generate(&path, &rel).await {
+        // Run each fixture on its own task so a panic inside a backend parser costs
+        // one golden rather than aborting the run and leaving the corpus half-written
+        // (`mathemascii` panics on a char boundary parsing one asciidoc fixture).
+        let (task_path, task_rel) = (path.clone(), rel.clone());
+        let outcome = tokio::spawn(async move { generate(&task_path, &task_rel).await }).await;
+        let outcome = match outcome {
+            Ok(r) => r,
+            Err(join_err) => {
+                eprintln!("panic {rel}: {join_err}");
+                failed += 1;
+                continue;
+            }
+        };
+
+        match outcome {
             Ok(reference) => {
                 let json = serde_json::to_string_pretty(&reference).unwrap();
                 if let Err(e) = std::fs::write(&out_path, json) {
