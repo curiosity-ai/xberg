@@ -403,10 +403,19 @@ public static class HtmlMeta
                         break;
                     case "table":
                         if (!selfClose)
+                        {
+                            // A layout table's rows are walked inline, which is what makes an
+                            // image inside one degrade to its alt text. The verdict comes from
+                            // the handler's own predicate over this table's markup, so the two
+                            // sides cannot drift apart.
+                            int tableEnd = FindElementEnd(html, tagStart, "table");
+                            string tableHtml = html[tagStart..(tableEnd < 0 ? n : tableEnd)];
                             tables.Add(new TableFrame
                             {
                                 BorderZero = HtmlWalker.ExtractAttr(attrsStr, "border") == "0",
+                                Layout = HtmlToMarkdown.TableMarkupRendersAsLayoutList(tableHtml),
                             });
+                        }
                         break;
                     case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
                         captureHeading = tag[1] - '0';
@@ -469,8 +478,18 @@ public static class HtmlMeta
                             Attributes = attrs,
                         };
                         ImageSink().Add(image);
-                        // A link wrapping an image carries the image markdown as its label text.
-                        if (inAnchor) anchorText.Append("![").Append(alt ?? "").Append("](").Append(src ?? "").Append(')');
+                        // A link wrapping an image carries the image markdown as its label text —
+                        // except inside a heading, where the image degrades to its alt text and
+                        // the label carries that instead. A heading holding an image directly
+                        // carries the alt text the same way.
+                        // Inline context — a heading, or a cell of a table the handler renders
+                        // as a list — degrades the image to its alt text.
+                        bool inlineImage = captureHeading != 0 || tables.Exists(t => t.Layout);
+                        string rendered = inlineImage
+                            ? alt ?? ""
+                            : "![" + (alt ?? "") + "](" + (src ?? "") + ")";
+                        if (inAnchor) anchorText.Append(rendered);
+                        else if (captureHeading != 0) headingText.Append(rendered);
                         break;
                     }
                     // An `<svg>` converts to an image whose source is the serialized subtree, so
@@ -699,6 +718,9 @@ public static class HtmlMeta
     {
         /// <summary>Where a run of records came from, which decides the passes it is replayed for.</summary>
         public enum Origin { Cell, Caption, Child }
+
+        /// <summary>Set when the handler renders this table as a list of its rows.</summary>
+        public bool Layout;
 
         public readonly List<(Origin From, List<object> Items)> Headers = new(), Links = new(), Images = new();
 

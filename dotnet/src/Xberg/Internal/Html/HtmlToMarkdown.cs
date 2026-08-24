@@ -2530,7 +2530,7 @@ internal static class HtmlToMarkdown
     }
 
     // ── tables (block/table/*.rs) ────────────────────────────────────────────
-    private sealed class TableScan
+    internal sealed class TableScan
     {
         public readonly List<int> RowCounts = new();
         public bool HasSpan, HasHeader, HasCaption, HasText;
@@ -2704,18 +2704,43 @@ internal static class HtmlToMarkdown
         return sb.ToString();
     }
 
-    private static void HandleTable(HNode node, StringBuilder output, Ctx ctx)
+    /// <summary>
+    /// Whether the handler renders this table as a list of its rows rather than as a Markdown
+    /// table. A layout table's cells are walked inline, which is what makes an image inside one
+    /// degrade to its alt text — so the metadata collector has to reach the same verdict.
+    /// </summary>
+    internal static bool RendersAsLayoutList(HNode node, TableScan scan)
     {
-        var scan = ScanTable(node);
-
         var distinctCounts = scan.RowCounts.Where(c => c > 0).Distinct().ToList();
         bool hasBorderZero = node.Attr("border") == "0";
         bool looksLikeLayout = scan.NestedTableCount > 1 || distinctCounts.Count > 1 || (scan.HasSpan && hasBorderZero);
         bool isBlankTable = !scan.HasText;
         int rowCount = scan.RowCounts.Count;
+        return !scan.HasHeader && !scan.HasCaption
+            && (looksLikeLayout || isBlankTable || (rowCount <= 2 && scan.LinkCount >= 3));
+    }
 
-        if (!scan.HasHeader && !scan.HasCaption
-            && (looksLikeLayout || isBlankTable || (rowCount <= 2 && scan.LinkCount >= 3)))
+    /// <summary>Whether the `&lt;table&gt;` this markup opens renders as a layout list.</summary>
+    internal static bool TableMarkupRendersAsLayoutList(string tableHtml)
+    {
+        var root = HtmlDom.Parse(tableHtml);
+        var table = FindFirstTable(root);
+        return table is not null && RendersAsLayoutList(table, ScanTable(table));
+    }
+
+    private static HNode? FindFirstTable(HNode node)
+    {
+        foreach (var child in Descendants(node))
+            if (child.Tag == "table") return child;
+        return null;
+    }
+
+    private static void HandleTable(HNode node, StringBuilder output, Ctx ctx)
+    {
+        var scan = ScanTable(node);
+        bool isBlankTable = !scan.HasText;
+
+        if (RendersAsLayoutList(node, scan))
         {
             if (isBlankTable && scan.LinkCount == 0) return;
             foreach (var child in node.Children)
