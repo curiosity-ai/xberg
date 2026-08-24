@@ -986,6 +986,10 @@ public sealed class HtmlWalker
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
             string key = attrs[ks..i];
+            // A `<` cannot open an attribute name, and a tag left unterminated runs the next
+            // element's opening bracket into its own attribute list: `<a href="…"<u>` is one
+            // `a` carrying an attribute named `u`, not `<u`.
+            if (key.StartsWith('<')) key = key.TrimStart('<');
             // Nothing that can start a name here — a stray `=` or `/` between attributes. Step
             // over that one character and look again; the `=` does not adopt what follows it as
             // its value, so `<a =` + `href=…` still yields the href.

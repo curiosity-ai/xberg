@@ -552,7 +552,10 @@ public static class HtmlMeta
                     anchorText.Append(cellDepth > 0 ? HtmlToMarkdown.EscapeCellText(decoded) : decoded);
                     anchorRawText.Append(decoded);
                 }
-                else if (inTitle) titleText.Append(HtmlWalker.DecodeEntities(text));
+                // The head reaches the converter with its character references resolved, so the
+                // title is decoded against the full WHATWG table rather than the small one the
+                // structure walker's own Rust function knows.
+                else if (inTitle) titleText.Append(HtmlWalker.DecodeEntitiesFull(text));
                 pos = lt;
             }
         }
@@ -903,6 +906,10 @@ public static class HtmlMeta
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>') i++;
             string key = attrs[ks..i];
+            // A `<` cannot open an attribute name: a tag left unterminated runs the next
+            // element's opening bracket into its own attribute list, so `<a href="…"<u>` is one
+            // `a` carrying an attribute named `u`.
+            if (key.StartsWith('<')) key = key.TrimStart('<');
             if (key.Length == 0) { i++; continue; }
             while (i < n && char.IsWhiteSpace(attrs[i])) i++;
             string value = "";
