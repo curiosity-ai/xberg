@@ -395,10 +395,54 @@ comments) plus two structural fixes (its issues #13, #453, #454, #455). Ported s
 - The table-grid walk runs with its collectors detached, so a cell's links, images and nested
   tables are not recorded a second time.
 
+- A table's cells are recorded **once**, not once per pass over them. The handler still walks a
+  table up to three times — a column-width pre-pass, the render, and the grid the structure
+  collector wants — but only one of those walks now carries the collectors: the pre-pass
+  detaches them (a column measurement must not show up in the result) and so does the grid walk
+  (the render already recorded the same cells). Upstream keeps the pre-pass's handles instead
+  when it can reuse that pass's markdown verbatim, but that needs no structure collector
+  installed, and this port's options always install one. This was the single largest source of
+  wrong metadata: every link, image and heading inside a cell appeared three times, and one
+  inside a nested table six.
+- A heading inside a table carries its real DOM depth (it read 0 while the re-walks recorded
+  it), and emphasis leaves its whitespace outside the delimiters in recorded markdown.
+- A `<li>` inside a table cell takes a `<br>` boundary; the head `<title>` is entity-decoded.
+
 Not yet ported, in rough order of expected value: the tier-1 router/scanner changes (168 + 654
-lines, and they decide which documents take the fast path at all), `block/table/builder.rs` and
-`cells.rs` (129 + 170), `strip_hidden_elements`' nesting-aware closing-tag scan, and
-`parse_ordered_list_start`'s clamping.
+lines, and they decide which documents take the fast path at all), the rest of
+`block/table/builder.rs` and `cells.rs` (129 + 170 — the `CellTextCache` reuse path, which this
+port never takes, and the ragged-table separator width), `strip_hidden_elements`' nesting-aware
+closing-tag scan, and `parse_ordered_list_start`'s clamping.
+
+### What else the regeneration exposed, and what was done about it
+
+Beyond the converter upgrade, `ec94d8c0` (#1414) moved five other formats. Ported:
+
+- **org** — display math (`\[…\]`, `$$…$$`, a LaTeX math environment) leaves the paragraph and
+  becomes its own formula element, before the inline-markup parser runs, because Org's markup
+  characters (`_`, `/`, `=`) also occur inside LaTeX. 7 -> 12 of 12.
+- **rst** — a `.. math::` body that uses alignment columns is wrapped in `aligned`. 11 -> 13
+  of 15.
+- **jupyter** — a `text/latex` output is the equation itself and becomes a formula, ahead of the
+  `text/html` and `text/plain` reprs of the same result. 7 -> 16 of 16.
+- **xml/docbook/jats** — a `.xml` file is routed by the vocabulary it declares (a DocBook or
+  JATS public identifier in the DOCTYPE, or the DocBook namespace bound on the root by the
+  prefix the root's own name uses) rather than by its extension alone, and both extractors read
+  their equations through a new shared `FormulaXml` capture: verbatim TeX first, then the `math`
+  subtree through the MathML converter, then the flattened text, with a `<label>` becoming a
+  LaTeX `\tag`. xml 5 -> 10 of 15, docbook 3 -> 4 of 4.
+- **typst** — a line that opens and closes its own math is one formula; it used to become the
+  start of a display block and swallow everything up to the next `$` in the document.
+
+Two are **not** ported, both because they need a parser this port does not have:
+
+- **asciidoc (0 of 6).** Upstream converts `stem:[…]`, `latexmath:[…]` and `asciimath:[…]` to
+  LaTeX through the `mathemascii` crate — `stem:[B_"FROM"^"out"]` becomes
+  `$B_{\text{FROM}}^{\text{out}}$`. Every adoc fixture in the corpus is a maths one, so all six
+  fail on it. An AsciiMath parser is the whole job.
+- **typst (6 of 12).** The same shape: upstream added a 540-line Typst-math-to-LaTeX converter
+  built on `typst-syntax`'s own parser. The scanner fix above removes the content loss, so what
+  remains is purely the notation (`2 pi sqrt(l / g)` against `2 \pi \sqrt{\frac{l}{g}}`).
 
 ### The 17 remaining failures, classified
 
