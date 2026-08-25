@@ -158,6 +158,16 @@ internal static class OdfContentParser
             {
                 if (frameChild.Name.LocalName != "image")
                     continue;
+
+                // A captioned figure nests a frame inside this one, and the inner frame owns its
+                // image. Without this the image is emitted once for the outer frame and again for
+                // the inner one.
+                bool ownedByNestedFrame = false;
+                for (var a = frameChild.Parent; a is not null && a != desc; a = a.Parent)
+                    if (a.Name.LocalName == "frame") { ownedByNestedFrame = true; break; }
+                if (ownedByNestedFrame)
+                    continue;
+
                 var href = OdfStyles.Attr(frameChild, "href");
 
                 // Richer alt text: svg:title/svg:desc/text:p, else frame's svg:title attribute.
