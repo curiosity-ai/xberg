@@ -410,6 +410,30 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
+    /// A document that reaches the walk through the html5ever repair arrives with its character
+    /// references already resolved, and that applies to head metadata too: a `<title>`'s text and
+    /// a `<meta content>`'s value read as the resolved character. Off the repair path both keep
+    /// the reference as written. `<div>` inside `<span>` is what puts this document on the repair
+    /// path — a block element under an inline ancestor.
+    /// </summary>
+    [Fact]
+    public void HeadMetadataResolvesItsReferencesOnTheRepairPath()
+    {
+        const string Head = "<title>x &deg; y</title>"
+                          + "<meta name=\"description\" content=\"a &reg; b\">"
+                          + "<meta name=\"keywords\" content=\"p &reg; q\">";
+
+        var repaired = Meta($"<html><head>{Head}</head><body><span><div>z</div></span></body></html>");
+        Assert.Equal("x \u00b0 y", repaired.Title);
+        Assert.Equal("a \u00ae b", repaired.Description);
+        Assert.Equal(new[] { "p \u00ae q" }, repaired.Keywords.ToArray());
+
+        var plain = Meta($"<html><head>{Head}</head><body><p>z</p></body></html>");
+        Assert.Equal("x &deg; y", plain.Title);
+        Assert.Equal("a &reg; b", plain.Description);
+    }
+
+    /// <summary>
     /// Upstream normalizes its input once, before anything reads it, so its metadata collector —
     /// which runs inside the conversion — never sees a carriage return. This port collects
     /// metadata in a separate pass and has to normalize for itself, or a title spanning two

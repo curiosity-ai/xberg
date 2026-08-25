@@ -285,6 +285,10 @@ public static class HtmlMeta
                             // Trimmed but not collapsed: a title written with two spaces between
                             // its halves keeps them.
                             string t = titleText.ToString().Trim();
+                            // A repaired document reaches the walk with its references already
+                            // resolved, so `&deg;` in a title is the degree sign by the time the
+                            // collector reads it.
+                            if (canonicalAttrs) t = HtmlToMarkdown.CanonicalizeText(t).Trim();
                             if (t.Length > 0) headMetadata["title"] = t;
                         }
                         inTitle = false;
@@ -373,7 +377,9 @@ public static class HtmlMeta
                     }
                     case "meta" when inHead:
                     {
-                        string? metaContent = HtmlWalker.ExtractAttr(attrsStr, "content");
+                        // `Raw` so a repaired document's `content` reads as html5ever's
+                        // serializer wrote it, the same as every other attribute here.
+                        string? metaContent = Raw(attrsStr, "content");
                         if (metaContent is null) break;
                         if (HtmlWalker.ExtractAttr(attrsStr, "name") is { } metaName)
                             headMetadata["meta-" + metaName] = metaContent;

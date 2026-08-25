@@ -89,9 +89,9 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > | 6 | `keywords`/`description`/`subject` together, so probably one cause |
 > | 4 | `images` count |
 >
-> Of the title ten, two were CRLF (fixed), two are `&deg;` left undecoded on documents that
-> take the repair path, one is a title the port misses entirely, and **four have a `<title>`
-> the reference does not report at all**. That last group is worth a warning: those documents
+> Of the title ten, two were CRLF (fixed), two are `&deg;` left undecoded on documents the
+> reference repairs and this port does not (see below), one is a title the port misses entirely,
+> and **four have a `<title>` the reference does not report at all**. That last group is worth a warning: those documents
 > carry a *second* `<head>` deep inside the body, and the port takes its title from it. The
 > reference does not — but the rule for when it does is not a rule I could state. Probing the
 > converter directly, a second `<head>` in the body yields its title when the first head is
@@ -100,6 +100,17 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > only scripts and links, which by that model should yield the title, and the reference still
 > reports none — so the model is already wrong. Do not implement from the shape above; measure
 > from the fixtures.
+>
+> **The repair predicate is incomplete, and that is a tree-shape problem, not a rule.**
+> `office/regression/000_000073.html` and `000_000074.html` are repaired by the reference and
+> not by this port, so their head metadata keeps `&deg;` where the golden has the degree sign.
+> Bisecting 073 against the converter puts the trigger in a `<form>`/`<table>` region about
+> 2 KB into the body, and the port's `HasInlineBlockMisnest` reports no misnest on the same
+> fragment — because the two parsers build different trees there in the first place. `tl` also
+> mangles that document's `<!DOCTYPE HTML PUBLIC "…">`, leaving `ublic "-//W3C…">` as the
+> document's first node (confirmed by probing `astral-tl` directly). So the misnest the
+> reference sees exists in `tl`'s tree and not in this port's, and no predicate change closes
+> it. This belongs to the recovery class.
 >
 > A probe against the real converter is the tool that made this tractable and is worth
 > rebuilding: `htmlprobe` (see the scratchpad pattern in "Re-syncing after an upstream merge")
