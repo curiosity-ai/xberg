@@ -73,10 +73,31 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >   replacement table — but only on the html5ever repair path, which is where the port already
 >   models canonical spelling. Seven fixtures.
 >
-> The recovery class is still real. `office/regression/000_000202.html` is its clearest
-> specimen: `<A NAME="000000"</A>` (no closing bracket) truncates upstream's output at five
-> lines where this port recovers and emits 413. Closing that class means aligning the tree
-> builders, not adding rules — but it is a dozen fixtures, so measure the rest first.
+> **Sanity-checked against a real browser, which is where this should have started.** Chromium
+> (via Playwright, scripting off, `<script>/<style>/<noscript>/<template>` removed from the DOM
+> first) gives `document.body.textContent` for all 158 fixtures; comparing word recall against
+> that says how much of what a browser actually shows each extractor recovers:
+>
+> | | mean word recall vs the browser |
+> |---|---|
+> | upstream (the goldens) | 0.8753 |
+> | this port | **0.8967** |
+>
+> The port recovers *more* browser-visible text than the reference does. Four fixtures are
+> materially worse than upstream (205, 070, 071, 191) and nine are materially better — three of
+> those dramatically, where upstream extracts essentially nothing from a document the browser
+> renders in full: `000_000069.html` (port 1.000 vs upstream 0.000), `000_000420.html`
+> (0.989 vs 0.000), `000_000136.html` (0.991 vs 0.010). Six fixtures are below 0.30 for *both*,
+> which is upstream dropping content this port faithfully drops with it.
+>
+> So the residual golden mismatches are overwhelmingly formatting and metadata, not content
+> loss, and the remaining tail is not worth aligning tree builders for. The harness is
+> `$SP/browser/extract2.mjs` plus `compare.py` — cheap to rebuild and the right first move next
+> time.
+>
+> `office/regression/000_000202.html` used to be this file's named specimen of the recovery
+> class. It is not one any more: the malformed-tag fix below took it from 0.000 to 0.872 word
+> recall while upstream still reports 0.000 for it.
 >
 > **What the metadata dimension still holds** (56 of the 74, measured per fixture rather than
 > per differing field, since one missing link shifts every index after it):

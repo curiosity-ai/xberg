@@ -410,6 +410,27 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
+    /// A start tag with no `>` of its own costs the tag, not the document. astral-tl's
+    /// `parse_tag` gives up when it cannot find the bracket, and `parse_single` ignores that
+    /// failure and carries on from wherever the scan stopped — so everything after the malformed
+    /// tag is still parsed. `<input … value="" </span>` is the shape that exposed it: on
+    /// office/regression/000_000061.html it was hiding every heading and paragraph that followed.
+    /// </summary>
+    [Fact]
+    public void AStartTagWithNoClosingBracketDoesNotSwallowTheDocument()
+    {
+        var doc = Html("<html><body><p>before</p>"
+                       + "<input type=\"text\" name=\"i\" value=\"\" </span>"
+                       + "<h3>AFTER</h3><p>tail</p></body></html>");
+        string[] texts = doc.Elements.Select(e => e.Text).ToArray();
+        Assert.Contains("before", texts);
+        Assert.Contains("AFTER", texts);
+        Assert.Contains("tail", texts);
+        // The raw markup must not reach the output as a literal text run.
+        Assert.DoesNotContain(texts, t => t.Contains("<h3>"));
+    }
+
+    /// <summary>
     /// A document that reaches the walk through the html5ever repair arrives with its character
     /// references already resolved, and that applies to head metadata too: a `<title>`'s text and
     /// a `<meta content>`'s value read as the resolved character. Off the repair path both keep

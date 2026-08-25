@@ -3563,8 +3563,19 @@ internal static class HtmlDom
                 continue;
             }
 
-            int gt = FindTagEnd(src, pos);
-            if (gt < 0) { AddChild(new HNode { Tag = null, Text = src[pos..] }); break; }
+            int gt = FindTagEnd(src, pos, out int stop);
+            if (gt < 0)
+            {
+                // `parse_tag` bailed without finding the tag's `>`. astral-tl's `parse_single`
+                // ignores that failure and loops from wherever the stream stopped, so the
+                // malformed tag is dropped and everything after it is still parsed. Treating the
+                // remainder as one text node instead costs the whole document: on
+                // office/regression/000_000061.html an unclosed `<input … value="" </span>` was
+                // hiding every heading and paragraph that followed it.
+                if (stop > pos && stop < n) { pos = stop; continue; }
+                AddChild(new HNode { Tag = null, Text = src[pos..] });
+                break;
+            }
             string tagContent = src[(pos + 1)..gt];
             pos = gt + 1;
 
@@ -3707,9 +3718,17 @@ internal static class HtmlDom
     /// PDF's XML listing — hide the tag's own <c>&gt;</c> and swallow the document up to the next
     /// quote, which is text loss rather than a mis-parse.
     /// </remarks>
-    private static int FindTagEnd(string src, int lt)
+    private static int FindTagEnd(string src, int lt) => FindTagEnd(src, lt, out _);
+
+    /// <param name="stop">
+    /// Where the scan gave up when it found no <c>&gt;</c>. `parse_single` ignores `parse_tag`'s
+    /// failure and carries on from the stream position it left behind, so a malformed tag costs
+    /// the tag and not the rest of the document.
+    /// </param>
+    private static int FindTagEnd(string src, int lt, out int stop)
     {
         int n = src.Length;
+        stop = -1;
 
         // `read_end`: an end tag runs to the next `>`; it parses no attributes and honours no
         // quotes.
@@ -3722,7 +3741,7 @@ internal static class HtmlDom
         while (i < n)
         {
             i = SkipTagSpace(src, i);
-            if (i >= n) return -1;
+            if (i >= n) { stop = i; return -1; }
             if (src[i] is '/' or '>') break;      // `is_closing`
 
             int nameEnd = SkipIdent(src, i);
@@ -3731,7 +3750,7 @@ internal static class HtmlDom
             i = SkipTagSpace(src, nameEnd);
             if (i >= n || src[i] != '=') continue;   // a valueless attribute
             i = SkipTagSpace(src, i + 1);
-            if (i >= n) return -1;
+            if (i >= n) { stop = i; return -1; }
 
             char quote = src[i];
             if (quote is '"' or '\'')
@@ -3751,7 +3770,9 @@ internal static class HtmlDom
         }
 
         if (i < n && src[i] == '/') i++;          // `is_self_closing`
-        return i < n && src[i] == '>' ? i : -1;
+        if (i < n && src[i] == '>') return i;
+        stop = i;
+        return -1;
     }
 
     /// <summary>
