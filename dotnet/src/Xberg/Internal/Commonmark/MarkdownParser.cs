@@ -347,11 +347,15 @@ public static class MarkdownParser
                 int newI = TryHtmlBlock(lines, i, hi);
                 if (newI > i)
                 {
-                    // One event per line, as pulldown-cmark emits them. The extractor records
-                    // each as its own raw block, so a `<details>` wrapper and the `<summary>` it
-                    // contains stay separate rather than fusing into one indented run.
+                    // One event per line, as pulldown-cmark emits them, and each carries its
+                    // line ending the way pulldown-cmark's do. The extractor records a block-level
+                    // event as its own raw block — trimming the newline back off — so a
+                    // `<details>` wrapper and the `<summary>` it contains stay separate rather
+                    // than fusing into one indented run. Inside a list item there is no such
+                    // block to open, and the lines are appended to the item's text: there the
+                    // newline is the only thing keeping the run from collapsing onto one line.
                     for (int h = i; h < newI; h++)
-                        ev.Add(MdEvent.WithText(MdEventKind.Html, lines[h]));
+                        ev.Add(MdEvent.WithText(MdEventKind.Html, lines[h] + "\n"));
                     i = newI; continue;
                 }
             }
@@ -1052,6 +1056,17 @@ public static class MarkdownParser
             buf.Clear();
         }
 
+        // Trailing spaces and tabs before a line ending are not content. pulldown-cmark drops
+        // them where it ends a line's text run, not where it joins the lines, and the difference
+        // is visible: a math span reads its body straight out of the joined source, so a display
+        // equation whose line ends in a space keeps that space. Trimming at the join would take
+        // it from the equation too.
+        void FlushLine()
+        {
+            while (buf.Length > 0 && (buf[^1] == ' ' || buf[^1] == '\t')) buf.Length--;
+            Flush();
+        }
+
         int n = text.Length;
         int i = 0;
         while (i < n)
@@ -1071,7 +1086,7 @@ public static class MarkdownParser
             // stands for goes to the paragraph around it.
             if (c == '\n')
             {
-                Flush();
+                FlushLine();
                 nodes.AddLast(new Node
                 {
                     T = NType.Opaque,
@@ -1340,7 +1355,7 @@ public static class MarkdownParser
 
             buf.Append(c); i++;
         }
-        Flush();
+        FlushLine();
         return nodes;
     }
 
@@ -1461,7 +1476,10 @@ public static class MarkdownParser
             // indentation is part of the equation, and the math span reads its body straight out
             // of this string. The first line has no soft break in front of it to carry its
             // indentation away, so that one is trimmed here.
-            parts.Add(k == 0 ? lines[k].Trim() : lines[k].TrimEnd());
+            //
+            // Trailing whitespace stays for the same reason, and is dropped by the inline
+            // scanner instead (see `FlushLine`).
+            parts.Add(k == 0 ? lines[k].TrimStart() : lines[k]);
         }
         // Joined with newlines, not spaces. A soft line break in prose still reads as a space —
         // the inline scanner turns it into one when it flushes a text node — but a math span
