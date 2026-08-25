@@ -474,6 +474,93 @@ public sealed class RstExtractor : IExtractor
         return refs;
     }
 
+    /// <summary>
+    /// Push an image (or figure) URI and, where configured, a placeholder paragraph for it.
+    /// Shared by the <c>.. image::</c> and <c>.. figure::</c> handlers so a figure builds on the
+    /// same emission logic (`push_image_directive`).
+    /// </summary>
+    private static void PushImageDirective(InternalDocumentBuilder b, string uri,
+                                           Dictionary<string, string> opts, bool injectPlaceholders)
+    {
+        opts.TryGetValue("alt", out var alt);
+        string desc = alt ?? uri;
+        if (uri.Length != 0) b.PushUri(MarkupHelpers.Image(uri, alt));
+        if (injectPlaceholders)
+        {
+            uint idx = b.PushParagraph($"[image: {desc}]", new(), null, null);
+            if (uri.Length != 0) b.SetAttributes(idx, new Dictionary<string, string> { ["src"] = uri });
+        }
+    }
+
+    /// <summary>
+    /// Parse the row and cell structure of a <c>.. list-table::</c> body. A row is a top-level
+    /// bullet (<c>* - cell</c>) and each further cell is a nested bullet (<c>- cell</c>) indented
+    /// deeper than the row marker.
+    /// </summary>
+    private static List<List<string>> ParseListTableRows(List<string> lines, ref int start)
+    {
+        var rows = new List<List<string>>();
+        while (start < lines.Count)
+        {
+            string line = lines[start];
+            if (line.Trim().Length == 0) break;
+            int leading = line.Length - line.TrimStart().Length;
+            string trimmed = line.TrimStart();
+            if (!trimmed.StartsWith("* ", StringComparison.Ordinal)) break;
+            string afterStar = trimmed[2..];
+            if (!afterStar.StartsWith("- ", StringComparison.Ordinal)) break;
+
+            var row = new List<string> { afterStar[2..].Trim() };
+            start++;
+            while (start < lines.Count)
+            {
+                string cellLine = lines[start];
+                if (cellLine.Trim().Length == 0) break;
+                int cellLeading = cellLine.Length - cellLine.TrimStart().Length;
+                string cellTrimmed = cellLine.TrimStart();
+                if (cellLeading > leading && cellTrimmed.StartsWith("- ", StringComparison.Ordinal))
+                {
+                    row.Add(cellTrimmed[2..].Trim());
+                    start++;
+                }
+                else break;
+            }
+            rows.Add(row);
+        }
+        return rows;
+    }
+
+    /// <summary>
+    /// Split one CSV line into fields, honouring double-quoted fields with embedded commas and
+    /// <c>""</c>-escaped quotes (RFC 4180-style), as <c>.. csv-table::</c> uses.
+    /// </summary>
+    private static List<string> ParseCsvLine(string line)
+    {
+        var fields = new List<string>();
+        var current = new StringBuilder();
+        bool inQuotes = false;
+        for (int idx = 0; idx < line.Length; idx++)
+        {
+            char ch = line[idx];
+            if (inQuotes)
+            {
+                if (ch == '"')
+                {
+                    if (idx + 1 < line.Length && line[idx + 1] == '"') { current.Append('"'); idx++; continue; }
+                    inQuotes = false;
+                    continue;
+                }
+                current.Append(ch);
+                continue;
+            }
+            if (ch == '"') { inQuotes = true; continue; }
+            if (ch == ',') { fields.Add(current.ToString().Trim()); current.Clear(); continue; }
+            current.Append(ch);
+        }
+        fields.Add(current.ToString().Trim());
+        return fields;
+    }
+
     private static Dictionary<string, string> ParseImageOptions(List<string> lines, ref int start)
     {
         var opts = new Dictionary<string, string>();
@@ -607,14 +694,73 @@ public sealed class RstExtractor : IExtractor
                 string uri = trimmed.Substring(".. image::".Length).Trim();
                 i++;
                 var opts = ParseImageOptions(lines, ref i);
-                opts.TryGetValue("alt", out var alt);
-                string desc = alt ?? uri;
-                if (uri.Length != 0) b.PushUri(MarkupHelpers.Image(uri, alt));
-                if (injectPlaceholders)
+                PushImageDirective(b, uri, opts, injectPlaceholders);
+                continue;
+            }
+
+            if (trimmed.StartsWith(".. figure::"))
+            {
+                string uri = trimmed.Substring(".. figure::".Length).Trim();
+                i++;
+                var opts = ParseImageOptions(lines, ref i);
+                PushImageDirective(b, uri, opts, injectPlaceholders);
+
+                // The figure body — an indented paragraph after the option block — is the
+                // figure's caption, and is emitted as a regular paragraph so the text survives.
+                var caption = new StringBuilder();
+                while (i < lines.Count)
                 {
-                    uint idx = b.PushParagraph($"[image: {desc}]", new(), null, null);
-                    if (uri.Length != 0) b.SetAttributes(idx, new Dictionary<string, string> { ["src"] = uri });
+                    if (lines[i].Length == 0)
+                    {
+                        if (caption.Length != 0) break;
+                        i++;
+                        continue;
+                    }
+                    if (!lines[i].StartsWith("   ", StringComparison.Ordinal)
+                        && !lines[i].StartsWith("\t", StringComparison.Ordinal)) break;
+                    if (caption.Length != 0) caption.Append(' ');
+                    caption.Append(lines[i].Trim());
+                    i++;
                 }
+                if (caption.Length != 0)
+                {
+                    var (stripped, annotations) = ParseInlineMarkup(caption.ToString());
+                    b.PushParagraph(stripped, annotations, null, null);
+                }
+                continue;
+            }
+
+            if (trimmed.StartsWith(".. list-table::"))
+            {
+                i++;
+                ParseImageOptions(lines, ref i);
+                // `ParseImageOptions` only eats the blank line after the option block when there
+                // were options, so any left over are skipped here or the row parser sees a blank
+                // first line and stops immediately.
+                while (i < lines.Count && lines[i].Trim().Length == 0) i++;
+                var cells = ParseListTableRows(lines, ref i);
+                if (cells.Count != 0) b.PushTableFromCells(cells, null, null);
+                continue;
+            }
+
+            if (trimmed.StartsWith(".. csv-table::"))
+            {
+                i++;
+                var tableOpts = ParseImageOptions(lines, ref i);
+                while (i < lines.Count && lines[i].Trim().Length == 0) i++;
+                var csvCells = new List<List<string>>();
+                if (tableOpts.TryGetValue("header", out var headerLine))
+                    csvCells.Add(ParseCsvLine(headerLine));
+                while (i < lines.Count)
+                {
+                    string l = lines[i];
+                    if (l.Trim().Length == 0
+                        || !(l.StartsWith("   ", StringComparison.Ordinal) || l.StartsWith("\t", StringComparison.Ordinal)))
+                        break;
+                    csvCells.Add(ParseCsvLine(l.Trim()));
+                    i++;
+                }
+                if (csvCells.Count != 0) b.PushTableFromCells(csvCells, null, null);
                 continue;
             }
 
