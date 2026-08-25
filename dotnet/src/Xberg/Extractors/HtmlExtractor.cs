@@ -40,7 +40,11 @@ public sealed class HtmlExtractor : IExtractor
         string contentText = HtmlToMarkdown.ConvertWithStructure(html, plainText, out var structure);
         var doc = MapStructure(structure, contentText);
 
-        var htmlMeta = HtmlMeta.Extract(html);
+        // Upstream normalizes the input once, before anything reads it, so the metadata collector
+        // — which runs inside its conversion — never sees a carriage return. This port collects
+        // metadata in a separate pass, so it has to do the same normalization here or a title
+        // spanning two source lines keeps its CRLF where the golden has a bare newline.
+        var htmlMeta = HtmlMeta.Extract(HtmlToMarkdown.NormalizeInput(html));
         var metadata = new Metadata();
         if (!IsEmpty(htmlMeta))
         {

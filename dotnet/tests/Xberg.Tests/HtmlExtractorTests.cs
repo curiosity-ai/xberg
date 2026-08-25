@@ -410,6 +410,19 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
+    /// Upstream normalizes its input once, before anything reads it, so its metadata collector —
+    /// which runs inside the conversion — never sees a carriage return. This port collects
+    /// metadata in a separate pass and has to normalize for itself, or a title spanning two
+    /// source lines keeps the CRLF the golden does not have.
+    /// </summary>
+    [Fact]
+    public void ATitleSpanningTwoLinesKeepsOnlyTheNewline()
+    {
+        var doc = Html("<html><head><title>A\r\nB</title></head><body><p>x</p></body></html>");
+        Assert.Equal("A\nB", doc.Metadata.Title);
+    }
+
+    /// <summary>
     /// A numeric character reference in the C1 range names a Windows-1252 character rather than
     /// the control it nominally points at — the HTML5 tokenizer's replacement table of §13.2.5.80.
     /// Only a document that reaches the walk through the html5ever repair gets that: the

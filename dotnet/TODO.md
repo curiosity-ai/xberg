@@ -78,6 +78,29 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > lines where this port recovers and emits 413. Closing that class means aligning the tree
 > builders, not adding rules — but it is a dozen fixtures, so measure the rest first.
 >
+> **What the metadata dimension still holds** (56 of the 74, measured per fixture rather than
+> per differing field, since one missing link shifts every index after it):
+>
+> | fixtures | class |
+> |---|---|
+> | 17 | `links[].text` differs — five sub-classes, none larger than 8 |
+> | ~25 | `headers[].depth` off, which is the tree-shape class |
+> | 10 | `title` differs |
+> | 6 | `keywords`/`description`/`subject` together, so probably one cause |
+> | 4 | `images` count |
+>
+> Of the title ten, two were CRLF (fixed), two are `&deg;` left undecoded on documents that
+> take the repair path, one is a title the port misses entirely, and **four have a `<title>`
+> the reference does not report at all**. That last group is worth a warning: those documents
+> carry a *second* `<head>` deep inside the body, and the port takes its title from it. The
+> reference does not — but the rule for when it does is not a rule I could state. Probing the
+> converter directly, a second `<head>` in the body yields its title when the first head is
+> empty, holds only whitespace, a `<link>`, or a `<script>`, and yields nothing when the first
+> head holds a `<meta>` or a comment. `office/regression/000_000071.html`'s first head holds
+> only scripts and links, which by that model should yield the title, and the reference still
+> reports none — so the model is already wrong. Do not implement from the shape above; measure
+> from the fixtures.
+>
 > A probe against the real converter is the tool that made this tractable and is worth
 > rebuilding: `htmlprobe` (see the scratchpad pattern in "Re-syncing after an upstream merge")
 > links `html-to-markdown-rs` directly with the options `extraction/html/converter.rs` sets, so

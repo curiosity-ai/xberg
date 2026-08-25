@@ -40,9 +40,17 @@ internal static class HtmlToMarkdown
         return Convert(html, structure, plainText);
     }
 
+    /// <summary>
+    /// The normalization upstream applies to the input before any of it is read
+    /// (`convert_api.rs::normalize_input`): NULs dropped and every line ending reduced to a bare
+    /// newline.
+    /// </summary>
+    internal static string NormalizeInput(string html) =>
+        html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
+
     private static string Convert(string html, HtmlStructureCollector? structure, bool plainText = false)
     {
-        html = html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
+        html = NormalizeInput(html);
         string prepared = StripHiddenElements(StripScriptAndStyleTags(html));
         var root = HtmlDom.Parse(prepared);
         if (HasCustomElementTags(prepared) || HasInlineBlockMisnest(root))
