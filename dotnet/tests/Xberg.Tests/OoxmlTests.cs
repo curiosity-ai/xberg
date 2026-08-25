@@ -274,6 +274,32 @@ public class OoxmlTests
     }
 
     /// <summary>
+    /// Word writes a `<w:lastRenderedPageBreak/>` at the start of the first run on each page it
+    /// laid out. When one lands after text the paragraph has already collected, the break belongs
+    /// behind that paragraph — the paragraph's own element has not been emitted yet at the point
+    /// the walk reaches the hint, so recording it there would put the page boundary a whole
+    /// paragraph too early (Rust GH#1416).
+    /// </summary>
+    [Fact]
+    public void Docx_APageBreakAfterTextInItsParagraphFollowsThatParagraph()
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>" +
+                "<w:p><w:r><w:t>First page.</w:t></w:r>" +
+                "<w:r><w:lastRenderedPageBreak/><w:t> Still page one.</w:t></w:r></w:p>" +
+                "<w:p><w:r><w:t>Second page.</w:t></w:r></w:p>" +
+                "</w:body></w:document>"));
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+
+        var pages = doc.Metadata.Pages!;
+        Assert.Equal(2u, pages.TotalCount);
+        // The whole first paragraph is on page one; the boundary falls between the paragraphs.
+        int end = "First page. Still page one.".Length;
+        Assert.Contains($"\"ByteEnd\":{end}", System.Text.Json.JsonSerializer.Serialize(pages.Boundaries));
+    }
+
+    /// <summary>
     /// A reviewer comment leaves a `[cmt:N]` marker in the body and its body text in
     /// `word/comments.xml`; the marker becomes a `CommentRef` element and the body a
     /// `CommentDefinition`, so a consumer can tell a comment from an authored footnote.
