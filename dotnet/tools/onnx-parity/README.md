@@ -278,36 +278,68 @@ At ~1.8x, the arithmetic-bound nodes run at 185-190 GFLOP/s and the best single 
 270-300, so the spread across shapes is now the largest remaining term rather than the peak.
 Convolution is still ~60% of runtime.
 
-The known routes from here, in rough order of expected value — **revised 2026-08-26 against a
-fresh per-node profile**, which contradicts what was written here before:
+### Two wrong turns, and what they cost to find
 
-- **Shallow-reduction convolutions, which means 1x1 with a large channel count.** These are the
-  slowest shapes in the graph by a wide margin, not the small-channel 3x3 layers this list
-  used to name first:
+This section named a next step twice and was wrong twice. Both are recorded because the way
+each was disproved is the useful part.
 
-  | node | output | rate |
-  | --- | --- | --- |
-  | `res_layers.2/blocks.0/branch2c` (1x1, k=256) | `[1,1024,40,40]` | 113 GFLOP/s |
-  | `res_layers.2/blocks.0/short` (1x1, k=512) | `[1,1024,40,40]` | 128 GFLOP/s |
-  | `fpn_blocks.1/bottlenecks.0` (3x3, k=2304) | `[1,256,80,80]` | 349 GFLOP/s |
-  | `backbone/conv1/conv1_3` (3x3, 64 channels) | `[1,64,320,320]` | 277 GFLOP/s |
+**"A direct convolution for small-channel layers."** A per-node profile says the small-channel
+3x3 layers run at 195-277 GFLOP/s, mid-pack, while the slowest shapes in the graph are 1x1
+convolutions with a large channel count at 113-128. A kernel avoiding the nine-fold `im2col`
+expansion would have been attacking shapes that are not the problem.
 
-  The pattern is `k`. A 1x1 layer reduces over 256 or 512 elements where a 3x3 over the same
-  channel count reduces over nine times as many, so the fixed cost of each output tile — the
-  register-block prologue and the accumulator store — is amortised nine times worse. The panel
-  sizes and the packing are not the difference: the 3x3 shape above packs a 14 MB panel, far
-  past L2, and still runs three times faster.
+**"So it must be the shallow reduction."** The reasoning was that a 1x1 reduces over 256 or 512
+elements where a 3x3 over the same channels reduces over nine times as many, so each output
+tile's prologue and accumulator store are amortised nine times worse. It is a good story and it
+is not what is happening: `--gemm` runs those exact products at 365-379 GFLOP/s, near the best
+shapes in the set. The multiply was never slow.
 
-  Note what this rules out. The small-channel 3x3 layers the previous entry named first run at
-  195-277 GFLOP/s, mid-pack; a direct convolution avoiding the nine-fold `im2col` expansion
-  would be attacking shapes that are not the problem.
+What was actually missing was a measurement. `--gemm` measures the product a convolution lowers
+to; nothing measured the convolution, which is 61% of the graph. `--conv` does, and on every hot
+shape — 1x1 included — a whole convolution runs at 71-113% of the calibrated ceiling. Only the
+shortcut convolutions are genuinely slower in the graph than in isolation, and they are worth
+about 2% of inference between them.
+
+The first version of `--conv` read **21 GFLOP/s on a shape whose multiply runs at 365**, because
+it allocated a fresh multi-megabyte output on every call instead of going through the pool the
+session installs: it was measuring the garbage collector. Its second version still disagreed with
+itself by 3x between adjacent columns, on three warm-up passes and five samples. The numbers only
+became stable at thirty of each. Both are the same lesson the top of this section already
+records, learned again.
+
+### Where the time actually goes, and what was taken
+
+`Conv` is 61% and `MatMul` 14%; 1,649 of the 2,315 nodes take under 10 us each, 0.2% between
+them. The remaining quarter is element-wise and data movement, and that is where the one win
+in this pass came from.
+
+**Writing an element-wise result over a dying operand.** Four hundred nodes read a buffer and
+write another the same size; when the operand they read is dead the moment they are done with
+it, the second buffer is waste. `OnnxSession.FindReusableOperand` decides, and the conditions
+are the whole of the risk — reusing one buffer too eagerly corrupts a value some later node
+reads, and that surfaces as a plausible detection rather than a crash.
+
+| | before | after |
+| --- | --- | --- |
+| `Relu` | 35.7 ms | 27.5 ms |
+| `Add` | 50.3 ms | 42.3 ms |
+| `Mul` | 10.6 ms | 8.4 ms |
+| buffer rentals per inference | 734 | 473 |
+| pool memory retained | 214 MiB | 168 MiB |
+
+Whole-model, timed by `--check-reuse`, which runs both configurations alternately in one process
+because across processes this host moves more than the difference: **1.00x, 1.02x, 1.04x** over
+three runs. Two percent, and honestly at the edge of what can be resolved here — the per-operator
+figures are the solid part, and they are consistent with it, since the operators involved are 12%
+of runtime. The memory figures are counts rather than timings and do not vary.
+
+`--check-reuse` also compares every graph output bitwise between the two configurations, which is
+the only check that means anything for a change of this kind. RT-DETR's three outputs are
+identical to the bit.
+
 - Beyond that: software prefetch hints and hand-scheduled instruction order, which C# cannot
   express, and MLAS's per-CPU kernel variants selected at run time, where this has one AVX-512
   path and one portable path.
-
-Also worth recording, because it bounds what any of this can buy: `Conv` is 61% of the graph
-and `MatMul` 14%, and 1,649 of the 2,315 nodes take under 10 us each — together 0.2% of
-runtime. There is nothing left to win outside the two matrix operators.
 
 ## Two bugs this caught
 

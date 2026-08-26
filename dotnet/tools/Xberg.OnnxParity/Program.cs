@@ -126,6 +126,7 @@ internal static class Program
         {
             NodeMicroseconds = new double[model.Nodes.Length],
             NodeOutputShapes = new string[model.Nodes.Length],
+            NodeReusedOperand = new bool[model.Nodes.Length],
         };
         session.Run(feeds, capture: null, profile);
 
@@ -135,6 +136,26 @@ internal static class Program
             $"{session.Pool.RetainedBytes / (1024.0 * 1024):F0} MiB retained");
         foreach (var (length, count) in session.Pool.AllocationsByLength.OrderByDescending(p => (long)p.Key * p.Value).Take(8))
             Console.WriteLine($"    {count,4} x {length,10} floats  ({(double)length * count * 4 / (1024 * 1024),6:F1} MiB)");
+
+        // How much of each operator's time ran into a recycled operand rather than a fresh
+        // buffer. An operator that could reuse and never does is the interesting case: it means
+        // the predicate is rejecting it, and the reason is worth knowing.
+        if (profile.NodeReusedOperand is { } reused)
+        {
+            var byOp = new Dictionary<string, (int Reused, int Total)>(StringComparer.Ordinal);
+            for (int i = 0; i < model.Nodes.Length; i++)
+            {
+                var entry = byOp.GetValueOrDefault(model.Nodes[i].OpType);
+                byOp[model.Nodes[i].OpType] = (entry.Reused + (reused[i] ? 1 : 0), entry.Total + 1);
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("operand reuse (result written over a dying input)");
+            foreach (var (op, counts) in byOp.Where(e => e.Value.Total >= 5)
+                         .OrderByDescending(e => e.Value.Total))
+                Console.WriteLine($"  {op,-24} {counts.Reused,4} of {counts.Total,4}");
+            Console.WriteLine();
+        }
 
         double total = profile.NodeMicroseconds.Sum();
         Console.WriteLine();
@@ -248,6 +269,192 @@ internal static class Program
     /// wrong once here.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// Time whole convolutions on the shapes the profile names as hottest.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>--gemm</c> measures the multiply a convolution lowers to; this measures the
+    /// convolution. The difference between the two is everything the wrapper adds — the output
+    /// allocation, the im2col or the pointwise reshape, the bias and the fused activation — and
+    /// nothing measured that until a per-node profile disagreed with the standalone kernel by
+    /// a factor of three on the same shape.
+    /// </para>
+    /// <para>
+    /// Each shape is run twice: once in a hot loop against the same buffers, and once with the
+    /// weights and the input evicted first. A graph reads its weights from a 169 MB file and
+    /// each node's operands are whatever the previous node left, so the second number is the
+    /// one the model actually pays.
+    /// </para>
+    /// </remarks>
+    private static void BenchmarkConv()
+    {
+        (string Label, int InChannels, int Filters, int Size, int Kernel, int Stride)[] shapes =
+        [
+            ("warm-up, ignore       ", 256, 1024, 40, 1, 1),
+            ("1x1  256->1024 @40x40 ", 256, 1024, 40, 1, 1),
+            ("1x1  512->1024 @40x40 ", 512, 1024, 40, 1, 1),
+            ("1x1 1024->2048 @20x20 ", 1024, 2048, 20, 1, 1),
+            ("1x1  256->512  @80x80 ", 256, 512, 80, 1, 1),
+            ("3x3  256->256  @80x80 ", 256, 256, 80, 3, 1),
+            ("3x3  256->256  @40x40 ", 256, 256, 40, 3, 1),
+            ("3x3  512->512  @40x40 ", 512, 512, 40, 3, 2),
+            ("3x3   32->64   @320x320", 32, 64, 320, 3, 1),
+        ];
+
+        Console.WriteLine("  shape                       hot                        cold operands");
+        foreach (var (label, inChannels, filters, size, kernel, stride) in shapes)
+        {
+            int pad = kernel / 2;
+            int outSize = (size + 2 * pad - kernel) / stride + 1;
+            double flops = 2.0 * filters * outSize * outSize * inChannels * kernel * kernel;
+
+            var random = new Random(1);
+            var x = Tensor.AllocateFloat(1, inChannels, size, size);
+            var w = Tensor.AllocateFloat(filters, inChannels, kernel, kernel);
+            var bias = Tensor.AllocateFloat(filters);
+            for (int i = 0; i < x.Floats.Length; i++) x.Floats[i] = (float)random.NextDouble();
+            for (int i = 0; i < w.Floats.Length; i++) w.Floats[i] = (float)random.NextDouble();
+
+            long[] strides = [stride, stride];
+            long[] pads = [pad, pad, pad, pad];
+            long[] dilations = [1, 1];
+
+            // The output goes through the same pool the session installs. Without it every
+            // call allocates a fresh multi-megabyte array on the large-object heap, and the
+            // measurement is of the collector rather than of the convolution — which is how
+            // the first version of this benchmark read 21 GFLOP/s on a shape whose multiply
+            // alone runs at 365.
+            var pool = new TensorPool();
+            void Run()
+            {
+                using var scope = pool.Activate();
+                var result = Convolution.Conv(
+                    x, w, bias, strides, pads, dilations, 1, "NOTSET", FusedActivation.Relu);
+                result.Buffer?.Release();
+            }
+
+            // Three passes is enough for a whole graph, whose every node is entered
+            // hundreds of times; one shape on its own needs more before the tier-1 JIT and
+            // the thread pool have settled.
+            for (int i = 0; i < 30; i++) Run();
+
+            // A shape whose multiply is a couple of milliseconds needs many more than a
+            // handful of samples on a host that swings twofold between runs.
+            int repeats = Math.Clamp((int)(2e10 / flops), 30, 2000);
+            var stopwatch = Stopwatch.StartNew();
+            for (int r = 0; r < repeats; r++) Run();
+            double hot = stopwatch.Elapsed.TotalSeconds / repeats;
+
+            // Evict by streaming through a buffer larger than any plausible last-level cache.
+            var flush = new float[24 * 1024 * 1024 / sizeof(float)];
+            double coldTotal = 0;
+            for (int r = 0; r < ColdRuns; r++)
+            {
+                for (int i = 0; i < flush.Length; i += 16) flush[i] = i;
+                stopwatch.Restart();
+                Run();
+                coldTotal += stopwatch.Elapsed.TotalSeconds;
+            }
+            double cold = coldTotal / ColdRuns;
+
+            Console.WriteLine(
+                $"  {label}  {hot * 1000,7:F1} ms {flops / hot / 1e9,6:F0} GFLOP/s {OfCeiling(flops / hot / 1e9)}  " +
+                $"{cold * 1000,7:F1} ms {flops / cold / 1e9,6:F0} GFLOP/s {OfCeiling(flops / cold / 1e9)}  " +
+                $"pool {pool.Reused}/{pool.Reused + pool.Allocated}");
+
+            GC.KeepAlive(flush);
+        }
+    }
+
+    /// <summary>
+    /// Run the graph with buffer reuse on and off and compare every declared output bitwise.
+    /// </summary>
+    /// <remarks>
+    /// Letting a node write over an operand is the kind of change that is either exactly right
+    /// or silently wrong somewhere deep in the graph, and a wrong one shows up as a plausible
+    /// detection rather than a crash. Off is the same graph computed into fresh buffers, so any
+    /// difference at all is the reuse being unsafe — the comparison is for equal bits, not for
+    /// a tolerance.
+    /// </remarks>
+    private static int CheckBufferReuse(OnnxModel model, Dictionary<string, Tensor> feeds)
+    {
+        var reuseSession = new OnnxSession(model, optimize: true, reuseBuffers: true);
+        var plainSession = new OnnxSession(model, optimize: true, reuseBuffers: false);
+        var withReuse = reuseSession.Run(feeds);
+        var without = plainSession.Run(feeds);
+
+        int mismatched = 0;
+        foreach (var (name, expected) in without)
+        {
+            if (!withReuse.TryGetValue(name, out var actual))
+            {
+                Console.WriteLine($"  MISSING  {name}");
+                mismatched++;
+                continue;
+            }
+
+            if (!expected.Shape.SequenceEqual(actual.Shape))
+            {
+                Console.WriteLine($"  SHAPE    {name}: [{string.Join(",", expected.Shape)}] vs " +
+                                  $"[{string.Join(",", actual.Shape)}]");
+                mismatched++;
+                continue;
+            }
+
+            int differing = 0;
+            for (int i = 0; i < expected.Count; i++)
+            {
+                if (BitConverter.SingleToInt32Bits(expected.GetFloat(i))
+                    != BitConverter.SingleToInt32Bits(actual.GetFloat(i))) differing++;
+            }
+
+            if (differing > 0)
+            {
+                Console.WriteLine($"  DIFFER   {name}: {differing} of {expected.Count} elements");
+                mismatched++;
+            }
+            else
+            {
+                Console.WriteLine($"  same     {name}  ({expected.Count} elements)");
+            }
+        }
+
+        Console.WriteLine(mismatched == 0
+            ? $"\nbuffer reuse is bit-identical across all {without.Count} graph outputs"
+            : $"\n{mismatched} output(s) differ — buffer reuse is not safe on this graph");
+
+        // Both configurations timed here, in one process and interleaved. Across processes
+        // this host moves enough to swamp the difference being looked for, and alternating
+        // rather than running one after the other keeps a drift during the measurement from
+        // landing entirely on whichever went second.
+        double reuseSeconds = 0, plainSeconds = 0;
+        var clock = new Stopwatch();
+        for (int i = 0; i < WarmupRuns; i++) { reuseSession.Run(feeds); plainSession.Run(feeds); }
+        for (int i = 0; i < TimedRuns; i++)
+        {
+            clock.Restart();
+            reuseSession.Run(feeds);
+            reuseSeconds += clock.Elapsed.TotalSeconds;
+
+            clock.Restart();
+            plainSession.Run(feeds);
+            plainSeconds += clock.Elapsed.TotalSeconds;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine($"  reuse on   {reuseSeconds / TimedRuns * 1000,7:F0} ms");
+        Console.WriteLine($"  reuse off  {plainSeconds / TimedRuns * 1000,7:F0} ms" +
+                          $"   ({plainSeconds / reuseSeconds:F2}x)");
+        return mismatched == 0 ? 0 : 1;
+    }
+
+    /// <summary>Timed passes per configuration in the reuse comparison.</summary>
+    private const int TimedRuns = 5;
+
+    /// <summary>How many cold-operand samples to average; each one costs a cache flush.</summary>
+    private const int ColdRuns = 10;
+
     private static void BenchmarkGemm()
     {
         (string Label, int M, int K, int N)[] shapes =
@@ -340,6 +547,8 @@ internal static class Program
         float? detectionThreshold = null;
         int benchmarkRuns = 0;
         bool gemmBenchmark = false;
+        bool convBenchmark = false;
+        bool checkReuse = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -353,6 +562,8 @@ internal static class Program
                 case "--list-ops": listOps = true; break;
                 case "--benchmark": benchmarkRuns = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 case "--gemm": gemmBenchmark = true; break;
+                case "--conv": convBenchmark = true; break;
+                case "--check-reuse": checkReuse = true; break;
                 case "--isolate": isolateOp = args[++i]; break;
                 case "--detections": detectionThreshold = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 default:
@@ -364,7 +575,7 @@ internal static class Program
         // Any timing at all is preceded by the machine description and a fresh calibration:
         // these runs happen on a VM whose host can change underneath us, and without a
         // re-measured hardware ceiling a slower host is indistinguishable from a regression.
-        if (gemmBenchmark || benchmarkRuns > 0)
+        if (gemmBenchmark || convBenchmark || benchmarkRuns > 0)
         {
             MachineProbe.PrintMachine();
             Console.WriteLine();
@@ -375,6 +586,14 @@ internal static class Program
         // Given both, the kernel shapes are timed in the same process as the model, so an
         // in-model rate and a standalone rate for the same shape can actually be compared —
         // across processes the host moves enough to swamp the difference being looked for.
+        if (convBenchmark)
+        {
+            BenchmarkConv();
+            Console.WriteLine();
+            if (gemmBenchmark) BenchmarkGemm();
+            if (modelPath is null) return 0;
+        }
+
         if (gemmBenchmark && modelPath is null)
         {
             BenchmarkGemm();
@@ -385,7 +604,9 @@ internal static class Program
         // numbers: it measures time, and time does not depend on the values. Requiring a
         // reference dump for it means regenerating hundreds of megabytes of intermediates
         // before anyone can measure a kernel change.
-        bool needsReference = referenceDir is not null || benchmarkRuns == 0;
+        // Only the per-layer comparison needs the reference: a timing run measures time and a
+        // reuse check compares the graph against itself, and neither depends on the values.
+        bool needsReference = referenceDir is not null || (benchmarkRuns == 0 && !checkReuse);
 
         if (modelPath is null || (needsReference && referenceDir is null))
         {
@@ -445,6 +666,8 @@ internal static class Program
             foreach (var input in model.FeedInputs)
                 feeds[input.Name] = SyntheticFeed(input);
         }
+
+        if (checkReuse) return CheckBufferReuse(model, feeds);
 
         // Fusion removes the intermediate values the per-node comparison is built on, so the
         // harness executes the graph verbatim.

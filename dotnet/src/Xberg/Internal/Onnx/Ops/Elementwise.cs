@@ -23,7 +23,7 @@ internal enum LogicalKind { And, Or, Xor }
 
 internal static class Elementwise
 {
-    public static Tensor Binary(Tensor a, Tensor b, BinaryKind kind)
+    public static Tensor Binary(Tensor a, Tensor b, BinaryKind kind, Tensor? into = null)
     {
         // Integral operands stay integral: Shape arithmetic (Mul/Div on dimension vectors)
         // must not round-trip through float, where large dimensions would lose exactness.
@@ -32,19 +32,31 @@ internal static class Elementwise
         var fa = a.AsFloat();
         var fb = b.AsFloat();
         var plan = Broadcast.MakePlan(fa.Shape, fb.Shape);
-        var result = Tensor.AllocateFloat(plan.Shape);
+
+        // Writing over an operand is only safe where each output element is produced from the
+        // matching element of that operand and no other — that is, where the operand's offsets
+        // coincide with the output's. That holds for an operand of the output's own shape, and
+        // for it alone: a broadcast operand is re-read across blocks, so overwriting it would
+        // feed later blocks the results of earlier ones.
+        bool elementwise = plan.IsFlat && fa.Count == plan.Total && fb.Count == plan.Total;
+        bool scalarRight = fb.Count == 1 && fa.Count == plan.Total;
+        bool scalarLeft = fa.Count == 1 && fb.Count == plan.Total;
+        var result = elementwise || scalarRight || scalarLeft || CoversOutput(into, fa, fb, plan)
+            ? DestinationFor(plan.Shape, into)
+            : Tensor.AllocateFloat(plan.Shape);
+
         var dataA = fa.Floats;
         var dataB = fb.Floats;
         var dataOut = result.Floats;
 
-        if (plan.IsFlat && fa.Count == plan.Total && fb.Count == plan.Total)
+        if (elementwise)
         {
             Apply(kind, dataA, dataB, dataOut);
             return result;
         }
 
         // A scalar operand has a dedicated primitive overload that avoids walking the plan.
-        if (fb.Count == 1 && fa.Count == plan.Total)
+        if (scalarRight)
         {
             // A constant small-integer exponent is worth recognising rather than calling a
             // general power: exported graphs spell the squaring inside a variance as
@@ -54,7 +66,7 @@ internal static class Elementwise
             ApplyScalarRight(kind, dataA, dataB[0], dataOut);
             return result;
         }
-        if (fa.Count == 1 && fb.Count == plan.Total)
+        if (scalarLeft)
         {
             ApplyScalarLeft(kind, dataA[0], dataB, dataOut);
             return result;
@@ -214,18 +226,63 @@ internal static class Elementwise
         _ => throw new NotSupportedException($"binary kind {kind}"),
     };
 
-    public static Tensor Relu(Tensor x)
+    /// <summary>
+    /// Whether <paramref name="into"/> is the operand that already has the output's shape.
+    /// </summary>
+    /// <remarks>
+    /// Same shape means the broadcast walk visits it at exactly the output's offsets, so each
+    /// element is written back over the one it was read from. An operand of any other shape is
+    /// read more than once and must not be written at all.
+    /// </remarks>
+    private static bool CoversOutput(Tensor? into, Tensor a, Tensor b, Broadcast.Plan plan)
+    {
+        if (into?.Buffer is null) return false;
+        foreach (var operand in (ReadOnlySpan<Tensor>)[a, b])
+        {
+            if (!ReferenceEquals(operand.Buffer, into.Buffer)) continue;
+            if (operand.Shape.AsSpan().SequenceEqual(plan.Shape)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// A destination of the given shape: <paramref name="into"/> reshaped when it fits,
+    /// otherwise a fresh allocation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <paramref name="into"/> is an operand the session has established is dead after this
+    /// node and held by nothing else, so the result may be written over it. That turns a
+    /// streaming pass over two buffers into a pass over one: the destination lines are already
+    /// in cache because the producing node just wrote them, where a freshly rented buffer has
+    /// to be pulled in first only to be overwritten.
+    /// </para>
+    /// <para>
+    /// The count has to match exactly, not merely fit — a shorter destination would leave the
+    /// tail of a longer result unwritten, and a longer one would keep a larger array alive
+    /// under a smaller shape.
+    /// </para>
+    /// </remarks>
+    private static Tensor DestinationFor(int[] shape, Tensor? into)
+    {
+        if (into is null || !into.IsFloat) return Tensor.AllocateFloat(shape);
+        return into.Count == Tensor.ElementCount(shape)
+            ? into.Reshaped(shape)
+            : Tensor.AllocateFloat(shape);
+    }
+
+    public static Tensor Relu(Tensor x, Tensor? into = null)
     {
         var f = x.AsFloat();
-        var result = Tensor.AllocateFloat(f.Shape);
+        var result = DestinationFor(f.Shape, into);
         TensorPrimitives.Max(f.Floats, 0f, result.Floats);
         return result;
     }
 
-    public static Tensor Sigmoid(Tensor x)
+    public static Tensor Sigmoid(Tensor x, Tensor? into = null)
     {
         var f = x.AsFloat();
-        var result = Tensor.AllocateFloat(f.Shape);
+        var result = DestinationFor(f.Shape, into);
         TensorPrimitives.Sigmoid(f.Floats, result.Floats);
         return result;
     }

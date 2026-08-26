@@ -35,11 +35,19 @@ internal sealed class OnnxSession
     /// compare every node against a reference dump; whole-graph outputs are unaffected either
     /// way.
     /// </param>
-    public OnnxSession(OnnxModel model, bool optimize = true)
+    /// <param name="reuseBuffers">
+    /// Let an element-wise node write its result over an operand that dies at it. Off is the
+    /// same graph computed into fresh buffers throughout, which is what the reuse is checked
+    /// against — see <c>--check-reuse</c> in <c>tools/Xberg.OnnxParity</c>.
+    /// </param>
+    public OnnxSession(OnnxModel model, bool optimize = true, bool reuseBuffers = true)
     {
         _model = optimize ? GraphOptimizer.Optimize(model) : model;
         _lastUse = ComputeLastUse(_model);
+        _reuseBuffers = reuseBuffers;
     }
+
+    private readonly bool _reuseBuffers;
 
     public static OnnxSession Load(string path) => new(OnnxModel.Load(path));
 
@@ -80,6 +88,9 @@ internal sealed class OnnxSession
         public required double[] NodeMicroseconds { get; init; }
         /// <summary>First output's shape per node, for reading the cost alongside the size.</summary>
         public required string[] NodeOutputShapes { get; init; }
+
+        /// <summary>Whether each node wrote its result over an operand rather than a new buffer.</summary>
+        public bool[]? NodeReusedOperand { get; init; }
     }
 
     /// <summary>
@@ -113,7 +124,15 @@ internal sealed class OnnxSession
             long startTicks = profile is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                outputs = Execute(node, env);
+                // A capturing run has to keep every intermediate, so nothing may be overwritten.
+                var reusable = _reuseBuffers && capture is null
+                    ? FindReusableOperand(node, env, _lastUse[i], declaredOutputs)
+                    : null;
+                outputs = Execute(node, env, reusable);
+
+                if (profile?.NodeReusedOperand is { } reused && reusable is not null)
+                    reused[i] = outputs.Length > 0
+                                && ReferenceEquals(outputs[0]?.Buffer, reusable.Buffer);
             }
             catch (Exception ex) when (ex is not NotSupportedException)
             {
@@ -174,6 +193,55 @@ internal sealed class OnnxSession
     {
         if (!env.Remove(name, out var tensor)) return;
         tensor.Buffer?.Release();
+    }
+
+    /// <summary>
+    /// An operand this node may write its output over, or <c>null</c> when there is none.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The element-wise operators are memory-bound: they read a buffer and write another one
+    /// the same size, and in this graph they are 17% of runtime across four hundred nodes. When
+    /// the operand they read is dead the moment they are done with it, the second buffer is
+    /// pure waste — the result can go back over the input, whose lines the producing node left
+    /// in cache.
+    /// </para>
+    /// <para>
+    /// Five conditions have to hold together, and each rules out a way this would be wrong:
+    /// the pool owns the array (an initializer is a constant shared by every run and a feed
+    /// belongs to the caller); exactly one value holds it (<c>Identity</c> and <c>Reshape</c>
+    /// bind a second name over the same storage, and that name would see the overwrite); the
+    /// name dies at this node (anything later reading it would read the result instead); it is
+    /// not a graph output (which the caller is about to be handed); and this node names it once
+    /// (an operand named twice is held once but read twice, so a count alone would call it
+    /// free).
+    /// </para>
+    /// </remarks>
+    private static Tensor? FindReusableOperand(
+        OnnxNode node, Dictionary<string, Tensor> env,
+        List<string> dying, HashSet<string> declaredOutputs)
+    {
+        if (dying.Count == 0) return null;
+
+        foreach (string input in node.Inputs)
+        {
+            if (input.Length == 0) continue;
+            if (!dying.Contains(input)) continue;
+            if (declaredOutputs.Contains(input)) continue;
+            if (!env.TryGetValue(input, out var tensor)) continue;
+            if (!tensor.IsFloat) continue;
+            if (tensor.Buffer is not { IsPooled: true, References: 1 }) continue;
+
+            // An operand named twice by the same node is held once but read twice; writing
+            // over it while the other read is still to come would corrupt the second.
+            int uses = 0;
+            foreach (string other in node.Inputs) if (other == input) uses++;
+            if (uses != 1) continue;
+
+            return tensor;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -328,7 +396,9 @@ internal sealed class OnnxSession
 
         foreach (var inner in graph.Nodes)
         {
-            var outputs = Execute(inner, env);
+            // A subgraph's values are bound by name into a shared scope and never unbound, so
+            // nothing here is known to be dead and nothing may be overwritten.
+            var outputs = Execute(inner, env, null);
             for (int o = 0; o < inner.Outputs.Length && o < outputs.Length; o++)
             {
                 if (inner.Outputs[o].Length == 0 || outputs[o] is null) continue;
@@ -381,9 +451,9 @@ internal sealed class OnnxSession
     /// wrong kernel from a correct one amplifying drift that arrived from upstream; this can.
     /// </para>
     /// </summary>
-    public Tensor?[] ExecuteNode(OnnxNode node, Dictionary<string, Tensor> env) => Execute(node, env);
+    public Tensor?[] ExecuteNode(OnnxNode node, Dictionary<string, Tensor> env) => Execute(node, env, null);
 
-    private Tensor?[] Execute(OnnxNode node, Dictionary<string, Tensor> env)
+    private Tensor?[] Execute(OnnxNode node, Dictionary<string, Tensor> env, Tensor? reusable)
     {
         switch (node.OpType)
         {
@@ -393,11 +463,11 @@ internal sealed class OnnxSession
             case "Identity":
                 return [Required(node, env, 0)];
 
-            case "Add": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Add)];
-            case "Sub": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Sub)];
-            case "Mul": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Mul)];
-            case "Div": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Div)];
-            case "Pow": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Pow)];
+            case "Add": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Add, reusable)];
+            case "Sub": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Sub, reusable)];
+            case "Mul": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Mul, reusable)];
+            case "Div": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Div, reusable)];
+            case "Pow": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Pow, reusable)];
 
             case "Min":
             case "Max":
@@ -525,8 +595,8 @@ internal sealed class OnnxSession
                 return [Elementwise.Where(
                     Required(node, env, 0), Required(node, env, 1), Required(node, env, 2))];
 
-            case "Relu": return [Elementwise.Relu(Required(node, env, 0))];
-            case "Sigmoid": return [Elementwise.Sigmoid(Required(node, env, 0))];
+            case "Relu": return [Elementwise.Relu(Required(node, env, 0), reusable)];
+            case "Sigmoid": return [Elementwise.Sigmoid(Required(node, env, 0), reusable)];
             case "Sqrt": return [Elementwise.Sqrt(Required(node, env, 0))];
             case "Exp": return [Elementwise.Exp(Required(node, env, 0))];
             case "Log": return [Elementwise.Log(Required(node, env, 0))];

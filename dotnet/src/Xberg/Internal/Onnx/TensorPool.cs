@@ -136,6 +136,20 @@ internal sealed class TensorBuffer
             : new TensorBuffer(pool.Rent(length), pool);
     }
 
+    /// <summary>How many graph values currently hold this storage.</summary>
+    /// <remarks>
+    /// One means a single name owns it, which is the condition under which a node may write
+    /// its output over its input: nothing else can observe the change.
+    /// </remarks>
+    public int References => _references;
+
+    /// <summary>Whether the pool owns this array, rather than a caller or an initializer.</summary>
+    /// <remarks>
+    /// An initializer is a constant shared by every run and a feed belongs to the caller;
+    /// neither may be overwritten, and both arrive wrapped rather than rented.
+    /// </remarks>
+    public bool IsPooled => _pool is not null;
+
     public void AddReference() => _references++;
 
     private bool _recycled;

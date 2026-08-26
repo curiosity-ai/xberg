@@ -1540,17 +1540,33 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       rejected, and how to measure anything at all on a VM whose host throughput moves by 2x
       between runs, is recorded in `tools/onnx-parity/README.md`.
 
-      **Re-profiled 2026-08-26, and the finding overturns the route that was recorded here.**
-      The slowest shapes are 1x1 convolutions with a large channel count — 113 and 128 GFLOP/s
-      — not the small-channel 3x3 layers this entry used to name first, which run at 195-277
-      while the deep 3x3 layers reach 349. The pattern is the reduction depth: a 1x1 reduces
-      over 256 or 512 elements where a 3x3 over the same channels reduces over nine times as
-      many, so each output tile's prologue and accumulator store are amortised nine times
-      worse. A direct convolution avoiding the im2col expansion would be attacking shapes that
-      are not the problem. Full table in `tools/onnx-parity/README.md`.
+      **Re-measured 2026-08-26, which overturned the recorded next step twice.** It was "a
+      direct convolution for small-channel layers": the profile says those run at 195-277
+      GFLOP/s, mid-pack, and the slowest shapes are 1x1 convolutions with a large channel count
+      at 113-128. So the entry became "the shallow reduction" — also wrong: `--gemm` runs those
+      exact products at 365-379, near the best in the set. **The multiply was never slow.**
 
-      Two things bound what any of this can buy: `Conv` is 61% of the graph and `MatMul` 14%,
-      and 1,649 of the 2,315 nodes take under 10 us each — 0.2% of runtime between them.
+      What was missing was a measurement. `--gemm` measures the product a convolution lowers to;
+      nothing measured the convolution, which is 61% of the graph. `--conv` does, and every hot
+      shape — 1x1 included — runs at 71-113% of the calibrated ceiling. Only the shortcut
+      convolutions are genuinely slower in the graph than in isolation, worth ~2% between them.
+
+      **The one win: writing an element-wise result over a dying operand.** Four hundred nodes
+      read a buffer and write another the same size, and when the operand is dead at that node
+      the second buffer is waste. `Relu` 35.7 -> 27.5 ms, `Add` 50.3 -> 42.3, `Mul` 10.6 -> 8.4;
+      buffer rentals per inference 734 -> 473 and pool memory 214 -> 168 MiB. Whole-model that
+      is **1.00-1.04x over three interleaved same-process runs** — two percent, at the edge of
+      what this host resolves, though the per-operator figures are solid and consistent with it
+      and the memory figures are counts rather than timings.
+
+      Correctness is the whole risk in that change: reusing a buffer too eagerly corrupts a
+      value a later node reads, and it surfaces as a plausible detection rather than a crash.
+      `--check-reuse` runs the graph with reuse on and off and compares every output bitwise —
+      RT-DETR's three are identical to the bit — and twelve tests cover the predicate, each of
+      which fails when its condition is removed.
+
+      Two things bound what is left: `Conv` is 61% of the graph and `MatMul` 14%, and 1,649 of
+      the 2,315 nodes take under 10 us each — 0.2% of runtime between them.
 
       `--benchmark` no longer needs a reference dump: a timing run measures time, and time does
       not depend on the numbers, so inputs are synthesised from the shapes the graph declares.
