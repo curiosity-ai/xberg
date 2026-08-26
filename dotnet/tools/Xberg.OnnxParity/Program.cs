@@ -128,11 +128,12 @@ internal static class Program
             NodeOutputShapes = new string[model.Nodes.Length],
             NodeReusedOperand = new bool[model.Nodes.Length],
         };
+        session.Pool.ResetCounters();
         session.Run(feeds, capture: null, profile);
 
         Console.WriteLine(
-            $"buffer pool over the profiled run: {session.Pool.Reused - reusedBefore} reused, " +
-            $"{session.Pool.Allocated - allocatedBefore} allocated, " +
+            $"buffer pool over the profiled run: {session.Pool.Reused} reused, " +
+            $"{session.Pool.Allocated} allocated, " +
             $"{session.Pool.RetainedBytes / (1024.0 * 1024):F0} MiB retained");
         foreach (var (length, count) in session.Pool.AllocationsByLength.OrderByDescending(p => (long)p.Key * p.Value).Take(8))
             Console.WriteLine($"    {count,4} x {length,10} floats  ({(double)length * count * 4 / (1024 * 1024),6:F1} MiB)");

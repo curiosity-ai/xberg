@@ -337,6 +337,34 @@ of runtime. The memory figures are counts rather than timings and do not vary.
 the only check that means anything for a change of this kind. RT-DETR's three outputs are
 identical to the bit.
 
+### The one unexplained thing, and three answers it is not
+
+The shortcut convolutions — `res_layers.N/blocks.0/short`, a 1x1 after an average pool — run
+about twice as slow in the graph as in isolation. Measured on one host sample in one process,
+so it is not drift: `1x1 512->1024 @40x40` reads 7.0 ms under `--conv` and 15.1 ms as node #61.
+The 3x3 shapes show no such gap, matching to within a millisecond. Between them the shortcuts
+are worth roughly 2% of inference.
+
+Three explanations were tested and none of them is it:
+
+- **Cold weights.** A is re-read once per column panel, and in a hot loop it stays in L3 while
+  the graph evicts it. But the traffic per flop works out the same for the fast 3x3 shape —
+  151 MFLOP per column panel against ~2 MB of A either way — and flushing 24 MB before each
+  isolated run does not slow it down.
+- **Pool misses on the large activations.** `ResetCounters` plus the per-run histogram says the
+  warm run misses 14 times for 4 MiB, and the other 55 misses are all under the 16 KB floor
+  where pooling is deliberately off. Four megabytes per 800 ms is not two percent of anything.
+- **Values nothing consumes.** `ComputeLastUse` builds from names used as *inputs*, so a value
+  the graph produces and never reads is never unbound and its buffer never returns to the pool.
+  True, and RT-DETR has none: releasing the leftover bindings at the end of a run moved the
+  counters not at all. The change was backed out — it also lets a graph output fed straight back
+  in as the next run's input be recycled underneath the caller, which is a real hazard bought
+  for no measured gain.
+
+What is left to try: the shortcut's input is an `AveragePool` output rather than another
+convolution's, which is the one structural difference from every fast shape. Whether that
+matters is unmeasured.
+
 - Beyond that: software prefetch hints and hand-scheduled instruction order, which C# cannot
   express, and MLAS's per-CPU kernel variants selected at run time, where this has one AVX-512
   path and one portable path.

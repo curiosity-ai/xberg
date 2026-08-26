@@ -41,6 +41,18 @@ internal sealed class TensorPool
     /// </summary>
     public Dictionary<int, int> AllocationsByLength { get; } = [];
 
+    /// <summary>Forget the counters, so a later run's misses can be read on their own.</summary>
+    /// <remarks>
+    /// The cumulative histogram is dominated by the first pass, when every shape misses by
+    /// definition. What names a real problem is what still misses once the pool is warm.
+    /// </remarks>
+    public void ResetCounters()
+    {
+        Reused = 0;
+        Allocated = 0;
+        AllocationsByLength.Clear();
+    }
+
     /// <summary>The ambient pool for the execution on this thread, if any.</summary>
     /// <remarks>
     /// Thread-static rather than threaded through every kernel signature: graph execution is

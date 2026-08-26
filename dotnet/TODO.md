@@ -1569,6 +1569,17 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       Two things bound what is left: `Conv` is 61% of the graph and `MatMul` 14%, and 1,649 of
       the 2,315 nodes take under 10 us each — 0.2% of runtime between them.
 
+      **One thing measured and still unexplained**: the shortcut convolutions (a 1x1 after an
+      average pool) run about twice as slow in the graph as in isolation — 7.0 ms under `--conv`
+      against 15.1 ms as a node — where every 3x3 shape matches to within a millisecond. Worth
+      ~2% between them. Three explanations were tested and disproved: cold weights (the traffic
+      per flop is the same for the fast shapes, and flushing the cache does not slow the
+      isolated run), pool misses (the warm run misses 14 times for 4 MiB, the rest below the
+      16 KB floor), and values nothing consumes (RT-DETR has none; releasing them moved nothing
+      and the change was backed out, since it also lets an output fed back in as the next run's
+      input be recycled underneath the caller). Recorded in the parity README so the next
+      attempt starts past them.
+
       `--benchmark` no longer needs a reference dump: a timing run measures time, and time does
       not depend on the numbers, so inputs are synthesised from the shapes the graph declares.
       Requiring hundreds of megabytes of promoted intermediates before anyone could measure a
