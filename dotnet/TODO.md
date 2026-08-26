@@ -1494,8 +1494,16 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
 - [x] **Layer-by-layer validation** against ONNX Runtime via `tools/onnx-parity` and
       `tools/Xberg.OnnxParity`. Every operator instance matches in isolation; all detections
       above threshold agree in class, confidence and geometry.
-- [ ] **Model acquisition** — port `layout/model_manager.rs`: Hugging Face download, on-disk
-      cache, SHA-256 verification, atomic publish with rollback.
+- [x] **Model acquisition** — `layout/model_manager.rs` ported 2026-08-26
+      (`Internal/Layout/LayoutModelManager.cs`): seven models each pinned to a Hugging Face
+      repository revision *and* a SHA-256 digest, resolved cache-first, published through a
+      staging name and an atomic rename with rollback. The digest is what decides, not the
+      size: an interrupted download looks fine to a size check. The cache root and the offline
+      switch come through `XbergOptions` rather than the environment, because the library reads
+      no ambient process state — a rule the suite enforces, and which caught the first draft.
+      Verified against the real service: the expected `models--<repo>/snapshots/<revision>/`
+      layout at exactly the pinned sizes, a 0.06 s cache hit on repeat, and a byte-tampered
+      entry detected and re-fetched.
 - [x] **Graph optimisation and buffer reuse.** Decomposed batch-norm folded into convolution
       weights, activations fused into the convolution's output pass, and activation storage
       recycled through a pool with reference counts on the buffer (so `Reshape` views and
@@ -1514,15 +1522,55 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       in-place unary operators, since the session already knows which values die at each node;
       and a specialised max-pooling path. Past those it is what C# cannot express — prefetch
       hints and hand-scheduled assembly — plus MLAS's per-CPU kernel variants.
-- [ ] **Page rasterisation.** The blocker for end-to-end use: layout detection needs a
-      rendered page bitmap, and the C# port has no PDF renderer. Until one exists the model
-      can only be driven from images supplied by the caller.
-- [ ] **Remaining models**: PP-DocLayout-V3, TATR, SLANeXt wired/wireless, PP-LCNet table
-      classifier. The runtime already executes the classifier; the others need their own
-      pre/postprocessing ported.
-- [ ] **Layout-aware reading order** (`extractors/pdf/reading_order.rs`). Note this is
-      entirely `#[cfg(feature = "layout-detection")]`, so it is absent from the goldens —
-      measuring it needs `xberg-reference-gen` rebuilt with that feature enabled.
+- [ ] **Page rasterisation.** The blocker for end-to-end use, and assessed rather than
+      assumed: layout detection needs a rendered page bitmap, and the C# port has no PDF
+      renderer. Upstream reaches one through pdf_oxide — 21,560 lines under `src/rendering/`
+      plus `tiny_skia` (~20k) plus font glyph outlines — and the model's output depends on the
+      pixels, so an approximate renderer would not give matching detections. Everything else in
+      this phase is therefore reachable only from images the caller supplies. That is not a
+      hypothetical restriction: it is why the model work above is verified against image
+      fixtures and probes rather than against the golden corpus.
+- [x] **Detection postprocessing** — `layout/postprocessing/{heuristics,nms}.rs` ported
+      2026-08-26 (`Internal/Layout/LayoutPostprocessing.cs`). Upstream carries no tests for
+      either file, so this is verified by differential probe: `LayoutEngine::detect` is public
+      and `apply_heuristics` is a public flag, so `tools/heuristics-probe` runs the same page
+      twice — raw and postprocessed — with no change to the xberg crate. Over all 44 image
+      fixtures, 979 raw detections reduce to 267 and every page matches upstream exactly.
+- [x] **PP-LCNet table classifier** ported 2026-08-26 (`Internal/Layout/TableClassifier.cs`).
+      All 44 fixtures agree with upstream on wired/wireless. The probe also captures the raw
+      logits upstream logs at debug level, which showed deltas up to 1.05e-2 — every one on a
+      JPEG. Re-decoding those to PNG and feeding both sides identical pixels drops the worst
+      delta to 6.17e-4, the rounding granularity of the 3dp reference. See the JPEG note below.
+- [x] **PP-DocLayout-V3** ported 2026-08-26 (`Internal/Layout/PpDocLayoutV3Model.cs`), with
+      upstream's 29 tests and a real-model probe: over 43 page images every page matches in
+      detection count and class, worst confidence delta 2.5e-3, worst box delta 0.17 px
+      (median 0.0007 px). Running the graph needed seven operators the runtime lacked — Where,
+      Range, GatherND, ScatterND, EyeLike, Floor, Greater, Mod, Einsum — now implemented with
+      31 tests of their own. `--onnx-ops` censuses a graph's operators against what exists, so
+      the next model names its gaps in one run.
+- [ ] **Remaining models**: TATR and SLANeXt wired/wireless still need their pre/postprocessing
+      ported. YOLO's letterbox preprocessing is in place; its wrapper is not.
+- [x] **Layout-aware reading order** — `extractors/pdf/reading_order.rs` ported 2026-08-26
+      (`Internal/Layout/ReadingOrder.cs`), together with the rotation-aware assembly in
+      `rotation.rs`. Verified by porting upstream's own test module: 58 of its 59 tests, fixture
+      for fixture (the 59th asserts a Rust config default with no counterpart here). Reading
+      order is a permutation rather than text, so no golden file can reach it.
+
+      Three Rust semantics C# does not share, each of which changes output: `f32::total_cmp` is
+      not `float.CompareTo`; `sort_by` is stable and `List.Sort` is not; `f32::min`/`max` return
+      the other operand on NaN where `MathF` propagates it. Also worth recording: Rust's
+      `f32::NAN` is `0x7fc00000` and .NET's `float.NaN` is `0xffc00000`, a *negative* quiet NaN,
+      and the sign bit decides which end of a total order NaN sorts to.
+
+      Note it is entirely `#[cfg(feature = "layout-detection")]` *and* gated on
+      `pdf_options.reading_order`, which defaults to false — so it is absent from the goldens.
+      `xberg-reference-gen --features layout` now enables both.
+- [ ] **JPEG decoding divergence.** ImageSharp and the Rust `image` crate disagree slightly on
+      JPEG (chroma upsampling and IDCT rounding), which is the only difference left between the
+      two layout stacks on identical models. It never changed a classification or a class across
+      the fixtures measured, but it does move confidences by ~1e-2, which is enough to reorder
+      near-tied detections in a confidence-sorted list. Not a layout bug; recorded here because
+      layout is where it shows up.
 
 ## Cross-cutting
 
