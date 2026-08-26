@@ -1481,8 +1481,18 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       ModelProto/GraphProto/NodeProto/TensorProto/AttributeProto decoding
       (`Internal/Onnx/ProtoReader.cs`, `OnnxModel.cs`). No dependency, no codegen; tensor
       payloads are slices over the model bytes rather than copies.
-- [x] **Operator kernels** (`Internal/Onnx/Ops/`) covering both pinned graphs — the 40
-      operators RT-DETR uses and the table classifier's set. Vectorised through
+- [x] **Operator kernels** (`Internal/Onnx/Ops/`) covering all five pinned graphs. Beyond
+      RT-DETR's original 40 and the table classifier's set, 2026-08-26 added what PP-DocLayout-V3
+      needed (Where, Range, GatherND, ScatterND, EyeLike, Floor, the comparison family, Mod,
+      Einsum), what TATR's int8 export needed (DynamicQuantizeLinear, MatMulInteger, ConvInteger,
+      CumSum, Sin, Cos), and what SLANeXt needed (OneHot, ScatterElements, the boolean family).
+      Integer accumulation runs in double: over a few thousand reduction steps an int8 product sum
+      passes float's exact-integer range, and a quantized path only means anything if it is exact.
+- [x] **Control flow.** `Loop` and `If`, with graph-typed attribute decoding and subgraph
+      execution against a seeded outer scope. Two things had to change beyond the operators
+      themselves: liveness analysis now walks subgraphs, because a value used only inside a loop
+      body was being released at its last top-level use, and the `--onnx-ops` census recurses, so
+      a graph is not reported runnable when a body needs a kernel that does not exist. Vectorised through
       `System.Numerics.Tensors`; convolution lowers to GEMM via im2col with dedicated
       pointwise and depthwise paths, and MatMul uses an axpy-ordered kernel so the inner
       loop is a contiguous fused multiply-add.
@@ -1548,8 +1558,17 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       Range, GatherND, ScatterND, EyeLike, Floor, Greater, Mod, Einsum — now implemented with
       31 tests of their own. `--onnx-ops` censuses a graph's operators against what exists, so
       the next model names its gaps in one run.
-- [ ] **Remaining models**: TATR and SLANeXt wired/wireless still need their pre/postprocessing
-      ported. YOLO's letterbox preprocessing is in place; its wrapper is not.
+- [x] **TATR** ported 2026-08-26 (`Internal/Layout/TatrModel.cs`) with all 36 of upstream's
+      tests: DETR preprocessing, the query decode, and the cell-grid reconstruction with its
+      header-row count and merged spans. Three details decide the output rather than the style —
+      the resize matches Hugging Face's `get_resize_output_image_size` including its truncation
+      order, suppression is intersection-over-*box* with different thresholds for rows and
+      columns, and normalisation is ImageNet in RGB rather than the PaddleOCR models' BGR.
+- [x] **SLANeXt** ported 2026-08-26 (`Internal/Layout/SlanetModel.cs`), with nine decode tests
+      for the token walk. Verified against ONNX Runtime per node: all 1035 graph values match and
+      both declared outputs match, worst absolute difference 1.3e-4.
+- [ ] **YOLO wrapper.** The letterbox preprocessing and greedy NMS it needs are in place; the
+      model wrapper itself is not ported.
 - [x] **Layout-aware reading order** — `extractors/pdf/reading_order.rs` ported 2026-08-26
       (`Internal/Layout/ReadingOrder.cs`), together with the rotation-aware assembly in
       `rotation.rs`. Verified by porting upstream's own test module: 58 of its 59 tests, fixture
