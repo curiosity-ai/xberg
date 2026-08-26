@@ -20,6 +20,17 @@ publish = false
 name = "xberg-reference-gen"
 path = "src/main.rs"
 
+# `extended` adds the xberg features the default set leaves off — the ones the C# port
+# is now growing counterparts for. Kept behind a cargo feature rather than switched on
+# outright: they change what a fixture extracts to, so the two builds answer different
+# questions and each needs its own golden set (see `--out`).
+[features]
+default = []
+extended = [
+    "xberg/tree-sitter",
+    "xberg/qr-codes",
+]
+
 [dependencies]
 xberg = { path = "../../../crates/xberg", default-features = false, features = [
     "tokio-runtime",

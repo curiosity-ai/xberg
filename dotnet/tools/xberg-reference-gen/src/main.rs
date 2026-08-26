@@ -6,7 +6,13 @@
 //! CLI diffs its own extraction output against these golden files.
 //!
 //! Usage:
-//!   xberg-reference-gen <root-dir> [--overwrite] [--filter <substr>]
+//!   xberg-reference-gen <root-dir> [--overwrite] [--filter <substr>] [--out <dir>]
+//!
+//! `--out <dir>` writes the goldens into a mirror of the fixture tree rooted at
+//! `<dir>` instead of next to each source file. That is what keeps a build with extra
+//! `xberg` features (the `extended` cargo feature below) from clobbering the goldens
+//! the default feature set produced: the two sets answer different questions and a
+//! fixture's result differs between them wherever a feature changes the extraction.
 
 use std::path::{Path, PathBuf};
 
@@ -59,7 +65,9 @@ async fn main() {
     let root = match args.first() {
         Some(r) if !r.starts_with("--") => PathBuf::from(r),
         _ => {
-            eprintln!("usage: xberg-reference-gen <root-dir> [--overwrite] [--filter <substr>]");
+            eprintln!(
+                "usage: xberg-reference-gen <root-dir> [--overwrite] [--filter <substr>] [--out <dir>]"
+            );
             std::process::exit(2);
         }
     };
@@ -72,6 +80,12 @@ async fn main() {
         .position(|a| a == "--filter")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    // `--out <dir>`: mirror the fixture tree under <dir> and write the goldens there.
+    let out_root = args
+        .iter()
+        .position(|a| a == "--out")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
 
     if !root.is_dir() {
         eprintln!("error: {} is not a directory", root.display());
@@ -101,7 +115,7 @@ async fn main() {
 
     for path in entries {
         total += 1;
-        let out_path = reference_path(&path);
+        let out_path = reference_path(&path, &root, out_root.as_deref());
         if out_path.exists() && !overwrite {
             skipped += 1;
             continue;
@@ -186,9 +200,26 @@ fn is_candidate(path: &Path) -> bool {
 }
 
 /// The `{filename}-results-rust.json` sibling path.
-fn reference_path(path: &Path) -> PathBuf {
+/// Where a fixture's golden goes.
+///
+/// Next to the fixture by default. With `--out`, into the same relative position under
+/// `out_root`, whose directories are created on demand — so one corpus can carry several
+/// golden sets, one per feature configuration, without any of them overwriting another.
+fn reference_path(path: &Path, root: &Path, out_root: Option<&Path>) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    path.with_file_name(format!("{name}-results-rust.json"))
+    let file = format!("{name}-results-rust.json");
+    match out_root {
+        None => path.with_file_name(file),
+        Some(out) => {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            let mut dest = out.join(rel);
+            dest.set_file_name(file);
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            dest
+        }
+    }
 }
 
 async fn generate(path: &Path, rel: &str) -> Result<ReferenceOutput, String> {

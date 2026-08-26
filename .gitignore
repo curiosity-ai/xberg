@@ -343,6 +343,12 @@ poly.local.toml
 **/.alef-cache/
 **/.alef/
 
+# Golden reference sets for the C# port. Generated locally by
+# `dotnet/tools/xberg-reference-gen`, one directory per xberg feature configuration
+# (`--out`), and regenerated rather than committed — they are large, machine-specific
+# in places (pdf_oxide's font cache), and tied to whatever the Rust tree is at.
+/test_documents-goldens-*/
+
 # BEGIN ai-rulez (DO NOT EDIT - managed by ai-rulez)
 .ai-rulez/.generated-manifest.json
 # END ai-rulez
