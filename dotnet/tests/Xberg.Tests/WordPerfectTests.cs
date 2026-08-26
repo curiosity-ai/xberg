@@ -608,4 +608,156 @@ public class WordPerfectTests
             new[] { WpdEventKind.BoldStart, WpdEventKind.Text, WpdEventKind.BoldEnd },
             events.Select(e => e.Kind));
     }
+
+    // ------------------------------------------------------------------ Tables in the older formats
+
+    /// <summary>A 5.x variable-length group: the size excludes its own four framing bytes.</summary>
+    private static byte[] Wp5Group(byte group, byte subGroup, params byte[] content)
+    {
+        int stored = content.Length + 4;
+        return
+        [
+            group, subGroup, (byte)(stored & 0xFF), (byte)(stored >> 8),
+            .. content,
+            (byte)(stored & 0xFF), (byte)(stored >> 8), subGroup, group,
+        ];
+    }
+
+    /// <summary>The same for 3.x, whose sizes are big-endian.</summary>
+    private static byte[] Wp3Group(byte group, byte subGroup, params byte[] content)
+    {
+        int stored = content.Length + 4;
+        return
+        [
+            group, subGroup, (byte)(stored >> 8), (byte)(stored & 0xFF),
+            .. content,
+            (byte)(stored >> 8), (byte)(stored & 0xFF), subGroup, group,
+        ];
+    }
+
+    /// <summary>
+    /// A 5.x table definition: the old column block, then the one that counts.
+    /// </summary>
+    /// <remarks>
+    /// The definition is written twice, and the first block's own column count is what says how
+    /// far to skip to reach the second. Zero old columns keeps the skip fixed.
+    /// </remarks>
+    private static byte[] Wp5TableDefinition(int columns)
+    {
+        var content = new List<byte>();
+        content.AddRange(new byte[2]);                  // before the old column count
+        content.AddRange([0, 0]);                       // old column count: none
+        content.AddRange(new byte[20]);                 // the rest of the old block
+        content.Add(0);                                 // position flags
+        content.Add(0);                                 // reserved
+        content.AddRange([(byte)(columns & 0xFF), (byte)(columns >> 8)]);
+        content.AddRange(new byte[4]);
+        content.AddRange(new byte[4]);                  // left and right gutter
+        content.AddRange(new byte[10]);
+        content.AddRange(new byte[2]);                  // left offset
+        content.AddRange(new byte[5 * columns]);        // widths, attributes, alignments
+        return Wp5Group(0xD2, 0x0B, content.ToArray());
+    }
+
+    /// <summary>A 5.x cell, whose column span carries the bound-from-above marker.</summary>
+    private static byte[] Wp5Cell(byte column, byte colSpan = 1, byte rowSpan = 1) =>
+        Wp5Group(0xDC, 0x00, [0x00, column, colSpan, rowSpan, 0, 0, 0, 0, 0, 0, 0]);
+
+    private static IReadOnlyList<WpdEvent> ParseWp5(params byte[][] parts) =>
+        WordPerfectReader.Parse(Wp5Header(0x00, 0x0a, parts.SelectMany(p => p).ToArray())).Events;
+
+    private static string RunsOf(IEnumerable<WpdEvent> events) =>
+        string.Join("|", events.Where(e => e.Kind == WpdEventKind.Text).Select(e => e.Text));
+
+    /// <summary>
+    /// A 5.x table comes out as a properly nested grid.
+    /// </summary>
+    /// <remarks>
+    /// Checked against libwpd on this exact document, built for the purpose: no fixture in the
+    /// corpus has a 5.x table, so the parser's table path had never run. libwpd reports two rows
+    /// of two, "A1"/"A2" then "B1"/"B2".
+    /// </remarks>
+    [Fact]
+    public void Wp5TablesAreBracketed()
+    {
+        byte[] row = Wp5Group(0xDC, 0x01, 0, 0, 0, 0);
+        byte[] off = Wp5Group(0xDC, 0x02, 0, 0, 0, 0);
+
+        var events = ParseWp5(
+            "Before"u8.ToArray(),
+            Wp5TableDefinition(2),
+            row, Wp5Cell(0), "A1"u8.ToArray(), Wp5Cell(1), "A2"u8.ToArray(),
+            row, Wp5Cell(0), "B1"u8.ToArray(), Wp5Cell(1), "B2"u8.ToArray(),
+            off,
+            "After"u8.ToArray());
+
+        Assert.Equal("Before|A1|A2|B1|B2|After", RunsOf(events));
+        Assert.Equal(1, events.Count(e => e.Kind == WpdEventKind.TableStart));
+        Assert.Equal(2, events.Count(e => e.Kind == WpdEventKind.RowStart));
+        Assert.Equal(2, events.Count(e => e.Kind == WpdEventKind.RowEnd));
+        Assert.Equal(4, events.Count(e => e.Kind == WpdEventKind.CellStart));
+        Assert.Equal(4, events.Count(e => e.Kind == WpdEventKind.CellEnd));
+        Assert.Equal(1, events.Count(e => e.Kind == WpdEventKind.TableEnd));
+    }
+
+    /// <summary>A 5.x slot the row above covers produces no cell of its own.</summary>
+    [Fact]
+    public void Wp5BoundFromAboveEmitsNoCell()
+    {
+        byte[] row = Wp5Group(0xDC, 0x01, 0, 0, 0, 0);
+        var events = ParseWp5(
+            Wp5TableDefinition(1),
+            row, Wp5Cell(0, colSpan: 0x81), "X"u8.ToArray());
+
+        // No cell opens where the marker sits, so the text that follows lands outside one and
+        // the single CellStart in the stream is the empty filler the row close adds.
+        Assert.Equal(1, events.Count(e => e.Kind == WpdEventKind.CellStart));
+        int text = events.ToList().FindIndex(e => e.Kind == WpdEventKind.Text && e.Text == "X");
+        int cell = events.ToList().FindIndex(e => e.Kind == WpdEventKind.CellStart);
+        Assert.True(text >= 0 && text < cell, "the text should precede the filler cell");
+    }
+
+    /// <summary>
+    /// A 3.x table left open at the end of the document still closes its last row.
+    /// </summary>
+    /// <remarks>
+    /// Nothing in these files has to turn a table off — it can simply run to the end — and a
+    /// row never closed is a row the builder never pushes. That silently dropped the last row of
+    /// every Macintosh table. libwpd, on this same document, reports both rows.
+    /// </remarks>
+    [Fact]
+    public void Wp3UnterminatedTableKeepsItsLastRow()
+    {
+        // The table function carries a full definition: 71 reserved bytes, the mode, five
+        // gutter measures, three more reserved, the column count, then ten bytes per column.
+        const int columns = 2;
+        var definition = new List<byte>();
+        definition.AddRange(new byte[71]);
+        definition.Add(0);
+        definition.AddRange(new byte[20]);
+        definition.AddRange(new byte[3]);
+        definition.Add(columns);
+        definition.AddRange(new byte[10 * columns]);
+
+        byte[] endCell = Wp3Group(0xDC, 0x16, 0, 0, 0, 0);
+        byte[] endRow = Wp3Group(0xDC, 0x18, 0, 0, 0, 0);
+        byte[] eol = Wp3Group(0xDC, 0x02, 0, 0, 0, 0);
+
+        byte[] body =
+        [
+            .. "Before"u8.ToArray(), .. eol,
+            .. Wp3Group(0xE2, 0x01, definition.ToArray()),
+            .. "A1"u8.ToArray(), .. endCell, .. "A2"u8.ToArray(), .. endRow,
+            .. "B1"u8.ToArray(), .. endCell, .. "B2"u8.ToArray(),
+            .. eol, .. "After"u8.ToArray(),
+        ];
+
+        var events = WordPerfectReader.Parse(Wp5Header(0x02, 0x2c, body)).Events;
+
+        Assert.Equal("Before|A1|A2|B1|B2|After", RunsOf(events));
+        Assert.Equal(2, events.Count(e => e.Kind == WpdEventKind.RowStart));
+        Assert.Equal(2, events.Count(e => e.Kind == WpdEventKind.RowEnd));
+        Assert.Equal(4, events.Count(e => e.Kind == WpdEventKind.CellEnd));
+        Assert.Equal(WpdEventKind.TableEnd, events[^1].Kind);
+    }
 }

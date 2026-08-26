@@ -17,18 +17,6 @@ namespace Xberg.Internal.WordPerfect;
 /// </remarks>
 internal static class Wp3Parser
 {
-    /// <summary>
-    /// What the walk needs to remember across groups.
-    /// </summary>
-    /// <remarks>
-    /// Only whether a table is open, which is what decides whether a cell or row boundary is
-    /// table structure or ordinary paragraph structure.
-    /// </remarks>
-    private sealed class ParseState
-    {
-        public bool TableOpen;
-    }
-
     /// <summary>Size of each fixed-length group from 0xC0 to 0xCF, counting both delimiters.</summary>
     private static readonly int[] FixedLengthGroupSize =
     {
@@ -59,14 +47,12 @@ internal static class Wp3Parser
         var sink = new WpdEventSink(document.Events);
         var reader = new WpdReader(bytes);
         reader.Seek((int)header.DocumentOffset);
-        var state = new ParseState();
-        ParseBody(reader, sink, state);
-        if (state.TableOpen) sink.Emit(WpdEvent.Simple(WpdEventKind.TableEnd));
+        ParseBody(reader, sink);
         sink.Finish();
         return document;
     }
 
-    private static void ParseBody(WpdReader reader, WpdEventSink sink, ParseState state, int depth = 0)
+    private static void ParseBody(WpdReader reader, WpdEventSink sink, int depth = 0)
     {
         if (depth > 8) return;
 
@@ -96,7 +82,7 @@ internal static class Wp3Parser
             }
             else if (value <= 0xEF)
             {
-                ParseVariableLengthGroup(reader, sink, value, depth, state);
+                ParseVariableLengthGroup(reader, sink, value, depth);
             }
         }
     }
@@ -196,7 +182,7 @@ internal static class Wp3Parser
     /// the subgroup and the opening byte.
     /// </summary>
     private static void ParseVariableLengthGroup(
-        WpdReader reader, WpdEventSink sink, byte group, int depth, ParseState state)
+        WpdReader reader, WpdEventSink sink, byte group, int depth)
     {
         int start = reader.Position;
         byte subGroup = reader.ReadU8();
@@ -215,18 +201,17 @@ internal static class Wp3Parser
         switch (group)
         {
             case EndOfLinePageGroup:
-                ParseEndOfLinePage(sink, subGroup, state);
+                ParseEndOfLinePage(sink, subGroup);
                 break;
 
             case TablesGroup:
                 // Subgroup 1 is the table definition, which is what actually opens a table. The
                 // rest set cell borders, colours and alignment, none of which is text.
-                if (subGroup == 0x01 && !state.TableOpen)
+                if (subGroup == 0x01 && !sink.TableOpen)
                 {
-                    state.TableOpen = true;
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.TableStart));
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.RowStart));
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.CellStart));
+                    sink.StartTable();
+                    sink.InsertRow(header: false);
+                    sink.InsertCell(1, 1);
                 }
                 break;
 
@@ -248,7 +233,7 @@ internal static class Wp3Parser
     /// come from the format documentation rather than from inspection, and libwpd's source says
     /// as much.
     /// </remarks>
-    private static void ParseEndOfLinePage(WpdEventSink sink, byte subGroup, ParseState state)
+    private static void ParseEndOfLinePage(WpdEventSink sink, byte subGroup)
     {
         switch (subGroup)
         {
@@ -275,20 +260,14 @@ internal static class Wp3Parser
             // codes are ordinary paragraph structure, and treating them as table events would
             // drop the break entirely.
             case 0x16:                                 // hard end of table cell
-                if (state.TableOpen)
-                {
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.CellEnd));
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.CellStart));
-                }
+                if (sink.TableOpen) sink.InsertCell(1, 1);
                 break;
 
             case 0x18:                                 // hard end of table row and cell
-                if (state.TableOpen)
+                if (sink.TableOpen)
                 {
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.CellEnd));
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.RowEnd));
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.RowStart));
-                    sink.Emit(WpdEvent.Simple(WpdEventKind.CellStart));
+                    sink.InsertRow(header: false);
+                    sink.InsertCell(1, 1);
                 }
                 else sink.ParagraphEnd();
                 break;

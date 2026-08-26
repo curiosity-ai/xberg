@@ -44,6 +44,14 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > | catastrophes | 0 | 0 | 0 |
 > | content losses | 3 (html) | 3 (html) | 2 (html) |
 >
+> **Two formats added since sit outside that run.** WordPerfect's fixtures live in the upstream
+> `wordperfect` corpus rather than `test_documents`, and its goldens need
+> `xberg-reference-gen --features wordperfect` (a C++ toolchain and vendored boost); against
+> those it is 7 of 7 comparable fixtures on every hard dimension. HEIC/HEIF/AVIF has no golden
+> at all — the reference generator has never enabled the `images` feature, so every image
+> fixture in `test_documents` reads "Unsupported format" — and is measured against libheif
+> directly. Neither moves the numbers above in either direction.
+>
 > The 81 remaining, by format: **html 71**, pdf 8, and one each in xml and dbf. Every other
 > format in the corpus is at full parity on the hard dimensions. Both the xml and the dbf
 > failures are upstream defects this port deliberately does not reproduce (see "Genuine upstream
@@ -1738,6 +1746,15 @@ and each probe lives in `dotnet/tools/` alongside the reference generator.
       sink also reopened attributes inside table cells, which cost plain and tables parity on the
       same fixture — so it was reverted and recorded here rather than traded for a hard-dimension
       regression. Plain, json, metadata and tables all match.
+
+      **The two older formats' tables had never run.** No fixture in the corpus has a 5.x or a
+      3.x table, so both paths were unexercised — and 3.x had a real defect: nothing in these
+      files has to turn a table off, it can simply run to the end of the document, and a row
+      never closed is a row the builder never pushes. Every Macintosh table was silently losing
+      its last row. Both are now routed through the same state machine and checked against
+      libwpd on purpose-built documents: a 5.x definition group with two columns and two rows,
+      and a 3.x table function left unterminated. Both match on every dimension, including the
+      3.x last row libwpd keeps and this port was dropping.
 
       **Also deliberately absent**: the Japanese character sets, which need libwpd's
       31,936-entry Shift-JIS table; headers and footers, which libwpd routes through page spans

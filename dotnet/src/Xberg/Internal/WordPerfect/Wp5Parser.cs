@@ -33,8 +33,12 @@ internal static class Wp5Parser
     private const byte TopAttributeOff = 0xC4;
     private const byte TopHeaderFooterGroup = 0xD5;
     private const byte TopFootnoteEndnoteGroup = 0xD6;
+    private const byte TopDefinitionGroup = 0xD2;
     private const byte TopTableEolGroup = 0xDC;
     private const byte TopTableEopGroup = 0xDD;
+
+    /// <summary>The definition group's subgroup that describes a table's columns.</summary>
+    private const byte DefinitionGroupDefineTables = 0x0B;
 
     // Attribute identifiers, shared by the on and off groups.
     private const byte AttributeSuperscript = 0x05;
@@ -203,6 +207,54 @@ internal static class Wp5Parser
     }
 
     /// <summary>
+    /// Read a table definition, which names the table's columns and opens it.
+    /// </summary>
+    /// <remarks>
+    /// 5.x writes the definition twice: the columns as they were, then the columns as they now
+    /// are, with the first set's own column count deciding how far to skip to reach the second.
+    /// Only the count matters here — the widths and alignments are presentation — but it has to
+    /// be the second one, and reaching it means reading the first.
+    /// </remarks>
+    private static void ParseTableDefinition(WpdReader reader, WpdEventSink sink, int contentStart)
+    {
+        reader.Seek(contentStart);
+        reader.Skip(2);
+        int oldColumns = reader.ReadU16();
+        reader.Skip(20 + 5 * oldColumns);
+
+        reader.Skip(2);                                 // position flags, then a reserved byte
+        int columns = reader.ReadU16();
+
+        // 5.x allows no nested table, so a new definition closes whatever was open.
+        sink.EndTable();
+        sink.DefineTable();
+        for (int i = 0; i < Math.Min(columns, MaxTableColumns); i++) sink.DefineTableColumn();
+        sink.StartTable();
+    }
+
+    /// <summary>The most columns a 5.x table definition can describe.</summary>
+    /// <remarks>libwpd refuses a larger count as corruption rather than trusting it.</remarks>
+    private const int MaxTableColumns = 32;
+
+    /// <summary>
+    /// Read a cell, whose spans say whether it is a cell at all.
+    /// </summary>
+    /// <remarks>
+    /// The high bit of the column span marks a grid slot the row above already covers. Read as a
+    /// span it would claim a cell that is not there and push the rest of the row along by one.
+    /// </remarks>
+    private static void ParseTableCell(WpdReader reader, WpdEventSink sink, int contentStart)
+    {
+        reader.Seek(contentStart);
+        reader.Skip(2);                                 // cell flags, then the column number
+        byte spanning = reader.ReadU8();
+        int rowSpan = reader.ReadU8();
+
+        if ((spanning & 0x80) != 0) return;             // bound from above
+        sink.InsertCell(spanning & 0x7F, rowSpan);
+    }
+
+    /// <summary>
     /// Read a variable-length group's header and check that its trailer agrees with it.
     /// </summary>
     /// <returns>The subgroup and total size, or <c>null</c> when the group is inconsistent.</returns>
@@ -245,15 +297,27 @@ internal static class Wp5Parser
                 ParseNote(reader, sink, subGroup, size, depth);
                 break;
 
+            case TopDefinitionGroup:
+                if (subGroup == DefinitionGroupDefineTables)
+                    ParseTableDefinition(reader, sink, start + 3);
+                break;
+
             case TopTableEolGroup:
-                // Subgroup 0 opens a cell at the end of a line; anything else closes the row.
-                sink.Emit(subGroup == 0
-                    ? WpdEvent.Simple(WpdEventKind.CellStart)
-                    : WpdEvent.Simple(WpdEventKind.RowEnd));
+                switch (subGroup)
+                {
+                    case 0x00: ParseTableCell(reader, sink, start + 3); break;
+                    case 0x01: sink.InsertRow(header: false); break;
+                    case 0x02: sink.EndTable(); break;
+                }
                 break;
 
             case TopTableEopGroup:
-                sink.Emit(WpdEvent.Simple(WpdEventKind.RowStart));
+                // A row that runs onto the next page, and the table ending on one.
+                switch (subGroup)
+                {
+                    case 0x01: case 0x03: sink.InsertRow(header: false); break;
+                    case 0x02: sink.EndTable(); break;
+                }
                 break;
         }
 
