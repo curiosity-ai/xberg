@@ -1563,7 +1563,8 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       value a later node reads, and it surfaces as a plausible detection rather than a crash.
       `--check-reuse` runs the graph with reuse on and off and compares every output bitwise —
       RT-DETR's three are identical to the bit — and twelve tests cover the predicate, each of
-      which fails when its condition is removed.
+      which fails when its condition is removed. The whole corpus re-ran unchanged at 2926 of
+      3007, per-format table identical row for row.
 
       Two things bound what is left: `Conv` is 61% of the graph and `MatMul` 14%, and 1,649 of
       the 2,315 nodes take under 10 us each — 0.2% of runtime between them.
