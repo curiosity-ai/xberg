@@ -1708,6 +1708,35 @@ and each probe lives in `dotnet/tools/` alongside the reference generator.
       31,936-entry Shift-JIS table; headers and footers, which libwpd routes through page spans
       rather than the content listener and which no fixture in the corpus exercises.
 
+- [~] **HEIC / HEIF / AVIF** — the container is read; the picture is not decoded. Say plainly
+      what that means: `test.heic`, `test.heif`, `alpha.heif` and `test.avif` now extract, with
+      the dimensions and EXIF the upstream extractor reports, and no pixels.
+
+      The measurement that made this the right shape. Upstream takes the dimensions from the PNG
+      it gets back from libheif — but those are the coded extent with the clean aperture and the
+      rotation applied, which is exactly what the container itself states. Checked against
+      libheif on all four fixtures: 1652×1791, 2048×1440, 256×256, 2048×1440, matching in every
+      case, and `test.heic`'s EXIF block comes out **byte-identical** to the one libheif hands
+      out — 2,326 bytes. `test.heic` is the interesting one: its spatial extent is 1652×1792 and
+      a clean aperture crops one row away, so a reader that ignores the property is a pixel out
+      on precisely the files most likely to be photographs.
+
+      **What decoding would take, and why it is not here.** HEIC carries an HEVC intra picture
+      and AVIF an AV1 one. Decoding either means CABAC or the AV1 symbol decoder, the coding-unit
+      quadtree, thirty-five (HEVC) or sixty-plus (AV1) intra prediction modes, the transform
+      families, deblocking, SAO, and for AV1 also CDEF, loop restoration and film grain — each of
+      the two larger than everything else in this port put together, and each needing to be
+      bit-exact for its output to be worth anything. Upstream does not write that either: it
+      vendors libheif.
+
+      **What that costs, bounded.** The C# image extractor reports metadata only — it has no OCR
+      and attaches no image bytes — so for these four fixtures its output is complete. A caller
+      who wants the pixels, or upstream's rebinding of the document's MIME type to `image/png`
+      after decoding, does not get them. There is no golden for this: the reference generator has
+      never enabled the `images` feature, so every image fixture in the corpus reads
+      "Unsupported format" and the comparison above is against libheif directly, through
+      `pillow-heif`.
+
 ## Excluded (dropped per requirements)
 
 - [-] OCR (Tesseract/Paddle/candle), doc orientation.
