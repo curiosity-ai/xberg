@@ -1822,6 +1822,49 @@ and each probe lives in `dotnet/tools/` alongside the reference generator.
       "Unsupported format" and the comparison above is against libheif directly, through
       `pillow-heif`.
 
+## Speed against the Rust library (measured 2026-08-26)
+
+`dotnet/tools/bench.sh` runs both implementations over the same corpus in one process tree,
+`--format plain`, and compares only files **both** sides extracted — a file one side refuses
+would otherwise quietly reward whichever did less work. 3,003 files compared; 97 the port
+extracts and Rust does not, 4 the other way.
+
+| metric | Rust | C# | C# / Rust |
+|---|---:|---:|---:|
+| total | 258.8 s | 168.1 s | **0.65x** |
+| median | 0.407 ms | 0.192 ms | 0.47x |
+| p90 | 16.7 ms | 13.7 ms | 0.82x |
+| p99 | 370.2 ms | 270.6 ms | 0.73x |
+
+Per-file ratio: median 0.42x, geomean 0.36x, p10 0.06x, p90 1.65x. **The port is faster on
+2,383 of 3,003 files (79.4%).**
+
+**The total is PDF.** 251 s of Rust's 259 s is 388 PDFs, where the port's median is 18.9 ms
+against 33.9 ms — 0.56x. So the headline ratio is essentially the PDF ratio, and everything
+else is rounding.
+
+**It is not faster by doing less.** The two files that dominate the corpus produce *more* text
+from the port than from Rust: the 53 MB Intel manual 12,335,597 characters against 12,269,452
+(+0.5%) in 35.5 s against 72.8 s, and the 35 MB Bayesian book 2,156,892 against 2,128,319
+(+1.3%) in 31.1 s against 37.6 s. Corpus parity independently puts pdf at 380 of 389 on the
+hard dimensions.
+
+**Where the port is slower**: adoc 2.85x, jsonl 2.78x, rst 1.65x, rtf 1.25x, json 1.18x,
+odt 1.05x. The jsonl figure is the 55 MB `parsebench/text_content.jsonl` fixture already
+recorded below as a known slow path.
+
+Three caveats worth carrying:
+
+- The comparison uses the minimum of three timed passes, which favours a runtime with garbage
+  collection. Recomputing on medians gives the same 0.65x and a per-file median of 0.44x
+  against 0.42x, so the choice does not decide anything.
+- The sub-millisecond formats — txt at 0.23x, eml 0.16x, opml 0.03x — are measuring fixed
+  per-call cost, not parsing throughput. Both sides do almost no work on those files, and what
+  the ratio reflects there has not been investigated.
+- Run on a 2.80 GHz Xeon. Every ONNX figure elsewhere in this file was taken on a 2.10 GHz one,
+  because the host changed underneath the session; the two sets of absolute milliseconds are
+  not comparable, though each ratio is internally sound.
+
 ## Excluded (dropped per requirements)
 
 - [-] OCR (Tesseract/Paddle/candle), doc orientation.
