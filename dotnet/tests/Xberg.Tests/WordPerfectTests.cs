@@ -58,20 +58,45 @@ public class WordPerfectTests
         Assert.Equal(WpdFormat.Unknown,
             WordPerfectReader.Detect("Just some ordinary text.\n"u8.ToArray()));
 
+    /// <summary>
+    /// 4.2 is told from Macintosh 1.x by its variable-length groups.
+    /// </summary>
+    /// <remarks>
+    /// The two formats overlap heavily — both classify bytes the same way and both close a group
+    /// with its opening byte — so a fixed-length group alone is ambiguous between them. 0xD1 is
+    /// variable-length in 4.2 and a six-byte fixed group in 1.x, so a short one is 4.2 and only
+    /// 4.2. Macintosh is tested first, matching libwpd, because its length-framed groups are the
+    /// more specific evidence.
+    /// </remarks>
     [Fact]
-    public void DetectsWp42FromItsFunctionGroups()
+    public void DetectsWp42FromItsVariableLengthGroups()
     {
-        // 0xCB is a fixed-length group of 6 bytes, closing with its own opening byte.
-        byte[] document = [(byte)'H', (byte)'i', 0xCB, 0x01, 0x02, 0x03, 0x04, 0xCB];
+        byte[] document = [(byte)'H', (byte)'i', 0xD1, 0x01, 0x02, 0xD1];
         Assert.Equal(WpdFormat.Wp42, WordPerfectReader.Detect(document));
     }
 
     /// <summary>A group that does not close where its size says is not this format.</summary>
     [Fact]
-    public void Wp42RejectsAGroupThatDoesNotClose()
+    public void AGroupThatDoesNotCloseIsNotWordPerfect()
     {
         byte[] document = [(byte)'H', 0xCB, 0x01, 0x02, 0x03, 0x04, 0x00];
         Assert.Equal(WpdFormat.Unknown, WordPerfectReader.Detect(document));
+    }
+
+    /// <summary>
+    /// A Macintosh 1.x variable-length group frames its payload with a repeated big-endian length,
+    /// which is the evidence that separates it from 4.2.
+    /// </summary>
+    [Fact]
+    public void DetectsMac1FromItsLengthFramedGroups()
+    {
+        // 0xC9 is variable-length in both tables; only 1.x expects the length pair.
+        byte[] document =
+        [
+            (byte)'H', (byte)'i',
+            0xC9, 0x00, 0x00, 0x00, 0x02, (byte)'x', (byte)'y', 0x00, 0x00, 0x00, 0x02, 0xC9,
+        ];
+        Assert.Equal(WpdFormat.Wp1, WordPerfectReader.Detect(document));
     }
 
     // ------------------------------------------------------------------ WP4.2 body
@@ -239,15 +264,6 @@ public class WordPerfectTests
     }
 
     // ------------------------------------------------------------------ Unsupported formats
-
-    /// <summary>An unreadable document says which format it is rather than failing vaguely.</summary>
-    [Fact]
-    public void MacFormatsReportThemselvesAsUnsupported()
-    {
-        var error = Assert.Throws<WpdParseException>(
-            () => WordPerfectReader.Parse(Wp5Header(0x02, 0x2c)));
-        Assert.Contains("Wp3", error.Message);
-    }
 
     [Fact]
     public void AnUnrecognisableDocumentIsRefused()

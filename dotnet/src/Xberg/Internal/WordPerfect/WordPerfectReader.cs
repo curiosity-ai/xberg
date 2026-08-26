@@ -19,6 +19,9 @@ internal static class WordPerfectReader
         if (WpdHeader.TryRead(reader) is { } header) return header.Format;
 
         // Formats before 5.0 have no header, so the structure itself has to identify them.
+        // Macintosh 1.x is checked first, matching libwpd: its variable-length groups carry a
+        // repeated length that 4.2's do not, so it is the more specific test of the two.
+        if (Wp1Parser.LooksLikeWp1(bytes)) return WpdFormat.Wp1;
         if (Wp42Parser.LooksLikeWp42(bytes)) return WpdFormat.Wp42;
         return WpdFormat.Unknown;
     }
@@ -30,8 +33,10 @@ internal static class WordPerfectReader
         return Detect(bytes) switch
         {
             WpdFormat.Wp42 => Wp42Parser.Parse(bytes),
+            WpdFormat.Wp1 => Wp1Parser.Parse(bytes),
             WpdFormat.Wp5 => Wp5Parser.Parse(bytes, header!),
             WpdFormat.Wp6 => Wp6Parser.Parse(bytes, header!),
+            WpdFormat.Wp3 => Wp3Parser.Parse(bytes, header!),
             var other => throw new WpdParseException(
                 other == WpdFormat.Unknown
                     ? "Failed to read WordPerfect document: unrecognised format"
