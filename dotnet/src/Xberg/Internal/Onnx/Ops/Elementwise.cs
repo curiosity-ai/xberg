@@ -618,4 +618,22 @@ internal static class Elementwise
 
         return result;
     }
+
+    /// <summary>ONNX <c>Sin</c>.</summary>
+    public static Tensor Sin(Tensor x)
+    {
+        var f = x.AsFloat();
+        var result = Tensor.AllocateFloat(f.Shape);
+        for (int i = 0; i < f.Count; i++) result.Floats[i] = MathF.Sin(f.Floats[i]);
+        return result;
+    }
+
+    /// <summary>ONNX <c>Cos</c>.</summary>
+    public static Tensor Cos(Tensor x)
+    {
+        var f = x.AsFloat();
+        var result = Tensor.AllocateFloat(f.Shape);
+        for (int i = 0; i < f.Count; i++) result.Floats[i] = MathF.Cos(f.Floats[i]);
+        return result;
+    }
 }

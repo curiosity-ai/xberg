@@ -264,6 +264,31 @@ internal sealed class OnnxSession
             }
 
             case "Floor": return [Elementwise.Floor(Required(node, env, 0))];
+            case "Sin": return [Elementwise.Sin(Required(node, env, 0))];
+            case "Cos": return [Elementwise.Cos(Required(node, env, 0))];
+
+            case "CumSum":
+                return [Reductions.CumSum(
+                    Required(node, env, 0), (int)Required(node, env, 1).GetLong(0),
+                    node.AttrInt("exclusive", 0) != 0, node.AttrInt("reverse", 0) != 0)];
+
+            case "DynamicQuantizeLinear":
+            {
+                var (quantized, scale, zeroPoint) = Quantized.DynamicQuantizeLinear(Required(node, env, 0));
+                return [quantized, scale, zeroPoint];
+            }
+
+            case "MatMulInteger":
+                return [Quantized.MatMulInteger(
+                    Required(node, env, 0), Required(node, env, 1),
+                    Optional(node, env, 2), Optional(node, env, 3))];
+
+            case "ConvInteger":
+                return [Quantized.ConvInteger(
+                    Required(node, env, 0), Required(node, env, 1),
+                    Optional(node, env, 2), Optional(node, env, 3),
+                    node.AttrInts("strides"), node.AttrInts("pads"), node.AttrInts("dilations"),
+                    node.AttrInt("group", 1), node.AttrString("auto_pad", "NOTSET"))];
 
             case "Greater":
             case "GreaterOrEqual":

@@ -89,6 +89,54 @@ if (args.Length >= 2 && args[0] == "--dump-qr")
     return 0;
 }
 
+// TATR probe mode: `--dump-tatr <model.onnx> <image>...` runs the ported table-structure model
+// over each image and prints its detections plus the reconstructed grid shape, matching
+// tools/tatr-probe so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-tatr")
+{
+    var tatr = Xberg.Internal.Layout.TatrModel.FromFile(args[1]);
+    var pages = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var recognized = tatr.Recognize(image);
+
+        static System.Text.Json.Nodes.JsonArray Render(
+            IEnumerable<Xberg.Internal.Layout.TatrDetection> detections)
+        {
+            var array = new System.Text.Json.Nodes.JsonArray();
+            foreach (var d in detections)
+                array.Add(new System.Text.Json.Nodes.JsonObject
+                {
+                    ["class_name"] = d.ClassName.ToString(),
+                    ["confidence"] = d.Confidence,
+                    ["bbox"] = new System.Text.Json.Nodes.JsonArray(d.X1, d.Y1, d.X2, d.Y2),
+                });
+            return array;
+        }
+
+        var (grid, structure) = Xberg.Internal.Layout.TatrModel.BuildCellGridWithStructure(
+            recognized, recognized.TableBox);
+        pages.Add(new System.Text.Json.Nodes.JsonObject
+        {
+            ["file"] = args[i],
+            ["rows"] = Render(recognized.Rows),
+            ["columns"] = Render(recognized.Columns),
+            ["headers"] = Render(recognized.Headers),
+            ["spanning"] = Render(recognized.Spanning),
+            ["table_bbox"] = recognized.TableBox is { } tb
+                ? new System.Text.Json.Nodes.JsonArray(tb[0], tb[1], tb[2], tb[3])
+                : null,
+            ["grid_rows"] = grid.Count,
+            ["grid_cols"] = grid.Count > 0 ? grid[0].Count : 0,
+            ["header_row_count"] = structure.HeaderRowCount,
+            ["spans"] = structure.Spans.Count,
+        });
+    }
+    Console.Out.Write(pages.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // ONNX op census: `--onnx-ops <model.onnx>` lists the distinct operators a graph uses and how
 // many nodes use each, so a model that needs a kernel the port lacks names all of them at once
 // rather than one exception per run.

@@ -277,4 +277,52 @@ internal static class Reductions
         }
         return result;
     }
+
+    /// <summary>
+    /// ONNX <c>CumSum</c>: running sum along <paramref name="axis"/>.
+    /// </summary>
+    /// <remarks>
+    /// <c>exclusive</c> shifts each output one step along the axis, so element <c>i</c> holds the
+    /// sum of everything strictly before it; <c>reverse</c> runs the scan from the far end.
+    /// </remarks>
+    public static Tensor CumSum(Tensor x, int axis, bool exclusive, bool reverse)
+    {
+        var f = x.AsFloat();
+        int rank = f.Shape.Length;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw new InvalidDataException($"CumSum: axis {axis} is out of range for rank {rank}");
+
+        int length = f.Shape[axis];
+        int inner = 1;
+        for (int d = axis + 1; d < rank; d++) inner *= f.Shape[d];
+        int outer = f.Count / Math.Max(length * inner, 1);
+
+        var result = Tensor.AllocateFloat(f.Shape);
+        for (int o = 0; o < outer; o++)
+        {
+            for (int i = 0; i < inner; i++)
+            {
+                int stride = inner;
+                int start = o * length * inner + i;
+                double running = 0.0;
+                for (int step = 0; step < length; step++)
+                {
+                    int position = reverse ? length - 1 - step : step;
+                    int offset = start + position * stride;
+                    if (exclusive)
+                    {
+                        result.Floats[offset] = (float)running;
+                        running += f.Floats[offset];
+                    }
+                    else
+                    {
+                        running += f.Floats[offset];
+                        result.Floats[offset] = (float)running;
+                    }
+                }
+            }
+        }
+        return result;
+    }
 }
