@@ -291,7 +291,6 @@ public sealed class DocxExtractor : IExtractor
     }
 
     private sealed record BoundaryDto(int ByteStart, int ByteEnd, uint PageNumber);
-    private sealed record PageInfoDto(uint Number);
 
     /// <summary>Ports `Document::to_plain_text` (used for page-boundary computation).</summary>
     private static string BuildPlainText(DocxDocument doc)

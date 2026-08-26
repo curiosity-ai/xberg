@@ -45,6 +45,45 @@ if (args.Length >= 2 && args[0] == "--dump-metadata")
     return 0;
 }
 
+// DocTags probe mode: `--dump-doctags <file>...` renders each file to DocTags and then feeds
+// that stream back through the DocTags extractor, printing the same JSON shape as
+// `tools/doctags-probe` so the two can be diffed. Both stages are printed, so a divergence pins
+// to the renderer or to the parser.
+if (args.Length >= 2 && args[0] == "--dump-doctags")
+{
+    var doctags = new System.Text.Json.Nodes.JsonObject();
+    var dtExtractor = new Extractor();
+    string RenderDocTags(ExtractInput input)
+    {
+        var cfg = new ExtractionConfig { OutputFormat = OutputFormat.DocTags };
+        try
+        {
+            var r = dtExtractor.Extract(input, cfg);
+            if (r.Errors.Count > 0) return $"<<error: {r.Errors[0].Message}>>";
+            return r.Results.FirstOrDefault()?.Content ?? "";
+        }
+        catch (Exception e) { return $"<<error: {e.Message}>>"; }
+    }
+    for (int i = 1; i < args.Length; i++)
+    {
+        // A real Docling stream is fed in as DocTags bytes rather than by extension: the corpus
+        // names them `*.doctags.txt`, which resolves as plain text, so the extractor would never
+        // otherwise see one.
+        string first = args[i].EndsWith(".doctags.txt", StringComparison.Ordinal)
+            ? RenderDocTags(ExtractInput.FromBytes(File.ReadAllBytes(args[i]), "text/vnd.docling.doctags"))
+            : RenderDocTags(ExtractInput.FromUri(args[i]));
+        string second = RenderDocTags(ExtractInput.FromBytes(
+            System.Text.Encoding.UTF8.GetBytes(first), "text/vnd.docling.doctags"));
+        doctags[args[i]] = new System.Text.Json.Nodes.JsonObject
+        {
+            ["render"] = first,
+            ["roundtrip"] = second,
+        };
+    }
+    Console.Out.Write(doctags.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // Styled-HTML probe mode: `--dump-styled-html <file>...` renders each file through
 // `StyledHtmlRenderer` under every configuration `tools/htmlstyled-probe` covers, printing the
 // same JSON shape so the two can be diffed byte for byte.

@@ -41,6 +41,20 @@ public sealed class PageContent
     public string? SheetName { get; set; }
 }
 
+/// <summary>
+/// One entry of <see cref="PageStructure.Pages"/>.
+/// </summary>
+/// <remarks>
+/// Upstream's <c>PageInfo</c> marks <c>dimensions</c> <c>#[serde(skip)]</c> — it never reaches
+/// the wire — but the DocTags renderer reads it back to place <c>&lt;loc_*&gt;</c> tokens, so it
+/// travels here as an ignored property rather than not at all.
+/// </remarks>
+public sealed record PageInfoDto(uint Number)
+{
+    [JsonIgnore]
+    public (double Width, double Height)? Dimensions { get; init; }
+}
+
 /// <summary>Document-level page structure summary.</summary>
 public sealed class PageStructure
 {

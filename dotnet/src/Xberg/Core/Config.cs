@@ -12,7 +12,7 @@ namespace Xberg.Core;
 [JsonConverter(typeof(OutputFormatConverter))]
 public readonly struct OutputFormat : IEquatable<OutputFormat>
 {
-    public enum Kind { Plain, Markdown, Djot, Html, Json, Structured, Custom }
+    public enum Kind { Plain, Markdown, Djot, Html, Json, Structured, DocTags, Custom }
 
     public Kind Which { get; }
     public string? CustomName { get; }
@@ -29,6 +29,7 @@ public readonly struct OutputFormat : IEquatable<OutputFormat>
     public static readonly OutputFormat Html = new(Kind.Html);
     public static readonly OutputFormat Json = new(Kind.Json);
     public static readonly OutputFormat Structured = new(Kind.Structured);
+    public static readonly OutputFormat DocTags = new(Kind.DocTags);
     public static OutputFormat Custom(string name) => new(Kind.Custom, name);
 
     /// <summary>Parse from a string (never fails; unknown → Custom of the lowercased string).</summary>
@@ -43,6 +44,7 @@ public readonly struct OutputFormat : IEquatable<OutputFormat>
             "html" => Html,
             "json" => Json,
             "structured" or "structured-ocr" => Structured,
+            "doctags" => DocTags,
             _ => Custom(lower),
         };
     }
@@ -55,6 +57,7 @@ public readonly struct OutputFormat : IEquatable<OutputFormat>
         Kind.Html => "html",
         Kind.Json => "json",
         Kind.Structured => "structured",
+        Kind.DocTags => "doctags",
         Kind.Custom => CustomName ?? "",
         _ => "plain",
     };

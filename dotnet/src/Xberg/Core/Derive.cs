@@ -82,6 +82,8 @@ public static class Derive
                     : new StyledHtmlRenderer(htmlOutput).Render(doc);
             case OutputFormat.Kind.Json:
                 return JsonRenderer.Render(doc);
+            case OutputFormat.Kind.DocTags:
+                return DocTagsRenderer.Render(doc);
             default:
                 return null; // Custom renderer registry — deferred.
         }

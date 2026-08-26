@@ -475,6 +475,10 @@ public static class Mime
         void Add(string mime, params string[] exts) { foreach (var e in exts) m[e] = mime; }
 
         Add("text/plain", "txt");
+        // Extension only, as upstream has it. The corpus's DocTags streams are named
+        // `*.doctags.txt` and so resolve as plain text, which is why none of them reaches the
+        // DocTags extractor and why adding a content sniff here would move them.
+        Add(Xberg.Internal.DocTags.DocTagsMime.MimeType, "doctags");
         Add("text/markdown", "md", "markdown");
         Add("text/x-commonmark", "commonmark");
         Add("text/x-quarto", "qmd");
