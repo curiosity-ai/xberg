@@ -263,6 +263,60 @@ internal sealed class OnnxSession
                 return [accumulator];
             }
 
+            case "Floor": return [Elementwise.Floor(Required(node, env, 0))];
+
+            case "Greater":
+            case "GreaterOrEqual":
+            case "Less":
+            case "LessOrEqual":
+            case "Equal":
+            {
+                var kind = node.OpType switch
+                {
+                    "Greater" => CompareKind.Greater,
+                    "GreaterOrEqual" => CompareKind.GreaterOrEqual,
+                    "Less" => CompareKind.Less,
+                    "LessOrEqual" => CompareKind.LessOrEqual,
+                    _ => CompareKind.Equal,
+                };
+                return [Elementwise.Compare(Required(node, env, 0), Required(node, env, 1), kind)];
+            }
+
+            case "Mod":
+                return [Elementwise.Mod(
+                    Required(node, env, 0), Required(node, env, 1), node.AttrInt("fmod", 0) != 0)];
+
+            case "GatherND":
+                return [Indexing.GatherND(
+                    Required(node, env, 0), Required(node, env, 1), (int)node.AttrInt("batch_dims", 0))];
+
+            case "ScatterND":
+                return [Indexing.ScatterND(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2))];
+
+            case "EyeLike":
+            {
+                var dtype = node.Attr("dtype");
+                return [Indexing.EyeLike(
+                    Required(node, env, 0), (int)node.AttrInt("k", 0),
+                    dtype is null ? null : (ElementType)dtype.Int)];
+            }
+
+            case "Einsum":
+            {
+                var operands = new List<Tensor>(node.Inputs.Length);
+                for (int i = 0; i < node.Inputs.Length; i++) operands.Add(Required(node, env, i));
+                return [EinsumKernel.Apply(node.AttrString("equation", ""), operands)];
+            }
+
+            case "Range":
+                return [Shapes.Range(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2))];
+
+            case "Where":
+                return [Elementwise.Where(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2))];
+
             case "Relu": return [Elementwise.Relu(Required(node, env, 0))];
             case "Sigmoid": return [Elementwise.Sigmoid(Required(node, env, 0))];
             case "Sqrt": return [Elementwise.Sqrt(Required(node, env, 0))];

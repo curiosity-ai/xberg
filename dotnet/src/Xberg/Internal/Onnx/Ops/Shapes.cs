@@ -679,4 +679,34 @@ internal static class Shapes
         }
         return results;
     }
+
+    /// <summary>
+    /// ONNX <c>Range</c>: the 1-D sequence <c>start, start+delta, ...</c> stopping before
+    /// <c>limit</c>.
+    /// </summary>
+    /// <remarks>
+    /// The element count is <c>ceil((limit - start) / delta)</c> clamped at zero, which is what
+    /// makes an empty range — a delta pointing away from the limit — produce a legal zero-length
+    /// tensor rather than a negative allocation.
+    /// </remarks>
+    public static Tensor Range(Tensor start, Tensor limit, Tensor delta)
+    {
+        if (start.IsFloat || limit.IsFloat || delta.IsFloat)
+        {
+            float from = start.GetFloat(0), to = limit.GetFloat(0), step = delta.GetFloat(0);
+            int count = step == 0f ? 0 : Math.Max((int)MathF.Ceiling((to - from) / step), 0);
+            var result = Tensor.AllocateFloat(count);
+            for (int i = 0; i < count; i++) result.Floats[i] = from + step * i;
+            return result;
+        }
+        else
+        {
+            long from = start.GetLong(0), to = limit.GetLong(0), step = delta.GetLong(0);
+            long span = step == 0 ? 0 : (to - from + step - Math.Sign(step)) / step;
+            int count = (int)Math.Max(span, 0);
+            var result = Tensor.AllocateLong(start.Type, count);
+            for (int i = 0; i < count; i++) result.Longs[i] = from + step * i;
+            return result;
+        }
+    }
 }

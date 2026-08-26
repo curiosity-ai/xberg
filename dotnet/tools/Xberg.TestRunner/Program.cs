@@ -89,6 +89,43 @@ if (args.Length >= 2 && args[0] == "--dump-qr")
     return 0;
 }
 
+// ONNX op census: `--onnx-ops <model.onnx>` lists the distinct operators a graph uses and how
+// many nodes use each, so a model that needs a kernel the port lacks names all of them at once
+// rather than one exception per run.
+if (args.Length >= 2 && args[0] == "--onnx-ops")
+{
+    var model = Xberg.Internal.Onnx.OnnxModel.Load(args[1]);
+    var census = new SortedDictionary<string, int>(StringComparer.Ordinal);
+    foreach (var node in model.Nodes)
+        census[node.OpType] = census.TryGetValue(node.OpType, out int n) ? n + 1 : 1;
+    foreach (var (op, count) in census) Console.WriteLine($"{count,6}  {op}");
+    Console.WriteLine($"distinct={census.Count} nodes={model.Nodes.Length}");
+    return 0;
+}
+
+// PP-DocLayout-V3 probe mode: `--dump-ppdoclayout <model.onnx> <image>...` runs the ported model
+// and prints the same JSON shape as tools/ppdoclayout-probe so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-ppdoclayout")
+{
+    var layoutModel = Xberg.Internal.Layout.PpDocLayoutV3Model.FromFile(args[1]);
+    var pages = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var found = new System.Text.Json.Nodes.JsonArray();
+        foreach (var d in layoutModel.Detect(image))
+            found.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["class_name"] = Xberg.Internal.Layout.LayoutClassExtensions.WireName(d.ClassName),
+                ["confidence"] = d.Confidence,
+                ["bbox"] = new System.Text.Json.Nodes.JsonArray(d.Box.X1, d.Box.Y1, d.Box.X2, d.Box.Y2),
+            });
+        pages.Add(new System.Text.Json.Nodes.JsonObject { ["file"] = args[i], ["detections"] = found });
+    }
+    Console.Out.Write(pages.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // Table-classifier probe mode: `--dump-tablecls <model.onnx> <image>...` classifies each image
 // wired/wireless through the ported PP-LCNet path, printing the same JSON shape as
 // tools/tablecls-probe so the two can be diffed.

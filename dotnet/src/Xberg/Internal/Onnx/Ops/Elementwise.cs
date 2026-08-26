@@ -17,6 +17,8 @@ internal enum BinaryKind { Add, Sub, Mul, Div, Pow, Min, Max }
 /// running CPU offers.
 /// </para>
 /// </summary>
+internal enum CompareKind { Greater, GreaterOrEqual, Less, LessOrEqual, Equal }
+
 internal static class Elementwise
 {
     public static Tensor Binary(Tensor a, Tensor b, BinaryKind kind)
@@ -426,5 +428,194 @@ internal static class Elementwise
                 longs[i] = to == ElementType.Bool ? (x.Longs[i] != 0 ? 1 : 0) : x.Longs[i];
         }
         return Tensor.FromLongs(longs, to, x.Shape);
+    }
+
+    /// <summary>
+    /// ONNX <c>Where</c>: elementwise select between <paramref name="x"/> and
+    /// <paramref name="y"/> by a boolean <paramref name="condition"/>, broadcasting all three.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three-operand rather than two, so it cannot reuse the pairwise broadcast plan: the result
+    /// shape is the broadcast of all three, and each operand is read through its own strides,
+    /// where a broadcast dimension has stride 0 and re-reads the same element.
+    /// </para>
+    /// <para>
+    /// The branches keep their own storage class. Integral <c>x</c> and <c>y</c> stay integral,
+    /// because <c>Where</c> appears in exported graphs selecting between shape vectors, and a
+    /// round trip through float would lose exactness on a large dimension.
+    /// </para>
+    /// </remarks>
+    public static Tensor Where(Tensor condition, Tensor x, Tensor y)
+    {
+        var shape = Broadcast.ResultShape(Broadcast.ResultShape(condition.Shape, x.Shape), y.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+
+        var strideCondition = Broadcast.StridesFor(condition.Shape, rank);
+        var strideX = Broadcast.StridesFor(x.Shape, rank);
+        var strideY = Broadcast.StridesFor(y.Shape, rank);
+
+        bool integral = !x.IsFloat && !y.IsFloat;
+        var result = integral
+            ? Tensor.AllocateLong(x.Type, shape)
+            : Tensor.AllocateFloat(shape);
+
+        var index = new int[rank];
+        int offsetCondition = 0, offsetX = 0, offsetY = 0;
+
+        for (int flat = 0; flat < total; flat++)
+        {
+            bool take = condition.GetLong(offsetCondition) != 0;
+            if (integral) result.Longs[flat] = take ? x.GetLong(offsetX) : y.GetLong(offsetY);
+            else result.Floats[flat] = take ? x.GetFloat(offsetX) : y.GetFloat(offsetY);
+
+            // Odometer step, carrying from the innermost dimension outwards.
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetCondition += strideCondition[d];
+                offsetX += strideX[d];
+                offsetY += strideY[d];
+                if (index[d] < shape[d]) break;
+                offsetCondition -= strideCondition[d] * index[d];
+                offsetX -= strideX[d] * index[d];
+                offsetY -= strideY[d] * index[d];
+                index[d] = 0;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>ONNX <c>Floor</c>: round each element toward negative infinity.</summary>
+    public static Tensor Floor(Tensor x)
+    {
+        // An integral tensor is already floored, and round-tripping a large int64 through float
+        // would lose exactness, so it passes through unchanged.
+        if (!x.IsFloat) return x;
+        var f = x.AsFloat();
+        var result = Tensor.AllocateFloat(f.Shape);
+        TensorPrimitives.Floor(f.Floats, result.Floats);
+        return result;
+    }
+
+    /// <summary>
+    /// ONNX <c>Greater</c>, <c>GreaterOrEqual</c>, <c>Less</c>, <c>LessOrEqual</c> and
+    /// <c>Equal</c>: elementwise comparison producing a boolean tensor.
+    /// </summary>
+    /// <remarks>
+    /// Integral operands compare as integers rather than through float, so two int64 values that
+    /// differ only beyond float's 24-bit mantissa still compare as unequal.
+    /// </remarks>
+    public static Tensor Compare(Tensor a, Tensor b, CompareKind kind)
+    {
+        var shape = Broadcast.ResultShape(a.Shape, b.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+        var strideA = Broadcast.StridesFor(a.Shape, rank);
+        var strideB = Broadcast.StridesFor(b.Shape, rank);
+        var result = Tensor.AllocateLong(ElementType.Bool, shape);
+
+        bool integral = !a.IsFloat && !b.IsFloat;
+        var index = new int[rank];
+        int offsetA = 0, offsetB = 0;
+
+        for (int flat = 0; flat < total; flat++)
+        {
+            bool value;
+            if (integral)
+            {
+                long left = a.GetLong(offsetA), right = b.GetLong(offsetB);
+                value = kind switch
+                {
+                    CompareKind.Greater => left > right,
+                    CompareKind.GreaterOrEqual => left >= right,
+                    CompareKind.Less => left < right,
+                    CompareKind.LessOrEqual => left <= right,
+                    _ => left == right,
+                };
+            }
+            else
+            {
+                float left = a.GetFloat(offsetA), right = b.GetFloat(offsetB);
+                value = kind switch
+                {
+                    CompareKind.Greater => left > right,
+                    CompareKind.GreaterOrEqual => left >= right,
+                    CompareKind.Less => left < right,
+                    CompareKind.LessOrEqual => left <= right,
+                    _ => left == right,
+                };
+            }
+            result.Longs[flat] = value ? 1 : 0;
+
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetA += strideA[d];
+                offsetB += strideB[d];
+                if (index[d] < shape[d]) break;
+                offsetA -= strideA[d] * index[d];
+                offsetB -= strideB[d] * index[d];
+                index[d] = 0;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// ONNX <c>Mod</c>: remainder, either C-style (<c>fmod</c>) or Python-style.
+    /// </summary>
+    /// <remarks>
+    /// The two differ in sign for a negative operand: <c>fmod</c> takes the sign of the dividend
+    /// and the default integer form takes the sign of the divisor, so the attribute is not
+    /// cosmetic.
+    /// </remarks>
+    public static Tensor Mod(Tensor a, Tensor b, bool fmod)
+    {
+        var shape = Broadcast.ResultShape(a.Shape, b.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+        var strideA = Broadcast.StridesFor(a.Shape, rank);
+        var strideB = Broadcast.StridesFor(b.Shape, rank);
+
+        bool integral = !a.IsFloat && !b.IsFloat;
+        var result = integral ? Tensor.AllocateLong(a.Type, shape) : Tensor.AllocateFloat(shape);
+
+        var index = new int[rank];
+        int offsetA = 0, offsetB = 0;
+
+        for (int flat = 0; flat < total; flat++)
+        {
+            if (integral)
+            {
+                long left = a.GetLong(offsetA), right = b.GetLong(offsetB);
+                long remainder = right == 0 ? 0 : left % right;
+                if (!fmod && remainder != 0 && (remainder < 0) != (right < 0)) remainder += right;
+                result.Longs[flat] = remainder;
+            }
+            else
+            {
+                float left = a.GetFloat(offsetA), right = b.GetFloat(offsetB);
+                float remainder = left - right * MathF.Truncate(left / right);
+                if (!fmod && remainder != 0f && (remainder < 0f) != (right < 0f)) remainder += right;
+                result.Floats[flat] = remainder;
+            }
+
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetA += strideA[d];
+                offsetB += strideB[d];
+                if (index[d] < shape[d]) break;
+                offsetA -= strideA[d] * index[d];
+                offsetB -= strideB[d] * index[d];
+                index[d] = 0;
+            }
+        }
+
+        return result;
     }
 }
