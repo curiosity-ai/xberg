@@ -89,6 +89,38 @@ if (args.Length >= 2 && args[0] == "--dump-qr")
     return 0;
 }
 
+// WordPerfect probe mode: `--dump-wpd <file>...` parses each document with the managed
+// WordPerfect reader and prints the event stream plus the plain text it renders to, so both can
+// be diffed against what libwpd produced.
+if (args.Length >= 2 && args[0] == "--dump-wpd")
+{
+    var documents = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 1; i < args.Length; i++)
+    {
+        var entry = new System.Text.Json.Nodes.JsonObject { ["file"] = args[i] };
+        try
+        {
+            var parsed = Xberg.Internal.WordPerfect.WordPerfectReader.Parse(File.ReadAllBytes(args[i]));
+            var events = new System.Text.Json.Nodes.JsonArray();
+            foreach (var e in parsed.Events)
+                events.Add(e.Kind == Xberg.Internal.WordPerfect.WpdEventKind.Text
+                    ? $"Text:{e.Text}"
+                    : e.Kind.ToString());
+            entry["format"] = Xberg.Internal.WordPerfect.WordPerfectReader.Detect(
+                File.ReadAllBytes(args[i])).ToString();
+            entry["events"] = events;
+            entry["plain"] = Xberg.Internal.WordPerfect.WordPerfectReader.RenderPlain(parsed);
+        }
+        catch (Exception e)
+        {
+            entry["error"] = e.Message;
+        }
+        documents.Add(entry);
+    }
+    Console.Out.Write(documents.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // SLANeXt probe mode: `--dump-slanet <model.onnx> <image>...` runs the ported table-structure
 // model and prints its decoded token stream, grid shape and cell boxes.
 if (args.Length >= 3 && args[0] == "--dump-slanet")
