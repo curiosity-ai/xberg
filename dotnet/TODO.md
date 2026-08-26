@@ -44,6 +44,11 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > | catastrophes | 0 | 0 | 0 |
 > | content losses | 3 (html) | 3 (html) | 2 (html) |
 >
+> Re-run whole-corpus after this session's work: **2926 of 3007, unchanged**. The only line
+> that moved is "rust failed, C# produced output", 78 to 82 — the four HEIF-family fixtures the
+> reference cannot open and this port now reads. They are not comparable, so they neither help
+> nor hurt the figure above; the per-format table is identical row for row.
+>
 > **Two formats added since sit outside that run.** WordPerfect's fixtures live in the upstream
 > `wordperfect` corpus rather than `test_documents`, and its goldens need
 > `xberg-reference-gen --features wordperfect` (a C++ toolchain and vendored boost); against
