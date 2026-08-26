@@ -510,6 +510,7 @@ public static class Mime
         Add("application/vnd.oasis.opendocument.presentation", "odp");
         Add("application/x-dbf", "dbf");
         Add("application/x-hwp", "hwp");
+        Add("application/vnd.wordperfect", "wpd", "wp", "wp5", "wp6");
         Add("application/haansofthwpx", "hwpx");
         Add("image/bmp", "bmp");
         Add("image/gif", "gif");
