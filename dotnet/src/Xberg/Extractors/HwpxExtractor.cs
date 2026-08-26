@@ -20,8 +20,25 @@ public sealed class HwpxExtractor : IExtractor
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
+        var limits = config.SecurityLimits ?? new SecurityLimits();
+        // The declared file size is refused before the zip is even opened: a container that
+        // large has nothing legitimate to say and reading its directory is work already done
+        // on an attacker's behalf.
+        if (content.Length > limits.MaxArchiveSize)
+            throw new ValidationException(
+                $"HWPX file exceeds size limit ({content.Length} > {limits.MaxArchiveSize} bytes)");
+
         using var stream = new MemoryStream(content.ToArray(), writable: false);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+        ZipArchive archive;
+        try
+        {
+            archive = ZipBombValidator.OpenValidated(stream, limits);
+        }
+        catch (Xberg.Core.SecurityException e)
+        {
+            throw new ValidationException(e.Message);
+        }
+        using var _archive = archive;
 
         var builder = new InternalDocumentBuilder("hwpx");
         builder.SetMimeType(mimeType);

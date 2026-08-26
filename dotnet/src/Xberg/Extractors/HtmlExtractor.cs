@@ -38,7 +38,7 @@ public sealed class HtmlExtractor : IExtractor
         // walk collects is the same either way, so only the fallback text changes.
         bool plainText = config.OutputFormat.Which == OutputFormat.Kind.Plain;
         string contentText = HtmlToMarkdown.ConvertWithStructure(html, plainText, out var structure);
-        var doc = MapStructure(structure, contentText);
+        var doc = MapStructure(structure, contentText, config.SecurityLimits);
 
         // Upstream normalizes the input once, before anything reads it, so the metadata collector
         // — which runs inside its conversion — never sees a carriage return. This port collects
@@ -201,13 +201,15 @@ public sealed class HtmlExtractor : IExtractor
     /// one paragraph when the structure came back empty — which is what upstream does for a page
     /// with content but no recognised blocks.
     /// </summary>
-    private static InternalDocument MapStructure(HtmlStructureCollector structure, string content)
+    private static InternalDocument MapStructure(
+        HtmlStructureCollector structure, string content, SecurityLimits? limits)
     {
+        var budget = new SecurityBudget(limits ?? new SecurityLimits());
         var builder = new InternalDocumentBuilder("html");
         var roots = new List<int>();
         for (int i = 0; i < structure.Nodes.Count; i++)
             if (structure.Nodes[i].Parent < 0) roots.Add(i);
-        WalkStructure(structure, roots, builder);
+        WalkStructure(structure, roots, builder, budget);
         var doc = builder.Build();
 
         // Upstream pushes the conversion text verbatim, trailing newline and all — the html and
@@ -221,39 +223,54 @@ public sealed class HtmlExtractor : IExtractor
         return doc;
     }
 
-    private static void WalkStructure(HtmlStructureCollector s, List<int> indices, InternalDocumentBuilder b)
+    private static void WalkStructure(
+        HtmlStructureCollector s, List<int> indices, InternalDocumentBuilder b, SecurityBudget budget)
     {
         foreach (int idx in indices)
         {
+            budget.Step();
             var node = s.Nodes[idx];
             switch (node.Kind)
             {
                 case StructureKind.Group:
+                    budget.Enter();
                     b.PushGroupStart(node.Label, null);
-                    WalkStructure(s, node.Children, b);
+                    WalkStructure(s, node.Children, b, budget);
                     b.PushGroupEnd();
+                    budget.Leave();
                     break;
                 case StructureKind.Heading:
+                    budget.AccountText(Encoding.UTF8.GetByteCount(node.Text));
                     b.PushHeading(node.Level, node.Text, null, null);
                     break;
                 case StructureKind.Paragraph:
+                    budget.AccountText(Encoding.UTF8.GetByteCount(node.Text));
                     b.PushParagraph(node.Text, new(), null, null);
                     break;
                 case StructureKind.List:
+                    budget.Enter();
                     b.PushList(node.Ordered);
-                    WalkStructure(s, node.Children, b);
+                    WalkStructure(s, node.Children, b, budget);
                     b.EndList();
+                    budget.Leave();
                     break;
                 case StructureKind.ListItem:
                 {
                     bool ordered = node.Parent >= 0
                         && s.Nodes[node.Parent] is { Kind: StructureKind.List, Ordered: true };
+                    budget.AccountText(Encoding.UTF8.GetByteCount(node.Text));
                     b.PushListItem(node.Text, ordered, new(), null, null);
-                    WalkStructure(s, node.Children, b);
+                    WalkStructure(s, node.Children, b, budget);
                     break;
                 }
                 case StructureKind.Table:
-                    if (node.Cells is { Count: > 0 }) b.PushTableFromCells(node.Cells, null, null);
+                    if (node.Cells is { Count: > 0 })
+                    {
+                        long cellCount = 0;
+                        foreach (var row in node.Cells) cellCount += row.Count;
+                        budget.AddCells(cellCount);
+                        b.PushTableFromCells(node.Cells, null, null);
+                    }
                     break;
                 case StructureKind.Image:
                 {
@@ -263,6 +280,7 @@ public sealed class HtmlExtractor : IExtractor
                         string display = node.Src is { } src
                             ? (text.Length == 0 ? $"![]({src})" : $"![{text}]({src})")
                             : text;
+                        budget.AccountText(Encoding.UTF8.GetByteCount(display));
                         b.PushParagraph(display, new(), null, null);
                     }
                     if (node.Src is { Length: > 0 } imageSrc)

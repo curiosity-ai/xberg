@@ -1,5 +1,5 @@
 // Ported from Rust `crates/xberg/src/extractors/odt.rs` (OdtExtractor + extract_content).
-// SecurityBudget calls are omitted; tracked-changes/revisions are omitted (the C# port's
+// Tracked-changes/revisions are omitted (the C# port's
 // InternalDocument.Revisions is [JsonIgnore]); image_kind::classify is skipped.
 
 using System.IO.Compression;
@@ -28,7 +28,7 @@ public sealed class OdtExtractor : IExtractor
         using (var archiveStream = new MemoryStream(bytes, writable: false))
         using (var archive = new ZipArchive(archiveStream, ZipArchiveMode.Read))
         {
-            doc = OdfContentParser.BuildInternalDocument(archive);
+            doc = OdfContentParser.BuildInternalDocument(archive, config.SecurityLimits);
         }
         doc.MimeType = mimeType;
 

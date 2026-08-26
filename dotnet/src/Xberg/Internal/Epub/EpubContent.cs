@@ -1,6 +1,7 @@
 // Ported from crates/xberg/src/extractors/epub/content.rs
 // EPUB body-document reading, XHTML sanitisation and plain-text extraction.
-// The SecurityBudget-gated variants are intentionally omitted (see PORT notes in EpubExtractor.cs).
+// The budget-gated text walk lives in EpubExtractor, which charges each spine document before
+// handing it here; these helpers stay budget-free so both callers share one implementation.
 
 using System.IO.Compression;
 using System.Text;

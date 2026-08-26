@@ -57,14 +57,18 @@ if (args.Length >= 2 && args[0] == "--dump-tables")
 var opts = ParseArgs(args);
 if (opts is null) return 2;
 
+// Goldens live next to their fixtures by default. `--goldens <dir>` reads them from a
+// mirror of the fixture tree instead, which is how one corpus carries several golden sets —
+// one per xberg feature configuration — without either overwriting the other.
+var goldenRoot = opts.GoldenRoot ?? opts.Root;
 var goldenFiles = Directory
-    .EnumerateFiles(opts.Root, "*-results-rust.json", SearchOption.AllDirectories)
+    .EnumerateFiles(goldenRoot, "*-results-rust.json", SearchOption.AllDirectories)
     .OrderBy(p => p, StringComparer.Ordinal)
     .ToList();
 
 if (goldenFiles.Count == 0)
 {
-    Console.Error.WriteLine($"No *-results-rust.json golden files under {opts.Root}");
+    Console.Error.WriteLine($"No *-results-rust.json golden files under {goldenRoot}");
     return 2;
 }
 
@@ -77,8 +81,11 @@ var clusters = new Dictionary<string, (int Count, string Rel, string Want, strin
 
 foreach (var goldenPath in goldenFiles)
 {
-    var sourcePath = goldenPath[..^"-results-rust.json".Length];
-    var rel = Path.GetRelativePath(opts.Root, sourcePath).Replace('\\', '/');
+    var goldenStem = goldenPath[..^"-results-rust.json".Length];
+    // With `--goldens`, the golden sits at the fixture's relative position under the golden
+    // root; the fixture itself is still under `--root`.
+    var rel = Path.GetRelativePath(goldenRoot, goldenStem).Replace('\\', '/');
+    var sourcePath = opts.GoldenRoot is null ? goldenStem : Path.Combine(opts.Root, rel);
     var ext = Path.GetExtension(sourcePath).TrimStart('.').ToLowerInvariant();
 
     if (opts.Filter is not null && !rel.Contains(opts.Filter, StringComparison.OrdinalIgnoreCase)) continue;
@@ -100,6 +107,10 @@ foreach (var goldenPath in goldenFiles)
     var got = new Dictionary<string, string>();
     ExtractedDocument? plainDoc = null;
     bool csharpFailed = false;
+    // The extractor reports a refusal as an error item rather than throwing, and a fixture that
+    // starts being refused is exactly what a change to the security limits would do; without
+    // this the sweep only shows it as a fixture quietly moving into the "both empty" bucket.
+    string csharpError = "";
     foreach (var (name, fmt) in Formats())
     {
         try
@@ -107,7 +118,7 @@ foreach (var goldenPath in goldenFiles)
             // Per-file guard: a pathological fixture must not stall the whole sweep.
             var capturedPath = sourcePath;
             var task = System.Threading.Tasks.Task.Run(() =>
-                extractor.Extract(ExtractInput.FromUri(capturedPath), new ExtractionConfig { OutputFormat = fmt }));
+                extractor.Extract(ExtractInput.FromUri(capturedPath), Cfg.Make(fmt, opts)));
             if (!task.Wait(TimeSpan.FromSeconds(120)))
             {
                 csharpFailed = true;
@@ -117,12 +128,21 @@ foreach (var goldenPath in goldenFiles)
             }
             var doc = task.Result.Results.FirstOrDefault();
             got[name] = doc?.Content ?? "";
-            if (name == "plain") plainDoc = doc;
+            if (name == "plain")
+            {
+                plainDoc = doc;
+                if (task.Result.Errors.Count > 0)
+                {
+                    csharpFailed = true;
+                    csharpError = $"{task.Result.Errors[0].ErrorType}: {task.Result.Errors[0].Message}";
+                }
+            }
         }
-        catch
+        catch (Exception ex)
         {
             csharpFailed = true;
             got[name] = "";
+            if (csharpError.Length == 0) csharpError = ex.Message;
         }
     }
 
@@ -130,7 +150,33 @@ foreach (var goldenPath in goldenFiles)
     bool csharpEmpty = string.IsNullOrEmpty(got["plain"]) && (plainDoc is null || plainDoc.Metadata.Format is null);
     if (!rustSuccess)
     {
-        if (csharpFailed || csharpEmpty) { es.BothUnsupported++; stats.BothUnsupported++; }
+        if (csharpFailed || csharpEmpty)
+        {
+            es.BothUnsupported++; stats.BothUnsupported++;
+            // Rust extracts nothing from this fixture, so parity says nothing about it either
+            // way — but if the port would have produced something with the security limits
+            // lifted, then the limits are what emptied it, and that is worth naming. Only the
+            // non-comparable set is re-run, which is small.
+            if (opts.ListFail && !opts.NoSecurity)
+            {
+                try
+                {
+                    var loose = Cfg.Make(OutputFormat.Plain, new Options { NoSecurity = true });
+                    var again = extractor.Extract(ExtractInput.FromUri(sourcePath), loose);
+                    var got2 = again.Results.FirstOrDefault();
+                    bool wouldHaveContent = !string.IsNullOrEmpty(got2?.Content)
+                        || (got2 is not null && got2.Metadata.Format is not null);
+                    if (wouldHaveContent && again.Errors.Count == 0)
+                        Console.WriteLine($"SECEMPTY\t{ext}\t{rel}\t{csharpError}");
+                }
+                catch { /* the loose run failing too means the limits were not the cause */ }
+            }
+            // Rust extracts nothing here either, so this is not a parity failure — but a
+            // fixture that moves into this bucket after a change is one the port stopped
+            // handling, and `--list-fail` is where that has to be visible.
+            if (opts.ListFail && csharpFailed)
+                Console.WriteLine($"CSFAIL\t{ext}\t{rel}\t{csharpError}");
+        }
         else { es.Extra++; stats.Extra++; }
         continue;
     }
@@ -496,10 +542,44 @@ static Options? ParseArgs(string[] args)
             case "--list-ok": o.ListOk = true; break;
             case "--list-fail": o.ListFail = true; break;
             case "--dump": o.Dump = args[++i]; break;
+            case "--goldens": o.GoldenRoot = args[++i]; break;
+            case "--no-security": o.NoSecurity = true; break;
+            case "--features":
+                foreach (var f in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    if (f.Trim() == "code") o.SourceCodeDetection = true;
+                break;
         }
     }
     if (!Directory.Exists(o.Root)) { Console.Error.WriteLine($"not a directory: {o.Root}"); return null; }
     return o;
+}
+
+static partial class Cfg
+{
+    /// <summary>The extraction config for one sweep run.</summary>
+    public static ExtractionConfig Make(OutputFormat fmt, Options o) => new()
+    {
+        OutputFormat = fmt,
+        SecurityLimits = o.NoSecurity ? Unbounded : null,
+        // Upstream gates source-code detection behind the `tree-sitter` cargo feature, so a
+        // golden set generated without it reads a `.py` file as plain text. The port decides at
+        // run time instead, and the sweep has to be told which golden set it is measuring
+        // against: `--features code` alongside `--goldens <extended tree>`.
+        Options = new XbergOptions { SourceCodeDetection = o.SourceCodeDetection },
+    };
+
+    private static readonly SecurityLimits Unbounded = new()
+    {
+        MaxArchiveSize = long.MaxValue,
+        MaxCompressionRatio = long.MaxValue,
+        MaxFilesInArchive = long.MaxValue,
+        MaxNestingDepth = long.MaxValue,
+        MaxEntityLength = long.MaxValue,
+        MaxContentSize = long.MaxValue,
+        MaxIterations = long.MaxValue,
+        MaxXmlDepth = long.MaxValue,
+        MaxTableCells = long.MaxValue,
+    };
 }
 
 sealed class Options
@@ -515,6 +595,18 @@ sealed class Options
     public bool ListOk;
     public bool ListFail;
     public string? Dump;
+
+    /// <summary>Root of a mirrored golden tree (`--goldens`), or null to read them next to
+    /// the fixtures.</summary>
+    public string? GoldenRoot;
+
+    /// <summary>Raise every security limit out of reach, so a sweep can be A/B'd against one
+    /// with the limits in force and attribute any difference to them.</summary>
+    public bool NoSecurity;
+
+    /// <summary>Whether a source file resolves to the code extractor (`--features code`).
+    /// Off by default, matching the golden set the default generator build produces.</summary>
+    public bool SourceCodeDetection;
 }
 
 sealed class DimStat { public int Match; public int Mismatch; }

@@ -28,7 +28,7 @@ public sealed class JatsExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         string jats = XmlPullReader.Decode(content);
-        var jm = ExtractAllMetadata(jats);
+        var jm = ExtractAllMetadata(jats, config.SecurityLimits);
 
         var metadata = new Metadata();
         var subjectParts = new List<string>();
@@ -64,7 +64,7 @@ public sealed class JatsExtractor : IExtractor
 
         if (subjectParts.Count > 0) metadata.Subject = string.Join(" | ", subjectParts);
 
-        var doc = BuildInternalDocument(jats);
+        var doc = BuildInternalDocument(jats, config.SecurityLimits);
         doc.MimeType = mimeType;
         doc.Metadata = metadata;
 
@@ -77,9 +77,9 @@ public sealed class JatsExtractor : IExtractor
     private static string Capitalize(string s) => s.Length == 0 ? s : char.ToUpperInvariant(s[0]) + s[1..];
 
     // ── content pass (mirrors build_jats_internal_document) ──────────────────
-    private static InternalDocument BuildInternalDocument(string content)
+    private static InternalDocument BuildInternalDocument(string content, SecurityLimits? limits)
     {
-        var reader = new XmlPullReader(content);
+        var reader = new XmlPullReader(content, limits);
         var builder = new InternalDocumentBuilder("jats");
 
         bool inArticleMeta = false, inAbstract = false, inBody = false, inBack = false, inRefList = false;
@@ -594,9 +594,9 @@ public sealed class JatsExtractor : IExtractor
         public readonly List<(string, string)> ContributorRoles = new();
     }
 
-    private static JatsMeta ExtractAllMetadata(string content)
+    private static JatsMeta ExtractAllMetadata(string content, SecurityLimits? limits)
     {
-        var reader = new XmlPullReader(content);
+        var reader = new XmlPullReader(content, limits);
         var m = new JatsMeta();
 
         bool inArticleMeta = false, inArticleTitle = false, inSubtitle = false, inContrib = false;

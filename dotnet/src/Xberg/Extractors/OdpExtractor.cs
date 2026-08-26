@@ -25,7 +25,7 @@ public sealed class OdpExtractor : IExtractor
         using (var stream = new MemoryStream(bytes, writable: false))
         using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
         {
-            doc = OdfPresentationParser.BuildInternalDocument(archive);
+            doc = OdfPresentationParser.BuildInternalDocument(archive, config.SecurityLimits);
         }
         doc.MimeType = mimeType;
 

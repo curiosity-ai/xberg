@@ -2,7 +2,6 @@
 // Native EPUB extractor: ZIP container -> OPF (manifest/spine/Dublin Core) -> XHTML spine walk.
 //
 // Deferrals vs. Rust (see PORT report):
-//  - SecurityBudget gating is omitted (budget steps/limits are no-ops here).
 //  - image_kind::classify is skipped (ImageKind/KindConfidence left null).
 //  - Markdown/Djot pre-rendering (config.output_format == Markdown|Djot) is not performed;
 //    this port always emits the structural element stream (plain/json parity target).
@@ -76,7 +75,7 @@ public sealed class EpubExtractor : IExtractor
             spineDoc.Xhtml = EpubContent.ResolveEpubSwitchElements(spineDoc.Xhtml, supportedNamespaces);
 
         string? coverImagePath = package.Metadata.CoverImageHref;
-        var doc = BuildInternalDocument(archive, spineDocuments, coverImagePath)
+        var doc = BuildInternalDocument(archive, spineDocuments, coverImagePath, config.SecurityLimits)
                   ?? new InternalDocumentBuilder("epub").Build();
 
         doc.MimeType = mimeType;
@@ -118,8 +117,13 @@ public sealed class EpubExtractor : IExtractor
 
     /// <summary>Build the flat <see cref="InternalDocument"/> from the spine. Mirrors `build_internal_document`.</summary>
     private static InternalDocument BuildInternalDocument(
-        ZipArchive archive, List<EpubSpineDocument> spineDocuments, string? coverImagePath)
+        ZipArchive archive, List<EpubSpineDocument> spineDocuments, string? coverImagePath,
+        SecurityLimits? limits)
     {
+        // An EPUB stops at its limit rather than failing on it: a book that runs the budget out
+        // mid-spine keeps the chapters already read. That is upstream's choice here specifically,
+        // which is why these calls report instead of throwing.
+        var budget = new SecurityBudget(limits ?? new SecurityLimits());
         var builder = new InternalDocumentBuilder("epub");
 
         // Emit the cover image as the first element, if present.
@@ -144,6 +148,8 @@ public sealed class EpubExtractor : IExtractor
 
         for (int index = 0; index < spineDocuments.Count; index++)
         {
+            if (!budget.TryStep()) break;
+
             var spineDoc = spineDocuments[index];
             string filePath = spineDoc.FilePath;
             string sanitized = spineDoc.Xhtml;
@@ -151,6 +157,8 @@ public sealed class EpubExtractor : IExtractor
             // Skip navigation documents (TOC pages, etc.).
             if (EpubContent.LooksLikeNavigationDocument(sanitized))
                 continue;
+
+            budget.TryAccountText(System.Text.Encoding.UTF8.GetByteCount(sanitized));
 
             // Skip empty chapters.
             if (EpubContent.ExtractTextFromXhtml(sanitized).Length == 0)

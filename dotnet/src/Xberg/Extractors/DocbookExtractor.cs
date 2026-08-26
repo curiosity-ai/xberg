@@ -24,7 +24,7 @@ public sealed class DocbookExtractor : IExtractor
     {
         string docbook = XmlPullReader.Decode(content);
 
-        var (title, author, date, publisher, copyright) = ParseMetadata(docbook);
+        var (title, author, date, publisher, copyright) = ParseMetadata(docbook, config.SecurityLimits);
 
         var metadata = new Metadata();
         var subjectParts = new List<string>();
@@ -43,7 +43,7 @@ public sealed class DocbookExtractor : IExtractor
         if (publisher is not null) metadata.Additional["publisher"] = System.Text.Json.JsonSerializer.SerializeToElement(publisher);
         if (copyright is not null) metadata.Additional["copyright"] = System.Text.Json.JsonSerializer.SerializeToElement(copyright);
 
-        var doc = BuildInternalDocument(docbook, injectPlaceholders: true);
+        var doc = BuildInternalDocument(docbook, injectPlaceholders: true, config.SecurityLimits);
         doc.MimeType = mimeType;
         doc.Metadata = metadata;
         return doc;
@@ -84,9 +84,9 @@ public sealed class DocbookExtractor : IExtractor
     }
 
     // ── InternalDocument builder pass (mirrors build_docbook_internal_document) ─
-    private static InternalDocument BuildInternalDocument(string content, bool injectPlaceholders)
+    private static InternalDocument BuildInternalDocument(string content, bool injectPlaceholders, SecurityLimits? limits)
     {
-        var reader = new XmlPullReader(EnsureRoot(content));
+        var reader = new XmlPullReader(EnsureRoot(content), limits);
         var builder = new InternalDocumentBuilder("docbook");
 
         bool titleExtracted = false;
@@ -257,9 +257,9 @@ public sealed class DocbookExtractor : IExtractor
     }
 
     // ── metadata single pass (title/author/date/publisher/copyright) ─────────
-    private static (string title, string? author, string? date, string? publisher, string? copyright) ParseMetadata(string content)
+    private static (string title, string? author, string? date, string? publisher, string? copyright) ParseMetadata(string content, SecurityLimits? limits)
     {
-        var reader = new XmlPullReader(EnsureRoot(content));
+        var reader = new XmlPullReader(EnsureRoot(content), limits);
         string title = "";
         string? author = null, date = null, publisher = null, copyright = null;
         bool inInfo = false;
@@ -491,11 +491,58 @@ internal readonly record struct XmlToken(XmlEv Kind, string Name, string Text, L
 internal sealed class XmlPullReader
 {
     private readonly List<XmlToken> _toks;
+    private readonly SecurityBudget _budget;
     private int _i;
 
-    public XmlPullReader(string xml) => _toks = Tokenize(xml);
+    /// <summary>
+    /// Read <paramref name="xml"/> as a token stream, charging it against
+    /// <paramref name="limits"/> as it goes.
+    /// </summary>
+    /// <remarks>
+    /// Each reader carries its own counters rather than sharing one across a document's passes.
+    /// Upstream clones its budget where a second pass starts (`docbook.rs`'s id pass), for the
+    /// same reason: a pass that stops early leaves the depth counter mid-descent, and a shared
+    /// counter would carry that into the next pass and refuse a document nothing is wrong with.
+    /// </remarks>
+    public XmlPullReader(string xml, SecurityLimits? limits = null)
+    {
+        _budget = new SecurityBudget(limits ?? new SecurityLimits());
+        _toks = Tokenize(xml, _budget);
+    }
 
-    public XmlToken Read() => _i < _toks.Count ? _toks[_i++] : new XmlToken(XmlEv.Eof, "", "", null);
+    public XmlToken Read()
+    {
+        var tok = _i < _toks.Count ? _toks[_i++] : new XmlToken(XmlEv.Eof, "", "", null);
+        switch (tok.Kind)
+        {
+            case XmlEv.Start:
+                _budget.Enter();
+                ChargeAttrs(tok);
+                break;
+            case XmlEv.Empty:
+                // A self-closing element is a descent and an ascent in one event, so it is
+                // charged as both — otherwise a document of nothing but `<a/>` would never
+                // reach the depth limit no matter how it nested elsewhere.
+                _budget.Enter();
+                ChargeAttrs(tok);
+                _budget.Leave();
+                break;
+            case XmlEv.End:
+                _budget.Leave();
+                break;
+            case XmlEv.Text:
+            case XmlEv.CData:
+                _budget.AccountText(Encoding.UTF8.GetByteCount(tok.Text.Trim()));
+                break;
+        }
+        return tok;
+    }
+
+    private void ChargeAttrs(XmlToken tok)
+    {
+        if (tok.Attrs is null) return;
+        foreach (var (key, value) in tok.Attrs) _budget.CheckAttr(key, value);
+    }
 
     public static string Decode(ReadOnlySpan<byte> content)
     {
@@ -542,7 +589,7 @@ internal sealed class XmlPullReader
         };
     }
 
-    private static List<XmlToken> Tokenize(string s)
+    private static List<XmlToken> Tokenize(string s, SecurityBudget budget)
     {
         var result = new List<XmlToken>();
         int i = 0, n = s.Length;
@@ -561,6 +608,8 @@ internal sealed class XmlPullReader
                     {
                         int end = s.IndexOf("]]>", i + 9, StringComparison.Ordinal);
                         string body = end < 0 ? s.Substring(i + 9) : s.Substring(i + 9, end - (i + 9));
+                        budget.Step();
+                        budget.CheckEntity(body);
                         result.Add(new XmlToken(XmlEv.CData, "", body, null));
                         i = end < 0 ? n : end + 3;
                     }
@@ -579,6 +628,7 @@ internal sealed class XmlPullReader
                     int gt = s.IndexOf('>', i + 2);
                     if (gt < 0) break;
                     string name = ParseName(s.Substring(i + 2, gt - (i + 2)).Trim());
+                    budget.Step();
                     result.Add(new XmlToken(XmlEv.End, name, "", null));
                     i = gt + 1;
                 }
@@ -590,6 +640,7 @@ internal sealed class XmlPullReader
                     bool empty = inner.EndsWith("/", StringComparison.Ordinal);
                     if (empty) inner = inner[..^1];
                     var (name, attrs) = ParseTag(inner);
+                    budget.Step();
                     result.Add(new XmlToken(empty ? XmlEv.Empty : XmlEv.Start, name, "", attrs));
                     i = gt + 1;
                 }
@@ -617,7 +668,13 @@ internal sealed class XmlPullReader
                     }
                     run.Append(s[j]);
                 }
-                if (run.Length > 0) result.Add(new XmlToken(XmlEv.Text, "", run.ToString(), null));
+                if (run.Length > 0)
+                {
+                    budget.Step();
+                    string body = run.ToString();
+                    budget.CheckEntity(body);
+                    result.Add(new XmlToken(XmlEv.Text, "", body, null));
+                }
                 i = lt;
             }
         }

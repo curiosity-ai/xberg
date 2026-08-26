@@ -43,6 +43,19 @@ public sealed class XbergOptions
     public bool UsePortedPdfSpans { get; init; } = true;
 
     /// <summary>
+    /// Resolve a file whose extension or shebang names a programming language to
+    /// <c>text/x-source-code</c>, so the source-code extractor handles it instead of the
+    /// plain-text one.
+    /// </summary>
+    /// <remarks>
+    /// On by default, matching what upstream's published packages ship: the <c>tree-sitter</c>
+    /// feature is in its <c>full</c> set. It is a switch rather than a constant because upstream
+    /// gates it at compile time, so a build without that feature reads the same `.py` file as
+    /// plain text — and the golden sets generated from each build disagree accordingly.
+    /// </remarks>
+    public bool SourceCodeDetection { get; init; } = true;
+
+    /// <summary>
     /// Fixed part of the per-document wall-clock guard for PDF extraction, in seconds. Also the
     /// floor: a one-page document still gets this long.
     /// </summary>

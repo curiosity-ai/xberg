@@ -58,6 +58,7 @@ public sealed class XlsxExtractor : IExtractor
         var workbook = extension == ".xlsb"
             ? XlsbReader.Read(content)
             : XlsxReader.Read(content, officeMetadata);
+        TableBudget.ChargeSheets(SecurityBudget.FromConfig(config), workbook.Sheets.Select(sh => sh.TableCells));
         var doc = WorkbookToInternalDocument(workbook);
         doc.MimeType = mimeType;
         return doc;

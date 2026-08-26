@@ -5,6 +5,8 @@ using System.IO.Compression;
 using System.Xml.Linq;
 using Xberg.Types;
 
+using Xberg.Core;
+
 namespace Xberg.Internal.Odf;
 
 /// <summary>
@@ -20,8 +22,9 @@ namespace Xberg.Internal.Odf;
 /// </remarks>
 internal static class OdfPresentationParser
 {
-    public static InternalDocument BuildInternalDocument(ZipArchive archive)
+    public static InternalDocument BuildInternalDocument(ZipArchive archive, SecurityLimits? limits = null)
     {
+        var budget = new SecurityBudget(limits ?? new SecurityLimits());
         var imageData = OdfContentParser.PreExtractImages(archive);
         var formulaData = OdfContentParser.PreExtractFormulas(archive);
 
@@ -40,6 +43,7 @@ internal static class OdfPresentationParser
         foreach (var presentation in body.Elements().Where(n => n.Name.LocalName == "presentation"))
         foreach (var page in presentation.Elements().Where(n => n.Name.LocalName == "page"))
         {
+            budget.Step();
             slideNumber++;
             builder.PushSlide(slideNumber, OdfStyles.Attr(page, "name"), null);
 
@@ -48,7 +52,7 @@ internal static class OdfPresentationParser
             // text. Groups are recursed into below, so nothing on the slide is missed.
             foreach (var pageChild in page.Elements())
                 if (pageChild.Name.LocalName is "frame" or "g")
-                    ProcessPageObject(pageChild, builder, styleMap, listStyleMap, imageData, formulaData);
+                    ProcessPageObject(pageChild, builder, styleMap, listStyleMap, imageData, formulaData, budget);
 
             var notes = page.Elements().FirstOrDefault(n => n.Name.LocalName == "notes");
             if (notes is not null && ExtractNotesText(notes) is { } notesText)
@@ -74,14 +78,15 @@ internal static class OdfPresentationParser
         Dictionary<string, OdtStyleProps> styleMap,
         Dictionary<string, bool> listStyleMap,
         Dictionary<string, OdfImage> imageData,
-        Dictionary<string, string> formulaData)
+        Dictionary<string, string> formulaData,
+        SecurityBudget budget)
     {
         switch (node.Name.LocalName)
         {
             case "frame":
             case "g":
                 foreach (var child in node.Elements())
-                    ProcessPageObject(child, builder, styleMap, listStyleMap, imageData, formulaData);
+                    ProcessPageObject(child, builder, styleMap, listStyleMap, imageData, formulaData, budget);
                 break;
 
             case "text-box":
@@ -96,13 +101,19 @@ internal static class OdfPresentationParser
             case "connector":
             case "regular-polygon":
             case "measure":
-                OdfContentParser.BuildInternalElements(node, builder, styleMap, listStyleMap, imageData, formulaData);
+                OdfContentParser.BuildInternalElements(node, builder, styleMap, listStyleMap, imageData, formulaData, budget);
                 break;
 
             case "table":
             {
                 var cells = OdfContentParser.ExtractTableCells(node);
-                if (cells.Count > 0) builder.PushTableFromCells(cells, null, null);
+                if (cells.Count > 0)
+                {
+                    long cellCount = 0;
+                    foreach (var row in cells) cellCount += row.Count;
+                    budget.AddCells(cellCount);
+                    builder.PushTableFromCells(cells, null, null);
+                }
                 break;
             }
 

@@ -20,7 +20,10 @@ public sealed class Extractor
         var result = new ExtractionResult();
         try
         {
-            var (bytes, mimeType) = Resolve(input);
+            var (bytes, mimeType) = Resolve(input, config);
+            // Extension-based language detection needs the file's name, and only the caller or
+            // this resolution step knows it.
+            config.SourceName ??= input.Filename ?? (input.Uri is { } u ? Path.GetFileName(u) : null);
             var extractor = _registry.ForMime(mimeType);
             if (extractor is null)
             {
@@ -46,11 +49,21 @@ public sealed class Extractor
         }
         catch (Exception ex)
         {
+            // Upstream's `extraction_error_type` / `extraction_error_code` taxonomy. Only the
+            // variants this port can actually raise are distinguished; everything else lands on
+            // the same catch-all upstream uses for the variants it does not name.
+            var (errorType, code) = ex switch
+            {
+                SecurityException => ("security", 1006u),
+                ValidationException => ("validation", 1002u),
+                IOException => ("io", 1001u),
+                _ => ("other", 1099u),
+            };
             result.Errors.Add(new ExtractionErrorItem
             {
                 Index = 0,
-                Code = 1,
-                ErrorType = "extraction_error",
+                Code = code,
+                ErrorType = errorType,
                 Source = input.Filename ?? input.Uri ?? "input",
                 Message = ex.Message,
             });
@@ -68,13 +81,14 @@ public sealed class Extractor
     public Task<ExtractionResult> ExtractAsync(ExtractInput input, ExtractionConfig config) =>
         Task.FromResult(Extract(input, config));
 
-    private static (byte[] Bytes, string MimeType) Resolve(ExtractInput input)
+    private static (byte[] Bytes, string MimeType) Resolve(ExtractInput input, ExtractionConfig config)
     {
+        bool sourceCode = config.Options.SourceCodeDetection;
         if (input.Kind == ExtractInputKind.Bytes)
         {
             byte[] bytes = input.Bytes ?? Array.Empty<byte>();
             string mime = input.MimeType
-                ?? Mime.DetectMimeTypeFromBytes(bytes)
+                ?? Mime.DetectMimeTypeFromBytes(bytes, sourceCode)
                 ?? Mime.OctetStream;
             return (bytes, mime);
         }
@@ -86,7 +100,8 @@ public sealed class Extractor
         // A caller-supplied type is taken at its word; otherwise the extension is only a starting
         // point, and the file's own content overrules it where the two disagree.
         string mimeType = input.MimeType
-            ?? Mime.ResolveWithContent(Mime.DetectMimeType(path, checkExists: false), fileBytes);
+            ?? Mime.ResolveWithContent(
+                Mime.DetectMimeType(path, checkExists: false, sourceCode), fileBytes, sourceCode);
         return (fileBytes, mimeType);
     }
 }

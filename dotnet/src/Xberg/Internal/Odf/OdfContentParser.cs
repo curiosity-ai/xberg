@@ -9,6 +9,8 @@ using System.Xml.Linq;
 using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
+using Xberg.Core;
+
 namespace Xberg.Internal.Odf;
 
 /// <summary>Pre-extracted image binary: raw bytes plus a normalized format string.</summary>
@@ -20,8 +22,9 @@ internal static class OdfContentParser
     // ── entry point ────────────────────────────────────────────────────────
 
     /// <summary>Build an <see cref="InternalDocument"/> from an ODT archive. Ports `build_internal_document`.</summary>
-    public static InternalDocument BuildInternalDocument(ZipArchive archive)
+    public static InternalDocument BuildInternalDocument(ZipArchive archive, SecurityLimits? limits = null)
     {
+        var budget = new SecurityBudget(limits ?? new SecurityLimits());
         var imageData = PreExtractImages(archive);
         var formulaData = PreExtractFormulas(archive);
 
@@ -57,7 +60,7 @@ internal static class OdfContentParser
             {
                 if (textElem.Name.LocalName != "text")
                     continue;
-                BuildInternalElements(textElem, builder, styleMap, listStyleMap, imageData, formulaData);
+                BuildInternalElements(textElem, builder, styleMap, listStyleMap, imageData, formulaData, budget);
             }
         }
 
@@ -74,12 +77,14 @@ internal static class OdfContentParser
         Dictionary<string, OdtStyleProps> styleMap,
         Dictionary<string, bool> listStyleMap,
         Dictionary<string, OdfImage> imageData,
-        Dictionary<string, string> formulaData)
+        Dictionary<string, string> formulaData,
+        SecurityBudget budget)
     {
         uint footnoteCounter = 0;
 
         foreach (var node in parent.Elements())
         {
+            budget.Step();
             switch (node.Name.LocalName)
             {
                 case "h":
@@ -99,20 +104,25 @@ internal static class OdfContentParser
                     break;
                 }
                 case "p":
-                    HandleParagraph(node, builder, styleMap, imageData, formulaData, ref footnoteCounter);
+                    HandleParagraph(node, builder, styleMap, imageData, formulaData, ref footnoteCounter, budget);
                     break;
                 case "table":
                 {
                     var cells = ExtractTableCells(node);
                     if (cells.Count > 0)
+                    {
+                        long cellCount = 0;
+                        foreach (var row in cells) cellCount += row.Count;
+                        budget.AddCells(cellCount);
                         builder.PushTableFromCells(cells, null, null);
+                    }
                     break;
                 }
                 case "list":
                     BuildList(node, builder, listStyleMap);
                     break;
                 case "section":
-                    BuildInternalElements(node, builder, styleMap, listStyleMap, imageData, formulaData);
+                    BuildInternalElements(node, builder, styleMap, listStyleMap, imageData, formulaData, budget);
                     break;
             }
         }
@@ -124,7 +134,8 @@ internal static class OdfContentParser
         Dictionary<string, OdtStyleProps> styleMap,
         Dictionary<string, OdfImage> imageData,
         Dictionary<string, string> formulaData,
-        ref uint footnoteCounter)
+        ref uint footnoteCounter,
+        SecurityBudget budget)
     {
         var footnoteMarkers = new List<string>();
 
@@ -292,7 +303,10 @@ internal static class OdfContentParser
 
         var finalTrimmed = text.ToString().Trim();
         if (finalTrimmed.Length > 0)
+        {
+            budget.AccountText(System.Text.Encoding.UTF8.GetByteCount(finalTrimmed));
             builder.PushParagraph(finalTrimmed, annotations, null, null);
+        }
     }
 
     /// <summary>

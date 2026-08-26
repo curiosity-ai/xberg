@@ -87,6 +87,25 @@ public sealed class ExtractionConfig
     public bool ExtractTables { get; set; } = true;
 
     /// <summary>
+    /// Limits applied to hostile input. <c>null</c> takes <see cref="SecurityLimits"/>' defaults,
+    /// which is what upstream's <c>Option&lt;SecurityLimits&gt;</c> does with <c>None</c>.
+    /// </summary>
+    [JsonPropertyName("security_limits")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public SecurityLimits? SecurityLimits { get; set; }
+
+    /// <summary>
+    /// The input's file name, when the caller knows it. Used to fall back to extension-based
+    /// language detection where content-based detection — a shebang — says nothing.
+    /// </summary>
+    /// <remarks>
+    /// Not part of the wire format, matching upstream's <c>#[serde(skip)]</c>: it describes the
+    /// input rather than configuring the extraction.
+    /// </remarks>
+    [JsonIgnore]
+    public string? SourceName { get; set; }
+
+    /// <summary>
     /// Port-local behavioural knobs (deadlines, implementation switches). Defaults to
     /// <see cref="XbergOptions.Default"/>. Not part of the wire format: everything above mirrors
     /// upstream's config field for field, and these have no upstream counterpart.

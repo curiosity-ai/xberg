@@ -73,7 +73,7 @@ public sealed class StructuredExtractor : IExtractor
             _ => null,
         };
 
-        var doc = BuildInternalDocument(result, sourceFormat, language);
+        var doc = BuildInternalDocument(result, sourceFormat, language, config.SecurityLimits);
         doc.MimeType = mimeType;
 
         // Assemble metadata.additional: field_count, data_format, plus text-field entries.
@@ -96,8 +96,12 @@ public sealed class StructuredExtractor : IExtractor
 
     // ── document building ───────────────────────────────────────────────────
 
-    private static InternalDocument BuildInternalDocument(StructuredResult result, string sourceFormat, string? language)
+    private static InternalDocument BuildInternalDocument(
+        StructuredResult result, string sourceFormat, string? language, SecurityLimits? limits)
     {
+        // Structured input is where nesting is cheapest to write and most expensive to walk:
+        // a few kilobytes of `[[[[...]]]]` is a recursion the depth counter is here to stop.
+        var budget = new SecurityBudget(limits ?? new SecurityLimits());
         // Render document structure (headings, sub-headings, lists) from the parsed value for
         // every structured format, not just JSON objects: YAML, TOML and JSONL parse into the
         // same shape, and a top-level array (JSONL's natural shape, and valid JSON on its own)
@@ -107,53 +111,69 @@ public sealed class StructuredExtractor : IExtractor
             if (root.ValueKind == JsonValueKind.Object)
             {
                 var builder = new InternalDocumentBuilder(sourceFormat);
-                BuildJsonInternalStructure(root, builder, 1);
+                BuildJsonInternalStructure(root, builder, 1, budget);
                 return builder.Build();
             }
             if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
             {
                 var builder = new InternalDocumentBuilder(sourceFormat);
-                BuildJsonArray(root, builder, 1);
+                BuildJsonArray(root, builder, 1, budget);
                 return builder.Build();
             }
         }
 
         // Fallback: a single code block with the raw content.
         var fallback = new InternalDocumentBuilder(sourceFormat);
+        budget.AccountText(Encoding.UTF8.GetByteCount(result.Content));
         fallback.PushCode(result.Content, language, null, null);
         return fallback.Build();
     }
 
-    private static void BuildJsonInternalStructure(JsonElement value, InternalDocumentBuilder builder, int depth)
+    private static void BuildJsonInternalStructure(
+        JsonElement value, InternalDocumentBuilder builder, int depth, SecurityBudget budget)
     {
         byte level = (byte)Math.Min(depth, 6);
         switch (value.ValueKind)
         {
             case JsonValueKind.Object:
+                budget.Enter();
                 foreach (var prop in value.EnumerateObject())
                 {
+                    budget.Step();
+                    budget.CheckEntity(prop.Name);
                     var val = prop.Value;
                     switch (val.ValueKind)
                     {
                         case JsonValueKind.Object:
                             builder.PushHeading(level, prop.Name, null, null);
-                            BuildJsonInternalStructure(val, builder, depth + 1);
+                            BuildJsonInternalStructure(val, builder, depth + 1, budget);
                             break;
                         case JsonValueKind.Array:
                             builder.PushHeading(level, prop.Name, null, null);
-                            BuildJsonArray(val, builder, depth + 1);
+                            BuildJsonArray(val, builder, depth + 1, budget);
                             break;
                         case JsonValueKind.String:
-                            builder.PushParagraph($"{prop.Name}: {val.GetString()}", new(), null, null);
+                        {
+                            string str = val.GetString()!;
+                            budget.CheckEntity(str);
+                            string rendered = $"{prop.Name}: {str}";
+                            budget.AccountText(Encoding.UTF8.GetByteCount(rendered));
+                            builder.PushParagraph(rendered, new(), null, null);
                             break;
+                        }
                         default:
-                            builder.PushParagraph($"{prop.Name}: {SerdeJson.Compact(val)}", new(), null, null);
+                        {
+                            string rendered = $"{prop.Name}: {SerdeJson.Compact(val)}";
+                            budget.AccountText(Encoding.UTF8.GetByteCount(rendered));
+                            builder.PushParagraph(rendered, new(), null, null);
                             break;
+                        }
                     }
                 }
+                budget.Leave();
                 break;
             case JsonValueKind.Array:
-                BuildJsonArray(value, builder, depth);
+                BuildJsonArray(value, builder, depth, budget);
                 break;
             case JsonValueKind.String:
                 builder.PushParagraph(value.GetString()!, new(), null, null);
@@ -169,31 +189,36 @@ public sealed class StructuredExtractor : IExtractor
     /// Lists are closed before an object or nested array is rendered so headings and
     /// paragraphs do not become implicit children of the preceding list item.
     /// </summary>
-    private static void BuildJsonArray(JsonElement values, InternalDocumentBuilder builder, int depth)
+    private static void BuildJsonArray(
+        JsonElement values, InternalDocumentBuilder builder, int depth, SecurityBudget budget)
     {
         const string ArrayItemLabel = "Item";
 
+        budget.Enter();
         bool listIsOpen = false;
         int index = 0;
         foreach (var value in values.EnumerateArray())
         {
+            budget.Step();
             index++;
             if (value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
             {
                 if (listIsOpen) { builder.EndList(); listIsOpen = false; }
                 builder.PushHeading((byte)Math.Min(depth, 6), $"{ArrayItemLabel} {index}", null, null);
-                BuildJsonInternalStructure(value, builder, depth + 1);
+                BuildJsonInternalStructure(value, builder, depth + 1, budget);
             }
             else
             {
                 string text = value.ValueKind == JsonValueKind.String
                     ? value.GetString()!
                     : SerdeJson.Compact(value);
+                budget.AccountText(Encoding.UTF8.GetByteCount(text));
                 if (!listIsOpen) { builder.PushList(false); listIsOpen = true; }
                 builder.PushListItem(text, false, new(), null, null);
             }
         }
         if (listIsOpen) builder.EndList();
+        budget.Leave();
     }
 
     /// <summary>Materialize a parsed YAML/TOML node as a <see cref="JsonElement"/> so the

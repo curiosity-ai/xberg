@@ -33,6 +33,7 @@ public sealed class XmlExtractor : IExtractor
     {
         bool isSvg = mimeType == "image/svg+xml";
         string xml = Decode(content);
+        var budget = SecurityBudget.FromConfig(config);
 
         var doc = new InternalDocument("xml");
         int depth = 0;
@@ -43,11 +44,15 @@ public sealed class XmlExtractor : IExtractor
 
         foreach (var ev in Tokenize(xml))
         {
+            budget.Step();
             switch (ev.Kind)
             {
                 case EventKind.Start:
                 {
+                    budget.Enter();
                     byte level = HeadingLevel(depth);
+                    if (ev.Attributes is not null)
+                        foreach (var (key, value) in ev.Attributes) budget.CheckAttr(key, value);
                     var attrs = FilterAttrs(ev.Attributes);
                     doc.PushElement(MakeElement(ElementKind.Heading(level), ev.Name, depth, index++, attrs));
                     stack.Add(ev.Name);
@@ -57,12 +62,15 @@ public sealed class XmlExtractor : IExtractor
                     break;
                 }
                 case EventKind.End:
+                    budget.Leave();
                     depth = depth > 0 ? depth - 1 : 0;
                     if (stack.Count > 0) stack.RemoveAt(stack.Count - 1);
                     break;
                 case EventKind.Empty:
                 {
                     byte level = HeadingLevel(depth);
+                    if (ev.Attributes is not null)
+                        foreach (var (key, value) in ev.Attributes) budget.CheckAttr(key, value);
                     var attrs = FilterAttrs(ev.Attributes);
                     doc.PushElement(MakeElement(ElementKind.Heading(level), ev.Name, depth, index++, attrs));
                     elementCount++;
@@ -72,8 +80,10 @@ public sealed class XmlExtractor : IExtractor
                 case EventKind.Text:
                 {
                     if (isSvg && !stack.Any(SvgTextElements.Contains)) break;
+                    budget.CheckEntity(ev.Text);
                     string trimmed = ev.Text.Trim();
                     if (trimmed.Length == 0) break;
+                    budget.AccountText(Encoding.UTF8.GetByteCount(trimmed));
                     int textDepth = depth > 0 ? depth - 1 : 0;
                     doc.PushElement(MakeElement(ElementKind.Paragraph, trimmed, textDepth, index++, null));
                     break;
@@ -83,8 +93,10 @@ public sealed class XmlExtractor : IExtractor
                     // No SVG text-element filter here: upstream guards only the `Text` arm, so a
                     // CDATA section — which is how an SVG carries its script and style bodies —
                     // is kept wherever it appears.
+                    budget.CheckEntity(ev.Text);
                     string trimmed = ev.Text.Trim();
                     if (trimmed.Length == 0) break;
+                    budget.AccountText(Encoding.UTF8.GetByteCount(trimmed));
                     doc.PushElement(MakeElement(ElementKind.Paragraph, trimmed, depth, index++, null));
                     break;
                 }

@@ -1,4 +1,5 @@
 using System.Text;
+using Xberg.Core;
 using Xberg.Types;
 
 namespace Xberg.Internal.Html;
@@ -48,10 +49,18 @@ public sealed class HtmlWalker
     private readonly StringBuilder _dtText = new();
     private readonly StringBuilder _ddText = new();
 
-    public HtmlWalker(string src, InternalDocumentBuilder builder)
+    /// <summary>
+    /// The hostile-input counters for this walk. Charged where upstream's node walk charges:
+    /// one loop turn per tag, a descent per nested container, the emitted text of every block,
+    /// and a table's cells before the table is built.
+    /// </summary>
+    private readonly SecurityBudget _budget;
+
+    public HtmlWalker(string src, InternalDocumentBuilder builder, SecurityLimits? limits = null)
     {
         _src = src;
         _b = builder;
+        _budget = new SecurityBudget(limits ?? new SecurityLimits());
     }
 
     /// <summary>
@@ -104,6 +113,7 @@ public sealed class HtmlWalker
                 _pos = CommentEnd(_src, _pos);
                 continue;
             }
+            _budget.Step();
             if (_src[_pos] == '<' && OpensTag(_src, _pos)) HandleTag();
             else HandleText();
         }
@@ -112,6 +122,14 @@ public sealed class HtmlWalker
 
         if (_b.NodeCount == 0 && _discarded.Length != 0)
             _b.PushParagraph(_discarded.ToString(), new(), null, null);
+    }
+
+    /// <summary>Charge a table's cells before it is handed to the builder.</summary>
+    private void ChargeCells(List<List<string>> grid)
+    {
+        long count = 0;
+        foreach (var row in grid) count += row.Count;
+        _budget.AddCells(count);
     }
 
     private bool Starts(string s) => string.CompareOrdinal(_src, _pos, s, 0, s.Length) == 0 && _pos + s.Length <= _src.Length;
@@ -517,6 +535,7 @@ public sealed class HtmlWalker
         }
         _b.PushGroupStart(null, null);
         _groupStack.Add(level);
+        _budget.AccountText(Encoding.UTF8.GetByteCount(text));
         _b.PushHeading(level, text, null, null);
     }
 
@@ -530,6 +549,7 @@ public sealed class HtmlWalker
                 display = text.Length == 0 ? $"![]({src})" : $"![{text}]({src})";
             else
                 display = text;
+            _budget.AccountText(Encoding.UTF8.GetByteCount(display));
             _b.PushParagraph(display, new(), null, null);
         }
         if (!string.IsNullOrEmpty(src))
@@ -579,7 +599,7 @@ public sealed class HtmlWalker
         if (table is null) return;
         HtmlToMarkdown.EmitTableTree(table, grid =>
         {
-            if (grid.Count > 0) _b.PushTableFromCells(grid, null, null);
+            if (grid.Count > 0) { ChargeCells(grid); _b.PushTableFromCells(grid, null, null); }
         }, (alt, src) => EmitImage(alt, src));
     }
 
@@ -603,6 +623,7 @@ public sealed class HtmlWalker
         if (!hasSpans)
         {
             var simple = rows.Select(r => r.Select(c => CellNormalize(c.Text)).ToList()).ToList();
+            ChargeCells(simple);
             _b.PushTableFromCells(simple, null, null);
             return;
         }
@@ -610,6 +631,7 @@ public sealed class HtmlWalker
         // covers, which slides every cell beneath one leftwards and out from under its header.
         var grid = Tables.GridFlatten.FlattenSpannedRows<CellMeta>(
             rows, c => (int)c.ColSpan, c => (int)c.RowSpan, c => CellNormalize(c.Text));
+        ChargeCells(grid);
         _b.PushTableFromCells(grid, null, null);
     }
 
@@ -726,6 +748,7 @@ public sealed class HtmlWalker
         if (text.Length > 0)
         {
             var anns = new List<TextAnnotation>(_annotations);
+            _budget.AccountText(Encoding.UTF8.GetByteCount(text));
             _b.PushParagraph(text, anns, null, null);
         }
         DiscardParagraph();
@@ -802,7 +825,11 @@ public sealed class HtmlWalker
         foreach (var item in lst.Items)
         {
             string text = ItemText(item, nl, ud);
-            if (text.Length > 0) _b.PushListItem(text, lst.Ordered, new(), null, null);
+            if (text.Length > 0)
+            {
+                _budget.AccountText(Encoding.UTF8.GetByteCount(text));
+                _b.PushListItem(text, lst.Ordered, new(), null, null);
+            }
         }
         _b.EndList();
         foreach (var item in lst.Items)

@@ -189,6 +189,15 @@ public sealed class PdfExtractor : IExtractor
                 Message = "PDF is encrypted and could not be decrypted with the empty password; text unavailable.",
             });
 
+        // The growth guard runs over the finished elements rather than the input: a PDF's own
+        // byte count says nothing about how much text it decompresses to, so the total is only
+        // knowable once the pages are read.
+        {
+            var budget = SecurityBudget.FromConfig(config);
+            foreach (var elem in doc.Elements)
+                budget.AccountText(System.Text.Encoding.UTF8.GetByteCount(elem.Text));
+        }
+
         return doc;
     }
 

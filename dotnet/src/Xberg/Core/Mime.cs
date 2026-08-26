@@ -18,7 +18,7 @@ public static class Mime
     private static readonly Dictionary<string, string> ExtToMime = BuildExtTable();
 
     /// <summary>Extension-only detection (never reads content). Returns null when unknown.</summary>
-    public static string? DetectMimeType(string path, bool checkExists)
+    public static string? DetectMimeType(string path, bool checkExists, bool sourceCode = true)
     {
         if (checkExists && !File.Exists(path))
             throw new FileNotFoundException($"File does not exist: {path}", path);
@@ -28,11 +28,20 @@ public static class Mime
         ext = ext.ToLowerInvariant();
         if (ext.Length > 0 && ExtToMime.TryGetValue(ext, out var mime))
             return mime;
+
+        // Only after the format table has had its say: `.json`, `.yaml`, `.md` and `.html` are
+        // languages tree-sitter knows and formats xberg handles, and the format wins.
+        if (sourceCode && Internal.Code.CodeLanguages.FromPath(path) is not null)
+            return CodeMimeType;
+
         return null;
     }
 
+    /// <summary>The MIME every source file resolves to, whatever language it turns out to be.</summary>
+    public const string CodeMimeType = "text/x-source-code";
+
     /// <summary>Content-based detection. Returns null when the type cannot be determined.</summary>
-    public static string? DetectMimeTypeFromBytes(ReadOnlySpan<byte> content)
+    public static string? DetectMimeTypeFromBytes(ReadOnlySpan<byte> content, bool sourceCode = true)
     {
         string? magic = SniffMagic(content);
         if (magic is not null)
@@ -88,6 +97,11 @@ public static class Mime
                 return XmlVocabulary(trimmed) ?? "application/xml";
             if (trimmed.StartsWith("%PDF", StringComparison.Ordinal))
                 return "application/pdf";
+            // A shebang is the last thing checked: every signature above is more specific than
+            // "some script", and a file that matched one of them is not source whatever its
+            // first line says.
+            if (sourceCode && Internal.Code.CodeLanguages.FromContent(trimmed) is not null)
+                return CodeMimeType;
             return "text/plain";
         }
 
@@ -109,10 +123,10 @@ public static class Mime
     /// says nothing at all; generic XML cannot tell FictionBook from DocBook; generic JSON cannot
     /// tell a notebook from line-delimited JSON.
     /// </remarks>
-    public static string ResolveWithContent(string? extensionMime, ReadOnlySpan<byte> content)
+    public static string ResolveWithContent(string? extensionMime, ReadOnlySpan<byte> content, bool sourceCode = true)
     {
         if (extensionMime is null)
-            return DetectMimeTypeFromBytes(content) ?? OctetStream;
+            return DetectMimeTypeFromBytes(content, sourceCode) ?? OctetStream;
 
         // Upstream reads a 4 KiB header rather than the whole file, which is visible behaviour:
         // the JSON check parses what it was given, so a large JSON body in a mis-named file does
@@ -120,7 +134,7 @@ public static class Mime
         var header = content.Length > MagicHeaderBytes ? content[..MagicHeaderBytes] : content;
         if (header.IsEmpty) return extensionMime;
 
-        string? fromMagic = DetectMimeTypeFromBytes(header);
+        string? fromMagic = DetectMimeTypeFromBytes(header, sourceCode);
         if (fromMagic is null || fromMagic == extensionMime) return extensionMime;
 
         if (fromMagic == "text/plain") return extensionMime;

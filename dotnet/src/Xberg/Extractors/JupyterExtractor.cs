@@ -20,6 +20,10 @@ public sealed class JupyterExtractor : IExtractor
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
+        // Upstream's one-line growth guard: the input's own size is charged against
+        // `max_content_size` before parsing, so a document too large to render is refused
+        // rather than rendered and then found to be too large.
+        SecurityBudget.FromConfig(config).AccountText(content.Length);
         var node = JsonNode.Parse(content.ToArray()) ?? throw new JsonException("invalid notebook");
         var notebook = node.AsObject();
 

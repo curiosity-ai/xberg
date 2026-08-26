@@ -31,6 +31,7 @@ public sealed class XlsExtractor : IExtractor
     {
         var comp = CompoundFile.Open(content);
         var sheets = BiffReader.ReadSheets(comp);
+        TableBudget.ChargeSheets(SecurityBudget.FromConfig(config), sheets.Select(sh => sh.Cells));
 
         var doc = BuildInternalDocument(sheets);
 

@@ -27,6 +27,20 @@ public sealed partial class CsvExtractor : IExtractor
 
         var rows = ParseCsv(text, delimiter);
 
+        // A CSV's cost is its cells, not its bytes: a few hundred kilobytes of commas declares
+        // millions of them. Charged per row so the walk stops at the limit rather than after it.
+        var budget = SecurityBudget.FromConfig(config);
+        foreach (var row in rows)
+        {
+            budget.Step();
+            budget.AddCells(row.Count);
+            foreach (var cell in row)
+            {
+                budget.CheckEntity(cell);
+                budget.AccountText(Encoding.UTF8.GetByteCount(cell));
+            }
+        }
+
         int rowCount = rows.Count;
         int colCount = rows.Count == 0 ? 0 : rows.Max(r => r.Count);
         bool hasHeader = DetectHeader(rows);
