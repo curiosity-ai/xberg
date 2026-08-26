@@ -181,24 +181,22 @@ internal static class Wp5Parser
         switch (attribute)
         {
             case AttributeBold:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.BoldStart : WpdEventKind.BoldEnd));
+                sink.AttributeChange(WpdEventKind.BoldStart, WpdEventKind.BoldEnd, on);
                 break;
             case AttributeItalics:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.ItalicStart : WpdEventKind.ItalicEnd));
+                sink.AttributeChange(WpdEventKind.ItalicStart, WpdEventKind.ItalicEnd, on);
                 break;
             case AttributeUnderline:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.UnderlineStart : WpdEventKind.UnderlineEnd));
+                sink.AttributeChange(WpdEventKind.UnderlineStart, WpdEventKind.UnderlineEnd, on);
                 break;
             case AttributeStrikeOut:
-                sink.Emit(WpdEvent.Simple(
-                    on ? WpdEventKind.StrikethroughStart : WpdEventKind.StrikethroughEnd));
+                sink.AttributeChange(WpdEventKind.StrikethroughStart, WpdEventKind.StrikethroughEnd, on);
                 break;
             case AttributeSuperscript:
-                sink.Emit(WpdEvent.Simple(
-                    on ? WpdEventKind.SuperscriptStart : WpdEventKind.SuperscriptEnd));
+                sink.AttributeChange(WpdEventKind.SuperscriptStart, WpdEventKind.SuperscriptEnd, on);
                 break;
             case AttributeSubscript:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.SubscriptStart : WpdEventKind.SubscriptEnd));
+                sink.AttributeChange(WpdEventKind.SubscriptStart, WpdEventKind.SubscriptEnd, on);
                 break;
             // Size and colour attributes carry no counterpart in the event stream.
         }

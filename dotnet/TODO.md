@@ -1664,6 +1664,50 @@ and each probe lives in `dotnet/tools/` alongside the reference generator.
       comparison forced: `f64::round` is half-away-from-zero where .NET's default is half-to-even,
       and `Perspective::create` rejects on a *signed* `wden < EPSILON`.
 
+- [x] **WordPerfect** — a managed reimplementation of libwpd 0.10.3, not a binding to it. Five
+      unrelated binary formats live behind one extension: WP4.2 (DOS, no header), WP5.0/5.1 (DOS,
+      `\xFFWPC`), WP6.x (DOS/Windows), WP1 (Mac 1.x, no header) and WP3 (Mac 2.x/3.x). Each gets
+      its own parser; detection reads the header first and falls back to two structural
+      heuristics for the two headerless formats.
+
+      libwpd was built once — to *generate goldens*, never to be called — and the port is diffed
+      against them. Against the ten-fixture corpus it is **7 of 7 comparable fixtures matching on
+      every hard dimension**, including the three deliberately-malformed CVE samples, which
+      libwpd refuses and this port refuses identically.
+
+      Three things the diff caught that reading would not have:
+
+      - The table state machine lives in libwpd's *content listener*, not in any of its five
+        parsers: the file writes a row code and a cell code and no closes at all, so the
+        bracketing — open the row, close the previous cell, pad the row out to the definition's
+        column count, consume the grid slots a vertical span already covers — is derived. Ported
+        into `WpdEventSink`, which is what turned `corel_wp6.wpd`'s tables from one run-on line
+        into the reference's grid. The two Macintosh formats keep their own simpler bracketing:
+        they carry no column definition for the machine to pad against, and their fixtures match
+        as they are.
+      - A tab before any text on a line is not a tab. WordPerfect expresses a paragraph's
+        first-line indent with the same codes it uses for a typed tab, and a back tab is a hanging
+        indent that never reaches the text at all.
+      - A note's anchor number and every other automatic number sit inline in the byte stream as
+        literal digits, bracketed by codes that say what they are. Read as text they come out as
+        bare digits glued to the neighbouring word.
+
+      6.x holds a footnote's body in a prefix packet elsewhere in the file, addressed by number
+      from the anchor; `Wp6PrefixData` reads the index and the block-split packet bodies, and the
+      note body parses as a document of its own.
+
+      **The one gap, measured**: `corel_wp6.wpd`'s markdown and html (both soft dimensions) differ
+      from upstream in a single hunk, where upstream's output carries a bold span across a
+      paragraph boundary that this port ends at it. libwpd re-emits the attribute bits at every
+      span it opens, so its stream repeats the attribute per paragraph; reproducing that in the
+      sink also reopened attributes inside table cells, which cost plain and tables parity on the
+      same fixture — so it was reverted and recorded here rather than traded for a hard-dimension
+      regression. Plain, json, metadata and tables all match.
+
+      **Also deliberately absent**: the Japanese character sets, which need libwpd's
+      31,936-entry Shift-JIS table; headers and footers, which libwpd routes through page spans
+      rather than the content listener and which no fixture in the corpus exercises.
+
 ## Excluded (dropped per requirements)
 
 - [-] OCR (Tesseract/Paddle/candle), doc orientation.

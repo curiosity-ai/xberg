@@ -119,14 +119,14 @@ internal static class Wp42Parser
             {
                 switch (value)
                 {
-                    case 0x92: sink.Open(WpdEventKind.StrikethroughStart); break;
-                    case 0x93: sink.Close(WpdEventKind.StrikethroughEnd); break;
-                    case 0x94: sink.Open(WpdEventKind.UnderlineStart); break;
-                    case 0x95: sink.Close(WpdEventKind.UnderlineEnd); break;
-                    case 0x9C: sink.Close(WpdEventKind.BoldEnd); break;
-                    case 0x9D: sink.Open(WpdEventKind.BoldStart); break;
-                    case 0xB2: sink.Open(WpdEventKind.ItalicStart); break;
-                    case 0xB3: sink.Close(WpdEventKind.ItalicEnd); break;
+                    case 0x92: sink.AttributeChange(WpdEventKind.StrikethroughStart, WpdEventKind.StrikethroughEnd, on: true); break;
+                    case 0x93: sink.AttributeChange(WpdEventKind.StrikethroughStart, WpdEventKind.StrikethroughEnd, on: false); break;
+                    case 0x94: sink.AttributeChange(WpdEventKind.UnderlineStart, WpdEventKind.UnderlineEnd, on: true); break;
+                    case 0x95: sink.AttributeChange(WpdEventKind.UnderlineStart, WpdEventKind.UnderlineEnd, on: false); break;
+                    case 0x9C: sink.AttributeChange(WpdEventKind.BoldStart, WpdEventKind.BoldEnd, on: false); break;
+                    case 0x9D: sink.AttributeChange(WpdEventKind.BoldStart, WpdEventKind.BoldEnd, on: true); break;
+                    case 0xB2: sink.AttributeChange(WpdEventKind.ItalicStart, WpdEventKind.ItalicEnd, on: true); break;
+                    case 0xB3: sink.AttributeChange(WpdEventKind.ItalicStart, WpdEventKind.ItalicEnd, on: false); break;
                     // Redline and shadow have no counterpart in the event stream.
                 }
             }
@@ -173,9 +173,9 @@ internal static class Wp42Parser
         while (end < reader.Length && reader.PeekAt(end) != 0xFF) end++;
         if (end - bodyStart <= 2) return;
 
-        sink.Open(WpdEventKind.HeaderStart);
+        sink.AttributeChange(WpdEventKind.HeaderStart, WpdEventKind.HeaderEnd, on: true);
         ParseBody(new WpdReader(reader.Slice(bodyStart, end - bodyStart)), sink);
-        sink.Close(WpdEventKind.HeaderEnd);
+        sink.AttributeChange(WpdEventKind.HeaderStart, WpdEventKind.HeaderEnd, on: false);
     }
 
     /// <summary>Position the cursor just past a group's closing byte.</summary>

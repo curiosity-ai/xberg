@@ -123,20 +123,20 @@ internal static class Wp1Parser
     {
         switch (function)
         {
-            case 0x92: sink.Open(WpdEventKind.StrikethroughStart); break;
-            case 0x93: sink.Close(WpdEventKind.StrikethroughEnd); break;
-            case 0x94: sink.Open(WpdEventKind.UnderlineStart); break;
-            case 0x95: sink.Close(WpdEventKind.UnderlineEnd); break;
-            case 0x9C: sink.Close(WpdEventKind.BoldEnd); break;
-            case 0x9D: sink.Open(WpdEventKind.BoldStart); break;
-            case 0xB2: sink.Open(WpdEventKind.ItalicStart); break;
-            case 0xB3: sink.Close(WpdEventKind.ItalicEnd); break;
+            case 0x92: sink.AttributeChange(WpdEventKind.StrikethroughStart, WpdEventKind.StrikethroughEnd, on: true); break;
+            case 0x93: sink.AttributeChange(WpdEventKind.StrikethroughStart, WpdEventKind.StrikethroughEnd, on: false); break;
+            case 0x94: sink.AttributeChange(WpdEventKind.UnderlineStart, WpdEventKind.UnderlineEnd, on: true); break;
+            case 0x95: sink.AttributeChange(WpdEventKind.UnderlineStart, WpdEventKind.UnderlineEnd, on: false); break;
+            case 0x9C: sink.AttributeChange(WpdEventKind.BoldStart, WpdEventKind.BoldEnd, on: false); break;
+            case 0x9D: sink.AttributeChange(WpdEventKind.BoldStart, WpdEventKind.BoldEnd, on: true); break;
+            case 0xB2: sink.AttributeChange(WpdEventKind.ItalicStart, WpdEventKind.ItalicEnd, on: true); break;
+            case 0xB3: sink.AttributeChange(WpdEventKind.ItalicStart, WpdEventKind.ItalicEnd, on: false); break;
             // Superscript and subscript are the one place this format is not symmetric: the
             // opening codes sit above the closing ones rather than beside them.
-            case 0xBC: sink.Open(WpdEventKind.SuperscriptStart); break;
-            case 0xB9: sink.Close(WpdEventKind.SuperscriptEnd); break;
-            case 0xBD: sink.Open(WpdEventKind.SubscriptStart); break;
-            case 0xB8: sink.Close(WpdEventKind.SubscriptEnd); break;
+            case 0xBC: sink.AttributeChange(WpdEventKind.SuperscriptStart, WpdEventKind.SuperscriptEnd, on: true); break;
+            case 0xB9: sink.AttributeChange(WpdEventKind.SuperscriptStart, WpdEventKind.SuperscriptEnd, on: false); break;
+            case 0xBD: sink.AttributeChange(WpdEventKind.SubscriptStart, WpdEventKind.SubscriptEnd, on: true); break;
+            case 0xB8: sink.AttributeChange(WpdEventKind.SubscriptStart, WpdEventKind.SubscriptEnd, on: false); break;
             // Redline, shadow and outline have no counterpart in the event stream.
         }
     }
@@ -164,9 +164,9 @@ internal static class Wp1Parser
                 int bodyStart = reader.Position;
                 if (length > 0 && length < int.MaxValue / 2)
                 {
-                    sink.Open(WpdEventKind.HeaderStart);
+                    sink.AttributeChange(WpdEventKind.HeaderStart, WpdEventKind.HeaderEnd, on: true);
                     ParseBody(new WpdReader(reader.Slice(bodyStart, (int)length)), sink, depth + 1);
-                    sink.Close(WpdEventKind.HeaderEnd);
+                    sink.AttributeChange(WpdEventKind.HeaderStart, WpdEventKind.HeaderEnd, on: false);
                 }
                 break;
             }

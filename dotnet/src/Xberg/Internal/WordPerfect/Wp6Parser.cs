@@ -47,7 +47,31 @@ internal static class Wp6Parser
     private const byte TopEolGroup = 0xD0;
     private const byte TopParagraphGroup = 0xD3;
     private const byte TopCharacterGroup = 0xD4;
+    private const byte TopFootnoteEndnoteGroup = 0xD7;
+    private const byte TopDisplayNumberReferenceGroup = 0xDA;
     private const byte TopTabGroup = 0xE0;
+
+    /// <summary>Set in a variable-length group's flags when prefix IDs follow.</summary>
+    private const byte VariableGroupPrefixIdBit = 0x80;
+
+    /// <summary>Set in a group's flags when the document wants the function ignored.</summary>
+    private const byte VariableGroupIgnoreBit = 0x40;
+
+    private const int TabBack = 0x00;
+    private const int TabTable = 0x01;
+    private const int TabBar = 0x04;
+    private const int TabCenter = 0x0A;
+    private const int TabRight = 0x12;
+    private const int TabDecimal = 0x1A;
+
+    private const byte FootnoteOn = 0x00;
+    private const byte FootnoteOff = 0x01;
+    private const byte EndnoteOn = 0x02;
+    private const byte EndnoteOff = 0x03;
+
+    private const byte CharacterGroupTableDefinitionOn = 0x2A;
+    private const byte CharacterGroupTableDefinitionOff = 0x2B;
+    private const byte CharacterGroupTableColumn = 0x2C;
 
     private const byte AttributeSuperscript = 5;
     private const byte AttributeSubscript = 6;
@@ -56,6 +80,26 @@ internal static class Wp6Parser
     private const byte AttributeStrikeOut = 13;
     private const byte AttributeUnderline = 14;
 
+    /// <summary>How deep a packet may pull in another before the nesting is refused.</summary>
+    /// <remarks>
+    /// Packets address each other by number, so nothing in the format stops one from naming
+    /// itself. The limit is generous enough that a note inside a boxed note inside a table
+    /// still reads, and small enough that a cycle cannot exhaust the stack.
+    /// </remarks>
+    private const int MaxPacketDepth = 8;
+
+    /// <summary>What the parse carries across a group boundary.</summary>
+    private sealed class Wp6State
+    {
+        public required Wp6PrefixData Prefix { get; init; }
+
+        /// <summary>How many packets deep this parse already is.</summary>
+        public int Depth { get; init; }
+
+        /// <summary>The packet holding the body of the note currently being read.</summary>
+        public int PendingNotePacket { get; set; }
+    }
+
     /// <summary>Parse a WordPerfect 6.x document into an event stream.</summary>
     public static WpdDocument Parse(byte[] bytes, WpdHeader header)
     {
@@ -63,12 +107,12 @@ internal static class Wp6Parser
         var sink = new WpdEventSink(document.Events);
         var reader = new WpdReader(bytes);
         reader.Seek((int)header.DocumentOffset);
-        ParseBody(reader, sink);
+        ParseBody(reader, sink, new Wp6State { Prefix = Wp6PrefixData.Read(bytes) });
         sink.Finish();
         return document;
     }
 
-    private static void ParseBody(WpdReader reader, WpdEventSink sink)
+    private static void ParseBody(WpdReader reader, WpdEventSink sink, Wp6State state)
     {
         while (!reader.AtEnd)
         {
@@ -92,7 +136,7 @@ internal static class Wp6Parser
             }
             else if (value <= 0xEF)
             {
-                ParseVariableLengthGroup(reader, sink, value);
+                ParseVariableLengthGroup(reader, sink, value, state);
             }
             else if (value < 0xFF)
             {
@@ -125,16 +169,19 @@ internal static class Wp6Parser
             // (0xBA-0xBC) are removed content that libwpd does not dispatch at all.
 
             case 0xBD: case 0xBE: case 0xBF:            // table off
-                sink.Emit(WpdEvent.Simple(WpdEventKind.TableEnd));
+                sink.EndTable();
                 break;
 
             case 0xC0: case 0xC1: case 0xC2:
             case 0xC3: case 0xC4: case 0xC5:            // table row
-                sink.Emit(WpdEvent.Simple(WpdEventKind.RowStart));
+                // The single-byte form exists only for a row with default values, and it
+                // carries the row's first cell with it — a row code is never on its own.
+                sink.InsertRow(header: false);
+                sink.InsertCell(1, 1);
                 break;
 
             case 0xC6:                                  // table cell
-                sink.Emit(WpdEvent.Simple(WpdEventKind.CellStart));
+                sink.InsertCell(1, 1);
                 break;
         }
     }
@@ -179,6 +226,89 @@ internal static class Wp6Parser
     }
 
     /// <summary>
+    /// What an end-of-line group's embedded sub-functions said about the row or cell it opens.
+    /// </summary>
+    private struct EolInfo
+    {
+        public bool IsHeaderRow;
+        public int ColSpan;
+        public int RowSpan;
+
+        /// <summary>Whether this grid slot is covered by a cell in an earlier row.</summary>
+        public bool BoundFromAbove;
+
+        public static EolInfo Default => new() { ColSpan = 1, RowSpan = 1 };
+    }
+
+    /// <summary>
+    /// Read the sub-functions packed into an end-of-line group's non-deletable data.
+    /// </summary>
+    /// <remarks>
+    /// A row or cell code carries its properties here rather than in fixed fields: the row's
+    /// header flag and a cell's spans are what decide the table's shape, so they have to be
+    /// read even though everything else in this block is presentation.
+    /// </remarks>
+    private static EolInfo ParseEolSubFunctions(WpdReader reader, int contentStart, int sizeNonDeletable)
+    {
+        var info = EolInfo.Default;
+
+        reader.Seek(contentStart);
+        int sizeDeletable = reader.ReadU16();
+        if (sizeDeletable > sizeNonDeletable) return info;
+        reader.Skip(sizeDeletable);
+
+        int end = contentStart + sizeNonDeletable;
+        while (reader.Position < end && !reader.AtEnd)
+        {
+            byte function = reader.ReadU8();
+            int after = reader.Position;
+            int size;
+
+            switch (function)
+            {
+                case 128:                                   // row information
+                    size = 5;
+                    byte rowFlags = reader.ReadU8();
+                    if ((rowFlags & 0x04) != 0) info.IsHeaderRow = true;
+                    break;
+
+                case 129:                                   // cell formula, length-prefixed
+                case 0x8E: case 0x8F:                       // undocumented, also length-prefixed
+                    size = reader.ReadU16();
+                    break;
+
+                case 130: case 131: size = 4; break;        // gutter spacing
+                case 132: size = 9; break;                  // cell information
+                case 133:                                   // cell spanning information
+                    size = 4;
+                    info.ColSpan = reader.ReadU8();
+                    info.RowSpan = reader.ReadU8();
+                    // A span of 128 or more is the marker for a slot the row above covers.
+                    if (info.ColSpan >= 128) info.BoundFromAbove = true;
+                    break;
+
+                case 134: size = 10; break;                 // cell fill colours
+                case 135: size = 6; break;                  // cell line colour
+                case 136: size = 6; break;                  // cell number type
+                case 137: size = 11; break;                 // cell floating point number
+                case 139: size = 3; break;                  // cell prefix flag
+                case 140: size = 3; break;                  // recalculation error number
+                case 141: size = 1; break;                  // don't end a paragraph style
+
+                default:
+                    // An unrecognised sub-function means the group is not what it claims to
+                    // be; libwpd abandons the whole group here rather than guessing a length.
+                    return info;
+            }
+
+            if (after + size - 1 < reader.Position) return info;
+            reader.Seek(after + size - 1);
+        }
+
+        return info;
+    }
+
+    /// <summary>
     /// Dispatch an end-of-line group by its subgroup.
     /// </summary>
     /// <remarks>
@@ -186,7 +316,7 @@ internal static class Wp6Parser
     /// family into subgroups of 0xD0, so treating the group as a single paragraph break turns
     /// every wrapped line into a paragraph and every table row into two.
     /// </remarks>
-    private static void ParseEolGroup(WpdEventSink sink, byte subGroup)
+    private static void ParseEolGroup(WpdEventSink sink, byte subGroup, in EolInfo info)
     {
         switch (subGroup)
         {
@@ -202,16 +332,16 @@ internal static class Wp6Parser
                 break;
 
             case 0x0A:
-                sink.Emit(WpdEvent.Simple(WpdEventKind.CellStart));
+                if (!info.BoundFromAbove) sink.InsertCell(info.ColSpan, info.RowSpan);
                 break;
 
             case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x0F: case 0x10:
-                sink.Emit(WpdEvent.Simple(WpdEventKind.RowStart));
-                sink.Emit(WpdEvent.Simple(WpdEventKind.CellStart));
+                sink.InsertRow(info.IsHeaderRow);
+                if (!info.BoundFromAbove) sink.InsertCell(info.ColSpan, info.RowSpan);
                 break;
 
             case 0x11: case 0x12: case 0x13:
-                sink.Emit(WpdEvent.Simple(WpdEventKind.TableEnd));
+                sink.EndTable();
                 break;
 
             // Column and page breaks (0x07-0x09, 0x1A, 0x1B) produce no text, and the deletable
@@ -224,24 +354,22 @@ internal static class Wp6Parser
         switch (attribute)
         {
             case AttributeBold:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.BoldStart : WpdEventKind.BoldEnd));
+                sink.AttributeChange(WpdEventKind.BoldStart, WpdEventKind.BoldEnd, on);
                 break;
             case AttributeItalics:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.ItalicStart : WpdEventKind.ItalicEnd));
+                sink.AttributeChange(WpdEventKind.ItalicStart, WpdEventKind.ItalicEnd, on);
                 break;
             case AttributeUnderline:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.UnderlineStart : WpdEventKind.UnderlineEnd));
+                sink.AttributeChange(WpdEventKind.UnderlineStart, WpdEventKind.UnderlineEnd, on);
                 break;
             case AttributeStrikeOut:
-                sink.Emit(WpdEvent.Simple(
-                    on ? WpdEventKind.StrikethroughStart : WpdEventKind.StrikethroughEnd));
+                sink.AttributeChange(WpdEventKind.StrikethroughStart, WpdEventKind.StrikethroughEnd, on);
                 break;
             case AttributeSuperscript:
-                sink.Emit(WpdEvent.Simple(
-                    on ? WpdEventKind.SuperscriptStart : WpdEventKind.SuperscriptEnd));
+                sink.AttributeChange(WpdEventKind.SuperscriptStart, WpdEventKind.SuperscriptEnd, on);
                 break;
             case AttributeSubscript:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.SubscriptStart : WpdEventKind.SubscriptEnd));
+                sink.AttributeChange(WpdEventKind.SubscriptStart, WpdEventKind.SubscriptEnd, on);
                 break;
         }
     }
@@ -255,12 +383,13 @@ internal static class Wp6Parser
     /// a note's body — rather than inline as 5.x does. Those packets are not read here, which is
     /// the one deliberate gap in this parser.
     /// </remarks>
-    private static void ParseVariableLengthGroup(WpdReader reader, WpdEventSink sink, byte group)
+    private static void ParseVariableLengthGroup(
+        WpdReader reader, WpdEventSink sink, byte group, Wp6State state)
     {
         int start = reader.Position;
 
         // Consistency first: the trailer has to agree before the header is trusted.
-        reader.Skip(1);
+        byte subGroup = reader.ReadU8();
         int size = reader.ReadU16();
         int trailer = start + size - 4;
         if (size == 0 || trailer + 2 >= reader.Length
@@ -271,24 +400,156 @@ internal static class Wp6Parser
             return;
         }
 
-        byte subGroup = (byte)reader.PeekAt(start);
+        byte flags = reader.ReadU8();
+        int firstPrefixId = 0;
+        if ((flags & VariableGroupPrefixIdBit) != 0)
+        {
+            int prefixIdCount = reader.ReadU8();
+            for (int i = 0; i < prefixIdCount; i++)
+            {
+                int prefixId = reader.ReadU16();
+                if (i == 0) firstPrefixId = prefixId;
+            }
+        }
+
+        int sizeNonDeletable = reader.ReadU16();
+        int contentStart = reader.Position;
+
+        // A non-deletable block claiming to be larger than the group, or with the high bit set,
+        // is corruption; libwpd abandons the group rather than reading past it.
+        bool contentsUsable = sizeNonDeletable <= size && (sizeNonDeletable & 0x8000) == 0;
+
         switch (group)
         {
             case TopTabGroup:
-                sink.Tab();
+                // A tab the document marked as ignored is a position record, not a tab stop
+                // anyone typed; emitting it indents a line that is not indented.
+                if ((flags & VariableGroupIgnoreBit) == 0) InsertTab(sink, subGroup);
+                break;
+
+            case TopDisplayNumberReferenceGroup:
+                // The subgroups pair up: an even one starts a number the document writes out
+                // literally, the odd one after it ends it. What lies between is the number
+                // itself, which belongs to whatever owns it rather than to the running text.
+                if ((subGroup & 1) == 0) sink.NumberTextOn();
+                else sink.NumberTextOff();
+                break;
+
+            case TopFootnoteEndnoteGroup:
+                switch (subGroup)
+                {
+                    case FootnoteOn:
+                    case EndnoteOn:
+                        sink.NoteOn();
+                        state.PendingNotePacket = firstPrefixId;
+                        break;
+                    case FootnoteOff: EmitNote(sink, state, endnote: false); break;
+                    case EndnoteOff: EmitNote(sink, state, endnote: true); break;
+                }
                 break;
 
             case TopEolGroup:
-                ParseEolGroup(sink, subGroup);
+            {
+                var info = contentsUsable
+                    ? ParseEolSubFunctions(reader, contentStart, sizeNonDeletable)
+                    : EolInfo.Default;
+                ParseEolGroup(sink, subGroup, info);
+                break;
+            }
+
+            case TopCharacterGroup:
+                if (contentsUsable) ParseCharacterGroup(reader, sink, subGroup, contentStart);
                 break;
 
-            // The paragraph and character groups carry justification, spacing, fonts and colour:
-            // formatting only, with no text and no structure the event stream models.
+            // The paragraph group carries justification and spacing: formatting only, with no
+            // text and no structure the event stream models.
             case TopParagraphGroup:
-            case TopCharacterGroup:
                 break;
         }
 
         reader.Seek(start + size - 1);
+    }
+
+    /// <summary>
+    /// Emit a note, pulling its body out of the packet the anchor named.
+    /// </summary>
+    /// <remarks>
+    /// The body is a WordPerfect document in its own right, so it is parsed the same way the
+    /// main body is — which is what lets a note hold its own formatting, and a table.
+    /// </remarks>
+    private static void EmitNote(WpdEventSink sink, Wp6State state, bool endnote)
+    {
+        int packetId = state.PendingNotePacket;
+        state.PendingNotePacket = 0;
+
+        sink.NoteBegin(endnote);
+
+        var body = packetId > 0 && state.Depth < MaxPacketDepth
+            ? state.Prefix.TextPacket(packetId)
+            : null;
+        if (body is { Length: > 0 })
+        {
+            ParseBody(
+                new WpdReader(body),
+                sink,
+                new Wp6State { Prefix = state.Prefix, Depth = state.Depth + 1 });
+        }
+
+        sink.NoteFinish();
+    }
+
+    /// <summary>
+    /// Emit a tab, or the indent it stands for.
+    /// </summary>
+    /// <remarks>
+    /// A tab before any text on the line is not a tab at all: WordPerfect uses the tab codes to
+    /// express a paragraph's first-line indent and its left margin, and only a tab that lands
+    /// mid-line is a tab stop the reader sees. Emitting the indent forms would put a stray tab
+    /// at the head of every indented paragraph.
+    /// </remarks>
+    private static void InsertTab(WpdEventSink sink, byte subGroup)
+    {
+        int type = (subGroup & 0xF8) >> 3;
+
+        // A back tab is a hanging indent; it is never a tab stop.
+        if (type == TabBack) return;
+
+        bool alwaysATab = type is TabTable or TabBar or TabCenter or TabRight or TabDecimal;
+        if (!sink.ParagraphStarted && !alwaysATab) return;
+
+        sink.Tab();
+
+        // A bar tab draws a vertical rule, which has no character of its own.
+        if (type == TabBar) sink.Character('|');
+    }
+
+    /// <summary>
+    /// Dispatch a character group by its subgroup.
+    /// </summary>
+    /// <remarks>
+    /// Most of this group is font and colour changes the event stream does not model. What it
+    /// does carry is the table definition — the columns a table has, which is what tells a later
+    /// row how wide it should be and which of its slots a vertical span already covers.
+    /// </remarks>
+    private static void ParseCharacterGroup(
+        WpdReader reader, WpdEventSink sink, byte subGroup, int contentStart)
+    {
+        switch (subGroup)
+        {
+            case CharacterGroupTableDefinitionOn:
+                sink.DefineTable();
+                break;
+
+            case CharacterGroupTableColumn:
+                sink.DefineTableColumn();
+                break;
+
+            case CharacterGroupTableDefinitionOff:
+                // The definition is complete, so the table itself opens here.
+                sink.StartTable();
+                break;
+        }
+
+        reader.Seek(contentStart);
     }
 }

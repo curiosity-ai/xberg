@@ -146,9 +146,11 @@ internal static class Wp3Parser
 
             case AttributeGroup:
             {
-                // The subgroup says whether the attribute turns on or off.
-                byte subGroup = reader.ReadU8();
-                Attribute(sink, reader.ReadU8(), on: subGroup == 0);
+                // The attribute comes first and its state second; the low bit of the state is
+                // what says on or off.
+                byte attribute = reader.ReadU8();
+                byte state = reader.ReadU8();
+                Attribute(sink, attribute, on: (state & 0x01) == 0x01);
                 break;
             }
 
@@ -169,24 +171,22 @@ internal static class Wp3Parser
         switch (attribute)
         {
             case AttributeBold:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.BoldStart : WpdEventKind.BoldEnd));
+                sink.AttributeChange(WpdEventKind.BoldStart, WpdEventKind.BoldEnd, on);
                 break;
             case AttributeItalics:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.ItalicStart : WpdEventKind.ItalicEnd));
+                sink.AttributeChange(WpdEventKind.ItalicStart, WpdEventKind.ItalicEnd, on);
                 break;
             case AttributeUnderline:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.UnderlineStart : WpdEventKind.UnderlineEnd));
+                sink.AttributeChange(WpdEventKind.UnderlineStart, WpdEventKind.UnderlineEnd, on);
                 break;
             case AttributeStrikeOut:
-                sink.Emit(WpdEvent.Simple(
-                    on ? WpdEventKind.StrikethroughStart : WpdEventKind.StrikethroughEnd));
+                sink.AttributeChange(WpdEventKind.StrikethroughStart, WpdEventKind.StrikethroughEnd, on);
                 break;
             case AttributeSuperscript:
-                sink.Emit(WpdEvent.Simple(
-                    on ? WpdEventKind.SuperscriptStart : WpdEventKind.SuperscriptEnd));
+                sink.AttributeChange(WpdEventKind.SuperscriptStart, WpdEventKind.SuperscriptEnd, on);
                 break;
             case AttributeSubscript:
-                sink.Emit(WpdEvent.Simple(on ? WpdEventKind.SubscriptStart : WpdEventKind.SubscriptEnd));
+                sink.AttributeChange(WpdEventKind.SubscriptStart, WpdEventKind.SubscriptEnd, on);
                 break;
         }
     }
