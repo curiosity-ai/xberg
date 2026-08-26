@@ -45,6 +45,45 @@ if (args.Length >= 2 && args[0] == "--dump-metadata")
     return 0;
 }
 
+// Styled-HTML probe mode: `--dump-styled-html <file>...` renders each file through
+// `StyledHtmlRenderer` under every configuration `tools/htmlstyled-probe` covers, printing the
+// same JSON shape so the two can be diffed byte for byte.
+if (args.Length >= 2 && args[0] == "--dump-styled-html")
+{
+    var cases = new (string Name, HtmlOutputConfig Config)[]
+    {
+        ("unstyled-embed", new HtmlOutputConfig()),
+        ("default-embed", new HtmlOutputConfig { Theme = HtmlTheme.Default }),
+        ("github-embed", new HtmlOutputConfig { Theme = HtmlTheme.GitHub }),
+        ("dark-embed", new HtmlOutputConfig { Theme = HtmlTheme.Dark }),
+        ("light-embed", new HtmlOutputConfig { Theme = HtmlTheme.Light }),
+        ("default-noembed", new HtmlOutputConfig { Theme = HtmlTheme.Default, EmbedCss = false }),
+        ("unstyled-prefix", new HtmlOutputConfig { ClassPrefix = "zz-" }),
+        ("unstyled-usercss", new HtmlOutputConfig { Css = ".kb-p { color: red; }" }),
+    };
+    var probe = new System.Text.Json.Nodes.JsonObject();
+    var probeExtractor = new Extractor();
+    for (int i = 1; i < args.Length; i++)
+    {
+        var perCase = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (name, html) in cases)
+        {
+            var cfg = new ExtractionConfig { OutputFormat = OutputFormat.Html, HtmlOutput = html };
+            string content;
+            try
+            {
+                var r = probeExtractor.Extract(ExtractInput.FromUri(args[i]), cfg);
+                content = r.Results.FirstOrDefault()?.Content ?? "";
+            }
+            catch (Exception e) { content = $"<<error: {e.Message}>>"; }
+            perCase[name] = content;
+        }
+        probe[args[i]] = perCase;
+    }
+    Console.Out.Write(probe.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // Table dump mode: `--dump-tables <file>` prints the C# tables as JSON, so a mismatch can be
 // diffed cell-by-cell against the golden's `tables` array.
 if (args.Length >= 2 && args[0] == "--dump-tables")

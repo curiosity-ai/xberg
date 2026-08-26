@@ -95,6 +95,14 @@ public sealed class ExtractionConfig
     public SecurityLimits? SecurityLimits { get; set; }
 
     /// <summary>
+    /// How <c>OutputFormat.Html</c> is rendered. <c>null</c> keeps the markdown-based renderer;
+    /// setting it selects <see cref="Xberg.Rendering.StyledHtmlRenderer"/>.
+    /// </summary>
+    [JsonPropertyName("html_output")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public HtmlOutputConfig? HtmlOutput { get; set; }
+
+    /// <summary>
     /// The input's file name, when the caller knows it. Used to fall back to extension-based
     /// language detection where content-based detection — a shebang — says nothing.
     /// </summary>

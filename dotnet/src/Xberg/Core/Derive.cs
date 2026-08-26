@@ -15,7 +15,9 @@ namespace Xberg.Core;
 /// </summary>
 public static class Derive
 {
-    public static ExtractedDocument DeriveExtractionResult(InternalDocument doc, bool includeDocumentStructure, OutputFormat outputFormat)
+    public static ExtractedDocument DeriveExtractionResult(
+        InternalDocument doc, bool includeDocumentStructure, OutputFormat outputFormat,
+        HtmlOutputConfig? htmlOutput = null)
     {
         ResolveRelationships(doc);
 
@@ -25,7 +27,7 @@ public static class Derive
             ? doc.MimeType
             : SourceFormatToMimeType(doc.SourceFormat);
 
-        string? formatted = RenderFormatted(doc, outputFormat);
+        string? formatted = RenderFormatted(doc, outputFormat, htmlOutput);
 
         List<PageContent>? pages = doc.PrebuiltPages ?? BuildPages(doc);
 
@@ -55,7 +57,8 @@ public static class Derive
         return result;
     }
 
-    private static string? RenderFormatted(InternalDocument doc, OutputFormat outputFormat)
+    private static string? RenderFormatted(
+        InternalDocument doc, OutputFormat outputFormat, HtmlOutputConfig? htmlOutput)
     {
         switch (outputFormat.Which)
         {
@@ -71,7 +74,12 @@ public static class Derive
                     return doc.PreRenderedContent;
                 return DjotRenderer.Render(doc);
             case OutputFormat.Kind.Html:
-                return HtmlRenderer.Render(doc);
+                // A caller who supplied an html_output config asked for the styled renderer;
+                // without one the markdown-based renderer stays, which is what the goldens
+                // measure and what upstream does when the config is `None`.
+                return htmlOutput is null
+                    ? HtmlRenderer.Render(doc)
+                    : new StyledHtmlRenderer(htmlOutput).Render(doc);
             case OutputFormat.Kind.Json:
                 return JsonRenderer.Render(doc);
             default:
