@@ -22,6 +22,44 @@ internal static class Program
 {
     private sealed record ReferenceTensor(string File, string Dtype, int[] Shape);
 
+    /// <summary>
+    /// An input of the right shape and type for a timing run.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A benchmark measures time, and the time a convolution takes does not depend on the
+    /// numbers going through it — so it needs the shape the graph declares, not the reference's
+    /// own values. Requiring a reference dump for a timing run means regenerating hundreds of
+    /// megabytes of intermediates before anyone can measure a kernel change.
+    /// </para>
+    /// <para>
+    /// A symbolic dimension becomes 1: it is the batch, and one page is the unit the numbers in
+    /// the README are quoted in. Integer inputs are filled with the page size a detector expects
+    /// rather than zeros, because a zero-size page can take a short path through the decode and
+    /// time something the real graph never does.
+    /// </para>
+    /// </remarks>
+    private static Tensor SyntheticFeed(OnnxValueInfo input)
+    {
+        int[] shape = input.Shape.Length > 0
+            ? input.Shape.Select(d => d <= 0 ? 1 : d).ToArray()
+            : [1];
+
+        if (input.ElementType == ElementType.Float)
+        {
+            var tensor = Tensor.AllocateFloat(shape);
+            // A mid-grey page: the values do not matter, but a buffer of zeros can be
+            // denormal-free in a way real activations are not.
+            Array.Fill(tensor.Floats, 0.5f);
+            return tensor;
+        }
+
+        var integral = Tensor.AllocateLong(input.ElementType, shape);
+        Array.Fill(integral.Longs, 640L);
+        return integral;
+    }
+
+
     private sealed record NodeInfo(int Index, string Name, string OpType, string[] Inputs, string[] Outputs);
 
     /// <summary>Warm-up executions discarded before timing anything.</summary>
@@ -343,10 +381,18 @@ internal static class Program
             return 0;
         }
 
-        if (modelPath is null || referenceDir is null)
+        // A benchmark needs a graph and inputs of the right shape, not the reference's own
+        // numbers: it measures time, and time does not depend on the values. Requiring a
+        // reference dump for it means regenerating hundreds of megabytes of intermediates
+        // before anyone can measure a kernel change.
+        bool needsReference = referenceDir is not null || benchmarkRuns == 0;
+
+        if (modelPath is null || (needsReference && referenceDir is null))
         {
             Console.Error.WriteLine(
                 "usage: xberg-onnx-parity --model MODEL.onnx --reference REF_DIR [--atol A] [--rtol R] [--limit N] [--list-ops]");
+            Console.Error.WriteLine(
+                "       xberg-onnx-parity --model MODEL.onnx --benchmark N   (no reference needed)");
             return 2;
         }
 
@@ -363,31 +409,41 @@ internal static class Program
             return 0;
         }
 
-        using var manifestStream = File.OpenRead(Path.Combine(referenceDir, "manifest.json"));
-        using var manifest = JsonDocument.Parse(manifestStream);
-        var root = manifest.RootElement;
-
         var tensors = new Dictionary<string, ReferenceTensor>(StringComparer.Ordinal);
-        foreach (var property in root.GetProperty("tensors").EnumerateObject())
-        {
-            var value = property.Value;
-            tensors[property.Name] = new ReferenceTensor(
-                value.GetProperty("file").GetString()!,
-                value.GetProperty("dtype").GetString()!,
-                value.GetProperty("shape").EnumerateArray().Select(d => d.GetInt32()).ToArray());
-        }
-
-        // Feed the exact inputs the reference ran with, so any divergence is the runtime's.
         var feeds = new Dictionary<string, Tensor>(StringComparer.Ordinal);
-        foreach (var input in root.GetProperty("graph_inputs").EnumerateArray())
+        JsonDocument? manifest = null;
+
+        if (referenceDir is not null)
         {
-            string name = input.GetProperty("name").GetString()!;
-            if (!tensors.TryGetValue(name, out var reference))
+            using var manifestStream = File.OpenRead(Path.Combine(referenceDir, "manifest.json"));
+            manifest = JsonDocument.Parse(manifestStream);
+            var root = manifest.RootElement;
+
+            foreach (var property in root.GetProperty("tensors").EnumerateObject())
             {
-                Console.Error.WriteLine($"reference dump has no tensor for input '{name}'");
-                return 3;
+                var value = property.Value;
+                tensors[property.Name] = new ReferenceTensor(
+                    value.GetProperty("file").GetString()!,
+                    value.GetProperty("dtype").GetString()!,
+                    value.GetProperty("shape").EnumerateArray().Select(d => d.GetInt32()).ToArray());
             }
-            feeds[name] = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+
+            // Feed the exact inputs the reference ran with, so any divergence is the runtime's.
+            foreach (var input in root.GetProperty("graph_inputs").EnumerateArray())
+            {
+                string name = input.GetProperty("name").GetString()!;
+                if (!tensors.TryGetValue(name, out var reference))
+                {
+                    Console.Error.WriteLine($"reference dump has no tensor for input '{name}'");
+                    return 3;
+                }
+                feeds[name] = NpyFile.Load(Path.Combine(referenceDir, reference.File));
+            }
+        }
+        else
+        {
+            foreach (var input in model.FeedInputs)
+                feeds[input.Name] = SyntheticFeed(input);
         }
 
         // Fusion removes the intermediate values the per-node comparison is built on, so the

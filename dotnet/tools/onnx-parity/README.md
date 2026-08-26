@@ -126,6 +126,16 @@ For the same reason `--gemm` can run in the same process as `--benchmark`, so an
 and a standalone rate for the same shape are comparable at all, and `compare_speed.py` runs
 ONNX Runtime and this runtime back to back rather than against a figure recorded earlier.
 
+`--benchmark` needs no reference dump. A timing run measures time, and the time a convolution
+takes does not depend on the numbers going through it, so the harness synthesises inputs from
+the shapes the graph declares — a symbolic batch dimension becomes 1. Requiring the reference
+meant regenerating hundreds of megabytes of promoted intermediates before anyone could measure
+a kernel change, which is enough friction to stop the measurement happening at all:
+
+```bash
+dotnet run --project tools/Xberg.OnnxParity -c Release -- --model rtdetr.onnx --benchmark 3
+```
+
 **Cold code measures the compiler.** .NET starts methods in a quick-JIT tier and promotes
 them only after roughly thirty calls, and this graph also has to fault in 169 MB of weights
 and spin up the thread pool. Every benchmark discards three full inference passes first.
@@ -268,15 +278,36 @@ At ~1.8x, the arithmetic-bound nodes run at 185-190 GFLOP/s and the best single 
 270-300, so the spread across shapes is now the largest remaining term rather than the peak.
 Convolution is still ~60% of runtime.
 
-The known routes from here, in rough order of expected value:
+The known routes from here, in rough order of expected value — **revised 2026-08-26 against a
+fresh per-node profile**, which contradicts what was written here before:
 
-- **A direct convolution for small-channel layers.** For a 3x3 layer with 32 or 64 output
-  channels the packed panel holds each input pixel nine times, and each packed float is used
-  for only `2m` flops, so the expansion stops paying for itself. A kernel that reads a shifted
-  window of the image directly, the way oneDNN's do, would not write the expansion at all.
+- **Shallow-reduction convolutions, which means 1x1 with a large channel count.** These are the
+  slowest shapes in the graph by a wide margin, not the small-channel 3x3 layers this list
+  used to name first:
+
+  | node | output | rate |
+  | --- | --- | --- |
+  | `res_layers.2/blocks.0/branch2c` (1x1, k=256) | `[1,1024,40,40]` | 113 GFLOP/s |
+  | `res_layers.2/blocks.0/short` (1x1, k=512) | `[1,1024,40,40]` | 128 GFLOP/s |
+  | `fpn_blocks.1/bottlenecks.0` (3x3, k=2304) | `[1,256,80,80]` | 349 GFLOP/s |
+  | `backbone/conv1/conv1_3` (3x3, 64 channels) | `[1,64,320,320]` | 277 GFLOP/s |
+
+  The pattern is `k`. A 1x1 layer reduces over 256 or 512 elements where a 3x3 over the same
+  channel count reduces over nine times as many, so the fixed cost of each output tile — the
+  register-block prologue and the accumulator store — is amortised nine times worse. The panel
+  sizes and the packing are not the difference: the 3x3 shape above packs a 14 MB panel, far
+  past L2, and still runs three times faster.
+
+  Note what this rules out. The small-channel 3x3 layers the previous entry named first run at
+  195-277 GFLOP/s, mid-pack; a direct convolution avoiding the nine-fold `im2col` expansion
+  would be attacking shapes that are not the problem.
 - Beyond that: software prefetch hints and hand-scheduled instruction order, which C# cannot
   express, and MLAS's per-CPU kernel variants selected at run time, where this has one AVX-512
   path and one portable path.
+
+Also worth recording, because it bounds what any of this can buy: `Conv` is 61% of the graph
+and `MatMul` 14%, and 1,649 of the 2,315 nodes take under 10 us each — together 0.2% of
+runtime. There is nothing left to win outside the two matrix operators.
 
 ## Two bugs this caught
 

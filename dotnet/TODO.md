@@ -1527,11 +1527,22 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       rejected, and how to measure anything at all on a VM whose host throughput moves by 2x
       between runs, is recorded in `tools/onnx-parity/README.md`.
 
-      The routes still open, in rough order of expected value: a direct convolution for
-      small-channel layers, where the nine-fold im2col expansion stops paying for itself;
-      in-place unary operators, since the session already knows which values die at each node;
-      and a specialised max-pooling path. Past those it is what C# cannot express — prefetch
-      hints and hand-scheduled assembly — plus MLAS's per-CPU kernel variants.
+      **Re-profiled 2026-08-26, and the finding overturns the route that was recorded here.**
+      The slowest shapes are 1x1 convolutions with a large channel count — 113 and 128 GFLOP/s
+      — not the small-channel 3x3 layers this entry used to name first, which run at 195-277
+      while the deep 3x3 layers reach 349. The pattern is the reduction depth: a 1x1 reduces
+      over 256 or 512 elements where a 3x3 over the same channels reduces over nine times as
+      many, so each output tile's prologue and accumulator store are amortised nine times
+      worse. A direct convolution avoiding the im2col expansion would be attacking shapes that
+      are not the problem. Full table in `tools/onnx-parity/README.md`.
+
+      Two things bound what any of this can buy: `Conv` is 61% of the graph and `MatMul` 14%,
+      and 1,649 of the 2,315 nodes take under 10 us each — 0.2% of runtime between them.
+
+      `--benchmark` no longer needs a reference dump: a timing run measures time, and time does
+      not depend on the numbers, so inputs are synthesised from the shapes the graph declares.
+      Requiring hundreds of megabytes of promoted intermediates before anyone could measure a
+      kernel change was enough friction to stop the measurement happening.
 - [ ] **Page rasterisation.** The blocker for end-to-end use, and assessed rather than
       assumed: layout detection needs a rendered page bitmap, and the C# port has no PDF
       renderer. Upstream reaches one through pdf_oxide — 21,560 lines under `src/rendering/`

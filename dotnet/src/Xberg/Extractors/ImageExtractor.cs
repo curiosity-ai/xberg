@@ -100,7 +100,9 @@ public sealed class ImageExtractor : IExtractor
             Width = info.Width,
             Height = info.Height,
             Format = "HEIF",
-            Exif = info.Exif is { Length: > 0 } exif ? ExifReader.Extract(ReadExifProfile(exif)) : null,
+            // A file with no EXIF item yields an empty map, the same as a raster image
+            // whose profile is absent.
+            Exif = ExifReader.Extract(info.Exif is { Length: > 0 } exif ? ReadExifProfile(exif) : null),
         };
     }
 

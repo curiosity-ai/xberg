@@ -108,6 +108,17 @@ internal sealed class OnnxValueInfo
 {
     public string Name = "";
     public ElementType ElementType;
+
+    /// <summary>
+    /// The declared shape, with a dimension the export left symbolic recorded as -1.
+    /// </summary>
+    /// <remarks>
+    /// A traced export names the batch dimension rather than fixing it, so a graph input's
+    /// shape is a contract with a hole in it. Recording the hole rather than guessing a number
+    /// lets a caller that needs a concrete shape choose one and a caller that does not ignore
+    /// it. Empty when the export declared no shape at all.
+    /// </remarks>
+    public int[] Shape = [];
 }
 
 /// <summary>A parsed ONNX model: the graph, its constants, and its declared boundary.</summary>
@@ -308,32 +319,69 @@ internal sealed class OnnxModel
             switch (f)
             {
                 case 1 when w == WireType.LengthDelimited: info.Name = r.ReadString(); break;
-                case 2 when w == WireType.LengthDelimited: info.ElementType = ParseTypeProto(r.ReadBytes()); break;
+                case 2 when w == WireType.LengthDelimited:
+                    (info.ElementType, info.Shape) = ParseTypeProto(r.ReadBytes());
+                    break;
                 default: r.SkipField(w); break;
             }
         }
         return info;
     }
 
-    /// <summary>Element type of a <c>TypeProto</c>. Only the tensor case appears in these graphs.</summary>
-    private static ElementType ParseTypeProto(ReadOnlySpan<byte> bytes)
+    /// <summary>
+    /// Element type and shape of a <c>TypeProto</c>. Only the tensor case appears in these graphs.
+    /// </summary>
+    private static (ElementType Type, int[] Shape) ParseTypeProto(ReadOnlySpan<byte> bytes)
     {
         var r = new ProtoReader(bytes);
         while (r.TryReadTag(out int f, out var w))
         {
             if (f == 1 && w == WireType.LengthDelimited)
             {
+                var type = ElementType.Undefined;
+                int[] shape = [];
                 var inner = new ProtoReader(r.ReadBytes());
                 while (inner.TryReadTag(out int g, out var iw))
                 {
-                    if (g == 1 && iw == WireType.Varint) return (ElementType)inner.ReadInt32();
-                    inner.SkipField(iw);
+                    switch (g)
+                    {
+                        case 1 when iw == WireType.Varint: type = (ElementType)inner.ReadInt32(); break;
+                        case 2 when iw == WireType.LengthDelimited: shape = ParseShape(inner.ReadBytes()); break;
+                        default: inner.SkipField(iw); break;
+                    }
                 }
-                return ElementType.Undefined;
+                return (type, shape);
             }
             r.SkipField(w);
         }
-        return ElementType.Undefined;
+        return (ElementType.Undefined, []);
+    }
+
+    /// <summary>Decode a <c>TensorShapeProto</c>, recording a symbolic dimension as -1.</summary>
+    private static int[] ParseShape(ReadOnlySpan<byte> bytes)
+    {
+        var dims = new List<int>();
+        var r = new ProtoReader(bytes);
+        while (r.TryReadTag(out int f, out var w))
+        {
+            if (f != 1 || w != WireType.LengthDelimited)
+            {
+                r.SkipField(w);
+                continue;
+            }
+
+            int value = -1;
+            var dim = new ProtoReader(r.ReadBytes());
+            while (dim.TryReadTag(out int g, out var dw))
+            {
+                // Field 1 is a fixed value; field 2 is a name, which is what a traced export
+                // writes for the batch dimension.
+                if (g == 1 && dw == WireType.Varint) value = (int)dim.ReadInt64();
+                else dim.SkipField(dw);
+            }
+            dims.Add(value);
+        }
+        return dims.ToArray();
     }
 
     /// <summary>

@@ -427,7 +427,7 @@ internal static class HeifContainer
         long value = 0;
         for (int i = 0; i < size; i++)
         {
-            value = (value << 8) | (p < bytes.Length ? bytes[p] : 0);
+            value = (value << 8) | (p < bytes.Length ? bytes[p] : (byte)0);
             p++;
         }
         return value;
