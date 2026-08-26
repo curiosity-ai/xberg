@@ -22,32 +22,42 @@ internal sealed class WpdEventSink
     private readonly List<WpdEvent> _events;
     private readonly StringBuilder _pending = new();
 
+    /// <summary>
+    /// While set, everything the parser emits is discarded.
+    /// </summary>
+    /// <remarks>
+    /// WordPerfect keeps deleted text in the file, bracketed as invalid, so that an undo can
+    /// bring it back. It is still there to be read, and reading it puts text the author removed
+    /// into the extraction.
+    /// </remarks>
+    public bool Discarding { get; set; }
+
     public WpdEventSink(List<WpdEvent> events) => _events = events;
 
     /// <summary>Append one character to the current run.</summary>
-    public void Character(char value) => _pending.Append(value);
+    public void Character(char value) { if (!Discarding) _pending.Append(value); }
 
     /// <summary>Append one Unicode scalar, which may need a surrogate pair.</summary>
     public void Scalar(int scalar)
     {
-        if (scalar <= 0) return;
+        if (Discarding || scalar <= 0) return;
         if (System.Text.Rune.IsValid(scalar)) _pending.Append(new System.Text.Rune(scalar).ToString());
     }
 
     /// <summary>Append a whole run at once.</summary>
-    public void Text(string text) => _pending.Append(text);
+    public void Text(string text) { if (!Discarding) _pending.Append(text); }
 
-    public void Tab() { Flush(); _events.Add(WpdEvent.Simple(WpdEventKind.Tab)); }
+    public void Tab() { if (Discarding) return; Flush(); _events.Add(WpdEvent.Simple(WpdEventKind.Tab)); }
 
-    public void LineBreak() { Flush(); _events.Add(WpdEvent.Simple(WpdEventKind.LineBreak)); }
+    public void LineBreak() { if (Discarding) return; Flush(); _events.Add(WpdEvent.Simple(WpdEventKind.LineBreak)); }
 
-    public void ParagraphEnd() { Flush(); _events.Add(WpdEvent.Simple(WpdEventKind.ParagraphEnd)); }
+    public void ParagraphEnd() { if (Discarding) return; Flush(); _events.Add(WpdEvent.Simple(WpdEventKind.ParagraphEnd)); }
 
-    public void Open(WpdEventKind kind) { Flush(); _events.Add(WpdEvent.Simple(kind)); }
+    public void Open(WpdEventKind kind) { if (Discarding) return; Flush(); _events.Add(WpdEvent.Simple(kind)); }
 
-    public void Close(WpdEventKind kind) { Flush(); _events.Add(WpdEvent.Simple(kind)); }
+    public void Close(WpdEventKind kind) { if (Discarding) return; Flush(); _events.Add(WpdEvent.Simple(kind)); }
 
-    public void Emit(WpdEvent e) { Flush(); _events.Add(e); }
+    public void Emit(WpdEvent e) { if (Discarding) return; Flush(); _events.Add(e); }
 
     /// <summary>Push any buffered characters out as one text event.</summary>
     public void Flush()

@@ -31,6 +31,7 @@ internal static class WordPerfectReader
         {
             WpdFormat.Wp42 => Wp42Parser.Parse(bytes),
             WpdFormat.Wp5 => Wp5Parser.Parse(bytes, header!),
+            WpdFormat.Wp6 => Wp6Parser.Parse(bytes, header!),
             var other => throw new WpdParseException(
                 other == WpdFormat.Unknown
                     ? "Failed to read WordPerfect document: unrecognised format"
