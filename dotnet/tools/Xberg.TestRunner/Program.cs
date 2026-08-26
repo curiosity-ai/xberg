@@ -89,6 +89,47 @@ if (args.Length >= 2 && args[0] == "--dump-qr")
     return 0;
 }
 
+// YOLO probe mode: `--dump-yolo <image> <variant>=<model.onnx>...` runs the ported YOLO
+// wrapper over each model and prints what it decoded, in the same JSON shape as
+// `tools/yolo-probe`, so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-yolo")
+{
+    using var page = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[1]);
+    var byVariant = new System.Text.Json.Nodes.JsonObject();
+
+    for (int i = 2; i < args.Length; i++)
+    {
+        int split = args[i].IndexOf('=');
+        string name = args[i][..split];
+        string path = args[i][(split + 1)..];
+
+        var (variant, width, height) = name switch
+        {
+            "doclaynet" => (Xberg.Internal.Layout.YoloVariant.DocLayNet, 640, 640),
+            "docstructbench" => (Xberg.Internal.Layout.YoloVariant.DocStructBench, 1024, 1024),
+            "yolox" => (Xberg.Internal.Layout.YoloVariant.Yolox, 768, 1024),
+            _ => throw new ArgumentException($"unknown variant {name}"),
+        };
+
+        var model = Xberg.Internal.Layout.YoloModel.FromFile(path, variant, width, height, name);
+        var found = new System.Text.Json.Nodes.JsonArray();
+        foreach (var detection in model.Detect(page))
+            found.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["class"] = Xberg.Internal.Layout.LayoutClassExtensions.WireName(detection.ClassName),
+                ["confidence"] = detection.Confidence,
+                ["x1"] = detection.Box.X1,
+                ["y1"] = detection.Box.Y1,
+                ["x2"] = detection.Box.X2,
+                ["y2"] = detection.Box.Y2,
+            });
+        byVariant[name] = found;
+    }
+
+    Console.Out.Write(byVariant.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // WordPerfect probe mode: `--dump-wpd <file>...` parses each document with the managed
 // WordPerfect reader and prints the event stream plus the plain text it renders to, so both can
 // be diffed against what libwpd produced.

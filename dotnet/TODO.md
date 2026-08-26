@@ -1567,8 +1567,32 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
 - [x] **SLANeXt** ported 2026-08-26 (`Internal/Layout/SlanetModel.cs`), with nine decode tests
       for the token walk. Verified against ONNX Runtime per node: all 1035 graph values match and
       both declared outputs match, worst absolute difference 1.3e-4.
-- [ ] **YOLO wrapper.** The letterbox preprocessing and greedy NMS it needs are in place; the
-      model wrapper itself is not ported.
+- [x] **YOLO wrapper** ported 2026-08-26 (`Internal/Layout/YoloModel.cs`), covering all three
+      families the Rust supports: YOLOv10/v8 on DocLayNet, DocLayout-YOLO on DocStructBench, and
+      YOLOX with its grid decoding.
+
+      There is no model to test it against — nothing YOLO is pinned in the model manager, and the
+      Rust reaches these only through `ModelBackend::Custom` with a caller's own file. So the
+      comparison uses synthetic ONNX files whose single output is a fixed tensor: both sides then
+      run the *same* numbers through their own decode, which is the half that differs. Over the
+      three variants that is **5,636 detections agreeing** on class, confidence and every
+      coordinate, worst delta 4.8e-5 — one float ulp at those magnitudes, i.e. JSON round-tripping.
+      `tools/yolo-probe` drives the real `YoloModel` through the public `LayoutEngine`.
+
+      What the comparison had to get right, and unit tests now pin: the YOLOX anchor grid is
+      walked finest-stride-first and row-major, which is what ties output row *i* to a place on
+      the page; a six-column output is already suppressed by the export and a wider one is not;
+      and a tie between class scores keeps the earlier class, which is also what leaves an
+      all-zero row scoring zero instead of reading as a confident class 0.
+- [x] **Layout engine facade** ported 2026-08-26 (`Internal/Layout/LayoutEngine.cs`) from
+      `layout/engine.rs`: backend selection, a confidence-threshold override, the heuristics
+      toggle, and batching where the model supports it. The model differences — one wants the
+      page size alongside the pixels, one decodes anchors against a grid, one is already free of
+      duplicates — stop at this boundary.
+
+      Not ported, and deliberately: `layout/mod.rs`'s session pool and `inference_timings.rs`.
+      Both are about *when* a model is loaded and how long it took, not about what comes out;
+      the C# runtime is in-process with no ORT session to pool.
 - [x] **Layout-aware reading order** — `extractors/pdf/reading_order.rs` ported 2026-08-26
       (`Internal/Layout/ReadingOrder.cs`), together with the rotation-aware assembly in
       `rotation.rs`. Verified by porting upstream's own test module: 58 of its 59 tests, fixture

@@ -1,0 +1,23 @@
+# Probe crate for the C# port: runs the real `YoloModel` — through the public `LayoutEngine`
+# with a custom model path — over a set of ONNX files whose single output is a fixed tensor, so
+# what is compared is the decode path rather than the arithmetic of a convolution. No YOLO model
+# is pinned in the model manager, so there is no real one to run: the synthetic ones stand in.
+# Not part of the xberg workspace.
+[workspace]
+
+[package]
+name = "yolo-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "yolo-probe"
+path = "src/main.rs"
+
+[dependencies]
+xberg = { path = "../../../crates/xberg", default-features = false, features = [
+    "layout-detection",
+] }
+image = "0.25"
+serde_json = "1"
