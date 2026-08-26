@@ -34,6 +34,10 @@ extended = [
 # downloads model weights, so it is only worth building when the layout path is what is
 # being measured.
 layout = ["xberg/layout-detection"]
+# WordPerfect via the vendored libwpd/librevenge C++ shim. Kept separate because it needs a C++
+# toolchain and vendors boost; it exists so the managed reimplementation has a reference to be
+# measured against.
+wordperfect = ["xberg/wordperfect"]
 
 [dependencies]
 xberg = { path = "../../../crates/xberg", default-features = false, features = [
