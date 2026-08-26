@@ -62,8 +62,8 @@ internal static class HeifContainer
     /// <summary>Read the primary image's dimensions and EXIF, or <c>null</c> if they are absent.</summary>
     public static HeifImageInfo? TryRead(byte[] bytes)
     {
-        var meta = FindBox(bytes, 0, bytes.Length, "meta");
-        if (meta is not var (metaStart, metaEnd)) return null;
+        if (FindBox(bytes, 0, bytes.Length, "meta") is not { } meta) return null;
+        var (metaStart, metaEnd) = meta;
         if (metaEnd - metaStart < 4) return null;
 
         // meta is a full box: a version and flags precede its children.
@@ -203,7 +203,8 @@ internal static class HeifContainer
 
     private static uint ReadPrimaryItemId(byte[] bytes, int start, int end)
     {
-        if (FindBox(bytes, start, end, "pitm") is not var (boxStart, boxEnd)) return 0;
+        if (FindBox(bytes, start, end, "pitm") is not { } pitm) return 0;
+        var (boxStart, boxEnd) = pitm;
         if (boxEnd - boxStart < 6) return 0;
         return bytes[boxStart] == 0 ? ReadU16(bytes, boxStart + 4) : ReadU32(bytes, boxStart + 4);
     }
@@ -212,7 +213,8 @@ internal static class HeifContainer
     private static Dictionary<uint, string> ReadItemTypes(byte[] bytes, int start, int end)
     {
         var items = new Dictionary<uint, string>();
-        if (FindBox(bytes, start, end, "iinf") is not var (infoStart, infoEnd)) return items;
+        if (FindBox(bytes, start, end, "iinf") is not { } info) return items;
+        var (infoStart, infoEnd) = info;
         if (infoEnd - infoStart < 6) return items;
 
         byte version = bytes[infoStart];
@@ -254,7 +256,8 @@ internal static class HeifContainer
         byte[] bytes, int start, int end)
     {
         var locations = new Dictionary<uint, (long, long)>();
-        if (FindBox(bytes, start, end, "iloc") is not var (locStart, locEnd)) return locations;
+        if (FindBox(bytes, start, end, "iloc") is not { } loc) return locations;
+        var (locStart, locEnd) = loc;
         if (locEnd - locStart < 8) return locations;
 
         byte version = bytes[locStart];
@@ -321,13 +324,14 @@ internal static class HeifContainer
         byte[] bytes, int start, int end, uint itemId)
     {
         var found = new List<(string, int, int)>();
-        if (FindBox(bytes, start, end, "iprp") is not var (propStart, propEnd)) return found;
-        if (FindBox(bytes, propStart, propEnd, "ipco") is not var (containerStart, containerEnd))
-            return found;
+        if (FindBox(bytes, start, end, "iprp") is not { } properties) return found;
+        var (propStart, propEnd) = properties;
 
-        var container = Children(bytes, containerStart, containerEnd).ToList();
-        if (FindBox(bytes, propStart, propEnd, "ipma") is not var (assocStart, assocEnd))
-            return found;
+        if (FindBox(bytes, propStart, propEnd, "ipco") is not { } ipco) return found;
+        var container = Children(bytes, ipco.Start, ipco.End).ToList();
+
+        if (FindBox(bytes, propStart, propEnd, "ipma") is not { } ipma) return found;
+        var (assocStart, assocEnd) = ipma;
         if (assocEnd - assocStart < 8) return found;
 
         byte version = bytes[assocStart];
