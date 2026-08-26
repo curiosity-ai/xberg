@@ -34,22 +34,47 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > **Where it stands against the new goldens**, whole corpus in one run — the only figure that
 > means anything:
 >
-> | | at regeneration | now |
-> |---|---|---|
-> | fixtures walked | 3165 | 3165 |
-> | comparable (Rust extracts something) | 3007 | 3007 |
-> | **matching on every hard dimension** | **2839 (94.4%)** | **2841 (94.5%)** |
-> | failing at least one | 168 | 166 |
-> | catastrophes | 0 | 0 |
-> | content losses | 3 (html) | 3 (html) |
+> | | at regeneration | 2026-08-24 | now |
+> |---|---|---|---|
+> | fixtures walked | 3165 | 3165 | 3165 |
+> | comparable (Rust extracts something) | 3007 | 3007 | 3007 |
+> | **matching on every hard dimension** | **2839 (94.4%)** | **2841 (94.5%)** | **2926 (97.3%)** |
+> | with `--strict-md` | 2839 | 2841 | 2849 (94.7%) |
+> | failing at least one | 168 | 166 | 81 |
+> | catastrophes | 0 | 0 | 0 |
+> | content losses | 3 (html) | 3 (html) | 2 (html) |
 >
-> The 118 remaining, by format: **html 81**, pdf 9, typ 6, adoc 6, xml 5, rst 2, jats 2, docx 2,
-> and one each in txt, qmd, odt, mdx, dbf. html is the converter upgrade's tail; typ and adoc
-> need parsers this port does not have; the pdf set is the one classified below.
+> The 81 remaining, by format: **html 71**, pdf 8, and one each in xml and dbf. Every other
+> format in the corpus is at full parity on the hard dimensions. Both the xml and the dbf
+> failures are upstream defects this port deliberately does not reproduce (see "Genuine upstream
+> defects"), so outside html and pdf there is nothing left to fix.
 >
-> Formats brought back to full parity since the regeneration: org (7 -> 12 of 12), ipynb
-> (7 -> 16 of 16), docbook (3 -> 4 of 4). Improved: html (15 -> 76 of 157), xml (5 -> 10 of 15),
-> rst (11 -> 13 of 15).
+> Formats brought to full parity since the regeneration: org (7 -> 12 of 12), ipynb
+> (7 -> 16 of 16), docbook (3 -> 4 of 4), typ (6 -> 12 of 12), adoc (0 -> 6 of 6),
+> jats (1 -> 3 of 3), rst (11 -> 15 of 15), docx (44 -> 46 of 46), odt (20 -> 21 of 21),
+> qmd (2 -> 3 of 3), mdx (4 -> 5 of 5), txt (990 -> 991 of 991). Improved: html
+> (15 -> 86 of 157), xml (5 -> 14 of 15).
+>
+> **The last pass, format by format** (each closed by a fix traced to an upstream line, with a
+> unit test alongside it):
+>
+> - **rst** — no handler at all for `.. figure::`, `.. list-table::` or `.. csv-table::`, so all
+>   three fell through to the generic directive path: the figure emitted its `:target:` and
+>   `:scale:` option lines as paragraphs, and the two table directives read as bullet lists.
+> - **qmd / mdx** — two places where the markdown parser flattened text pulldown-cmark keeps
+>   verbatim. Trailing whitespace was stripped where paragraph lines are *joined*, and a math
+>   span reads its body straight out of that joined string, so a display equation ending a line
+>   in a space lost it; pulldown-cmark drops that whitespace at the line ending instead, in the
+>   inline scanner. And block-level raw HTML was emitted one event per line without the line
+>   ending, which collapsed a multi-line `<summary>` inside a list item onto one line.
+> - **docx** — `<w:lastRenderedPageBreak/>` reached mid-paragraph was emitted ahead of the
+>   paragraph it sits inside, putting the page boundary a whole paragraph early. Upstream defers
+>   such a break until the paragraph is pushed; reproducing that needs to know whether the
+>   paragraph has a closed run yet, which a flat `Descendants()` sweep cannot see.
+> - **odt** — a captioned figure nests a frame inside a text box inside an outer frame, and the
+>   walk took every `draw:image` beneath every frame, so the image was emitted twice.
+> - **txt** — the DocTags groundtruth files, which parse as xml; see the heading-level wrap
+>   below.
 >
 > **What is left in html** (157 comparable, `--strict-md`: ok 83, plain 102, markdown 117,
 > html 111, json 105, metadata 101, tables 122).
@@ -214,6 +239,17 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > - **UTF-16 XML** (`vendored/unstructured/xml/factbook-utf-16.xml`). Upstream ignores the
 >   byte-order mark and reads the file as UTF-8, emitting `? x m l` with the NULs as spaces.
 >   This port decodes it. One fixture, permanently red.
+> - **A wrapping heading level past depth 255** (`vendored/docling/.../multi_page.doctags.txt`
+>   and the other DocTags groundtruth files). `extractors/xml.rs` computes an element's heading
+>   level as `((depth as u8) + 1).min(6)` over a `u16` depth: in a release build the cast keeps
+>   only the low byte and the add wraps, so a document that never closes its tags — DocTags nests
+>   `<loc_12>`, `<page_1>` and friends and closes none of them — walks past depth 255 and its
+>   levels start over from 0 instead of staying pinned at 6.
+>   **Reproduced rather than flagged**, on the same reasoning as the `/>` comment below: the
+>   level is derived structure rather than content — nothing is lost or corrupted, only nested
+>   differently — and it lands in the rendered section tree, so leaving it straight would put the
+>   port's JSON at odds with every deeply-nested XML document upstream emits. `HeadingLevel` in
+>   `XmlExtractor.cs` is the one line to change if that call should go the other way.
 > - **Escaped markup in XMP `dc:description`.** quick-xml emits an entity reference as its own
 >   event, splitting the text run, so upstream keeps only the first fragment — `div` for a value
 >   that is a whole HTML document. This port returns the value. Four PDF fixtures.
@@ -224,6 +260,11 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 >   html5ever's behaviour nor `tl`'s — both were probed directly on the same input — so it comes
 >   from the converter's own preprocessing. Reproduced rather than flagged, because eleven
 >   fixtures turn on it and there is no reading of the goldens that does not encode it.
+> - **An empty table over a paragraph** (`vendored/docling/pdf/2305.03393v1.pdf`). Upstream's
+>   table detector claims a region that holds an ordinary paragraph and emits `|  |` / `| --- |`
+>   in place of it, dropping 18 lines of body text. Its golden is stable across regenerations, so
+>   this is deterministic rather than the font-cache instability the other PDF failures sit on.
+>   This port emits the text.
 > - **Inherited `/MediaBox`** (`pdf/pdfa_034.pdf`). ISO 32000-1 §7.7.3.4 inherits from the
 >   nearest ancestor that defines the attribute; on a document with two nested `Pages` nodes
 >   upstream reports the root's A4 box where the page's own parent says Letter.
@@ -603,13 +644,44 @@ Two reductions, both recorded in the file headers:
   reaches the output: the converter renders a `Hash` as nothing and drops `Named` and `Spread`
   arguments whole, so only where the code expression *ends* has to be right.
 
+### The 8 remaining PDF failures, classified (2026-08-25)
+
+Measured, not reasoned: each failing golden was regenerated from the same Rust binary and the
+result compared both against the committed golden and against this port's output.
+
+- **5 sit on an unstable upstream heuristic** — `nougat_012`, `pdfa_027`, `pdfa_044`, and the
+  two copies of `vendored/pdfplumber/.../WARN-Report-for-7-1-2015-to-03-25-2016`. A sixth,
+  `user_reports/mp_axmp_rec_en`, is in the same class and no longer counted below only because
+  its golden was replaced (see the caution two paragraphs down). Regenerating each of the six
+  goldens alone produced *different text from the committed golden*, and for five of them that
+  fresh golden is byte-identical to this port's output. `pdfa_044` is the clearest specimen: two fresh
+  generations of the same file from the same binary disagree with each other, one carrying
+  spurious spaces (`Hong Kong Exchange s`, `liability whatsoever fo r`, `8 6,440,000`) and the
+  other not — and the clean one matches this port exactly. The mechanism is the one already
+  named for the earlier order-dependent set: pdf_oxide's process-global font cache
+  (`fonts/global_cache.rs:111`) makes a document's spacing decisions a function of what was
+  extracted before it in the same process.
+
+  `user_reports/mp_axmp_rec_en.pdf`'s golden **in this working tree has been replaced** with
+  such an isolated regeneration, which is why it now passes; treat that pass as batch-dependent,
+  not as evidence about the port. It is worth one line of caution in reverse too: a fixture in
+  this class passing after a corpus-wide regeneration means no more than its failing does.
+
+- **1 upstream content loss** — `vendored/docling/pdf/2305.03393v1.pdf`, the only regenerated
+  golden that *is* stable across runs. Upstream's table detector claims a region that
+  holds an ordinary paragraph and emits an empty table (`|  |` / `| --- |`) in place of it,
+  dropping 18 lines of body text. This port emits the text. Flagged, not reproduced.
+
+- **2 large documents with a table-tier divergence** — the Intel SDM (`tables` only) and
+  `algebra_topology` (`json` and `tables`), unchanged and traced below. Both pass `plain`.
+
 ### The 17 remaining failures, classified
 
-> **Stale as of the 2026-08-24 regeneration.** This classification was measured against the
-> 2026-08-12 goldens. The PDF entries below (order-dependent goldens, the two large documents,
-> the deliberate non-port) still describe real behaviour; the counts and the HTML entries do
-> not, because the converter upgrade moved them. Re-derive with `--list-fail` before quoting
-> any figure here.
+> **Stale — superseded twice.** This classification was measured against the 2026-08-12 goldens;
+> the counts and the HTML entries were already wrong after the converter upgrade, and the PDF
+> entries are now superseded by "The 8 remaining PDF failures, classified (2026-08-25)" above,
+> which re-measured every one of them by regenerating its golden. Kept only for the mechanism
+> notes. Re-derive with `--list-fail` before quoting any figure here.
 
 Re-derived with `--list-fail` on the current tree rather than carried forward — the running
 count has gone stale twice now (it read "about eleven port gaps" long after the real figure was
@@ -726,8 +798,12 @@ diffing, not by reasoning from the fixture.
   unrelated ruling-line clusters and dragging `cluster.bbox.x` with them.
 - `2305.03393v1` — two independent gaps. `stitch_fragmented_tables` (`pipeline.rs:2553-2843`)
   was documented in `PdfExtractor.cs` as knowingly unported; now ported, which makes this
-  fixture's `markdown` and `html` byte-identical. The residual `plain`/`json` diff is the
-  html-to-markdown behavior above, deliberately not ported.
+  fixture's `markdown` and `html` byte-identical. The residual `plain`/`json` diff was re-measured
+  on 2026-08-25 and is not what this bullet used to say: upstream's table detector claims a region
+  that holds an ordinary paragraph and emits an empty table (`|  |` / `| --- |`) where the text
+  should be, losing 18 lines of body text that appear nowhere else in its output. Its golden is
+  stable across regenerations, so this is deterministic, not the font-cache instability the other
+  PDF failures sit on. Flagged as an upstream defect; this port emits the text.
 - `proof_of_concept_or_gtfo_v13` (plain, json) — not XY-cut region splitting: all 197 spans were
   byte-identical to Rust. Three HTML tokenizer bugs, fixed by porting astral-tl 0.7.11's
   `parse_tag`/`parse_attributes` in place of the approximated `>`-scanner.
@@ -744,7 +820,8 @@ Each is traced to a specific line, not assumed.
   `Franconia-Springfield blue #0000ff rail-metro` on the next. This port emits declared order
   consistently and is correct.
 - **`<h0>` from a truncated heading depth** (`vendored/docling/.../multi_page.doctags.txt`), the
-  `u16` depth through `((depth as u8) + 1).min(6)` described below.
+  `u16` depth through `((depth as u8) + 1).min(6)` described below. **Reproduced**, unlike the
+  rest of this list — see the note under "Upstream defects, flagged and left alone".
 - **UTF-16 BOM ignored** (`vendored/unstructured/xml/factbook-utf-16.xml`).
 - **Corpus drift** (`ATTRIBUTIONS.md`, `LICENSES.md`, `scripts/corpus-patterns.txt`): the fixtures
   are `test_documents`' own docs and grew after their goldens were made.
