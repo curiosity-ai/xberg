@@ -45,6 +45,9 @@ public sealed class Extractor
                 // Set after derive so the extractor-supplied value the renderer consults for
                 // `PreRenderedContent` is not disturbed.
                 extracted.Metadata.OutputFormat = config.OutputFormat.ToString();
+                // Runs after the content is rendered, because the payloads are appended to that
+                // rendered text and not just recorded per image.
+                QrPostProcessor.Process(extracted, config);
                 result.Results.Add(extracted);
             }
         }

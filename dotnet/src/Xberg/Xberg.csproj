@@ -22,6 +22,7 @@
     <!-- Matches the tool's AssemblyName, not its project name. -->
     <InternalsVisibleTo Include="xberg-onnx-parity" />
     <InternalsVisibleTo Include="xberg-bench" />
+    <InternalsVisibleTo Include="xberg-testrunner" />
   </ItemGroup>
 
   <ItemGroup>

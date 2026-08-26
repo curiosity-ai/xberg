@@ -90,6 +90,18 @@ public sealed class ExtractionConfig
     public bool ExtractTables { get; set; } = true;
 
     /// <summary>
+    /// Decode the QR codes inside every extracted image, writing them to
+    /// <c>ExtractedImage.QrCodes</c> and appending their payloads to the document text.
+    /// </summary>
+    /// <remarks>
+    /// Opt-in, as upstream has it: decoding runs the detector over every image in the document,
+    /// which is real work to do on a caller's behalf without being asked.
+    /// </remarks>
+    [JsonPropertyName("qr_codes")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? QrCodes { get; set; }
+
+    /// <summary>
     /// Limits applied to hostile input. <c>null</c> takes <see cref="SecurityLimits"/>' defaults,
     /// which is what upstream's <c>Option&lt;SecurityLimits&gt;</c> does with <c>None</c>.
     /// </summary>

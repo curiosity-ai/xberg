@@ -45,6 +45,29 @@ if (args.Length >= 2 && args[0] == "--dump-metadata")
     return 0;
 }
 
+// QR probe mode: `--dump-qr <image>...` prints what the ported detector/decoder found, in the
+// same JSON shape as `tools/qr-probe`, so the two can be diffed.
+if (args.Length >= 2 && args[0] == "--dump-qr")
+{
+    var qr = new System.Text.Json.Nodes.JsonObject();
+    for (int i = 1; i < args.Length; i++)
+    {
+        var found = new System.Text.Json.Nodes.JsonArray();
+        foreach (var code in Xberg.Internal.Qr.QrScanner.Detect(File.ReadAllBytes(args[i])))
+            found.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["payload"] = code.Payload,
+                ["x"] = code.X,
+                ["y"] = code.Y,
+                ["width"] = code.Width,
+                ["height"] = code.Height,
+            });
+        qr[args[i]] = found;
+    }
+    Console.Out.Write(qr.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // DocTags probe mode: `--dump-doctags <file>...` renders each file to DocTags and then feeds
 // that stream back through the DocTags extractor, printing the same JSON shape as
 // `tools/doctags-probe` so the two can be diffed. Both stages are printed, so a divergence pins
