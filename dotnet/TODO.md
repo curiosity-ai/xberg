@@ -1526,17 +1526,76 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
 
 ## Cross-cutting
 
-- [ ] `Metadata` extraction parity (office core/app props, EXIF, PDF info dict).
-- [ ] URI/link collection.
-- [ ] Per-page content splitting.
-- [ ] Document-structure tree derivation (for the structured object output).
-- [ ] Security limits (max size, zip-bomb guards — `extractors/security.rs`).
+- [x] `Metadata` extraction parity (office core/app props, EXIF, PDF info dict). Measured green
+      on the `meta` dimension across the corpus.
+- [x] URI/link collection.
+- [x] Per-page content splitting.
+- [x] Document-structure tree derivation (for the structured object output).
+- [x] **Security limits** (`extractors/security.rs`). Ported 2026-08-26: `SecurityLimits` with
+      upstream's defaults value for value, the five validators, the zip central-directory check
+      and the path-traversal predicate, threaded where upstream threads them. A refusal carries
+      upstream's `security`/1006 error item, or `validation`/1002 where the archive and HWPX
+      extractors deliberately downgrade it. `--no-security` on the test runner lifts every limit
+      so any difference can be attributed to them in one A/B.
+
+      Twelve fixtures stopped extracting, and all twelve are correct: the same three DocTags
+      groundtruth files in four corpus copies, which nest `<loc_*>` and `<page_*>` without ever
+      closing them and so pass the 1024 nesting cap. Upstream refuses them too — its golden for
+      `redp5110_sampled.doctags.txt` records exactly the message this port now produces. Corpus
+      parity was unchanged at 2926/3007.
 - [ ] CI: build + run `Xberg.TestRunner` on the fixtures; publish NuGet on tag. Note the
       corpus is no longer self-contained: CI must run `test_documents/scripts/fetch_corpus.py`
       and regenerate goldens, since neither the binaries nor the goldens are in git.
 - [ ] Performance: the 55 MB `parsebench/text_content.jsonl` fixture takes ~29s to render
       markdown now that structured formats build an element tree. Not wrong, but far off
       Rust; the harness timeout was raised to 120s to keep it measured rather than skipped.
+
+## Formats and features added after the first pass (2026-08-26)
+
+Each was verified against the real implementation with a probe crate rather than by reading it,
+and each probe lives in `dotnet/tools/` alongside the reference generator.
+
+- [x] **Source-code extractor** (`extractors/code.rs`). Language detection by extension, compound
+      suffix and shebang, reproducing `tree_sitter_language_pack`'s tables (430 extensions,
+      generated from the same JSON), then one verbatim code element carrying the language.
+
+      **The tree-sitter chunking half is not ported and cannot be** — it is a C library with a
+      grammar per language. What that costs is bounded and measured: under the default
+      configuration `tslp::process` returns no chunks, so all eighteen source fixtures in the
+      corpus have `chunks: []` and `data: null`, and every one matches the extended golden
+      exactly. A caller who turns chunking on upstream gets headings and per-chunk code elements
+      this port will not produce.
+
+      Detection is a runtime switch (`XbergOptions.SourceCodeDetection`) where upstream has a
+      compile-time feature, so both golden sets stay measurable: `--features code` alongside
+      `--goldens`. Against the extended set the port is **2931/3013**.
+- [x] **Styled HTML renderer** (`rendering/html_styled.rs`) and `HtmlOutputConfig`. Byte-identical
+      to upstream across 58 fixtures and 8 configurations — 464 of 464. The probe caught two
+      things reading would not have: the escape set is `v_htmlescape`'s (OWASP's), which escapes
+      the slash, so a URL in an `href` comes out with `&#x2f;`; and a C# raw string literal drops
+      the newline before its closing delimiter, which silently ate the trailing newline of all
+      three stylesheets.
+
+      Upstream's two OCR branches in the image path are unreachable here — OCR is out of scope, so
+      no document this port produces carries an OCR result to render.
+- [x] **DocTags** (`extraction/doctags.rs`, `rendering/doctags.rs`) and the `OutputFormat::DocTags`
+      variant the port's enum was missing. Byte-identical across 70 fixtures at both stages —
+      render, then parse-and-render — including 12 real Docling streams. 140 of 140, first run.
+
+      Page dimensions now travel on a shared `PageInfoDto`. **No extractor in this port records
+      them yet**, so a PDF rendered to DocTags here carries no `<loc_*>` tokens where upstream's
+      would; the round-trip case works because the parser supplies them. Wiring the PDF page sizes
+      through would close that.
+- [x] **QR decoding** — all of rqrr 0.10.1, not just the `extractors/qr.rs` shim over it: adaptive
+      binarisation, capstone finding, grid fitting with the perspective jiggle, format-bit BCH
+      correction, the zig-zag read, block de-interleaving, Reed-Solomon over GF(256), and the
+      numeric/alphanumeric/byte/kanji/ECI segments. Plus the post-processor.
+
+      Agrees with the real rqrr on **271 of 271** images: every version from 1 to 40, all four
+      error-correction levels, an occluded code that only decodes because error correction works,
+      and the 75 images rqrr itself cannot read, where the port fails identically. Two details the
+      comparison forced: `f64::round` is half-away-from-zero where .NET's default is half-to-even,
+      and `Perspective::create` rejects on a *signed* `wden < EPSILON`.
 
 ## Excluded (dropped per requirements)
 
