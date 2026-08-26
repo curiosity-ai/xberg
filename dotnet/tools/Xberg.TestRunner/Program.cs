@@ -89,6 +89,69 @@ if (args.Length >= 2 && args[0] == "--dump-qr")
     return 0;
 }
 
+// Layout heuristics check: `--check-heuristics <probe.json>` reads the differential dump from
+// tools/heuristics-probe — the same pages detected twice by the real engine, once with
+// apply_heuristics off and once on — applies the ported heuristics to each raw set, and reports
+// where the result differs from what upstream produced. Upstream's heuristics carry no tests of
+// their own, so this real-detection differential is what verifies them.
+if (args.Length >= 2 && args[0] == "--check-heuristics")
+{
+    using var probe = System.Text.Json.JsonDocument.Parse(File.ReadAllText(args[1]));
+
+    static Xberg.Internal.Layout.LayoutClass ParseClass(string label)
+    {
+        foreach (Xberg.Internal.Layout.LayoutClass value
+                 in Enum.GetValues<Xberg.Internal.Layout.LayoutClass>())
+            if (Xberg.Internal.Layout.LayoutClassExtensions.WireName(value) == label) return value;
+        throw new InvalidOperationException($"unknown layout class '{label}'");
+    }
+
+    static List<Xberg.Internal.Layout.LayoutDetection> ReadDetections(System.Text.Json.JsonElement page)
+    {
+        var list = new List<Xberg.Internal.Layout.LayoutDetection>();
+        foreach (var d in page.GetProperty("detections").EnumerateArray())
+        {
+            var box = d.GetProperty("bbox");
+            list.Add(new Xberg.Internal.Layout.LayoutDetection(
+                ParseClass(d.GetProperty("class_name").GetString()!),
+                d.GetProperty("confidence").GetSingle(),
+                new Xberg.Internal.Layout.BBox(
+                    box[0].GetSingle(), box[1].GetSingle(), box[2].GetSingle(), box[3].GetSingle())));
+        }
+        return list;
+    }
+
+    static string Render(Xberg.Internal.Layout.LayoutDetection d) =>
+        string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{Xberg.Internal.Layout.LayoutClassExtensions.WireName(d.ClassName)}@{d.Confidence:F6}{d.Box}");
+
+    int pages = 0, matched = 0, rawTotal = 0, expectedTotal = 0;
+    foreach (var entry in probe.RootElement.EnumerateArray())
+    {
+        pages++;
+        var rawPage = entry.GetProperty("raw");
+        var cookedPage = entry.GetProperty("cooked");
+        var raw = ReadDetections(rawPage);
+        var expected = ReadDetections(cookedPage);
+        rawTotal += raw.Count;
+        expectedTotal += expected.Count;
+
+        var actual = Xberg.Internal.Layout.LayoutPostprocessing.ApplyHeuristics(
+            raw, rawPage.GetProperty("page_width").GetSingle(), rawPage.GetProperty("page_height").GetSingle());
+
+        var expectedText = expected.Select(Render).ToList();
+        var actualText = actual.Select(Render).ToList();
+        if (expectedText.SequenceEqual(actualText)) { matched++; continue; }
+
+        Console.WriteLine($"MISMATCH {entry.GetProperty("file").GetString()}");
+        Console.WriteLine($"  expected ({expectedText.Count}): {string.Join(", ", expectedText)}");
+        Console.WriteLine($"  actual   ({actualText.Count}): {string.Join(", ", actualText)}");
+    }
+
+    Console.WriteLine($"pages={pages} matched={matched} raw={rawTotal} expected={expectedTotal}");
+    return matched == pages ? 0 : 1;
+}
+
 // DocTags probe mode: `--dump-doctags <file>...` renders each file to DocTags and then feeds
 // that stream back through the DocTags extractor, printing the same JSON shape as
 // `tools/doctags-probe` so the two can be diffed. Both stages are printed, so a divergence pins
