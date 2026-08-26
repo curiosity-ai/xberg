@@ -89,6 +89,29 @@ if (args.Length >= 2 && args[0] == "--dump-qr")
     return 0;
 }
 
+// Table-classifier probe mode: `--dump-tablecls <model.onnx> <image>...` classifies each image
+// wired/wireless through the ported PP-LCNet path, printing the same JSON shape as
+// tools/tablecls-probe so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-tablecls")
+{
+    var classifier = Xberg.Internal.Layout.TableClassifier.FromFile(args[1]);
+    var classified = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var (type, rawWired, rawWireless) = classifier.ClassifyWithLogits(image);
+        classified.Add(new System.Text.Json.Nodes.JsonObject
+        {
+            ["file"] = args[i],
+            ["table_type"] = Xberg.Internal.Layout.TableTypeExtensions.Name(type),
+            ["raw_wired"] = rawWired,
+            ["raw_wireless"] = rawWireless,
+        });
+    }
+    Console.Out.Write(classified.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // Layout heuristics check: `--check-heuristics <probe.json>` reads the differential dump from
 // tools/heuristics-probe — the same pages detected twice by the real engine, once with
 // apply_heuristics off and once on — applies the ported heuristics to each raw set, and reports
