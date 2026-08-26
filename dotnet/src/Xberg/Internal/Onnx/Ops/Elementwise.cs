@@ -19,6 +19,8 @@ internal enum BinaryKind { Add, Sub, Mul, Div, Pow, Min, Max }
 /// </summary>
 internal enum CompareKind { Greater, GreaterOrEqual, Less, LessOrEqual, Equal }
 
+internal enum LogicalKind { And, Or, Xor }
+
 internal static class Elementwise
 {
     public static Tensor Binary(Tensor a, Tensor b, BinaryKind kind)
@@ -634,6 +636,51 @@ internal static class Elementwise
         var f = x.AsFloat();
         var result = Tensor.AllocateFloat(f.Shape);
         for (int i = 0; i < f.Count; i++) result.Floats[i] = MathF.Cos(f.Floats[i]);
+        return result;
+    }
+
+    /// <summary>ONNX <c>Not</c>: elementwise boolean negation.</summary>
+    public static Tensor Not(Tensor x)
+    {
+        var result = Tensor.AllocateLong(ElementType.Bool, x.Shape);
+        for (int i = 0; i < x.Count; i++) result.Longs[i] = x.GetLong(i) != 0 ? 0 : 1;
+        return result;
+    }
+
+    /// <summary>ONNX <c>And</c>, <c>Or</c> and <c>Xor</c>: elementwise boolean logic, broadcast.</summary>
+    public static Tensor Logical(Tensor a, Tensor b, LogicalKind kind)
+    {
+        var shape = Broadcast.ResultShape(a.Shape, b.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+        var strideA = Broadcast.StridesFor(a.Shape, rank);
+        var strideB = Broadcast.StridesFor(b.Shape, rank);
+        var result = Tensor.AllocateLong(ElementType.Bool, shape);
+
+        var index = new int[rank];
+        int offsetA = 0, offsetB = 0;
+        for (int flat = 0; flat < total; flat++)
+        {
+            bool left = a.GetLong(offsetA) != 0, right = b.GetLong(offsetB) != 0;
+            bool value = kind switch
+            {
+                LogicalKind.And => left && right,
+                LogicalKind.Or => left || right,
+                _ => left ^ right,
+            };
+            result.Longs[flat] = value ? 1 : 0;
+
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetA += strideA[d];
+                offsetB += strideB[d];
+                if (index[d] < shape[d]) break;
+                offsetA -= strideA[d] * index[d];
+                offsetB -= strideB[d] * index[d];
+                index[d] = 0;
+            }
+        }
         return result;
     }
 }

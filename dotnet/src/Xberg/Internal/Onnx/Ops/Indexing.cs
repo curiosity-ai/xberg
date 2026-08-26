@@ -157,4 +157,94 @@ internal static class Indexing
         }
         return result;
     }
+
+    /// <summary>
+    /// ONNX <c>OneHot</c>: expand each index in <paramref name="indices"/> into a vector along a
+    /// new axis, carrying the on-value at that position and the off-value elsewhere.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="values"/> is a two-element tensor holding <c>[off, on]</c> in that order.
+    /// A negative index counts from the end of the new axis, and an index outside the axis
+    /// produces an all-off vector rather than an error — that is what the spec requires, and it
+    /// is what lets a padded sequence position encode as nothing.
+    /// </remarks>
+    public static Tensor OneHot(Tensor indices, Tensor depth, Tensor values, int axis)
+    {
+        int size = (int)depth.GetLong(0);
+        if (size <= 0) throw new InvalidDataException($"OneHot: depth {size} is not positive");
+
+        int rank = indices.Shape.Length + 1;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw new InvalidDataException($"OneHot: axis {axis} is out of range for rank {rank}");
+
+        var shape = new int[rank];
+        for (int i = 0, j = 0; i < rank; i++) shape[i] = i == axis ? size : indices.Shape[j++];
+
+        bool isFloat = values.IsFloat;
+        var result = isFloat ? Tensor.AllocateFloat(shape) : Tensor.AllocateLong(values.Type, shape);
+
+        // Everything ahead of the new axis, and everything behind it, stay contiguous around it.
+        int inner = 1;
+        for (int d = axis + 1; d < rank; d++) inner *= shape[d];
+        int outer = indices.Count / Math.Max(inner, 1);
+
+        if (isFloat) Array.Fill(result.Floats, values.GetFloat(0));
+        else Array.Fill(result.Longs, values.GetLong(0));
+
+        for (int o = 0; o < outer; o++)
+        {
+            for (int i = 0; i < inner; i++)
+            {
+                long index = indices.GetLong(o * inner + i);
+                if (index < 0) index += size;
+                if (index < 0 || index >= size) continue;
+                int offset = (o * size + (int)index) * inner + i;
+                if (isFloat) result.Floats[offset] = values.GetFloat(1);
+                else result.Longs[offset] = values.GetLong(1);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// ONNX <c>ScatterElements</c>: a copy of <paramref name="data"/> with individual elements
+    /// replaced, each index naming a position along <paramref name="axis"/> only.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="ScatterND"/>, an index here replaces a single element rather than a
+    /// slice: the other coordinates come from the index tensor's own position.
+    /// </remarks>
+    public static Tensor ScatterElements(Tensor data, Tensor indices, Tensor updates, int axis)
+    {
+        int rank = data.Shape.Length;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw new InvalidDataException($"ScatterElements: axis {axis} is out of range for rank {rank}");
+
+        var result = Allocate(data, data.Shape);
+        Copy(data, 0, result, 0, data.Count);
+
+        var dataStrides = Strides(data.Shape);
+        var indexStrides = Strides(indices.Shape);
+        var position = new int[rank];
+
+        for (int flat = 0; flat < indices.Count; flat++)
+        {
+            for (int d = 0; d < rank; d++) position[d] = flat / indexStrides[d] % indices.Shape[d];
+
+            long along = indices.GetLong(flat);
+            if (along < 0) along += data.Shape[axis];
+            if (along < 0 || along >= data.Shape[axis])
+                throw new InvalidDataException(
+                    $"ScatterElements: index {along} out of range for dimension {data.Shape[axis]}");
+
+            int offset = 0;
+            for (int d = 0; d < rank; d++) offset += (d == axis ? (int)along : position[d]) * dataStrides[d];
+            Copy(updates, flat, result, offset, 1);
+        }
+
+        return result;
+    }
 }

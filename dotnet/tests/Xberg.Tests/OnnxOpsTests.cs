@@ -288,4 +288,93 @@ public class OnnxOpsTests
     public void EinsumRejectsAnOperandCountMismatch() =>
         Assert.Throws<InvalidDataException>(() =>
             EinsumKernel.Apply("ij,jk->ik", [Floats([2, 2], 1, 2, 3, 4)]));
+
+    // ------------------------------------------------------------------ OneHot / ScatterElements
+
+    [Fact]
+    public void OneHotExpandsIndicesAlongTheLastAxis()
+    {
+        var result = Indexing.OneHot(Longs([2], 0, 2), Longs([1], 3), Floats([2], 0f, 1f), -1);
+        Assert.Equal(new[] { 2, 3 }, result.Shape);
+        Assert.Equal(new[] { 1f, 0f, 0f, 0f, 0f, 1f }, result.Floats);
+    }
+
+    [Fact]
+    public void OneHotHonoursTheOffAndOnValues()
+    {
+        var result = Indexing.OneHot(Longs([1], 1), Longs([1], 3), Floats([2], -1f, 5f), -1);
+        Assert.Equal(new[] { -1f, 5f, -1f }, result.Floats);
+    }
+
+    [Fact]
+    public void OneHotPlacesTheNewAxisWhereAsked()
+    {
+        var result = Indexing.OneHot(Longs([2], 0, 1), Longs([1], 2), Floats([2], 0f, 1f), 0);
+        Assert.Equal(new[] { 2, 2 }, result.Shape);
+        // Axis 0 is the one-hot axis, so the result is the transpose of the trailing-axis form.
+        Assert.Equal(new[] { 1f, 0f, 0f, 1f }, result.Floats);
+    }
+
+    [Fact]
+    public void OneHotNegativeIndexCountsFromTheEnd()
+    {
+        var result = Indexing.OneHot(Longs([1], -1), Longs([1], 3), Floats([2], 0f, 1f), -1);
+        Assert.Equal(new[] { 0f, 0f, 1f }, result.Floats);
+    }
+
+    /// <summary>
+    /// An index outside the axis yields an all-off vector rather than an error, which is what
+    /// lets a padded position encode as nothing.
+    /// </summary>
+    [Fact]
+    public void OneHotOutOfRangeIndexIsAllOff()
+    {
+        var result = Indexing.OneHot(Longs([1], 7), Longs([1], 3), Floats([2], 0f, 1f), -1);
+        Assert.Equal(new[] { 0f, 0f, 0f }, result.Floats);
+    }
+
+    [Fact]
+    public void ScatterElementsReplacesSingleElements()
+    {
+        var result = Indexing.ScatterElements(
+            Floats([1, 4], 1, 2, 3, 4), Longs([1, 2], 0, 3), Floats([1, 2], 10, 40), 1);
+        Assert.Equal(new[] { 10f, 2f, 3f, 40f }, result.Floats);
+    }
+
+    [Fact]
+    public void ScatterElementsScattersAlongTheNamedAxis()
+    {
+        // Axis 0: each column keeps its own position and the index chooses the row, so index
+        // element (0,0)=1 writes 9 to [1][0] and (0,1)=0 writes 8 to [0][1]. These are ONNX
+        // Runtime's own outputs.
+        var result = Indexing.ScatterElements(
+            Floats([2, 2], 1, 2, 3, 4), Longs([1, 2], 1, 0), Floats([1, 2], 9, 8), 0);
+        Assert.Equal(new[] { 1f, 8f, 9f, 4f }, result.Floats);
+    }
+
+    [Fact]
+    public void ScatterElementsRejectsAnOutOfRangeIndex() =>
+        Assert.Throws<InvalidDataException>(() => Indexing.ScatterElements(
+            Floats([1, 2], 1, 2), Longs([1, 1], 5), Floats([1, 1], 9), 1));
+
+    // ------------------------------------------------------------------ Boolean logic
+
+    [Fact]
+    public void NotNegatesElementwise()
+    {
+        var result = Elementwise.Not(Bools([3], 1, 0, 1));
+        Assert.Equal(ElementType.Bool, result.Type);
+        Assert.Equal(new long[] { 0, 1, 0 }, result.Longs);
+    }
+
+    [Fact]
+    public void LogicalOperatorsBroadcast()
+    {
+        Assert.Equal(new long[] { 1, 0 },
+            Elementwise.Logical(Bools([2], 1, 0), Bools([1], 1), LogicalKind.And).Longs);
+        Assert.Equal(new long[] { 1, 1 },
+            Elementwise.Logical(Bools([2], 1, 0), Bools([1], 1), LogicalKind.Or).Longs);
+        Assert.Equal(new long[] { 0, 1 },
+            Elementwise.Logical(Bools([2], 1, 0), Bools([1], 1), LogicalKind.Xor).Longs);
+    }
 }

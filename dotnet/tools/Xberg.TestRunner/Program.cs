@@ -89,6 +89,39 @@ if (args.Length >= 2 && args[0] == "--dump-qr")
     return 0;
 }
 
+// SLANeXt probe mode: `--dump-slanet <model.onnx> <image>...` runs the ported table-structure
+// model and prints its decoded token stream, grid shape and cell boxes.
+if (args.Length >= 3 && args[0] == "--dump-slanet")
+{
+    var slanet = Xberg.Internal.Layout.SlanetModel.FromFile(args[1]);
+    var pages = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var recognized = slanet.Recognize(image);
+        var cells = new System.Text.Json.Nodes.JsonArray();
+        foreach (var cell in recognized.Cells)
+            cells.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["row"] = cell.Row,
+                ["col"] = cell.Col,
+                ["bbox"] = new System.Text.Json.Nodes.JsonArray(
+                    cell.Box[0], cell.Box[1], cell.Box[2], cell.Box[3]),
+            });
+        pages.Add(new System.Text.Json.Nodes.JsonObject
+        {
+            ["file"] = args[i],
+            ["num_rows"] = recognized.NumRows,
+            ["num_cols"] = recognized.NumCols,
+            ["confidence"] = recognized.Confidence,
+            ["tokens"] = string.Join("", recognized.StructureTokens),
+            ["cells"] = cells,
+        });
+    }
+    Console.Out.Write(pages.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // TATR probe mode: `--dump-tatr <model.onnx> <image>...` runs the ported table-structure model
 // over each image and prints its detections plus the reconstructed grid shape, matching
 // tools/tatr-probe so the two can be diffed.
@@ -144,10 +177,24 @@ if (args.Length >= 2 && args[0] == "--onnx-ops")
 {
     var model = Xberg.Internal.Onnx.OnnxModel.Load(args[1]);
     var census = new SortedDictionary<string, int>(StringComparer.Ordinal);
-    foreach (var node in model.Nodes)
-        census[node.OpType] = census.TryGetValue(node.OpType, out int n) ? n + 1 : 1;
+    int total = 0;
+
+    // Control-flow nodes carry their own graphs, and a body's operators are just as required as
+    // the top level's — counting only top-level nodes reports a graph as runnable when it is not.
+    void Walk(IEnumerable<Xberg.Internal.Onnx.OnnxNode> nodes)
+    {
+        foreach (var node in nodes)
+        {
+            census[node.OpType] = census.TryGetValue(node.OpType, out int n) ? n + 1 : 1;
+            total++;
+            foreach (var attribute in node.Attributes)
+                if (attribute.Graph is { } subgraph) Walk(subgraph.Nodes);
+        }
+    }
+
+    Walk(model.Nodes);
     foreach (var (op, count) in census) Console.WriteLine($"{count,6}  {op}");
-    Console.WriteLine($"distinct={census.Count} nodes={model.Nodes.Length}");
+    Console.WriteLine($"distinct={census.Count} nodes={total}");
     return 0;
 }
 

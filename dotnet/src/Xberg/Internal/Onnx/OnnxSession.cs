@@ -187,15 +187,161 @@ internal sealed class OnnxSession
 
         var lastIndex = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int i = 0; i < model.Nodes.Length; i++)
+        {
             foreach (string input in model.Nodes[i].Inputs)
                 if (input.Length > 0) lastIndex[input] = i;
+
+            // A subgraph reads outer-scope values by name, so a control-flow node keeps alive
+            // everything its body touches. Without this, a value used only inside a loop is
+            // released at its last *top-level* use and the loop finds it gone.
+            foreach (var attribute in model.Nodes[i].Attributes)
+                if (attribute.Graph is { } subgraph) MarkSubgraphReads(subgraph, i, lastIndex);
+        }
 
         foreach (var (name, index) in lastIndex)
             if (!model.Initializers.ContainsKey(name)) lastUse[index].Add(name);
         return lastUse;
     }
 
+    /// <summary>
+    /// Attribute every name a subgraph reads to the control-flow node that owns it, recursing
+    /// through nested subgraphs.
+    /// </summary>
+    /// <remarks>
+    /// Names the subgraph defines for itself are recorded too. That is deliberate: they are never
+    /// bound in the outer environment, so releasing them is a no-op, and separating them out
+    /// would buy nothing but a way to get the analysis subtly wrong.
+    /// </remarks>
+    private static void MarkSubgraphReads(OnnxSubgraph graph, int nodeIndex, Dictionary<string, int> lastIndex)
+    {
+        foreach (var inner in graph.Nodes)
+        {
+            foreach (string input in inner.Inputs)
+                if (input.Length > 0) lastIndex[input] = nodeIndex;
+            foreach (var attribute in inner.Attributes)
+                if (attribute.Graph is { } nested) MarkSubgraphReads(nested, nodeIndex, lastIndex);
+        }
+    }
+
     /// <summary>Fetch an operand, or null for an omitted optional input.</summary>
+    /// <summary>
+    /// ONNX <c>Loop</c>: run the body subgraph until the trip count runs out or its condition
+    /// goes false.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The body's formal inputs are, in order: the iteration number, the incoming condition, and
+    /// one per loop-carried value. Its outputs are the outgoing condition, the updated
+    /// loop-carried values, and then any scan outputs — per-iteration results that are stacked
+    /// along a new leading axis when the loop finishes.
+    /// </para>
+    /// <para>
+    /// Both the trip count and the initial condition are optional, and an omitted one means
+    /// "unbounded" rather than zero: a loop with neither would run forever, which the spec allows
+    /// and a body's own condition is expected to stop.
+    /// </para>
+    /// </remarks>
+    private Tensor?[] ExecuteLoop(OnnxNode node, Dictionary<string, Tensor> env)
+    {
+        var body = node.Attr("body")?.Graph
+            ?? throw new InvalidDataException("Loop: no body subgraph");
+
+        var tripCountTensor = Optional(node, env, 0);
+        long tripCount = tripCountTensor is { Count: > 0 } ? tripCountTensor.GetLong(0) : long.MaxValue;
+
+        var conditionTensor = Optional(node, env, 1);
+        bool condition = conditionTensor is not { Count: > 0 } || conditionTensor.GetLong(0) != 0;
+
+        int carriedCount = Math.Max(node.Inputs.Length - 2, 0);
+        var carried = new Tensor[carriedCount];
+        for (int i = 0; i < carriedCount; i++) carried[i] = Required(node, env, i + 2);
+
+        // Body outputs past the condition and the carried values are scan outputs, stacked at the
+        // end rather than carried between iterations.
+        int scanCount = Math.Max(body.Outputs.Length - 1 - carriedCount, 0);
+        var scans = new List<Tensor>[scanCount];
+        for (int i = 0; i < scanCount; i++) scans[i] = new List<Tensor>();
+
+        for (long iteration = 0; iteration < tripCount && condition; iteration++)
+        {
+            var inner = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+            if (body.Inputs.Length > 0)
+                inner[body.Inputs[0].Name] = Tensor.Scalar(iteration);
+            if (body.Inputs.Length > 1)
+                inner[body.Inputs[1].Name] = Tensor.FromLongs([condition ? 1 : 0], ElementType.Bool);
+            for (int i = 0; i < carriedCount && i + 2 < body.Inputs.Length; i++)
+                inner[body.Inputs[i + 2].Name] = carried[i];
+
+            var produced = RunSubgraph(body, env, inner);
+
+            condition = produced[body.Outputs[0].Name].GetLong(0) != 0;
+            for (int i = 0; i < carriedCount; i++)
+                carried[i] = produced[body.Outputs[i + 1].Name];
+            for (int i = 0; i < scanCount; i++)
+                scans[i].Add(produced[body.Outputs[carriedCount + 1 + i].Name]);
+        }
+
+        var result = new Tensor?[carriedCount + scanCount];
+        for (int i = 0; i < carriedCount; i++) result[i] = carried[i];
+        for (int i = 0; i < scanCount; i++) result[carriedCount + i] = StackScanOutput(scans[i]);
+        return result;
+    }
+
+    /// <summary>Stack per-iteration scan results along a new leading axis.</summary>
+    /// <remarks>
+    /// A loop that never ran produces a zero-length leading axis, which is a legal shape and must
+    /// not be turned into an error or a scalar.
+    /// </remarks>
+    private static Tensor StackScanOutput(List<Tensor> slices)
+    {
+        if (slices.Count == 0) return Tensor.AllocateFloat(0);
+
+        var first = slices[0];
+        var shape = new int[first.Shape.Length + 1];
+        shape[0] = slices.Count;
+        Array.Copy(first.Shape, 0, shape, 1, first.Shape.Length);
+
+        var result = first.IsFloat ? Tensor.AllocateFloat(shape) : Tensor.AllocateLong(first.Type, shape);
+        int stride = first.Count;
+        for (int i = 0; i < slices.Count; i++)
+        {
+            if (first.IsFloat) Array.Copy(slices[i].Floats, 0, result.Floats, i * stride, stride);
+            else Array.Copy(slices[i].Longs, 0, result.Longs, i * stride, stride);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Run a subgraph, returning every value it produced.
+    /// </summary>
+    /// <remarks>
+    /// A subgraph reads outer-scope values by name, so the outer environment seeds the inner one;
+    /// the explicit bindings then shadow it, which is what makes a body input named the same as
+    /// an outer value resolve to the iteration's own copy.
+    /// </remarks>
+    private Dictionary<string, Tensor> RunSubgraph(
+        OnnxSubgraph graph, IReadOnlyDictionary<string, Tensor> outer, Dictionary<string, Tensor> bindings)
+    {
+        var env = new Dictionary<string, Tensor>(outer, StringComparer.Ordinal);
+        foreach (var (name, tensor) in graph.Initializers) env[name] = tensor;
+        foreach (var (name, tensor) in bindings) env[name] = tensor;
+
+        foreach (var inner in graph.Nodes)
+        {
+            var outputs = Execute(inner, env);
+            for (int o = 0; o < inner.Outputs.Length && o < outputs.Length; o++)
+            {
+                if (inner.Outputs[o].Length == 0 || outputs[o] is null) continue;
+                env[inner.Outputs[o]] = outputs[o]!;
+            }
+        }
+
+        foreach (var output in graph.Outputs)
+            if (!env.ContainsKey(output.Name))
+                throw new InvalidOperationException($"onnx: subgraph output '{output.Name}' was never produced");
+        return env;
+    }
+
     private static Tensor? Optional(OnnxNode node, IReadOnlyDictionary<string, Tensor> env, int index)
     {
         if (index >= node.Inputs.Length) return null;
@@ -261,6 +407,43 @@ internal sealed class OnnxSession
                 for (int i = 1; i < node.Inputs.Length; i++)
                     accumulator = Elementwise.Binary(accumulator, Required(node, env, i), kind);
                 return [accumulator];
+            }
+
+            case "Loop":
+                return ExecuteLoop(node, env);
+
+            case "If":
+            {
+                bool condition = Required(node, env, 0).GetLong(0) != 0;
+                var branch = node.Attr(condition ? "then_branch" : "else_branch")?.Graph
+                    ?? throw new InvalidDataException($"If: no {(condition ? "then" : "else")} branch");
+                var produced = RunSubgraph(branch, env, new Dictionary<string, Tensor>(StringComparer.Ordinal));
+                return branch.Outputs.Select(o => (Tensor?)produced[o.Name]).ToArray();
+            }
+
+            case "OneHot":
+                return [Indexing.OneHot(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2),
+                    (int)node.AttrInt("axis", -1))];
+
+            case "ScatterElements":
+                return [Indexing.ScatterElements(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2),
+                    (int)node.AttrInt("axis", 0))];
+
+            case "Not": return [Elementwise.Not(Required(node, env, 0))];
+
+            case "And":
+            case "Or":
+            case "Xor":
+            {
+                var kind = node.OpType switch
+                {
+                    "And" => LogicalKind.And,
+                    "Or" => LogicalKind.Or,
+                    _ => LogicalKind.Xor,
+                };
+                return [Elementwise.Logical(Required(node, env, 0), Required(node, env, 1), kind)];
             }
 
             case "Floor": return [Elementwise.Floor(Required(node, env, 0))];

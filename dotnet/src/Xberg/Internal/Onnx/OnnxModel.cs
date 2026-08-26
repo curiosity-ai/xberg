@@ -30,6 +30,26 @@ internal sealed class OnnxAttribute
     public float[] Floats = [];
     public long[] Ints = [];
     public Tensor? Tensor;
+
+    /// <summary>
+    /// The subgraph a control-flow attribute carries — <c>Loop</c>'s <c>body</c>, <c>If</c>'s
+    /// branches.
+    /// </summary>
+    /// <remarks>
+    /// A subgraph is a graph in its own right, with its own nodes, initializers and formal
+    /// inputs, but it also reads outer-scope values by name; the session supplies those, so what
+    /// is stored here is only what the wire format carries.
+    /// </remarks>
+    public OnnxSubgraph? Graph;
+}
+
+/// <summary>A nested graph, as carried by a control-flow node's attribute.</summary>
+internal sealed class OnnxSubgraph
+{
+    public required OnnxNode[] Nodes { get; init; }
+    public required Dictionary<string, Tensor> Initializers { get; init; }
+    public required OnnxValueInfo[] Inputs { get; init; }
+    public required OnnxValueInfo[] Outputs { get; init; }
 }
 
 /// <summary>An activation folded into the producing node, applied as part of its output pass.</summary>
@@ -253,6 +273,7 @@ internal sealed class OnnxModel
                 case 3 when w == WireType.Varint: attr.Int = r.ReadInt64(); break;
                 case 4 when w == WireType.LengthDelimited: attr.String = r.ReadString(); break;
                 case 5 when w == WireType.LengthDelimited: attr.Tensor = ParseTensor(r.ReadBytes()).Tensor; break;
+                case 6 when w == WireType.LengthDelimited: attr.Graph = ParseSubgraph(r.ReadBytes()); break;
                 case 7: r.ReadPackedFloat(w, floats); break;
                 case 8: r.ReadPackedInt64(w, ints); break;
                 case 20 when w == WireType.Varint: attr.Type = (AttributeType)r.ReadInt32(); break;
@@ -263,6 +284,19 @@ internal sealed class OnnxModel
         attr.Floats = floats.ToArray();
         attr.Ints = ints.ToArray();
         return attr;
+    }
+
+    /// <summary>Parse a nested <c>GraphProto</c> carried by a control-flow attribute.</summary>
+    private static OnnxSubgraph ParseSubgraph(ReadOnlySpan<byte> bytes)
+    {
+        ParseGraph(bytes, out var nodes, out var initializers, out var inputs, out var outputs);
+        return new OnnxSubgraph
+        {
+            Nodes = nodes,
+            Initializers = initializers,
+            Inputs = inputs,
+            Outputs = outputs,
+        };
     }
 
     private static OnnxValueInfo ParseValueInfo(ReadOnlySpan<byte> bytes)
