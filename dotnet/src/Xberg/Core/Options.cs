@@ -81,6 +81,23 @@ public sealed class XbergOptions
     public int PdfMaxSecondsPerDocument { get; init; } = 3600;
 
     /// <summary>
+    /// Root of the Hugging Face style cache the layout models are read from and written to.
+    /// <c>null</c> uses <c>~/.cache/huggingface/hub</c>.
+    /// </summary>
+    /// <remarks>
+    /// Hugging Face's own tooling takes this from <c>HF_HUB_CACHE</c> and friends, but this
+    /// library reads no environment: a consumer who wants those honoured calls
+    /// <see cref="FromEnvironment"/>, which maps them here.
+    /// </remarks>
+    public string? ModelCacheDirectory { get; init; }
+
+    /// <summary>
+    /// Never reach the network for a model. A model that is not already cached, and verified,
+    /// then fails rather than downloading.
+    /// </summary>
+    public bool ModelDownloadsDisabled { get; init; }
+
+    /// <summary>
     /// The wall-clock budget for a document of <paramref name="pageCount"/> pages, in seconds:
     /// <see cref="PdfBaseSeconds"/> plus <see cref="PdfMillisecondsPerPage"/> per page, clamped
     /// to <see cref="PdfMaxSecondsPerDocument"/>.
@@ -138,7 +155,26 @@ public sealed class XbergOptions
                 Number("XBERG_PDF_MS_PER_PAGE") ?? defaults.PdfMillisecondsPerPage,
             PdfMaxSecondsPerDocument =
                 Integer("XBERG_PDF_MAX_SECONDS") ?? defaults.PdfMaxSecondsPerDocument,
+            ModelCacheDirectory =
+                HfCacheDirectory() ?? defaults.ModelCacheDirectory,
+            ModelDownloadsDisabled =
+                (Flag("HF_HUB_OFFLINE") ?? false) || (Flag("TRANSFORMERS_OFFLINE") ?? false)
+                || defaults.ModelDownloadsDisabled,
         };
+
+        // The Hugging Face cache precedence, in the order the hub's own client applies it.
+        static string? HfCacheDirectory()
+        {
+            if (Environment.GetEnvironmentVariable("HF_HUB_CACHE") is { Length: > 0 } hubCache)
+                return hubCache;
+            if (Environment.GetEnvironmentVariable("HUGGINGFACE_HUB_CACHE") is { Length: > 0 } legacy)
+                return legacy;
+            if (Environment.GetEnvironmentVariable("HF_HOME") is { Length: > 0 } home)
+                return System.IO.Path.Combine(home, "hub");
+            if (Environment.GetEnvironmentVariable("XDG_CACHE_HOME") is { Length: > 0 } xdg)
+                return System.IO.Path.Combine(xdg, "huggingface", "hub");
+            return null;
+        }
 
         static bool? Flag(string name) => Environment.GetEnvironmentVariable(name) switch
         {

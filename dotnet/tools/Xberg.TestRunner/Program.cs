@@ -45,6 +45,27 @@ if (args.Length >= 2 && args[0] == "--dump-metadata")
     return 0;
 }
 
+// Layout-model fetch: `--fetch-layout-model <type> [<cacheDir>]` runs the ported model manager,
+// printing where the verified file landed. Used to check the download, digest and publish path
+// against the pinned checksums without a full layout run.
+if (args.Length >= 2 && args[0] == "--fetch-layout-model")
+{
+    // The harness is a caller, so it is the one that may opt into the HF_* variables.
+    var manager = new Xberg.Internal.Layout.LayoutModelManager(
+        args.Length > 2 ? args[2] : null, Xberg.Core.XbergOptions.FromEnvironment());
+    try
+    {
+        string path = manager.EnsureModelAsync(args[1]).GetAwaiter().GetResult();
+        Console.WriteLine($"OK\t{args[1]}\t{path}\t{new FileInfo(path).Length}");
+        return 0;
+    }
+    catch (Exception e)
+    {
+        Console.Error.WriteLine($"FAIL\t{args[1]}\t{e.Message}");
+        return 1;
+    }
+}
+
 // QR probe mode: `--dump-qr <image>...` prints what the ported detector/decoder found, in the
 // same JSON shape as `tools/qr-probe`, so the two can be diffed.
 if (args.Length >= 2 && args[0] == "--dump-qr")
