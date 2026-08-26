@@ -30,6 +30,10 @@ extended = [
     "xberg/tree-sitter",
     "xberg/qr-codes",
 ]
+# Layout-aware reading order. Separate from `extended` because it needs ONNX Runtime and
+# downloads model weights, so it is only worth building when the layout path is what is
+# being measured.
+layout = ["xberg/layout-detection"]
 
 [dependencies]
 xberg = { path = "../../../crates/xberg", default-features = false, features = [

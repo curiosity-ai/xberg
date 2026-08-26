@@ -238,6 +238,21 @@ async fn generate(path: &Path, rel: &str) -> Result<ReferenceOutput, String> {
     for (name, fmt) in FORMATS {
         let mut config = ExtractionConfig::default();
         config.output_format = fmt();
+        // `layout` builds capture the layout-aware path: regions come from the ONNX models
+        // and drive reading order, so the goldens differ wherever a page is multi-column,
+        // table-bearing or otherwise laid out in a way plain geometry reads out of order.
+        #[cfg(feature = "layout")]
+        {
+            config.layout = Some(Default::default());
+            config.use_layout_for_markdown = true;
+            // Reading order is a second opt-in on top of the feature: enabling layout
+            // detection alone only produces hints, it does not reorder anything. Without
+            // this the whole of `extractors/pdf/reading_order.rs` stays unreached, and a
+            // golden set built to measure it would measure nothing.
+            let mut pdf_options = config.pdf_options.clone().unwrap_or_default();
+            pdf_options.reading_order = true;
+            config.pdf_options = Some(pdf_options);
+        }
         let input = ExtractInput::from_uri(path_str.clone());
 
         // Guard against pathological inputs that spin forever in a backend parser.
