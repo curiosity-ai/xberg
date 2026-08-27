@@ -110,7 +110,7 @@ jobs:
       release_zig: ${{ steps.meta.outputs.release_zig }}
       release_kotlin: ${{ steps.meta.outputs.release_kotlin }}
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -118,7 +118,7 @@ jobs:
           owner: xberg-io
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ (inputs.republish == true && (inputs.ref || github.event.repository.default_branch)) || inputs.ref || inputs.tag || github.ref }}
           fetch-depth: 0
@@ -160,11 +160,15 @@ jobs:
   validate-versions:
     name: Validate language manifest versions
     needs: prepare
-    if: ${{ needs.prepare.outputs.is_tag == 'true' }}
+    # Runs on dry runs too. Checkout + a version comparison, no secret, no mutation, so there
+    # is nothing to guard against -- and catching a language manifest that disagrees with the
+    # release version is precisely what a dry run is for. It can legitimately go red when the
+    # version has not been bumped yet; that is the intended signal, not a flake. ~keep
+    if: ${{ needs.prepare.outputs.is_tag == 'true' || needs.prepare.outputs.dry_run == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -299,6 +303,7 @@ jobs:
             libheif_exists=xberg-libheif
             gliner_exists=xberg-gliner
             libwpd_exists=xberg-libwpd
+            native_pdf_exists=xberg-native-pdf
             cli_exists=xberg-cli
 
       - id: derive
@@ -310,6 +315,7 @@ jobs:
             && "${{ steps.check.outputs.libheif_exists }}" == "true" \
             && "${{ steps.check.outputs.gliner_exists }}" == "true" \
             && "${{ steps.check.outputs.libwpd_exists }}" == "true" \
+            && "${{ steps.check.outputs.native_pdf_exists }}" == "true" \
             && "${{ steps.check.outputs.cli_exists }}" == "true" ]]; then
             echo "all_exist=true" >> "$GITHUB_OUTPUT"
           else
@@ -467,7 +473,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15, macos-15-intel]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -475,6 +481,22 @@ jobs:
           submodules: false
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
+
+      # pyke's default download strategy links a Windows ORT build that always
+      # imports DirectML.dll (ort-sys's static_link_prerequisites is
+      # unconditional on windows targets), which this repo never ships and
+      # which no arm of ort_discovery.rs ever selects -- so `import xberg`
+      # fails on a clean Windows host before any Rust code runs
+      # (xberg-io/xberg#1456). This step forces ORT_STRATEGY=system (the same
+      # strategy every other Windows leg in this workflow already uses),
+      # which hits an early return in ort-sys before static_link_prerequisites
+      # runs, so the DirectML import is never introduced in the first place.
+      - name: Setup ONNX Runtime (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: "1.24.2"
+          dest-dir: crates/xberg-py
 
       - name: Build wheels
         uses: xberg-io/actions/build-python-wheels@v1
@@ -525,11 +547,57 @@ jobs:
           # target in this workflow, instead of depending on auditwheel alone.
           for w in wheelhouse/*.whl; do bash scripts/ci/vendor-native-closure.sh "$w"; done
 
+      - name: Vendor ONNX Runtime into wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # System-strategy dynamic linking (switched above) no longer bakes ORT
+          # into the .pyd the way the pyke static-link strategy did, so it must
+          # be vendored explicitly -- same rationale as the Linux step above.
+          Get-ChildItem -Path wheelhouse -Filter "*.whl" | ForEach-Object {
+            & "${{ github.workspace }}\scripts\ci\vendor-windows-wheel-closure.ps1" -Wheel $_.FullName -DllSourceDir "$env:ORT_LIB_LOCATION" -NativeGlob "*.pyd"
+            if ($LASTEXITCODE -ne 0) { throw "vendor-windows-wheel-closure failed for $($_.FullName)" }
+          }
+
+      - name: Verify wheel has no DirectML import and ships ONNX Runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path wheelhouse -Filter "*.whl" | ForEach-Object {
+            & "${{ github.workspace }}\scripts\ci\verify-windows-dll-closure.ps1" -Artifact $_.FullName -NativeGlob "*.pyd"
+            if ($LASTEXITCODE -ne 0) { throw "verify-windows-dll-closure failed for $($_.FullName)" }
+          }
+
       - name: Verify wheel glibc floor + bundled ONNX Runtime
         if: runner.os == 'Linux'
         shell: bash
         run: |
           for w in wheelhouse/*.whl; do bash scripts/ci/verify-glibc-floor.sh "$w" "$GLIBC_FLOOR"; done
+
+      # The checks above only prove a file exists (or, for Linux/Windows,
+      # inspect symbols/imports statically) -- none of them ever import or
+      # run the wheel. This installs it into a real venv on this same runner
+      # (matching glibc/macOS/Windows -- the family it was actually built
+      # for, unlike the musl leg which needs a separate Alpine container) and
+      # runs a real extraction against a known fixture, asserting the exact
+      # expected text comes back. See scripts/ci/smoke_test_python_wheel.py
+      # for why import-only is not enough. No continue-on-error: a broken
+      # wheel must fail this job, not merely warn.
+      - name: Smoke-test wheel (real extraction, not just import)
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(find wheelhouse -name '*.whl' | head -n1)"
+          python="python3"
+          venv_python="smoke-venv/bin/python"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            python="python"
+            venv_python="smoke-venv/Scripts/python.exe"
+          fi
+          "$python" -m venv smoke-venv
+          "$venv_python" -m pip install --no-cache-dir --quiet "$wheel"
+          "$venv_python" scripts/ci/smoke_test_python_wheel.py \
+            scripts/ci/fixtures/musl-python-smoke.pdf "XBERG MUSL SMOKE 490"
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7
@@ -550,7 +618,7 @@ jobs:
           - { os: ubuntu-latest, arch: x86_64, target: x86_64-unknown-linux-musl }
           - { os: ubuntu-24.04-arm, arch: aarch64, target: aarch64-unknown-linux-musl }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -566,6 +634,17 @@ jobs:
         run: |
           test -n "$(find build-output -name '*.whl')" || {
             echo "::error::no wheel produced by musl build for ${{ matrix.target }}"; exit 1; }
+
+      # Closes xberg-io/xberg#490: the wheel-existence check above only proves a
+      # file was produced, never that it installs and extracts correctly on the
+      # musl libc family it was cross-compiled for. This installs it into a real
+      # Alpine container and runs an actual extraction against a known fixture,
+      # asserting the exact expected text comes back. No continue-on-error: a
+      # broken wheel must fail this job, not merely warn.
+      - name: Smoke-test musl wheel (real extraction, not just import)
+        run: |
+          wheel="$(find build-output -name '*.whl' | head -n1)"
+          bash scripts/ci/smoke-test-musl-python-wheel.sh "$wheel"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -585,14 +664,14 @@ jobs:
     if: ${{ !cancelled() && needs.prepare.outputs.dry_run != 'true' && needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_python == 'true' && (needs.check-pypi.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
           submodules: false
       - uses: xberg-io/actions/setup-rust@v1
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -625,7 +704,7 @@ jobs:
           # sync with alef's [crates.node].exclude_platforms=["darwin-x64"]. ~keep
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -738,7 +817,7 @@ jobs:
           - { os: ubuntu-latest, arch: x86_64, napi_arch: x64, target: x86_64-unknown-linux-musl }
           - { os: ubuntu-24.04-arm, arch: aarch64, napi_arch: arm64, target: aarch64-unknown-linux-musl }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -781,6 +860,20 @@ jobs:
           print("reconciled files:", pkg["files"])
           ' "staging/npm/${platform}"
           tar -czf node-bindings-${{ matrix.target }}.tar.gz -C staging npm
+
+      # The steps above only prove a .node file (and its vendored shared-lib
+      # closure) exist on disk -- never that require()ing it actually works.
+      # This installs it into a real Alpine (musl libc) container and runs a
+      # real extraction against a known fixture, asserting the exact expected
+      # text comes back. See scripts/ci/smoke_test_node_binding.js for what
+      # this catches and why a require()-only check is not enough. No
+      # continue-on-error: a broken binding must fail this job, not merely
+      # warn.
+      - name: Smoke-test musl Node binding (real extraction, not just require)
+        run: |
+          platform="linux-${{ matrix.napi_arch }}-musl"
+          bash scripts/ci/smoke-test-musl-node-binding.sh "staging/npm/${platform}"
+
       - uses: actions/upload-artifact@v7
         with:
           name: node-bindings-${{ matrix.target }}
@@ -812,7 +905,7 @@ jobs:
               image: quay.io/pypa/manylinux_2_28_aarch64,
             }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -880,7 +973,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 1
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1002,6 +1095,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       RB_SYS_CARGO_PROFILE: release
+      # Alef's target dependency override selects `windows-gnu-target`, but the generated
+      # binding crate's default forwarding features otherwise union ORT back into xberg.
+      # MinGW has no ORT prebuilt, so compile the wrapper with only the cfg-gated APIs that
+      # the Windows GNU surface supports. The target dependency still supplies the complete
+      # `windows-gnu-target` implementation feature set.
+      RB_SYS_EXTRA_CARGO_ARGS: ${{ matrix.ruby_cargo_args }}
     strategy:
       fail-fast: false
       matrix:
@@ -1009,9 +1108,11 @@ jobs:
           - { os: ubuntu-latest, label: linux-x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64 }
           - { os: macos-15, label: macos-arm64 }
-          - { os: windows-latest, label: windows-x86_64 }
+          - os: windows-latest
+            label: windows-x86_64
+            ruby_cargo_args: --no-default-features --features pdf,markdown-footnotes,url-ingestion
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1090,7 +1191,7 @@ jobs:
           - { os: macos-15, label: macos-arm64, target: aarch64-apple-darwin }
           - { os: windows-latest, label: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1106,6 +1207,16 @@ jobs:
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
+
+      # See the equivalent step on python-wheels for the DirectML root cause
+      # (xberg-io/xberg#1456). This leg had no ORT setup step at all on
+      # Windows, so it defaulted to the pyke download strategy every time.
+      - name: Setup ONNX Runtime (Windows)
+        if: contains(matrix.platform.target, 'windows')
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: "1.24.2"
+          dest-dir: crates/xberg-php
 
       - uses: xberg-io/actions/build-php-extension@v1
         with:
@@ -1129,6 +1240,34 @@ jobs:
           windows-compiler: ${{ contains(matrix.platform.target, 'windows') && 'vs17' || '' }}
           version: ${{ needs.prepare.outputs.version }}
           output-dir: dist/php-package
+
+      # package-php-pie@v1 is an external action (xberg-io/actions); its
+      # internal file selection was not auditable from this repo, so vendor
+      # onto its OUTPUT archives (control we do have) rather than assume it
+      # bundles a co-located onnxruntime.dll from the build directory.
+      - name: Vendor ONNX Runtime into PHP package (Windows)
+        if: contains(matrix.platform.target, 'windows')
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path dist/php-package -Include "php_*.zip", "php_*.tgz" -Recurse | ForEach-Object {
+            & "${{ github.workspace }}\scripts\ci\vendor-windows-native-closure.ps1" -Archive $_.FullName -DllSourceDir "$env:ORT_LIB_LOCATION" -NativeGlob "php_xberg.dll"
+            if ($LASTEXITCODE -ne 0) { throw "vendor-windows-native-closure failed for $($_.FullName)" }
+            # Vendoring rewrites the archive bytes, so the .sha256 sidecar
+            # package-php-pie already wrote is now stale -- regenerate it.
+            $sha256Path = "$($_.FullName).sha256"
+            if (Test-Path $sha256Path) {
+              (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower() + "  " + $_.Name | Set-Content -Path $sha256Path -NoNewline:$false
+            }
+          }
+
+      - name: Verify PHP package has no DirectML import and ships ONNX Runtime (Windows)
+        if: contains(matrix.platform.target, 'windows')
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path dist/php-package -Include "php_*.zip", "php_*.tgz" -Recurse | ForEach-Object {
+            & "${{ github.workspace }}\scripts\ci\verify-windows-dll-closure.ps1" -Artifact $_.FullName -NativeGlob "php_xberg.dll"
+            if ($LASTEXITCODE -ne 0) { throw "verify-windows-dll-closure failed for $($_.FullName)" }
+          }
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1165,7 +1304,7 @@ jobs:
             }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1229,18 +1368,24 @@ jobs:
           cp LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cp "$BINARY_PATH" "$STAGE/xberg.exe"
+            # The `Setup ONNX Runtime` step above runs with its default `system`
+            # strategy (ORT_STRATEGY=system), which links ONNX Runtime
+            # dynamically rather than statically baking it in -- so, unlike the
+            # Linux/macOS branches which either vendor a shared-object closure
+            # or need nothing extra, this zip must ship the DLL closure itself
+            # (xberg-io/xberg#1456 sibling bug: this leg shipped no DLLs at
+            # all). Mirror the Dart leg's vendoring exactly.
+            cp "${ORT_LIB_LOCATION:?}"/*.dll "$STAGE/"
+            [ -f "$STAGE/onnxruntime.dll" ] || { echo "::error::onnxruntime.dll not staged"; exit 1; }
             # Smoke-test the staged tree exactly as a user would unzip it, the
             # Windows counterpart of the `--version` runs on the macOS and
-            # linux-gnu branches below. The `Setup ONNX Runtime` step above runs
-            # with its default `system` strategy, which exports ORT_STRATEGY=system
-            # and links ONNX Runtime dynamically, while this branch vendors no DLL
-            # into the zip (contrast the Intel-macOS dylib vendoring below). So
-            # this is what decides whether the shipped zip can start at all.
-            # The `Setup ONNX Runtime` step prepends its staged DLL directory
-            # (under the workspace) to PATH; leaving it there would let the
-            # loader satisfy the import from the build tree and pass no matter
-            # what the zip contains, so strip it first — the analogue of
-            # `env -u LD_LIBRARY_PATH` on the linux-gnu branch.
+            # linux-gnu branches below. The `Setup ONNX Runtime` step prepends
+            # its staged DLL directory (under the workspace) to PATH; leaving it
+            # there would let the loader satisfy the import from the build tree
+            # and pass no matter what the zip contains, so strip it first — the
+            # analogue of `env -u LD_LIBRARY_PATH` on the linux-gnu branch. This
+            # now proves the DLLs just copied into $STAGE are what satisfy the
+            # load, not an ambient workspace path.
             WORKSPACE_POSIX="$(pwd)"
             CLEAN_PATH=""
             while IFS= read -r path_entry; do
@@ -1264,6 +1409,13 @@ jobs:
             fi
             PATH="$CLEAN_PATH" "$STAGE/xberg.exe" --version
             echo "Windows CLI smoke test passed: $STAGE/xberg.exe --version ran without a workspace-provided onnxruntime.dll"
+            # `--version` alone does not prove the loader is happy: a hard PE
+            # import (like DirectML.dll before this fix) is resolved before
+            # main() runs either way, but a *delay-loaded* import only breaks
+            # once the code path that touches it executes, which `--version`
+            # never does. Inspect the import table directly instead of trusting
+            # the smoke test's exit code for that class of defect.
+            pwsh -NoProfile -File "$GITHUB_WORKSPACE/scripts/ci/verify-windows-dll-closure.ps1" -Artifact "$STAGE" -NativeGlob "xberg.exe"
             7z a "${STAGE}.zip" "$STAGE" >/dev/null
           else
             cp "$BINARY_PATH" "$STAGE/xberg"
@@ -1324,7 +1476,7 @@ jobs:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1375,7 +1527,7 @@ jobs:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, features: binstall-ocr }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, features: binstall }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1421,7 +1573,7 @@ jobs:
           - { os: macos-15, platform: macos-arm64, target: aarch64-apple-darwin }
           - { os: windows-latest, platform: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1493,7 +1645,7 @@ jobs:
           - { os: macos-15, platform: macos-arm64, target: aarch64-apple-darwin }
           - { os: windows-latest, platform: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1542,8 +1694,24 @@ jobs:
             -exec cp {} "$STAGE/lib/" \;
           cp crates/xberg-ffi/include/xberg.h "$STAGE/include/"
           cp LICENSE "$STAGE/" 2>/dev/null || true
+          # Windows links ONNX Runtime dynamically (`Setup ONNX Runtime` above
+          # runs with its default `system` strategy); this leg had no
+          # equivalent of the glibc-Linux step below and shipped no ONNX
+          # Runtime DLL at all (xberg-io/xberg#1456 sibling bug). Mirror the
+          # Dart leg's vendoring.
+          if [[ "$TARGET" == *-pc-windows-msvc ]]; then
+            cp "${ORT_LIB_LOCATION:?}"/*.dll "$STAGE/lib/"
+            [ -f "$STAGE/lib/onnxruntime.dll" ] || { echo "::error::onnxruntime.dll not staged"; exit 1; }
+          fi
           mkdir -p dist/c-ffi
           tar -czf "dist/c-ffi/${STAGE}.tar.gz" "$STAGE"
+
+      - name: Verify C FFI distribution has no DirectML import and ships ONNX Runtime (Windows)
+        if: contains(matrix.target, '-pc-windows-msvc')
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\scripts\ci\verify-windows-dll-closure.ps1" -Artifact "dist/c-ffi/xberg-ffi-${{ matrix.platform }}.tar.gz" -NativeGlob "xberg_ffi.dll"
+          if ($LASTEXITCODE -ne 0) { throw "verify-windows-dll-closure failed" }
 
       - name: Ship + verify ONNX Runtime (glibc Linux)
         if: contains(matrix.target, '-linux-gnu')
@@ -1579,7 +1747,7 @@ jobs:
           - { os: macos-15, classifier: macos-arm64, target: aarch64-apple-darwin }
           - { os: windows-latest, classifier: windows-x86_64, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1646,7 +1814,7 @@ jobs:
           - { os: ubuntu-latest, arch: x86_64, classifier: linux-musl-x86_64 }
           - { os: ubuntu-24.04-arm, arch: aarch64, classifier: linux-musl-aarch64 }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1663,6 +1831,21 @@ jobs:
         run: |
           mkdir -p "dist/java-natives/${CLASSIFIER}"
           cp build-output/libxberg_ffi.so "dist/java-natives/${CLASSIFIER}/libxberg_ffi.so"
+
+      # The step above only proves libxberg_ffi.so was produced -- never that
+      # a JVM can load it and call into it correctly. io.xberg.NativeLib
+      # already validates every required C symbol resolves by name the first
+      # time any io.xberg class is touched, but symbol presence does not
+      # prove a real extraction call works end to end. This compiles the
+      # io.xberg sources against a real JDK inside a genuine Alpine (musl
+      # libc) container and runs a real extraction against a known fixture,
+      # asserting the exact expected text comes back. See
+      # scripts/ci/fixtures/java-smoke/Smoke.java for details. No
+      # continue-on-error: a broken native library must fail this job, not
+      # merely warn.
+      - name: Smoke-test musl Java native (real extraction, not just symbol presence)
+        run: |
+          bash scripts/ci/smoke-test-musl-java-ffi.sh build-output
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1683,7 +1866,7 @@ jobs:
           - { abi: arm64-v8a }
           - { abi: x86_64 }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1721,7 +1904,7 @@ jobs:
           - { os: macos-15, rid: osx-arm64, target: aarch64-apple-darwin }
           - { os: windows-latest, rid: win-x64, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1789,7 +1972,7 @@ jobs:
           - { os: ubuntu-latest, arch: x64, rid: linux-musl-x64 }
           - { os: ubuntu-24.04-arm, arch: arm64, rid: linux-musl-arm64 }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1811,6 +1994,19 @@ jobs:
           # `*.so*` (not `*.so`) matches versioned sonames like libonnxruntime.so.1,
           # which a plain `*.so` glob silently drops. ~keep
           cp build-output/*.so* "dist/csharp-natives/runtimes/${RID}/native/"
+
+      # The step above only proves the shared-lib closure was produced --
+      # never that .NET can load it and call into it correctly. [DllImport]
+      # entry points bind lazily on first call, so nothing before this point
+      # has ever executed a P/Invoke into the library. This builds a small
+      # program against it inside a genuine Alpine (musl libc) container and
+      # runs a real extraction against a known fixture, asserting the exact
+      # expected text comes back. See scripts/ci/fixtures/csharp-smoke/Program.cs
+      # for details. No continue-on-error: a broken native library must fail
+      # this job, not merely warn.
+      - name: Smoke-test musl C# native (real extraction, not just P/Invoke resolution)
+        run: |
+          bash scripts/ci/smoke-test-musl-csharp-ffi.sh "dist/csharp-natives/runtimes/${{ matrix.rid }}/native"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1844,7 +2040,7 @@ jobs:
             label: windows-x86_64
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1860,7 +2056,7 @@ jobs:
         shell: bash
         run: echo "ImageOS=win25" >> "$GITHUB_ENV"
 
-      - uses: erlef/setup-beam@v1.24.0
+      - uses: erlef/setup-beam@v1.24.1
         with:
           elixir-version: "1.17"
           otp-version: "27"
@@ -1886,8 +2082,12 @@ jobs:
         shell: bash
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
+      # Was gated to `-linux-gnu` only, so Windows fell through to pyke's
+      # default download strategy, which always imports DirectML.dll on
+      # Windows (xberg-io/xberg#1456). Widen the gate to also run on Windows,
+      # forcing ORT_STRATEGY=system so that import is never introduced.
       - name: Setup ONNX Runtime
-        if: contains(matrix.target, '-linux-gnu')
+        if: contains(matrix.target, '-linux-gnu') || contains(matrix.target, 'windows')
         uses: ./.github/actions/setup-onnx-runtime
         with:
           ort-version: "1.24.2"
@@ -1916,6 +2116,24 @@ jobs:
             bash scripts/ci/verify-glibc-floor.sh "$t" "$GLIBC_FLOOR"
           done
           [ "$shipped" = 1 ] || echo "::notice::no artifact produced (dry-run stub); skipping ship+verify"
+
+      # build-elixir-natives@v1 is an external action; vendor onto its OUTPUT
+      # tarball rather than assume it bundles a co-located onnxruntime.dll,
+      # same reasoning as the PHP PIE package step above.
+      - name: Ship + verify ONNX Runtime (Windows)
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $tarballs = @(Get-ChildItem -Path dist/elixir-natives -Filter "*.tar.gz" -File -ErrorAction SilentlyContinue)
+          if ($tarballs.Count -eq 0) {
+            Write-Host "::notice::no artifact produced (dry-run stub); skipping ship+verify"
+          }
+          foreach ($t in $tarballs) {
+            & "${{ github.workspace }}\scripts\ci\vendor-windows-native-closure.ps1" -Archive $t.FullName -DllSourceDir "$env:ORT_LIB_LOCATION" -NativeGlob "xberg_nif.dll"
+            if ($LASTEXITCODE -ne 0) { throw "vendor-windows-native-closure failed for $($t.FullName)" }
+            & "${{ github.workspace }}\scripts\ci\verify-windows-dll-closure.ps1" -Artifact $t.FullName -NativeGlob "xberg_nif.dll"
+            if ($LASTEXITCODE -ne 0) { throw "verify-windows-dll-closure failed for $($t.FullName)" }
+          }
 
       # `build-elixir-natives` returns before creating the tarball on a dry run
       # (scripts/build.py writes its outputs and skips the cargo build), so the
@@ -1951,7 +2169,7 @@ jobs:
             arch: aarch64
             target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -1961,6 +2179,17 @@ jobs:
         run: |
           docker build -f docker/Dockerfile.musl-rustler \
             --output type=local,dest=./build-output .
+
+      # Nothing before this point has ever loaded libxberg_nif.so into a BEAM
+      # VM. This loads the freshly built .so directly (bypassing
+      # RustlerPrecompiled's release-download / force_build paths -- see
+      # scripts/ci/smoke_test_elixir_nif.exs for why) inside a genuine Alpine
+      # (musl libc) container and runs a real extraction against a known
+      # fixture, asserting the exact expected text comes back. No
+      # continue-on-error: a broken NIF must fail this job, not merely warn.
+      - name: Smoke-test musl Elixir NIF (real extraction, not just load)
+        run: |
+          bash scripts/ci/smoke-test-musl-elixir-nif.sh build-output
 
       - name: Package NIF as RustlerPrecompiled tarball
         env:
@@ -2020,7 +2249,7 @@ jobs:
               lib: xberg_dart.dll,
             }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -2119,7 +2348,7 @@ jobs:
     if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.release_dart == 'true' && needs.dart-server-natives.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2170,7 +2399,7 @@ jobs:
     if: ${{ needs.prepare.outputs.release_swift == 'true' }}
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -2209,7 +2438,7 @@ jobs:
     if: ${{ needs.prepare.outputs.release_swift == 'true' }}
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -2242,14 +2471,14 @@ jobs:
     if: ${{ needs.prepare.outputs.release_swift == 'true' && needs.upload-swift-bundle.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
           owner: xberg-io
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -2307,7 +2536,7 @@ jobs:
     if: ${{ needs.prepare.outputs.release_zig == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
@@ -2326,7 +2555,14 @@ jobs:
   cli-proxy-wheels:
     name: Build CLI proxy wheel (${{ matrix.target }})
     needs: [prepare, check-cli, cli-binaries, cli-binaries-musl]
-    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.cli-binaries.result == 'success' && needs.cli-binaries-musl.result == 'success' && (needs.check-cli.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
+    # Runs on dry runs too, matching `check-cli` and `zig-package`. This job is where the
+    # runtime wheel-payload smoke test lives (GH#1407), and gating it on `is_tag` alone meant
+    # a dry run SKIPPED the one check that would have caught a 257-byte launcher wheel -- the
+    # matrix never expanded, so the run went green having exercised nothing. Safe to widen:
+    # the job ends at `upload-artifact` and contains no twine, token or secret, and
+    # `cli-binaries`/`cli-binaries-musl` carry no `is_tag` term either, so they produce real
+    # binaries on a dry run rather than stubs. ~keep
+    if: ${{ (needs.prepare.outputs.is_tag == 'true' || needs.prepare.outputs.dry_run == 'true') && needs.cli-binaries.result == 'success' && needs.cli-binaries-musl.result == 'success' && (needs.check-cli.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -2340,12 +2576,12 @@ jobs:
           - { target: x86_64-unknown-linux-musl }
           - { target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -2478,7 +2714,7 @@ jobs:
     if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.cli-binaries.result == 'success' && needs.cli-binaries-musl.result == 'success' && needs.cli-binaries-binstall.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2532,7 +2768,7 @@ jobs:
     if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.go-ffi-libraries.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2581,14 +2817,14 @@ jobs:
     if: ${{ !cancelled() && needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.dry_run != 'true' && needs.upload-go-release.result == 'success' && (needs.update-swift-package-manifest.result == 'success' || needs.update-swift-package-manifest.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
           owner: xberg-io
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Pin to the tag by name so checkout takes its CURRENT commit rather
           # than asserting the triggering `github.sha`. update-swift-package-manifest
@@ -2618,7 +2854,7 @@ jobs:
     if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.c-ffi-libraries.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2650,7 +2886,7 @@ jobs:
     if: ${{ needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.elixir-natives.result == 'success' || needs.elixir-natives-musl.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2677,7 +2913,7 @@ jobs:
     if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.php-extension.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2708,7 +2944,7 @@ jobs:
     if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.swift-artifactbundle.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2744,7 +2980,7 @@ jobs:
       # with finalize and the other release-writing jobs. Without it the lookup
       # failed every retry with "release not found", skipping finalize and
       # cascading into a skipped Homebrew bottle build (issue #1247). ~keep
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -2775,7 +3011,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
@@ -2787,7 +3023,7 @@ jobs:
 
       - uses: xberg-io/actions/publish-crates@v1
         with:
-          crates: xberg-libheif xberg-tesseract xberg-paddle-ocr xberg-candle-ocr xberg-gliner xberg-libwpd xberg xberg-cli
+          crates: xberg-libheif xberg-tesseract xberg-paddle-ocr xberg-candle-ocr xberg-gliner xberg-libwpd xberg-native-pdf xberg xberg-cli
           version: ${{ needs.prepare.outputs.version }}
           dry-run: ${{ needs.prepare.outputs.dry_run }}
 
@@ -2834,12 +3070,12 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -2892,7 +3128,7 @@ jobs:
       - name: Update RubyGems for OIDC trusted publishing
         run: gem update --system
 
-      - uses: rubygems/configure-rubygems-credentials@v2.0.0
+      - uses: rubygems/configure-rubygems-credentials@v2.1.0
 
       - name: Verify Ruby gem package contents
         uses: xberg-io/actions/verify-package-contents@v1
@@ -2915,7 +3151,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
@@ -3106,7 +3342,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
@@ -3208,7 +3444,7 @@ jobs:
     if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_java == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-maven.outputs.java_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
@@ -3259,7 +3495,7 @@ jobs:
     if: ${{ needs.publish-crates.result != 'failure' && needs.prepare.outputs.release_kotlin == 'true' && needs.prepare.outputs.is_tag == 'true' && (needs.check-maven.outputs.kotlin_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
@@ -3306,7 +3542,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
@@ -3327,7 +3563,7 @@ jobs:
           done
         shell: bash
 
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "8.0.x"
 
@@ -3398,7 +3634,7 @@ jobs:
       && needs.upload-elixir-release.result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3426,13 +3662,13 @@ jobs:
       && (needs.check-hex.outputs.elixir_exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
           submodules: false
       - uses: xberg-io/actions/setup-rust@v1
-      - uses: erlef/setup-beam@v1.24.0
+      - uses: erlef/setup-beam@v1.24.1
         with:
           elixir-version: "1.17"
           otp-version: "27"
@@ -3479,7 +3715,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3511,7 +3747,7 @@ jobs:
       && (needs.check-zig.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
           submodules: false
@@ -3575,7 +3811,7 @@ jobs:
       # Mint the app token immediately before the upload. GitHub App installation
       # tokens have a hard 1h TTL; laying out the multi-platform FFI bundle (>1GB)
       # can outlast a token minted at job start, causing the release upload to 401. ~keep
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3622,14 +3858,14 @@ jobs:
       && (needs.check-homebrew.outputs.exists != 'true' || needs.prepare.outputs.force_republish == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
           owner: xberg-io
 
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: tap-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3638,14 +3874,14 @@ jobs:
           repositories: homebrew-tap
 
       - name: Checkout source repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: true
 
       - name: Checkout homebrew-tap
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: xberg-io/homebrew-tap
           token: ${{ steps.tap-token.outputs.token }}
@@ -3706,7 +3942,7 @@ jobs:
           - { os: ubuntu-latest, bottle_tag: x86_64_linux, install_brew: true }
           - { os: ubuntu-24.04-arm, bottle_tag: arm64_linux, install_brew: true }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
 
@@ -3730,7 +3966,7 @@ jobs:
           github-repo: xberg-io/xberg
           upload: false
 
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3786,7 +4022,7 @@ jobs:
       && needs.prepare.outputs.is_tag == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: tap-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3794,13 +4030,13 @@ jobs:
           owner: xberg-io
           repositories: homebrew-tap
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
 
           submodules: false
       - name: Checkout homebrew-tap
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: xberg-io/homebrew-tap
           token: ${{ steps.tap-token.outputs.token }}
@@ -3879,7 +4115,7 @@ jobs:
       needs.publish-zig.result != 'failure'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3928,7 +4164,7 @@ jobs:
       !contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
@@ -3951,7 +4187,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - uses: xberg-io/actions/setup-node-workspace@v1
@@ -3984,7 +4220,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - name: Install uv
@@ -4026,7 +4262,7 @@ jobs:
       && needs.prepare.outputs.is_tag == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.ref }}
       - uses: actions/setup-java@v5
@@ -4099,7 +4335,7 @@ jobs:
           - langchain-xberg
           - llamaindex-xberg
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - uses: xberg-io/actions/setup-node-workspace@v1
@@ -4144,7 +4380,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - uses: xberg-io/actions/setup-node-workspace@v1
@@ -4187,7 +4423,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - name: Install uv

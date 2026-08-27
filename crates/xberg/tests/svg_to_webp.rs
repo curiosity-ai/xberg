@@ -94,6 +94,22 @@ fn svg_to_webp_emits_no_image_encoder_warnings() {
     let result =
         extract_bytes_document_blocking(HTML_WITH_INLINE_SVG, "text/html", &config).expect("extraction must succeed");
 
+    // Anti-vacuity guard. Until `capture_svg` was set in `extract_html_inline_images`, inline
+    // SVG was never captured at all, so `images` was `None` and this test passed by finding no
+    // `image_encoder` warnings about images that were never encoded -- it was satisfied by the
+    // very defect it should have caught. Assert there is something to encode BEFORE asserting
+    // that encoding it produced no warnings.
+    let images = result
+        .images
+        .as_ref()
+        .expect("images must be Some when extract_images=true");
+    assert!(
+        !images.is_empty(),
+        "HTML with inline SVG must yield at least one ExtractedImage before the warning check \
+         means anything; processing_warnings: {:?}",
+        result.processing_warnings
+    );
+
     let encoder_warnings: Vec<_> = result
         .processing_warnings
         .iter()

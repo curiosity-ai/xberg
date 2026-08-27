@@ -34,9 +34,32 @@ RUN cd /tmp && \
     ldconfig && \
     cd / && rm -rf /tmp/libheif*
 
+ARG PDFIUM_VERSION=7881
 ARG ONNXRUNTIME_VERSION=1.24.2
 ARG TARGETARCH
+ENV PDFIUM_VERSION=${PDFIUM_VERSION}
 ENV ONNXRUNTIME_VERSION=${ONNXRUNTIME_VERSION}
+
+# Download and extract pdfium to a location that survives into the runtime stage.
+# TARGETARCH is automatically set by Docker: amd64, arm64, etc. The GitHub release
+# is tried first, then the chromium-browser-snapshots mirror -- pdfium-binaries
+# releases have gone missing/rate-limited before, and this is a published-image
+# build, not a best-effort dev one. Both legs get retries; only the combination
+# failing should fail the build.
+RUN mkdir -p /build/pdfium && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        PDFIUM_ARCH="arm64"; \
+    else \
+        PDFIUM_ARCH="x64"; \
+    fi && \
+    (curl -fL --retry 5 --retry-delay 2 --retry-max-time 180 --retry-all-errors \
+        "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/${PDFIUM_VERSION}/pdfium-linux-${PDFIUM_ARCH}.tgz" \
+        -o /build/pdfium.tgz \
+        || curl -fL --retry 5 --retry-delay 2 --retry-max-time 180 --retry-all-errors \
+        "https://storage.googleapis.com/chromium-browser-snapshots/Linux_${PDFIUM_ARCH}/pdfium-${PDFIUM_VERSION}.tgz" \
+        -o /build/pdfium.tgz) && \
+    tar -xzf /build/pdfium.tgz -C /build/pdfium && \
+    rm /build/pdfium.tgz
 
 RUN mkdir -p /build/onnxruntime && \
     if [ "$TARGETARCH" = "arm64" ]; then \
@@ -51,7 +74,6 @@ RUN mkdir -p /build/onnxruntime && \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
-COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-cli/ crates/xberg-cli/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
@@ -59,8 +81,10 @@ COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
+COPY crates/xberg-pdfium-render/ crates/xberg-pdfium-render/
+COPY crates/xberg-native-pdf/ crates/xberg-native-pdf/
 
-RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
+RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /e2e\/rust/d' Cargo.toml
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -111,6 +135,7 @@ COPY --from=builder /usr/local/lib/pkgconfig/libheif.pc /usr/local/lib/pkgconfig
 RUN ldconfig
 
 COPY --from=builder /build/onnxruntime/lib/libonnxruntime.so* /usr/local/lib/
+COPY --from=builder /build/pdfium/lib/libpdfium.so /usr/local/lib/
 RUN ldconfig
 
 COPY --from=builder /build/xberg /usr/local/bin/xberg
@@ -146,7 +171,8 @@ RUN set -eux; \
 ENV XBERG_CACHE_DIR=/app/.xberg \
     HF_HOME=/app/.xberg/huggingface \
     RUST_LOG=info \
-    LD_LIBRARY_PATH=/usr/local/lib:/usr/lib:/lib
+    LD_LIBRARY_PATH=/usr/local/lib:/usr/lib:/lib \
+    PDFIUM_DYNAMIC_LIB_PATH=/usr/local/lib
 
 USER xberg
 

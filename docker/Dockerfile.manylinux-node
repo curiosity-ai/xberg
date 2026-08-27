@@ -61,17 +61,18 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
-COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-node/ crates/xberg-node/
 COPY crates/xberg-ffi/ crates/xberg-ffi/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
+COPY crates/xberg-pdfium-render/ crates/xberg-pdfium-render/
+COPY crates/xberg-native-pdf/ crates/xberg-native-pdf/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
 COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 
-RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-cli/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
+RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-cli/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /e2e\/rust/d' Cargo.toml
 
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc \

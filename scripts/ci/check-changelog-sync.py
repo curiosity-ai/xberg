@@ -25,6 +25,7 @@ docs copy starts at its first version heading.
 Run from the repository root:
 
     python3 scripts/ci/check-changelog-sync.py
+    python3 scripts/ci/check-changelog-sync.py --fix
 
 Exits 0 when in sync, 1 on drift, 2 when a file is missing.
 """
@@ -113,11 +114,25 @@ def check(repo_path: Path, docs_path: Path) -> int:
     return 0
 
 
+def sync(repo_path: Path, docs_path: Path) -> None:
+    """Replace the docs' numeric release sections with the canonical repo sections."""
+    repo_lines = repo_path.read_text(encoding="utf-8").splitlines()
+    docs_lines = docs_path.read_text(encoding="utf-8").splitlines()
+    repo_start = next(index for index, line in enumerate(repo_lines) if VERSION_HEADING.match(line))
+    docs_start = next(index for index, line in enumerate(docs_lines) if VERSION_HEADING.match(line))
+    docs_path.write_text("\n".join(docs_lines[:docs_start] + repo_lines[repo_start:]) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     for path in (REPO_CHANGELOG, DOCS_CHANGELOG):
         if not path.is_file():
             _fail(f"{path}: not found (run from the repository root)")
             return 2
+    if sys.argv[1:] == ["--fix"]:
+        sync(REPO_CHANGELOG, DOCS_CHANGELOG)
+    elif sys.argv[1:]:
+        _fail("usage: check-changelog-sync.py [--fix]")
+        return 2
     return check(REPO_CHANGELOG, DOCS_CHANGELOG)
 
 

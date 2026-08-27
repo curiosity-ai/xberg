@@ -352,7 +352,6 @@ fn test_output_format_all_variants() {
         OutputFormat::Markdown,
         OutputFormat::Html,
         OutputFormat::Djot,
-        OutputFormat::Structured,
     ];
 
     for fmt in &formats {

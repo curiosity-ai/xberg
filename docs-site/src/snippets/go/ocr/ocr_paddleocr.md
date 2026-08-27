@@ -11,7 +11,7 @@ func main() {
 	cfg := xberg.ExtractionConfig{
 		Ocr: &xberg.OcrConfig{
 			Backend:  "paddle-ocr",
-			Language: "en",
+			Language: []string{"en"},
 		},
 	}
 

@@ -3,10 +3,10 @@
 // ~keep ── Glyph-fragmentation repair (issue #962) ────────────────────────────────
 // ~keep
 // ~keep Word-exported PDFs position each glyph via its own BT…ET block with a
-// ~keep sinusoidal y-jitter (~3–5 pt amplitude, 6-glyph period). pdf_oxide's
+// ~keep sinusoidal y-jitter (~3–5 pt amplitude, 6-glyph period). xberg_native_pdf's
 // ~keep ColumnAware reading order groups spans by y-level, scrambling reading
 // ~keep order for these documents. The constants below parameterise the
-// ~keep detection and reconstruction heuristic in `pdf::oxide::text`.
+// ~keep detection and reconstruction heuristic in `pdf::native::text`.
 
 /// Maximum y-gap (pt) between two spans that can still be considered "same
 /// line" under the glyph-fragmentation detection heuristic.
@@ -42,8 +42,23 @@ pub(super) const MAX_HEADING_DISTANCE_MULTIPLIER: f32 = 2.0;
 /// Minimum ratio of heading font size to body font size (heading must be this much larger).
 /// 1.15 captures LaTeX \subsection (12pt vs 10pt body = 1.2 ratio).
 pub(super) const MIN_HEADING_FONT_RATIO: f32 = 1.15;
-/// Minimum absolute font-size difference (in points) between heading and body.
-/// 1.5pt captures academic sub-headings (11.5pt vs 10pt body).
+/// Minimum absolute font-size difference (in points) between heading and body, used as
+/// an *additional* requirement alongside [`MIN_HEADING_FONT_RATIO`] (both must hold) in
+/// the AND-style gates (`sparse_multi_page_heading_map`'s `clears_font_gate`,
+/// `clears_bold_font_gate`, and `classify::other_paragraphs_font_size`'s title-promotion
+/// gate). 1.5pt captures academic sub-headings (11.5pt vs 10pt body).
+///
+/// This constant assumes points. Combined via AND (the caller requires
+/// `>= body*ratio && >= body+gap`, i.e. the *harder* of the two bounds), the ratio bound
+/// already dominates once `body_font_size` exceeds `gap / (ratio - 1)` (10, at these
+/// values) — which native body text and OCR/pixel-scale body text (routinely tens of
+/// pixels) both do — so this constant is self-limiting at that end. It only binds, and
+/// only matters, for sub-10-unit body sizes, where it deliberately requires a real
+/// absolute (point) separation beyond the ratio, guarding against over-promotion on
+/// sparse/small-body-font native documents. It is not used by the k-means main path
+/// (`assign_heading_levels_smart`), which is purely ratio-based — see that function's
+/// doc comment for why an OR/min-style combinator with this same absolute constant was
+/// scale-unsafe there.
 pub(super) const MIN_HEADING_FONT_GAP: f32 = 1.5;
 /// Maximum word count for a bold paragraph to be promoted to a section heading.
 pub(super) const MAX_BOLD_HEADING_WORD_COUNT: usize = 12;

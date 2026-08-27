@@ -194,17 +194,6 @@ fn resample_linear_to_16k(samples: &[f32], src_hz: u32) -> Vec<f32> {
     out
 }
 
-/// Fallback no-op decode when the transcription feature is completely disabled
-/// at compile time (should never be called in practice because the extractor
-/// itself is also cfg-gated).
-#[cfg(not(feature = "transcription"))]
-#[cfg_attr(alef, alef(skip))]
-pub fn decode_audio_to_pcm(_bytes: &[u8], _max_bytes: Option<u64>) -> Result<PcmAudio> {
-    Err(XbergError::transcription(
-        "Audio decoding requires the `transcription` Cargo feature (symphonia + ORT)",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

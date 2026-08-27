@@ -6,19 +6,19 @@ Xberg runs its ML models — layout detection, table classification, document-or
 through [ONNX Runtime](https://onnxruntime.ai/) by default. ONNX Runtime is a native library and
 cannot link on `wasm32` or the Android x86_64 emulator. On those targets Xberg runs the same models
 through [`tract`](https://github.com/sonos/tract), Sonos' pure-Rust ONNX engine, behind a shared
-inference seam. tract loads the identical `.onnx` artifacts (no weight conversion), is CPU-only, and
-needs no C toolchain.
+inference seam. The `tract` engine loads the identical `.onnx` artifacts (no weight conversion), is
+CPU-only, and needs no C toolchain.
 
-ONNX Runtime stays the default on every native build. tract is selected only where ORT cannot link,
-and it trades CPU latency for portability — see [Latency](#latency).
+ONNX Runtime stays the default on every native build. The `tract` engine is selected only where ORT
+cannot link, and it trades CPU latency for portability — see [Latency](#latency).
 
 ## Model coverage
 
-tract 0.23.4 does not execute every model Xberg ships. The seam routes each model to whichever engine
+`tract` 0.23.4 does not execute every model Xberg ships. The seam routes each model to whichever engine
 is active; models tract cannot run stay ONNX Runtime-only and are compiled out of the pure-Rust
 feature sets (`layout-tract`, `auto-rotate-tract`).
 
-| Model | Role | tract |
+| Model | Role | `tract` |
 |---|---|---|
 | RT-DETR | Layout detection | Runs |
 | PP-LCNet | Table classifier, document-orientation, text-line orientation | Runs |
@@ -42,7 +42,7 @@ Revisit each only if a non-quantized export or an upstream tract fix lands.
 ## Latency
 
 Measured on Apple Silicon (aarch64), release build, best-of-8 warm inferences. Each engine runs
-**as xberg ships it**: ONNX Runtime with its default intra-op thread pool (up to `min(8, cores)`
+**as Xberg ships it**: ONNX Runtime with its default intra-op thread pool (up to `min(8, cores)`
 threads), tract single-threaded (the seam configures no tract thread pool). The ratio below is
 therefore an *as-shipped, wall-clock* comparison — the real cost you pay on a no-ORT build versus
 native ORT — and an **upper bound** on the pure per-core kernel gap, since part of ORT's lead is

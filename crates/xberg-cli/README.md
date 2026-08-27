@@ -390,6 +390,7 @@ xberg extract <PATH> [OPTIONS]
 | `--pdf-password <PASS>`                | Password for encrypted PDFs (repeatable)                                                                   |
 | `--pdf-extract-images <true\|false>`   | Extract images from PDF pages                                                                              |
 | `--pdf-extract-metadata <true\|false>` | Extract PDF metadata                                                                                       |
+| `--pdf-backend <BACKEND>`              | PDF engine: `native` (default) or `pdfium` (see [PDF Backends](#pdf-backends))                             |
 | `--token-reduction <LEVEL>`            | Token reduction: `off`, `light`, `moderate`, `aggressive`, `maximum`                                       |
 | `--layout-table-model <MODEL>`         | Table structure model: `tatr`, `slanet_wired`, `slanet_wireless`, `slanet_plus`, `slanet_auto`, `disabled` |
 | `--disable-ocr <true\|false>`          | Disable OCR entirely (even for images)                                                                     |
@@ -420,6 +421,39 @@ xberg extract document.pdf --layout --content-format markdown --acceleration cor
 
 # GPU-accelerated extraction
 xberg extract scanned.pdf --ocr true --acceleration coreml
+```
+
+### PDF Backends
+
+Xberg ships two PDF engines:
+
+- `native` (default) — xberg's own pure-Rust PDF engine (`crates/xberg-native-pdf`). No system
+  libraries, no linking configuration. Full extraction support: text, tables, images, metadata,
+  annotations, AcroForm/XFA form fields, hierarchy, layout-aware reading order, and OCR fallback.
+- `pdfium` — Google's PDFium engine, opt-in via the `pdf-pdfium` Cargo feature (`pdf-pdfium-surface`
+  for the CLI build). Deliberately narrower in scope than `native`: page count, per-page plain text,
+  and Info-dictionary metadata only. No table detection, no image/diagram extraction, no layout
+  detection, no annotations, no form fields, no embedded files, no OCR fallback. Every pdfium
+  extraction attaches a processing warning naming what it skipped, so a diff against `native` output
+  is never mistaken for parity.
+
+Select the backend with `--pdf-backend <native|pdfium>` on `extract` and `batch`, or via the
+`pdf_options.backend` config key (`native` / `pdfium`) in a config file or `--config-json`. There is
+no environment variable for this setting.
+
+Selecting `pdfium` on a binary built without the `pdf-pdfium-surface` feature is a hard error at CLI
+validation time — the flag is rejected with a message naming the required feature, it never silently
+falls back to `native`. At runtime, `pdfium` also requires the PDFium shared library
+(`libpdfium.so`/`.dylib`/`pdfium.dll`) to be discoverable via `PDFIUM_DYNAMIC_LIB_PATH` or the system
+library search path; if it isn't found, extraction fails with a `MissingDependency` error rather than
+producing an empty document.
+
+```bash
+# Explicitly select the native backend (default, no-op)
+xberg extract document.pdf --pdf-backend native
+
+# Use PDFium instead (requires a pdf-pdfium-surface build)
+xberg extract document.pdf --pdf-backend pdfium
 ```
 
 ### batch

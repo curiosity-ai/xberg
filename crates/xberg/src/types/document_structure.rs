@@ -172,7 +172,7 @@ impl DocumentStructure {
     /// rendered text content (the string that chunking operates on, e.g.
     /// Markdown or plain-text output).
     ///
-    /// # Status: not yet implemented
+    /// **Deprecated since 1.1.0; scheduled for removal in 2.0.**
     ///
     /// Nodes carry position information for the *source* document (`page`,
     /// `bbox`) but not offsets into *rendered* output — rendering is a
@@ -200,6 +200,7 @@ impl DocumentStructure {
     /// is not FFI-friendly, and the method is a placeholder with no behavior
     /// to expose yet. A binding-facing surface can be added once #1296
     /// implements real offset resolution.
+    #[deprecated(since = "1.1.0", note = "Always returns None; scheduled for removal in 2.0")]
     #[cfg_attr(alef, alef(skip))]
     #[must_use]
     pub fn node_rendered_offset(&self, _node_index: NodeIndex) -> Option<(usize, usize)> {
@@ -491,9 +492,7 @@ pub enum NodeContent {
     /// Structured metadata block (email headers, YAML frontmatter, etc.).
     MetadataBlock {
         /// Key-value pairs extracted from the metadata block.
-        #[cfg_attr(feature = "api", schema(value_type = Vec<[String; 2]>))]
-        #[cfg_attr(alef, alef(skip))]
-        entries: Vec<(String, String)>,
+        entries: Vec<super::metadata::KeyValueAttribute>,
     },
 }
 
@@ -750,8 +749,8 @@ impl NodeContent {
                 }
             }
             NodeContent::MetadataBlock { entries } => {
-                for (_key, value) in entries.iter_mut() {
-                    redact(value);
+                for attribute in entries.iter_mut() {
+                    redact(&mut attribute.value);
                 }
             }
             NodeContent::List { .. } | NodeContent::Quote | NodeContent::PageBreak | NodeContent::DefinitionList => {}
@@ -1173,7 +1172,7 @@ mod tests {
         );
         assert_eq!(
             NodeContent::MetadataBlock {
-                entries: vec![("k".to_string(), "v".to_string())]
+                entries: vec![("k".to_string(), "v".to_string()).into()]
             }
             .text(),
             None
@@ -1301,8 +1300,8 @@ mod tests {
 
         let content = NodeContent::MetadataBlock {
             entries: vec![
-                ("From".to_string(), "alice@example.com".to_string()),
-                ("Subject".to_string(), "Hello".to_string()),
+                ("From".to_string(), "alice@example.com".to_string()).into(),
+                ("Subject".to_string(), "Hello".to_string()).into(),
             ],
         };
         let json = serde_json::to_value(&content).expect("serialize");
@@ -1482,6 +1481,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_node_rendered_offset_is_unimplemented_stub() {
         let mut doc = DocumentStructure::new();
         doc.push_node(make_paragraph("Hello", Some(1), 0));

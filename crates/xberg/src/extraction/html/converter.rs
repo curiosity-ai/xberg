@@ -15,7 +15,7 @@ pub(crate) fn map_output_format(format: XbergOutputFormat) -> LibOutputFormat {
         XbergOutputFormat::Markdown => LibOutputFormat::Markdown,
         XbergOutputFormat::Djot => LibOutputFormat::Djot,
         XbergOutputFormat::Plain => LibOutputFormat::Plain,
-        XbergOutputFormat::Html | XbergOutputFormat::Json | XbergOutputFormat::Structured => LibOutputFormat::Markdown,
+        XbergOutputFormat::Html | XbergOutputFormat::Json => LibOutputFormat::Markdown,
         // The conversion library has no DocTags mode. Markdown is the closest structured
         // intermediate; the DocTags renderer works from the element tree, not from this text.
         XbergOutputFormat::DocTags => LibOutputFormat::Markdown,
@@ -216,6 +216,10 @@ pub(crate) fn extract_html_inline_images(html: &str, options: Option<ConversionO
 
     let mut opts = options.unwrap_or_default();
     opts.extract_images = true;
+    // html-to-markdown-rs defaults `capture_svg` to false, so inline `<svg>` elements
+    // are silently dropped even with `extract_images = true` (data-URI `<img>` sources
+    // still work — that path is unaffected because it is not gated on this flag).
+    opts.capture_svg = true;
     opts.output_format = LibOutputFormat::Plain;
     opts.extract_metadata = false;
 

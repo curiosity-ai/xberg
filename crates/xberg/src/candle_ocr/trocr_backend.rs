@@ -12,6 +12,9 @@ use ahash::AHashMap;
 use parking_lot::RwLock;
 
 use crate::Result;
+use crate::candle_ocr::config::{
+    CandleTrocrVariant, TrocrBackendOptions, parse_backend_options, validate_optional_non_empty,
+};
 use crate::core::config::OcrConfig;
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
 use crate::types::ExtractedDocument;
@@ -31,6 +34,52 @@ fn variant_discriminant(v: TrocrVariant) -> u8 {
 
 /// Type alias for the engine pool mapping.
 type EnginePoolMap = AHashMap<(u8, DevicePreference, PathBuf, String), Arc<TrocrEngine>>;
+
+/// Tallest a single cropped text-line image is expected to be, in pixels.
+///
+/// TrOCR is trained on single-line crops (see `TrocrBackend` docs). A raster this
+/// tall is far more likely to be a whole page handed to the backend by mistake than
+/// an unusually large line crop: at the pipeline's 150 DPI page render, even a large
+/// heading line is well under this, while a full US Letter or A4 page renders to
+/// roughly 1650-2550px tall. Chosen with headroom above the `test_hello_world.png`
+/// fixture (200px) used in `xberg-candle-ocr`'s own integration test.
+const MAX_LINE_CROP_HEIGHT_PX: u32 = 300;
+
+/// Reject an `image_bytes` payload that looks like a full page rather than a single
+/// cropped text line, before it is handed to a model trained only on the latter.
+///
+/// TrOCR's [`ImageProcessor`](xberg_candle_ocr::models::image_processor::ImageProcessor)
+/// force-resizes any input to a fixed 384x384 square, discarding the original aspect
+/// ratio. Handed a whole-page raster, it does not error — it decodes, resizes, and runs
+/// inference to completion, producing confident-looking but fabricated text (the model
+/// decodes whatever line-shaped pattern the squashed page most resembles). Returning
+/// `Ok` with hallucinated content is worse than failing loudly here: a caller checking
+/// only the exit code has no way to tell the two apart otherwise.
+fn reject_whole_page_input(image_bytes: &[u8]) -> Result<()> {
+    let (width, height) =
+        xberg_candle_ocr::models::image_processor::dimensions(image_bytes).map_err(|e| crate::XbergError::Ocr {
+            message: format!("TrOCR: failed to read image dimensions: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+    if height > MAX_LINE_CROP_HEIGHT_PX {
+        return Err(crate::XbergError::Validation {
+            message: format!(
+                "candle-trocr received a {width}x{height} image that looks like a full page, not a \
+                 single cropped text line. TrOCR is trained on line-level crops and will silently \
+                 hallucinate text on whole-page input instead of failing (the pipeline force-resizes \
+                 any input to a 384x384 square, destroying page layout). Either: (1) crop the page \
+                 into individual text lines/regions before calling this backend (e.g. via a text \
+                 detector or layout model), or (2) use a full-page backend instead, such as \
+                 `candle-paddleocr-vl`, `candle-glm-ocr`, `candle-deepseek-ocr`, `tesseract`, \
+                 `paddle-ocr`, or `sceptre`."
+            ),
+            source: None,
+        });
+    }
+
+    Ok(())
+}
 
 /// Process-wide engine pool keyed by `(variant_discriminant, device_preference)`.
 ///
@@ -105,12 +154,16 @@ fn get_or_init_engine(
 /// ```json
 /// {
 ///   "variant": "base-printed",
-///   "device": "auto"
+///   "device": "auto",
+///   "cache_dir": "/path/to/huggingface/cache",
+///   "hf_revision": "immutable-commit"
 /// }
 /// ```
 ///
 /// - `variant` (string): `"base-printed"` (default), `"large-printed"`, `"base-handwritten"`, `"large-handwritten"`
 /// - `device` (string): `"auto"`, `"cpu"`, `"cuda"`, `"metal"`
+/// - `cache_dir` (string, optional): explicit Hugging Face Hub cache root
+/// - `hf_revision` (string, optional): immutable model revision
 #[cfg_attr(alef, alef(skip))]
 pub struct TrocrBackend {
     variant: TrocrVariant,
@@ -142,37 +195,22 @@ impl TrocrBackend {
     ///
     /// Device selection is delegated to [`crate::candle_ocr::resolve_device_preference`]
     /// so the central `AccelerationConfig` is honoured.
-    fn parse_options(config: &OcrConfig) -> TrocrOptions {
-        let mut variant: Option<TrocrVariant> = None;
-        let mut cache_dir = None;
-        let mut hf_revision = None;
-
-        if let Some(opts) = &config.backend_options {
-            if let Some(v) = opts.get("variant").and_then(|v| v.as_str()) {
-                variant = Some(match v {
-                    "large-printed" => TrocrVariant::LargePrinted,
-                    "base-handwritten" => TrocrVariant::BaseHandwritten,
-                    "large-handwritten" => TrocrVariant::LargeHandwritten,
-                    _ => TrocrVariant::BasePrinted,
-                });
-            }
-            cache_dir = opts
-                .get("cache_dir")
-                .and_then(|value| value.as_str())
-                .map(PathBuf::from);
-            hf_revision = opts
-                .get("hf_revision")
-                .or_else(|| opts.get("revision"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
-        }
-
-        TrocrOptions {
+    fn parse_options(config: &OcrConfig) -> Result<TrocrOptions> {
+        let options: TrocrBackendOptions = parse_backend_options(config.backend_options.as_ref(), "candle-trocr")?;
+        validate_optional_non_empty(options.cache_dir.as_deref(), "candle-trocr", "cache_dir")?;
+        validate_optional_non_empty(options.hf_revision.as_deref(), "candle-trocr", "hf_revision")?;
+        let variant = options.variant.map(|variant| match variant {
+            CandleTrocrVariant::BasePrinted => TrocrVariant::BasePrinted,
+            CandleTrocrVariant::LargePrinted => TrocrVariant::LargePrinted,
+            CandleTrocrVariant::BaseHandwritten => TrocrVariant::BaseHandwritten,
+            CandleTrocrVariant::LargeHandwritten => TrocrVariant::LargeHandwritten,
+        });
+        Ok(TrocrOptions {
             variant,
-            device: super::resolve_device_preference(config),
-            cache_dir,
-            hf_revision,
-        }
+            device: super::resolve_device_preference(config, options.device),
+            cache_dir: options.cache_dir.map(PathBuf::from),
+            hf_revision: options.hf_revision,
+        })
     }
 }
 
@@ -195,6 +233,7 @@ impl Plugin for TrocrBackend {
     }
 }
 
+/// Inherits the `RequiresUpright` default for `page_orientation_handling` — unmeasured, not validated (#657).
 #[async_trait]
 impl OcrBackend for TrocrBackend {
     /// Recognize text in `image_bytes` via the configured TrOCR variant and device.
@@ -204,7 +243,7 @@ impl OcrBackend for TrocrBackend {
     /// in `self.variant`. Inference runs inside `tokio::task::spawn_blocking` so the
     /// async runtime is never blocked.
     async fn process_image(&self, image_bytes: &[u8], config: &OcrConfig) -> Result<ExtractedDocument> {
-        let options = Self::parse_options(config);
+        let options = Self::parse_options(config)?;
         let variant = options.variant.unwrap_or(self.variant);
         let cache_dir = options.cache_dir.unwrap_or_else(hf_hub::resolve_cache_dir);
         let revision = options.hf_revision.unwrap_or_else(|| variant.revision().to_string());
@@ -215,6 +254,8 @@ impl OcrBackend for TrocrBackend {
                 source: None,
             });
         }
+
+        reject_whole_page_input(image_bytes)?;
 
         let image_bytes_owned = image_bytes.to_vec();
 
@@ -242,6 +283,7 @@ impl OcrBackend for TrocrBackend {
             Cow::Borrowed("text/plain"),
             image_bytes,
             config,
+            "candle-trocr",
         ))
     }
 
@@ -261,6 +303,14 @@ impl OcrBackend for TrocrBackend {
     fn backend_type(&self) -> OcrBackendType {
         OcrBackendType::Candle
     }
+
+    /// TrOCR reports no page-level confidence.
+    fn confidence_semantics(&self) -> crate::plugins::ConfidenceSemantics {
+        crate::plugins::ConfidenceSemantics::None
+    }
+
+    // Rotation handling has not been measured for this backend; it stays on the trait's
+    // `RequiresUpright` default.
 }
 
 #[cfg(test)]
@@ -294,7 +344,7 @@ mod tests {
     #[test]
     fn test_parse_options_defaults() {
         let config = OcrConfig::default();
-        let options = TrocrBackend::parse_options(&config);
+        let options = TrocrBackend::parse_options(&config).unwrap();
         assert_eq!(options.variant, None);
         assert_eq!(options.device, DevicePreference::Auto);
     }
@@ -307,7 +357,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let options = TrocrBackend::parse_options(&config);
+        let options = TrocrBackend::parse_options(&config).unwrap();
         assert_eq!(options.variant, Some(TrocrVariant::LargePrinted));
     }
 
@@ -319,8 +369,22 @@ mod tests {
             })),
             ..Default::default()
         };
-        let options = TrocrBackend::parse_options(&config);
+        let options = TrocrBackend::parse_options(&config).unwrap();
         assert_eq!(options.device, DevicePreference::Cpu);
+    }
+
+    #[test]
+    fn test_parse_options_hf_cache_and_revision() {
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({
+                "cache_dir": "/tmp/trocr-cache",
+                "hf_revision": "trocr-revision"
+            })),
+            ..Default::default()
+        };
+        let options = TrocrBackend::parse_options(&config).unwrap();
+        assert_eq!(options.cache_dir.as_deref(), Some(Path::new("/tmp/trocr-cache")));
+        assert_eq!(options.hf_revision.as_deref(), Some("trocr-revision"));
     }
 
     #[test]
@@ -350,5 +414,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../test_documents/images/{name}"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()))
+    }
+
+    /// A whole scanned page (595x842, an A4-shaped raster) must be rejected before TrOCR
+    /// wastes a forward pass hallucinating line-shaped text on it.
+    ///
+    /// This regression-guards the fix for the bug measured against
+    /// `test_documents/pdf_scanned/ordinance_2197_scanned.pdf`: `candle-trocr` exited 0 and
+    /// emitted 145 bytes of receipt-shaped hallucination (`AMOUNT NAME`, `CASHIER`, ...) for a
+    /// 16-page zoning ordinance, because nothing rejected the full-page raster before it was
+    /// force-resized to 384x384 and decoded anyway. Before the fix (no `reject_whole_page_input`
+    /// call in `process_image`), this assertion fails: `is_err()` is `false` because no check
+    /// exists to reject a full-page input.
+    #[test]
+    fn test_reject_whole_page_input_rejects_full_page_raster() {
+        let bytes = fixture_bytes("ocr_test_original.png");
+        let result = reject_whole_page_input(&bytes);
+        assert!(
+            result.is_err(),
+            "a 595x842 full-page raster must be rejected as line-level TrOCR input, got Ok"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("full page"),
+            "error message must explain the mismatch, got: {message}"
+        );
+    }
+
+    /// A genuine single-line crop (800x200, wide and short) must be accepted.
+    #[test]
+    fn test_reject_whole_page_input_accepts_line_crop() {
+        let bytes = fixture_bytes("test_hello_world.png");
+        let result = reject_whole_page_input(&bytes);
+        assert!(
+            result.is_ok(),
+            "an 800x200 single-line crop must be accepted, got {:?}",
+            result.err().map(|e| e.to_string())
+        );
     }
 }

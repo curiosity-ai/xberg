@@ -1,13 +1,13 @@
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:78f96ed59a738305ea8455fb716572f6a36d35302d26956d57d02eba192b0869
-Source-Hash: blake3:ac8bab9ae4a76e61f437af29b4a45a38326056a50769a177038927c69353edaf
+Content-Hash: blake3:dacb4d7def21681b8b237603d2c7b89beaf18b8ee4110175b6ea5593022f3229
+Source-Hash: blake3:45cb11995592f052d075d6a24353eb8b647075dcb25f77187fcb4c161b574d49
 Schema-Version: v1
 -->
 
 # Language Bindings Reference
 
-Xberg provides native bindings for many languages, each with precompiled binaries for x86_64 and aarch64 on Linux and macOS. This reference covers installation and basic usage for each binding.
+Xberg provides bindings for Python, TypeScript/Node.js, Ruby, PHP, Go, Java, C#, Elixir, WebAssembly, Dart, Kotlin Android, Swift, Zig, and C. Platform and packaging support varies by binding.
 
 Every binding shares the same shape: build an **`ExtractInput`** (from a URI or bytes), pass it with an **`ExtractionConfig`** to `extract` (or `extract_batch`), and read per-document data from the result **envelope's `results` array** (index `[0]` for a single input). WASM follows the same shape — its `extract` returns a `WasmExtractionResult` envelope with a `results` array, not the document directly.
 
@@ -96,13 +96,13 @@ See the [Ruby binding documentation](https://github.com/xberg-io/xberg/tree/main
 
 ## Java
 
-**Installation:** add to your Maven `pom.xml` (the binding version tracks the core release, currently `1.0.2`):
+**Installation:** add to your Maven `pom.xml` (the binding version tracks the core release, currently `1.1.0`):
 
 ```xml
 <dependency>
     <groupId>io.xberg</groupId>
     <artifactId>xberg</artifactId>
-    <version>1.0.2</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
@@ -145,7 +145,7 @@ ExtractionResult output = Xberg.extract(
 
 See the [Java binding documentation](https://github.com/xberg-io/xberg/tree/main/packages/java) for the complete API reference.
 
-## C
+## C#
 
 **Installation:**
 
@@ -237,12 +237,12 @@ See the [PHP binding documentation](https://github.com/xberg-io/xberg/tree/main/
 
 ## Elixir
 
-**Installation:** add to your `mix.exs` dependencies (the binding version tracks the core release, currently `1.0.2`):
+**Installation:** add to your `mix.exs` dependencies (the binding version tracks the core release, currently `1.1.0`):
 
 ```elixir
 def deps do
   [
-    {:xberg, "~> 1.0.2"}
+    {:xberg, "~> 1.1.0"}
   ]
 end
 ```
@@ -299,7 +299,7 @@ console.log(result.results[0].content);
 **With OCR:**
 
 ```typescript
-const config = { force_ocr: true, ocr: { backend: "tesseract", language: "eng" } };
+const config = { force_ocr: true, ocr: { backend: "tesseract", language: ["eng"] } };
 const result = await extract({ kind: "bytes", bytes: data, mimeType: "application/pdf" }, config);
 console.log(result.results[0].content);
 ```
@@ -338,8 +338,8 @@ See the [Docker guide](https://docs.xberg.io/guides/docker/) for deployment deta
 
 ## Other Bindings
 
-Native bindings also ship for R, Dart/Flutter, Swift, Kotlin (Android), Zig, and C (FFI). They follow the same `ExtractInput` → `extract` → `results[0]` shape (R, Swift, Zig, and C use JSON-string config and, for some, JSON-string results). See the per-language package directories under [`packages/`](https://github.com/xberg-io/xberg/tree/main/packages) for details.
+Bindings also ship for Dart/Flutter, Swift, Kotlin Android, Zig, and C FFI. Python and TypeScript/Node.js have dedicated references in this skill. See the per-language directories under [`packages/`](https://github.com/xberg-io/xberg/tree/main/packages) for exact installation and API details.
 
 ## Platform Support
 
-All language bindings include precompiled binaries for x86_64 and aarch64 on Linux and macOS. Windows support varies by binding. Refer to the main [README](https://github.com/xberg-io/xberg) for the platform compatibility matrix.
+Precompiled target support varies by binding. Refer to the main [README](https://github.com/xberg-io/xberg) for the current platform matrix.

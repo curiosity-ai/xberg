@@ -11,7 +11,7 @@
 
 use std::io::{Cursor, Write};
 use xberg::ExtractInput;
-use xberg::core::config::ExtractionConfig;
+use xberg::core::config::{ExtractionConfig, OutputFormat};
 use xberg::extractors::EpubExtractor;
 use xberg::plugins::DocumentExtractor;
 use zip::write::FileOptions;
@@ -148,4 +148,67 @@ async fn test_mixed_chapter_converts_math_alongside_prose() {
         "Raw MathML tag names must not leak into extracted content, got: {}",
         result.content
     );
+}
+
+#[tokio::test]
+async fn serialized_mathml_comment_is_removed_from_plain_and_markdown() {
+    let chapter_xhtml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body>
+    <!-- MathML: <math><mi>x</mi></math> -->
+    <p>Readable equation fallback: x squared.</p>
+  </body>
+</html>"#;
+
+    for output_format in [OutputFormat::Plain, OutputFormat::Markdown] {
+        let bytes = build_epub_bytes(chapter_xhtml);
+        let extractor = EpubExtractor;
+        let config = ExtractionConfig {
+            output_format,
+            ..Default::default()
+        };
+        let input = ExtractInput::from_bytes(bytes, "application/epub+zip", None);
+
+        let result = extractor.extract(input, &config).await.expect("extract chapter");
+
+        assert!(result.content.contains("Readable equation fallback"));
+        assert!(!result.content.contains("MathML:"), "got: {}", result.content);
+        assert!(!result.content.contains("<math"), "got: {}", result.content);
+    }
+}
+
+#[tokio::test]
+async fn unresolved_image_keeps_alt_text_and_caption_in_plain_and_markdown() {
+    let chapter_xhtml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body>
+    <figure>
+      <img src="missing.png" alt="Illustration alt text"/>
+      <figcaption>Illustration caption</figcaption>
+    </figure>
+  </body>
+</html>"#;
+
+    for output_format in [OutputFormat::Plain, OutputFormat::Markdown] {
+        let bytes = build_epub_bytes(chapter_xhtml);
+        let extractor = EpubExtractor;
+        let config = ExtractionConfig {
+            output_format,
+            ..Default::default()
+        };
+        let input = ExtractInput::from_bytes(bytes, "application/epub+zip", None);
+
+        let result = extractor.extract(input, &config).await.expect("extract chapter");
+
+        assert!(
+            result.content.contains("Illustration alt text"),
+            "got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Illustration caption"),
+            "got: {}",
+            result.content
+        );
+    }
 }

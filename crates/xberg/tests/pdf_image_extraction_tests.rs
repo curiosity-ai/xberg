@@ -120,7 +120,7 @@ fn test_docling_content_quality() {
 /// Regression test for issue #752: structured output was ~1000x slower than text
 /// on Ghostscript-produced PDFs with many inline images (~1,924 per page).
 ///
-/// Root cause: `populate_images_from_oxide` used `Vec::contains` (O(N)) inside
+/// Root cause: `populate_images_from_native` used `Vec::contains` (O(N)) inside
 /// the per-page object loop — O(N²) total. Fixed by converting to `AHashSet` for
 /// O(1) lookup before the loop.
 ///
@@ -532,7 +532,7 @@ fn test_chunk_image_indices_are_valid_when_images_extracted() {
 /// After the fix:
 /// - When extract_images=false, NO decompression occurs at all (the main hang fix).
 /// - When extract_images=true, a single pass runs and the cap is respected in output.
-///   The per-page decompression cost for images beyond the cap is a pdf_oxide
+///   The per-page decompression cost for images beyond the cap is a xberg_native_pdf
 ///   upstream limitation: `extract_images()` is eager.  Eliminating that
 ///   remaining cost requires a count-limited API upstream.
 #[test]
@@ -694,7 +694,7 @@ fn test_no_decompression_when_images_disabled() {
 ///
 /// This directly proves the decompression code path was skipped — complementing
 /// `test_no_decompression_when_images_disabled` which only observes the output.
-/// An event with target `xberg::pdf::oxide::images` and field
+/// An event with target `xberg::pdf::native::images` and field
 /// `event = "decompression_started"` is emitted at the top of
 /// `extract_images_with_data`; absence of that event is structural proof the
 /// function was not called.
@@ -716,7 +716,7 @@ fn test_no_decompression_trace_when_images_disabled() {
         fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
             let target = event.metadata().target().to_owned();
 
-            if target != "xberg::pdf::oxide::images" {
+            if target != "xberg::pdf::native::images" {
                 return;
             }
 
@@ -770,7 +770,7 @@ fn test_no_decompression_trace_when_images_disabled() {
     let decompression_events: Vec<_> = events
         .iter()
         .filter(|(target, event_field)| {
-            target == "xberg::pdf::oxide::images" && event_field.as_deref() == Some("decompression_started")
+            target == "xberg::pdf::native::images" && event_field.as_deref() == Some("decompression_started")
         })
         .collect();
 
@@ -787,7 +787,7 @@ fn test_no_decompression_trace_when_images_disabled() {
 ///
 /// Before the fix for #985 this path was doubly dangerous: the unconditional
 /// `extract_image_positions` call ran even when `extract_images=false`, and on
-/// the oxide path the decompression was unbounded.  The OCR path was never
+/// the native path the decompression was unbounded.  The OCR path was never
 /// covered by a test, so a regression disabling decompression for
 /// `ocr_inline_images=true` would be invisible.
 #[test]

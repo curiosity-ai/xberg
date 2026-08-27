@@ -1,7 +1,7 @@
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:ab4e073238ce8da179601b4d98b1aa72c0ff620e9f1b1bb3570fe0f1e162e11a
-Source-Hash: blake3:ac8bab9ae4a76e61f437af29b4a45a38326056a50769a177038927c69353edaf
+Content-Hash: blake3:c551708aa62f1b25b1cea8041e8aab5b3101a1622317b7239d3de04d8a375754
+Source-Hash: blake3:45cb11995592f052d075d6a24353eb8b647075dcb25f77187fcb4c161b574d49
 Schema-Version: v1
 -->
 
@@ -137,9 +137,9 @@ Main extraction configuration. All fields are optional and use sensible defaults
 | `pages`                     | PageConfig \| None                | None        | Per-page content extraction and tracking.                          |
 | `postprocessor`             | PostProcessorConfig \| None       | None        | Post-processor pipeline configuration.                            |
 | `html_output`               | HtmlOutputConfig \| None          | None        | Styled HTML output configuration (when `output_format="html"`).    |
-| `max_concurrent_extractions`| int \| None                       | num_cpus×1.5| Maximum concurrent extractions in batch operations.               |
+| `max_concurrent_extractions`| int \| None                       | None        | Optional batch ceiling; when unset, concurrency derives from `concurrency.max_threads`. |
 | `result_format`             | `"unified"` \| `"element_based"`  | "unified"   | Result structure format.                                          |
-| `output_format`             | `"plain"` \| `"markdown"` \| `"djot"` \| `"html"` | "plain" | Content text format.                          |
+| `output_format`             | OutputFormat \| str              | "plain"     | Content renderer: plain, markdown, djot, HTML, JSON, DocTags, or custom. |
 | `security_limits`           | SecurityLimits \| None            | None        | Security limits for archive extraction.                            |
 
 **Example:**
@@ -151,7 +151,7 @@ config = ExtractionConfig(
     use_cache=True,
     enable_quality_processing=True,
     output_format="markdown",
-    ocr=OcrConfig(backend="tesseract", language="eng"),
+    ocr=OcrConfig(backend="tesseract", language=["eng"]),
     chunking=ChunkingConfig(max_characters=1000, overlap=200),
 )
 result = await extract(ExtractInput(uri="document.pdf"), config)
@@ -169,7 +169,7 @@ scanned = ExtractInput(
     uri="scanned.pdf",
     config=FileExtractionConfig(
         force_ocr=True,
-        ocr=OcrConfig(backend="tesseract", language="deu"),
+        ocr=OcrConfig(backend="tesseract", language=["deu"]),
     ),
 )
 ```
@@ -182,15 +182,15 @@ OCR configuration for extracting text from images and scanned pages.
 | ------------------ | ----------------------- | ----------- | ------------------------------------------------------------------------------------------- |
 | `enabled`          | bool                    | True        | Whether OCR is enabled.                                                                      |
 | `backend`          | str                     | `""`        | OCR backend: `"tesseract"`, `"paddleocr"`, `"paddle-ocr"`, or `"vlm"`.                       |
-| `language`         | str \| list[str]        | `["eng"]`   | Language code(s). Accepts a single code (`"eng"`), a `+`-joined string (`"eng+fra"`), or a list (`["eng", "deu"]`). |
+| `language`         | list[str]                | `["eng"]`   | Language codes. Use multiple entries for multilingual OCR. |
 | `tesseract_config` | TesseractConfig \| None | None        | Tesseract-specific configuration.                                                            |
 
 ```python
 from xberg import OcrConfig, TesseractConfig
 
-OcrConfig(backend="tesseract", language="deu")
+OcrConfig(backend="tesseract", language=["deu"])
 OcrConfig(backend="tesseract", language=["eng", "fra"], tesseract_config=TesseractConfig(psm=6))
-OcrConfig(backend="paddleocr", language="chinese")
+OcrConfig(backend="paddleocr", language=["chinese"])
 ```
 
 ### TesseractConfig
@@ -225,7 +225,6 @@ Text chunking for RAG, indexing, and length-limited systems.
 | `chunker_type`            | `"text"` \| `"markdown"` \| `"semantic"` | "text" | Chunking strategy.                                          |
 | `embedding`               | EmbeddingConfig \| None   | None      | Generate an embedding per chunk. None = no embeddings.                      |
 | `preset`                  | str \| None               | None      | Named preset (overrides individual settings if provided).                  |
-| `prepend_heading_context` | bool                      | False     | (Markdown chunker) prepend the heading breadcrumb to each chunk's content. |
 
 > **IMPORTANT:** The fields are `max_characters` and `overlap` (NOT `max_chars`/`max_overlap` or `max_chars`/`max_chars`).
 
@@ -525,7 +524,7 @@ class WordCountProcessor:
         return "word_count"
 
     def version(self) -> str:
-        return "1.0.0"
+        return "1.1.0"
 
     def processing_stage(self) -> str:
         return "early"
@@ -557,7 +556,7 @@ class MinLengthValidator:
         return "min_length_validator"
 
     def version(self) -> str:
-        return "1.0.0"
+        return "1.1.0"
 
     def priority(self) -> int:
         return 100
@@ -584,7 +583,7 @@ class CustomJsonExtractor:
         return "custom-json-extractor"
 
     def version(self) -> str:
-        return "1.0.0"
+        return "1.1.0"
 
     def supported_mime_types(self) -> list[str]:
         return ["application/json"]
@@ -611,7 +610,7 @@ class MyEmbedder:
         return "my-embedder"
 
     def version(self) -> str:
-        return "1.0.0"
+        return "1.1.0"
 
     def dimensions(self) -> int:
         return 768
@@ -642,7 +641,7 @@ clear_validators()
 
 ### Content output format (`output_format`)
 
-`"plain"` (default), `"markdown"`, `"djot"`, `"html"`.
+`"plain"` (default), `"markdown"`, `"djot"`, `"html"`, `"json"`, `"doctags"`, or a registered custom renderer name.
 
 ### Result format (`result_format`)
 

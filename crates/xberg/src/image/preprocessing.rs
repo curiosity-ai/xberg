@@ -222,8 +222,8 @@ fn create_skip_result(
         rgb_data,
         dimensions: (width, height),
         metadata: ImagePreprocessingMetadata {
-            original_dimensions: (width, height),
-            original_dpi,
+            original_dimensions: (width, height).into(),
+            original_dpi: original_dpi.into(),
             target_dpi: config.target_dpi,
             scale_factor,
             auto_adjusted,
@@ -264,13 +264,13 @@ fn perform_resize(
     )?;
 
     let metadata = ImagePreprocessingMetadata {
-        original_dimensions: (original_width as usize, original_height as usize),
-        original_dpi,
+        original_dimensions: (original_width as usize, original_height as usize).into(),
+        original_dpi: original_dpi.into(),
         target_dpi: config.target_dpi,
         scale_factor: final_scale,
         auto_adjusted,
         final_dpi: target_dpi,
-        new_dimensions: Some((new_width as usize, new_height as usize)),
+        new_dimensions: Some((new_width as usize, new_height as usize).into()),
         resample_method: if final_scale < 1.0 { "LANCZOS3" } else { "CATMULLROM" }.to_string(),
         dimension_clamped,
         calculated_dpi,

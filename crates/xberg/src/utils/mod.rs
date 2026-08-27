@@ -3,7 +3,6 @@
 //! This module provides:
 //! - Quality processing: clean OCR artifacts, calculate quality scores
 //! - String utilities: safe decoding, mojibake fixing, encoding detection
-//! - Object pooling: reusable pools for batch processing to reduce allocations
 
 #[cfg(feature = "quality")]
 /// OCR quality analysis helpers (artifact detection, scoring, confidence aggregation).
@@ -66,10 +65,6 @@ pub(crate) fn strip_bom(s: &str) -> &str {
 pub mod json_utils;
 /// Markdown post-processing helpers used by extractors that emit Markdown output.
 pub mod markdown_utils;
-/// Generic object pool for reusing allocations across batch operations.
-pub mod pool;
-/// Heuristics for sizing thread and object pools based on CPU and workload.
-pub mod pool_sizing;
 /// Interned string pool for reducing allocation pressure on repeated strings.
 pub mod string_pool;
 /// XML helper utilities for tag-name extraction and attribute traversal.
@@ -165,7 +160,11 @@ pub(crate) fn decode_with_provenance(byte_data: &[u8], encoding: Option<&str>) -
     }
 }
 
-#[cfg(any(all(feature = "layout-detection", feature = "pdf"), feature = "office"))]
+#[cfg(any(
+    all(feature = "layout-detection", feature = "pdf"),
+    feature = "office",
+    feature = "markdown-footnotes"
+))]
 use std::borrow::Cow;
 
 /// Escape `&`, `<`, and `>` in text destined for markdown/HTML output.
@@ -201,7 +200,7 @@ pub(crate) fn escape_html_entities(text: &str) -> Cow<'_, str> {
 
 /// Normalizes whitespace by collapsing multiple whitespace characters into single spaces.
 /// Returns Cow::Borrowed if no normalization needed.
-#[cfg(feature = "office")]
+#[cfg(any(feature = "office", feature = "markdown-footnotes"))]
 #[inline]
 #[cfg_attr(alef, alef(skip))]
 pub(crate) fn normalize_whitespace(s: &str) -> Cow<'_, str> {
@@ -209,12 +208,51 @@ pub(crate) fn normalize_whitespace(s: &str) -> Cow<'_, str> {
         .as_bytes()
         .windows(2)
         .any(|w| w[0].is_ascii_whitespace() && w[1].is_ascii_whitespace())
-        || s.bytes().any(|b| b != b' ' && b.is_ascii_whitespace());
+        || s.bytes().any(|b| b != b' ' && b.is_ascii_whitespace())
+        || s.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+        || s.as_bytes().last().is_some_and(u8::is_ascii_whitespace);
 
     if needs_normalization {
         Cow::Owned(s.split_whitespace().collect::<Vec<_>>().join(" "))
     } else {
         Cow::Borrowed(s)
+    }
+}
+
+#[cfg(all(test, any(feature = "office", feature = "markdown-footnotes")))]
+mod normalize_whitespace_tests {
+    use super::*;
+
+    #[test]
+    fn borrows_when_already_normalized() {
+        let result = normalize_whitespace("already normal");
+        assert!(matches!(result, Cow::Borrowed(_)), "should not allocate when unchanged");
+        assert_eq!(result, "already normal");
+    }
+
+    #[test]
+    fn borrows_empty_string() {
+        assert!(matches!(normalize_whitespace(""), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn allocates_and_collapses_internal_whitespace_runs() {
+        let result = normalize_whitespace("a  b\tc\nd");
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "a b c d");
+    }
+
+    #[test]
+    fn allocates_and_trims_single_leading_and_trailing_space() {
+        // A single leading/trailing space has no adjacent whitespace run and no
+        // non-space whitespace byte, so it must be checked explicitly: matches
+        // `split_whitespace().join(" ")`, which always trims.
+        let result = normalize_whitespace(" a b ");
+        assert!(
+            matches!(result, Cow::Owned(_)),
+            "leading/trailing space must not take the borrow fast path"
+        );
+        assert_eq!(result, "a b");
     }
 }
 

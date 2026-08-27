@@ -1,7 +1,7 @@
 //! PDF text hierarchy utilities (backend-agnostic).
 //!
 //! Provides font-size clustering, heading level assignment, and shared segment
-//! data types used by the oxide PDF extraction pipeline.
+//! data types used by the native PDF extraction pipeline.
 
 mod bounding_box;
 mod clustering;

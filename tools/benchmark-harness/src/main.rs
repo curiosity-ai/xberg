@@ -8,7 +8,7 @@
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use benchmark_harness::types::ErrorKind;
-use benchmark_harness::{BenchmarkConfig, BenchmarkMode, FixtureManager, OutputFormat, Result};
+use benchmark_harness::{BenchmarkConfig, BenchmarkMode, FixtureManager, OutputFormat, Result, XbergPdfBackend};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -368,6 +368,26 @@ fn cohort_contract_summary(cohort: benchmark_harness::bench_matrix::Cohort) -> s
     })
 }
 
+/// Parses `run --pdf-backends`. An empty list (the flag omitted) means "unchanged default
+/// behavior" and is handled by the caller, not here -- this function only validates values a
+/// caller actually supplied, and rejects duplicates so a typo like `native,native` cannot be
+/// mistaken for `native,pdfium`.
+fn parse_pdf_backends(values: &[String]) -> Result<Vec<XbergPdfBackend>> {
+    let mut backends = Vec::with_capacity(values.len());
+    for value in values {
+        let backend = value
+            .parse::<XbergPdfBackend>()
+            .map_err(|error| benchmark_harness::Error::Config(format!("invalid --pdf-backends value: {error}")))?;
+        if backends.contains(&backend) {
+            return Err(benchmark_harness::Error::Config(format!(
+                "--pdf-backends lists '{backend}' more than once"
+            )));
+        }
+        backends.push(backend);
+    }
+    Ok(backends)
+}
+
 fn parse_model_provenance(values: &[String]) -> Result<Vec<benchmark_harness::ModelProvenance>> {
     values
         .iter()
@@ -513,6 +533,15 @@ enum Commands {
         /// reported but excluded from this framework-quality rate. Defaults to 1.0.
         #[arg(long, default_value = "1.0", value_parser = parse_success_rate)]
         min_success_rate: f64,
+
+        /// PDF backends to benchmark (comma-separated: native, pdfium). Only the `baseline`
+        /// xberg pipeline honors more than `native` -- the pdfium engine has no OCR fallback
+        /// path, so every other pipeline always runs `native` regardless of this flag. Defaults
+        /// to `native` only, so existing committed results and framework names stay unchanged
+        /// unless a caller opts in. This is the supported way to request the pdfium leg: it
+        /// does not require also naming `-pdfium`-suffixed framework names via `--frameworks`.
+        #[arg(long, value_delimiter = ',')]
+        pdf_backends: Vec<String>,
     },
 
     /// Consolidate multiple benchmark runs
@@ -574,6 +603,8 @@ enum Commands {
         /// and paddle-v5-server[+layout], plus paddle-{auto,no}rotate. Opt-in Paddle quality sweeps use the
         /// paddle-v6-small+layout+{det-side-*,det-db-*,drop-score-*} prefix. Tesseract PSM presets are
         /// tesseract-{vertical-block,single-block,sparse-text} (PSM 5, 6, and 11), plus tesseract-autorotate.
+        /// Sceptre presets (pinned to the ONNX Runtime inference engine) are sceptre-ort[+layout]
+        /// and sceptre-ort-autorotate.
         #[arg(long, value_delimiter = ',')]
         pipelines: Option<Vec<String>>,
 
@@ -627,7 +658,9 @@ enum Commands {
 
         /// Pipeline paths to run. Paddle presets include paddle-v6-{medium,small,tiny}[+layout]
         /// and paddle-v5-server[+layout], plus paddle-{auto,no}rotate. Tesseract PSM presets are
-        /// tesseract-{vertical-block,single-block,sparse-text} (PSM 5, 6, and 11), plus tesseract-autorotate. ~keep
+        /// tesseract-{vertical-block,single-block,sparse-text} (PSM 5, 6, and 11), plus tesseract-autorotate.
+        /// Sceptre presets (pinned to the ONNX Runtime inference engine) are sceptre-ort[+layout]
+        /// and sceptre-ort-autorotate. ~keep
         #[arg(long, value_delimiter = ',')]
         paths: Option<Vec<String>>,
 
@@ -845,9 +878,12 @@ async fn main() -> Result<()> {
             shard,
             model_ids,
             min_success_rate,
+            pdf_backends,
         } => {
             use benchmark_harness::{AdapterRegistry, BenchmarkRunner};
             use std::sync::Arc;
+
+            let requested_pdf_backends = parse_pdf_backends(&pdf_backends)?;
 
             for framework in &frameworks {
                 if !framework.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
@@ -913,10 +949,19 @@ async fn main() -> Result<()> {
             use benchmark_harness::XbergPipeline;
             use benchmark_harness::adapters::create_xberg_adapter;
 
+            let has_explicit_frameworks = !frameworks.is_empty();
+            // An omitted `--pdf-backends` means "unchanged default behavior": native only, for
+            // every pipeline, exactly as before this flag existed.
+            let native_only_backend = [XbergPdfBackend::Native];
+            let effective_pdf_backends: &[XbergPdfBackend] = if requested_pdf_backends.is_empty() {
+                &native_only_backend
+            } else {
+                &requested_pdf_backends
+            };
             let mut xberg_count = 0;
             let formats = [parsed_format];
             for pipeline in &XBERG_RUN_PIPELINES {
-                if !should_register_xberg_pipeline(*pipeline, !frameworks.is_empty()) {
+                if !should_register_xberg_pipeline(*pipeline, has_explicit_frameworks) {
                     continue;
                 }
                 if !ocr
@@ -934,41 +979,56 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 for format in &formats {
-                    let format_slug = match format {
-                        OutputFormat::Markdown => "markdown",
-                        OutputFormat::Plaintext => "plaintext",
-                    };
-                    let base_name = format!("xberg-{}-{}", format_slug, pipeline.as_str());
-                    let framework_name = if batch_mode {
-                        format!("{base_name}-batch")
+                    // `Pdfium` is a distinct cohort dimension, not a pipeline: it is opt-in only
+                    // (must be requested explicitly via `--pdf-backends pdfium`) and restricted
+                    // to `Baseline`, since the pdfium engine has no OCR fallback path of its own.
+                    // Every other pipeline always runs `native`, regardless of `--pdf-backends`.
+                    let pdf_backends: &[XbergPdfBackend] = if matches!(pipeline, XbergPipeline::Baseline) {
+                        effective_pdf_backends
                     } else {
-                        base_name
+                        &native_only_backend
                     };
-                    if should_init(&framework_name) {
-                        match create_xberg_adapter(*pipeline, *format, batch_mode, ocr)
-                            .map(|adapter| adapter.with_batch_workers(config.max_concurrent))
-                            .map(|adapter| match config.xberg_max_threads {
-                                Some(max_threads) => adapter.with_xberg_max_threads(max_threads),
-                                None => adapter,
-                            }) {
-                            Ok(adapter) => {
-                                if let Err(err) = registry.register(Arc::new(adapter)) {
+                    for pdf_backend in pdf_backends {
+                        let format_slug = match format {
+                            OutputFormat::Markdown => "markdown",
+                            OutputFormat::Plaintext => "plaintext",
+                        };
+                        let pdf_backend_suffix = match pdf_backend {
+                            XbergPdfBackend::Native => "",
+                            XbergPdfBackend::Pdfium => "-pdfium",
+                        };
+                        let base_name = format!("xberg-{}-{}{}", format_slug, pipeline.as_str(), pdf_backend_suffix);
+                        let framework_name = if batch_mode {
+                            format!("{base_name}-batch")
+                        } else {
+                            base_name
+                        };
+                        if should_init(&framework_name) {
+                            match create_xberg_adapter(*pipeline, *format, batch_mode, ocr, *pdf_backend)
+                                .map(|adapter| adapter.with_batch_workers(config.max_concurrent))
+                                .map(|adapter| match config.xberg_max_threads {
+                                    Some(max_threads) => adapter.with_xberg_max_threads(max_threads),
+                                    None => adapter,
+                                }) {
+                                Ok(adapter) => {
+                                    if let Err(err) = registry.register(Arc::new(adapter)) {
+                                        tracing::warn!(
+                                            framework = %framework_name,
+                                            error = %err,
+                                            "adapter registration failed"
+                                        );
+                                    } else {
+                                        tracing::info!(framework = %framework_name, "adapter registered");
+                                        xberg_count += 1;
+                                    }
+                                }
+                                Err(err) => {
                                     tracing::warn!(
                                         framework = %framework_name,
                                         error = %err,
-                                        "adapter registration failed"
+                                        "adapter initialization failed"
                                     );
-                                } else {
-                                    tracing::info!(framework = %framework_name, "adapter registered");
-                                    xberg_count += 1;
                                 }
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    framework = %framework_name,
-                                    error = %err,
-                                    "adapter initialization failed"
-                                );
                             }
                         }
                     }
@@ -1744,8 +1804,8 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, XBERG_RUN_PIPELINES, cohort_contract_summary, compute_framework_coverage,
-        normalize_run_frameworks, parse_model_provenance, parse_pipeline_names, parse_sort_metric,
+        Cli, Commands, XBERG_RUN_PIPELINES, XbergPdfBackend, cohort_contract_summary, compute_framework_coverage,
+        normalize_run_frameworks, parse_model_provenance, parse_pdf_backends, parse_pipeline_names, parse_sort_metric,
         selected_frameworks_use_tesseract, should_register_xberg_pipeline, tracing_filter,
         validate_framework_result_cardinality, write_run_artifacts_and_check_gate,
     };
@@ -1877,6 +1937,35 @@ mod tests {
             }
         ));
         assert!(parse_model_provenance(&["invalid".to_string()]).is_err());
+    }
+
+    #[test]
+    fn run_cli_accepts_pdf_backends_flag() {
+        let cli = Cli::try_parse_from([
+            "benchmark-harness",
+            "run",
+            "--fixtures",
+            "fixtures",
+            "--pdf-backends",
+            "native,pdfium",
+        ])
+        .unwrap();
+
+        let Commands::Run { pdf_backends, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(pdf_backends, ["native", "pdfium"]);
+        assert_eq!(
+            parse_pdf_backends(&pdf_backends).unwrap(),
+            [XbergPdfBackend::Native, XbergPdfBackend::Pdfium]
+        );
+    }
+
+    #[test]
+    fn parse_pdf_backends_rejects_unknown_and_duplicate_values() {
+        assert!(parse_pdf_backends(&["pdf_oxide".to_string()]).is_err());
+        assert!(parse_pdf_backends(&["native".to_string(), "native".to_string()]).is_err());
+        assert_eq!(parse_pdf_backends(&[]).unwrap(), Vec::<XbergPdfBackend>::new());
     }
 
     #[test]

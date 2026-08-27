@@ -401,6 +401,24 @@ xberg cache clear
 xberg cache stats
 ```
 
+### Tree-sitter Grammars
+
+Manage the grammar cache used for code intelligence. This command is available when the CLI is
+built with the `tree-sitter` feature.
+
+```bash title="Terminal"
+# Download selected grammars
+xberg tree-sitter download python rust go
+
+# Download configured language groups
+xberg tree-sitter download --from-config
+
+# Inspect or clear the grammar cache
+xberg tree-sitter list --downloaded
+xberg tree-sitter cache-dir
+xberg tree-sitter clean
+```
+
 ### Environment Diagnostics
 
 `doctor` checks whether the backends in your config will actually run on this machine, before the first document. Each check reports pass, warn, fail, or skip with a one-line reason; warnings are actionable but never fail the command, and it exits nonzero only on failures.
@@ -460,7 +478,7 @@ xberg extract document.pdf --chunking-tokenizer "Xenova/gpt-4o"
 
 | Flag                                | Description                                                                                                                                    |
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--content-format <FORMAT>`         | Content output format: `plain`, `markdown`, `djot`, or `html`. Controls how extracted text is formatted. (Deprecated alias: `--output-format`) |
+| `--content-format <FORMAT>`         | Content output format: `plain`, `markdown`, `djot`, `html`, `json`, or `doctags`. Controls how extracted text is formatted. (Deprecated alias: `--output-format`) |
 | `--include-structure <true\|false>` | Include hierarchical document structure in results.                                                                                            |
 
 ```bash title="Terminal"

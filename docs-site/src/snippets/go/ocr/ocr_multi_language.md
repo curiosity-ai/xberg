@@ -11,7 +11,7 @@ func main() {
 	config := xberg.ExtractionConfig{
 		Ocr: &xberg.OcrConfig{
 			Backend:  "tesseract",
-			Language: "eng+deu+fra",
+			Language: []string{"eng", "deu", "fra"},
 		},
 	}
 	input := xberg.ExtractInputFromURI("multilingual.pdf")

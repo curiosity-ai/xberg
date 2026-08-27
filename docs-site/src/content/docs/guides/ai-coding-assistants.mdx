@@ -118,7 +118,7 @@ output = await extract(ExtractInput(kind="uri", uri="document.pdf"))
 print(output.results[0].content)
 
 config = ExtractionConfig(
-    ocr=OcrConfig(backend="tesseract", language="eng"),
+    ocr=OcrConfig(backend="tesseract", language=["eng"]),
     output_format="markdown",
 )
 output = await extract(ExtractInput(kind="uri", uri="document.pdf"), config=config)

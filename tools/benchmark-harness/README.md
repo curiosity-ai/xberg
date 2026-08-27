@@ -110,27 +110,53 @@ Fixtures are JSON files organized by format directory under `fixtures/`:
 
 ### Ground Truth Coverage
 
-| Format | Fixtures | With Markdown GT |
-| ------ | -------- | ---------------- |
-| PDF    | 159      | 158              |
-| HTML   | 36       | 36               |
-| DOCX   | 26       | 26               |
-| ODT    | 19       | 19               |
-| RTF    | 17       | 17               |
-| XLSX   | 12       | 11               |
-| CSV    | 11       | 11               |
-| EPUB   | 8        | 8                |
-| PPTX   | 8        | 8                |
-| Org    | 6        | 6                |
-| DOC    | 5        | 5                |
-| OPML   | 4        | 4                |
-| RST    | 3        | 3                |
-| XLS    | 3        | 3                |
-| IPynb  | 1        | 1                |
-| JATS   | 1        | 1                |
-| LaTeX  | 1        | 1                |
+| Format      | Fixtures | With Markdown GT |
+| ----------- | -------- | ---------------- |
+| PDF         | 187      | 182              |
+| Markdown    | 111      | 1                |
+| HTML        | 37       | 37               |
+| DOCX        | 31       | 27               |
+| ODT         | 21       | 21               |
+| RTF         | 18       | 18               |
+| JPEG        | 15       | 11               |
+| CSV         | 13       | 13               |
+| XLSX        | 12       | 12               |
+| PNG         | 10       | 6                |
+| LaTeX       | 9        | 9                |
+| Typst       | 9        | 9                |
+| EPUB        | 8        | 8                |
+| PPTX        | 8        | 7                |
+| FB2         | 7        | 7                |
+| Org         | 7        | 7                |
+| WordPerfect | 7        | 7                |
+| DOC         | 6        | 6                |
+| DocBook     | 6        | 5                |
+| IPynb       | 5        | 5                |
+| RST         | 5        | 5                |
+| OPML        | 4        | 4                |
+| TSV         | 4        | 1                |
+| XLS         | 3        | 3                |
+| DBK         | 1        | 1                |
+| HWPX        | 1        | 1                |
+| JATS        | 1        | 1                |
+| Keynote     | 1        | 1                |
+| Numbers     | 1        | 1                |
+| ODP         | 1        | 1                |
+| Pages       | 1        | 1                |
+| PPT         | 1        | 1                |
 
-**Total:** 318 fixtures with markdown ground truth across 17 formats.
+Format is determined by each fixture's JSON `file_type` field (see
+[`Fixture::file_type`](src/fixture.rs)), not by its directory — most fixtures
+live in a directory matching their `file_type`, but several do not (for
+example `fixtures/ordinance_2197_scanned.json` sits at the top level and
+`fixtures/pdf_medium.json` has no format subdirectory at all). "With Markdown
+GT" counts fixtures whose JSON contains `ground_truth.markdown_file`.
+Two format labels above merge fixtures with inconsistent `file_type` values
+for the same underlying format: **Typst** merges `file_type: "typ"` (8
+fixtures) and `file_type: "typst"` (1 fixture, `typst_tables.json`); **WordPerfect**
+merges `file_type: "wp"` (3 fixtures) and `file_type: "wpd"` (4 fixtures).
+
+**Total:** 419 fixtures with markdown ground truth across 32 formats.
 
 ## Frameworks
 
@@ -173,6 +199,8 @@ The `compare` and `pipeline-benchmark` commands support these extraction paths:
 | `paddle-v6-small[+layout]` | PP-OCRv6 small tier, optionally with layout |
 | `paddle-v6-tiny[+layout]` | PP-OCRv6 tiny tier, optionally with layout |
 | `paddle-v5-server[+layout]` | Explicit legacy PP-OCRv5 server tier       |
+| `sceptre-ort[+layout]` | Sceptre OCR pinned to the ONNX Runtime inference engine |
+| `sceptre-ort-autorotate` | Sceptre OCR (ONNX Runtime) with auto_rotate enabled |
 | `docling`          | Vendored Docling reference extraction          |
 | `paddleocr-python` | Vendored PaddleOCR Python extraction           |
 | `rapidocr`         | Vendored RapidOCR extraction                   |
@@ -382,7 +410,7 @@ benchmark-harness compare -f fixtures/ \
 Guardrail contracts may include a `relative_order` array of exact text anchors. The comparison
 fails unless every anchor is present in the listed order, allowing focused reading-order checks
 that are independent of aggregate SF1 thresholds. The known `681693`
-`pdf-oxide+layout+reading-order` sequence is installed when guardrails are loaded or generated,
+`native+layout+reading-order` sequence is installed when guardrails are loaded or generated,
 including for legacy guardrail files without `relative_order`.
 
 ### `pipeline-benchmark` -- 6-path extraction matrix

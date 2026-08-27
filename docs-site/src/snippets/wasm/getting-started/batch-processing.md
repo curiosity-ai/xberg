@@ -1,5 +1,10 @@
+---
+language: typescript
+target: wasm
+---
+
 ```typescript title="Wasm"
-import { extractBatch, initWasm } from "@xberg-io/xberg-wasm";
+import init, { WasmExtractInput, extractBatch } from "@xberg-io/xberg-wasm";
 
 interface DocumentJob {
   name: string;
@@ -8,19 +13,15 @@ interface DocumentJob {
 }
 
 async function _processBatch(documents: DocumentJob[], concurrency: number = 3) {
-  await initWasm();
+  await init();
 
   const results: Record<string, string> = {};
 
   for (let index = 0; index < documents.length; index += concurrency) {
     const batch = documents.slice(index, index + concurrency);
     const output = await extractBatch(
-      batch.map((doc) => ({
-        kind: "bytes",
-        bytes: doc.bytes,
-        mimeType: doc.mimeType,
-        filename: doc.name,
-      })),
+      batch.map((doc) => WasmExtractInput.fromBytes(doc.bytes, doc.mimeType, doc.name)),
+      undefined,
     );
 
     output.results.forEach((result, resultIndex) => {

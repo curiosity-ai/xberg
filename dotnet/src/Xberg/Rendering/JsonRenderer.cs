@@ -100,15 +100,23 @@ public static class JsonRenderer
                     break;
 
                 case ElementKindTag.ListItem:
+                {
+                    // JSON list items are plain strings with no separate marker slot, so a literal
+                    // source label is prefixed onto the item text — the same convention the other
+                    // text-based renderers use.
+                    string itemText = elem.ListItemSourceLabel is { Length: > 0 } jsonLabel
+                        ? jsonLabel + " " + elem.Text
+                        : elem.Text;
                     if (openList is not null)
-                        openList.Items.Add(elem.Text);
+                        openList.Items.Add(itemText);
                     else
                     {
                         var single = new OpenList { Ordered = elem.Kind.Ordered };
-                        single.Items.Add(elem.Text);
+                        single.Items.Add(itemText);
                         PushToCurrent(rootBody, sectionStack, ref openBlockquote, ListNode(single));
                     }
                     break;
+                }
 
                 case ElementKindTag.Code:
                     FlushList(ref openList, rootBody, sectionStack, ref openBlockquote);

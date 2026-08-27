@@ -9,13 +9,13 @@ import (
 )
 
 func main() {
-	preserveMarkdown := true
 	mode := "moderate"
 
 	cfg := xberg.ExtractionConfig{
-		TokenReduction: &xberg.TokenReductionConfig{
-			Mode:             &mode,
-			PreserveMarkdown: &preserveMarkdown,
+		// TokenReductionOptions only exposes Mode and PreserveImportantWords; Markdown
+		// preservation is controlled by the reduction level's own defaults, not a separate flag.
+		TokenReduction: &xberg.TokenReductionOptions{
+			Mode: mode,
 		},
 	}
 
@@ -25,23 +25,6 @@ func main() {
 		log.Fatalf("extraction failed: %v", err)
 	}
 
-	original := 0
-	reduced := 0
-	ratio := 0.0
-
-	if val, ok := result.Results[0].Metadata["original_token_count"]; ok {
-		original = val.(int)
-	}
-
-	if val, ok := result.Results[0].Metadata["token_count"]; ok {
-		reduced = val.(int)
-	}
-
-	if val, ok := result.Results[0].Metadata["token_reduction_ratio"]; ok {
-		ratio = val.(float64)
-	}
-
-	fmt.Printf("Reduced from %d to %d tokens\n", original, reduced)
-	fmt.Printf("Reduction: %.1f%%\n", ratio*100)
+	fmt.Printf("Reduced content:\n%s\n", result.Results[0].Content)
 }
 ```

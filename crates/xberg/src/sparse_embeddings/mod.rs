@@ -8,7 +8,6 @@
 //! Built on the shared [`crate::onnx`] model-loading helpers. The engine math is
 //! in [`engine`].
 //!
-//! Since v5.0.0.
 
 use std::sync::LazyLock;
 
@@ -35,7 +34,6 @@ const DEFAULT_MODEL_FILE: &str = "onnx/model.onnx";
 /// `indices[i]`. The two arrays always have equal length. Only strictly-positive
 /// terms are retained, so the representation is genuinely sparse.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct SparseEmbedding {
@@ -45,9 +43,54 @@ pub struct SparseEmbedding {
     pub values: Vec<f32>,
 }
 
+#[cfg(all(test, feature = "sparse-embeddings"))]
+mod engine_cache_key_tests {
+    use super::*;
+    use crate::core::config::acceleration::{AccelerationConfig, ExecutionProviderType};
+
+    fn key(
+        additional_files: &[String],
+        max_length: usize,
+        acceleration: &AccelerationConfig,
+    ) -> SparseEmbeddingEngineCacheKey {
+        SparseEmbeddingEngineCacheKey::new(
+            "owner/model",
+            "model.onnx",
+            additional_files,
+            "revision",
+            max_length,
+            "cache-root".to_string(),
+            crate::onnx::OnnxAccelerationCacheKey::from_resolved(acceleration.provider.clone(), acceleration.device_id),
+        )
+    }
+
+    #[test]
+    fn engine_cache_reuses_equal_configs_and_isolates_distinct_configs() {
+        let cpu = AccelerationConfig {
+            provider: ExecutionProviderType::Cpu,
+            device_id: 0,
+        };
+        let cuda = AccelerationConfig {
+            provider: ExecutionProviderType::Cuda,
+            device_id: 1,
+        };
+        let files = vec!["config.json".to_string(), "weights.onnx.data".to_string()];
+        let reversed_files = vec!["weights.onnx.data".to_string(), "config.json".to_string()];
+        let original = key(&files, 512, &cpu);
+        let equal = key(&files, 512, &cpu);
+        let mut cache = AHashMap::new();
+        cache.insert(original, 7_u8);
+
+        assert_eq!(cache.get(&equal), Some(&7));
+        assert_eq!(cache.get(&key(&files, 1024, &cpu)), None);
+        assert_eq!(cache.get(&key(&files, 512, &cuda)), None);
+        assert_eq!(cache.get(&key(&[], 512, &cpu)), None);
+        assert_eq!(cache.get(&key(&reversed_files, 512, &cpu)), None);
+    }
+}
+
 /// Static metadata for a bundled SPLADE preset (WASM/Android-safe, no ORT).
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct SparseEmbeddingPreset {
@@ -104,7 +147,6 @@ pub static SPARSE_EMBEDDING_PRESETS: LazyLock<Vec<SparseEmbeddingPreset>> = Lazy
 
 /// Look up a bundled SPLADE preset by exact name.
 ///
-/// Since v5.0.0.
 #[cfg(any(feature = "sparse-embedding-presets", feature = "sparse-embeddings"))]
 #[cfg_attr(alef, alef(skip))]
 pub fn get_preset(name: &str) -> Option<SparseEmbeddingPreset> {
@@ -113,7 +155,6 @@ pub fn get_preset(name: &str) -> Option<SparseEmbeddingPreset> {
 
 /// List the names of all bundled SPLADE presets.
 ///
-/// Since v5.0.0.
 #[cfg(any(feature = "sparse-embedding-presets", feature = "sparse-embeddings"))]
 #[cfg_attr(alef, alef(skip))]
 pub fn list_presets() -> Vec<String> {
@@ -124,7 +165,43 @@ pub fn list_presets() -> Vec<String> {
 type CachedEngine = Arc<SparseEmbeddingEngine>;
 
 #[cfg(feature = "sparse-embeddings")]
-static ENGINE_CACHE: LazyLock<RwLock<AHashMap<String, CachedEngine>>> = LazyLock::new(|| RwLock::new(AHashMap::new()));
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SparseEmbeddingEngineCacheKey {
+    repo_name: String,
+    model_file: String,
+    additional_files: Vec<String>,
+    revision: String,
+    max_length: usize,
+    cache_root: String,
+    acceleration: crate::onnx::OnnxAccelerationCacheKey,
+}
+
+#[cfg(feature = "sparse-embeddings")]
+impl SparseEmbeddingEngineCacheKey {
+    fn new(
+        repo_name: &str,
+        model_file: &str,
+        additional_files: &[String],
+        revision: &str,
+        max_length: usize,
+        cache_root: String,
+        acceleration: crate::onnx::OnnxAccelerationCacheKey,
+    ) -> Self {
+        Self {
+            repo_name: repo_name.to_string(),
+            model_file: model_file.to_string(),
+            additional_files: additional_files.to_vec(),
+            revision: revision.to_string(),
+            max_length,
+            cache_root,
+            acceleration,
+        }
+    }
+}
+
+#[cfg(feature = "sparse-embeddings")]
+static ENGINE_CACHE: LazyLock<RwLock<AHashMap<SparseEmbeddingEngineCacheKey, CachedEngine>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::new()));
 
 /// Bounds concurrent blocking inference tasks spawned by [`embed_sparse_async`].
 #[cfg(all(feature = "sparse-embeddings", feature = "tokio-runtime"))]
@@ -188,8 +265,15 @@ fn get_or_init_engine(
     accel: Option<crate::core::config::acceleration::AccelerationConfig>,
 ) -> crate::Result<Arc<SparseEmbeddingEngine>> {
     let revision = (repo_name == "xberg-io/sparse-embeddings").then_some(SPARSE_EMBEDDING_REVISION);
-    let cache_key = crate::model_download::hf_cache_key(cache_dir.as_deref());
-    let engine_key = format!("{repo_name}_{model_file}_{}_{}", revision.unwrap_or("main"), cache_key);
+    let engine_key = SparseEmbeddingEngineCacheKey::new(
+        repo_name,
+        model_file,
+        additional_files,
+        revision.unwrap_or("main"),
+        max_length,
+        crate::model_download::hf_cache_key(cache_dir.as_deref()),
+        crate::onnx::OnnxAccelerationCacheKey::new(accel.as_ref()),
+    );
 
     match ENGINE_CACHE.read() {
         Ok(cache) => {
@@ -262,7 +346,6 @@ fn map_engine_err(e: engine::SparseEmbedError) -> crate::XbergError {
 /// Returns an error if the model cannot be downloaded/loaded, if ONNX Runtime is
 /// unavailable, or if a `Plugin` model is selected (not yet supported).
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 #[cfg(feature = "sparse-embeddings")]
 pub fn embed_sparse<T: AsRef<str>>(
@@ -290,7 +373,6 @@ pub fn embed_sparse<T: AsRef<str>>(
 /// Async wrapper over [`embed_sparse`]: runs the blocking ONNX inference on a
 /// bounded blocking-task pool so it does not stall the async runtime.
 ///
-/// Since v5.0.0.
 #[cfg(all(feature = "sparse-embeddings", feature = "tokio-runtime"))]
 #[cfg_attr(alef, alef(skip))]
 pub async fn embed_sparse_async(

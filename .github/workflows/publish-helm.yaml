@@ -51,7 +51,10 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+
+      - name: Install Task
+        uses: xberg-io/actions/install-task@v1
 
       - name: Resolve version
         id: meta
@@ -83,6 +86,11 @@ jobs:
             echo "- **Version**: \`${VERSION}\`"
             echo "- **Dry Run**: \`${DRY_RUN}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate release metadata
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: task version:check
 
       - name: Setup Helm
         uses: azure/setup-helm@v5
@@ -123,7 +131,7 @@ jobs:
 
       - name: Install oras
         if: steps.meta.outputs.dry_run != 'true'
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
 
       - name: Registry login
         if: steps.meta.outputs.dry_run != 'true'

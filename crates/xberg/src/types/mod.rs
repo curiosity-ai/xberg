@@ -1,7 +1,7 @@
 //! Core types for document extraction.
 
 pub mod annotations;
-pub mod builder;
+pub(crate) mod builder;
 pub mod classification;
 pub mod diagram;
 pub mod djot;
@@ -18,6 +18,7 @@ pub mod ocr_elements;
 pub mod page;
 pub mod qr;
 pub mod redaction;
+pub mod region;
 pub mod revisions;
 pub mod serde_helpers;
 pub mod summary;
@@ -42,6 +43,7 @@ pub use ocr_elements::*;
 pub use page::*;
 pub use qr::{QrBoundingBox, QrCode};
 pub use redaction::{PiiCategory, RedactionFinding, RedactionReport, RedactionStrategy};
+pub use region::RegionKind;
 pub use revisions::{
     CellChange, DiffLine, DocumentRevision, PropertyChange, RevisionAnchor, RevisionDelta, RevisionKind,
 };
@@ -192,6 +194,7 @@ mod tests {
                 }),
             ],
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -217,6 +220,7 @@ mod tests {
             content: "Page with images".to_string(),
             tables: Vec::new(),
             image_indices: vec![0, 1],
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -250,6 +254,7 @@ mod tests {
             content: "Page 1".to_string(),
             tables: vec![Arc::clone(&shared_table)],
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -263,6 +268,7 @@ mod tests {
             content: "Page 2".to_string(),
             tables: vec![Arc::clone(&shared_table)],
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -289,6 +295,7 @@ mod tests {
             content: "No tables or images".to_string(),
             tables: Vec::new(),
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,

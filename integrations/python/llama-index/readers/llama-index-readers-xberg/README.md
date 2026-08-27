@@ -112,7 +112,7 @@ from xberg import ChunkingConfig, ExtractionConfig
 
 reader = XbergReader(
     extraction_config=ExtractionConfig(
-        chunking=ChunkingConfig(max_characters=1000, overlap=200, prepend_heading_context=True),
+        chunking=ChunkingConfig(max_characters=1000, overlap=200),
     )
 )
 documents = reader.load_data("report.pdf")

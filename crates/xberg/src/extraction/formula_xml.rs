@@ -8,7 +8,6 @@
 use crate::Result;
 use crate::extraction::derive::strip_math_delimiters;
 use crate::extractors::security::SecurityBudget;
-use crate::text::utf8_validation;
 use crate::utils::xml_utils::EntityReader;
 use quick_xml::events::{BytesStart, Event};
 
@@ -23,12 +22,8 @@ pub(crate) struct FormulaElements<'a> {
 }
 
 /// Return the local part of a possibly prefixed XML qualified name.
-fn local_name_of(qname: &[u8]) -> String {
-    let name = String::from_utf8_lossy(qname);
-    match name.rsplit(':').next() {
-        Some(local) => local.to_string(),
-        None => name.into_owned(),
-    }
+fn local_name_of(qname: &str) -> &str {
+    qname.rsplit(':').next().unwrap_or(qname)
 }
 
 /// Append a start tag to `buf` with the prefix stripped and namespace
@@ -41,10 +36,10 @@ fn local_name_of(qname: &[u8]) -> String {
 /// a duplicate attribute would make the captured XML unparseable.
 fn write_start_tag(buf: &mut String, event: &BytesStart<'_>, self_closing: bool) {
     buf.push('<');
-    buf.push_str(&local_name_of(event.name().as_ref()));
+    buf.push_str(local_name_of(event.name().as_ref()));
     let mut written: Vec<String> = Vec::new();
     for attr in event.attributes().flatten() {
-        let key = String::from_utf8_lossy(attr.key.as_ref());
+        let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
         if key == "xmlns" || key.starts_with("xmlns:") {
             continue;
         }
@@ -52,7 +47,7 @@ fn write_start_tag(buf: &mut String, event: &BytesStart<'_>, self_closing: bool)
         if written.contains(&local_key) {
             continue;
         }
-        let raw = String::from_utf8_lossy(&attr.value);
+        let raw = std::borrow::Cow::Borrowed(attr.value.as_ref());
         buf.push(' ');
         buf.push_str(&local_key);
         buf.push_str("=\"");
@@ -121,7 +116,8 @@ pub(crate) fn extract_formula_latex(
             Ok(Event::Start(s)) => {
                 budget.enter()?;
                 depth += 1;
-                let local = local_name_of(s.name().as_ref());
+                let name = s.name();
+                let local = local_name_of(name.as_ref());
                 if let Some(buf) = capture.as_mut() {
                     capture_depth += 1;
                     let before = buf.len();
@@ -153,7 +149,7 @@ pub(crate) fn extract_formula_latex(
                 budget.leave();
                 if let Some(buf) = capture.as_mut() {
                     buf.push_str("</");
-                    buf.push_str(&local_name_of(e.name().as_ref()));
+                    buf.push_str(local_name_of(e.name().as_ref()));
                     buf.push('>');
                     capture_depth -= 1;
                     if capture_depth == 0
@@ -172,7 +168,8 @@ pub(crate) fn extract_formula_latex(
                         }
                     }
                 } else {
-                    let local = local_name_of(e.name().as_ref());
+                    let name = e.name();
+                    let local = local_name_of(name.as_ref());
                     if local == names.tex {
                         in_tex_math = false;
                     } else if names.label.is_some_and(|name| local == name) {
@@ -187,7 +184,7 @@ pub(crate) fn extract_formula_latex(
                 depth -= 1;
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                let decoded = t.as_ref().to_string();
                 if decoded.trim().is_empty() {
                     continue;
                 }
@@ -208,7 +205,7 @@ pub(crate) fn extract_formula_latex(
                 }
             }
             Ok(Event::CData(t)) => {
-                let decoded = utf8_validation::from_utf8(t.as_ref()).unwrap_or("").to_string();
+                let decoded = t.as_ref().to_string();
                 if decoded.trim().is_empty() {
                     continue;
                 }

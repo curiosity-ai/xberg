@@ -94,11 +94,11 @@ fn get_w_attr_i32(element: &BytesStart, local_name: &str) -> Option<i32> {
     let w_prefixed = format!("w:{}", local_name);
     for attr in element.attributes().flatten() {
         let key = attr.key.as_ref();
-        if (key == w_prefixed.as_bytes() || key == local_name.as_bytes())
-            && let Ok(val) = std::str::from_utf8(&attr.value)
-            && let Ok(num) = val.parse::<i32>()
-        {
-            return Some(num);
+        if key == w_prefixed || key == local_name {
+            let val = attr.value.as_ref();
+            if let Ok(num) = val.parse::<i32>() {
+                return Some(num);
+            }
         }
     }
     None
@@ -107,10 +107,9 @@ fn get_w_attr_i32(element: &BytesStart, local_name: &str) -> Option<i32> {
 /// Get a namespaced string attribute.
 fn get_w_attr_string(element: &BytesStart, local_name: &str) -> Option<String> {
     for attr in element.attributes().flatten() {
-        let key_str = std::str::from_utf8(attr.key.as_ref()).ok()?;
-        if (key_str == local_name || key_str.ends_with(&format!(":{}", local_name)))
-            && let Ok(val) = std::str::from_utf8(&attr.value)
-        {
+        let key_str = attr.key.as_ref();
+        if key_str == local_name || key_str.ends_with(&format!(":{}", local_name)) {
+            let val = attr.value.as_ref();
             return Some(val.to_string());
         }
     }
@@ -209,7 +208,7 @@ pub(crate) fn parse_section_properties_streaming(
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"w:sectPr" {
+                if e.name().as_ref() == "w:sectPr" {
                     break;
                 }
             }
@@ -233,8 +232,8 @@ pub(crate) fn parse_section_properties_streaming(
 /// since OOXML section child elements (`w:pgSz`, `w:pgMar`, etc.)
 /// are typically self-closing.
 fn apply_section_element(e: &BytesStart, props: &mut SectionProperties) {
-    match e.name().as_ref() as &[u8] {
-        b"w:pgSz" => {
+    match e.name().as_ref() {
+        "w:pgSz" => {
             props.page_width_twips = get_w_attr_i32(e, "w");
             props.page_height_twips = get_w_attr_i32(e, "h");
             props.orientation = get_w_attr_string(e, "orient").and_then(|s| match s.as_str() {
@@ -243,7 +242,7 @@ fn apply_section_element(e: &BytesStart, props: &mut SectionProperties) {
                 _ => None,
             });
         }
-        b"w:pgMar" => {
+        "w:pgMar" => {
             props.margins.top = get_w_attr_i32(e, "top");
             props.margins.right = get_w_attr_i32(e, "right");
             props.margins.bottom = get_w_attr_i32(e, "bottom");
@@ -252,14 +251,14 @@ fn apply_section_element(e: &BytesStart, props: &mut SectionProperties) {
             props.margins.footer = get_w_attr_i32(e, "footer");
             props.margins.gutter = get_w_attr_i32(e, "gutter");
         }
-        b"w:cols" => {
+        "w:cols" => {
             props.columns.count = get_w_attr_i32(e, "num");
             props.columns.space_twips = get_w_attr_i32(e, "space");
             if let Some(eq_width_str) = get_w_attr_string(e, "equalWidth") {
                 props.columns.equal_width = Some(eq_width_str == "1" || eq_width_str == "true");
             }
         }
-        b"w:docGrid" => {
+        "w:docGrid" => {
             props.doc_grid_line_pitch = get_w_attr_i32(e, "linePitch");
         }
         _ => {}
@@ -385,7 +384,7 @@ mod tests {
 
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"w:sectPr" => break,
+                Ok(Event::Start(ref e)) if e.name().as_ref() == "w:sectPr" => break,
                 Ok(Event::Eof) => panic!("unexpected EOF"),
                 Err(e) => panic!("unexpected error: {}", e),
                 _ => {}
@@ -418,7 +417,7 @@ mod tests {
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"w:sectPr" => break,
+                Ok(Event::Start(ref e)) if e.name().as_ref() == "w:sectPr" => break,
                 Ok(Event::Eof) => panic!("unexpected EOF"),
                 _ => {}
             }

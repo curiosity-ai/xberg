@@ -40,7 +40,11 @@ pub(crate) mod model_stager;
 #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
 pub mod deepseek_ocr_backend;
 
-pub use config::{CandleModelId, CandleOcrConfig};
+pub use config::{
+    CandleDevicePreference, CandleModelId, CandleOcrConfig, CandleTrocrVariant, DeepseekOcrBackendOptions,
+    GlmOcrBackendOptions, GlmOcrLayoutMode, GlmOcrTaskKind, PaddleOcrVlBackendOptions, PaddleOcrVlTaskKind,
+    TrocrBackendOptions,
+};
 
 #[cfg(feature = "candle-trocr")]
 pub use trocr_backend::TrocrBackend;
@@ -74,11 +78,10 @@ use crate::core::config::{AccelerationConfig, ExecutionProviderType, OcrConfig};
 use xberg_candle_ocr::DevicePreference;
 
 /// Resolve a candle [`DevicePreference`] from the centralised acceleration
-/// config plus the candle-specific `backend_options.device` override.
+/// config plus a validated backend-specific device override.
 ///
 /// Precedence (highest first):
-/// 1. `OcrConfig.backend_options.device` (when present) — an explicit
-///    per-call override.
+/// 1. The typed backend option's device (when present) — an explicit per-call override.
 /// 2. `OcrConfig.acceleration.provider` — the central config that already
 ///    drives layout-detection and embeddings.
 /// 3. `DevicePreference::Auto`.
@@ -98,17 +101,12 @@ use xberg_candle_ocr::DevicePreference;
         any(feature = "candle-glm-ocr", feature = "candle-deepseek-ocr")
     )
 ))]
-pub(crate) fn resolve_device_preference(config: &OcrConfig) -> DevicePreference {
-    if let Some(opts) = &config.backend_options
-        && let Some(v) = opts.get("device").and_then(|v| v.as_str())
-    {
-        match v {
-            "cpu" => return DevicePreference::Cpu,
-            "cuda" => return DevicePreference::Cuda,
-            "metal" => return DevicePreference::Metal,
-            "auto" => return DevicePreference::Auto,
-            _ => {}
-        }
+pub(crate) fn resolve_device_preference(
+    config: &OcrConfig,
+    explicit: Option<CandleDevicePreference>,
+) -> DevicePreference {
+    if let Some(explicit) = explicit {
+        return explicit.into();
     }
 
     if let Some(accel) = &config.acceleration {

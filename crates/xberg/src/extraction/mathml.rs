@@ -163,7 +163,10 @@ fn collect_nth_child(parent: Node, index: usize, budget: &mut SecurityBudget) ->
 /// Collect a single MathML element into an `MmlNode`, dispatching on tag name.
 fn collect_node(node: Node, budget: &mut SecurityBudget) -> Result<MmlNode, SecurityError> {
     budget.step()?;
-    budget.enter()?;
+    if let Err(error) = budget.enter() {
+        budget.leave();
+        return Err(error);
+    }
     let result = collect_node_inner(node, budget);
     budget.leave();
     result
@@ -408,7 +411,11 @@ fn convert_apply(node: Node, budget: &mut SecurityBudget) -> Result<String, Secu
         }
         // An operator the mapping does not name still parses and still says what
         // the source said.
-        _ => Ok(format!("\\operatorname{{{}}}\\left({}\\right)", name, rendered.join(", "))),
+        _ => Ok(format!(
+            "\\operatorname{{{}}}\\left({}\\right)",
+            name,
+            rendered.join(", ")
+        )),
     }
 }
 
@@ -729,7 +736,11 @@ fn render_node(node: &MmlNode, out: &mut String) {
             // children; inserting the spec-default comma separators there turns
             // `(1 - x)` into `(1,-,x)`. Suppress separators when any child is
             // itself an infix operator.
-            let sep = if elements.iter().any(is_operator_child) { "" } else { sep.as_str() };
+            let sep = if elements.iter().any(is_operator_child) {
+                ""
+            } else {
+                sep.as_str()
+            };
             let (left, right) = (fence_chr_to_latex(open), fence_chr_to_latex(close));
             match (left, right) {
                 (Some(left), Some(right)) => {
@@ -916,9 +927,11 @@ fn over_script_command(over: &MmlNode, base: &MmlNode) -> Option<&'static str> {
         "~" | "\u{02DC}" | "\u{0303}" | "\u{223C}" => Some("\\tilde"),
         "\u{02D9}" | "\u{0307}" => Some("\\dot"),
         "\u{00A8}" | "\u{0308}" => Some("\\ddot"),
-        "\u{00AF}" | "\u{203E}" | "\u{0304}" | "\u{0305}" => {
-            Some(if base_is_single_glyph(base) { "\\bar" } else { "\\overline" })
-        }
+        "\u{00AF}" | "\u{203E}" | "\u{0304}" | "\u{0305}" => Some(if base_is_single_glyph(base) {
+            "\\bar"
+        } else {
+            "\\overline"
+        }),
         "\u{2192}" | "\u{20D7}" => Some(if base_is_single_glyph(base) {
             "\\vec"
         } else {
@@ -959,9 +972,8 @@ fn render_arg(node: &MmlNode, out: &mut String) {
         return;
     }
     let single_char = trimmed.chars().count() == 1;
-    let single_command = trimmed.starts_with('\\')
-        && trimmed.len() > 1
-        && trimmed[1..].chars().all(|c| c.is_ascii_alphabetic());
+    let single_command =
+        trimmed.starts_with('\\') && trimmed.len() > 1 && trimmed[1..].chars().all(|c| c.is_ascii_alphabetic());
     if single_char || single_command || is_single_brace_group(trimmed) {
         out.push_str(&rendered);
     } else {
@@ -977,17 +989,7 @@ fn is_operator_child(node: &MmlNode) -> bool {
     let MmlNode::Run(text) = node else { return false };
     matches!(
         text.trim(),
-        "+" | "-"
-            | "\u{2212}"
-            | "="
-            | "\u{00B1}"
-            | "\u{00D7}"
-            | "\u{22C5}"
-            | "/"
-            | "<"
-            | ">"
-            | "\u{2264}"
-            | "\u{2265}"
+        "+" | "-" | "\u{2212}" | "=" | "\u{00B1}" | "\u{00D7}" | "\u{22C5}" | "/" | "<" | ">" | "\u{2264}" | "\u{2265}"
     )
 }
 
@@ -1042,8 +1044,14 @@ mod tests {
         let mut budget = SecurityBudget::with_defaults();
         let latex = convert_mathml_str_to_latex(xml, &mut budget).expect("converts");
 
-        assert!(!latex.chars().any(is_private_use), "no private use character survives: {latex:?}");
-        assert!(latex.contains('F') && latex.contains('1'), "the real content stays: {latex}");
+        assert!(
+            !latex.chars().any(is_private_use),
+            "no private use character survives: {latex:?}"
+        );
+        assert!(
+            latex.contains('F') && latex.contains('1'),
+            "the real content stays: {latex}"
+        );
     }
 
     #[test]
@@ -1062,7 +1070,10 @@ mod tests {
 
         let mut budget = SecurityBudget::with_defaults();
         let latex = convert_mathml_str_to_latex(xml, &mut budget).expect("converts");
-        assert!(!latex.trim().is_empty(), "a formula with a DOCTYPE must convert, got {latex:?}");
+        assert!(
+            !latex.trim().is_empty(),
+            "a formula with a DOCTYPE must convert, got {latex:?}"
+        );
         assert!(latex.contains('1') && latex.contains('2'), "operands survive: {latex}");
     }
 
@@ -1172,10 +1183,22 @@ mod tests {
 
     #[test]
     fn test_mover_accent_family() {
-        assert_eq!(mathml_to_latex("<mover><mi>x</mi><mo>\u{02DC}</mo></mover>"), "\\tilde{x}");
-        assert_eq!(mathml_to_latex("<mover><mi>q</mi><mo>\u{02D9}</mo></mover>"), "\\dot{q}");
-        assert_eq!(mathml_to_latex("<mover><mi>y</mi><mo>\u{00AF}</mo></mover>"), "\\bar{y}");
-        assert_eq!(mathml_to_latex("<mover><mi>v</mi><mo>\u{2192}</mo></mover>"), "\\vec{v}");
+        assert_eq!(
+            mathml_to_latex("<mover><mi>x</mi><mo>\u{02DC}</mo></mover>"),
+            "\\tilde{x}"
+        );
+        assert_eq!(
+            mathml_to_latex("<mover><mi>q</mi><mo>\u{02D9}</mo></mover>"),
+            "\\dot{q}"
+        );
+        assert_eq!(
+            mathml_to_latex("<mover><mi>y</mi><mo>\u{00AF}</mo></mover>"),
+            "\\bar{y}"
+        );
+        assert_eq!(
+            mathml_to_latex("<mover><mi>v</mi><mo>\u{2192}</mo></mover>"),
+            "\\vec{v}"
+        );
         // Multi-glyph base widens to the stretched forms.
         assert_eq!(
             mathml_to_latex("<mover><mrow><mi>a</mi><mi>b</mi></mrow><mo>\u{00AF}</mo></mover>"),
@@ -1186,7 +1209,10 @@ mod tests {
     #[test]
     fn test_munder_low_line_is_underline() {
         // Authors write lower bounds as `munder` with a low-line char.
-        assert_eq!(mathml_to_latex("<munder><mi>m</mi><mo>_</mo></munder>"), "\\underline{m}");
+        assert_eq!(
+            mathml_to_latex("<munder><mi>m</mi><mo>_</mo></munder>"),
+            "\\underline{m}"
+        );
     }
 
     #[test]
@@ -1248,10 +1274,7 @@ mod tests {
 
     #[test]
     fn test_mtext_escapes_structural_chars() {
-        assert_eq!(
-            mathml_to_latex("<mtext>m_{0} 50%</mtext>"),
-            "\\text{m\\_\\{0\\} 50\\%}"
-        );
+        assert_eq!(mathml_to_latex("<mtext>m_{0} 50%</mtext>"), "\\text{m\\_\\{0\\} 50\\%}");
     }
 
     #[test]
@@ -1259,9 +1282,7 @@ mod tests {
         // `{S_{\sigma }}_{1}` starts and ends with braces but is two atoms;
         // scripting it again without a wrap is a double subscript.
         assert_eq!(
-            mathml_to_latex(
-                "<msub><msub><mrow><mi>S</mi><mi>b</mi></mrow><mn>1</mn></msub><mn>2</mn></msub>"
-            ),
+            mathml_to_latex("<msub><msub><mrow><mi>S</mi><mi>b</mi></mrow><mn>1</mn></msub><mn>2</mn></msub>"),
             "{{Sb}_{1}}_{2}"
         );
     }
@@ -1271,9 +1292,7 @@ mod tests {
         // `\lambda _{1}^{'}` scripted again must brace-wrap, or the outer
         // script produces a double superscript.
         assert_eq!(
-            mathml_to_latex(
-                "<msup><msup><mi>\u{03BB}</mi><mn>1</mn></msup><mn>2</mn></msup>"
-            ),
+            mathml_to_latex("<msup><msup><mi>\u{03BB}</mi><mn>1</mn></msup><mn>2</mn></msup>"),
             "{\\lambda ^{1}}^{2}"
         );
     }
@@ -1360,10 +1379,7 @@ mod tests {
     /// wrapper stays.
     #[test]
     fn test_partial_brace_group_keeps_the_wrapper() {
-        assert_eq!(
-            strip_style_wrapper("{\\displaystyle a} + b"),
-            "{\\displaystyle a} + b"
-        );
+        assert_eq!(strip_style_wrapper("{\\displaystyle a} + b"), "{\\displaystyle a} + b");
     }
 
     /// An annotation in another notation is not TeX and must not leak.
@@ -1394,14 +1410,8 @@ mod tests {
     /// converts by operator.
     #[test]
     fn test_content_mathml_apply_converts_by_operator() {
-        assert_eq!(
-            mathml_to_latex("<apply><plus/><ci>a</ci><ci>b</ci></apply>"),
-            "a+b"
-        );
-        assert_eq!(
-            mathml_to_latex("<apply><power/><ci>x</ci><cn>2</cn></apply>"),
-            "x^{2}"
-        );
+        assert_eq!(mathml_to_latex("<apply><plus/><ci>a</ci><ci>b</ci></apply>"), "a+b");
+        assert_eq!(mathml_to_latex("<apply><power/><ci>x</ci><cn>2</cn></apply>"), "x^{2}");
         assert_eq!(
             mathml_to_latex("<apply><root/><degree><cn>3</cn></degree><ci>x</ci></apply>"),
             "\\sqrt[3]{x}"
@@ -1530,5 +1540,24 @@ mod tests {
         let mut budget = SecurityBudget::with_defaults();
         let latex = convert_mathml_node_to_latex(doc.root_element(), &mut budget).expect("conversion ok");
         assert_eq!(latex, "x");
+    }
+
+    #[test]
+    fn test_depth_failure_does_not_leak_mathml_budget_depth() {
+        let limits = crate::extractors::security::SecurityLimits {
+            max_nesting_depth: 1,
+            max_xml_depth: 1,
+            ..Default::default()
+        };
+        let mut budget = SecurityBudget::from_limits(&limits);
+        let nested = roxmltree::Document::parse("<math><mrow><mi>x</mi></mrow></math>").expect("parse nested MathML");
+
+        assert!(convert_mathml_node_to_latex(nested.root_element(), &mut budget).is_err());
+
+        let shallow = roxmltree::Document::parse("<mi>x</mi>").expect("parse shallow MathML");
+        assert_eq!(
+            convert_mathml_node_to_latex(shallow.root_element(), &mut budget).expect("depth should be restored"),
+            "x"
+        );
     }
 }

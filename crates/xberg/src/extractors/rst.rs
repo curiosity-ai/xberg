@@ -1401,9 +1401,23 @@ impl RstExtractor {
             let row: Vec<String> = col_ranges
                 .iter()
                 .map(|&(start, end)| {
-                    let end = end.min(line.len());
-                    let start = start.min(line.len());
-                    if start >= line.len() {
+                    let mut end = end.min(line.len());
+                    let mut start = start.min(line.len());
+                    // `col_ranges` are byte offsets counted against the ASCII
+                    // (`=`/` ` only) separator line, but `line` is an arbitrary data
+                    // row that the document controls and may contain multi-byte UTF-8
+                    // (e.g. accented characters). A column boundary that falls between
+                    // an ASCII separator's columns is not guaranteed to land on a char
+                    // boundary in a non-ASCII data row, so slicing on it directly can
+                    // panic. Snap inward to the nearest valid boundary instead of
+                    // trusting the separator's byte offsets verbatim.
+                    while start < end && !line.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    while end > start && !line.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    if start >= end {
                         String::new()
                     } else {
                         line[start..end].trim().to_string()
@@ -1722,6 +1736,33 @@ Second paragraph.
             .filter(|e| matches!(e.kind, crate::types::internal::ElementKind::Table { .. }))
             .count();
         assert_eq!(table_element_count, 1);
+    }
+
+    /// A simple RST table's column boundaries are byte offsets counted against the
+    /// ASCII (`=`/` ` only) separator line, then applied verbatim to each data row.
+    /// A data row with a multi-byte UTF-8 character (here `é`, 2 bytes) straddling a
+    /// column boundary makes that boundary land mid-codepoint: against the unfixed
+    /// `parse_simple_table_cells` (`line[start..end]` with no boundary check) this
+    /// panics with "byte index 3 is not a char boundary; it is inside 'é' (bytes
+    /// 2..4) of `éé  yyy`". The fixed code must snap the boundary inward instead and
+    /// extract successfully.
+    #[tokio::test]
+    async fn test_simple_table_multibyte_column_boundary_does_not_panic() {
+        let rst = "Intro.\n\n===  ===\n\u{e9}\u{e9}  yyy\n===  ===\n\nOutro.\n";
+        let extractor = RstExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let doc = extractor
+            .extract_content(rst.as_bytes(), "text/x-rst", &config)
+            .await
+            .expect("extraction must not panic on a multi-byte column boundary");
+
+        assert_eq!(
+            doc.tables.len(),
+            1,
+            "the simple table must still be extracted: {:?}",
+            doc.tables
+        );
     }
 
     #[test]

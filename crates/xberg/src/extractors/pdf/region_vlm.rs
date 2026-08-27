@@ -15,8 +15,9 @@ use std::io::Cursor;
 
 use image::{ExtendedColorType, ImageEncoder};
 
+use crate::RegionKind;
 use crate::core::config::LlmConfig;
-use crate::llm::region_extractor::{RegionKind, extract_region_with_vlm};
+use crate::llm::region_extractor::extract_region_with_vlm;
 use crate::pdf::structure::types::{LayoutHint, LayoutHintClass};
 
 /// Minimum confidence threshold for a layout hint to trigger VLM region extraction.

@@ -313,7 +313,7 @@ pub struct ModelPaths {
 }
 #[cfg_attr(alef, alef(skip))]
 /// A single downloadable model entry.
-#[allow(dead_code)]
+#[cfg(paddle_ocr)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelManifestEntry {
     /// Stable logical path used by manifest consumers; the runtime artifact remains
@@ -328,7 +328,7 @@ pub struct ModelManifestEntry {
 }
 #[cfg_attr(alef, alef(skip))]
 /// Statistics about the PaddleOCR model cache.
-#[allow(dead_code)]
+#[cfg(paddle_ocr)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelCacheStats {
     /// Total size of cached models in bytes.

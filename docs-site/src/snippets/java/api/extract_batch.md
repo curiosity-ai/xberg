@@ -3,19 +3,16 @@ import io.xberg.ExtractInput;
 import io.xberg.ExtractInputKind;
 import io.xberg.ExtractionConfig;
 import io.xberg.Xberg;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 var inputs = List.of(
     ExtractInput.builder()
         .withKind(ExtractInputKind.Uri)
-        .withUri("document.pdf")
+        .withUri("report.pdf")
         .build(),
     ExtractInput.builder()
-        .withKind(ExtractInputKind.Bytes)
-        .withBytes("Hello from memory".getBytes(StandardCharsets.UTF_8))
-        .withMimeType("text/plain")
-        .withFilename("note.txt")
+        .withKind(ExtractInputKind.Uri)
+        .withUri("notes.txt")
         .build()
 );
 

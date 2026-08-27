@@ -4,10 +4,9 @@
 //! model. Unlike dense or sparse embeddings, each output is a *sequence* of
 //! per-token vectors (one per input token, including the ColBERT `[Q]`/`[D]`
 //! marker) rather than a single pooled vector. Retrieval scores documents
-//! against a query via MaxSim (see [`crate::late_interaction::max_sim_score`])
+//! against a query via MaxSim (see `late_interaction::max_sim_score`)
 //! instead of a single dot product.
 //!
-//! Since v5.0.0.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -17,7 +16,6 @@ use std::path::PathBuf;
 /// Controls which model to use, batching, and download/cache behavior for the
 /// local ONNX ColBERT model.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LateInteractionConfig {
     /// The late-interaction model to use (defaults to the "gte-moderncolbert" preset).
@@ -89,7 +87,6 @@ impl Default for LateInteractionConfig {
 
 /// Late-interaction model types supported by Xberg.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LateInteractionModelType {

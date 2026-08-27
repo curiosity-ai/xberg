@@ -1553,7 +1553,10 @@ mod tests {
         let org_text = "Result:\n\n\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}\n";
         let doc = OrgModeExtractor::build_internal_document(org_text);
 
-        assert_eq!(formula_texts(&doc), vec!["\\begin{align} a &= b \\\\ c &= d \\end{align}"]);
+        assert_eq!(
+            formula_texts(&doc),
+            vec!["\\begin{align} a &= b \\\\ c &= d \\end{align}"]
+        );
         assert_eq!(prose_texts(&doc), vec!["Result:"]);
     }
 
@@ -1562,7 +1565,10 @@ mod tests {
         let org_text = "\\begin{center}\nnot math\n\\end{center}\n";
         let doc = OrgModeExtractor::build_internal_document(org_text);
 
-        assert!(formula_texts(&doc).is_empty(), "a non-math environment is not a formula");
+        assert!(
+            formula_texts(&doc).is_empty(),
+            "a non-math environment is not a formula"
+        );
     }
 
     #[test]

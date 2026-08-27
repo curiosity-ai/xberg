@@ -38,10 +38,10 @@ The node has one resource, **Document**, with three operations.
 | Operation | Description |
 | ------------- | ------------------------------------------------------------------------------------------ |
 | Extract       | Extract text, tables, and metadata from one document per item.                             |
-| Extract Batch | Extract every incoming item in a single batch call — substantially faster than looping.    |
+| Extract Batch | Extract every incoming item in a single batch call instead of looping.                     |
 | Map URL       | List the URLs reachable from a web page or sitemap without extracting them.                 |
 
-**Extract** and **Extract Batch** accept either uploaded binary data or a URL/local path via the **Input Source** parameter, and expose the key `ExtractionConfig` options: output format (Markdown, plain, HTML, Djot, JSON tree, structured JSON), OCR (enable, force, languages), chunking (size and overlap), image extraction, and quality processing. Per-item failures respect n8n's **Continue On Fail** setting.
+**Extract** and **Extract Batch** accept either uploaded binary data or a URL/local path via the **Input Source** parameter, and expose the key `ExtractionConfig` options: output format (Markdown, plain, HTML, Djot, JSON tree, or DocTags), OCR (enable, force, languages), chunking (size and overlap), image extraction, and quality processing. Per-item failures respect n8n's **Continue On Fail** setting.
 
 ## Output
 

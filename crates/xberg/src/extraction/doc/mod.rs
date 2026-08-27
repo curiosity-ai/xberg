@@ -667,17 +667,131 @@ fn extract_text_word6(word_doc: &[u8]) -> Result<String> {
     Ok(normalize_doc_text(&result))
 }
 
-/// Normalize extracted DOC text: convert special characters and clean up whitespace.
+/// Word field BEGIN marker. Text from here to [`FIELD_SEPARATOR`] is the field
+/// *instruction* (`HYPERLINK "…"`, `PAGEREF _Toc1 \h`, `TOC \o "1-3"`), i.e. markup.
+const FIELD_BEGIN: char = '\x13';
+
+/// Word field SEPARATOR marker. Text from here to [`FIELD_END`] is the field
+/// *result* — the only part a reader sees, and the only part that is document text.
+const FIELD_SEPARATOR: char = '\x14';
+
+/// Word field END marker.
+const FIELD_END: char = '\x15';
+
+/// Word non-breaking hyphen (`0x1E` in the binary text stream).
+///
+/// This is a *visible* character — the reader sees a hyphen; the only thing
+/// "non-breaking" suppresses is a line break at that position. Dropping it
+/// welds the two halves of a compound together (`twenty-one` → `twentyone`),
+/// which corrupts the word rather than merely losing formatting.
+///
+/// Emitted as U+2011 NON-BREAKING HYPHEN rather than ASCII `-` to match the
+/// DOCX parser, which maps `w:noBreakHyphen` — the same character in the modern
+/// serialization of the same Word document model — to U+2011 (#224). The same
+/// document saved as `.doc` and as `.docx` must extract to the same text.
+const NON_BREAKING_HYPHEN: char = '\u{2011}';
+
+/// Record, for each [`FIELD_BEGIN`] in `text` (in order of occurrence), whether it
+/// has a matching [`FIELD_END`].
+///
+/// Fields nest — a `TOC` result is full of `PAGEREF` fields — so matching is
+/// innermost-first via a stack. Begins left on the stack at end of input are
+/// unterminated and reported as `false`.
+///
+/// An unterminated begin is deliberately *not* treated as opening a suppression
+/// region by the caller: doing so would swallow the entire remainder of a document
+/// whose stream happens to carry one stray `0x13`. Degrading to the historical
+/// behaviour (the instruction leaks) is far cheaper than losing the document tail.
+fn scan_field_begin_termination(text: &str) -> Vec<bool> {
+    let mut terminated: Vec<bool> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+
+    for c in text.chars() {
+        match c {
+            FIELD_BEGIN => {
+                terminated.push(false);
+                open.push(terminated.len() - 1);
+            }
+            FIELD_END => {
+                // A stray END with nothing open is ignored rather than panicking:
+                // this is user-supplied binary content.
+                if let Some(index) = open.pop() {
+                    terminated[index] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    terminated
+}
+
+/// Normalize extracted DOC text: strip field instructions, convert special
+/// characters and clean up whitespace.
+///
+/// Field handling (#1460): the text between [`FIELD_BEGIN`] and [`FIELD_SEPARATOR`]
+/// is the field instruction and is markup, not document text, so it is dropped;
+/// the result between [`FIELD_SEPARATOR`] and [`FIELD_END`] is kept. A terminated
+/// field with no separator has no result and therefore contributes nothing.
 fn normalize_doc_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
 
+    let begin_terminated = scan_field_begin_termination(text);
+    let mut begin_ordinal = 0usize;
+    // One entry per open field; `true` while that field is still in its
+    // instruction part.
+    let mut field_stack: Vec<bool> = Vec::new();
+    // Count of `field_stack` entries still in their instruction part. Text is
+    // suppressed whenever this is non-zero, which is what makes nesting work:
+    // a `PAGEREF` inside a `TOC` instruction stays suppressed even after the
+    // inner field reaches its own separator.
+    let mut instruction_depth = 0usize;
+
     for c in text.chars() {
+        match c {
+            FIELD_BEGIN => {
+                let terminated = begin_terminated.get(begin_ordinal).copied().unwrap_or(false);
+                begin_ordinal += 1;
+                if terminated {
+                    field_stack.push(true);
+                    instruction_depth += 1;
+                }
+                continue;
+            }
+            FIELD_SEPARATOR => {
+                if let Some(in_instruction) = field_stack.last_mut()
+                    && *in_instruction
+                {
+                    *in_instruction = false;
+                    instruction_depth -= 1;
+                }
+                continue;
+            }
+            FIELD_END => {
+                if let Some(in_instruction) = field_stack.pop()
+                    && in_instruction
+                {
+                    instruction_depth -= 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        if instruction_depth > 0 {
+            continue;
+        }
+
         match c {
             '\r' => result.push('\n'),
             '\x07' => result.push('\t'),
             '\x0B' => result.push('\n'),
             '\x0C' => result.push('\n'),
-            '\x01' | '\x08' | '\x13' | '\x14' | '\x15' => {}
+            '\x01' | '\x08' => {}
+            '\x1E' => result.push(NON_BREAKING_HYPHEN),
+            // `0x1F` is the *optional* (soft) hyphen: invisible unless the line
+            // happens to break there, so discarding it is correct and must stay
+            // that way — emitting it would insert a hyphen the reader never saw.
             c if c < '\x20' && c != '\n' && c != '\t' => {}
             _ => result.push(c),
         }
@@ -919,7 +1033,99 @@ mod tests {
 
     #[test]
     fn test_normalize_doc_text_field_codes() {
-        assert_eq!(normalize_doc_text("A\x13FIELD\x14result\x15B"), "AFIELDresultB");
+        // The instruction between BEGIN and SEPARATOR is markup; only the result survives.
+        assert_eq!(normalize_doc_text("A\x13FIELD\x14result\x15B"), "AresultB");
+    }
+
+    #[test]
+    fn should_drop_hyperlink_instruction_and_keep_result_text() {
+        let text = "See \x13 HYPERLINK \"http://example.com/spec\" \\o \"Spec\" \x14the specification\x15 for details.";
+        assert_eq!(
+            normalize_doc_text(text),
+            "See the specification for details.",
+            "HYPERLINK instruction must not appear in extracted text"
+        );
+    }
+
+    #[test]
+    fn should_strip_nested_pageref_fields_inside_a_toc_field() {
+        // A TOC field whose result contains PAGEREF fields, exactly as Word writes it.
+        let text = concat!(
+            "\x13 TOC \\o \"1-3\" \\h \\z \\u \x14",
+            "\x13 PAGEREF _Toc101 \\h \x141\x15\tIntroduction\n",
+            "\x13 PAGEREF _Toc102 \\h \x142\x15\tMethods\n",
+            "\x15",
+            "Body text."
+        );
+        assert_eq!(
+            normalize_doc_text(text),
+            "1\tIntroduction\n2\tMethods\nBody text.",
+            "nested PAGEREF/TOC instructions must be stripped without corrupting the result"
+        );
+    }
+
+    #[test]
+    fn should_keep_text_after_an_unterminated_field_begin() {
+        // BEGIN with no END at all: treated as inert so the document tail is never lost.
+        let text = "Intro.\n\x13PAGEREF _Toc1 \\h \x14";
+        assert_eq!(
+            normalize_doc_text(text),
+            "Intro.\nPAGEREF _Toc1 \\h",
+            "an unterminated field must degrade, not swallow the rest of the document"
+        );
+    }
+
+    #[test]
+    fn should_ignore_a_stray_field_end_without_a_begin() {
+        assert_eq!(normalize_doc_text("Before\x15After"), "BeforeAfter");
+        assert_eq!(
+            normalize_doc_text("\x15\x13 SEQ Figure \\* ARABIC \x147\x15\x15Tail"),
+            "7Tail",
+            "unbalanced END markers must not underflow the field stack"
+        );
+    }
+
+    #[test]
+    fn should_emit_nothing_for_a_terminated_field_without_a_separator() {
+        // BEGIN..END with no SEPARATOR: the field has no result, so there is
+        // nothing for a reader to see and nothing to emit.
+        assert_eq!(
+            normalize_doc_text("A\x13 SEQ Figure \\* MERGEFORMAT \x15B"),
+            "AB",
+            "a resultless field must contribute no text"
+        );
+    }
+
+    #[test]
+    fn should_keep_non_breaking_hyphen_as_a_visible_character() {
+        // 0x1E is a hyphen the reader SEES; dropping it welds the compound together.
+        assert_eq!(
+            normalize_doc_text("Section twenty\x1Eone of the sub\x1Esection"),
+            "Section twenty\u{2011}one of the sub\u{2011}section",
+            "the non-breaking hyphen is visible text and must not be discarded"
+        );
+    }
+
+    #[test]
+    fn should_keep_non_breaking_hyphen_but_drop_optional_hyphen() {
+        // The two are one byte apart and must stay on opposite sides of the line:
+        // 0x1E is always rendered, 0x1F only when the line breaks there.
+        assert_eq!(
+            normalize_doc_text("self\x1Econtained extra\x1Fordinary"),
+            "self\u{2011}contained extraordinary",
+            "0x1E must survive as U+2011 while 0x1F stays discarded"
+        );
+    }
+
+    #[test]
+    fn should_keep_non_breaking_hyphen_inside_a_field_result() {
+        // Field-code stripping runs before character mapping; a cross-reference
+        // result such as a clause number must keep its hyphen.
+        assert_eq!(
+            normalize_doc_text("See \x13 REF _Ref1 \\h \x14clause 3\x1E4\x15."),
+            "See clause 3\u{2011}4.",
+            "hyphen mapping must apply to text kept from a field result"
+        );
     }
 
     #[test]

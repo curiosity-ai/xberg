@@ -40,6 +40,14 @@ impl Default for DocxExtractor {
     }
 }
 
+/// Attribute key under which the resolved DOCX paragraph style name (`w:pStyle` ->
+/// `styles.xml` `w:name`, walking `w:basedOn`) is exposed on `Element.metadata.additional`.
+const STYLE_NAME_ATTRIBUTE: &str = "style_name";
+
+/// Attribute key set to `"true"` on every element that belongs to a table of contents
+/// (a `w:sdt` with a `Table of Contents` doc-part gallery, or a `TOC` field code).
+const TOC_ENTRY_ATTRIBUTE: &str = "toc_entry";
+
 /// Resolve a drawing's alt text: `wp:docPr/@descr`, falling back to `@name` (#81).
 ///
 /// Word writes `@descr` only when the author fills in the description field, but always
@@ -80,6 +88,15 @@ fn build_internal_document(
     let mut current_list_ordered: bool = false;
     let mut current_list_nesting_level: i64 = 0;
     let mut open_list_count: i64 = 0;
+    let mut current_page = 1;
+
+    // Bookmark name -> the element it starts in, and the internal (`#anchor`) links
+    // waiting on it. A table of contents precedes the headings it points at, so the
+    // targets are only known once the whole body has been walked. Resolving here rather
+    // than through `InternalElement::anchor` leaves the heading slug anchors that
+    // `push_heading` generates intact.
+    let mut bookmark_elements: AHashMap<String, u32> = AHashMap::new();
+    let mut pending_anchor_links: Vec<(u32, String, RelationshipKind)> = Vec::new();
 
     for element in &doc.elements {
         match element {
@@ -123,7 +140,7 @@ fn build_internal_document(
                     } else {
                         text.clone()
                     };
-                    let idx = builder.push_heading(level, &heading_text, None, None);
+                    let idx = builder.push_heading(level, &heading_text, Some(current_page), None);
                     if !annotations.is_empty() {
                         builder.set_annotations(idx, annotations.clone());
                     }
@@ -137,12 +154,12 @@ fn build_internal_document(
                         open_list_count = 0;
                     }
                     builder.push_quote_start();
-                    let para_idx = builder.push_paragraph(&text, annotations.clone(), None, None);
+                    let para_idx = builder.push_paragraph(&text, annotations.clone(), Some(current_page), None);
                     builder.push_quote_end();
                     Some(para_idx)
                 } else if let Some(nid) = paragraph.numbering_id {
                     for formula in &math_formulas {
-                        builder.push_formula(formula, None, None);
+                        builder.push_formula(formula, Some(current_page), None);
                     }
                     if !text.is_empty() {
                         let nlvl = paragraph.numbering_level.unwrap_or(0);
@@ -177,8 +194,13 @@ fn build_internal_document(
                             }
                             current_list_nesting_level = nlvl;
                         }
-                        let li_idx =
-                            builder.push_list_item(&text, current_list_ordered, annotations.clone(), None, None);
+                        let li_idx = builder.push_list_item(
+                            &text,
+                            current_list_ordered,
+                            annotations.clone(),
+                            Some(current_page),
+                            None,
+                        );
                         Some(li_idx)
                     } else {
                         None
@@ -192,10 +214,10 @@ fn build_internal_document(
                         open_list_count = 0;
                     }
                     for formula in &math_formulas {
-                        builder.push_formula(formula, None, None);
+                        builder.push_formula(formula, Some(current_page), None);
                     }
                     if !text.is_empty() {
-                        let para_idx = builder.push_paragraph(&text, annotations.clone(), None, None);
+                        let para_idx = builder.push_paragraph(&text, annotations.clone(), Some(current_page), None);
                         Some(para_idx)
                     } else {
                         None
@@ -203,18 +225,35 @@ fn build_internal_document(
                 };
 
                 if let Some(elem_idx) = element_idx {
+                    if let Some(style_name) = paragraph.style.as_deref().and_then(|s| doc.resolve_style_name(s)) {
+                        builder.merge_attribute(elem_idx, STYLE_NAME_ATTRIBUTE, style_name);
+                    }
+
+                    // Table-of-contents membership (#1452). Marked on the element rather
+                    // than expressed as a content layer so it stays additive.
+                    if paragraph.in_table_of_contents {
+                        builder.merge_attribute(elem_idx, TOC_ENTRY_ATTRIBUTE, "true");
+                    }
+
+                    for bookmark in &paragraph.bookmarks {
+                        bookmark_elements.entry(bookmark.clone()).or_insert(elem_idx);
+                    }
+
                     for run in &paragraph.runs {
                         if run.math_latex.is_some() || run.text.is_empty() {
                             continue;
                         }
                         if let Some(ref url) = run.hyperlink_url {
-                            if url.starts_with('#') {
-                                let anchor_key = url.trim_start_matches('#').to_string();
-                                builder.push_relationship(
-                                    elem_idx,
-                                    RelationshipTarget::Key(anchor_key),
-                                    RelationshipKind::InternalLink,
-                                );
+                            if let Some(anchor_key) = url.strip_prefix('#') {
+                                // A link inside a TOC is what makes that TOC navigable, so
+                                // it is reported as `TocEntry` rather than a generic
+                                // internal link.
+                                let kind = if paragraph.in_table_of_contents {
+                                    RelationshipKind::TocEntry
+                                } else {
+                                    RelationshipKind::InternalLink
+                                };
+                                pending_anchor_links.push((elem_idx, anchor_key.to_string(), kind));
                             }
                             builder.push_uri(ExtractedUri::hyperlink(url.as_str(), Some(run.text.clone())));
                         }
@@ -227,7 +266,7 @@ fn build_internal_document(
                             let ref_id = &text[abs_start + 2..abs_start + end];
                             if !ref_id.is_empty() && ref_id.chars().all(|c| c.is_ascii_digit()) {
                                 let key = format!("fn{}", ref_id);
-                                builder.push_footnote_ref(ref_id, &key, None);
+                                builder.push_footnote_ref(ref_id, &key, Some(current_page));
                             }
                             search_start = abs_start + end + 1;
                         } else {
@@ -248,7 +287,7 @@ fn build_internal_document(
                             let comment_id = &text[abs_start + 5..abs_start + end];
                             if !comment_id.is_empty() {
                                 let key = format!("cmt{}", comment_id);
-                                builder.push_comment_ref(comment_id, &key, None);
+                                builder.push_comment_ref(comment_id, &key, Some(current_page));
                             }
                             search_start = abs_start + end + 1;
                         } else {
@@ -267,7 +306,7 @@ fn build_internal_document(
                     && let Some(ref caption) = props.caption
                     && !caption.is_empty()
                 {
-                    builder.push_paragraph(caption, vec![], None, None);
+                    builder.push_paragraph(caption, vec![], Some(current_page), None);
                 }
                 let mut cells: Vec<Vec<String>> = Vec::new();
                 for row in &table.rows {
@@ -306,7 +345,7 @@ fn build_internal_document(
                     }
                 }
                 if !cells.is_empty() {
-                    builder.push_table_from_cells(&cells, None, None);
+                    builder.push_table_from_cells(&cells, Some(current_page), None);
                 }
             }
             crate::extraction::docx::parser::DocumentElement::Drawing(idx) => {
@@ -319,7 +358,7 @@ fn build_internal_document(
                         builder.end_list();
                         current_list_numbering_id = None;
                     }
-                    builder.push_paragraph(textbox_text, vec![], None, None);
+                    builder.push_paragraph(textbox_text, vec![], Some(current_page), None);
                 }
 
                 if drawing.image_ref.is_none() {
@@ -360,7 +399,7 @@ fn build_internal_document(
                     image_index: *idx as u32,
                 };
                 let text_val = description.as_deref().unwrap_or("");
-                let elem = InternalElement::text(kind, text_val, 0);
+                let elem = InternalElement::text(kind, text_val, 0).with_page(current_page);
                 let elem = if let Some(b) = bbox { elem.with_bbox(b) } else { elem };
                 let img_elem_idx = builder.push_element(elem);
 
@@ -380,7 +419,10 @@ fn build_internal_document(
                     builder.set_attributes(img_elem_idx, attrs);
                 }
             }
-            crate::extraction::docx::parser::DocumentElement::PageBreak => {}
+            crate::extraction::docx::parser::DocumentElement::PageBreak => {
+                builder.push_page_break_with_page(Some(current_page));
+                current_page += 1;
+            }
         }
     }
 
@@ -424,6 +466,22 @@ fn build_internal_document(
             let idx = builder.push_comment_definition(&text, &key, None);
             builder.set_layer(idx, ContentLayer::Footnote);
         }
+    }
+
+    // Resolve internal (`w:anchor`) links against the bookmarks collected above. A TOC
+    // entry's several runs share one `w:hyperlink`, so the same (source, bookmark) pair
+    // arrives once per run and is emitted only once. An unknown bookmark stays a
+    // `Key` target, which `derive::resolve_relationships` reports as one warning.
+    let mut linked: std::collections::HashSet<(u32, &str)> = std::collections::HashSet::new();
+    for (source, anchor_key, kind) in &pending_anchor_links {
+        if !linked.insert((*source, anchor_key.as_str())) {
+            continue;
+        }
+        let target = match bookmark_elements.get(anchor_key) {
+            Some(&target_idx) => RelationshipTarget::Index(target_idx),
+            None => RelationshipTarget::Key(anchor_key.clone()),
+        };
+        builder.push_relationship(*source, target, *kind);
     }
 
     builder.build()
@@ -661,8 +719,9 @@ fn parse_docx_core(
     output_format: crate::core::config::OutputFormat,
     inject_placeholders: bool,
     mut budget: SecurityBudget,
+    limits: crate::extractors::security::SecurityLimits,
 ) -> crate::error::Result<DocxParseResult> {
-    let mut doc = crate::extraction::docx::parser::parse_document(content, &mut budget)?;
+    let mut doc = crate::extraction::docx::parser::parse_document(content, &mut budget, &limits)?;
     // `is_markdown` gates `to_markdown()` (which bakes `![desc](image_N)` placeholders into
     // the flat text) vs. `to_plain_text()`. That placeholder is what the image-to-page
     // association below (`text.find(&placeholder)`) relies on; without it every image
@@ -687,7 +746,7 @@ fn parse_docx_core(
         })
         .collect();
 
-    let page_boundaries = if page_boundaries.len() > 1 {
+    let page_boundaries = if page_boundaries.len() > 1 || !text.trim().is_empty() {
         Some(page_boundaries)
     } else {
         None
@@ -810,6 +869,7 @@ impl InternalDocumentExtractor for DocxExtractor {
 
         let inject_placeholders = config.images.as_ref().map(|i| i.inject_placeholders).unwrap_or(true);
         let budget = SecurityBudget::from_config(config);
+        let limits = config.security_limits.clone().unwrap_or_default();
         let content_owned: Arc<[u8]> = Arc::from(content);
         let (text, tables, page_boundaries, drawings, image_rels, mut internal_doc) = {
             #[cfg(feature = "tokio-runtime")]
@@ -818,19 +878,32 @@ impl InternalDocumentExtractor for DocxExtractor {
                     return Err(crate::error::XbergError::Cancelled);
                 }
                 let parse_content = Arc::clone(&content_owned);
+                let parse_limits = limits.clone();
                 let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
                     let _guard = span.entered();
-                    parse_docx_core(&parse_content, output_format, inject_placeholders, budget)
+                    parse_docx_core(&parse_content, output_format, inject_placeholders, budget, parse_limits)
                 })
                 .await
                 .map_err(|e| crate::error::XbergError::parsing(format!("DOCX extraction task failed: {}", e)))??
             } else {
-                parse_docx_core(&content_owned, output_format, inject_placeholders, budget)?
+                parse_docx_core(
+                    &content_owned,
+                    output_format,
+                    inject_placeholders,
+                    budget,
+                    limits.clone(),
+                )?
             }
 
             #[cfg(not(feature = "tokio-runtime"))]
-            parse_docx_core(&content_owned, output_format, inject_placeholders, budget)?
+            parse_docx_core(
+                &content_owned,
+                output_format,
+                inject_placeholders,
+                budget,
+                limits.clone(),
+            )?
         };
 
         let mut archive = {
@@ -859,6 +932,15 @@ impl InternalDocumentExtractor for DocxExtractor {
                     .map_err(|e| crate::error::XbergError::parsing(format!("Failed to open ZIP archive: {}", e)))?
             }
         };
+        // A second, independent open of the same bytes `parse_docx_core` already
+        // validated -- but that validation lives on the other archive handle, so relying
+        // on it here would be relying on execution order rather than on this call site
+        // being checked. One call covers both: `validate_archive_security` now runs the
+        // entry-count and size checks AND delegates the compression-ratio check to
+        // `ZipBombValidator`, so this handle gets exactly what the parsing open gets.
+        crate::extraction::docx::parser::validate_archive_security(&mut archive, &limits).map_err(|e| {
+            crate::error::XbergError::parsing(format!("DOCX metadata archive validation failed: {}", e))
+        })?;
 
         let mut metadata_map = AHashMap::new();
         let mut parsed_keywords: Option<Vec<String>> = None;
@@ -1027,20 +1109,18 @@ impl InternalDocumentExtractor for DocxExtractor {
             if extract_image_data
                 && let Some(ref rid) = drawing.image_ref
                 && let Some(target) = image_rels.get(rid)
-                && !crate::extractors::security::has_path_traversal(target)
+                // Relationships in `word/_rels/document.xml.rels` resolve relative to
+                // `word/`. An in-bounds `..` (e.g. `../media/image1.png`, the normal shape
+                // for an image that lives at the package root) is legitimate and must
+                // resolve; only a `..` that pops past the package root is rejected. A
+                // leading `/` re-roots to the package root, same as before.
+                && let Ok(zip_path) = crate::extractors::security::resolve_container_entry("word", target)
+                && let Ok(mut file) = archive.by_name(&zip_path)
+                && file.size() <= crate::extraction::docx::MAX_IMAGE_FILE_SIZE
             {
-                let zip_path = if let Some(stripped) = target.strip_prefix('/') {
-                    stripped.to_string()
-                } else {
-                    format!("word/{}", target)
-                };
-                if let Ok(mut file) = archive.by_name(&zip_path)
-                    && file.size() <= crate::extraction::docx::MAX_IMAGE_FILE_SIZE
-                {
-                    let mut data = Vec::with_capacity(file.size() as usize);
-                    if std::io::Read::read_to_end(&mut file, &mut data).is_ok() {
-                        image_data = Some(data);
-                    }
+                let mut data = Vec::with_capacity(file.size() as usize);
+                if std::io::Read::read_to_end(&mut file, &mut data).is_ok() {
+                    image_data = Some(data);
                 }
             }
 
@@ -1136,7 +1216,7 @@ impl InternalDocumentExtractor for DocxExtractor {
                         while end > start && !text.is_char_boundary(end) {
                             end -= 1;
                         }
-                        text[start..end].trim().to_string()
+                        crate::extraction::docx::parser::trim_blank_lines(&text[start..end]).to_string()
                     } else {
                         String::new()
                     };
@@ -1163,6 +1243,7 @@ impl InternalDocumentExtractor for DocxExtractor {
                         content: page_text,
                         tables: page_tables,
                         image_indices: page_image_indices,
+                        image_preprocessing: None,
                         hierarchy: None,
                         is_blank: Some(is_blank),
                         layout_regions: None,
@@ -1178,6 +1259,7 @@ impl InternalDocumentExtractor for DocxExtractor {
                     content: text.clone(),
                     tables: arc_tables,
                     image_indices: (0..extracted_images.len() as u32).collect(),
+                    image_preprocessing: None,
                     hierarchy: None,
                     is_blank: Some(text.chars().filter(|c| !c.is_whitespace()).count() < 3),
                     layout_regions: None,
@@ -1463,6 +1545,11 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    /// `crate::core::batch_mode` is itself gated on `tokio-runtime`
+    /// (`core/mod.rs:31`), so without this cfg the whole lib test target fails to COMPILE
+    /// under `--no-default-features --features office` with E0433, not merely fail at run
+    /// time.
+    #[cfg(feature = "tokio-runtime")]
     #[tokio::test]
     async fn should_match_single_extraction_in_batch_mode() {
         let data = build_test_docx(TRACK_CHANGES_XML);
@@ -1946,6 +2033,271 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_paragraph_style_name_reaches_element_metadata() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Quote1"/></w:pPr><w:r><w:t>A quoted paragraph.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let styles_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="Quote1">
+    <w:name w:val="Intense Quote"/>
+  </w:style>
+</w:styles>"#;
+
+        let data = build_test_docx_with_parts(document_xml, Some(styles_xml), None, None, None, None, None);
+        let extractor = DocxExtractor::new();
+        let config = ExtractionConfig {
+            output_format: crate::core::config::OutputFormat::Markdown,
+            ..Default::default()
+        };
+        let internal_doc = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let elements = crate::extraction::transform::convert_internal_elements_to_elements(&internal_doc, &None);
+        let quoted = elements
+            .iter()
+            .find(|e| e.text.contains("A quoted paragraph."))
+            .expect("quoted paragraph element should be present");
+        // Unfixed code never calls `resolve_style_name` / `merge_attribute`, so
+        // `metadata.additional` has no "style_name" key here (empty map).
+        assert_eq!(
+            quoted.metadata.additional.get(STYLE_NAME_ATTRIBUTE),
+            Some(&"Intense Quote".to_string()),
+            "resolved w:pStyle name should surface as element metadata: {:?}",
+            quoted.metadata.additional
+        );
+    }
+
+    /// A Word-generated table of contents wrapped in a `w:sdt` structured document tag,
+    /// followed by the heading its single entry points at (#1452).
+    const TOC_SDT_DOCUMENT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:sdt>
+      <w:sdtPr>
+        <w:docPartObj>
+          <w:docPartGallery w:val="Table of Contents"/>
+          <w:docPartUnique/>
+        </w:docPartObj>
+      </w:sdtPr>
+      <w:sdtContent>
+        <w:p><w:hyperlink w:anchor="_Toc100"><w:r><w:t>Introduction</w:t></w:r></w:hyperlink></w:p>
+      </w:sdtContent>
+    </w:sdt>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:bookmarkStart w:id="1" w:name="_Toc100"/>
+      <w:r><w:t>Introduction</w:t></w:r>
+      <w:bookmarkEnd w:id="1"/>
+    </w:p>
+    <w:p><w:r><w:t>Body text.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+    async fn extract_docx_internal_document(data: &[u8]) -> crate::types::internal::InternalDocument {
+        DocxExtractor::new()
+            .extract_content(
+                data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &ExtractionConfig {
+                    include_document_structure: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_sdt_table_of_contents_marks_its_entries() {
+        let data = build_test_docx_with_parts(TOC_SDT_DOCUMENT_XML, None, None, None, None, None, None);
+        let internal_doc = extract_docx_internal_document(&data).await;
+        let elements = crate::extraction::transform::convert_internal_elements_to_elements(&internal_doc, &None);
+
+        let introductions: Vec<_> = elements.iter().filter(|e| e.text.trim() == "Introduction").collect();
+        assert_eq!(
+            introductions.len(),
+            2,
+            "expected the TOC entry and the heading it points at: {:?}",
+            elements.iter().map(|e| &e.text).collect::<Vec<_>>()
+        );
+
+        // Unfixed code never looks at `w:sdt`/`w:docPartGallery`, so no element carries
+        // the marker and `get("toc_entry")` is `None` here.
+        assert_eq!(
+            introductions[0].metadata.additional.get(TOC_ENTRY_ATTRIBUTE),
+            Some(&"true".to_string()),
+            "the sdt-wrapped TOC entry should be marked: {:?}",
+            introductions[0].metadata.additional
+        );
+        assert_eq!(
+            introductions[1].metadata.additional.get(TOC_ENTRY_ATTRIBUTE),
+            None,
+            "the heading the TOC points at is not itself a TOC entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bare_toc_field_code_marks_its_entries() {
+        // No `w:sdt`: the `TOC` field code is the only marker. The first entry's paragraph
+        // is where the field begins, the second holds a nested `PAGEREF` field (whose `end`
+        // must not close the TOC) and then the TOC field's own `end`.
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve">TOC \o "1-3" \h \z \u</w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:hyperlink w:anchor="_Toc200"><w:r><w:t>First section</w:t></w:r></w:hyperlink>
+    </w:p>
+    <w:p>
+      <w:hyperlink w:anchor="_Toc201"><w:r><w:t>Second section</w:t></w:r></w:hyperlink>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve">PAGEREF _Toc201 \h</w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>2</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+    <w:p><w:r><w:t>Body text outside the TOC.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let data = build_test_docx_with_parts(document_xml, None, None, None, None, None, None);
+        let internal_doc = extract_docx_internal_document(&data).await;
+        let elements = crate::extraction::transform::convert_internal_elements_to_elements(&internal_doc, &None);
+
+        let first_entry = elements
+            .iter()
+            .find(|e| e.text.contains("First section"))
+            .expect("first TOC entry element");
+        let second_entry = elements
+            .iter()
+            .find(|e| e.text.contains("Second section"))
+            .expect("second TOC entry element");
+        let body = elements
+            .iter()
+            .find(|e| e.text.contains("Body text outside"))
+            .expect("post-TOC body element");
+
+        // Unfixed code accumulates the `TOC` instruction into `field_instruction` and
+        // discards it, so `get("toc_entry")` is `None` for both entries.
+        assert_eq!(
+            first_entry.metadata.additional.get(TOC_ENTRY_ATTRIBUTE),
+            Some(&"true".to_string()),
+            "the entry whose paragraph opens the TOC field should be marked"
+        );
+        assert_eq!(
+            second_entry.metadata.additional.get(TOC_ENTRY_ATTRIBUTE),
+            Some(&"true".to_string()),
+            "a nested PAGEREF field's end must not close the TOC region"
+        );
+        assert_eq!(
+            body.metadata.additional.get(TOC_ENTRY_ATTRIBUTE),
+            None,
+            "content after the TOC field's end is not part of the TOC"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_toc_entry_anchor_resolves_to_a_toc_entry_relationship() {
+        use crate::types::document_structure::RelationshipKind as PublicRelationshipKind;
+
+        let data = build_test_docx_with_parts(TOC_SDT_DOCUMENT_XML, None, None, None, None, None, None);
+        let internal_doc = extract_docx_internal_document(&data).await;
+        let result = crate::extraction::derive::derive_extraction_result(
+            internal_doc,
+            true,
+            crate::core::config::OutputFormat::Plain,
+        );
+        let doc = result.document.as_ref().expect("DocumentStructure should be present");
+
+        // Unfixed code reads only `r:id` on `w:hyperlink`, so the `w:anchor` jump produces
+        // no link at all and `doc.relationships` is empty — this fails with `0`.
+        let toc_relationships: Vec<_> = doc
+            .relationships
+            .iter()
+            .filter(|rel| rel.kind == PublicRelationshipKind::TocEntry)
+            .collect();
+        assert_eq!(
+            toc_relationships.len(),
+            1,
+            "expected one TocEntry relationship, got: {:?}",
+            doc.relationships
+        );
+
+        // Hierarchical derivation represents a heading as the Group it heads, with the
+        // Heading itself as that group's first child (`derive.rs`), and `elem_to_node`
+        // maps the heading element to the GROUP. So a bookmark on a heading resolves to
+        // the section, which is the correct destination for a table-of-contents entry --
+        // following it should land on the whole section, not just its title line.
+        let target = &doc.nodes[toc_relationships[0].target.0 as usize];
+        assert!(
+            matches!(
+                &target.content,
+                crate::types::NodeContent::Group { heading_text: Some(text), .. } if text == "Introduction"
+            ),
+            "TocEntry should target the section headed by the bookmarked heading, got: {:?}",
+            target.content
+        );
+        let heading_child = &doc.nodes[target.children[0].0 as usize];
+        assert!(
+            matches!(&heading_child.content, crate::types::NodeContent::Heading { text, .. } if text == "Introduction"),
+            "the targeted group's first child should be the heading itself, got: {:?}",
+            heading_child.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_internal_anchor_outside_a_toc_is_an_internal_link() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:hyperlink w:anchor="_Ref9001"><w:r><w:t>see the appendix</w:t></w:r></w:hyperlink></w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:bookmarkStart w:id="4" w:name="_Ref9001"/>
+      <w:r><w:t>Appendix</w:t></w:r>
+      <w:bookmarkEnd w:id="4"/>
+    </w:p>
+  </w:body>
+</w:document>"#;
+
+        let data = build_test_docx_with_parts(document_xml, None, None, None, None, None, None);
+        let internal_doc = extract_docx_internal_document(&data).await;
+        let result = crate::extraction::derive::derive_extraction_result(
+            internal_doc,
+            true,
+            crate::core::config::OutputFormat::Plain,
+        );
+        let doc = result.document.as_ref().expect("DocumentStructure should be present");
+
+        // Unfixed code yields no relationship at all here, so this fails with `[]`.
+        assert_eq!(
+            doc.relationships.len(),
+            1,
+            "expected one internal link, got: {:?}",
+            doc.relationships
+        );
+        assert_eq!(
+            doc.relationships[0].kind,
+            crate::types::document_structure::RelationshipKind::InternalLink,
+            "an anchor link outside a table of contents stays an InternalLink"
+        );
+    }
+
+    #[tokio::test]
     async fn test_document_structure_generation() {
         let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -2049,6 +2401,75 @@ mod tests {
             "Content should contain the document text: {}",
             result.content
         );
+        let page_structure = result
+            .metadata
+            .pages
+            .as_ref()
+            .expect("non-empty DOCX should report its one-page structure");
+        assert_eq!(page_structure.total_count, 1);
+        assert_eq!(page_structure.boundaries.as_ref().map(Vec::len), Some(1));
+        assert_eq!(result.pages.as_ref().map(Vec::len), Some(1));
+        let elements = crate::extraction::transform::transform_extraction_result_to_elements(&result);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].metadata.page_number, Some(1));
+    }
+
+    #[tokio::test]
+    async fn should_attribute_docx_elements_to_pages_and_preserve_break_order() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Page one body text</w:t></w:r></w:p>
+    <w:p><w:r><w:br w:type="page"/></w:r></w:p>
+    <w:p><w:r><w:t>Page two body text</w:t></w:r></w:p>
+    <w:p><w:r><w:br w:type="page"/></w:r></w:p>
+    <w:p><w:r><w:t>Page three body text</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let data = build_test_docx(document_xml);
+        let extractor = DocxExtractor::new();
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &ExtractionConfig::default(),
+            )
+            .await
+            .unwrap();
+        let result =
+            crate::extraction::derive::derive_extraction_result(result, true, crate::core::config::OutputFormat::Plain);
+        let elements = crate::extraction::transform::transform_extraction_result_to_elements(&result);
+
+        assert_eq!(
+            elements.iter().map(|element| element.element_type).collect::<Vec<_>>(),
+            vec![
+                crate::types::ElementType::NarrativeText,
+                crate::types::ElementType::PageBreak,
+                crate::types::ElementType::NarrativeText,
+                crate::types::ElementType::PageBreak,
+                crate::types::ElementType::NarrativeText,
+            ]
+        );
+        assert_eq!(
+            elements
+                .iter()
+                .map(|element| element.metadata.page_number)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(1), Some(2), Some(2), Some(3)]
+        );
+        assert_eq!(
+            elements.iter().map(|element| element.text.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Page one body text",
+                "--- PAGE BREAK (page 1 → 2) ---",
+                "Page two body text",
+                "--- PAGE BREAK (page 2 → 3) ---",
+                "Page three body text"
+            ]
+        );
+        assert_eq!(result.pages.as_ref().map(Vec::len), Some(3));
+        assert_eq!(result.metadata.pages.as_ref().map(|pages| pages.total_count), Some(3));
     }
 
     #[tokio::test]
@@ -3509,6 +3930,226 @@ mod tests {
                 .any(|w| w.source == "docx" && w.message.contains("ZZZZ")),
             "an unmappable w:sym char code should produce a ProcessingWarning: {:?}",
             internal_doc.processing_warnings
+        );
+    }
+
+    /// GH#639: the archive entry-count ceiling must come from
+    /// `config.security_limits.max_files_in_archive`, not a hardcoded constant. A limit
+    /// above 10,000 would pass under both the old and new code, so this uses a limit well
+    /// below the old hardcoded 10,000 default - only the fixed code reads it.
+    #[tokio::test]
+    async fn test_docx_extract_content_honours_configured_archive_entry_limit() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let extra_files: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("word/extra_{}.xml", i), "<x/>".to_string()))
+            .collect();
+        let extra_refs: Vec<(&str, &str)> = extra_files.iter().map(|(p, x)| (p.as_str(), x.as_str())).collect();
+        let data = build_test_docx_with_files(document_xml, &extra_refs);
+
+        let extractor = DocxExtractor::new();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_files_in_archive: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an archive with more entries than the configured max_files_in_archive must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains('3'),
+            "error should mention the configured limit (3), got: {}",
+            err_msg
+        );
+    }
+
+    /// Sibling of the rejection test above: the same archive shape, but under a
+    /// configured limit that comfortably fits it, must still extract successfully.
+    #[tokio::test]
+    async fn test_docx_extract_content_succeeds_under_configured_archive_entry_limit() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let extra_files: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("word/extra_{}.xml", i), "<x/>".to_string()))
+            .collect();
+        let extra_refs: Vec<(&str, &str)> = extra_files.iter().map(|(p, x)| (p.as_str(), x.as_str())).collect();
+        let data = build_test_docx_with_files(document_xml, &extra_refs);
+
+        let extractor = DocxExtractor::new();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_files_in_archive: 50,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "an archive within the configured max_files_in_archive must extract successfully: {:?}",
+            result.err()
+        );
+    }
+
+    /// A normal document with no `security_limits` override (the common case) must still
+    /// extract successfully under the default `SecurityLimits::max_files_in_archive`.
+    #[tokio::test]
+    async fn test_docx_extract_content_succeeds_under_default_archive_entry_limit() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Hello, default limits.</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let data = build_test_docx(document_xml);
+
+        let extractor = DocxExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a normal document must extract under the default archive entry limit: {:?}",
+            result.err()
+        );
+    }
+
+    /// `validate_archive_security` checked per-file and total *declared* uncompressed size,
+    /// but never a compression ratio -- unlike every other OOXML/ODF container (XLSX, PPTX,
+    /// ODT, ODP, HWPX, EPUB, iWork), which routes its ratio check through
+    /// `ZipBombValidator`. A member well under both size limits can still be a compression
+    /// bomb by ratio: this part is 2,000,000 bytes of a single repeated byte -- far under the
+    /// 100 MB per-file / 500 MB total ceilings -- but compresses to a few hundred bytes,
+    /// comfortably past the default 100:1 `max_compression_ratio`. Against the unfixed code
+    /// this document extracts successfully (the ratio is never examined); against the fixed
+    /// code `ZipBombValidator::validate` rejects it before `word/document.xml` is even read.
+    #[tokio::test]
+    async fn test_docx_extract_content_rejects_high_compression_ratio_member() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let bomb_content = "A".repeat(2_000_000);
+        let data = build_test_docx_with_files(document_xml, &[("word/bomb.xml", &bomb_content)]);
+
+        let extractor = DocxExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a member whose compression ratio exceeds max_compression_ratio must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err_msg.contains("bomb") || err_msg.contains("ratio"),
+            "error should mention the compression-ratio rejection, got: {}",
+            err_msg
+        );
+    }
+
+    /// Positive control for the ratio check above: a validator that rejects everything would
+    /// also pass a test that only checks `is_err()`, so this proves an ordinary DOCX -- built
+    /// the same way, with the default (deflate) compression that yields an unremarkable ratio
+    /// for short XML text -- still extracts, and still extracts the *same* text, unaffected by
+    /// the new check.
+    #[tokio::test]
+    async fn test_docx_extract_content_succeeds_for_ordinary_compression_ratio() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Hello, ordinary ratio.</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let data = build_test_docx(document_xml);
+
+        let internal_doc = extract_docx_internal_document(&data).await;
+
+        assert!(
+            internal_doc
+                .elements
+                .iter()
+                .any(|e| e.text.contains("Hello, ordinary ratio.")),
+            "an ordinary DOCX with a normal compression ratio must extract its text unchanged: {:?}",
+            internal_doc.elements
+        );
+    }
+
+    /// With no `security_limits` override the container must still enforce the default
+    /// `SecurityLimits::max_files_in_archive`: "unset" means the default ceiling, not "no
+    /// ceiling". One entry past that default must be rejected.
+    #[tokio::test]
+    async fn test_docx_extract_content_rejects_archive_over_default_entry_limit() {
+        let default_limit = crate::extractors::security::SecurityLimits::default().max_files_in_archive;
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        // The builder adds its own fixed parts, so this alone already exceeds the ceiling.
+        let extra_files: Vec<(String, String)> = (0..=default_limit)
+            .map(|i| (format!("word/extra_{}.xml", i), "<x/>".to_string()))
+            .collect();
+        let extra_refs: Vec<(&str, &str)> = extra_files.iter().map(|(p, x)| (p.as_str(), x.as_str())).collect();
+        let data = build_test_docx_with_files(document_xml, &extra_refs);
+
+        let extractor = DocxExtractor::new();
+        let config = ExtractionConfig::default();
+        assert!(
+            config.security_limits.is_none(),
+            "this test must exercise the unset fallback, not an explicit limit"
+        );
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an archive over the default max_files_in_archive must be rejected when no limit is configured"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&default_limit.to_string()),
+            "error should mention the default limit ({default_limit}), got: {err_msg}"
         );
     }
 }

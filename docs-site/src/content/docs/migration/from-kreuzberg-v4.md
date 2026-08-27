@@ -1,11 +1,11 @@
 ---
 title: Migrating from Kreuzberg v4
-description: How Xberg relates to Kreuzberg, what changed in v5, and how to stay on the v4 LTS line.
+description: How Xberg v1 relates to Kreuzberg v4 and how to stay on the v4 LTS line.
 ---
 
-Xberg is the direct continuation of **Kreuzberg**. The Rust core and extraction API are the same
-lineage — v5 is the Xberg-branded release line. The Kreuzberg **v4** line continues as a
-long-term-support release.
+Xberg is the direct continuation of **Kreuzberg**. The Rust core and extraction API share the same
+lineage, but Xberg restarted package versioning at **v1** under the new name. The Kreuzberg **v4**
+line continues as a long-term-support release.
 
 ## Backwards compatibility
 
@@ -13,7 +13,8 @@ long-term-support release.
   names and are supported as LTS (see below). Nothing you have deployed on v4 stops functioning.
 - **Go module pins keep resolving.** Old imports of `github.com/kreuzberg-dev/kreuzberg` continue to
   resolve from the Go module proxy cache. New v4 releases publish at
-  `github.com/kreuzberg-dev/kreuzberg-lts/v4`; v5 is `github.com/xberg-io/xberg`.
+  `github.com/kreuzberg-dev/kreuzberg-lts/v4`; Xberg v1 is
+  `github.com/xberg-io/xberg/packages/go`.
 - **The v4 LTS line is MIT-licensed** (earlier v4 shipped under Elastic License 2.0).
 
 ## The v4 LTS line
@@ -23,16 +24,17 @@ with docs at **[kreuzberg.dev](https://kreuzberg.dev)**. It receives critical bu
 **until the end of 2026, on a best-effort basis**. No new features land on v4 — feature work happens
 in Xberg.
 
-**Stay on v4 LTS if** you depend on the **R binding** (removed in v5 — v4 is the last line to ship it)
+**Stay on v4 LTS if** you depend on the **R binding** (not shipped by Xberg v1 — v4 is the last line
+to ship it)
 or you are not ready to migrate.
 
-## What changed in v5 (Xberg)
+## What changed in Xberg v1
 
 ### Package names
 
 Package identifiers moved from `kreuzberg` to `xberg`:
 
-| Ecosystem | v4 (Kreuzberg) | v5 (Xberg) |
+| Ecosystem | v4 (Kreuzberg) | v1 (Xberg) |
 |-----------|----------------|------------|
 | Rust (crates.io) | `kreuzberg` | `xberg` |
 | Python (PyPI) | `kreuzberg` | `xberg` |
@@ -51,16 +53,22 @@ self-contained.
 
 ### API identifiers
 
-The extraction API is compatible in shape — the entry points (`extract_file`/`extract_bytes` and
-their batch and sync variants), config, and result types keep the same structure. The identifiers
-that changed:
+Xberg standardizes extraction around an explicit input type and a result envelope:
+
+- Replace `extract_file` and `extract_bytes` with `extract(ExtractInput, config)`.
+- Replace legacy batch variants with `extract_batch(Vec<ExtractInput>, config)`.
+- Read extracted documents from `ExtractionResult.results`; per-input failures are retained in
+  `ExtractionResult.errors` instead of discarding successful documents.
+
+Generated bindings expose the same `ExtractInput` and `ExtractionResult` model with
+language-appropriate async wrappers. Other identifiers that changed:
 
 - **Rust error type:** `KreuzbergError` → `XbergError` (and `Result<T>` now aliases
   `Result<T, XbergError>`).
 - **Config file discovery:** `kreuzberg.{toml,yaml,json}` → `xberg.{toml,yaml,yml,json}` (the `.yml`
   extension is now also recognized).
 
-Update the import/package name and consult the [API reference](/reference/api-python/) for your
+Update the import/package name and see the [API reference](/reference/api-python/) for your
 language.
 
 ### Environment variables
@@ -71,7 +79,7 @@ All environment variables are re-prefixed `KREUZBERG_*` → `XBERG_*` — for ex
 environment or deployment config.
 
 - **Removed:** `KREUZBERG_PDFIUM_BUNDLED_PATH` — the bundled PDFium fork was dropped.
-- **New:** xberg adds `XBERG_`-prefixed variables for layout tuning, OCR model tier/version, CoreML,
+- **New:** Xberg adds `XBERG_`-prefixed variables for layout tuning, OCR model tier/version, CoreML,
   and the ONNX Runtime execution provider. See the configuration reference for the full list.
 
 ### Models and cache

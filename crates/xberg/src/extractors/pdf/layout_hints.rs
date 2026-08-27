@@ -8,7 +8,7 @@
 //!   Y-flips (image y=0 at top → PDF y=0 at bottom) without scaling.
 //!
 //! * **Markdown layout-for-markdown path** —
-//!   `pixel_detection_to_layout_hints_pdf_space`: paragraphs come from oxide
+//!   `pixel_detection_to_layout_hints_pdf_space`: paragraphs come from native
 //!   text extraction in PDF point space. The hint conversion must scale x
 //!   and y from rendered pixel dimensions to PDF point dimensions AND
 //!   Y-flip.

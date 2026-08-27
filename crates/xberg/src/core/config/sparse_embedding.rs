@@ -5,7 +5,6 @@
 //! but mostly-zero vocabulary vector, stored as parallel `(indices, values)`
 //! arrays. These unlock hybrid dense+sparse retrieval.
 //!
-//! Since v5.0.0.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -15,7 +14,6 @@ use std::path::PathBuf;
 /// Controls which model to use, batching, and download/cache behavior for the
 /// local ONNX SPLADE model.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SparseEmbeddingConfig {
     /// The sparse-embedding model to use (defaults to the "opensearch-v3-distill" preset).
@@ -75,7 +73,6 @@ impl Default for SparseEmbeddingConfig {
 
 /// Sparse-embedding model types supported by Xberg.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SparseEmbeddingModelType {

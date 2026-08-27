@@ -213,9 +213,13 @@ mod engine {
 
         /// Load weights from HuggingFace Hub and assemble the engine.
         ///
-        /// Downloads `config.json`, `preprocessor_config.json`, `tokenizer.json`,
-        /// and safetensors from the GLM-OCR HuggingFace repo. Constructs the
-        /// vision encoder, connector, and decoder modules.
+        /// Downloads `config.json`, `tokenizer.json`, and safetensors from the GLM-OCR
+        /// HuggingFace repo (there is no separate `preprocessor_config.json` fetch — the
+        /// image preprocessor's `patch_size`/`t_patch_size` are derived from the same
+        /// `config.json` `vision_config` block the vision encoder uses; the remaining
+        /// preprocessing knobs, min/max pixel budget and CLIP mean/std, have no
+        /// `config.json` counterpart and stay at their [`preprocess::PreprocessConfig`]
+        /// defaults). Constructs the vision encoder, connector, and decoder modules.
         pub fn new(task: GlmOcrTask, device: Device, dtype: DType) -> Result<Self> {
             Self::new_with_hf(task, device, dtype, None, None)
         }
@@ -358,7 +362,16 @@ mod engine {
 
         fn process_image_inner(&self, image_bytes: &[u8], task: GlmOcrTask) -> Result<CandleOcrOutput> {
             tracing::debug!(image_size = image_bytes.len(), task = %task, "GLM-OCR: starting inference");
-            let preprocess_config = preprocess::PreprocessConfig::default();
+            // `patch_size`/`t_patch_size` must match the vision encoder's `config.json`-derived
+            // values (the encoder rejects pixel_values whose H/W are not multiples of
+            // `patch_size`), so they are taken from the same deserialized `VisionConfig` rather
+            // than from `PreprocessConfig::default()`. The remaining fields (min/max pixel
+            // budget, CLIP mean/std) have no `config.json` counterpart and keep their defaults.
+            let preprocess_config = preprocess::PreprocessConfig {
+                patch_size: self.config.vision_config.patch_size,
+                t_patch_size: self.config.vision_config.temporal_patch_size,
+                ..preprocess::PreprocessConfig::default()
+            };
             let (pixel_values, grid_thw) =
                 preprocess::preprocess(image_bytes, &preprocess_config, &self.device, self.dtype)?;
             super::glm_debug_tensor("pixel_values", &pixel_values);

@@ -61,6 +61,20 @@ fi
 # unit tests. ~keep
 export XBERG_SKIP_LIVE_HF=1
 
+# libtest spawns every test thread with no `.stack_size()`, so std's 2 MiB
+# DEFAULT_MIN_STACK_SIZE applies -- the 8 MiB main-thread figure never does, and
+# `#[tokio::test]` is current_thread so `block_on` runs on that same 2 MiB thread.
+# The extraction future sits within a few percent of that budget and overflows on
+# some runs, aborting with an uncatchable SIGABRT that names no test
+# (`benchmark_harness::batch_diagnostic::tests::diagnostic_uses_equivalent_public_extraction_paths`).
+# Every CI workflow already sets this at workflow level (ci-rust.yaml, ci-e2e,
+# ci-gpu, ci-integrations, benchmarks, profiling); this script is the single choke
+# point behind `task rust:test` locally and was the only place missing it, so the
+# failure reproduced only on developer machines. 16 MiB matches every other stack
+# budget in the repo (core/runtime.rs, xberg-cli, xberg-node, xberg-py, the elixir
+# NIF, html/stack_management.rs). ~keep
+export RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}"
+
 echo "=== Starting cargo test ==="
 
 # NOTE: We intentionally avoid `--all-features` for the `xberg` crate because
@@ -108,6 +122,14 @@ if ! {
   # wasm-target's ner-candle-wasm would pull gemm-f16 in on aarch64 (no fullfp16),
   # past the --exclude xberg-gliner guard above. Matches every Taskfile path. ~keep
   extra_excludes+=(--exclude xberg-wasm)
+  # xberg-pdfium-render: --all-features enables its `bindings` feature, whose build.rs
+  # regenerates bindgen output from include/<release>/*.h. That directory ships only
+  # `rust-import-wrapper.h`, so the build script deliberately fails with
+  # NoHeaderFilesFound rather than silently reusing the checked-in bindings. Every
+  # Taskfile path already carries this exclude (.task/languages/rust.yml:35-44); this
+  # leg was the one place it was missing, so the crate becoming a workspace member
+  # would have failed the workspace test run outright. ~keep
+  extra_excludes+=(--exclude xberg-pdfium-render)
   RUST_BACKTRACE=full cargo test --locked \
     --workspace \
     --exclude xberg \

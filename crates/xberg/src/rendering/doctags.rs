@@ -65,7 +65,15 @@ pub(crate) fn render_doctags(doc: &InternalDocument) -> String {
         match elem.kind {
             ElementKind::ListItem { ordered } => {
                 state.open(&mut out, ordered);
-                push_element(&mut out, "list_item", loc, &normalize_inline_text(&elem.text), None);
+                // DocTags' `list_item` tag carries no separate marker slot -- a literal
+                // source label (e.g. "B.", "(a)") that the auto `ordered` container alone
+                // cannot express is prefixed onto the visible text instead, exactly as the
+                // other text-based renderers (comrak/markdown, djot, plain) do.
+                let text = match elem.list_item_source_label() {
+                    Some(label) if !label.is_empty() => format!("{label} {}", elem.text),
+                    _ => elem.text.clone(),
+                };
+                push_element(&mut out, "list_item", loc, &normalize_inline_text(&text), None);
                 continue;
             }
             ElementKind::ListStart { ordered } => {
@@ -122,7 +130,7 @@ pub(crate) fn render_doctags(doc: &InternalDocument) -> String {
                     .filter(|desc| !desc.is_empty());
                 let caption = captions
                     .caption_payload(doc, index, &dims)
-                    .or_else(|| described.map(normalize_inline_text));
+                    .or_else(|| described.map(|desc| normalize_inline_text(desc).into_owned()));
                 push_element(&mut out, "picture", loc, "", caption.as_deref());
             }
             ElementKind::Code => {
@@ -272,9 +280,11 @@ fn page_dimensions(doc: &InternalDocument) -> AHashMap<u32, (f64, f64)> {
         return dims;
     };
     for page in pages {
-        let Some((width, height)) = page.dimensions else {
+        let Some(dimensions) = page.dimensions else {
             continue;
         };
+        let width = dimensions.width;
+        let height = dimensions.height;
         if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
             dims.insert(page.number, (width, height));
         }
@@ -445,7 +455,7 @@ impl Captions {
         }
         Some(match element_loc(elem, dims) {
             Some(loc) => format!("{}{}", loc, text),
-            None => text,
+            None => text.into_owned(),
         })
     }
 }
@@ -769,7 +779,7 @@ mod tests {
             pages: Some(vec![crate::types::PageInfo {
                 number: 1,
                 title: None,
-                dimensions,
+                dimensions: dimensions.map(Into::into),
                 image_count: None,
                 table_count: None,
                 hidden: None,

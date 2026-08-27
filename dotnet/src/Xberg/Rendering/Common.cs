@@ -248,9 +248,14 @@ public static class RenderCommon
 
         foreach (var ann in sorted)
         {
-            uint start = Math.Min(ann.Start, len);
-            uint end = Math.Min(ann.End, len);
-            if (start < pos) continue;
+            // TextAnnotation offsets are byte offsets that may originate from any extractor, not
+            // just the ones that derive them from the exact same buffer and are provably
+            // boundary-safe. Nothing here guarantees that in general, so clamp to the nearest char
+            // boundary before slicing rather than trusting the offset outright and cutting a
+            // codepoint in half.
+            uint start = CeilCharBoundary(bytes, Math.Min(ann.Start, len));
+            uint end = FloorCharBoundary(bytes, Math.Min(ann.End, len));
+            if (start < pos || start >= end) continue;
             if (start > pos)
                 sb.Append(plain(Encoding.UTF8.GetString(bytes, (int)pos, (int)(start - pos))));
             string span = Encoding.UTF8.GetString(bytes, (int)start, (int)(end - start));
@@ -267,6 +272,27 @@ public static class RenderCommon
     public static string RenderAnnotatedText(string text, IReadOnlyList<TextAnnotation> annotations,
         Func<string, AnnotationKind, string> emit) =>
         RenderAnnotatedTextWithPlain(text, annotations, emit, s => s);
+
+    /// <summary>Whether <paramref name="b"/> starts a UTF-8 codepoint (i.e. is not a continuation
+    /// byte).</summary>
+    private static bool IsCharBoundary(byte b) => (b & 0xC0) != 0x80;
+
+    /// <summary>The nearest char boundary at or after <paramref name="offset"/>. Rust's
+    /// <c>str::ceil_char_boundary</c>.</summary>
+    private static uint CeilCharBoundary(byte[] bytes, uint offset)
+    {
+        while (offset < bytes.Length && !IsCharBoundary(bytes[offset])) offset++;
+        return offset;
+    }
+
+    /// <summary>The nearest char boundary at or before <paramref name="offset"/>. Rust's
+    /// <c>str::floor_char_boundary</c>.</summary>
+    private static uint FloorCharBoundary(byte[] bytes, uint offset)
+    {
+        if (offset > bytes.Length) return (uint)bytes.Length;
+        while (offset > 0 && offset < bytes.Length && !IsCharBoundary(bytes[offset])) offset--;
+        return offset;
+    }
 
     // Rust `str::lines()`: split on '\n', dropping a trailing '\r' on each line, and no trailing empty line.
     internal static IEnumerable<string> SplitLines(string text)

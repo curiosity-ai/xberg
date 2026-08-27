@@ -28,7 +28,7 @@ pub(crate) fn assign_hierarchy_to_pages(pages: &mut [PageContent], doc: &Interna
                     level: format!("h{}", level),
                     bbox: element
                         .bbox
-                        .map(|b| (b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32)),
+                        .map(|b| (b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32).into()),
                 };
                 page_hierarchies.entry(page_num).or_default().push(block);
             }
@@ -39,7 +39,7 @@ pub(crate) fn assign_hierarchy_to_pages(pages: &mut [PageContent], doc: &Interna
                     level: "body".to_string(),
                     bbox: element
                         .bbox
-                        .map(|b| (b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32)),
+                        .map(|b| (b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32).into()),
                 };
                 page_hierarchies.entry(page_num).or_default().push(block);
             }

@@ -1,29 +1,23 @@
 //! Internal extraction implementation.
 //!
 //! Public extraction orchestration lives in [`crate::core::extract`]. This module
-//! contains the private file, bytes, and batch implementation details used by that
-//! public API and by internal extractors.
+//! contains the private file and bytes implementation details used by that
+//! public API and by internal extractors. Batch orchestration lives in
+//! [`crate::engine::extract_impl`], reached via [`crate::extract_batch`].
 
 mod bytes;
 mod file;
 mod helpers;
-
-#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
-mod batch;
 
 #[allow(unused_imports)]
 pub(crate) use bytes::extract_bytes;
 #[allow(unused_imports)]
 pub(crate) use file::extract_file;
 
-#[allow(unused_imports)]
-#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
-pub(crate) use batch::{batch_extract_bytes, batch_extract_files};
-
 #[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::core::config::{BatchBytesItem, BatchFileItem, ExtractionConfig};
+    use crate::core::config::ExtractionConfig;
     use serial_test::serial;
     use std::fs::File;
     use std::io::Write;
@@ -91,70 +85,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_extract_file() {
-        let dir = tempdir().unwrap();
-
-        let file1 = dir.path().join("test1.txt");
-        let file2 = dir.path().join("test2.txt");
-
-        File::create(&file1).unwrap().write_all(b"content 1").unwrap();
-        File::create(&file2).unwrap().write_all(b"content 2").unwrap();
-
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchFileItem {
-                path: file1,
-                config: None,
-            },
-            BatchFileItem {
-                path: file2,
-                config: None,
-            },
-        ];
-        let results = batch_extract_files(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_text_content(&results[0].content, "content 1");
-        assert_text_content(&results[1].content, "content 2");
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_file_empty() {
-        let config = ExtractionConfig::default();
-        let items: Vec<BatchFileItem> = vec![];
-        let results = batch_extract_files(items, &config).await;
-
-        assert!(results.is_ok());
-        assert_eq!(results.unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_bytes() {
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchBytesItem {
-                content: b"content 1".to_vec(),
-                mime_type: "text/plain".to_string(),
-                config: None,
-            },
-            BatchBytesItem {
-                content: b"content 2".to_vec(),
-                mime_type: "text/plain".to_string(),
-                config: None,
-            },
-        ];
-        let results = batch_extract_bytes(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_text_content(&results[0].content, "content 1");
-        assert_text_content(&results[1].content, "content 2");
-    }
-
-    #[tokio::test]
     async fn test_extractor_cache() {
         let config = ExtractionConfig::default();
 
@@ -219,7 +149,14 @@ mod tests {
             f.write_all(b"content").unwrap();
             let config = ExtractionConfig::default();
             let result = extract_file(&file_path, None, &config).await;
-            assert!(result.is_ok() || result.is_err());
+
+            // A 204-byte filename is well under every common filesystem's 255-byte
+            // component limit, so `File::create` above already succeeded; nothing in
+            // `detect_or_validate`/`extract_file` imposes a length limit of its own, so
+            // this must extract exactly like any other `.txt` file.
+            let result = result.expect("a 204-byte filename is under every common filesystem limit");
+            assert_text_content(&result.content, "content");
+            assert_eq!(result.mime_type, "text/plain");
         }
     }
 
@@ -260,89 +197,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_extract_file_with_errors() {
-        let dir = tempdir().unwrap();
-
-        let valid_file = dir.path().join("valid.txt");
-        File::create(&valid_file).unwrap().write_all(b"valid content").unwrap();
-
-        let invalid_file = dir.path().join("nonexistent.txt");
-
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchFileItem {
-                path: valid_file,
-                config: None,
-            },
-            BatchFileItem {
-                path: invalid_file,
-                config: None,
-            },
-        ];
-        let results = batch_extract_files(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_text_content(&results[0].content, "valid content");
-        assert!(results[1].metadata.error.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_bytes_mixed_valid_invalid() {
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchBytesItem {
-                content: b"valid 1".to_vec(),
-                mime_type: "text/plain".to_string(),
-                config: None,
-            },
-            BatchBytesItem {
-                content: b"invalid".to_vec(),
-                mime_type: "invalid/mime".to_string(),
-                config: None,
-            },
-            BatchBytesItem {
-                content: b"valid 2".to_vec(),
-                mime_type: "text/plain".to_string(),
-                config: None,
-            },
-        ];
-        let results = batch_extract_bytes(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 3);
-        assert_text_content(&results[0].content, "valid 1");
-        assert!(results[1].metadata.error.is_some());
-        assert_text_content(&results[2].content, "valid 2");
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_bytes_all_invalid() {
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchBytesItem {
-                content: b"test 1".to_vec(),
-                mime_type: "invalid/mime1".to_string(),
-                config: None,
-            },
-            BatchBytesItem {
-                content: b"test 2".to_vec(),
-                mime_type: "invalid/mime2".to_string(),
-                config: None,
-            },
-        ];
-        let results = batch_extract_bytes(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 2);
-        assert!(results[0].metadata.error.is_some());
-        assert!(results[1].metadata.error.is_some());
-    }
-
-    #[tokio::test]
     async fn test_extract_bytes_very_large() {
         let large_content = vec![b'a'; 10_000_000];
         let config = ExtractionConfig::default();
@@ -352,35 +206,6 @@ mod tests {
         let result = result.unwrap();
         let trimmed_len = result.content.trim_end_matches('\n').len();
         assert_eq!(trimmed_len, 10_000_000);
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_large_count() {
-        let dir = tempdir().unwrap();
-        let mut items = Vec::new();
-
-        for i in 0..100 {
-            let file_path = dir.path().join(format!("file{}.txt", i));
-            File::create(&file_path)
-                .unwrap()
-                .write_all(format!("content {}", i).as_bytes())
-                .unwrap();
-            items.push(BatchFileItem {
-                path: file_path,
-                config: None,
-            });
-        }
-
-        let config = ExtractionConfig::default();
-        let results = batch_extract_files(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 100);
-
-        for (i, result) in results.iter().enumerate() {
-            assert_text_content(&result.content, &format!("content {}", i));
-        }
     }
 
     #[tokio::test]
@@ -395,7 +220,21 @@ mod tests {
         let config = ExtractionConfig::default();
         let result = extract_file(&file_path, None, &config).await;
 
-        assert!(result.is_ok() || result.is_err());
+        // Despite the test's name, `detect_mime_type` (crates/xberg/src/core/mime.rs) has
+        // no content-sniffing fallback for an extensionless path: with no `extension`, it
+        // skips straight past `mime_guess` (which also needs an extension) to the final
+        // `Err(Validation)` naming the path. This must always fail, not "gracefully do
+        // either" -- content sniffing is a real behavior this crate does not have here.
+        let error = result.expect_err("an extensionless path has no extension to sniff a MIME type from");
+        use crate::XbergError;
+        assert!(
+            matches!(error, XbergError::Validation { .. }),
+            "expected a Validation error, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("Could not determine MIME type"),
+            "error must name the MIME-determination failure, got: {error}"
+        );
     }
 
     #[tokio::test]
@@ -407,7 +246,40 @@ mod tests {
         let config = ExtractionConfig::default();
         let result = extract_file(&file_path, Some("application/pdf"), &config).await;
 
-        assert!(result.is_err() || result.is_ok());
+        // `Some("application/pdf")` skips detection entirely (`detect_or_validate` only
+        // validates a caller-supplied MIME, it never sniffs against it). Which error comes
+        // back therefore depends on whether a PDF extractor is registered at all, so the
+        // assertion is split by feature rather than asserting one build's behaviour
+        // unconditionally -- a `--no-default-features --features excel` leg registers no PDF
+        // extractor and returns `UnsupportedFormat` long before any parser runs.
+        let error = result.expect_err("plain text has no PDF structure, extraction must fail");
+        use crate::XbergError;
+
+        // With `pdf`: the PDF extractor runs directly on ten bytes of plain text with no
+        // `%PDF` header, and `NativeDocument::open_bytes_with_passwords`
+        // (crates/xberg/src/pdf/native/mod.rs) wraps `xberg_native_pdf`'s parse failure as
+        // `XbergError::Parsing`. See `security_validation.rs::assert_rejected_as_invalid_pdf`
+        // for the same contract.
+        #[cfg(feature = "pdf")]
+        {
+            assert!(
+                matches!(error, XbergError::Parsing { .. }),
+                "expected a Parsing error, got: {error:?}"
+            );
+            assert!(
+                error.to_string().contains("xberg_native_pdf"),
+                "error must name the failing parser, got: {error}"
+            );
+        }
+
+        // Without `pdf`: no extractor claims the MIME, so the registry rejects it by name.
+        #[cfg(not(feature = "pdf"))]
+        {
+            assert!(
+                matches!(&error, XbergError::UnsupportedFormat(mime) if mime == "application/pdf"),
+                "expected UnsupportedFormat naming the overridden MIME, got: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -462,93 +334,6 @@ mod tests {
         }
 
         assert_eq!(success_count, 30);
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_file_with_per_file_configs() {
-        let dir = tempdir().unwrap();
-
-        let file1 = dir.path().join("test1.txt");
-        let file2 = dir.path().join("test2.txt");
-        File::create(&file1).unwrap().write_all(b"content 1").unwrap();
-        File::create(&file2).unwrap().write_all(b"content 2").unwrap();
-
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchFileItem {
-                path: file1,
-                config: Some(crate::FileExtractionConfig::default()),
-            },
-            BatchFileItem {
-                path: file2,
-                config: None,
-            },
-        ];
-        let results = batch_extract_files(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_text_content(&results[0].content, "content 1");
-        assert_text_content(&results[1].content, "content 2");
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_file_with_configs_empty() {
-        let config = ExtractionConfig::default();
-        let items: Vec<BatchFileItem> = vec![];
-        let results = batch_extract_files(items, &config).await;
-
-        assert!(results.is_ok());
-        assert_eq!(results.unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_bytes_with_per_item_configs() {
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchBytesItem {
-                content: b"hello".to_vec(),
-                mime_type: "text/plain".to_string(),
-                config: None,
-            },
-            BatchBytesItem {
-                content: b"world".to_vec(),
-                mime_type: "text/plain".to_string(),
-                config: Some(crate::FileExtractionConfig::default()),
-            },
-        ];
-        let results = batch_extract_bytes(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_text_content(&results[0].content, "hello");
-        assert_text_content(&results[1].content, "world");
-    }
-
-    #[tokio::test]
-    async fn test_batch_extract_bytes_with_configs_error_handling() {
-        let config = ExtractionConfig::default();
-        let items = vec![
-            BatchBytesItem {
-                content: b"valid".to_vec(),
-                mime_type: "text/plain".to_string(),
-                config: None,
-            },
-            BatchBytesItem {
-                content: b"invalid".to_vec(),
-                mime_type: "invalid/mime".to_string(),
-                config: Some(crate::FileExtractionConfig::default()),
-            },
-        ];
-        let results = batch_extract_bytes(items, &config).await;
-
-        assert!(results.is_ok());
-        let results = results.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_text_content(&results[0].content, "valid");
-        assert!(results[1].metadata.error.is_some());
     }
 
     #[test]

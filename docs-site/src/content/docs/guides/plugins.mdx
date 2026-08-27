@@ -3,6 +3,7 @@ title: "Creating Plugins"
 ---
 
 import { Tabs, TabItem } from "@astrojs/starlight/components";
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 import { Content as Snip_elixir_plugins_word_count_processor } from "../../../snippets/elixir/plugins/word_count_processor.md";
 import { Content as Snip_rust_plugins_plugin_extractor } from "../../../snippets/rust/plugins/plugin_extractor.md";
 import { Content as Snip_python_plugins_plugin_extractor } from "../../../snippets/python/plugins/plugin_extractor.md";
@@ -33,18 +34,6 @@ import { Content as Snip_rust_plugins_quality_score_validator } from "../../../s
 import { Content as Snip_python_plugins_quality_score_validator } from "../../../snippets/python/plugins/quality_score_validator.md";
 import { Content as Snip_java_plugins_quality_score_validator } from "../../../snippets/java/plugins/quality_score_validator.md";
 import { Content as Snip_csharp_quality_score_validator } from "../../../snippets/csharp/quality_score_validator.md";
-import { Content as Snip_python_plugins_list_plugins } from "../../../snippets/python/plugins/list_plugins.md";
-import { Content as Snip_rust_plugins_list_plugins } from "../../../snippets/rust/plugins/list_plugins.md";
-import { Content as Snip_java_plugins_list_plugins } from "../../../snippets/java/plugins/list_plugins.md";
-import { Content as Snip_csharp_list_plugins } from "../../../snippets/csharp/list_plugins.md";
-import { Content as Snip_python_plugins_unregister_plugins } from "../../../snippets/python/plugins/unregister_plugins.md";
-import { Content as Snip_rust_plugins_unregister_plugins } from "../../../snippets/rust/plugins/unregister_plugins.md";
-import { Content as Snip_java_plugins_unregister_plugins } from "../../../snippets/java/plugins/unregister_plugins.md";
-import { Content as Snip_csharp_unregister_plugins } from "../../../snippets/csharp/unregister_plugins.md";
-import { Content as Snip_python_plugins_clear_plugins } from "../../../snippets/python/plugins/clear_plugins.md";
-import { Content as Snip_rust_plugins_clear_plugins } from "../../../snippets/rust/plugins/clear_plugins.md";
-import { Content as Snip_java_plugins_clear_plugins } from "../../../snippets/java/plugins/clear_plugins.md";
-import { Content as Snip_csharp_clear_plugins } from "../../../snippets/csharp/clear_plugins.md";
 import { Content as Snip_rust_plugins_stateful_plugin } from "../../../snippets/rust/plugins/stateful_plugin.md";
 import { Content as Snip_python_plugins_stateful_plugin } from "../../../snippets/python/plugins/stateful_plugin.md";
 import { Content as Snip_java_plugins_stateful_plugin } from "../../../snippets/java/plugins/stateful_plugin.md";
@@ -332,78 +321,23 @@ Validation errors cause extraction to fail. Use validators for critical quality 
 
 ### Listing
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
+Registry operations are type-specific. This example lists post-processors; the OCR, validator,
+embedding, reranker, tokenizer, and renderer registries expose the same operation.
 
-<Snip_python_plugins_list_plugins />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_plugins_list_plugins />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_plugins_list_plugins />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_list_plugins />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="registry/list_post_processors" />
 
 ### Unregistering
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
+Unregister from the registry that owns the plugin. The example registers a post-processor first so
+the removal has an observable target.
 
-<Snip_python_plugins_unregister_plugins />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_plugins_unregister_plugins />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_plugins_unregister_plugins />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_unregister_plugins />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="plugin_api/unregister_post_processor_after_register" />
 
 ### Clearing All
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
+Clear only the registry you intend to reset:
 
-<Snip_python_plugins_clear_plugins />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_plugins_clear_plugins />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_plugins_clear_plugins />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_clear_plugins />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="plugin_api/post_processors_clear" />
 
 ## Thread Safety
 

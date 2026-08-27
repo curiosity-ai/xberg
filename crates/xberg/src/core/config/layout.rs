@@ -82,7 +82,7 @@ impl fmt::Display for TableModel {
 
 /// How to resolve overlapping native vs layout (TATR/SLANeXT) tables.
 ///
-/// When both native oxide detection and the layout table model produce a table for
+/// When both native detection and the layout table model produce a table for
 /// the same page region, one must be dropped. This controls which one wins. Wire
 /// format is snake_case in all serializers (JSON, TOML, YAML).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ pub enum TableOverlapPreference {
     /// text F1 when the recognized cell reflow diverges from the source reading order.
     #[default]
     Content,
-    /// Prefer the native oxide table when it overlaps a layout table. Native tables
+    /// Prefer the native table when it overlaps a layout table. Native tables
     /// preserve the source reading order, which scores higher on text F1 for
     /// documents where the layout model's cell reflow diverges from the ground truth.
     Native,
@@ -213,7 +213,7 @@ pub struct LayoutDetectionConfig {
 
     /// How to resolve overlapping native vs layout tables.
     ///
-    /// When a native oxide table and a layout (TATR/SLANeXT) table overlap on the
+    /// When a native table and a layout (TATR/SLANeXT) table overlap on the
     /// same region, this controls which one is kept. Defaults to
     /// [`TableOverlapPreference::Content`] (historical behavior: keep the table with
     /// more content). Set to [`TableOverlapPreference::Native`] to favor source

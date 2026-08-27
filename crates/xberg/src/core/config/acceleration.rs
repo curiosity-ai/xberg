@@ -36,7 +36,7 @@ pub struct AccelerationConfig {
 ///
 /// Determines which hardware backend is used for model inference.
 /// `Auto` (default) selects the best available provider per platform.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionProviderType {
     /// Auto-select: CoreML on macOS, CUDA on Linux, CPU elsewhere.

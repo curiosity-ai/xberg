@@ -3,8 +3,7 @@
 //! This module holds the extraction internals moved verbatim from
 //! `core/extract/mod.rs`. The public free functions `crate::extract` /
 //! `crate::extract_batch` delegate here via a process-global default
-//! [`crate::engine::Engine`]. The logic is unchanged from the previous
-//! free-function implementation.
+//! [`crate::engine::Engine`].
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -50,10 +49,15 @@ const PROGRESS_STAGE_START: &str = "extract_start";
 const PROGRESS_STAGE_CACHE_HIT: &str = "extract_cache_hit";
 const PROGRESS_STAGE_COMPLETE: &str = "extract_complete";
 const PROGRESS_STAGE_ERROR: &str = "extract_error";
+const BATCH_PROGRESS_STAGE_START: &str = "extract_batch_start";
+const BATCH_PROGRESS_STAGE_CACHE_HIT: &str = "extract_batch_cache_hit";
+const BATCH_PROGRESS_STAGE_COMPLETE: &str = "extract_batch_complete";
+const BATCH_PROGRESS_STAGE_ERROR: &str = "extract_batch_error";
 
 /// Namespace prefix mixed into the content-hash cache key so a future,
 /// incompatible key derivation can never collide with entries this version wrote.
 const CACHE_KEY_NAMESPACE: &[u8] = b"xberg-engine-extract-v1";
+const BATCH_CACHE_KEY_NAMESPACE: &[u8] = b"xberg-engine-extract-batch-v1";
 
 /// Extract content from a single bytes or URI input.
 ///
@@ -76,6 +80,15 @@ pub(crate) async fn extract(
         message: None,
         fraction: Some(0.0),
     });
+
+    if let Err(error) = config.validate().and_then(|()| ensure_not_cancelled(config)) {
+        inner.progress.emit(ProgressEvent {
+            stage: PROGRESS_STAGE_ERROR.to_string(),
+            message: Some(error.to_string()),
+            fraction: None,
+        });
+        return Err(error);
+    }
 
     let cache_key = content_cache_key(&input, config);
     if let Some(key) = cache_key.as_deref()
@@ -111,7 +124,8 @@ pub(crate) async fn extract(
 
     match &result {
         Ok(output) => {
-            if let Some(key) = cache_key
+            if output.errors.is_empty()
+                && let Some(key) = cache_key
                 && let Ok(serialized) = serde_json::to_vec(output)
             {
                 inner.cache.put(&key, serialized, None).await;
@@ -134,13 +148,22 @@ pub(crate) async fn extract(
     result
 }
 
+fn ensure_not_cancelled(config: &ExtractionConfig) -> Result<()> {
+    if config.cancel_token.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return Err(XbergError::Cancelled);
+    }
+    Ok(())
+}
+
 /// The extraction path proper, unwrapped from cache/progress bookkeeping so
 /// [`extract`] can wrap it uniformly for both the cache-hit and cache-miss cases.
 async fn extract_uncached(input: ExtractInput, config: &ExtractionConfig) -> Result<ExtractionResult> {
     let mut seen = initial_seen_urls(std::slice::from_ref(&input));
     let seed_hosts = initial_seed_hosts(std::slice::from_ref(&input));
     let mut output = Box::pin(extract_one(input, config, 0)).await?;
+
     follow_recursive_document_urls(&mut output, config, &mut seen, &seed_hosts).await?;
+
     Ok(output)
 }
 
@@ -174,8 +197,83 @@ fn content_cache_key(input: &ExtractInput, base_config: &ExtractionConfig) -> Op
     Some(hasher.finalize().to_hex().to_string())
 }
 
+fn batch_content_cache_key(inputs: &[ExtractInput], base_config: &ExtractionConfig) -> Option<String> {
+    if inputs.is_empty() {
+        return None;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BATCH_CACHE_KEY_NAMESPACE);
+    hasher.update(&(inputs.len() as u64).to_le_bytes());
+    for input in inputs {
+        let item_key = content_cache_key(input, base_config)?;
+        hasher.update(&(item_key.len() as u64).to_le_bytes());
+        hasher.update(item_key.as_bytes());
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
 /// Extract content from multiple bytes or URI inputs.
 pub(crate) async fn extract_batch(
+    inner: &super::EngineInner,
+    inputs: Vec<ExtractInput>,
+    config: &ExtractionConfig,
+) -> Result<ExtractionResult> {
+    inner.progress.emit(ProgressEvent {
+        stage: BATCH_PROGRESS_STAGE_START.to_string(),
+        message: None,
+        fraction: Some(0.0),
+    });
+
+    if let Err(error) = config.validate().and_then(|()| ensure_not_cancelled(config)) {
+        inner.progress.emit(ProgressEvent {
+            stage: BATCH_PROGRESS_STAGE_ERROR.to_string(),
+            message: Some(error.to_string()),
+            fraction: None,
+        });
+        return Err(error);
+    }
+
+    let cache_key = batch_content_cache_key(&inputs, config);
+    if let Some(key) = cache_key.as_deref()
+        && let Some(cached_bytes) = inner.cache.get(key).await
+        && let Ok(cached_result) = serde_json::from_slice::<ExtractionResult>(&cached_bytes)
+    {
+        inner.progress.emit(ProgressEvent {
+            stage: BATCH_PROGRESS_STAGE_CACHE_HIT.to_string(),
+            message: None,
+            fraction: Some(1.0),
+        });
+        return Ok(cached_result);
+    }
+
+    let result = extract_batch_uncached(inner, inputs, config).await;
+    match &result {
+        Ok(output) => {
+            if output.errors.is_empty()
+                && let Some(key) = cache_key
+                && let Ok(serialized) = serde_json::to_vec(output)
+            {
+                inner.cache.put(&key, serialized, None).await;
+            }
+            inner.progress.emit(ProgressEvent {
+                stage: BATCH_PROGRESS_STAGE_COMPLETE.to_string(),
+                message: None,
+                fraction: Some(1.0),
+            });
+        }
+        Err(error) => {
+            inner.progress.emit(ProgressEvent {
+                stage: BATCH_PROGRESS_STAGE_ERROR.to_string(),
+                message: Some(error.to_string()),
+                fraction: None,
+            });
+        }
+    }
+    result
+}
+
+async fn extract_batch_uncached(
     inner: &super::EngineInner,
     inputs: Vec<ExtractInput>,
     config: &ExtractionConfig,
@@ -944,11 +1042,18 @@ async fn extract_one(input: ExtractInput, base_config: &ExtractionConfig, index:
 }
 
 fn resolve_input_config(input: &ExtractInput, base_config: &ExtractionConfig) -> ExtractionConfig {
-    input
+    let mut resolved = input
         .config
         .as_ref()
         .map(|overrides| base_config.with_file_overrides(overrides))
-        .unwrap_or_else(|| base_config.clone())
+        .unwrap_or_else(|| base_config.clone());
+    // Install a token here, before this item's own timeout wrapper (`run_batch_item`,
+    // `finalize_shared_item`) races against `extract_file`/`extract_bytes`'s inner
+    // timeout — the outer wrapper starts first and has the same duration, so it always
+    // wins that race, and its `token.cancel()` needs the SAME token this config's
+    // extractor checkpoints observe. See `ExtractionConfig::ensure_cancel_token`.
+    resolved.ensure_cancel_token();
+    resolved
 }
 
 /// Resolve config for batch items, taking Arc<ExtractionConfig> to avoid unnecessary clones.
@@ -969,14 +1074,23 @@ fn resolve_batch_input_config(
     thread_budget: usize,
 ) -> Arc<ExtractionConfig> {
     let resolved = resolve_input_config_arc(input, base_config);
-    if crate::core::config::concurrency::resolve_thread_budget(resolved.concurrency.as_ref()) == thread_budget {
+    let needs_thread_budget =
+        crate::core::config::concurrency::resolve_thread_budget(resolved.concurrency.as_ref()) != thread_budget;
+    // See `ExtractionConfig::ensure_cancel_token` and `resolve_input_config`: this
+    // item's `run_batch_item` timeout wrapper needs the same token its extractor
+    // checkpoints observe, installed before that wrapper races `extract_one_resolved`.
+    let needs_cancel_token = resolved.extraction_timeout_secs.is_some() && resolved.cancel_token.is_none();
+    if !needs_thread_budget && !needs_cancel_token {
         return resolved;
     }
 
     let mut resolved = Arc::unwrap_or_clone(resolved);
-    resolved.concurrency = Some(crate::core::config::ConcurrencyConfig {
-        max_threads: Some(thread_budget),
-    });
+    if needs_thread_budget {
+        resolved.concurrency = Some(crate::core::config::ConcurrencyConfig {
+            max_threads: Some(thread_budget),
+        });
+    }
+    resolved.ensure_cancel_token();
     Arc::new(resolved)
 }
 
@@ -998,10 +1112,26 @@ async fn extract_one_resolved(
     config: &ExtractionConfig,
     index: usize,
 ) -> Result<ExtractionResult> {
-    match input.kind {
-        ExtractInputKind::Bytes => extract_bytes_input(input, config, index).await,
-        ExtractInputKind::Uri => extract_uri_input(input, config, index).await,
-    }
+    // Type-erased per arm. An inline `.await` embeds BOTH arms' coroutines in this
+    // function's state, and that state is inlined into `extract_one`, which is
+    // alloca'd at four `Box::pin` sites and embedded again in `extract_uncached` --
+    // so every byte here is paid many times over. Boxing leaves an 8-byte pointer and
+    // makes the two arms mutually exclusive in memory as well as in control flow.
+    //
+    // No `+ Send` on wasm32; see the `extract` entry point above. ~keep
+    #[cfg(not(target_arch = "wasm32"))]
+    let resolved: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + Send + '_>> =
+        match input.kind {
+            ExtractInputKind::Bytes => Box::pin(extract_bytes_input(input, config, index)),
+            ExtractInputKind::Uri => Box::pin(extract_uri_input(input, config, index)),
+        };
+    #[cfg(target_arch = "wasm32")]
+    let resolved: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + '_>> = match input.kind
+    {
+        ExtractInputKind::Bytes => Box::pin(extract_bytes_input(input, config, index)),
+        ExtractInputKind::Uri => Box::pin(extract_uri_input(input, config, index)),
+    };
+    resolved.await
 }
 
 async fn extract_bytes_input(input: ExtractInput, config: &ExtractionConfig, index: usize) -> Result<ExtractionResult> {
@@ -1028,7 +1158,30 @@ async fn extract_uri_input(input: ExtractInput, config: &ExtractionConfig, index
         .ok_or_else(|| XbergError::validation("extract input kind 'uri' requires the 'uri' field".to_string()))?;
 
     if uri.starts_with(HTTP_SCHEME) || uri.starts_with(HTTPS_SCHEME) {
-        return extract_remote_uri(&uri, config, index).await;
+        // Type-erased, not merely boxed, and for a stack reason rather than a `Send`-proof one.
+        // This branch is not taken for the overwhelmingly common local-path/`file://` input, yet
+        // an inline `.await` folds the entire URL-ingestion subtree — `extract_remote_uri` (which
+        // holds a `CrawlConfig` by value plus a crawlberg engine future), `output_from_scrape`,
+        // `output_from_crawl`, `extract_downloaded_document` and `run_url_page_pipeline`, the last
+        // two each embedding a full unboxed `extract_bytes` pipeline — into this coroutine's TYPE.
+        // That type is paid unconditionally: it inflates `extract_one_resolved` -> `extract_one`,
+        // and `extract_one` is materialised in an `alloca` at every `Box::pin(extract_one(..))`
+        // call site (rust-lang/rust#54628), so the cost lands on the stack of every extraction,
+        // remote or not. A bare `Box::pin` does NOT fix this: `Pin<Box<Concrete>>` keeps the
+        // concrete coroutine as a type parameter. Coercing to `dyn Future` turns the whole subtree
+        // into a 16-byte pointer here and moves its materialisation into a frame cost paid only
+        // when an HTTP(S) URI is actually seen. ~keep
+        //
+        // No `+ Send` on wasm32, for the same reason as `extract`/`extract_batch` above: extractor
+        // futures are `!Send` there (`async_trait(?Send)`), as are crawlberg/reqwest's JS-backed
+        // wasm futures, and wasm32 has no `tokio::spawn` that would need the bound. ~keep
+        #[cfg(not(target_arch = "wasm32"))]
+        let remote: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + Send + '_>> =
+            Box::pin(extract_remote_uri(&uri, config, index));
+        #[cfg(target_arch = "wasm32")]
+        let remote: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + '_>> =
+            Box::pin(extract_remote_uri(&uri, config, index));
+        return remote.await;
     }
 
     if uri.contains("://") && !uri.starts_with(FILE_SCHEME) {

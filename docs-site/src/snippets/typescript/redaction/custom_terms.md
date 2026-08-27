@@ -1,12 +1,12 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, RedactionStrategy, extract } from "@xberg-io/xberg";
 
 const output = await extract({
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "contract.pdf",
 }, {
     redaction: {
-        strategy: "token_replace",
+        strategy: RedactionStrategy.TokenReplace,
         customTerms: [
             { label: "Project", value: "Project Polaris", caseSensitive: false },
             { label: "Employee", value: "EMP-7421", caseSensitive: true },

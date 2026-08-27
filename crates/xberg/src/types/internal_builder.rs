@@ -1,7 +1,7 @@
 //! Ergonomic builder for constructing `InternalDocument` instances.
 //!
 //! Mirrors the API of `DocumentStructureBuilder`
-//! but outputs the flat [`InternalDocument`](super::internal::InternalDocument) representation
+//! but outputs the flat `InternalDocument` representation
 //! instead of a tree-based `DocumentStructure`.
 //!
 //! # Example
@@ -193,8 +193,8 @@ impl InternalDocumentBuilder {
         for (row_index, row) in cells.iter().enumerate() {
             for (col_index, cell) in row.iter().enumerate() {
                 let repeats_left = col_index > 0 && row[col_index - 1] == *cell;
-                let repeats_above = row_index > 0
-                    && cells[row_index - 1].get(col_index).is_some_and(|above| above == cell);
+                let repeats_above =
+                    row_index > 0 && cells[row_index - 1].get(col_index).is_some_and(|above| above == cell);
                 if repeats_left || repeats_above {
                     continue;
                 }
@@ -350,7 +350,11 @@ impl InternalDocumentBuilder {
 
     /// Push a page break marker at depth 0.
     pub fn push_page_break(&mut self) {
-        let elem = self.make_element(ElementKind::PageBreak, "", 0, None, None, None);
+        self.push_page_break_with_page(None);
+    }
+
+    pub(crate) fn push_page_break_with_page(&mut self, page: Option<u32>) {
+        let elem = self.make_element(ElementKind::PageBreak, "", 0, page, None, None);
         self.doc.push_element(elem);
     }
 
@@ -484,6 +488,37 @@ impl InternalDocumentBuilder {
     pub fn set_attributes(&mut self, index: u32, attributes: AHashMap<String, String>) {
         if let Some(elem) = self.doc.elements.get_mut(index as usize) {
             elem.attributes = Some(attributes);
+        }
+    }
+
+    /// Insert a single attribute on an already-pushed element, merging into any
+    /// attributes already set instead of replacing them wholesale.
+    ///
+    /// Use this (rather than `set_attributes`) when other code may have already
+    /// attached attributes to the same element index.
+    pub fn merge_attribute(&mut self, index: u32, key: impl Into<String>, value: impl Into<String>) {
+        if let Some(elem) = self.doc.elements.get_mut(index as usize) {
+            elem.attributes
+                .get_or_insert_with(AHashMap::new)
+                .insert(key.into(), value.into());
+        }
+    }
+
+    /// Record the literal source list-marker text on an already-pushed list item.
+    ///
+    /// `normalize_list_text` strips the marker off the item's text so the text
+    /// reads as content; without this the original label is lost and renderers
+    /// can only synthesize a sequence position. That silently renumbers a
+    /// document whose clauses are cross-referenced by their printed label.
+    /// An empty label is ignored.
+    ///
+    /// `pdf`-gated to match `InternalElement::set_list_item_source_label`, which it wraps:
+    /// the sole caller is the PDF structure assembly, and an ungated wrapper failed to
+    /// compile under a bare `ocr-pipeline` build.
+    #[cfg(feature = "pdf")]
+    pub fn set_list_item_source_label(&mut self, index: u32, label: impl Into<String>) {
+        if let Some(elem) = self.doc.elements.get_mut(index as usize) {
+            elem.set_list_item_source_label(label);
         }
     }
 

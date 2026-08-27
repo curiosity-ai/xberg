@@ -66,6 +66,14 @@ public static class PlainRenderer
                     break;
 
                 case ElementKindTag.ListItem:
+                    // Plain text renders no marker glyph at all — this format is markers-off
+                    // across the board. A literal source label (e.g. "B.", "(a)") is the one piece
+                    // of list-item structure it can still carry, so it is kept as visible text.
+                    if (elem.ListItemSourceLabel is { Length: > 0 } plainLabel)
+                    {
+                        sb.Append(plainLabel);
+                        sb.Append(' ');
+                    }
                     sb.Append(elem.Text);
                     sb.Append('\n');
                     break;
@@ -120,6 +128,14 @@ public static class PlainRenderer
                                 sb.Append(ocr.Content);
                                 sb.Append("\n\n");
                             }
+                        }
+                        else if (elem.Text.Trim().Length > 0)
+                        {
+                            // An image the extractor could not resolve (a missing archive member)
+                            // still carries its alt text or caption.
+                            sb.Append("[Image: ");
+                            sb.Append(elem.Text.Trim());
+                            sb.Append("]\n\n");
                         }
                     }
                     break;

@@ -21,9 +21,7 @@
 //! # Breadcrumb placement: render at index time, don't mutate (#1393)
 //!
 //! `chunk.content` is **always** exactly the `[byte_start, byte_end)` span of the
-//! source document — the chunker never prepends a heading breadcrumb into it, and
-//! the deprecated `prepend_heading_context`/`breadcrumb_target` config fields have
-//! no effect on `content` any more (kept only so existing callers keep compiling).
+//! source document — the chunker never prepends a heading breadcrumb into it.
 //! `heading_context`/`heading_path` (which `chunk_for_rag` always populates) are
 //! the source of truth for the breadcrumb; rendering it into a chunk's text — e.g.
 //! `"# Guide > ## Setup\n\n"` prepended ahead of the body — is a step a *consumer*
@@ -164,6 +162,40 @@ mod tests {
             chunker_type: ChunkerType::Markdown,
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn chunk_for_rag_applies_fast_preset_and_preserves_trim_setting() {
+        const MANUAL_MAX_CHARACTERS: usize = 64;
+        const FAST_PRESET_MAX_CHARACTERS: usize = 512;
+        const FAST_PRESET_OVERLAP: usize = 50;
+
+        let text = format!("  {}", "abcdefghijklmnopqrstuvwxyz".repeat(100));
+        let config = ChunkingConfig {
+            max_characters: MANUAL_MAX_CHARACTERS,
+            overlap: 0,
+            trim: false,
+            preset: Some("fast".to_string()),
+            ..Default::default()
+        };
+
+        let result = chunk_for_rag(&text, &config).unwrap();
+
+        assert!(result.chunks.len() > 2);
+        assert_eq!(result.chunks[0].content, "  ");
+        assert!(
+            result
+                .chunks
+                .iter()
+                .all(|chunk| chunk.content.len() <= FAST_PRESET_MAX_CHARACTERS)
+        );
+
+        let body_chunks: Vec<_> = result.chunks.iter().filter(|chunk| chunk.content.len() > 2).collect();
+        assert_eq!(body_chunks[0].content.len(), FAST_PRESET_MAX_CHARACTERS);
+        let first = &body_chunks[0].content;
+        let expected_overlap = &first[first.len() - FAST_PRESET_OVERLAP..];
+        assert!(body_chunks[1].content.starts_with(expected_overlap));
     }
 
     #[test]

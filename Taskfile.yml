@@ -46,9 +46,14 @@ includes:
     taskfile: ./.task/tools/fixtures.yml
   test-apps:
     taskfile: ./.task/tools/test-apps.yml
+  pdfium:
+    taskfile: ./.task/tools/pdfium.yml
   _tools:
     taskfile: ./.task/tools/general.yml
     flatten: true
+
+vars:
+  AI_RULEZ_VERSION: "4.11.3"
 
 tasks:
   default:
@@ -61,6 +66,7 @@ tasks:
     cmds:
       - task: rust:install
       - alef setup
+      - task: governance:generate
       - task: integrations:sync
       - command -v poly >/dev/null 2>&1 || brew install goldziher/tap/poly
       - poly hooks install
@@ -155,6 +161,31 @@ tasks:
     cmds:
       - task: format:check
       - task: lint:check
+
+  governance:generate:
+    desc: "Generate local AI governance files with the pinned ai-rulez version"
+    cmds:
+      - npx -y ai-rulez@{{.AI_RULEZ_VERSION}} generate
+
+  governance:validate:
+    desc: "Validate the root AI governance configuration"
+    cmds:
+      - npx -y ai-rulez@{{.AI_RULEZ_VERSION}} validate
+
+  governance:verify:
+    desc: "Validate that AI governance inputs resolve and render without modifying the checkout"
+    deps:
+      - governance:validate
+    cmds:
+      - |
+        set -euo pipefail
+        governance_verify_root="$(mktemp -d)"
+        trap 'rm -rf -- "$governance_verify_root"' EXIT
+        cp -R .ai-rulez "$governance_verify_root/.ai-rulez"
+        (
+          cd "$governance_verify_root"
+          npx -y ai-rulez@{{.AI_RULEZ_VERSION}} generate --no-configure-cli-mcp --quiet
+        )
 
   check:android:
     desc: "cargo check xberg-dart + xberg-ffi for Android ABIs"
@@ -263,6 +294,16 @@ tasks:
     cmds:
       - python3 scripts/ci/check-ffi-format-features.py alef.toml
 
+  verify:feature-parity:
+    desc: "Check per-target feature aggregates still match `full` (GH#1443)"
+    cmds:
+      - python3 scripts/ci/check-feature-parity.py crates/xberg/Cargo.toml
+
+  verify:docker-crates:
+    desc: "Check every workspace member is COPYd, real, and survives .dockerignore"
+    cmds:
+      - bash scripts/ci/docker/check-dockerfile-crate-coverage.sh
+
   docs:verify:changelog:
     desc: "Check the docs-site changelog carries every release section from CHANGELOG.md"
     cmds:
@@ -271,7 +312,7 @@ tasks:
   e2e:generate:
     desc: "Generate E2E tests for all languages from fixtures"
     cmds:
-      - alef e2e generate
+      - alef e2e generate --strict
 
   e2e:build:
     desc: "Build all language bindings used by e2e suites (release)"
@@ -303,7 +344,7 @@ tasks:
   e2e:verify:
     desc: "Verify generated e2e tests are up to date"
     cmds:
-      - alef e2e generate
+      - alef e2e generate --strict
       - git diff --exit-code e2e/
 
   e2e:lang:
@@ -366,7 +407,9 @@ tasks:
   dart:codegen:
     desc: "Generate flutter_rust_bridge bindings for Dart"
     cmds:
-      - command -v flutter_rust_bridge_codegen >/dev/null 2>&1 || cargo install flutter_rust_bridge_codegen --version 2.12.0
+      - |
+        command -v flutter_rust_bridge_codegen >/dev/null 2>&1 || \
+          cargo install flutter_rust_bridge_codegen --version 2.13.0
       - cd packages/dart && dart pub get
       - cd packages/dart/rust && flutter_rust_bridge_codegen generate --config-file flutter_rust_bridge.yaml
 

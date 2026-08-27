@@ -28,6 +28,22 @@ use crate::types::ExtractedImage;
 
 const SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE: &str = "xberg:internal:suppress-image-ocr-render";
 
+/// Attribute key carrying a `ListItem` element's literal source marker text
+/// (e.g. `"B."`, `"(a)"`, `"iv."`), when the extractor recovered one.
+///
+/// Deliberately a generic attribute rather than a field on
+/// [`ElementKind::ListItem`]: `ElementKind` derives `Copy` and is matched *by
+/// value* (`match elem.kind { .. }`) throughout the renderers and the
+/// structure-tree derivation step. A `String`-bearing field there would
+/// silently drop the `Copy` derive and break every one of those call sites
+/// across the crate. Routing the label through the existing attribute bag
+/// keeps `ElementKind` unchanged and, unlike
+/// [`SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE`], is intentionally left out of the
+/// [`public_attributes`](InternalElement::public_attributes) filter, so it
+/// also reaches the public `DocumentStructure` tree via
+/// `DocumentNode::attributes` with no change needed in `extraction::derive`.
+const LIST_ITEM_SOURCE_LABEL_ATTRIBUTE: &str = "list_marker";
+
 #[cfg_attr(alef, alef(skip))]
 /// Deterministic element identifier, generated via blake3 hashing.
 ///
@@ -78,22 +94,6 @@ impl InternalElementId {
         buf[1] = b'e';
         buf[2] = b'-';
         hex::encode_to_slice(bytes, &mut buf[3..]).expect("fixed size");
-        Self(buf)
-    }
-
-    /// Create from a pre-computed ID string.
-    ///
-    /// The input must be exactly 15 bytes in `"ie-{12 hex}"` format.
-    /// Panics if the input length is not 15.
-    #[allow(dead_code)]
-    pub fn new(id: &str) -> Self {
-        assert!(
-            id.len() == 15,
-            "InternalElementId must be exactly 15 bytes, got {}",
-            id.len()
-        );
-        let mut buf = [0u8; 15];
-        buf.copy_from_slice(id.as_bytes());
         Self(buf)
     }
 
@@ -265,6 +265,11 @@ pub struct InternalDocument {
     #[serde(skip)]
     pub escape_markdown: bool,
 
+    /// ~keep When `true`, Markdown rendering preserves watermark text such as arXiv
+    /// identifiers. Set by the pipeline from `ContentFilterConfig::include_watermarks`.
+    #[serde(skip)]
+    pub include_watermarks: bool,
+
     /// Page marker format (with `{page_num}` placeholder) when
     /// `PageConfig::insert_page_markers` is enabled, `None` otherwise. Set by
     /// the pipeline. Renderers use it to emit page markers verbatim instead of
@@ -350,6 +355,7 @@ impl InternalDocument {
             ocr_text_only: false,
             append_ocr_text: false,
             escape_markdown: true,
+            include_watermarks: false,
             page_marker_format: None,
             table_anchors: false,
             form_fields: Vec::new(),
@@ -573,6 +579,39 @@ impl InternalElement {
             .is_some_and(|attributes| attributes.contains_key(SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE))
     }
 
+    /// Attach a `ListItem` element's literal source marker text (e.g. `"B."`,
+    /// `"(a)"`, `"iv."`).
+    ///
+    /// Real caller: `pdf::structure::assembly::push_paragraph_element`, which
+    /// attaches the prefix `normalize_list_text` strips off the paragraph text,
+    /// via `InternalDocumentBuilder::set_list_item_source_label`. Non-PDF
+    /// extractors never call it, so the attribute is absent there and renderers
+    /// fall back to a synthesized position.
+    #[cfg(feature = "pdf")]
+    pub(crate) fn set_list_item_source_label(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        if label.is_empty() {
+            return;
+        }
+        self.attributes
+            .get_or_insert_with(AHashMap::new)
+            .insert(LIST_ITEM_SOURCE_LABEL_ATTRIBUTE.to_string(), label);
+    }
+
+    /// The literal source list-marker text, if one was captured (see
+    /// [`set_list_item_source_label`](Self::set_list_item_source_label)).
+    ///
+    /// `None` for every non-PDF extractor and for PDF list items whose marker
+    /// text was not confidently recovered -- renderers must fall back to
+    /// `ElementKind::ListItem::ordered`'s synthesized sequence position in
+    /// that case, exactly as they did before this attribute existed.
+    pub(crate) fn list_item_source_label(&self) -> Option<&str> {
+        self.attributes
+            .as_ref()?
+            .get(LIST_ITEM_SOURCE_LABEL_ATTRIBUTE)
+            .map(String::as_str)
+    }
+
     /// Attributes safe to expose through the public document structure.
     pub(crate) fn public_attributes(&self) -> Option<std::collections::HashMap<String, String>> {
         let original = self.attributes.as_ref()?;
@@ -587,6 +626,13 @@ impl InternalElement {
             Some(attributes)
         }
     }
+}
+
+/// [`InternalElement::list_item_source_label`], for renderers that flatten an
+/// element into a `(kind, text, .., attributes)` tuple before dispatch
+/// (`rendering::comrak_bridge`) rather than keeping `&InternalElement` around.
+pub(crate) fn list_item_source_label_from_attributes(attributes: Option<&AHashMap<String, String>>) -> Option<&str> {
+    attributes?.get(LIST_ITEM_SOURCE_LABEL_ATTRIBUTE).map(String::as_str)
 }
 
 /// Semantic role of an internal element.
@@ -838,6 +884,44 @@ mod tests {
 
         assert!(element.public_attributes().is_none());
         assert!(!element.should_render_image_ocr());
+    }
+
+    /// #### FAILS against unfixed code
+    /// `set_list_item_source_label`/`list_item_source_label` do not exist yet
+    /// on unfixed `InternalElement` -- this test does not compile without the
+    /// fix. Once the fix lands, it proves two things a bare
+    /// `ElementKind::ListItem { ordered: true }` cannot: the literal marker
+    /// text round-trips unchanged, and -- unlike the OCR-suppression
+    /// attribute -- it is NOT filtered out of `public_attributes()`, so it
+    /// reaches the public `DocumentStructure` tree via `DocumentNode::attributes`.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn list_item_source_label_round_trips_and_stays_public() {
+        let mut element = InternalElement::text(ElementKind::ListItem { ordered: false }, "General Provisions.", 1);
+        assert_eq!(element.list_item_source_label(), None);
+
+        element.set_list_item_source_label("B.");
+
+        assert_eq!(element.list_item_source_label(), Some("B."));
+        assert_eq!(
+            element.public_attributes(),
+            Some(std::collections::HashMap::from([(
+                "list_marker".to_string(),
+                "B.".to_string()
+            )]))
+        );
+    }
+
+    /// An empty label is a caller bug (e.g. a marker-strip that removed
+    /// nothing), not a real source marker -- `set_list_item_source_label`
+    /// must not manufacture a spurious attribute for it.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn list_item_source_label_ignores_an_empty_label() {
+        let mut element = InternalElement::text(ElementKind::ListItem { ordered: true }, "item text", 1);
+        element.set_list_item_source_label("");
+        assert_eq!(element.list_item_source_label(), None);
+        assert_eq!(element.attributes, None);
     }
 
     #[cfg(any(feature = "ocr", feature = "pdf", paddle_ocr, feature = "xml", feature = "office"))]

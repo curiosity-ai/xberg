@@ -1,24 +1,25 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, extract } from "@xberg-io/xberg";
 
 const output = await extract({
-  kind: "uri",
+  kind: ExtractInputKind.Uri,
   uri: "document.pdf",
 });
-const result = output.results[0];
-console.log(`Metadata: ${JSON.stringify(result.metadata)}`);
-if (result.metadata?.pageCount) {
-  console.log(`Pages: ${result.metadata.pageCount}`);
+const result = output.results?.[0];
+console.log(`Metadata: ${JSON.stringify(result?.metadata)}`);
+if (result?.metadata?.pages?.totalCount) {
+  console.log(`Pages: ${result.metadata.pages.totalCount}`);
 }
 
 const htmlOutput = await extract({
-  kind: "uri",
+  kind: ExtractInputKind.Uri,
   uri: "page.html",
 });
-const htmlResult = htmlOutput.results[0];
-console.log(`HTML Metadata: ${JSON.stringify(htmlResult.metadata)}`);
+const htmlResult = htmlOutput.results?.[0];
+console.log(`HTML Metadata: ${JSON.stringify(htmlResult?.metadata)}`);
 
-const htmlMeta = htmlResult.metadata;
+const htmlFormat = htmlResult?.metadata?.format;
+const htmlMeta = htmlFormat?.format_type === "html" ? htmlFormat.html : undefined;
 if (htmlMeta?.title) {
   console.log(`Title: ${htmlMeta.title}`);
 }

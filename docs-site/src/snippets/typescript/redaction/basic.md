@@ -1,16 +1,16 @@
 ```typescript title="TypeScript"
-import { extract } from '@xberg-io/xberg';
+import { ExtractInputKind, PiiCategory, RedactionStrategy, extract } from '@xberg-io/xberg';
 
 const output = await extract({
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "contract.pdf",
 }, {
     redaction: {
-        categories: ["email", "phone", "ssn", "credit_card", "iban"],
-        strategy: "mask",
+        categories: [PiiCategory.Email, PiiCategory.Phone, PiiCategory.Ssn, PiiCategory.CreditCard, PiiCategory.Iban],
+        strategy: RedactionStrategy.Mask,
     },
 });
-const result = output.results[0];
-console.log(result.content);
-console.log(`Redacted ${result.redactionReport?.totalRedacted ?? 0} spans`);
+const [result] = output.results ?? [];
+console.log(result?.content);
+console.log(`Redacted ${result?.redactionReport?.totalRedacted ?? 0} spans`);
 ```

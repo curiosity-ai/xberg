@@ -10,8 +10,88 @@
 //! - **Format flexibility**: Support text, markdown, djot, and structured output formats
 //! - **Table detection support**: Enable table reconstruction from element geometry
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+
+fn deserialize_quadrilateral_points<'de, D>(deserializer: D) -> Result<Vec<OcrPoint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let points = Vec::<OcrPoint>::deserialize(deserializer)?;
+    if points.len() != 4 {
+        return Err(serde::de::Error::invalid_length(
+            points.len(),
+            &"exactly four quadrilateral points",
+        ));
+    }
+    Ok(points)
+}
+
+/// A point in OCR raster pixel coordinates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OcrPoint {
+    /// Horizontal coordinate.
+    pub x: u32,
+    /// Vertical coordinate.
+    pub y: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OcrPointWire {
+    Positional((u32, u32)),
+    Named { x: u32, y: u32 },
+}
+
+impl Serialize for OcrPoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (self.x, self.y).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OcrPoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match OcrPointWire::deserialize(deserializer)? {
+            OcrPointWire::Positional(point) => point.into(),
+            OcrPointWire::Named { x, y } => Self { x, y },
+        })
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for OcrPoint {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ArrayBuilder, ArrayItems, Object, Type};
+
+        ArrayBuilder::new()
+            .items(ArrayItems::False)
+            .prefix_items([Object::with_type(Type::Integer), Object::with_type(Type::Integer)])
+            .min_items(Some(2))
+            .max_items(Some(2))
+            .into()
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for OcrPoint {}
+
+impl From<(u32, u32)> for OcrPoint {
+    fn from((x, y): (u32, u32)) -> Self {
+        Self { x, y }
+    }
+}
+
+impl From<OcrPoint> for (u32, u32) {
+    fn from(point: OcrPoint) -> Self {
+        (point.x, point.y)
+    }
+}
 
 /// Bounding geometry for an OCR element.
 ///
@@ -37,10 +117,9 @@ pub enum OcrBoundingGeometry {
     /// Points are in clockwise order starting from top-left:
     /// `[top_left, top_right, bottom_right, bottom_left]`
     Quadrilateral {
-        /// Four corner points as `[[x, y], ...]` in clockwise order
-        #[cfg_attr(feature = "api", schema(value_type = [[u32; 2]; 4]))]
-        #[cfg_attr(alef, alef(skip))]
-        points: [(u32, u32); 4],
+        /// Exactly four corner points in clockwise order.
+        #[serde(deserialize_with = "deserialize_quadrilateral_points")]
+        points: Vec<OcrPoint>,
     },
 }
 
@@ -82,10 +161,10 @@ impl OcrBoundingGeometry {
                 height,
             } => (*left, *top, *width, *height),
             Self::Quadrilateral { points } => {
-                let min_x = points.iter().map(|(x, _)| *x).min().unwrap_or(0);
-                let max_x = points.iter().map(|(x, _)| *x).max().unwrap_or(0);
-                let min_y = points.iter().map(|(_, y)| *y).min().unwrap_or(0);
-                let max_y = points.iter().map(|(_, y)| *y).max().unwrap_or(0);
+                let min_x = points.iter().map(|point| point.x).min().unwrap_or(0);
+                let max_x = points.iter().map(|point| point.x).max().unwrap_or(0);
+                let min_y = points.iter().map(|point| point.y).min().unwrap_or(0);
+                let max_y = points.iter().map(|point| point.y).max().unwrap_or(0);
                 (min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y))
             }
         }
@@ -279,13 +358,29 @@ pub struct OcrElement {
 
     /// Parent element ID for hierarchical relationships.
     ///
-    /// Only used for Tesseract output which has word -> line -> block hierarchy.
+    /// ~keep When hierarchy output is enabled, this resolves to another emitted element's
+    /// `backend_metadata["element_id"]` value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
 
     /// Backend-specific metadata that doesn't fit the unified schema.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub backend_metadata: HashMap<String, serde_json::Value>,
+}
+
+const OCR_ELEMENT_ID_METADATA_KEY: &str = "element_id";
+
+impl OcrElement {
+    /// Return this element's hierarchy ID when hierarchy output was requested.
+    ///
+    /// ~keep The ID is stored in `backend_metadata["element_id"]` for compatibility with the
+    /// existing serialized and binding-safe shape of [`OcrElement`].
+    #[cfg_attr(alef, alef(skip))]
+    pub fn element_id(&self) -> Option<&str> {
+        self.backend_metadata
+            .get(OCR_ELEMENT_ID_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+    }
 }
 
 fn default_page_number() -> u32 {
@@ -327,12 +422,6 @@ impl OcrElement {
         self
     }
 
-    /// Set parent element ID.
-    pub(crate) fn with_parent_id(mut self, parent_id: impl Into<String>) -> Self {
-        self.parent_id = Some(parent_id.into());
-        self
-    }
-
     /// Add backend-specific metadata.
     pub(crate) fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.backend_metadata.insert(key.into(), value);
@@ -366,10 +455,120 @@ pub struct OcrElementConfig {
 
     /// Whether to build hierarchical relationships between elements.
     ///
-    /// When true, `parent_id` fields will be populated based on spatial containment.
-    /// Only meaningful for Tesseract output.
+    /// ~keep When true, emitted elements receive an `element_id` metadata value and `parent_id`
+    /// references are populated only when a spatially containing parent is also emitted.
     #[serde(default)]
     pub build_hierarchy: bool,
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+impl OcrElementConfig {
+    pub(crate) fn select_elements(&self, elements: &[OcrElement]) -> Vec<OcrElement> {
+        if !self.include_elements {
+            return Vec::new();
+        }
+
+        let minimum_rank = element_level_rank(self.min_level);
+        let mut selected = elements
+            .iter()
+            .filter(|element| element.confidence.recognition >= self.min_confidence)
+            .filter(|element| element_level_rank(element.level) >= minimum_rank)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for element in &mut selected {
+            element.parent_id = None;
+            element.backend_metadata.remove(OCR_ELEMENT_ID_METADATA_KEY);
+        }
+        if !self.build_hierarchy {
+            return selected;
+        }
+
+        let element_ids = selected
+            .iter()
+            .enumerate()
+            .map(|(index, element)| format!("ocr-p{}-e{}", element.page_number, index + 1))
+            .collect::<Vec<_>>();
+        for (element, element_id) in selected.iter_mut().zip(&element_ids) {
+            element.backend_metadata.insert(
+                OCR_ELEMENT_ID_METADATA_KEY.to_string(),
+                serde_json::Value::String(element_id.clone()),
+            );
+        }
+        for child_index in 0..selected.len() {
+            if let Some(parent_index) = hierarchy_parent_index(&selected, child_index) {
+                selected[child_index].parent_id = Some(element_ids[parent_index].clone());
+            }
+        }
+        selected
+    }
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn element_level_rank(level: OcrElementLevel) -> u8 {
+    match level {
+        OcrElementLevel::Word => 0,
+        OcrElementLevel::Line => 1,
+        OcrElementLevel::Block => 2,
+        OcrElementLevel::Page => 3,
+    }
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn hierarchy_parent_index(elements: &[OcrElement], child_index: usize) -> Option<usize> {
+    let child = &elements[child_index];
+    let child_rank = element_level_rank(child.level);
+    let child_bounds = geometry_bounds(&child.geometry)?;
+    elements
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.page_number == child.page_number)
+        .filter_map(|(index, candidate)| {
+            let candidate_rank = element_level_rank(candidate.level);
+            if candidate_rank <= child_rank {
+                return None;
+            }
+            let candidate_bounds = geometry_bounds(&candidate.geometry)?;
+            bounds_contain(candidate_bounds, child_bounds).then_some((
+                index,
+                candidate_rank - child_rank,
+                candidate_bounds.2 * candidate_bounds.3,
+            ))
+        })
+        .min_by_key(|(index, rank_distance, area)| (*rank_distance, *area, *index))
+        .map(|(index, _, _)| index)
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn geometry_bounds(geometry: &OcrBoundingGeometry) -> Option<(u64, u64, u64, u64)> {
+    match geometry {
+        OcrBoundingGeometry::Rectangle {
+            left,
+            top,
+            width,
+            height,
+        } => (*width > 0 && *height > 0).then_some((
+            u64::from(*left),
+            u64::from(*top),
+            u64::from(*width),
+            u64::from(*height),
+        )),
+        OcrBoundingGeometry::Quadrilateral { points } => {
+            let left = u64::from(points.iter().map(|point| point.x).min()?);
+            let top = u64::from(points.iter().map(|point| point.y).min()?);
+            let right = u64::from(points.iter().map(|point| point.x).max()?);
+            let bottom = u64::from(points.iter().map(|point| point.y).max()?);
+            (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
+        }
+    }
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn bounds_contain(parent: (u64, u64, u64, u64), child: (u64, u64, u64, u64)) -> bool {
+    parent.0 <= child.0
+        && parent.1 <= child.1
+        && parent.0 + parent.2 >= child.0 + child.2
+        && parent.1 + parent.3 >= child.1 + child.3
 }
 
 /// Geometry-only tests that do not require the `ocr` feature.
@@ -391,7 +590,10 @@ mod geometry_tests {
     #[test]
     fn test_quadrilateral_to_aabb() {
         let geom = OcrBoundingGeometry::Quadrilateral {
-            points: [(10, 22), (108, 20), (110, 72), (12, 74)],
+            points: [(10, 22), (108, 20), (110, 72), (12, 74)]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         };
         let (left, top, width, height) = geom.to_aabb();
         assert_eq!(left, 10);
@@ -415,9 +617,160 @@ mod geometry_tests {
     }
 }
 
+#[cfg(test)]
+mod binding_value_serde_tests {
+    use super::{OcrBoundingGeometry, OcrPoint};
+    use serde_json::json;
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_describe_ocr_point_as_legacy_array_schema() {
+        let schema =
+            serde_json::to_value(<OcrPoint as utoipa::PartialSchema>::schema()).expect("schema must serialize");
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], 2);
+        assert_eq!(schema["maxItems"], 2);
+        assert_eq!(schema["items"], false);
+        assert_eq!(schema["prefixItems"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn should_accept_both_ocr_point_wire_shapes_and_serialize_as_legacy_tuple() {
+        let legacy = json!([10, 20]);
+        let positional: OcrPoint = serde_json::from_value(legacy.clone()).expect("legacy OCR point must deserialize");
+        let named: OcrPoint =
+            serde_json::from_value(json!({"x": 10, "y": 20})).expect("named OCR point must deserialize");
+
+        assert_eq!(named, positional);
+        assert_eq!(
+            serde_json::to_value(positional).expect("OCR point must serialize"),
+            legacy
+        );
+        assert_eq!(
+            serde_json::to_value(named).expect("named OCR point must serialize"),
+            legacy
+        );
+    }
+
+    #[test]
+    fn should_preserve_legacy_quadrilateral_point_tuple_wire_format() {
+        let legacy = json!({
+            "type": "quadrilateral",
+            "points": [[10, 20], [100, 22], [98, 70], [8, 68]]
+        });
+        let geometry: OcrBoundingGeometry =
+            serde_json::from_value(legacy.clone()).expect("legacy geometry must deserialize");
+        let OcrBoundingGeometry::Quadrilateral { points } = &geometry else {
+            panic!("expected quadrilateral geometry");
+        };
+
+        assert_eq!(points[0], OcrPoint { x: 10, y: 20 });
+        assert_eq!(serde_json::to_value(geometry).expect("geometry must serialize"), legacy);
+    }
+
+    #[test]
+    fn should_reject_quadrilateral_with_invalid_point_count() {
+        let error = serde_json::from_value::<OcrBoundingGeometry>(json!({
+            "type": "quadrilateral",
+            "points": [[0, 0], [10, 0], [10, 10]]
+        }))
+        .expect_err("quadrilateral with three points must be rejected");
+
+        assert!(
+            error.to_string().contains("exactly four quadrilateral points"),
+            "unexpected deserialization error: {error}"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "ocr"))]
 mod tests {
     use super::*;
+
+    fn positioned_element(
+        text: &str,
+        level: OcrElementLevel,
+        left: u32,
+        top: u32,
+        width: u32,
+        height: u32,
+    ) -> OcrElement {
+        OcrElement {
+            text: text.to_string(),
+            geometry: OcrBoundingGeometry::Rectangle {
+                left,
+                top,
+                width,
+                height,
+            },
+            level,
+            confidence: OcrConfidence {
+                detection: None,
+                recognition: 1.0,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_omit_hierarchy_when_not_requested() {
+        let mut element = positioned_element("word", OcrElementLevel::Word, 0, 0, 10, 5);
+        element.parent_id = Some("stale-parent".to_string());
+        element.backend_metadata.insert(
+            OCR_ELEMENT_ID_METADATA_KEY.to_string(),
+            serde_json::json!("stale-element"),
+        );
+        let config = OcrElementConfig {
+            include_elements: true,
+            min_level: OcrElementLevel::Word,
+            min_confidence: 0.0,
+            build_hierarchy: false,
+        };
+
+        let selected = config.select_elements(&[element]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].parent_id, None);
+        assert_eq!(selected[0].element_id(), None);
+    }
+
+    #[test]
+    fn should_emit_only_resolvable_hierarchy_references() {
+        let elements = vec![
+            positioned_element("page", OcrElementLevel::Page, 0, 0, 100, 100),
+            positioned_element("block", OcrElementLevel::Block, 5, 5, 90, 90),
+            positioned_element("line", OcrElementLevel::Line, 10, 10, 80, 20),
+            positioned_element("word", OcrElementLevel::Word, 15, 15, 10, 5),
+            positioned_element("orphan", OcrElementLevel::Word, 150, 150, 10, 5),
+        ];
+        let config = OcrElementConfig {
+            include_elements: true,
+            min_level: OcrElementLevel::Word,
+            min_confidence: 0.0,
+            build_hierarchy: true,
+        };
+
+        let selected = config.select_elements(&elements);
+        let repeated = config.select_elements(&elements);
+        let element_ids = selected
+            .iter()
+            .map(|element| element.element_id().expect("hierarchy-enabled element ID"))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(element_ids.len(), selected.len());
+        assert_eq!(
+            selected.iter().map(OcrElement::element_id).collect::<Vec<_>>(),
+            repeated.iter().map(OcrElement::element_id).collect::<Vec<_>>()
+        );
+        assert!(selected.iter().all(|element| {
+            element
+                .parent_id
+                .as_deref()
+                .is_none_or(|parent_id| element_ids.contains(parent_id))
+        }));
+        assert_eq!(selected[3].parent_id.as_deref(), selected[2].element_id());
+        assert_eq!(selected[4].parent_id, None);
+    }
 
     #[test]
     fn test_confidence_from_tesseract() {
@@ -516,7 +869,10 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip() {
         let geom = OcrBoundingGeometry::Quadrilateral {
-            points: [(10, 20), (100, 22), (98, 70), (8, 68)],
+            points: [(10, 20), (100, 22), (98, 70), (8, 68)]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         };
         let conf = OcrConfidence::from_paddle(0.95, 0.88);
         let rot = OcrRotation::from_paddle(0, 0.99).expect("Valid angle_index");

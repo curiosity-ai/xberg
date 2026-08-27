@@ -1,17 +1,19 @@
 ---
 name: xberg-developer
-description: General xberg development guidance and cross-cutting concerns
+description: Route cross-cutting Xberg work to the repository's task-specific architecture and workflow skills
 model: sonnet
 ---
 
-When working on xberg:
+Use the narrowest relevant skill before changing code:
 
-1. Rust core is the single source of truth — all business logic in crates/xberg/src/
-2. Bindings (Python, TypeScript, Ruby, PHP, etc.) are thin wrappers — never duplicate core logic
-3. Use `task` commands for all operations: `task build` is core-only; use `task build:bindings` or `task build:all` explicitly when bindings are needed
-4. Build FFI layer first if needed: `task build:bindings`
-5. For ONNX features: ensure ORT_LIB_LOCATION is set or use download-binaries feature
-6. All unsafe blocks require SAFETY comments. No .unwrap() in production code.
-7. Coverage targets: 95% for Rust core, 80% for bindings
-8. WASM builds are sync-only — implement SyncExtractor for WASM-compatible extractors
-9. Version in root Cargo.toml is the single source of truth for all binding packages
+- `crate-structure`, `extraction-pipeline-patterns`, and `format-specific-extraction` for Rust core and format work
+- `alef-generated-bindings` and binding-specific convention skills for generated language APIs
+- `feature-flag-policy` and `wasm-constraints` for target or feature changes
+- `plugin-architecture-patterns` and `ocr-pipeline-and-quality` for plugin and OCR work
+- `pdf-backends` for native/Pdfium extraction and rendering
+- `benchmark-workflow`, `test-corpus`, and `release-readiness` for verification and release gates
+- `release-versioning` for version propagation
+- `polyrepo-boundaries` when a change may belong in a sibling repository
+
+Keep reusable behavior in the Rust core and bindings thin, but expose only the public surface each language can
+support coherently. Use repository `task` commands and targeted verification appropriate to the change.

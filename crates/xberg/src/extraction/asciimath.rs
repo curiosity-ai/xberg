@@ -24,7 +24,7 @@ pub(crate) fn convert_asciimath_to_latex(source: &str, budget: &mut SecurityBudg
     // `mathemascii` 0.4.0 scans by byte index and splits a multi-byte character,
     // so a real specification that writes `≤` panics inside the parser and takes
     // the whole extraction with it. The panic is contained here, the way the
-    // crate already contains ORT and pdf_oxide. The equation itself is lost,
+    // crate already contains ORT and xberg_native_pdf. The equation itself is lost,
     // because there is no LaTeX to report, and the document survives.
     let mathml = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         mathemascii::render_mathml(mathemascii::parse(trimmed))
@@ -35,7 +35,11 @@ pub(crate) fn convert_asciimath_to_latex(source: &str, budget: &mut SecurityBudg
     .ok()?;
     let latex = crate::extraction::mathml::convert_mathml_str_to_latex(&mathml, budget).ok()?;
     let latex = latex.trim();
-    if latex.is_empty() { None } else { Some(latex.to_string()) }
+    if latex.is_empty() {
+        None
+    } else {
+        Some(latex.to_string())
+    }
 }
 
 #[cfg(test)]

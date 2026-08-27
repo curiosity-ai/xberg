@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -52,6 +53,14 @@ PLUGIN_CONFIG = "plugin/.ai-rulez/config.toml"
 # native/semver form Helm requires. ~keep
 HELM_CHART = "charts/xberg/Chart.yaml"
 HELM_CHART_README = "charts/xberg/README.md"
+HELM_IMAGE_REPOSITORY = "ghcr.io/xberg-io/xberg"
+SEMVER_PRERELEASE_IDENTIFIER = r"(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER_PATTERN = re.compile(
+    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    rf"(?:-(?P<prerelease>{SEMVER_PRERELEASE_IDENTIFIER}"
+    rf"(?:\.{SEMVER_PRERELEASE_IDENTIFIER})*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 # npm integration packages (package.json): version + exact `@xberg-io/xberg` pin,
 # both in the native/semver form. The committed `package-lock.json` is intentionally NOT
@@ -111,6 +120,51 @@ def to_pep440(version: str) -> str:
     )
 
 
+def _single_metadata_value(text: str, pattern: str) -> str | None:
+    matches = re.findall(pattern, text, flags=re.MULTILINE)
+    return matches[0] if len(matches) == 1 else None
+
+
+def helm_metadata_errors(chart: str, expected_version: str) -> list[str]:
+    """Validate release-sensitive Chart.yaml metadata before publishing."""
+    semver = SEMVER_PATTERN.fullmatch(expected_version)
+    if semver is None:
+        return [f"release version is not valid SemVer: {expected_version}"]
+
+    fields = {
+        "chart version": _single_metadata_value(chart, r"^version:\s*[\"']?([^\"'\s]+)[\"']?\s*$"),
+        "chart appVersion": _single_metadata_value(chart, r"^appVersion:\s*[\"']?([^\"'\s]+)[\"']?\s*$"),
+        "Artifact Hub image tag": _single_metadata_value(
+            chart,
+            rf"^\s*image:\s*[\"']?{re.escape(HELM_IMAGE_REPOSITORY)}:([^\"'\s]+)[\"']?\s*$",
+        ),
+        "Artifact Hub prerelease": _single_metadata_value(
+            chart,
+            r'^\s*artifacthub\.io/prerelease:\s*["\']?(true|false)["\']?\s*$',
+        ),
+    }
+    expected = {
+        "chart version": expected_version,
+        "chart appVersion": expected_version,
+        "Artifact Hub image tag": expected_version,
+        "Artifact Hub prerelease": "true" if semver.group("prerelease") else "false",
+    }
+    missing_names = {
+        "chart version": "version",
+        "chart appVersion": "appVersion",
+        "Artifact Hub image tag": "artifacthub.io/images xberg image",
+        "Artifact Hub prerelease": "artifacthub.io/prerelease",
+    }
+
+    errors = []
+    for name, value in fields.items():
+        if value is None:
+            errors.append(f"chart is missing {missing_names[name]}")
+        elif value != expected[name]:
+            errors.append(f"{name} is {value}, expected {expected[name]}")
+    return errors
+
+
 def transform(rel: str, sync_version: bool, sync_dep: bool, maven: str, pep440: str) -> tuple[str, str]:
     path = ROOT / rel
     original = path.read_text(encoding="utf-8")
@@ -124,7 +178,10 @@ def transform(rel: str, sync_version: bool, sync_dep: bool, maven: str, pep440: 
             # with appVersion or ArtifactHub advertises an image the chart never deploys.
             updated = re.sub(r"(?m)^(\s*image: ghcr\.io/xberg-io/xberg:).*$", rf"\g<1>{maven}", updated)
             # A version with no pre-release suffix is, by definition, not a prerelease.
-            prerelease = "true" if "-" in maven else "false"
+            semver = SEMVER_PATTERN.fullmatch(maven)
+            if semver is None:
+                sys.exit(f"cannot sync invalid SemVer release: {maven}")
+            prerelease = "true" if semver.group("prerelease") else "false"
             updated = re.sub(r'(?m)^(\s*artifacthub\.io/prerelease: ")[^"]*(")', rf"\g<1>{prerelease}\g<2>", updated)
         return original, updated
     if rel == HELM_CHART_README:
@@ -171,7 +228,7 @@ def transform_plugin(version: str) -> tuple[str, str]:
 
 def main() -> int:
     check = "--check" in sys.argv[1:]
-    maven = core_version()
+    maven = os.environ.get("RELEASE_VERSION", core_version()) if check else core_version()
     pep440 = to_pep440(maven)
 
     targets: dict[str, tuple[bool, bool]] = {}
@@ -197,10 +254,13 @@ def main() -> int:
             (ROOT / PLUGIN_CONFIG).write_text(plugin_updated, encoding="utf-8")
 
     if check:
-        if drift:
+        helm_errors = helm_metadata_errors((ROOT / HELM_CHART).read_text(encoding="utf-8"), maven)
+        if drift or helm_errors:
             print(f"integration versions out of sync with core {maven}:")
             for rel in drift:
                 print(f"  - {rel}")
+            for error in helm_errors:
+                print(f"  - {error}")
             print("run: task version:sync")
             return 1
         print(f"integration versions in sync with core {maven}")

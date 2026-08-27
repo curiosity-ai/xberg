@@ -13,12 +13,22 @@ use comrak::nodes::{
 };
 
 use crate::types::document_structure::{AnnotationKind, ContentLayer, TextAnnotation};
-use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
+use crate::types::internal::{ElementKind, InternalDocument, InternalElement, list_item_source_label_from_attributes};
 
 use super::common::{
     FootnoteCollector, NestingKind, RenderState, handle_container_end, is_body_element, is_container_end,
     parse_metadata_entries,
 };
+
+/// Minimum valid ATX heading depth (CommonMark `#`).
+const MIN_HEADING_LEVEL: u8 = 1;
+
+/// Maximum valid ATX heading depth (CommonMark `######`). A level beyond this
+/// is not a valid ATX heading — more than six leading `#` characters are not
+/// recognized as a heading on re-parse and silently degrade to a paragraph —
+/// so a level reported by upstream structure detection is clamped rather than
+/// forwarded verbatim.
+const MAX_HEADING_LEVEL: u8 = 6;
 
 /// Allocate a comrak AST node in the arena with the given `NodeValue`.
 fn mk<'a>(arena: &'a comrak::Arena<'a>, value: NodeValue) -> &'a AstNode<'a> {
@@ -434,8 +444,19 @@ fn append_annotated_span<'a>(
 }
 
 /// Build a comrak `Table` subtree from a 2-D cell grid.
-fn build_table<'a>(arena: &'a comrak::Arena<'a>, cells: &[Vec<String>], has_header: bool) -> &'a AstNode<'a> {
+///
+/// Returns `None` when the grid has no columns at all (every row is empty).
+/// Comrak's CommonMark writer only emits the required `|---|` delimiter row
+/// as a side effect of writing the last header *cell*; with zero cells that
+/// write never happens, so a zero-column table would render as a single bare
+/// `|` line — not a valid GFM table, and not parseable as one on re-read.
+/// Callers should fall back to something else (e.g. the table's flat
+/// `markdown` field) rather than emit that.
+fn build_table<'a>(arena: &'a comrak::Arena<'a>, cells: &[Vec<String>], has_header: bool) -> Option<&'a AstNode<'a>> {
     let num_cols = cells.iter().map(|r| r.len()).max().unwrap_or(0);
+    if num_cols == 0 {
+        return None;
+    }
     let synthetic_header_rows = usize::from(!has_header);
 
     let table_node = mk(
@@ -472,7 +493,78 @@ fn build_table<'a>(arena: &'a comrak::Arena<'a>, cells: &[Vec<String>], has_head
         table_node.append(row_node);
     }
 
-    table_node
+    Some(table_node)
+}
+
+/// Bullet glyphs that OCR/plain-text extraction commonly reads as unordered
+/// list markers.
+const BULLET_MARKER_CHARS: &[char] = &['-', '*', '•', '‣', '◦'];
+
+/// Byte length of a leading list marker in `text` — a bullet glyph, or a
+/// digit run followed by `.`/`)` — when followed by at least one space.
+///
+/// A `ListItem` element is expected to carry only its label in
+/// [`InternalElement::text`]; the marker itself (`1.`, `-`, …) is emitted by
+/// the comrak list/item writer. A source that leaves its own marker in the
+/// label text (OCR reads the marker as part of the line) would otherwise
+/// produce a doubled marker such as `1. 1. Label`, so callers stripping list
+/// content use this to detect and remove it first. Returns 0 when no such
+/// marker is present, leaving genuine content untouched.
+fn redundant_list_marker_len(text: &str) -> usize {
+    let mut chars = text.chars();
+    if let Some(first) = chars.next()
+        && BULLET_MARKER_CHARS.contains(&first)
+    {
+        let bullet_len = first.len_utf8();
+        let rest = &text[bullet_len..];
+        let space_len = rest.len() - rest.trim_start_matches(' ').len();
+        return if space_len > 0 { bullet_len + space_len } else { 0 };
+    }
+
+    let digits_len = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    if digits_len == 0 {
+        return 0;
+    }
+    let after_digits = &text[digits_len..];
+    let Some(delimiter) = after_digits.chars().next().filter(|&c| c == '.' || c == ')') else {
+        return 0;
+    };
+    let after_delimiter = &after_digits[delimiter.len_utf8()..];
+    let space_len = after_delimiter.len() - after_delimiter.trim_start_matches(' ').len();
+    if space_len == 0 {
+        return 0;
+    }
+    digits_len + delimiter.len_utf8() + space_len
+}
+
+/// Strip a redundant leading list marker (see [`redundant_list_marker_len`])
+/// from `text`, shifting `annotations` to match.
+///
+/// Returns the possibly-shortened text together with adjusted annotations.
+/// Annotations that fall entirely within the stripped marker are dropped;
+/// annotations that overlap it are clipped to start at the new text origin.
+/// Allocates only when a marker is actually found, so the common case (no
+/// embedded marker) is zero-cost.
+fn strip_redundant_list_marker<'a>(
+    text: &'a str,
+    annotations: &'a [TextAnnotation],
+) -> (&'a str, Cow<'a, [TextAnnotation]>) {
+    let marker_len = redundant_list_marker_len(text);
+    if marker_len == 0 {
+        return (text, Cow::Borrowed(annotations));
+    }
+
+    let offset = marker_len as u32;
+    let adjusted: Vec<TextAnnotation> = annotations
+        .iter()
+        .filter(|ann| ann.end > offset)
+        .map(|ann| TextAnnotation {
+            start: ann.start.saturating_sub(offset),
+            end: ann.end - offset,
+            kind: ann.kind.clone(),
+        })
+        .collect();
+    (&text[marker_len..], Cow::Owned(adjusted))
 }
 
 /// An entry on the container stack, tracking what comrak node to append
@@ -598,7 +690,7 @@ pub(crate) fn build_comrak_ast<'a>(doc: &InternalDocument, arena: &'a comrak::Ar
                 let heading = mk(
                     arena,
                     NodeValue::Heading(NodeHeading {
-                        level,
+                        level: level.clamp(MIN_HEADING_LEVEL, MAX_HEADING_LEVEL),
                         setext: false,
                         closed: false,
                     }),
@@ -618,12 +710,26 @@ pub(crate) fn build_comrak_ast<'a>(doc: &InternalDocument, arena: &'a comrak::Ar
             }
 
             ElementKind::ListItem { ordered } => {
+                // comrak's CommonMark writer takes the marker style and the running
+                // number from the *enclosing* `List` node alone -- an `Item`'s own
+                // `NodeList` is not consulted -- and CommonMark cannot express a
+                // lettered or parenthesized marker like "B." or "(a)" as a list
+                // ordinal at all. So when the source label survived, the label is
+                // written as leading text and the enclosing list is forced to
+                // bulleted: emitting it as an ordered list would print a synthesized
+                // "1." beside the real "B.", renumbering a document whose clauses are
+                // cross-referenced by their printed label. A bullet defers to the
+                // label instead of competing with it.
+                let source_label =
+                    list_item_source_label_from_attributes(elem_attributes).filter(|label| !label.is_empty());
+                let numbered = ordered && source_label.is_none();
+                let list_type = if numbered {
+                    comrak::nodes::ListType::Ordered
+                } else {
+                    comrak::nodes::ListType::Bullet
+                };
                 let item_list = comrak::nodes::NodeList {
-                    list_type: if ordered {
-                        comrak::nodes::ListType::Ordered
-                    } else {
-                        comrak::nodes::ListType::Bullet
-                    },
+                    list_type,
                     bullet_char: b'-',
                     start: 1,
                     tight: true,
@@ -631,20 +737,27 @@ pub(crate) fn build_comrak_ast<'a>(doc: &InternalDocument, arena: &'a comrak::Ar
                 };
                 let item = mk(arena, NodeValue::Item(item_list));
                 let item_para = mk(arena, NodeValue::Paragraph);
-                build_inlines(arena, item_para, elem_text, elem_annotations);
+                if let Some(label) = source_label {
+                    item_para.append(mk_text(arena, &format!("{label} ")));
+                }
+                let (item_text, item_annotations) = strip_redundant_list_marker(elem_text, elem_annotations);
+                build_inlines(arena, item_para, item_text, item_annotations.as_ref());
                 item.append(item_para);
 
                 let list_parent = if matches!(parent.data.borrow().value, NodeValue::List(..)) {
+                    // A run opened by `ListStart` is already numbered; a labelled item
+                    // joining it has to demote the whole run, or comrak resumes counting
+                    // around it.
+                    if !numbered && let NodeValue::List(list) = &mut parent.data.borrow_mut().value {
+                        list.list_type = comrak::nodes::ListType::Bullet;
+                        list.bullet_char = b'-';
+                    }
                     parent
                 } else {
                     let implicit_list = mk(
                         arena,
                         NodeValue::List(comrak::nodes::NodeList {
-                            list_type: if ordered {
-                                comrak::nodes::ListType::Ordered
-                            } else {
-                                comrak::nodes::ListType::Bullet
-                            },
+                            list_type,
                             bullet_char: b'-',
                             start: 1,
                             tight: true,
@@ -699,16 +812,19 @@ pub(crate) fn build_comrak_ast<'a>(doc: &InternalDocument, arena: &'a comrak::Ar
                         anchor.append(mk_text(arena, &format!("[TABLE:{table_id}]")));
                         parent.append(anchor);
                     }
-                    if !table.cells.is_empty() {
-                        tracing::trace!(table_index, rows = table.cells.len(), "rendering table");
-                        let has_header = !matches!(doc.source_format.as_str(), "csv" | "orgmode" | "typst")
-                            || table.columns.is_some();
-                        let table_node = build_table(arena, &table.cells, has_header);
-                        parent.append(table_node);
-                    } else if !table.markdown.trim().is_empty() {
-                        let para = mk(arena, NodeValue::Paragraph);
-                        para.append(mk_text(arena, &table.markdown));
-                        parent.append(para);
+                    let has_header =
+                        !matches!(doc.source_format.as_str(), "csv" | "orgmode" | "typst") || table.columns.is_some();
+                    match build_table(arena, &table.cells, has_header) {
+                        Some(table_node) => {
+                            tracing::trace!(table_index, rows = table.cells.len(), "rendering table");
+                            parent.append(table_node);
+                        }
+                        None if !table.markdown.trim().is_empty() => {
+                            let para = mk(arena, NodeValue::Paragraph);
+                            para.append(mk_text(arena, &table.markdown));
+                            parent.append(para);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -1259,7 +1375,7 @@ mod tests {
     }
 
     /// Regression test for issue #762: image links must appear in markdown when image
-    /// data is available via pdf_oxide extraction (non-empty `data` field).
+    /// data is available via xberg_native_pdf extraction (non-empty `data` field).
     #[test]
     fn test_image_with_data_renders_link() {
         use crate::types::ExtractedImage;
@@ -1725,6 +1841,161 @@ mod tests {
         assert!(
             out.contains("[world](https://example.com)"),
             "link must still render; got: {out}"
+        );
+    }
+
+    /// OCR-derived structure detection reads a numbered list marker as part of
+    /// the line's own text, so `ListItem.text` still carries "1. " even though
+    /// the element is correctly flagged `ElementKind::ListItem { ordered: true }`.
+    /// Without stripping that redundant marker, comrak emits its own "1. "
+    /// marker followed by the untouched label — which itself starts with
+    /// "1." — and comrak's CommonMark writer backslash-escapes that second
+    /// period (to keep it from being misread as a second list start on
+    /// re-parse), producing "1. 1\. Land Use…" instead of a single clean
+    /// "1. Land Use…" line. Fails without the fix in
+    /// `strip_redundant_list_marker`: the line would contain the doubled
+    /// "1. 1" marker and a stray "\." rather than the clean text.
+    #[test]
+    fn test_ordered_list_item_strips_embedded_numeral_marker() {
+        let mut b = InternalDocumentBuilder::new("test");
+        b.push_list(true);
+        b.push_list_item("1. Land Use: Live/Work Townhomes", true, vec![], None, None);
+        b.end_list();
+        let doc = b.build();
+        let out = render(&doc);
+        assert!(
+            out.lines().any(|l| l.trim() == "1. Land Use: Live/Work Townhomes"),
+            "expected a single clean marker with no doubling or escaping; got: {out:?}"
+        );
+        assert!(!out.contains("1. 1"), "marker must not be doubled; got: {out:?}");
+        assert!(
+            !out.contains("1\\."),
+            "period after the label's own leading digit must not be escaped; got: {out:?}"
+        );
+    }
+
+    /// Mirrors [`test_ordered_list_item_strips_embedded_numeral_marker`] for
+    /// unordered lists, where OCR reads the bullet glyph as literal text.
+    /// Without the fix, comrak's own "- " marker precedes the untouched
+    /// "- Bullet content" label, and the label's own leading "-" is itself
+    /// backslash-escaped (line-leading dash), producing "- \- Bullet content".
+    #[test]
+    fn test_bullet_list_item_strips_embedded_dash_marker() {
+        let mut b = InternalDocumentBuilder::new("test");
+        b.push_list(false);
+        b.push_list_item("- Bullet content", false, vec![], None, None);
+        b.end_list();
+        let doc = b.build();
+        let out = render(&doc);
+        assert!(
+            out.lines().any(|l| l.trim() == "- Bullet content"),
+            "expected a single clean bullet marker; got: {out:?}"
+        );
+        assert!(!out.contains("- -"), "marker must not be doubled; got: {out:?}");
+        assert!(
+            !out.contains("\\-"),
+            "label's own leading dash must not be escaped; got: {out:?}"
+        );
+    }
+
+    /// Verifies `strip_redundant_list_marker` shifts annotation byte offsets
+    /// to match the shortened text rather than leaving them pointed at the
+    /// now-removed marker prefix. "Land Use" is bold in the *original*
+    /// (marker-inclusive) offsets; after the 3-byte "1. " marker is stripped,
+    /// the same span must still land on "Land Use", not on "d Use:" (an
+    /// unshifted span) or nothing (a dropped annotation).
+    #[test]
+    fn test_ordered_list_item_marker_strip_shifts_annotation_offsets() {
+        let mut b = InternalDocumentBuilder::new("test");
+        b.push_list(true);
+        b.push_list_item(
+            "1. Land Use: Live/Work Townhomes",
+            true,
+            vec![TextAnnotation {
+                start: 3,
+                end: 11,
+                kind: AnnotationKind::Bold,
+            }],
+            None,
+            None,
+        );
+        b.end_list();
+        let doc = b.build();
+        let out = render(&doc);
+        assert!(
+            out.lines().any(|l| l.trim() == "1. **Land Use**: Live/Work Townhomes"),
+            "bold span must follow the stripped marker onto \"Land Use\"; got: {out:?}"
+        );
+    }
+
+    /// Heading levels beyond ATX's 1-6 range are not valid CommonMark: more
+    /// than six leading `#` characters are not recognized as a heading on
+    /// re-parse. A structure-detection bug that ever emits a level like 9
+    /// must not be passed straight through to comrak. Fails without the
+    /// `.clamp(MIN_HEADING_LEVEL, MAX_HEADING_LEVEL)` fix: the line would
+    /// read "######### Out of range" (9 hashes) instead of the clamped
+    /// "###### Out of range" (6 hashes).
+    #[test]
+    fn test_heading_level_above_max_is_clamped() {
+        let mut b = InternalDocumentBuilder::new("test");
+        b.push_element(InternalElement::text(
+            ElementKind::Heading { level: 9 },
+            "Out of range",
+            0,
+        ));
+        let doc = b.build();
+        let out = render(&doc);
+        assert!(
+            out.lines().any(|l| l == "###### Out of range"),
+            "level must be clamped to 6 hashes; got: {out:?}"
+        );
+        assert!(
+            !out.contains("####### "),
+            "no more than 6 hashes may appear; got: {out:?}"
+        );
+    }
+
+    /// A level of 0 is likewise out of range — comrak still writes the
+    /// marker's trailing space even for zero hashes, so unclamped it renders
+    /// as a bare " Out of range" line: no `#` at all, and thus not a heading
+    /// on re-parse. Fails without the clamp: no line equals "# Out of range".
+    #[test]
+    fn test_heading_level_zero_is_clamped() {
+        let mut b = InternalDocumentBuilder::new("test");
+        b.push_element(InternalElement::text(
+            ElementKind::Heading { level: 0 },
+            "Out of range",
+            0,
+        ));
+        let doc = b.build();
+        let out = render(&doc);
+        assert!(
+            out.lines().any(|l| l == "# Out of range"),
+            "level must be clamped up to 1 hash; got: {out:?}"
+        );
+    }
+
+    /// A table whose every row is entirely empty (`num_cols == 0`, e.g. a
+    /// garbage table-region detection on an OCR page) must not reach comrak's
+    /// table writer: with zero cells, `format_table_cell` — which is what
+    /// emits the mandatory `|---|` delimiter row — never runs, so the "table"
+    /// serializes to a single bare "|" line. That is not valid GFM (no
+    /// delimiter row) and does not round-trip as a table. Fails without the
+    /// `num_cols == 0` guard in `build_table`: output would contain "|".
+    #[test]
+    fn test_table_with_all_empty_rows_emits_no_malformed_pipe() {
+        let mut b = InternalDocumentBuilder::new("test");
+        b.push_paragraph("Before degenerate table.", vec![], None, None);
+        b.push_table_from_cells(&[vec![]], None, None);
+        let doc = b.build();
+        let out = render(&doc);
+        assert!(
+            !out.contains('|'),
+            "a columnless table must not leak a bare, unmatched pipe; got: {out:?}"
+        );
+        assert!(
+            out.contains("Before degenerate table."),
+            "surrounding content must still render; got: {out:?}"
         );
     }
 }

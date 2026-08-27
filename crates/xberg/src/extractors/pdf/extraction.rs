@@ -33,7 +33,7 @@ fn effective_layout_acceleration<'a>(
     acceleration_override.or_else(|| config.resolved_layout_acceleration())
 }
 
-/// Whether the PDF pipeline must retain the full oxide hierarchy/geometry pass
+/// Whether the PDF pipeline must retain the full native hierarchy/geometry pass
 /// rather than take the cheaper flat-text path.
 ///
 /// `Custom(_)` is deliberately excluded: `OutputFormat::from_str` never rejects an
@@ -45,18 +45,67 @@ fn effective_layout_acceleration<'a>(
 /// (`core/pipeline/format.rs`'s `custom_fallback_to_plain`). `DocTags` is a real,
 /// always-registered built-in renderer that needs the same geometry and headings
 /// as Markdown/Djot/HTML, so it gets its own explicit arm instead.
-fn needs_structured_extraction(hierarchy_enabled: bool, output_format: &OutputFormat, ocr_inline_images: bool) -> bool {
+fn needs_structured_extraction(
+    hierarchy_enabled: bool,
+    output_format: &OutputFormat,
+    ocr_inline_images: bool,
+    content_filter_configured: bool,
+) -> bool {
     hierarchy_enabled
         || matches!(
             output_format,
             OutputFormat::Markdown | OutputFormat::Djot | OutputFormat::Html | OutputFormat::DocTags
         )
         || ocr_inline_images
+        || content_filter_configured
 }
 
-/// Extract text, metadata, tables, and annotations from a PDF document using the pdf_oxide backend.
+fn hierarchy_cluster_count(config: &ExtractionConfig) -> usize {
+    config
+        .pdf_options
+        .as_ref()
+        .and_then(|options| options.hierarchy.as_ref())
+        .map_or_else(
+            || crate::core::config::HierarchyConfig::default().k_clusters,
+            |hierarchy| hierarchy.k_clusters,
+        )
+}
+
+/// Report a table-extraction failure that took out a whole detector pass, not just one page.
 ///
-/// Accepts an authenticated `OxideDocument`, then delegates to each oxide extraction module.
+/// The per-page warnings in `pdf::native::table` cannot cover these: a stage that fails or
+/// panics outright returns no pages at all, so its own warnings never reach the caller and
+/// the document comes back with an empty `tables` list indistinguishable from a PDF that
+/// genuinely has none. ~keep
+///
+/// Module-scoped (rather than nested inside `extract_all_from_native_document`) so
+/// `mod tests` below can exercise its message format directly — see
+/// `table_stage_failure_warning_formats_the_message_it_promises`.
+fn table_stage_failure_warning(stage: &str, error: &impl std::fmt::Display) -> crate::types::ProcessingWarning {
+    crate::types::ProcessingWarning {
+        source: std::borrow::Cow::Borrowed("pdf_tables"),
+        message: std::borrow::Cow::Owned(format!(
+            "{stage} table extraction failed for the document: {error}; \
+             tables from this pass were skipped"
+        )),
+    }
+}
+
+#[cfg(feature = "pdf")]
+fn retain_segments_inside_page_margins(
+    segments: &mut Vec<crate::pdf::hierarchy::SegmentData>,
+    page_bottom: f32,
+    page_top: f32,
+    margins: crate::pdf::native::text::PageMarginFractions,
+) {
+    segments.retain(|segment| {
+        crate::pdf::native::text::baseline_is_inside_page_margins(segment.baseline_y, page_bottom, page_top, margins)
+    });
+}
+
+/// Extract text, metadata, tables, and annotations from a PDF document using the xberg_native_pdf backend.
+///
+/// Accepts an authenticated `NativeDocument`, then delegates to each native extraction module.
 /// The return type is `PdfExtractionPhaseResult` so callers can switch transparently between
 /// backends.
 ///
@@ -65,12 +114,12 @@ fn needs_structured_extraction(hierarchy_enabled: bool, output_format: &OutputFo
 /// - With the `layout-detection` feature, layout images, per-page layout results, the configured
 ///   table model and table-overlap preference, and the resolved layout acceleration are threaded
 ///   into `SegmentStructureConfig`; layout hints additionally drive reading-order reordering.
-/// - When output format is Markdown/Djot/HTML, the oxide hierarchy module extracts font
+/// - When output format is Markdown/Djot/HTML, the native hierarchy module extracts font
 ///   metrics and feeds them into the backend-agnostic structure pipeline for heading detection.
 /// - Font encoding issue detection is not available; the flag is always `false`.
 #[cfg(feature = "pdf")]
-pub(crate) fn extract_all_from_oxide_document(
-    mut doc: crate::pdf::oxide::OxideDocument,
+pub(crate) fn extract_all_from_native_document(
+    mut doc: crate::pdf::native::NativeDocument,
     config: &ExtractionConfig,
     outline_entries: &[crate::pdf::bookmarks::PdfOutlineEntry],
     layout_hints: Option<&[Vec<crate::pdf::structure::types::LayoutHint>]>,
@@ -82,13 +131,14 @@ pub(crate) fn extract_all_from_oxide_document(
         &crate::core::config::acceleration::AccelerationConfig,
     >,
 ) -> Result<PdfExtractionPhaseResult> {
-    let _span = tracing::debug_span!("extract_pdf_oxide").entered();
+    let _span = tracing::debug_span!("extract_xberg_native_pdf").entered();
+    let margins = crate::pdf::native::text::PageMarginFractions::from_extraction_config(Some(config));
 
     #[cfg_attr(not(feature = "layout-detection"), allow(unused_mut))]
     let (mut native_text, mut boundaries, mut page_contents, mut pdf_metadata) =
-        crate::pdf::oxide::text::extract_text_and_metadata(&mut doc, Some(config)).map_err(|e| {
+        crate::pdf::native::text::extract_text_and_metadata(&mut doc, Some(config)).map_err(|e| {
             crate::error::XbergError::Parsing {
-                message: format!("pdf_oxide text extraction failed: {e}"),
+                message: format!("xberg_native_pdf text extraction failed: {e}"),
                 source: None,
             }
         })?;
@@ -97,7 +147,7 @@ pub(crate) fn extract_all_from_oxide_document(
     if config.pdf_options.as_ref().is_some_and(|opts| opts.reading_order)
         && let Some(hints) = layout_hints
     {
-        match apply_reading_order_reordering(&mut doc, &native_text, hints, config.pages.as_ref()) {
+        match apply_reading_order_reordering(&mut doc, &native_text, hints, config.pages.as_ref(), margins) {
             Ok((reordered, reordered_boundaries, reordered_per_page)) => {
                 native_text = reordered;
                 // Reordering rebuilds the text, so boundaries computed against
@@ -132,26 +182,15 @@ pub(crate) fn extract_all_from_oxide_document(
         .pdf_options
         .as_ref()
         .is_some_and(|options| options.hierarchy.as_ref().is_some_and(|hierarchy| hierarchy.enabled));
-    let needs_structured = needs_structured_extraction(hierarchy_enabled, &config.output_format, ocr_inline_images);
+    let needs_structured = needs_structured_extraction(
+        hierarchy_enabled,
+        &config.output_format,
+        ocr_inline_images,
+        config.content_filter.is_some(),
+    );
     let retain_hierarchy_segments = needs_structured && !config.force_ocr;
 
     let mut extraction_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
-
-    /// Report a table-extraction failure that took out a whole detector pass, not just one page.
-    ///
-    /// The per-page warnings in `pdf::oxide::table` cannot cover these: a stage that fails or
-    /// panics outright returns no pages at all, so its own warnings never reach the caller and
-    /// the document comes back with an empty `tables` list indistinguishable from a PDF that
-    /// genuinely has none. ~keep
-    fn table_stage_failure_warning(stage: &str, error: &impl std::fmt::Display) -> crate::types::ProcessingWarning {
-        crate::types::ProcessingWarning {
-            source: std::borrow::Cow::Borrowed("pdf_tables"),
-            message: std::borrow::Cow::Owned(format!(
-                "{stage} table extraction failed for the document: {error}; \
-                 tables from this pass were skipped"
-            )),
-        }
-    }
 
     let extract_tables_flag = config.pdf_options.as_ref().is_none_or(|opts| opts.extract_tables);
     let allow_single_column = config
@@ -159,29 +198,29 @@ pub(crate) fn extract_all_from_oxide_document(
         .as_ref()
         .is_some_and(|o| o.allow_single_column_tables);
     let (tables, mut extracted_hierarchy_segments, table_warnings) = if extract_tables_flag {
-        crate::pdf::oxide::guard_oxide_panic(
+        crate::pdf::native::guard_native_panic(
             || -> Result<(
                 Vec<Table>,
-                Option<crate::pdf::oxide::table::ExtractedHierarchySegments>,
+                Option<crate::pdf::native::table::ExtractedHierarchySegments>,
                 Vec<crate::types::ProcessingWarning>,
             )> {
                 let mut warnings = Vec::new();
                 let (mut combined, native_warnings) =
-                    crate::pdf::oxide::table::extract_tables_native(&mut doc).unwrap_or_else(|e| {
-                        tracing::warn!("pdf_oxide native table extraction failed, skipping tables: {e}");
+                    crate::pdf::native::table::extract_tables_native(&mut doc).unwrap_or_else(|e| {
+                        tracing::warn!("xberg_native_pdf native table extraction failed, skipping tables: {e}");
                         (Vec::new(), vec![table_stage_failure_warning("native", &e)])
                     });
                 warnings.extend(native_warnings);
                 let native_pages: std::collections::HashSet<u32> = combined.iter().map(|t| t.page_number).collect();
                 let (bordered, bordered_warnings) =
-                    crate::pdf::oxide::table::extract_tables_bordered(&mut doc, &native_pages).unwrap_or_else(|e| {
-                        tracing::warn!("pdf_oxide bordered table extraction failed, skipping tables: {e}");
+                    crate::pdf::native::table::extract_tables_bordered(&mut doc, &native_pages).unwrap_or_else(|e| {
+                        tracing::warn!("xberg_native_pdf bordered table extraction failed, skipping tables: {e}");
                         (Vec::new(), vec![table_stage_failure_warning("bordered", &e)])
                     });
                 combined.extend(bordered);
                 warnings.extend(bordered_warnings);
                 let covered_pages: std::collections::HashSet<u32> = combined.iter().map(|t| t.page_number).collect();
-                let hierarchy_segments = match crate::pdf::oxide::table::extract_tables_heuristic(
+                let hierarchy_segments = match crate::pdf::native::table::extract_tables_heuristic(
                     &mut doc,
                     allow_single_column,
                     &covered_pages,
@@ -191,7 +230,7 @@ pub(crate) fn extract_all_from_oxide_document(
                         retain_hierarchy_segments.then_some(extraction.hierarchy_segments)
                     }
                     Err(error) => {
-                        tracing::warn!("pdf_oxide heuristic table extraction failed, skipping tables: {error}");
+                        tracing::warn!("xberg_native_pdf heuristic table extraction failed, skipping tables: {error}");
                         warnings.push(table_stage_failure_warning("heuristic", &error));
                         None
                     }
@@ -207,12 +246,12 @@ pub(crate) fn extract_all_from_oxide_document(
                 Ok((combined, hierarchy_segments, warnings))
             },
             |panic| crate::error::XbergError::Parsing {
-                message: format!("pdf_oxide panicked during table extraction: {panic}"),
+                message: format!("xberg_native_pdf panicked during table extraction: {panic}"),
                 source: None,
             },
         )
         .unwrap_or_else(|e| {
-            tracing::warn!("pdf_oxide table extraction panicked, skipping tables: {e}");
+            tracing::warn!("xberg_native_pdf table extraction panicked, skipping tables: {e}");
             (Vec::new(), None, vec![table_stage_failure_warning("whole-document", &e)])
         })
     } else {
@@ -221,7 +260,7 @@ pub(crate) fn extract_all_from_oxide_document(
     extraction_warnings.extend(table_warnings);
 
     let annotations = if config.pdf_options.as_ref().is_some_and(|opts| opts.extract_annotations) {
-        let (extracted, annotation_warnings) = crate::pdf::oxide::annotations::extract_annotations(&mut doc);
+        let (extracted, annotation_warnings) = crate::pdf::native::annotations::extract_annotations(&mut doc);
         extraction_warnings.extend(annotation_warnings);
         if extracted.is_empty() { None } else { Some(extracted) }
     } else {
@@ -234,9 +273,9 @@ pub(crate) fn extract_all_from_oxide_document(
     let (images, image_positions) = if images_extraction_enabled || ocr_inline_images {
         let max_images = config.images.as_ref().and_then(|i| i.max_images_per_page);
         let (extracted, image_warnings) =
-            crate::pdf::oxide::images::extract_images_with_data(&mut doc, max_images, config.cancel_token.as_ref())
+            crate::pdf::native::images::extract_images_with_data(&mut doc, max_images, config.cancel_token.as_ref())
                 .map_err(|e| crate::error::XbergError::Parsing {
-                    message: format!("pdf_oxide image extraction failed: {e}"),
+                    message: format!("xberg_native_pdf image extraction failed: {e}"),
                     source: None,
                 })?;
         extraction_warnings.extend(image_warnings);
@@ -255,12 +294,7 @@ pub(crate) fn extract_all_from_oxide_document(
     }
 
     let pre_rendered_doc = if needs_structured && !config.force_ocr {
-        let k = config
-            .pdf_options
-            .as_ref()
-            .and_then(|opts| opts.hierarchy.as_ref())
-            .map(|h| h.k_clusters)
-            .unwrap_or(4);
+        let k = hierarchy_cluster_count(config);
 
         // `HierarchyConfig::include_bbox` (default `true`): when explicitly disabled,
         // bounding-box info is stripped from every structural element below so
@@ -273,7 +307,7 @@ pub(crate) fn extract_all_from_oxide_document(
             .map(|h| h.include_bbox)
             .unwrap_or(true);
 
-        let (strip_repeating_text, include_headers, include_footers, include_footnotes) = config
+        let (strip_repeating_text, include_headers, include_footers, include_footnotes, include_watermarks) = config
             .content_filter
             .as_ref()
             .map(|cf| {
@@ -282,26 +316,41 @@ pub(crate) fn extract_all_from_oxide_document(
                     cf.include_headers,
                     cf.include_footers,
                     cf.include_footnotes,
+                    cf.include_watermarks,
                 )
             })
-            .unwrap_or((true, false, false, false));
+            .unwrap_or((true, false, false, false, false));
 
-        let (all_page_segments, used_structure_tree) = match extracted_hierarchy_segments.take() {
+        let (mut all_page_segments, used_structure_tree) = match extracted_hierarchy_segments.take() {
             Some(segments) => (segments.pages, segments.used_structure_tree),
-            None => crate::pdf::oxide::hierarchy::extract_all_segments(&mut doc).map_err(|e| {
+            None => crate::pdf::native::hierarchy::extract_all_segments(&mut doc).map_err(|e| {
                 crate::error::XbergError::Parsing {
-                    message: format!("pdf_oxide hierarchy extraction failed: {e}"),
+                    message: format!("xberg_native_pdf hierarchy extraction failed: {e}"),
                     source: None,
                 }
             })?,
         };
+
+        for (page_index, segments) in all_page_segments.iter_mut().enumerate() {
+            let (_, lower_y, _, upper_y) =
+                doc.doc
+                    .get_page_media_box(page_index)
+                    .map_err(|error| crate::error::XbergError::Parsing {
+                        message: format!(
+                            "xberg_native_pdf failed to read page {} media box for margin filtering: {error}",
+                            page_index + 1
+                        ),
+                        source: None,
+                    })?;
+            retain_segments_inside_page_margins(segments, lower_y.min(upper_y), lower_y.max(upper_y), margins);
+        }
 
         let total_segs: usize = all_page_segments.iter().map(|s| s.len()).sum();
         tracing::debug!(
             total_segs,
             k,
             used_structure_tree,
-            "oxide structure: extracted segments for heading detection"
+            "native structure: extracted segments for heading detection"
         );
 
         let inject_placeholders =
@@ -317,6 +366,7 @@ pub(crate) fn extract_all_from_oxide_document(
                 include_headers,
                 include_footers,
                 include_footnotes,
+                include_watermarks,
                 used_structure_tree,
                 image_positions: &image_positions,
                 images: images.as_deref(),
@@ -351,7 +401,7 @@ pub(crate) fn extract_all_from_oxide_document(
                         .elements
                         .iter()
                         .any(|e| matches!(e.kind, crate::types::internal::ElementKind::Heading { .. })),
-                    "oxide structure: render succeeded"
+                    "native structure: render succeeded"
                 );
                 if !include_bbox {
                     for element in &mut structured_doc.elements {
@@ -361,11 +411,14 @@ pub(crate) fn extract_all_from_oxide_document(
                 Some(structured_doc)
             }
             Ok(_) => {
-                tracing::warn!("oxide structure: rendering produced empty output, falling back to plain text");
+                tracing::warn!("native structure: rendering produced empty output, falling back to plain text");
                 None
             }
             Err(e) => {
-                tracing::warn!("oxide structure: rendering failed: {:?}, falling back to plain text", e);
+                tracing::warn!(
+                    "native structure: rendering failed: {:?}, falling back to plain text",
+                    e
+                );
                 None
             }
         }
@@ -376,7 +429,7 @@ pub(crate) fn extract_all_from_oxide_document(
     let has_font_encoding_issues = false;
 
     let form_fields = if config.pdf_options.as_ref().is_none_or(|opts| opts.extract_form_fields) {
-        let (fields, form_warnings) = crate::pdf::oxide::forms::extract_form_fields(&mut doc);
+        let (fields, form_warnings) = crate::pdf::native::forms::extract_form_fields(&mut doc);
         extraction_warnings.extend(form_warnings);
         fields
     } else {
@@ -386,7 +439,7 @@ pub(crate) fn extract_all_from_oxide_document(
     // Issue #66: `/PageLabels` (roman-numeral front matter, per-section
     // numbering, ...). `None` when the document defines none, which is the
     // common case.
-    let page_labels = crate::pdf::oxide::metadata::extract_page_labels_all(&mut doc).unwrap_or_else(|e| {
+    let page_labels = crate::pdf::native::metadata::extract_page_labels_all(&mut doc).unwrap_or_else(|e| {
         tracing::debug!("page label extraction failed: {e}");
         None
     });
@@ -424,10 +477,11 @@ pub(crate) fn extract_all_from_oxide_document(
 /// document text and would otherwise keep the original, unreordered text.
 #[cfg(feature = "layout-detection")]
 fn apply_reading_order_reordering(
-    doc: &mut crate::pdf::oxide::OxideDocument,
+    doc: &mut crate::pdf::native::NativeDocument,
     native_text: &str,
     layout_hints_per_page: &[Vec<crate::pdf::structure::types::LayoutHint>],
     page_config: Option<&crate::core::config::PageConfig>,
+    margins: crate::pdf::native::text::PageMarginFractions,
 ) -> Result<(String, Vec<crate::types::PageBoundary>, Vec<String>)> {
     use crate::extractors::pdf::reading_order;
 
@@ -451,7 +505,7 @@ fn apply_reading_order_reordering(
 
     for (page_idx, hints) in layout_hints_per_page.iter().enumerate().take(page_count) {
         let (spans, reordered_sparse_columns) =
-            crate::pdf::oxide::text::extract_spans_from_page(&mut doc.doc, page_idx).map_err(|e| {
+            crate::pdf::native::text::extract_spans_from_page(&mut doc.doc, page_idx, margins).map_err(|e| {
                 crate::error::XbergError::Parsing {
                     message: format!(
                         "reading-order reordering: failed to extract spans from page {}: {e}",
@@ -483,7 +537,7 @@ fn apply_reading_order_reordering(
 ///
 /// `PageContent` is built independently of the joined `native_text`/
 /// `boundaries` returned by `extract_text_and_metadata`'s own per-page split
-/// (see `extract_text_from_oxide_document` in `pdf/oxide/text.rs`), so
+/// (see `extract_text_from_native_document` in `pdf/native/text.rs`), so
 /// reordering only the joined document text — as `apply_reading_order_reordering`
 /// used to do before this patch existed — left every page's own `content`
 /// field stuck with the original, unreordered per-page text. GH#1358: this is
@@ -510,7 +564,7 @@ fn apply_reordered_text_to_page_contents(
 }
 
 /// Join per-page texts, recording each page's byte range in the combined
-/// string, faithful to how `extract_text_from_oxide_document` assembles it:
+/// string, faithful to how `extract_text_from_native_document` assembles it:
 /// a rendered page marker before each page when `insert_page_markers` is on,
 /// otherwise `"\n\n"` separators between pages. Markers and separators belong
 /// to no page.
@@ -542,19 +596,100 @@ fn join_pages_with_boundaries(
 
 #[cfg(test)]
 mod tests {
-    use super::needs_structured_extraction;
+    use super::{
+        hierarchy_cluster_count, needs_structured_extraction, retain_segments_inside_page_margins,
+        table_stage_failure_warning,
+    };
     use crate::core::config::OutputFormat;
+
+    #[test]
+    fn should_use_public_hierarchy_default_for_implicit_structure() {
+        let config = crate::core::config::ExtractionConfig::default();
+
+        assert_eq!(
+            hierarchy_cluster_count(&config),
+            crate::core::config::HierarchyConfig::default().k_clusters
+        );
+    }
+
+    #[test]
+    fn should_filter_reused_hierarchy_segments_by_page_margins() {
+        let segment = |text: &str, baseline_y: f32| crate::pdf::hierarchy::SegmentData {
+            text: text.to_string(),
+            x: 20.0,
+            y: baseline_y,
+            width: 100.0,
+            height: 10.0,
+            font_size: 10.0,
+            is_bold: false,
+            is_italic: false,
+            is_monospace: false,
+            baseline_y,
+            rotation_degrees: 0.0,
+            assigned_role: None,
+        };
+        let mut segments = vec![
+            segment("header", 1000.01),
+            segment("top boundary", 1000.0),
+            segment("body", 500.0),
+            segment("bottom boundary", 150.0),
+            segment("footer", 149.99),
+        ];
+
+        retain_segments_inside_page_margins(
+            &mut segments,
+            100.0,
+            1100.0,
+            crate::pdf::native::text::PageMarginFractions {
+                top: 0.10,
+                bottom: 0.05,
+            },
+        );
+
+        assert_eq!(
+            segments.iter().map(|segment| segment.text.as_str()).collect::<Vec<_>>(),
+            ["top boundary", "body", "bottom boundary"]
+        );
+    }
+
+    /// Characterises `table_stage_failure_warning`'s message format only — it constructs the
+    /// error directly rather than driving a real xberg_native_pdf failure, so it does NOT prove any
+    /// table-extraction pass can fail or panic. That coverage used to live in
+    /// `crates/xberg/tests/issue_603_pdf_table_stage_failure_warning.rs` as
+    /// `should_emit_pdf_tables_warning_when_whole_document_table_pass_panics`, driven through the
+    /// public API against `test_documents/pdf/total_order_panic_1198_tables_path.pdf`. That
+    /// fixture stopped panicking once the `xberg-native` fork picked up upstream commit
+    /// `9b0f9c99` ("Fix reading-order sort panics on scanned/malformed PDFs (#807)"), which
+    /// replaced the non-transitive pairwise tategaki column comparator with
+    /// `sort_vertical_tategaki`, a genuine total order — `9b0f9c99` is an ancestor of the
+    /// `xberg-native` 1.0.1 version this crate now consumes. No fixture in `test_documents/`
+    /// still reaches a real `xberg_native_pdf` panic through the table-detection stage, so the old test
+    /// asserted a panic-recovery warning against code that no longer panics. Do not re-add a
+    /// test that asserts a panic on this fixture.
+    #[test]
+    fn table_stage_failure_warning_formats_the_message_it_promises() {
+        let cause = "xberg_native_pdf panicked during table extraction: boom";
+        let warning = table_stage_failure_warning("whole-document", &cause);
+
+        assert_eq!(warning.source, "pdf_tables");
+        let message = warning.message.as_ref();
+        assert_eq!(
+            message,
+            "whole-document table extraction failed for the document: xberg_native_pdf panicked during table \
+             extraction: boom; tables from this pass were skipped"
+        );
+    }
 
     /// Regression test for the defective `Custom(_)` catch-all shipped in #1388:
     /// `OutputFormat::FromStr` never rejects an unknown string, so a typo like
-    /// `Custom("markdwon")` must not trigger the expensive oxide hierarchy pass —
+    /// `Custom("markdwon")` must not trigger the expensive native hierarchy pass —
     /// it can only ever fall back to plain text (`custom_fallback_to_plain` in
     /// `core/pipeline/format.rs`), so running the full structure pass for it was
     /// pure waste.
     #[test]
     fn should_not_trigger_structured_extraction_for_unregistered_custom_format() {
         let output_format = OutputFormat::Custom("markdwon".to_string());
-        assert!(!needs_structured_extraction(false, &output_format, false));
+        assert!(!needs_structured_extraction(false, &output_format, false, false));
     }
 
     /// `DocTags` is a real, always-registered built-in renderer (see
@@ -562,32 +697,36 @@ mod tests {
     /// geometry/headings as Markdown, Djot, and HTML.
     #[test]
     fn should_trigger_structured_extraction_for_doctags_format() {
-        assert!(needs_structured_extraction(false, &OutputFormat::DocTags, false));
+        assert!(needs_structured_extraction(false, &OutputFormat::DocTags, false, false));
     }
 
     /// The pre-existing markup formats must keep triggering the structured path.
     #[test]
     fn should_trigger_structured_extraction_for_markdown_djot_and_html() {
-        assert!(needs_structured_extraction(false, &OutputFormat::Markdown, false));
-        assert!(needs_structured_extraction(false, &OutputFormat::Djot, false));
-        assert!(needs_structured_extraction(false, &OutputFormat::Html, false));
+        assert!(needs_structured_extraction(
+            false,
+            &OutputFormat::Markdown,
+            false,
+            false
+        ));
+        assert!(needs_structured_extraction(false, &OutputFormat::Djot, false, false));
+        assert!(needs_structured_extraction(false, &OutputFormat::Html, false, false));
     }
 
-    /// `Plain`, `Json`, and `Structured` must not trigger the structured path on
-    /// their own — only `hierarchy_enabled` or `ocr_inline_images` can force it.
+    /// `Plain` and `Json` must not trigger the structured path on their own.
     #[test]
-    fn should_not_trigger_structured_extraction_for_plain_json_or_structured() {
-        assert!(!needs_structured_extraction(false, &OutputFormat::Plain, false));
-        assert!(!needs_structured_extraction(false, &OutputFormat::Json, false));
-        assert!(!needs_structured_extraction(false, &OutputFormat::Structured, false));
+    fn should_not_trigger_structured_extraction_for_plain_or_json() {
+        assert!(!needs_structured_extraction(false, &OutputFormat::Plain, false, false));
+        assert!(!needs_structured_extraction(false, &OutputFormat::Json, false, false));
     }
 
-    /// `hierarchy_enabled` and `ocr_inline_images` must force the structured path
-    /// regardless of output format.
+    /// Hierarchy, inline-image OCR, and explicit content filtering require the
+    /// structured path regardless of output format.
     #[test]
-    fn should_trigger_structured_extraction_when_hierarchy_or_ocr_inline_images_enabled() {
-        assert!(needs_structured_extraction(true, &OutputFormat::Plain, false));
-        assert!(needs_structured_extraction(false, &OutputFormat::Plain, true));
+    fn should_trigger_structured_extraction_when_structure_dependent_options_are_enabled() {
+        assert!(needs_structured_extraction(true, &OutputFormat::Plain, false, false));
+        assert!(needs_structured_extraction(false, &OutputFormat::Plain, true, false));
+        assert!(needs_structured_extraction(false, &OutputFormat::Plain, false, true));
     }
 
     #[cfg(feature = "layout-detection")]
@@ -625,7 +764,7 @@ mod tests {
 
     /// Regression test for GH#1358: `pages[].content` is a per-page assembly
     /// built independently of the joined document text (see
-    /// `extract_text_and_metadata`'s own page split in `pdf/oxide/text.rs`),
+    /// `extract_text_and_metadata`'s own page split in `pdf/native/text.rs`),
     /// so a fix that only reorders the joined text — leaving this wiring
     /// out — cannot repair rotated-text scrambling reported through the
     /// per-page API. This asserts each `PageContent::content` takes the
@@ -649,6 +788,7 @@ mod tests {
                 speaker_notes: None,
                 section_name: None,
                 sheet_name: None,
+                image_preprocessing: None,
             },
             PageContent {
                 page_number: 2,
@@ -661,6 +801,7 @@ mod tests {
                 speaker_notes: None,
                 section_name: None,
                 sheet_name: None,
+                image_preprocessing: None,
             },
         ]);
         let reordered_per_page = vec![

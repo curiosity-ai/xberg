@@ -29,9 +29,7 @@
 //! ```
 
 #[cfg(feature = "tokio-runtime")]
-pub mod batch_mode;
-#[cfg(feature = "tokio-runtime")]
-pub mod batch_optimizations;
+pub(crate) mod batch_mode;
 pub mod config;
 pub mod config_validation;
 // Unconditional: every extractor that reports partial extraction goes through
@@ -39,10 +37,10 @@ pub mod config_validation;
 pub(crate) mod diagnostics;
 pub mod extract;
 pub(crate) mod extractor;
-pub mod formats;
+pub(crate) mod formats;
 #[cfg(feature = "image-encode")]
 pub(crate) mod image_encode;
-pub mod io;
+pub(crate) mod io;
 pub mod mime;
 pub(crate) mod path_resolver;
 pub mod pipeline;
@@ -63,8 +61,6 @@ pub use config::{
 #[cfg(feature = "api-types")]
 pub use server_config::ServerConfig;
 
-#[cfg(feature = "tokio-runtime")]
-pub use batch_optimizations::{BatchProcessor, BatchProcessorConfig};
 #[cfg(feature = "pdf")]
 pub use config::PdfConfig;
 pub use extract::{extract, extract_batch};

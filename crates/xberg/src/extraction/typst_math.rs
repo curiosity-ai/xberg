@@ -101,9 +101,46 @@ const SYMBOLS: &[(&str, &str)] = &[
 
 /// Greek letter names, which Typst and LaTeX spell the same way.
 const GREEK: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu", "nu", "xi",
-    "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega", "varepsilon", "vartheta", "varphi",
-    "varrho", "varsigma", "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi", "Psi", "Omega",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "mu",
+    "nu",
+    "xi",
+    "omicron",
+    "pi",
+    "rho",
+    "sigma",
+    "tau",
+    "upsilon",
+    "phi",
+    "chi",
+    "psi",
+    "omega",
+    "varepsilon",
+    "vartheta",
+    "varphi",
+    "varrho",
+    "varsigma",
+    "Gamma",
+    "Delta",
+    "Theta",
+    "Lambda",
+    "Xi",
+    "Pi",
+    "Sigma",
+    "Upsilon",
+    "Phi",
+    "Psi",
+    "Omega",
 ];
 
 /// Function names that wrap their single argument in a LaTeX command.
@@ -175,7 +212,11 @@ fn render_children(node: &SyntaxNode) -> String {
 /// than appearing in it.
 fn group(node: &SyntaxNode) -> String {
     let inner = group_inner(node);
-    if inner.chars().count() == 1 { inner } else { format!("{{{inner}}}") }
+    if inner.chars().count() == 1 {
+        inner
+    } else {
+        format!("{{{inner}}}")
+    }
 }
 
 /// Render a node as a braced LaTeX argument.
@@ -239,7 +280,11 @@ fn render_root(node: &SyntaxNode) -> String {
         .collect();
     match parts.as_slice() {
         [radicand] => format!("\\sqrt{}", braced(radicand)),
-        [degree, radicand] => format!("\\sqrt[{}]{}", collapse_spaces(&render(degree)).trim(), braced(radicand)),
+        [degree, radicand] => format!(
+            "\\sqrt[{}]{}",
+            collapse_spaces(&render(degree)).trim(),
+            braced(radicand)
+        ),
         _ => render_children(node),
     }
 }
@@ -413,8 +458,6 @@ fn escape_text(text: &str) -> String {
     out
 }
 
-
-
 /// Collapse runs of whitespace, which the walk emits freely around commands.
 fn collapse_spaces(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -535,6 +578,9 @@ mod tests {
     #[test]
     fn test_output_escapes_structural_characters() {
         let latex = convert_typst_math_to_latex("\"a $ b # c % d\"");
-        assert!(latex.contains("\\$") && latex.contains("\\#") && latex.contains("\\%"), "got: {latex}");
+        assert!(
+            latex.contains("\\$") && latex.contains("\\#") && latex.contains("\\%"),
+            "got: {latex}"
+        );
     }
 }

@@ -97,7 +97,7 @@ Extract text from uploaded files via multipart form data.
 | --------------- | ---------------- | ------------------------------------------------ |
 | `files`         | Yes (repeatable) | Files to extract                                 |
 | `config`        | No               | JSON config overrides                            |
-| `output_format` | No               | `plain` (default), `markdown`, `djot`, or `html` |
+| `output_format` | No               | `plain` (default), `markdown`, `djot`, `html`, `json`, or `doctags` |
 
 ```bash title="Terminal"
 # Single file
@@ -173,8 +173,8 @@ curl http://localhost:8000/jobs/550e8400-e29b-41d4-a716-446655440000
 
 | Endpoint          | Method | Description                                                               |
 | ----------------- | ------ | ------------------------------------------------------------------------- |
-| `/health`         | GET    | `{"status":"healthy","version":"1.0.0-rc.14"}`                            |
-| `/version`        | GET    | `{"version":"1.0.0-rc.14"}`                                               |
+| `/health`         | GET    | `{"status":"healthy","version":"<current-version>"}`                   |
+| `/version`        | GET    | `{"version":"<current-version>"}`                                        |
 | `/detect`         | POST   | MIME type detection (multipart)                                           |
 | `/formats`        | GET    | List supported formats                                                   |
 | `/cache/stats`    | GET    | Cache statistics                                                          |

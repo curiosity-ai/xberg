@@ -7,7 +7,7 @@ Future<void> main() async {
       kind: ExtractInputKind.uri,
       uri: 'document.pdf',
     ),
-    await createExtractionConfigFromJson(json: '{}'),
+    config: await createExtractionConfigFromJson(json: '{}'),
   );
 
   print(output.results.first.content);

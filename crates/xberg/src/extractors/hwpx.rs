@@ -21,6 +21,17 @@ use crate::types::internal_builder::InternalDocumentBuilder;
 /// `ProcessingWarning::source` for every warning this extractor emits (#171).
 const HWPX_WARNING_SOURCE: &str = "hwpx";
 
+/// Maximum bytes read from a single HWPX zip member's section XML.
+///
+/// `ZipBombValidator::validate` (called before any member is read) only checks
+/// the *declared* compressed/uncompressed sizes and ratio from the zip central
+/// directory -- it never decompresses. A crafted entry can under-declare its
+/// size while its deflate stream expands far past that declaration, so the
+/// entry's declared size cannot be trusted as an upper bound on what reading it
+/// actually produces. Bounding the read itself with `Read::take` (the same
+/// pattern as `odt::MAX_ODT_MEMBER_SIZE`) is what actually caps memory.
+const MAX_HWPX_MEMBER_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Extractor for Hangul Word Processor XML (.hwpx) files.
 ///
 /// Supports HWPX (Open HWPML), the ZIP-based XML successor to the binary HWP 5.0 format.
@@ -127,7 +138,7 @@ fn collect_section_formulas<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) ->
         if archive
             .by_name(&name)
             .ok()
-            .and_then(|mut part| part.read_to_string(&mut xml).ok())
+            .and_then(|part| part.take(MAX_HWPX_MEMBER_SIZE).read_to_string(&mut xml).ok())
             .is_none()
         {
             continue;
@@ -154,7 +165,7 @@ fn collect_section_formulas<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) ->
                     _ => {}
                 },
                 Ok(Event::Text(t)) if in_script => {
-                    script.push_str(&String::from_utf8_lossy(t.as_ref()));
+                    script.push_str(&std::borrow::Cow::Borrowed(t.as_ref()));
                 }
                 Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
                     "tbl" => table_depth = table_depth.saturating_sub(1),
@@ -197,11 +208,10 @@ fn section_index_of(name: &str) -> Option<usize> {
 }
 
 /// Return the local part of a possibly prefixed XML qualified name.
-fn local_name(qname: &[u8]) -> &str {
-    let name = std::str::from_utf8(qname).unwrap_or("");
-    match name.rsplit_once(':') {
+fn local_name(qname: &str) -> &str {
+    match qname.rsplit_once(':') {
         Some((_, local)) => local,
-        None => name,
+        None => qname,
     }
 }
 
@@ -659,8 +669,9 @@ mod tests {
         doc.sections.push(section);
 
         // The equation sits in the third paragraph, which is ordinal 2.
-        let scanned: AHashMap<usize, Vec<(usize, String)>> =
-            [(2usize, vec![(2usize, "\\frac{a}{b}".to_string())])].into_iter().collect();
+        let scanned: AHashMap<usize, Vec<(usize, String)>> = [(2usize, vec![(2usize, "\\frac{a}{b}".to_string())])]
+            .into_iter()
+            .collect();
         let internal = build_hwpx_internal_document(doc, "application/haansofthwpx", &scanned);
 
         let kinds: Vec<&ElementKind> = internal.elements.iter().map(|e| &e.kind).collect();
@@ -684,7 +695,10 @@ mod tests {
 
         let found = scan(&hwpx_package(&[("Contents/section0.xml", xml)]));
 
-        assert_eq!(found.get(&0).map(Vec::as_slice), Some(&[(1usize, "\\frac{a}{b}".to_string())][..]));
+        assert_eq!(
+            found.get(&0).map(Vec::as_slice),
+            Some(&[(1usize, "\\frac{a}{b}".to_string())][..])
+        );
     }
 
     /// `&amp;` separates the columns of a matrix, so a reader that drops entity
@@ -701,11 +715,44 @@ mod tests {
         // Compare against the script with its references already resolved. A
         // reader that drops them converts `1 &amp; 2` as `1 2`, which differs.
         let expected = unhwp::equation::to_latex("bmatrix { 1 & 2 # 3 & 4 }");
-        assert_eq!(latex, expected.trim(), "the scan must resolve `&amp;` before conversion");
+        assert_eq!(
+            latex,
+            expected.trim(),
+            "the scan must resolve `&amp;` before conversion"
+        );
         assert_ne!(
             latex,
             unhwp::equation::to_latex("bmatrix { 1  2 # 3  4 }").trim(),
             "a dropped reference must not produce the same LaTeX"
+        );
+    }
+
+    /// `ZipBombValidator::validate` only checks the *declared* central-directory
+    /// sizes; it never decompresses. `collect_section_formulas` must bound its own
+    /// read of a member's content with `Read::take(MAX_HWPX_MEMBER_SIZE)` rather
+    /// than trusting the declared size, or a section whose entry decompresses to
+    /// far more than declared can still exhaust memory. An XML comment (ignored by
+    /// the parser, so it does not disturb element nesting) padded past the cap
+    /// proves the bound: an equation entirely before the cap is found, one that
+    /// only starts after it is not, and the scan completes without hanging or
+    /// panicking on the oversized member.
+    #[test]
+    fn test_scan_bounds_the_read_of_an_oversized_section_member() {
+        let before = r#"<hp:p><hp:run><hp:equation><hp:script>a OVER b</hp:script></hp:equation></hp:run></hp:p>"#;
+        let padding = "x".repeat(MAX_HWPX_MEMBER_SIZE as usize + 4096);
+        let after = r#"<hp:p><hp:run><hp:equation><hp:script>p OVER q</hp:script></hp:equation></hp:run></hp:p>"#;
+        let xml = format!(
+            "<hs:sec xmlns:hp=\"http://www.hancom.co.kr/hwpml/2011/paragraph\">{before}<!--{padding}-->{after}</hs:sec>"
+        );
+
+        let found = scan(&hwpx_package(&[("Contents/section0.xml", &xml)]));
+
+        let formulas = found.get(&0).expect("the equation before the cap is found");
+        assert_eq!(
+            formulas.as_slice(),
+            &[(0usize, "\\frac{a}{b}".to_string())][..],
+            "only the equation entirely within the first MAX_HWPX_MEMBER_SIZE bytes must be found; \
+             finding the second equation would mean the read was not actually bounded"
         );
     }
 
@@ -743,7 +790,11 @@ mod tests {
 
         let found = scan(&hwpx_package(&[("Contents/section0.xml", xml)]));
 
-        assert_eq!(found.get(&0).map(|f| f[0].0), Some(1), "the equation is in the second paragraph");
+        assert_eq!(
+            found.get(&0).map(|f| f[0].0),
+            Some(1),
+            "the equation is in the second paragraph"
+        );
     }
 
     #[test]
@@ -856,7 +907,9 @@ mod tests {
         doc.sections.push(section);
 
         let section_formulas: AHashMap<usize, Vec<(usize, String)>> =
-            [(0usize, vec![(0usize, "\\frac{a}{b}".to_string())])].into_iter().collect();
+            [(0usize, vec![(0usize, "\\frac{a}{b}".to_string())])]
+                .into_iter()
+                .collect();
         let internal = build_hwpx_internal_document(doc, "application/haansofthwpx", &section_formulas);
 
         let formulas: Vec<&str> = internal
@@ -910,7 +963,9 @@ mod tests {
         doc.sections.push(section);
 
         let section_formulas: AHashMap<usize, Vec<(usize, String)>> =
-            [(0usize, vec![(0usize, "\\frac{a}{b}".to_string())])].into_iter().collect();
+            [(0usize, vec![(0usize, "\\frac{a}{b}".to_string())])]
+                .into_iter()
+                .collect();
         let internal = build_hwpx_internal_document(doc, "application/haansofthwpx", &section_formulas);
 
         let formulas: Vec<&str> = internal

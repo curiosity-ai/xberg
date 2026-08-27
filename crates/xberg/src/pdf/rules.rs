@@ -2,7 +2,7 @@
 //!
 //! Shared by the adaptive layout pre-screen ([`super::layout_gate`], which is
 //! only compiled with the `layout-detection` feature) and the borderless
-//! heuristic table gate in [`super::oxide::table`], which is compiled whenever
+//! heuristic table gate in [`super::native::table`], which is compiled whenever
 //! `pdf` is. It lives here rather than in `layout_gate` so the heuristic gate's
 //! behaviour does not silently change with the `layout-detection` feature — a
 //! table admitted in one build and rejected in another would be worse than
@@ -19,7 +19,7 @@ pub(crate) const RULED_LINE_MIN_LENGTH_PTS: f32 = 20.0;
 /// long. A rule must also be thin (minor bbox dimension within
 /// [`GRID_EDGE_ALIGN_TOLERANCE_PTS`]) so long diagonals on chart-heavy pages
 /// do not count.
-pub(crate) fn count_rules(paths: &[pdf_oxide::elements::PathContent]) -> (usize, usize) {
+pub(crate) fn count_rules(paths: &[xberg_native_pdf::elements::PathContent]) -> (usize, usize) {
     let mut horizontal = 0usize;
     let mut vertical = 0usize;
     for path in paths.iter().filter(|path| path.is_straight_line()) {

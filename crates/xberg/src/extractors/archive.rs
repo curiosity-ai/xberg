@@ -4,10 +4,9 @@ use crate::Result;
 use crate::core::config::ExtractionConfig;
 use crate::extraction::archive::{
     ArchiveMetadata as ExtractedMetadata, extract_7z_file_bytes, extract_7z_metadata, extract_7z_text_content,
-    extract_gzip, extract_gzip_with_bytes, extract_tar_file_bytes, extract_tar_metadata, extract_tar_text_content,
+    extract_gzip_with_bytes, extract_tar_file_bytes, extract_tar_metadata, extract_tar_text_content,
     extract_zip_file_bytes, extract_zip_metadata, extract_zip_text_content,
 };
-use crate::extractors::SyncExtractor;
 use crate::extractors::security::ZipBombValidator;
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
@@ -113,23 +112,6 @@ fn build_archive_doc_inner(
     doc
 }
 
-/// Sync version — no recursive child extraction.
-fn build_archive_doc_sync(
-    extraction_metadata: ExtractedMetadata,
-    text_contents: AHashMap<String, String>,
-    format_name: &'static str,
-    mime_type: &str,
-) -> InternalDocument {
-    build_archive_doc_inner(
-        extraction_metadata,
-        text_contents,
-        format_name,
-        mime_type,
-        Vec::new(),
-        Vec::new(),
-    )
-}
-
 /// Returns true if `path` names an archive/tooling bookkeeping file (macOS `.DS_Store`,
 /// `__MACOSX/` AppleDouble resource forks, `._`-prefixed AppleDouble sidecars, Python
 /// `__pycache__/`/`.pyc`/`.pyo` bytecode, or Windows `Thumbs.db`/`desktop.ini`) rather than
@@ -196,6 +178,20 @@ async fn build_archive_doc(
 
     if config.max_archive_depth > current_depth && !file_bytes.is_empty() {
         for (path, bytes) in &file_bytes {
+            // A timed-out extraction cancels this token (see
+            // `ExtractionConfig::ensure_cancel_token`); each entry launches its own
+            // recursive extraction, so stop starting new ones once cancelled rather
+            // than working through every remaining entry.
+            if config
+                .cancel_token
+                .as_ref()
+                .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+            {
+                let message = "Extraction cancelled; remaining archive entries were not processed".to_string();
+                crate::core::diagnostics::push_warning(&mut processing_warnings, ARCHIVE_WARNING_SOURCE, message);
+                break;
+            }
+
             if is_archive_metadata_path(path) {
                 filtered_paths.push(path.clone());
                 continue;
@@ -226,7 +222,13 @@ async fn build_archive_doc(
             let mut child_config = config.clone();
             child_config.max_archive_depth = config.max_archive_depth.saturating_sub(current_depth + 1);
 
-            match crate::core::extractor::extract_bytes(bytes, &file_mime, &child_config).await {
+            // Boxed: this is the recursive arm (build_archive_doc -> extract_bytes ->
+            // build_archive_doc), so an unboxed child future is stored inline in this
+            // one and every nesting level adds its whole size to the stack frame. A
+            // single nested ZIP was already enough to overflow the stack in a debug
+            // build. Heap-allocating the child keeps the per-level stack cost constant,
+            // matching how every other recursive await in core::extractor is written.
+            match Box::pin(crate::core::extractor::extract_bytes(bytes, &file_mime, &child_config)).await {
                 Ok(result) => {
                     children.push(crate::types::ArchiveEntry {
                         path: path.clone(),
@@ -355,27 +357,6 @@ impl InternalDocumentExtractor for ZipExtractor {
     }
 }
 
-impl SyncExtractor for ZipExtractor {
-    fn extract_sync(&self, content: &[u8], mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
-        let limits = config.security_limits.clone().unwrap_or_default();
-        let cursor = Cursor::new(content);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| crate::error::XbergError::parsing(format!("Failed to read ZIP archive: {}", e)))?;
-        let validator = ZipBombValidator::new(limits.clone());
-        validator
-            .validate(&mut archive)
-            .map_err(|e| crate::error::XbergError::validation(e.to_string()))?;
-
-        let extraction_metadata = extract_zip_metadata(content, &limits)?;
-        let text_contents = extract_zip_text_content(content, &limits)?;
-        Ok(build_archive_doc_sync(
-            extraction_metadata,
-            text_contents,
-            "ZIP",
-            mime_type,
-        ))
-    }
-}
 #[cfg_attr(alef, alef(skip))]
 /// TAR archive extractor.
 ///
@@ -460,19 +441,6 @@ impl InternalDocumentExtractor for TarExtractor {
     }
 }
 
-impl SyncExtractor for TarExtractor {
-    fn extract_sync(&self, content: &[u8], mime_type: &str, _config: &ExtractionConfig) -> Result<InternalDocument> {
-        let limits = _config.security_limits.clone().unwrap_or_default();
-        let extraction_metadata = extract_tar_metadata(content, &limits)?;
-        let text_contents = extract_tar_text_content(content, &limits)?;
-        Ok(build_archive_doc_sync(
-            extraction_metadata,
-            text_contents,
-            "TAR",
-            mime_type,
-        ))
-    }
-}
 #[cfg_attr(alef, alef(skip))]
 /// 7z archive extractor.
 ///
@@ -552,19 +520,6 @@ impl InternalDocumentExtractor for SevenZExtractor {
     }
 }
 
-impl SyncExtractor for SevenZExtractor {
-    fn extract_sync(&self, content: &[u8], mime_type: &str, _config: &ExtractionConfig) -> Result<InternalDocument> {
-        let limits = _config.security_limits.clone().unwrap_or_default();
-        let extraction_metadata = extract_7z_metadata(content, &limits)?;
-        let text_contents = extract_7z_text_content(content, &limits)?;
-        Ok(build_archive_doc_sync(
-            extraction_metadata,
-            text_contents,
-            "7Z",
-            mime_type,
-        ))
-    }
-}
 #[cfg_attr(alef, alef(skip))]
 /// Gzip archive extractor.
 ///
@@ -639,19 +594,6 @@ impl InternalDocumentExtractor for GzipExtractor {
 
     fn priority(&self) -> i32 {
         50
-    }
-}
-
-impl SyncExtractor for GzipExtractor {
-    fn extract_sync(&self, content: &[u8], mime_type: &str, _config: &ExtractionConfig) -> Result<InternalDocument> {
-        let limits = _config.security_limits.clone().unwrap_or_default();
-        let (extraction_metadata, text_contents) = extract_gzip(content, &limits)?;
-        Ok(build_archive_doc_sync(
-            extraction_metadata,
-            text_contents,
-            "GZIP",
-            mime_type,
-        ))
     }
 }
 
@@ -820,6 +762,73 @@ mod tests {
             warning.message.contains("Filtered"),
             "warning message should mention filtering: {}",
             warning.message
+        );
+    }
+
+    /// Regression test for task #709: the per-entry recursive-extraction loop in
+    /// `build_archive_doc` must stop starting new entries once cancellation is
+    /// signalled, instead of working through every remaining entry regardless.
+    ///
+    /// Proves the checkpoint actually stops work (not merely that an error comes
+    /// back elsewhere): the token is cancelled *before* extraction starts, so the
+    /// loop's first-iteration check must break before any of the 3 entries is
+    /// recursively extracted, leaving zero children — against code with the
+    /// checkpoint removed, all 3 entries are still recursed into regardless of
+    /// cancellation, so `children` would be `Some` with 3 entries, not `None`.
+    #[tokio::test]
+    async fn test_zip_extraction_stops_recursing_once_cancelled() {
+        let extractor = ZipExtractor::new();
+
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+            for (name, content) in [("a.txt", "alpha"), ("b.txt", "bravo"), ("c.txt", "charlie")] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+
+        let token = crate::cancellation::CancellationToken::new();
+        token.cancel();
+        let cancelled_config = ExtractionConfig {
+            cancel_token: Some(token),
+            ..ExtractionConfig::default()
+        };
+
+        let cancelled_result = extractor
+            .extract_content(&bytes, "application/zip", &cancelled_config)
+            .await
+            .expect("extraction must not error when cancelled, only skip recursive children");
+
+        assert!(
+            cancelled_result.children.is_none(),
+            "no archive entry should be recursively extracted once the token is already \
+             cancelled, got {:?}",
+            cancelled_result.children
+        );
+        assert!(
+            cancelled_result
+                .processing_warnings
+                .iter()
+                .any(|warning| warning.source == "archive" && warning.message.contains("cancelled")),
+            "a cancelled run should explain why entries were skipped: {:?}",
+            cancelled_result.processing_warnings
+        );
+
+        // Sanity check: the same 3 entries, uncancelled, all recurse normally — this
+        // rules out the empty result above being an unrelated bug (e.g. MIME
+        // detection rejecting `.txt`) rather than the cancellation checkpoint.
+        let uncancelled_result = extractor
+            .extract_content(&bytes, "application/zip", &ExtractionConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            uncancelled_result.children.map(|c| c.len()).unwrap_or(0),
+            3,
+            "all 3 entries should be recursively extracted when nothing is cancelled"
         );
     }
 

@@ -53,13 +53,13 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 budget.enter()?;
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
 
                 match tag.as_str() {
                     "article" => {
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "article-type" {
                                 metadata.article_type = Some(val.to_string());
@@ -80,8 +80,8 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                         current_author.clear();
                         current_contrib_type.clear();
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "contrib-type" {
                                 current_contrib_type = val.to_string();
@@ -98,8 +98,8 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                     "article-id" if in_article_meta => {
                         let mut id_type = String::new();
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "pub-id-type" {
                                 id_type = val.to_string();
@@ -169,8 +169,8 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                     "date" if in_history => {
                         let mut date_type = String::new();
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "date-type" {
                                 date_type = val.to_string();
@@ -253,7 +253,7 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                                 }
                                 Ok(Event::End(e)) => {
                                     budget.leave();
-                                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                                    let tag = e.name().as_ref().to_string();
                                     if (tag == "td" || tag == "th") && cell_depth == 0 {
                                         break;
                                     }
@@ -262,7 +262,7 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                                     }
                                 }
                                 Ok(Event::Text(t)) => {
-                                    let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                                    let decoded = t.as_ref().to_string();
                                     if !decoded.trim().is_empty() {
                                         budget.check_entity(decoded.trim())?;
                                         budget.account_text(decoded.trim().len())?;
@@ -288,7 +288,7 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
             }
             Ok(Event::End(e)) => {
                 budget.leave();
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
 
                 match tag.as_str() {
                     "article-meta" => {
@@ -380,7 +380,7 @@ pub(super) fn extract_jats_all_in_one(content: &str) -> Result<(JatsMetadataExtr
                 }
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                let decoded = t.as_ref().to_string();
                 let trimmed = decoded.trim();
 
                 if !trimmed.is_empty() {

@@ -1,6 +1,6 @@
 # xberg-cli
 
-[![Bindings](https://img.shields.io/badge/Bindings-alef%20%D7%90-007ec6)](https://github.com/xberg-io/alef)
+[![Built with alef](https://img.shields.io/badge/built%20with-alef%20%D7%90-007ec6)](https://github.com/xberg-io/alef)
 
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-007ec6?logo=docker&logoColor=white)](https://github.com/xberg-io/xberg/pkgs/container/xberg)
 [![Helm chart](https://img.shields.io/badge/Helm-chart-007ec6?logo=helm&logoColor=white)](https://docs.xberg.io/guides/kubernetes/)
@@ -35,12 +35,14 @@ Command-line interface with configuration and caching
 | `formats`     | List all supported document formats                                                                    |
 | `version`     | Show version information                                                                               |
 | `cache`       | Cache management (stats, clear, warm, manifest)                                                        |
+| `tree-sitter` | Manage code-intelligence grammar parsers (download, list, cache-dir, clean)                           |
+| `doctor`      | Diagnose configured backends and runtime dependencies                                                 |
 | `serve`       | Start the API server (requires `api` feature)                                                          |
 | `mcp`         | Start the MCP server (requires `mcp` feature)                                                          |
 | `api`         | API utilities (schema) (requires `api` feature)                                                        |
-| `embed`       | Generate embeddings for text (requires `embeddings` feature) <span class="version-badge">v4.5.2</span> |
-| `chunk`       | Chunk text for processing <span class="version-badge">v4.5.2</span>                                    |
-| `completions` | Generate shell completions <span class="version-badge">v4.5.2</span>                                   |
+| `embed`       | Generate embeddings for text (requires `embeddings` feature)                                          |
+| `chunk`       | Chunk text for processing                                                                                |
+| `completions` | Generate shell completions                                                                               |
 
 ### Platform Support
 
@@ -262,7 +264,7 @@ xberg mcp --config xberg.toml
 
 | Flag                  | Description                                                                                                                        |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `--log-level <LEVEL>` | Set log level (`trace`, `debug`, `info`, `warn`, `error`). Overrides `RUST_LOG` env var. <span class="version-badge">v4.5.2</span> |
+| `--log-level <LEVEL>` | Set log level (`trace`, `debug`, `info`, `warn`, `error`). Overrides `RUST_LOG` env var. |
 
 ## Configuration
 
@@ -358,9 +360,9 @@ xberg extract <PATH> [OPTIONS]
 - `--config-json <JSON>`: Inline JSON configuration
 - `--config-json-base64 <BASE64>`: Base64-encoded JSON configuration
 - `--mime-type <TYPE>`: MIME type hint (auto-detected if not provided)
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `text`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `text`
 
-**Extraction override flags** <span class="version-badge">v4.5.2</span> (also available on `batch`):
+**Extraction override flags** (also available on `batch`):
 
 | Flag                                   | Description                                                                                                |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
@@ -374,7 +376,7 @@ xberg extract <PATH> [OPTIONS]
 | `--chunk-size <SIZE>`                  | Maximum chunk size in characters (default: 1000)                                                           |
 | `--chunk-overlap <SIZE>`               | Overlap between chunks in characters (default: 200)                                                        |
 | `--chunking-tokenizer <MODEL>`         | Tokenizer model for token-based sizing (e.g. `Xenova/gpt-4o`)                                              |
-| `--content-format <FORMAT>`            | Content format: `plain`, `markdown`, `djot`, `html`                                                        |
+| `--content-format <FORMAT>`            | Content format: `plain`, `markdown`, `djot`, `html`, `json`, `doctags`                                     |
 | `--include-structure <true\|false>`    | Include hierarchical document structure                                                                    |
 | `--quality <true\|false>`              | Enable quality post-processing                                                                             |
 | `--detect-language <true\|false>`      | Enable language detection                                                                                  |
@@ -435,7 +437,7 @@ xberg batch <PATHS>... [OPTIONS]
 - `--config <PATH>`: Configuration file (TOML, YAML, or JSON)
 - `--config-json <JSON>`: Inline JSON configuration
 - `--config-json-base64 <BASE64>`: Base64-encoded JSON configuration
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `json`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `json`
 - `--file-configs <PATH>`: JSON file mapping per-file extraction overrides
 - All extraction override flags (see `extract` above)
 
@@ -468,7 +470,7 @@ xberg detect <PATH> [OPTIONS]
 
 **Options:**
 
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `text`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `text`
 
 **Examples:**
 
@@ -490,7 +492,7 @@ xberg formats [OPTIONS]
 
 **Options:**
 
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `text`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `text`
 
 **Examples:**
 
@@ -523,7 +525,7 @@ xberg cache stats [--cache-dir <DIR>] [--format <FORMAT>]
 **Options:**
 
 - `--cache-dir <DIR>`: Cache directory (default: `.xberg` in current directory)
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `text`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `text`
 
 #### clear
 
@@ -536,7 +538,7 @@ xberg cache clear [--cache-dir <DIR>] [--format <FORMAT>]
 **Options:**
 
 - `--cache-dir <DIR>`: Cache directory (default: `.xberg` in current directory)
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `text`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `text`
 
 #### warm
 
@@ -549,7 +551,7 @@ xberg cache warm [--cache-dir <DIR>] [--format <FORMAT>] [--all-embeddings] [--e
 **Options:**
 
 - `--cache-dir <DIR>`: Cache directory (default: `.xberg` or `XBERG_CACHE_DIR`)
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `text`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `text`
 - `--all-embeddings`: Download all 4 embedding model presets (fast, balanced, quality, multilingual)
 - `--embedding-model <PRESET>`: Download a specific embedding model preset
 
@@ -563,7 +565,7 @@ xberg cache manifest [--format <FORMAT>]
 
 **Options:**
 
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `json`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `json`
 
 **Examples:**
 
@@ -586,6 +588,35 @@ xberg cache warm --embedding-model fast
 # Get model manifest as JSON
 xberg cache manifest
 ```
+
+### tree-sitter (requires `tree-sitter` feature)
+
+Manage code-intelligence grammar parsers.
+
+```bash
+xberg tree-sitter download python rust go
+xberg tree-sitter download --groups web,systems
+xberg tree-sitter download --from-config
+xberg tree-sitter list --downloaded
+xberg tree-sitter cache-dir
+xberg tree-sitter clean
+```
+
+All subcommands accept `--format text|json|toon`. `download` also accepts `--all`, `--groups`,
+`--cache-dir`, and `--from-config`.
+
+### doctor
+
+Probe configured OCR, model, cache, and runtime backends before extraction.
+
+```bash
+xberg doctor
+xberg doctor --format json
+xberg doctor --clean
+```
+
+Use `--config <PATH>` to inspect an explicit config. `--clean` removes stray files only from
+Xberg-owned cache directories.
 
 ### serve (requires `api` feature)
 
@@ -646,7 +677,7 @@ xberg mcp --config mcp-config.toml
 
 API utility commands.
 
-#### schema <span class="version-badge">v4.5.2</span>
+#### schema
 
 Output the full OpenAPI 3.1 specification as JSON.
 
@@ -664,7 +695,7 @@ xberg api schema > openapi.json
 xberg api schema | jq '.paths | keys'
 ```
 
-### embed <span class="version-badge">v4.5.2</span> (requires `embeddings` feature)
+### embed (requires `embeddings` feature)
 
 Generate vector embeddings for text.
 
@@ -676,7 +707,7 @@ xberg embed [OPTIONS]
 
 - `--text <TEXT>`: Text to embed (repeatable for batch embedding; reads from stdin if omitted)
 - `--preset <PRESET>`: Embedding preset (`fast`, `balanced`, `quality`, `multilingual`), default: `balanced`
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `json`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `json`
 
 **Examples:**
 
@@ -694,7 +725,7 @@ xberg embed --text "bonjour" --preset multilingual
 cat document.txt | xberg embed --preset fast
 ```
 
-### chunk <span class="version-badge">v4.5.2</span>
+### chunk
 
 Chunk text for processing (useful for LLM context windows).
 
@@ -710,7 +741,7 @@ xberg chunk [OPTIONS]
 - `--chunk-overlap <SIZE>`: Chunk overlap in characters
 - `--chunker-type <TYPE>`: Chunker type: `text` (default), `markdown`, `yaml`, or `semantic`
 - `--chunking-tokenizer <MODEL>`: Tokenizer model for token-based sizing (e.g. `Xenova/gpt-4o`)
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `json`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `json`
 
 **Examples:**
 
@@ -731,7 +762,7 @@ xberg chunk --text "..." --chunking-tokenizer "Xenova/gpt-4o"
 cat long-document.txt | xberg chunk --chunk-size 1000
 ```
 
-### completions <span class="version-badge">v4.5.2</span>
+### completions
 
 Generate shell completion scripts.
 
@@ -767,7 +798,7 @@ xberg version [--format <FORMAT>]
 
 **Options:**
 
-- `--format <FORMAT>`: Output format (`text` or `json`), default: `text`
+- `--format <FORMAT>`: Output format (`text`, `json`, or `toon`), default: `text`
 
 **Examples:**
 

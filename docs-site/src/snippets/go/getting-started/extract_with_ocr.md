@@ -11,7 +11,7 @@ import (
 func main() {
 	ocrConfig := &xberg.OcrConfig{
 		Backend:  "tesseract",
-		Language: "eng",
+		Language: []string{"eng"},
 	}
 
 	config := xberg.ExtractionConfig{

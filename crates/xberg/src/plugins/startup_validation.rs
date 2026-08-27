@@ -229,11 +229,6 @@ mod tests {
 
     #[test]
     fn test_validate_plugins_at_startup() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_test_writer()
-            .try_init();
-
         let result = validate_plugins_at_startup();
         assert!(result.is_ok());
         let status = result.unwrap();
@@ -266,11 +261,6 @@ mod tests {
 
     #[test]
     fn test_validate_plugins_at_startup_returns_status() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_test_writer()
-            .try_init();
-
         let result = validate_plugins_at_startup();
         assert!(result.is_ok());
 
@@ -294,11 +284,6 @@ mod tests {
 
     #[test]
     fn test_validate_plugins_at_startup_with_logging() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_test_writer()
-            .try_init();
-
         let result = validate_plugins_at_startup();
         assert!(result.is_ok());
 
@@ -331,11 +316,6 @@ mod tests {
 
     #[test]
     fn test_validate_plugins_at_startup_logs_warnings_and_info() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_test_writer()
-            .try_init();
-
         let result = validate_plugins_at_startup();
         assert!(result.is_ok());
 
@@ -345,11 +325,6 @@ mod tests {
 
     #[test]
     fn test_check_environment_variables_with_rust_log() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_test_writer()
-            .try_init();
-
         let result = validate_plugins_at_startup();
         assert!(result.is_ok());
     }

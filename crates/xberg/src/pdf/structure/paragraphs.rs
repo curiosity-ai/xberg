@@ -56,6 +56,24 @@ pub(super) fn merge_continuation_paragraphs(paragraphs: &mut Vec<PdfParagraph>) 
         // headings would otherwise be re-joined here even after the line grouper
         // split them. See #1386. ~keep
         let next_starts_section = starts_numbered_section(&next);
+        // The mirror of `next_starts_section`: a numbered section heading must never be
+        // absorbed AS a continuation either. The line grouper in `blocks_to_paragraphs`
+        // (`pipeline.rs`) already splits a heading from unrelated text that follows it,
+        // but that split is undone here unless this pass independently refuses to
+        // re-join it -- the two passes see none of each other's decisions. The single
+        // exception is a heading that is itself still wrapping onto its next physical
+        // line, which must stay joined; `heading_wraps_onto` is the same right-edge
+        // test the grouper uses, applied to the boundary segments so both passes agree
+        // on the same wrap. See #1467. ~keep
+        let current_starts_section = starts_numbered_section(&current);
+        let boundary_is_heading_wrap = current
+            .lines
+            .last()
+            .and_then(|line| line.segments.last())
+            .zip(next.lines.first().and_then(|line| line.segments.first()))
+            .is_some_and(|(prev_segment, next_segment)| {
+                super::pipeline::heading_wraps_onto(prev_segment, next_segment)
+            });
         let should_merge = both_body
             && fonts_compatible
             && bold_compatible
@@ -63,7 +81,8 @@ pub(super) fn merge_continuation_paragraphs(paragraphs: &mut Vec<PdfParagraph>) 
             && same_region
             && same_rotation
             && vertical_gap_compatible
-            && !next_starts_section;
+            && !next_starts_section
+            && (!current_starts_section || boundary_is_heading_wrap);
 
         if should_merge {
             current.text.clear();

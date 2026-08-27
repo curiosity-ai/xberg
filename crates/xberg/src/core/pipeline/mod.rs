@@ -29,8 +29,68 @@ use initialization::{
 
 const CAPTIONING_PROCESSOR_NAME: &str = "captioning";
 const BUILTIN_REGISTRATION_SOURCE: &str = "builtin_registration";
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+const FULL_PAGE_IMAGE_AREA_RATIO: f64 = 0.85;
 
 type PostProcessorHandle = std::sync::Arc<dyn crate::plugins::PostProcessor>;
+
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn image_ocr_positions(doc: &InternalDocument) -> Vec<usize> {
+    doc.images
+        .iter()
+        .enumerate()
+        .filter_map(|(position, image)| (!should_skip_pdf_image_ocr(doc, image)).then_some(position))
+        .collect()
+}
+
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn should_skip_pdf_image_ocr(doc: &InternalDocument, image: &crate::types::ExtractedImage) -> bool {
+    // A page-sized PDF XObject repeats content already supplied by native text or
+    // page OCR. Keep empty pages eligible so image OCR can still recover their text.
+    if doc.source_format != "pdf" || !page_has_extracted_text(doc, image.page_number) {
+        return false;
+    }
+
+    let Some(bounding_box) = image.bounding_box.as_ref() else {
+        return false;
+    };
+    let Some(page_number) = image.page_number else {
+        return false;
+    };
+    let Some(dimensions) = doc
+        .metadata
+        .pages
+        .as_ref()
+        .and_then(|structure| structure.pages.as_ref())
+        .and_then(|pages| pages.iter().find(|page| page.number == page_number))
+        .and_then(|page| page.dimensions)
+    else {
+        return false;
+    };
+    let page_width = dimensions.width;
+    let page_height = dimensions.height;
+    if page_width <= 0.0 || page_height <= 0.0 {
+        return false;
+    }
+
+    let image_area = (bounding_box.x1 - bounding_box.x0).abs() * (bounding_box.y1 - bounding_box.y0).abs();
+    image_area / (page_width * page_height) >= FULL_PAGE_IMAGE_AREA_RATIO
+}
+
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn page_has_extracted_text(doc: &InternalDocument, page_number: Option<u32>) -> bool {
+    let Some(page_number) = page_number else {
+        return false;
+    };
+    doc.elements
+        .iter()
+        .any(|element| element.page == Some(page_number) && !element.text.trim().is_empty())
+        || doc.prebuilt_pages.as_ref().is_some_and(|pages| {
+            pages
+                .iter()
+                .any(|page| page.page_number == page_number && !page.content.trim().is_empty())
+        })
+}
 
 fn processors_without_captioning(
     processors: &std::sync::Arc<Vec<PostProcessorHandle>>,
@@ -248,6 +308,10 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
     doc.ocr_text_only = config.images.as_ref().map(|i| i.ocr_text_only).unwrap_or(false);
     doc.append_ocr_text = config.images.as_ref().map(|i| i.append_ocr_text).unwrap_or(false);
     doc.escape_markdown = config.escape_markdown;
+    doc.include_watermarks = config
+        .content_filter
+        .as_ref()
+        .is_some_and(|filter| filter.include_watermarks);
     doc.table_anchors = config.table_anchors;
     doc.page_marker_format = config
         .pages
@@ -262,22 +326,32 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
     let image_ocr_enabled = config.images.as_ref().map(|i| i.run_ocr_on_images).unwrap_or(true);
     #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
     if image_ocr_enabled && config.ocr.is_some() && !doc.images.is_empty() {
-        let images_to_process = std::mem::take(&mut doc.images);
-        match crate::extraction::image_ocr::process_images_with_ocr(
-            images_to_process,
-            config,
-            &mut doc.processing_warnings,
-        )
-        .await
-        {
-            Ok(processed) => {
-                doc.images = processed;
-            }
-            Err(e) => {
-                doc.processing_warnings.push(crate::types::ProcessingWarning {
-                    source: std::borrow::Cow::Borrowed("image_ocr"),
-                    message: std::borrow::Cow::Owned(format!("Image OCR failed: {e}")),
-                });
+        let image_positions = image_ocr_positions(&doc);
+        // Clone only selected images so skipped entries keep their positions and a
+        // batch-level OCR failure cannot discard the original extracted images.
+        if !image_positions.is_empty() {
+            let images_to_process = image_positions
+                .iter()
+                .map(|&position| doc.images[position].clone())
+                .collect();
+            match crate::extraction::image_ocr::process_images_with_ocr(
+                images_to_process,
+                config,
+                &mut doc.processing_warnings,
+            )
+            .await
+            {
+                Ok(processed) => {
+                    for (position, image) in image_positions.into_iter().zip(processed) {
+                        doc.images[position] = image;
+                    }
+                }
+                Err(e) => {
+                    doc.processing_warnings.push(crate::types::ProcessingWarning {
+                        source: std::borrow::Cow::Borrowed("image_ocr"),
+                        message: std::borrow::Cow::Owned(format!("Image OCR failed: {e}")),
+                    });
+                }
             }
         }
     }
@@ -536,6 +610,10 @@ pub fn run_pipeline_sync(mut doc: InternalDocument, config: &ExtractionConfig) -
     doc.ocr_text_only = config.images.as_ref().map(|i| i.ocr_text_only).unwrap_or(false);
     doc.append_ocr_text = config.images.as_ref().map(|i| i.append_ocr_text).unwrap_or(false);
     doc.escape_markdown = config.escape_markdown;
+    doc.include_watermarks = config
+        .content_filter
+        .as_ref()
+        .is_some_and(|filter| filter.include_watermarks);
     doc.table_anchors = config.table_anchors;
     doc.page_marker_format = config
         .pages
@@ -997,6 +1075,7 @@ mod issue_214_text_coverage_tests {
             content: content.to_string(),
             tables: Vec::new(),
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,

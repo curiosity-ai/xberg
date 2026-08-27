@@ -81,7 +81,7 @@ pub const SUPPORTED_LANGUAGES: &[&str] = &[
 ];
 
 /// Check if a language code is supported by PaddleOCR.
-#[allow(dead_code)]
+#[cfg(paddle_ocr)]
 pub(crate) fn is_language_supported(lang: &str) -> bool {
     SUPPORTED_LANGUAGES.contains(&lang)
 }
@@ -107,7 +107,7 @@ pub(crate) fn is_language_supported(lang: &str) -> bool {
 /// | `devanagari` | Hindi, Marathi, Sanskrit, Nepali |
 /// | `tamil` | Tamil |
 /// | `telugu` | Telugu |
-#[allow(dead_code)]
+#[cfg(paddle_ocr)]
 pub(crate) fn language_to_script_family(paddle_lang: &str) -> &'static str {
     match paddle_lang {
         "en" => "english",
@@ -126,7 +126,7 @@ pub(crate) fn language_to_script_family(paddle_lang: &str) -> &'static str {
 }
 
 /// Map Xberg language codes to PaddleOCR language codes.
-#[allow(dead_code)]
+#[cfg(paddle_ocr)]
 pub(crate) fn map_language_code(xberg_code: &str) -> Option<&'static str> {
     match xberg_code {
         "ch" | "chi_sim" | "zho" | "zh" | "chinese" => Some("ch"),

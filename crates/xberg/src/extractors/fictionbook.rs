@@ -82,7 +82,7 @@ impl FictionBookExtractor {
                     }
                 }
                 Ok(Event::Text(t)) => {
-                    let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                    let decoded = t.as_ref().to_string();
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
                     let had_trailing_space = decoded.ends_with(char::is_whitespace);
@@ -100,7 +100,7 @@ impl FictionBookExtractor {
                     }
                 }
                 Ok(Event::CData(t)) => {
-                    let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                    let decoded = t.as_ref().to_string();
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
                     if !decoded.trim().is_empty() {
@@ -154,8 +154,8 @@ impl FictionBookExtractor {
                 Ok(Event::Start(e)) => {
                     budget.enter()?;
                     for attr in e.attributes().flatten() {
-                        let key = String::from_utf8_lossy(attr.key.as_ref());
-                        let val = String::from_utf8_lossy(attr.value.as_ref());
+                        let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                        let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                         budget.check_attr(&key, &val)?;
                     }
                     let name = e.name();
@@ -177,22 +177,22 @@ impl FictionBookExtractor {
                         }
                         "first-name" if in_author => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                first_name = String::from_utf8_lossy(t.as_ref()).trim().to_string();
+                                first_name = t.as_ref().trim().to_string();
                             }
                         }
                         "middle-name" if in_author => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                middle_name = String::from_utf8_lossy(t.as_ref()).trim().to_string();
+                                middle_name = t.as_ref().trim().to_string();
                             }
                         }
                         "last-name" if in_author => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                last_name = String::from_utf8_lossy(t.as_ref()).trim().to_string();
+                                last_name = t.as_ref().trim().to_string();
                             }
                         }
                         "nickname" if in_author => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                nickname = String::from_utf8_lossy(t.as_ref()).trim().to_string();
+                                nickname = t.as_ref().trim().to_string();
                             }
                         }
                         "annotation" if in_title_info => {
@@ -201,7 +201,7 @@ impl FictionBookExtractor {
                         }
                         "genre" if in_title_info => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                let genre = String::from_utf8_lossy(t.as_ref());
+                                let genre = std::borrow::Cow::Borrowed(t.as_ref());
                                 if !genre.trim().is_empty() && genre.trim() != "unrecognised" {
                                     genres.push(genre.trim().to_string());
                                 }
@@ -211,8 +211,8 @@ impl FictionBookExtractor {
                             let mut seq_name = String::new();
                             let mut seq_number = String::new();
                             for attr in e.attributes().flatten() {
-                                let attr_name = String::from_utf8_lossy(attr.key.as_ref());
-                                let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                                let attr_name = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                                let attr_value = std::borrow::Cow::Borrowed(attr.value.as_ref());
                                 if attr_name == "name" {
                                     seq_name = attr_value.to_string();
                                 } else if attr_name == "number" {
@@ -230,7 +230,7 @@ impl FictionBookExtractor {
                         }
                         "date" if in_title_info => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                let date = String::from_utf8_lossy(t.as_ref());
+                                let date = std::borrow::Cow::Borrowed(t.as_ref());
                                 if !date.trim().is_empty() {
                                     metadata.created_at = Some(date.trim().to_string());
                                 }
@@ -238,7 +238,7 @@ impl FictionBookExtractor {
                         }
                         "lang" if in_title_info => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                let lang = String::from_utf8_lossy(t.as_ref());
+                                let lang = std::borrow::Cow::Borrowed(t.as_ref());
                                 if !lang.trim().is_empty() {
                                     metadata.language = Some(lang.trim().to_string());
                                 }
@@ -246,7 +246,7 @@ impl FictionBookExtractor {
                         }
                         "book-title" if in_title_info => {
                             if let Ok(Event::Text(t)) = reader.read_event() {
-                                let title = String::from_utf8_lossy(t.as_ref());
+                                let title = std::borrow::Cow::Borrowed(t.as_ref());
                                 if !title.trim().is_empty() {
                                     metadata.title = Some(title.trim().to_string());
                                 }
@@ -320,7 +320,7 @@ impl FictionBookExtractor {
                     }
                 }
                 Ok(Event::Text(t)) if in_annotation => {
-                    let decoded = String::from_utf8_lossy(t.as_ref());
+                    let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
                     let trimmed = decoded.trim();
@@ -338,8 +338,8 @@ impl FictionBookExtractor {
                         let mut seq_name = String::new();
                         let mut seq_number = String::new();
                         for attr in e.attributes().flatten() {
-                            let attr_name = String::from_utf8_lossy(attr.key.as_ref());
-                            let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                            let attr_name = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let attr_value = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&attr_name, &attr_value)?;
                             if attr_name == "name" {
                                 seq_name = attr_value.to_string();
@@ -472,8 +472,8 @@ impl FictionBookExtractor {
                         let mut content_type = String::new();
                         let mut id = String::new();
                         for attr in e.attributes().flatten() {
-                            let attr_name = String::from_utf8_lossy(attr.key.as_ref());
-                            let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                            let attr_name = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let attr_value = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&attr_name, &attr_value)?;
                             if attr_name == "content-type" {
                                 content_type = attr_value.to_string();
@@ -487,7 +487,7 @@ impl FictionBookExtractor {
                             budget.step()?;
                             match reader.read_event() {
                                 Ok(Event::Text(t)) => {
-                                    let chunk = String::from_utf8_lossy(t.as_ref());
+                                    let chunk = std::borrow::Cow::Borrowed(t.as_ref());
                                     budget.account_text(chunk.len())?;
                                     b64_text.push_str(&chunk);
                                 }
@@ -580,8 +580,8 @@ impl FictionBookExtractor {
                     } else if tag == "a" && in_body {
                         let mut href = String::new();
                         for attr in e.attributes().flatten() {
-                            let attr_name = String::from_utf8_lossy(attr.key.as_ref());
-                            let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                            let attr_name = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let attr_value = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&attr_name, &attr_value)?;
                             if attr_name == "l:href" || attr_name == "xlink:href" || attr_name == "href" {
                                 href = attr_value.to_string();
@@ -609,7 +609,7 @@ impl FictionBookExtractor {
                                     }
                                 }
                                 Ok(Event::Text(t)) => {
-                                    let decoded = String::from_utf8_lossy(t.as_ref());
+                                    let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                                     budget.check_entity(&decoded)?;
                                     budget.account_text(decoded.len())?;
                                     let trimmed = decoded.trim();
@@ -689,8 +689,8 @@ impl FictionBookExtractor {
                     } else if tag == "body" {
                         let mut is_notes = false;
                         for a in e.attributes().flatten() {
-                            let attr_name = String::from_utf8_lossy(a.key.as_ref());
-                            let attr_val = String::from_utf8_lossy(a.value.as_ref());
+                            let attr_name = std::borrow::Cow::Borrowed(a.key.as_ref());
+                            let attr_val = std::borrow::Cow::Borrowed(a.value.as_ref());
                             budget.check_attr(&attr_name, &attr_val)?;
                             if attr_name == "name" && attr_val == "notes" {
                                 is_notes = true;
@@ -751,8 +751,8 @@ impl FictionBookExtractor {
                     } else if tag == "section" && is_notes_body {
                         let mut note_id = String::new();
                         for attr in e.attributes().flatten() {
-                            let attr_name = String::from_utf8_lossy(attr.key.as_ref());
-                            let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                            let attr_name = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let attr_value = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&attr_name, &attr_value)?;
                             if attr_name == "id" {
                                 note_id = attr_value.to_string();
@@ -854,8 +854,8 @@ impl FictionBookExtractor {
                     if tag == "a" {
                         let mut href = String::new();
                         for attr in e.attributes().flatten() {
-                            let attr_name = String::from_utf8_lossy(attr.key.as_ref());
-                            let attr_value = String::from_utf8_lossy(attr.value.as_ref());
+                            let attr_name = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let attr_value = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&attr_name, &attr_value)?;
                             if attr_name == "l:href" || attr_name == "xlink:href" || attr_name == "href" {
                                 href = attr_value.to_string();
@@ -912,14 +912,28 @@ impl FictionBookExtractor {
                     }
                 }
                 Ok(Event::Text(t)) => {
-                    let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                    let decoded = t.as_ref().to_string();
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
                     let normalized = crate::utils::normalize_whitespace(&decoded);
                     let trimmed: &str = normalized.as_ref();
                     if !trimmed.is_empty() {
                         if !text.is_empty() && !text.ends_with(' ') {
+                            // `normalize_whitespace` trims trailing whitespace off the
+                            // preceding text run (it rebuilds via `split_whitespace`), so the
+                            // joining space inserted here lands exactly at the byte offset any
+                            // still-open `format_stack` entry recorded as its annotation start.
+                            // Left unbumped, that entry's span swallows this space -- e.g.
+                            // `<code>` right after "Some " records start=4 for "Some", then this
+                            // push moves the real "code" text to byte 5, so the emitted Code
+                            // annotation covers " code" instead of "code" (#859).
+                            let join_pos = text.len() as u32;
                             text.push(' ');
+                            for (_, start) in format_stack.iter_mut() {
+                                if *start == join_pos {
+                                    *start += 1;
+                                }
+                            }
                         }
                         text.push_str(trimmed);
                     }
@@ -962,7 +976,7 @@ impl FictionBookExtractor {
                     }
                 }
                 Ok(Event::Text(t)) => {
-                    let decoded = String::from_utf8_lossy(t.as_ref());
+                    let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
                     let trimmed = decoded.trim();
@@ -1012,7 +1026,7 @@ impl FictionBookExtractor {
                     }
                 }
                 Ok(Event::Text(t)) => {
-                    let decoded = String::from_utf8_lossy(t.as_ref());
+                    let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
                     let trimmed = decoded.trim();
@@ -1070,12 +1084,26 @@ impl InternalDocumentExtractor for FictionBookExtractor {
     ) -> Result<InternalDocument> {
         let mut budget = SecurityBudget::from_config(config);
 
+        // quick-xml validates UTF-8 as it parses, so a FictionBook that is not already
+        // UTF-8 -- windows-1251 is the common case for this format -- has to be
+        // transcoded before the reader sees it. Otherwise the read fails outright and
+        // the document yields nothing, instead of degrading to a lossy decode. ~keep
+        let (decoded, decoded_lossily) = crate::utils::xml_utils::decode_xml_to_utf8(content);
+        let content = decoded.as_bytes();
+
         let metadata = Self::extract_metadata(content, &mut budget)?;
 
         let images = Self::extract_binary_images(content, &mut budget)?;
         let links = Self::extract_links(content, &mut budget)?;
 
         let mut doc = Self::build_internal_document(content, images, &mut budget)?;
+        if decoded_lossily {
+            crate::core::diagnostics::push_lossy_decode_warning(
+                &mut doc.processing_warnings,
+                FICTIONBOOK_WARNING_SOURCE,
+                "FictionBook source",
+            );
+        }
         doc.mime_type = mime_type.to_string();
         doc.metadata = metadata;
 
@@ -1514,6 +1542,58 @@ mod tests {
             image_element_count, 1,
             "expected one Image element in {:?}",
             doc.elements
+        );
+    }
+
+    /// A FictionBook declaring `windows-1251` must still extract its Cyrillic text.
+    ///
+    /// FB2 is predominantly a Russian format and windows-1251 is its most common
+    /// encoding, so these bytes are not valid UTF-8. The extractor is handed the raw
+    /// file bytes, so whatever decodes them has to do it before the XML reader sees
+    /// them -- quick-xml validates UTF-8 while parsing and fails the whole document
+    /// otherwise, which would turn a mojibake-but-readable result into no result.
+    #[tokio::test]
+    async fn should_extract_a_windows_1251_fictionbook() {
+        // "Проверка" (title) and "Текст главы" (body), encoded as windows-1251 bytes.
+        let title_cp1251 = [0xCF, 0xF0, 0xEE, 0xE2, 0xE5, 0xF0, 0xEA, 0xE0];
+        let body_cp1251 = [0xD2, 0xE5, 0xEA, 0xF1, 0xF2, 0x20, 0xE3, 0xEB, 0xE0, 0xE2, 0xFB];
+
+        let mut fb2: Vec<u8> = Vec::new();
+        fb2.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"windows-1251\"?>");
+        fb2.extend_from_slice(b"<FictionBook><description><title-info><book-title>");
+        fb2.extend_from_slice(&title_cp1251);
+        fb2.extend_from_slice(b"</book-title></title-info></description>");
+        fb2.extend_from_slice(b"<body><section><p>");
+        fb2.extend_from_slice(&body_cp1251);
+        fb2.extend_from_slice(b"</p></section></body></FictionBook>");
+
+        assert!(
+            std::str::from_utf8(&fb2).is_err(),
+            "the fixture must not be valid UTF-8, or it cannot exercise the decode path"
+        );
+
+        let config = ExtractionConfig {
+            output_format: OutputFormat::Markdown,
+            ..Default::default()
+        };
+
+        let doc = FictionBookExtractor::new()
+            .extract_content(&fb2, "application/x-fictionbook+xml", &config)
+            .await
+            .expect("a windows-1251 FictionBook must still extract");
+
+        let markdown = doc
+            .pre_rendered_content
+            .clone()
+            .expect("markdown output should have been pre-rendered");
+        assert!(
+            markdown.contains("Текст главы"),
+            "body text must be decoded from windows-1251, got {markdown:?}"
+        );
+        assert_eq!(
+            doc.metadata.title.as_deref(),
+            Some("Проверка"),
+            "title must be decoded from windows-1251"
         );
     }
 }

@@ -17,7 +17,8 @@ func main() {
 	}
 
 	// Access PDF metadata
-	if pdf, ok := result.Results[0].Metadata.PdfMetadata(); ok {
+	if format := result.Results[0].Metadata.Format; format != nil && format.Pdf != nil {
+		pdf := format.Pdf
 		if pdf.PageCount != nil {
 			fmt.Printf("Pages: %d\n", *pdf.PageCount)
 		}
@@ -35,7 +36,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("extract html: %v", err)
 	}
-	if html, ok := htmlResult.Results[0].Metadata.HTMLMetadata(); ok {
+	if format := htmlResult.Results[0].Metadata.Format; format != nil && format.HTML != nil {
+		html := format.HTML
 		if html.Title != nil {
 			fmt.Printf("Title: %s\n", *html.Title)
 		}

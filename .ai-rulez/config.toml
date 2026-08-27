@@ -5,6 +5,7 @@ description = 'Rust document intelligence library with active Python, TypeScript
 gitignore = true
 presets = ["claude", "codex"]
 builtins = [
+  '!git-workflow',
   'rust',
   'python',
   'go',
@@ -13,6 +14,7 @@ builtins = [
   'php',
   'csharp',
   'elixir',
+  'typescript',
   'wasm',
   'pyo3',
   'napi-rs',
@@ -20,8 +22,15 @@ builtins = [
   'ext-php-rs',
   'rustler',
   'cgo',
+  'jni-rs',
   'default-commands',
 ]
+
+# No builtin exists for Dart, Swift, Zig, Kotlin Android or the raw C ABI. Those five are
+# governed only by their specialist agents in agent-conventions/modules/languages/agents/
+# plus the shared binding-architecture skill. Do not enable 'polyglot-bindings' to paper over
+# it: it ships ffi-engineer + polyglot-architect agents that collide with the tuned copies in
+# agent-conventions/modules/core/agents/. ~keep
 
 compact = true
 [[includes]]

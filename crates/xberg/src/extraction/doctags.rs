@@ -324,7 +324,7 @@ fn reconstructed_pages(count: u32) -> crate::types::PageStructure {
                 .map(|number| crate::types::PageInfo {
                     number,
                     title: None,
-                    dimensions: Some((LOC_GRID, LOC_GRID)),
+                    dimensions: Some((LOC_GRID, LOC_GRID).into()),
                     image_count: None,
                     table_count: None,
                     hidden: None,

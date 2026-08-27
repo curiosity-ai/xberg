@@ -9,7 +9,7 @@ func main() {
 	_ = xberg.ExtractionConfig{
 		Ocr: &xberg.OcrConfig{
 			Backend:  "tesseract",
-			Language: "eng+fra",
+			Language: []string{"eng", "fra"},
 			TesseractConfig: &xberg.TesseractConfig{
 				Psm: &psm,
 			},

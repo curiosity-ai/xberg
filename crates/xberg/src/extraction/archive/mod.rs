@@ -14,9 +14,9 @@ mod sevenz;
 mod tar;
 mod zip;
 
+pub(crate) use gzip::extract_gzip_with_bytes;
 #[cfg(test)]
-pub(crate) use gzip::{decompress_gzip, extract_gzip_metadata, extract_gzip_text_content};
-pub(crate) use gzip::{extract_gzip, extract_gzip_with_bytes};
+pub(crate) use gzip::{decompress_gzip, extract_gzip, extract_gzip_metadata, extract_gzip_text_content};
 pub(crate) use sevenz::{extract_7z_file_bytes, extract_7z_metadata, extract_7z_text_content};
 pub(crate) use tar::{extract_tar_file_bytes, extract_tar_metadata, extract_tar_text_content};
 pub(crate) use zip::{extract_zip_file_bytes, extract_zip_metadata, extract_zip_text_content};
@@ -39,12 +39,80 @@ pub struct ArchiveMetadata {
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone)]
 pub struct ArchiveEntry {
-    /// File path within the archive
+    /// File path within the archive, copied **verbatim** from the archive's own entry
+    /// name (`zip::read::ZipFile::name()`, `tar::Entry::path()`, ...).
+    ///
+    /// This value is untrusted and unnormalised: a hostile or malformed archive can make
+    /// it an absolute path (`/etc/passwd`), a traversing relative path
+    /// (`../../etc/passwd`), or a Windows drive-letter/UNC form. Nothing in this module
+    /// rejects or rewrites those forms, because nothing here writes archive contents to a
+    /// real filesystem path built from this string -- it is only ever used as an opaque
+    /// map key (`extract_zip_text_content`/`extract_zip_file_bytes` and their TAR
+    /// equivalents) or surfaced as informational metadata.
+    ///
+    /// A future caller that *does* want to write an entry to disk (a CLI "extract to
+    /// directory" feature, an FFI binding, ...) must never join this value onto a real
+    /// path directly. Use [`ArchiveEntry::confined_path`] instead, which returns a
+    /// normalised path guaranteed not to escape the archive root, or `None` when the raw
+    /// name cannot be confined at all.
     pub path: String,
     /// File size in bytes
     pub size: u64,
     /// Whether this is a directory
     pub is_dir: bool,
+}
+
+impl ArchiveEntry {
+    /// Returns [`Self::path`] normalised and confined to the archive root, or `None` when
+    /// it cannot be confined safely.
+    ///
+    /// This is the safe counterpart to the raw `path` field: it rejects (via `None`)
+    /// exactly the cases that make `path` unsafe to use as a filesystem write target --
+    /// a `..` that pops past the root, a NUL byte, and a Windows drive letter or UNC
+    /// prefix -- and otherwise returns a `/`-joined, root-relative path with `.` and
+    /// empty segments removed.
+    ///
+    /// Backslashes are normalised to `/` first, since a hostile archive can store a
+    /// backslash-separated name that native path handling would treat as a single opaque
+    /// segment on Unix rather than as traversal components.
+    ///
+    /// This function does not decide *what* to do with an unconfined entry (skip it, warn,
+    /// abort the whole archive, ...); that policy belongs to the caller that would
+    /// otherwise write the entry somewhere.
+    pub fn confined_path(&self) -> Option<String> {
+        if self.path.contains('\0') {
+            return None;
+        }
+
+        let normalized = self.path.replace('\\', "/");
+        if has_drive_or_unc_prefix(&normalized) {
+            return None;
+        }
+
+        let mut stack: Vec<&str> = Vec::new();
+        for segment in normalized.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    stack.pop()?;
+                }
+                other => stack.push(other),
+            }
+        }
+
+        if stack.is_empty() {
+            return None;
+        }
+
+        Some(stack.join("/"))
+    }
+}
+
+/// `true` when `path` begins with a Windows drive letter (`C:`) or a UNC prefix (`//`,
+/// which is what a backslash-normalised `\\server\share` becomes).
+fn has_drive_or_unc_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with("//") || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 /// Common text file extensions that should be extracted from archives.
@@ -144,6 +212,70 @@ mod tests {
 
     fn default_limits() -> SecurityLimits {
         SecurityLimits::default()
+    }
+
+    fn entry(path: &str) -> ArchiveEntry {
+        ArchiveEntry {
+            path: path.to_string(),
+            size: 0,
+            is_dir: false,
+        }
+    }
+
+    #[test]
+    fn test_confined_path_returns_normalised_relative_path_unchanged() {
+        assert_eq!(
+            entry("folder/document.pdf").confined_path(),
+            Some("folder/document.pdf".to_string())
+        );
+    }
+
+    #[test]
+    fn test_confined_path_rejects_traversal_past_the_root() {
+        assert_eq!(entry("../../etc/passwd").confined_path(), None);
+    }
+
+    #[test]
+    fn test_confined_path_allows_in_bounds_traversal_that_stays_inside_root() {
+        // `a/../b` never leaves the root it started in, so it is confined even though it
+        // contains a `..` component.
+        assert_eq!(entry("a/../b/file.txt").confined_path(), Some("b/file.txt".to_string()));
+    }
+
+    #[test]
+    fn test_confined_path_strips_leading_slash_from_absolute_unix_path() {
+        // A leading `/` is treated the same as any other empty segment here (unlike the
+        // OOXML/EPUB `resolve_container_entry`, an archive entry has no "container root"
+        // concept to redirect to): stripping it still leaves a normal relative path.
+        assert_eq!(
+            entry("/tmp/malicious.txt").confined_path(),
+            Some("tmp/malicious.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_confined_path_rejects_windows_drive_prefix() {
+        assert_eq!(entry("C:/Windows/System32/evil.dll").confined_path(), None);
+    }
+
+    #[test]
+    fn test_confined_path_rejects_unc_prefix() {
+        assert_eq!(entry("\\\\server\\share\\evil.dll").confined_path(), None);
+    }
+
+    #[test]
+    fn test_confined_path_rejects_nul_byte() {
+        assert_eq!(entry("evil\0.txt").confined_path(), None);
+    }
+
+    #[test]
+    fn test_confined_path_rejects_bare_parent_dir() {
+        assert_eq!(entry("..").confined_path(), None);
+    }
+
+    #[test]
+    fn test_confined_path_rejects_path_made_only_of_dot_segments() {
+        assert_eq!(entry("./.").confined_path(), None);
     }
 
     /// Regression for #113: real text members with extensions absent from the
@@ -1196,6 +1328,164 @@ mod tests {
             Some(true),
             "expected a replaced_characters=true field on the warning, got {:?}",
             events[0]
+        );
+    }
+
+    /// Covers per-member rejection and error naming for an oversized ZIP member's text
+    /// content -- NOT memory-boundedness. `extract_zip_text_content` takes `bytes: &[u8]` and
+    /// builds a concrete `zip::read::ZipFile` reader internally; there is no seam here to
+    /// substitute a counting/instrumented `Read` for it, so the actual property the `.take()`
+    /// exists for (the reader is never asked for more than `cap + 1` bytes) cannot be observed
+    /// from this test. It is covered by inspection only. What this test does prove: a member
+    /// whose decompressed content dwarfs `max_content_size` is rejected by a *member-scoped*
+    /// error that names the member, rather than surfacing only from the aggregate
+    /// `total_content_size` check (which, once several members have been summed, can no longer
+    /// report which one was responsible).
+    ///
+    /// Neutralisation that must break this test: replace `.take(cap.saturating_add(1))` with
+    /// `.take(u64::MAX)` in `extract_zip_text_content`. That neutralisation does NOT break this test on its
+    /// own -- the post-read `raw.len() as u64 > cap` check a few lines below still fires and
+    /// still names "huge.txt", so the assertion still passes. Only removing that length check
+    /// too (or renaming the error's member field) would fail it, which is exactly the point:
+    /// this test cannot distinguish a bounded reader from an unbounded one.
+    /// `--features archives`.
+    #[test]
+    fn test_zip_text_content_names_offending_member_when_it_exceeds_content_cap() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+            zip.start_file("huge.txt", options).unwrap();
+            // Highly compressible filler large enough to dwarf a tiny cap without needing a
+            // gigabyte-scale allocation in the test process.
+            zip.write_all(&vec![b'A'; 200_000]).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+        let limits = SecurityLimits {
+            max_content_size: 1_000,
+            ..SecurityLimits::default()
+        };
+
+        let result = extract_zip_text_content(&bytes, &limits);
+
+        let error = result.expect_err("a member whose decompressed size dwarfs max_content_size must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("huge.txt"),
+            "the rejection must name the offending member instead of only reporting an \
+             aggregate total that cannot identify one: {message}"
+        );
+    }
+
+    /// Same defect family, different call: `extract_zip_file_bytes`. See the doc comment on
+    /// `test_zip_text_content_names_offending_member_when_it_exceeds_content_cap` for why this
+    /// covers per-member rejection and naming, not memory-boundedness.
+    ///
+    /// Neutralisation that must break this test: replace `.take(cap.saturating_add(1))` with
+    /// `.take(u64::MAX)` in `extract_zip_file_bytes` -- and, as above, that alone does not break it, since the
+    /// `content.len() as u64 > cap` check still fires and still names "huge.bin".
+    /// `--features archives`.
+    #[test]
+    fn test_zip_file_bytes_names_offending_member_when_it_exceeds_archive_cap() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options = FileOptions::<'_, ()>::default();
+            zip.start_file("huge.bin", options).unwrap();
+            zip.write_all(&vec![0xABu8; 200_000]).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+        let limits = SecurityLimits {
+            max_archive_size: 1_000,
+            ..SecurityLimits::default()
+        };
+
+        let result = extract_zip_file_bytes(&bytes, &limits);
+
+        let error = result.expect_err("a member whose decompressed size dwarfs max_archive_size must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("huge.bin"),
+            "the rejection must name the offending member instead of only reporting an \
+             aggregate total that cannot identify one: {message}"
+        );
+    }
+
+    /// TAR analogue of `test_zip_text_content_names_offending_member_when_it_exceeds_content_cap`.
+    /// Same limitation applies: `extract_tar_text_content` takes `bytes: &[u8]` and builds a
+    /// concrete `tar::Entry` reader internally, with no seam to inject a counting `Read`, so
+    /// this covers per-member rejection and error naming only -- memory-boundedness rests on
+    /// inspection.
+    ///
+    /// Neutralisation that must break this test: replace `.take(cap.saturating_add(1))` with
+    /// `.take(u64::MAX)` in `extract_tar_text_content`. As with ZIP, that alone does not break it: the
+    /// `raw.len() as u64 > cap` check still fires and still names "huge.txt".
+    /// `--features archives`.
+    #[test]
+    fn test_tar_text_content_names_offending_member_when_it_exceeds_content_cap() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut tar = TarBuilder::new(&mut cursor);
+            let data = vec![b'B'; 200_000];
+            let mut header = ::tar::Header::new_gnu();
+            header.set_path("huge.txt").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            tar.append(&header, &data[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+        let limits = SecurityLimits {
+            max_content_size: 1_000,
+            ..SecurityLimits::default()
+        };
+
+        let result = extract_tar_text_content(&bytes, &limits);
+
+        let error = result.expect_err("a member whose declared size dwarfs max_content_size must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("huge.txt"),
+            "the rejection must name the offending member instead of only reporting an \
+             aggregate total that cannot identify one: {message}"
+        );
+    }
+
+    /// TAR analogue of `test_zip_file_bytes_names_offending_member_when_it_exceeds_archive_cap`.
+    ///
+    /// Neutralisation that must break this test: replace `.take(cap.saturating_add(1))` with
+    /// `.take(u64::MAX)` in `extract_tar_file_bytes`. As above, that alone does not break it: the
+    /// `content.len() as u64 > cap` check still fires and still names "huge.bin".
+    /// `--features archives`.
+    #[test]
+    fn test_tar_file_bytes_names_offending_member_when_it_exceeds_archive_cap() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut tar = TarBuilder::new(&mut cursor);
+            let data = vec![0xCDu8; 200_000];
+            let mut header = ::tar::Header::new_gnu();
+            header.set_path("huge.bin").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            tar.append(&header, &data[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+        let limits = SecurityLimits {
+            max_archive_size: 1_000,
+            ..SecurityLimits::default()
+        };
+
+        let result = extract_tar_file_bytes(&bytes, &limits);
+
+        let error = result.expect_err("a member whose declared size dwarfs max_archive_size must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("huge.bin"),
+            "the rejection must name the offending member instead of only reporting an \
+             aggregate total that cannot identify one: {message}"
         );
     }
 

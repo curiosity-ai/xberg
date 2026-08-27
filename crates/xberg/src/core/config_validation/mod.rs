@@ -36,6 +36,11 @@ pub(crate) use sections::{
     validate_ocr_backend, validate_token_reduction_level, validate_vlm_backend_config,
 };
 
+// `layout_wastes_plain_output` is `pub`, not `pub(crate)`, unlike its siblings above: it backs
+// a CLI-level warning (`xberg-cli`'s `ExtractionOverrides::apply`), a downstream crate that
+// cannot see `pub(crate)` items. See its doc comment in `sections.rs` for the contract.
+pub use sections::layout_wastes_plain_output;
+
 pub(crate) use sections::{validate_binarization_method, validate_tesseract_oem, validate_tesseract_psm};
 
 // `validate_output_format` stays `#[cfg(test)]`-only, and correctly so: both
@@ -108,6 +113,18 @@ mod tests {
         assert!(validate_ocr_backend("TESSERACT").is_ok());
         assert!(validate_ocr_backend("PADDLEOCR").is_ok());
         assert!(validate_ocr_backend("SCEPTRE").is_ok());
+    }
+
+    /// The four candle backends are registered by `OcrRegistry::register_builtin_backends`
+    /// (plugins/registry/ocr.rs) under their own feature gates, but were absent from
+    /// `VALID_OCR_BACKENDS` — so config validation rejected a backend the registry was
+    /// perfectly capable of serving, before resolution ever ran.
+    #[test]
+    fn should_accept_every_name_a_builtin_candle_backend_registers_under() {
+        assert!(validate_ocr_backend("candle-trocr").is_ok());
+        assert!(validate_ocr_backend("candle-paddleocr-vl").is_ok());
+        assert!(validate_ocr_backend("candle-glm-ocr").is_ok());
+        assert!(validate_ocr_backend("candle-deepseek-ocr").is_ok());
     }
 
     #[test]
@@ -288,6 +305,32 @@ mod tests {
 
         let result = validate_chunking_params(100, 150);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_layout_wastes_plain_output_true_when_layout_enabled_and_format_plain() {
+        assert!(layout_wastes_plain_output(true, &crate::OutputFormat::Plain));
+    }
+
+    #[test]
+    fn test_layout_wastes_plain_output_false_when_format_is_structured() {
+        for format in [
+            crate::OutputFormat::Markdown,
+            crate::OutputFormat::Djot,
+            crate::OutputFormat::Html,
+            crate::OutputFormat::Json,
+            crate::OutputFormat::DocTags,
+        ] {
+            assert!(
+                !layout_wastes_plain_output(true, &format),
+                "layout + {format:?} should not be flagged as wasted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_layout_wastes_plain_output_false_when_layout_disabled() {
+        assert!(!layout_wastes_plain_output(false, &crate::OutputFormat::Plain));
     }
 
     #[test]

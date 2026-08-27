@@ -80,6 +80,7 @@ impl ContentBuilder {
                 content: slide_content,
                 tables: Vec::new(),
                 image_indices: vec![],
+                image_preprocessing: None,
                 hierarchy: None,
                 is_blank,
                 layout_regions: None,

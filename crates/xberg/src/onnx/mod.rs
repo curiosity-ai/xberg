@@ -13,10 +13,34 @@
 //! ONNX-Runtime-missing failures are reported as [`crate::XbergError::MissingDependency`]
 //! regardless of the caller.
 //!
-//! Since v5.0.0.
 
 use crate::core::config::DownloadProgress;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct OnnxAccelerationCacheKey {
+    provider: crate::core::config::acceleration::ExecutionProviderType,
+    device_id: u32,
+}
+
+impl OnnxAccelerationCacheKey {
+    pub(crate) fn new(acceleration: Option<&crate::core::config::acceleration::AccelerationConfig>) -> Self {
+        let provider = crate::ort_discovery::resolve_execution_provider(acceleration);
+        Self::from_resolved(provider, acceleration.map_or(0, |config| config.device_id))
+    }
+
+    pub(crate) fn from_resolved(
+        provider: crate::core::config::acceleration::ExecutionProviderType,
+        configured_device_id: u32,
+    ) -> Self {
+        let device_id = match provider {
+            crate::core::config::acceleration::ExecutionProviderType::Cuda
+            | crate::core::config::acceleration::ExecutionProviderType::TensorRt => configured_device_id,
+            _ => 0,
+        };
+        Self { provider, device_id }
+    }
+}
 
 /// A module-specific error constructor, e.g. `crate::XbergError::embedding::<String>`.
 ///

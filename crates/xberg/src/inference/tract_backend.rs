@@ -17,7 +17,6 @@
 //! reconcile either way (e.g. the quantized TATR export's symbolic scale tensors)
 //! stay on ONNX Runtime; see the Phase-0 coverage matrix.
 //!
-//! Since v5.0.0 (issue #1275).
 
 use std::path::Path;
 use std::sync::Arc;

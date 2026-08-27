@@ -508,5 +508,4 @@ mod tests {
         assert_eq!(standalone_equation("plain text"), None);
         assert_eq!(standalone_equation("$$"), None);
     }
-
 }

@@ -418,8 +418,16 @@ internal static partial class PdfTableReconstruct
         List<HocrWord> region, float pageHeight, uint pageNumber,
         bool allowSingleColumn, uint colGap, int horizontalRules)
     {
-        var columnPositions = DetectColumns(region, colGap);
-        var grid = ReconstructTable(region, colGap, 0.5);
+        // The column positions come from the same call that built the grid.
+        // ReconstructTable detects columns from post-merge cell tokens, not from the region
+        // directly, so a separate DetectColumns(region, colGap) no longer agrees with the grid's
+        // column count — and RepairSplitNumericTrack fails safe on a count mismatch, which would
+        // silently switch the repair off rather than reporting anything.
+        var (grid, columnPositions) = ReconstructTableWithColumns(region, colGap, 0.5);
+        // Passed by reference so a successful repair drops the merged boundary from BOTH: the
+        // repair collapses two grid columns into one, and a stale extra position would leave the
+        // grid one column narrower than the positions describing it for every consumer below —
+        // IsWellFormedBorderlessTable among them, which is handed both.
         RepairSplitNumericTrack(grid, region, columnPositions);
         if (grid.Count == 0 || grid[0].Count == 0) return null;
 
@@ -552,14 +560,30 @@ internal static partial class PdfTableReconstruct
         return best;
     }
 
+    /// <summary>
+    /// Which columns of a grid contain at least one non-empty cell.
+    /// </summary>
+    /// <remarks>
+    /// Shared by <see cref="RemoveEmptyRowsAndColumns"/> and
+    /// <see cref="ReconstructTableWithColumns"/>, which both drop the same set of all-empty
+    /// columns — the latter also filters a parallel column-position list by the identical mask so
+    /// positions keep lining up 1:1 with the grid's surviving columns.
+    /// </remarks>
+    private static bool[] NonEmptyColumnMask(List<List<string>> table)
+    {
+        int numCols = table.Count == 0 ? 0 : table[0].Count;
+        var mask = new bool[numCols];
+        foreach (var row in table)
+            for (int c = 0; c < row.Count && c < numCols; c++)
+                if (row[c].Trim().Length > 0) mask[c] = true;
+        return mask;
+    }
+
     private static List<List<string>> RemoveEmptyRowsAndColumns(List<List<string>> table)
     {
         if (table.Count == 0) return table;
         int numCols = table[0].Count;
-        var nonEmptyCols = new bool[numCols];
-        foreach (var row in table)
-            for (int c = 0; c < row.Count && c < numCols; c++)
-                if (row[c].Trim().Length > 0) nonEmptyCols[c] = true;
+        var nonEmptyCols = NonEmptyColumnMask(table);
 
         var result = new List<List<string>>();
         foreach (var row in table)
@@ -573,12 +597,111 @@ internal static partial class PdfTableReconstruct
         return result;
     }
 
-    internal static List<List<string>> ReconstructTable(List<HocrWord> words, uint columnThreshold, double rowThresholdRatio)
+    /// <summary>
+    /// Fraction of the median word height used as the maximum horizontal gap for merging two
+    /// horizontally-adjacent words in the same detected row into one cell token before column
+    /// detection.
+    /// </summary>
+    /// <remarks>
+    /// Without this pre-merge, a cell containing more than one word puts its second and third
+    /// words at x-positions matching no genuine column start, so <c>DetectColumns</c> mints a
+    /// spurious near-empty column per extra word — exactly what the downstream structural
+    /// validator then rejects, discarding a genuine table entirely (upstream #688: a scanned
+    /// newspaper stock table emitted zero rows against seventeen in ground truth).
+    /// <para>
+    /// 0.6 is upstream's measured value: on their 215-word fixture 0.4 gave 12 columns, 0.6 the
+    /// correct 10, 0.8 gave 9 and 1.0 gave 6.
+    /// </para>
+    /// </remarks>
+    private const double CellMergeGapHeightRatio = 0.6;
+
+    /// <summary>The median height of <paramref name="words"/>, or 0 when there are none.</summary>
+    private static uint MedianWordHeight(List<HocrWord> words)
     {
-        if (words.Count == 0) return new List<List<string>>();
-        var colPositions = DetectColumns(words, columnThreshold);
+        if (words.Count == 0) return 0;
+        var heights = words.Select(w => w.Height).ToList();
+        heights.Sort();
+        return heights[heights.Count / 2];
+    }
+
+    /// <summary>
+    /// Merge horizontally-adjacent words within the same detected row into single cell tokens, so
+    /// a multi-word cell reaches column detection as one token. See
+    /// <see cref="CellMergeGapHeightRatio"/>.
+    /// </summary>
+    private static List<HocrWord> MergeWordsIntoCellTokens(List<HocrWord> words, List<uint> rowPositions)
+    {
+        if (words.Count <= 1 || rowPositions.Count == 0) return words;
+
+        double mergeGap = MedianWordHeight(words) * CellMergeGapHeightRatio;
+
+        var rows = new List<HocrWord>[rowPositions.Count];
+        for (int i = 0; i < rows.Length; i++) rows[i] = new List<HocrWord>();
+        foreach (var word in words)
+            if (FindRowIndex(rowPositions, word) is int rowIndex && rowIndex < rows.Length)
+                rows[rowIndex].Add(word);
+
+        var tokens = new List<HocrWord>(words.Count);
+        foreach (var rowWords in rows)
+        {
+            rowWords.Sort((a, b) => a.Left.CompareTo(b.Left));
+
+            HocrWord? current = null;
+            foreach (var word in rowWords)
+            {
+                if (current is not { } token) { current = word; continue; }
+
+                double gap = (double)word.Left - (token.Left + token.Width);
+                if (gap <= mergeGap)
+                {
+                    uint newRight = Math.Max(word.Left + word.Width, token.Left + token.Width);
+                    uint newBottom = Math.Max(word.Top + word.Height, token.Top + token.Height);
+                    token.Top = Math.Min(token.Top, word.Top);
+                    token.Width = newRight > token.Left ? newRight - token.Left : 0;
+                    token.Height = newBottom > token.Top ? newBottom - token.Top : 0;
+                    token.Text = token.Text + " " + word.Text;
+                    current = token;
+                }
+                else
+                {
+                    tokens.Add(token);
+                    current = word;
+                }
+            }
+            if (current is { } last) tokens.Add(last);
+        }
+
+        return tokens;
+    }
+
+    /// <summary>
+    /// Reconstruct a grid from positioned words. Rows come first, then adjacent words in a row are
+    /// merged into cell tokens, then columns are detected from those tokens; the <em>original</em>
+    /// words are what gets assigned to cells, so cell text is unchanged wherever a column was
+    /// already detected correctly.
+    /// </summary>
+    /// <remarks>
+    /// A caller that later indexes the column positions against the grid must use
+    /// <see cref="ReconstructTableWithColumns"/>: columns are detected from post-merge tokens, so
+    /// a separate <c>DetectColumns</c> call on the raw words no longer corresponds to this grid.
+    /// </remarks>
+    internal static List<List<string>> ReconstructTable(List<HocrWord> words, uint columnThreshold, double rowThresholdRatio) =>
+        ReconstructTableWithColumns(words, columnThreshold, rowThresholdRatio).Grid;
+
+    /// <summary>
+    /// As <see cref="ReconstructTable"/>, but also returns the column x-positions actually used to
+    /// build the grid, filtered to the columns that survived empty-column removal — so position
+    /// <c>i</c> corresponds exactly to column <c>i</c> of every row.
+    /// </summary>
+    internal static (List<List<string>> Grid, List<uint> ColumnPositions) ReconstructTableWithColumns(
+        List<HocrWord> words, uint columnThreshold, double rowThresholdRatio)
+    {
+        if (words.Count == 0) return (new List<List<string>>(), new List<uint>());
         var rowPositions = DetectRows(words, rowThresholdRatio);
-        if (colPositions.Count == 0 || rowPositions.Count == 0) return new List<List<string>>();
+        var cellTokens = MergeWordsIntoCellTokens(words, rowPositions);
+        var colPositions = DetectColumns(cellTokens, columnThreshold);
+        if (colPositions.Count == 0 || rowPositions.Count == 0)
+            return (new List<List<string>>(), new List<uint>());
 
         int numRows = rowPositions.Count, numCols = colPositions.Count;
         var cells = new List<string>[numRows, numCols];
@@ -602,7 +725,13 @@ internal static partial class PdfTableReconstruct
                 row.Add(cells[r, c].Count == 0 ? "" : string.Join(" ", cells[r, c]));
             result.Add(row);
         }
-        return RemoveEmptyRowsAndColumns(result);
+
+        var keptMask = NonEmptyColumnMask(result);
+        var keptColumnPositions = new List<uint>(colPositions.Count);
+        for (int c = 0; c < colPositions.Count && c < keptMask.Length; c++)
+            if (keptMask[c]) keptColumnPositions.Add(colPositions[c]);
+
+        return (RemoveEmptyRowsAndColumns(result), keptColumnPositions);
     }
 
     /// <summary>
@@ -1451,6 +1580,10 @@ internal static partial class PdfTableReconstruct
             row.RemoveAt(found + 1);
             if (row[found].Trim().Length == 0) row[found] = right;
         }
+        // The two tracks were nearly coincident by construction — that is what made this a split
+        // rather than two real columns — so the surviving cluster keeps the left anchor and the
+        // spurious boundary is dropped, mirroring the row.RemoveAt(found + 1) above exactly.
+        if (found + 1 < columnPositions.Count) columnPositions.RemoveAt(found + 1);
         return true;
     }
 

@@ -113,9 +113,9 @@ fn make_interactive_form_pdf() -> Vec<u8> {
 /// Issue #64: `doc.form_fields` reaches `ExtractedDocument.form_fields`, but
 /// before the fix nothing rendered it into `content` for structured output
 /// formats. The plain-text path already got these values via a separate
-/// Widget-splice mechanism (`oxide::text::append_missing_widget_values`,
+/// Widget-splice mechanism (`native::text::append_missing_widget_values`,
 /// issue #1120) — this test targets Markdown specifically, which is built
-/// from `pdf::oxide::hierarchy` span segments that mechanism never touches.
+/// from `pdf::native::hierarchy` span segments that mechanism never touches.
 #[test]
 fn test_interactive_form_field_values_appear_in_markdown_output() {
     let pdf = make_interactive_form_pdf();

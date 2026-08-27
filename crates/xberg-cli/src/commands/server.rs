@@ -39,7 +39,10 @@ pub fn serve_command(
 
     tracing::info!("Starting Xberg API server on http://{}", server_config.listen_addr());
 
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(crate::commands::extract::RUNTIME_WORKER_STACK_SIZE_BYTES)
+        .build()?;
     rt.block_on(xberg::api::serve_with_server_config(
         extraction_config,
         server_config.clone(),
@@ -67,7 +70,10 @@ pub fn mcp_command(
     #[cfg(not(feature = "mcp-http"))] _allowed_hosts: Vec<String>,
 ) -> Result<()> {
     tracing::debug!("Starting Xberg MCP server with transport: {}", transport);
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(crate::commands::extract::RUNTIME_WORKER_STACK_SIZE_BYTES)
+        .build()?;
 
     match transport.to_lowercase().as_str() {
         "stdio" => {

@@ -170,7 +170,12 @@ pub(crate) fn create_router_with_limits_and_server_config(
     #[cfg(feature = "prometheus")]
     let prometheus_registry = crate::telemetry::init_prometheus();
 
-    let extraction_service = ExtractionServiceBuilder::new().with_tracing().with_metrics().build();
+    let extraction_service_builder = ExtractionServiceBuilder::new().with_tracing();
+    #[cfg(feature = "otel")]
+    let extraction_service_builder = extraction_service_builder.with_metrics();
+    let extraction_service = extraction_service_builder
+        .build()
+        .expect("the built-in extraction service uses a valid concurrency limit");
 
     let state = ApiState {
         default_config: Arc::new(config),

@@ -14,7 +14,9 @@ use crate::layout::error::LayoutError;
 /// - Linux: CUDA (GPU)
 /// - Others: CPU only
 ///
-/// ORT silently falls back to CPU if the requested EP is unavailable.
+/// An auto-detected EP (the default) silently falls back to CPU if unavailable. An
+/// explicitly-requested EP (e.g. `cuda`, `tensorrt`, `coreml`) that is unavailable or fails to
+/// build returns an error instead — see [`crate::ort_discovery::apply_execution_providers`].
 pub(crate) fn build_session(
     path: &str,
     accel: Option<&AccelerationConfig>,

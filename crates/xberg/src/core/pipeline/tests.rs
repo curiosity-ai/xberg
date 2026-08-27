@@ -1101,6 +1101,34 @@ async fn test_run_pipeline_with_output_format_plain() {
 
 #[tokio::test]
 #[serial]
+async fn test_pipeline_honors_include_watermarks_for_markdown() {
+    let watermark = "Research title 7 arXiv:2401.12345v2 [cs.CL] 9 Jan 2024";
+    let default_config = ExtractionConfig {
+        output_format: OutputFormat::Markdown,
+        ..Default::default()
+    };
+    let stripped = run_pipeline(make_doc(watermark, "application/pdf"), &default_config)
+        .await
+        .unwrap();
+
+    let preserve_config = ExtractionConfig {
+        output_format: OutputFormat::Markdown,
+        content_filter: Some(crate::core::config::ContentFilterConfig {
+            include_watermarks: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let preserved = run_pipeline(make_doc(watermark, "application/pdf"), &preserve_config)
+        .await
+        .unwrap();
+
+    assert!(!stripped.content.contains("arXiv:2401.12345v2"));
+    assert!(preserved.content.contains("arXiv:2401.12345v2 [cs.CL] 9 Jan 2024"));
+}
+
+#[tokio::test]
+#[serial]
 async fn test_run_pipeline_with_output_format_djot() {
     let doc = make_doc("test content", "text/djot");
 
@@ -1345,6 +1373,112 @@ fn test_append_ocr_text_for_pptx_images() {
 
     let rendered = crate::rendering::render_markdown(&doc);
     assert!(rendered.contains("OCR text here"));
+}
+
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+mod full_page_image_ocr_tests {
+    use bytes::Bytes;
+
+    use super::{image_ocr_positions, should_skip_pdf_image_ocr};
+    use crate::types::ExtractedImage;
+    use crate::types::extraction::BoundingBox;
+    use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
+    use crate::types::ocr_elements::OcrElementLevel;
+    use crate::types::page::{PageInfo, PageStructure, PageUnitType};
+
+    fn pdf_document() -> InternalDocument {
+        let mut document = InternalDocument::new("pdf");
+        document.mime_type = "application/pdf".to_string();
+        document.metadata.pages = Some(PageStructure {
+            total_count: 2,
+            unit_type: PageUnitType::Page,
+            boundaries: None,
+            pages: Some(vec![page_info(1), page_info(2)]),
+        });
+        document
+    }
+
+    fn page_info(number: u32) -> PageInfo {
+        PageInfo {
+            number,
+            title: None,
+            dimensions: Some((100.0, 100.0).into()),
+            image_count: None,
+            table_count: None,
+            hidden: None,
+            is_blank: None,
+            has_vector_graphics: false,
+        }
+    }
+
+    fn image(image_index: u32, page_number: u32, bounding_box: BoundingBox) -> ExtractedImage {
+        ExtractedImage {
+            data: Bytes::new(),
+            image_index,
+            page_number: Some(page_number),
+            bounding_box: Some(bounding_box),
+            ..Default::default()
+        }
+    }
+
+    fn full_page_box() -> BoundingBox {
+        BoundingBox {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 100.0,
+        }
+    }
+
+    #[test]
+    fn should_skip_only_full_page_pdf_images_with_existing_page_text() {
+        let mut document = pdf_document();
+        document.push_element(
+            InternalElement::text(
+                ElementKind::OcrText {
+                    level: OcrElementLevel::Block,
+                },
+                "page-level OCR text",
+                0,
+            )
+            .with_page(1),
+        );
+        document.images = vec![
+            image(0, 1, full_page_box()),
+            image(
+                1,
+                1,
+                BoundingBox {
+                    x0: 10.0,
+                    y0: 10.0,
+                    x1: 40.0,
+                    y1: 40.0,
+                },
+            ),
+            image(2, 2, full_page_box()),
+        ];
+
+        assert_eq!(image_ocr_positions(&document), vec![1, 2]);
+    }
+
+    #[test]
+    fn should_return_no_ocr_work_when_every_image_repeats_page_text() {
+        let mut document = pdf_document();
+        document.push_element(InternalElement::text(ElementKind::Paragraph, "already extracted", 0).with_page(1));
+        document.images = vec![image(0, 1, full_page_box())];
+
+        assert!(image_ocr_positions(&document).is_empty());
+    }
+
+    #[test]
+    fn should_not_apply_pdf_deduplication_to_other_formats() {
+        let mut document = pdf_document();
+        document.source_format = "pptx".to_string();
+        document.push_element(InternalElement::text(ElementKind::Paragraph, "slide text", 0).with_page(1));
+        let full_page_image = image(0, 1, full_page_box());
+
+        assert!(!should_skip_pdf_image_ocr(&document, &full_page_image));
+    }
 }
 
 /// Smoke tests for `apply_output_format_pass`.
@@ -1653,6 +1787,7 @@ mod document_counts {
             content: String::new(),
             tables: Vec::new(),
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,

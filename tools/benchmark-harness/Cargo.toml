@@ -33,6 +33,20 @@ memory-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 glm-ocr-bench = ["xberg/candle-glm-ocr"]
 candle-deepseek-ocr-bench = ["xberg/candle-deepseek-ocr"]
 candle-paddleocr-vl-15-bench = ["xberg/candle-paddleocr-vl"]
+# Passthrough for in-process `xberg::extract` call sites in this crate (e.g. `comparison.rs`'s
+# `build_extraction_config`) that build an `ExtractionConfig` with `PdfConfig::backend =
+# PdfBackend::Pdfium` directly. NOT default-on: `pdf-pdfium` links `pdfium-render`, which
+# dlopen()s a `libpdfium` runtime library that is not present on a plain dev machine, so a
+# default-on feature would break `cargo build -p benchmark-harness` there. Selecting
+# `PdfBackend::Pdfium` without this feature already fails loudly with an actionable `XbergError` (see
+# `crates/xberg/src/extractors/pdf/mod.rs::extract_core_pdfium`) rather than panicking or
+# silently falling back to `native` -- that enforcement lives in xberg's core crate, not here.
+#
+# The `xberg-{format}-{pipeline}[-pdfium]` frameworks driven by `run --pdf-backends pdfium`
+# (see `adapters::xberg::create_xberg_adapter`) do NOT need this feature: they shell out to a
+# separately built `xberg` CLI binary via `SubprocessAdapter`, so it is that binary's own
+# `pdf-pdfium` feature and runtime `libpdfium` availability that matter, not this crate's.
+pdfium-bench = ["xberg/pdf-pdfium"]
 
 [dependencies]
 
@@ -45,7 +59,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 dirs = "6"
 futures = { workspace = true }
-jsonschema = "0.49"
+jsonschema = "0.51"
 libc = { workspace = true }
 num_cpus = { workspace = true }
 

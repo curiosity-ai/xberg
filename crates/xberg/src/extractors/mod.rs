@@ -4,27 +4,11 @@
 //! All extractors implement the `DocumentExtractor` plugin trait.
 
 use crate::Result;
-#[cfg(any(
-    feature = "archives",
-    feature = "email",
-    feature = "excel",
-    feature = "excel-wasm",
-    feature = "html",
-    feature = "tree-sitter",
-    feature = "xml",
-))]
+#[cfg(any(feature = "email", feature = "html", feature = "xml",))]
 use crate::core::config::ExtractionConfig;
 use crate::plugins::registry::get_document_extractor_registry;
 
-#[cfg(any(
-    feature = "archives",
-    feature = "email",
-    feature = "excel",
-    feature = "excel-wasm",
-    feature = "html",
-    feature = "tree-sitter",
-    feature = "xml",
-))]
+#[cfg(any(feature = "email", feature = "html", feature = "xml",))]
 use crate::types::internal::InternalDocument;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
@@ -53,15 +37,7 @@ use std::sync::Arc;
 ///     }
 /// }
 /// ```
-#[cfg(any(
-    feature = "archives",
-    feature = "email",
-    feature = "excel",
-    feature = "excel-wasm",
-    feature = "html",
-    feature = "tree-sitter",
-    feature = "xml",
-))]
+#[cfg(any(feature = "email", feature = "html", feature = "xml",))]
 pub(crate) trait SyncExtractor {
     /// Extract content from a byte array synchronously.
     ///

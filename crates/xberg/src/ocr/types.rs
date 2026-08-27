@@ -69,6 +69,14 @@ pub struct TesseractConfig {
     /// OCR Engine Mode (0 = Legacy, 1 = LSTM, 2 = Both, 3 = Default).
     pub oem: u8,
     /// Minimum word confidence threshold (0.0–100.0); words below are dropped.
+    ///
+    /// Applied per WORD, not per page (see `parse_tsv_to_elements` and
+    /// `extract_elements_via_iterator` in `ocr::processor::execution`): an individual
+    /// low-confidence word is dropped from the output while the rest of the page's words
+    /// are kept. A floor set too high can still empty an entire page one word at a time,
+    /// which is observably identical to a page-level drop, so this is not a "safe by
+    /// construction" knob. See [`Self::default`] for why this stays at `0.0` and what
+    /// measurement is owed before raising it.
     pub min_confidence: f64,
     /// Optional image preprocessing applied before recognition.
     pub preprocessing: Option<ImagePreprocessingConfig>,
@@ -85,6 +93,24 @@ pub struct TesseractConfig {
     /// Tesseract `classify_use_pre_adapted_templates` variable.
     pub classify_use_pre_adapted_templates: bool,
     /// Tesseract `language_model_ngram_on` variable.
+    ///
+    /// Enables Tesseract's character n-gram language model, which penalizes output that
+    /// does not look like a word of the target language even when the classifier itself
+    /// was confident about individual glyphs. This is the dominant failure mode this crate
+    /// has measured for scanned line art (survey plats, engineering drawings, signature
+    /// flourishes): the engine reads confident-looking non-words such as `LAAALDLI` that
+    /// downstream heuristics only partially catch (see `is_ocr_recognition_noise` in
+    /// `extractors::pdf::ocr`). Left off, Tesseract does not apply this penalty at all.
+    /// Kept on by default rather than off, unlike upstream's own default, because prose
+    /// pages are unaffected while noise pages are meaningfully suppressed.
+    ///
+    /// **This default must stay in sync with
+    /// [`crate::types::TesseractConfig::language_model_ngram_on`]'s default** (the
+    /// public-facing counterpart, in `types/formats.rs`). The two structs have independent
+    /// `Default` impls, and several call sites in `extractors::image` construct the public
+    /// struct's default and convert it (via the `From` impl below) *before* this default is
+    /// ever consulted — so this field's value only reaches standalone image OCR when both
+    /// defaults agree.
     pub language_model_ngram_on: bool,
     /// Tesseract `tessedit_dont_blkrej_good_wds` variable.
     pub tessedit_dont_blkrej_good_wds: bool,
@@ -120,7 +146,63 @@ pub struct TesseractConfig {
     /// When set, [`resolve_tessdata_path`](crate::ocr::processor) uses this path
     /// before consulting `TESSDATA_PREFIX`, cache, or system locations.
     pub tessdata_path: Option<std::path::PathBuf>,
+
+    /// True resolution, in DPI, of the image bytes accompanying this config, when the caller
+    /// knows it.
+    ///
+    /// This is *not* a user-facing knob and has no counterpart on the public
+    /// [`crate::types::TesseractConfig`]: it is a per-call fact about one image, set by the PDF
+    /// OCR route from [`crate::core::config::ocr::SOURCE_DPI_BACKEND_OPTION`] because that route
+    /// rendered the page and can derive it exactly. Every other caller leaves it `None`.
+    ///
+    /// `None` means "unknown", and the DPI-normalization step then falls back to assuming 72 DPI
+    /// as it always has. That assumption is what this field exists to displace: a page rendered
+    /// at 150 DPI but declared as 72 gets scaled by `target_dpi / 72` instead of
+    /// `target_dpi / 150`, which on a Letter page means upscaling into the 4096px dimension clamp
+    /// for no added information and then telling Tesseract a `scan_res` that is roughly half the
+    /// raster's real resolution.
+    #[serde(default)]
+    pub source_dpi: Option<f64>,
+
+    /// The true, 1-indexed page number of the source document that `image_bytes` came
+    /// from, when the caller knows it.
+    ///
+    /// Like `source_dpi`, this is *not* a user-facing knob and has no counterpart on the
+    /// public [`crate::types::TesseractConfig`]: `perform_ocr` runs Tesseract on exactly one
+    /// loaded image per call, so Tesseract's own per-call page index (hOCR's `ppageno`, the
+    /// TSV `page_num` column, and the iterator extraction's page argument) is always `0`/`1`
+    /// regardless of which page of the source document this image actually is. Every parsed
+    /// element, table, and `OcrElement` is stamped with this field's value instead of that
+    /// per-call index, so a caller processing page 2 of a multi-page document must set this
+    /// to `2` for the resulting elements to report the right page. Callers that don't know
+    /// (or don't need) the true page number leave it at the default, `1`.
+    #[serde(default = "default_page_number")]
+    pub page_number: u32,
 }
+
+/// Default for [`TesseractConfig::page_number`]: page 1, matching Tesseract's own
+/// single-image `ppageno`/TSV convention when no caller-supplied page number is known.
+fn default_page_number() -> u32 {
+    1
+}
+
+/// Word-level confidence floor (0.0-100.0) below which Tesseract drops a recognized word.
+/// `0.0` accepts every word Tesseract reports, regardless of confidence.
+///
+/// Calibration owed before this can safely move above `0.0`: unlike
+/// `max_ocr_output_fragmented_word_ratio` / `min_ocr_mean_confidence` in
+/// `OcrQualityThresholds` (measured as PAGE-level statistics over a recorded municipal
+/// ordinance), this floor is applied per WORD, so the required measurement is different
+/// in kind, not just in corpus: for each word Tesseract emits, cross-tabulate its raw
+/// `conf` value (TSV column 11 / the iterator's per-word confidence) against whether the
+/// word is genuinely correct — e.g. using ground truth, or the dictionary-validity signal
+/// in `dictionary_invalid_word_ratio` (`ocr::processor::execution`) as a proxy — and find
+/// the confidence value below which words are predominantly wrong. Do not raise this
+/// constant without that measurement: guessing a page-level number (like 70.0) and
+/// applying it per word risks silently deleting individual correct words throughout
+/// otherwise-good pages, which is a different and less visible failure than dropping a
+/// whole bad page.
+const MIN_CONFIDENCE_FLOOR_DEFAULT: f64 = 0.0;
 
 impl Default for TesseractConfig {
     fn default() -> Self {
@@ -132,7 +214,7 @@ impl Default for TesseractConfig {
             psm: 3,
             output_format: "markdown".to_string(),
             oem: 3,
-            min_confidence: 0.0,
+            min_confidence: MIN_CONFIDENCE_FLOOR_DEFAULT,
             preprocessing: None,
             enable_table_detection: true,
             table_min_confidence: 0.0,
@@ -140,7 +222,7 @@ impl Default for TesseractConfig {
             table_row_threshold_ratio: 0.5,
             use_cache: true,
             classify_use_pre_adapted_templates: true,
-            language_model_ngram_on: false,
+            language_model_ngram_on: true,
             tessedit_dont_blkrej_good_wds: true,
             tessedit_dont_rowrej_good_wds: true,
             tessedit_enable_dict_correction: true,
@@ -151,6 +233,8 @@ impl Default for TesseractConfig {
             thresholding_method: false,
             auto_rotate: false,
             tessdata_path: None,
+            source_dpi: None,
+            page_number: default_page_number(),
         }
     }
 }
@@ -199,6 +283,15 @@ impl From<&crate::types::TesseractConfig> for TesseractConfig {
             thresholding_method: config.thresholding_method,
             auto_rotate: config.preprocessing.as_ref().map(|p| p.auto_rotate).unwrap_or(false),
             tessdata_path: None,
+            // The public config is a user-supplied document-wide setting and cannot know the
+            // resolution of any one image; only the per-call `backend_options` hint can.
+            source_dpi: None,
+            // Same rationale as `source_dpi`: the public config has no notion of which page
+            // of a document this one call is for. Unlike `source_dpi`, no caller currently
+            // threads a per-call value in through `backend_options`, so this always resolves
+            // to the default; direct callers of the internal `TesseractConfig`/`perform_ocr`
+            // API can still set it explicitly.
+            page_number: default_page_number(),
         }
     }
 }
@@ -298,6 +391,16 @@ mod tests {
         assert_eq!(config.table_column_threshold, 50);
         assert_eq!(config.table_row_threshold_ratio, 0.5);
         assert!(config.use_cache);
+        assert!(
+            config.language_model_ngram_on,
+            "the n-gram language model penalizes non-dictionary output (recognition noise) \
+             and must be on by default, not off"
+        );
+        assert_eq!(
+            config.min_confidence, MIN_CONFIDENCE_FLOOR_DEFAULT,
+            "min_confidence stays at 0.0 until it is calibrated per-word, not per-page \
+             (see MIN_CONFIDENCE_FLOOR_DEFAULT)"
+        );
 
         #[cfg(target_arch = "wasm32")]
         assert_eq!(config.psm, 6, "WASM default must be PSM_SINGLE_BLOCK (6)");

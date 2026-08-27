@@ -2,11 +2,12 @@
 import { ExtractInputKind, extract } from "@xberg-io/xberg";
 
 const output = await extract({
-  kind: "uri",
+  kind: ExtractInputKind.Uri,
   uri: "document.pdf",
 });
 
-output.results[0].tables?.forEach((table) => {
+const [first] = output.results ?? [];
+first?.tables?.forEach((table) => {
   console.log(`Table with ${table.cells?.length ?? 0} rows`);
   console.log(table.markdown);
   table.cells?.forEach((row) => console.log(row.join(" | ")));

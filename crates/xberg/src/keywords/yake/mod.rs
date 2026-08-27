@@ -403,7 +403,7 @@ pub(crate) fn extract_keywords_yake(text: &str, config: &KeywordConfig) -> Resul
     });
 
     let yake_config = YakeConfig {
-        ngrams: config.ngram_range.1,
+        ngrams: config.ngram_range.max,
         window_size: params.window_size,
         ..YakeConfig::default()
     };
@@ -419,7 +419,7 @@ pub(crate) fn extract_keywords_yake(text: &str, config: &KeywordConfig) -> Resul
         .into_iter()
         .filter(|item| {
             let word_count = item.keyword.split_whitespace().count();
-            word_count >= config.ngram_range.0
+            word_count >= config.ngram_range.min
         })
         .map(|item| {
             let normalized_score = if item.score > 0.0 {

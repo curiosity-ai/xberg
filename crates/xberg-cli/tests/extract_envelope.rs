@@ -5,7 +5,7 @@
 //!  - `extract --format json` emits `{ result, extraction_time_ms }` shape
 //!  - `batch --format json` emits `{ results, total_ms, per_file_ms }` shape
 //!  - `result.metadata.ocr_used` exists as a bool field
-//!  - `--pdf-backend xyz` exits non-zero and mentions "pdf-oxide"
+//!  - `--pdf-backend xyz` exits non-zero and mentions "native"
 
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 
@@ -201,8 +201,8 @@ fn test_pdf_backend_invalid_value_exits_nonzero() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("pdf-oxide"),
-        "error message should mention 'pdf-oxide', got: {stderr}"
+        stderr.contains("native"),
+        "error message should mention 'native', got: {stderr}"
     );
 }
 
@@ -295,7 +295,7 @@ fn test_pdf_backend_valid_value_succeeds() {
             "extract",
             &pdf.to_string_lossy(),
             "--pdf-backend",
-            "pdf-oxide",
+            "native",
             "--format",
             "json",
         ])
@@ -304,7 +304,7 @@ fn test_pdf_backend_valid_value_succeeds() {
 
     assert!(
         output.status.success(),
-        "--pdf-backend pdf-oxide should succeed: {}",
+        "--pdf-backend native should succeed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 

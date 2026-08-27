@@ -307,7 +307,14 @@ impl<'a> AsciiDocParser<'a> {
     /// as AsciiMath unless the document names `latexmath`.
     fn pending_math_notation(&self) -> Option<MathNotation> {
         self.pending_attrs.first().and_then(|attr| {
-            match attr.split(',').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            match attr
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "latexmath" => Some(MathNotation::Latex),
                 "asciimath" => Some(MathNotation::AsciiMath),
                 "stem" => Some(self.stem_notation()),
@@ -1042,8 +1049,9 @@ impl InternalDocumentExtractor for AsciiDocExtractor {
             word_count: body.split_whitespace().count() as u32,
             character_count: body.chars().count() as u32,
             headers: Some(parsed.headers).filter(|h| !h.is_empty()),
-            links: Some(parsed.links).filter(|l| !l.is_empty()),
-            code_blocks: Some(parsed.code_blocks).filter(|c| !c.is_empty()),
+            links: Some(parsed.links.into_iter().map(Into::into).collect()).filter(|l: &Vec<_>| !l.is_empty()),
+            code_blocks: Some(parsed.code_blocks.into_iter().map(Into::into).collect())
+                .filter(|blocks: &Vec<_>| !blocks.is_empty()),
         }));
 
         Ok(document)

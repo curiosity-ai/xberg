@@ -81,6 +81,17 @@ struct KeynoteData {
 ///
 /// We separate slide-specific IWA files from other files to produce
 /// per-slide structured output.
+/// Reject a Keynote deck whose slide count exceeds `max_pages` before any
+/// per-slide work (IWA read, Snappy decompression, protobuf text extraction in
+/// the loop below) begins (#1451).
+///
+/// Slide count is exact by the time this runs: `slide_paths` comes from
+/// filtering `iwa_paths`, a ZIP entry-name listing already produced by
+/// `collect_iwa_paths` before any member is read or decompressed.
+fn enforce_slide_limit(slide_count: usize, max_pages: Option<usize>) -> Result<()> {
+    Ok(crate::extractors::security::enforce_page_count(slide_count, max_pages)?)
+}
+
 fn parse_keynote(content: &[u8], limits: &SecurityLimits) -> Result<KeynoteData> {
     validate_iwork_zip(content, limits)?;
     let mut budget = SecurityBudget::for_iwork(limits);
@@ -97,6 +108,7 @@ fn parse_keynote(content: &[u8], limits: &SecurityLimits) -> Result<KeynoteData>
         .collect();
 
     slide_paths.sort();
+    enforce_slide_limit(slide_paths.len(), limits.max_pages)?;
 
     let other_paths: Vec<&String> = iwa_paths
         .iter()
@@ -373,5 +385,69 @@ mod tests {
         assert_eq!(document.elements[0].text, "Title");
         assert_eq!(document.elements[1].kind, ElementKind::Paragraph);
         assert_eq!(document.elements[1].text, "Body");
+    }
+
+    fn three_slide_keynote_zip() -> Vec<u8> {
+        let slide1 = iwa_text_frame("Slide 1");
+        let slide2 = iwa_text_frame("Slide 2");
+        let slide3 = iwa_text_frame("Slide 3");
+        keynote_zip(&[
+            ("Index/Slide-1.iwa", &slide1),
+            ("Index/Slide-2.iwa", &slide2),
+            ("Index/Slide-3.iwa", &slide3),
+        ])
+    }
+
+    /// #1451: `max_pages` must reject a deck once its slide count is known, before
+    /// any per-slide work (IWA read, Snappy decompression, protobuf parsing)
+    /// begins. Against unfixed code `enforce_slide_limit` does not exist and
+    /// nothing checks `limits.max_pages`, so this fails to compile; once wired up
+    /// but not enforced, `parse_keynote` would return `Ok` with 3 slides instead
+    /// of the expected `SecurityError::TooManyPages`.
+    #[test]
+    fn should_reject_keynote_deck_exceeding_max_pages() {
+        let archive = three_slide_keynote_zip();
+        let limits = SecurityLimits {
+            max_pages: Some(2),
+            ..Default::default()
+        };
+
+        // `expect_err` would need `KeynoteData: Debug`, which it does not implement, so
+        // destructure instead of unwrapping.
+        let Err(error) = parse_keynote(&archive, &limits) else {
+            panic!("a deck with more slides than max_pages must be rejected");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("too many pages") || message.contains("max_pages"),
+            "error must name the limit that was hit: {message}"
+        );
+    }
+
+    /// A deck exactly at the configured `max_pages` ceiling must parse in full --
+    /// the off-by-one boundary case #1451 asked to get right.
+    #[test]
+    fn should_accept_keynote_deck_at_max_pages_boundary() {
+        let archive = three_slide_keynote_zip();
+        let limits = SecurityLimits {
+            max_pages: Some(3),
+            ..Default::default()
+        };
+
+        let data = parse_keynote(&archive, &limits).expect("a deck exactly at max_pages must not be rejected");
+        assert_eq!(data.slide_texts.len(), 3, "all three slides must be parsed");
+    }
+
+    /// The default `SecurityLimits` (`max_pages: None`) must never reject a
+    /// multi-slide deck: a real ceiling here is opt-in.
+    #[test]
+    fn should_accept_keynote_deck_under_default_max_pages() {
+        let archive = three_slide_keynote_zip();
+        let result = parse_keynote(&archive, &SecurityLimits::default());
+        assert!(
+            result.is_ok(),
+            "default security limits must not reject a normal multi-slide deck: {:?}",
+            result.err()
+        );
     }
 }

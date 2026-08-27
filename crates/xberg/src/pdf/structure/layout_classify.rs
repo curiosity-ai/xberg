@@ -13,6 +13,24 @@ const CODE_HEADING_OVERRIDE_CONFIDENCE: f32 = 0.8;
 const MIN_STRUCTURED_CODE_SYNTAX_CHARACTERS: usize = 3;
 const MIN_CODE_ASSIGNMENT_OPERATORS: usize = 2;
 
+/// Maximum character length for text a `Title`/`SectionHeader`/`Caption`/`Footnote`
+/// hint is allowed to promote or annotate, and -- since GH#793 -- the maximum length a
+/// `PageHeader`/`PageFooter`/`Picture` hint is allowed to suppress as page furniture.
+///
+/// Real running headers/footers and in-picture labels/watermarks are short by nature.
+/// A layout detector's box is imprecise and commonly clips a fraction of an adjacent
+/// paragraph (a figure caption, a multi-line title/author/affiliation block) into a
+/// `PageHeader`/`PageFooter`/`Picture` region alongside genuine furniture. Before this
+/// guard, `matches_hint_text`'s `_ => true` fallthrough let a hint of ANY of those
+/// three classes match a paragraph of ANY length, and `apply_hint_to_paragraph` then
+/// suppressed the whole thing unconditionally (`is_page_furniture = true`) with no
+/// length check of its own -- silently discarding real body content whenever it
+/// partially overlapped a detected header/footer/picture box (GH#793). Content long
+/// enough to exceed this bound is, definitionally, not a short repeating running
+/// header/footer or a picture label -- it is prose that happens to overlap the box,
+/// and must be classified as ordinary text instead.
+const MAX_FURNITURE_HINT_TEXT_CHARS: usize = 200;
+
 /// Apply layout detection overrides to classified paragraphs.
 ///
 /// Uses two matching strategies:
@@ -103,7 +121,10 @@ fn trace_layout_summary(paragraphs: &[PdfParagraph]) {
 /// validates text content matches the hint type: e.g., SectionHeader hints only apply
 /// to short paragraphs (≤200 chars), ListItem hints to list marker prefixes. This
 /// prevents false promotion of long body paragraphs that happen to spatially overlap
-/// a heading hint.
+/// a heading hint. The same length bound also applies to the *suppression* classes
+/// (PageHeader, PageFooter, Picture, see `MAX_FURNITURE_HINT_TEXT_CHARS`): a paragraph
+/// too long to plausibly be a running header/footer or an in-picture label is left
+/// unmatched by that hint rather than being marked page furniture (GH#793).
 fn apply_spatial_overrides_with_matches(
     paragraphs: &mut [PdfParagraph],
     hints: &[LayoutHint],
@@ -209,16 +230,23 @@ fn hint_area(hint: &LayoutHint) -> f32 {
 
 /// Check if text matches the content expectations of a layout hint class.
 ///
-/// For promotion classes (Title, SectionHeader, Caption, Footnote, ListItem),
-/// validate that the paragraph content aligns with the hint type:
+/// For promotion classes (Title, SectionHeader, Caption, Footnote, ListItem), and for
+/// the suppression classes (PageHeader, PageFooter, Picture), validate that the
+/// paragraph content aligns with the hint type:
 /// - Title/SectionHeader/Caption/Footnote: short text (≤200 chars)
+/// - PageHeader/PageFooter/Picture: short text (≤200 chars, see
+///   `MAX_FURNITURE_HINT_TEXT_CHARS`) -- a real running header/footer or in-picture
+///   label is short; a paragraph this long is prose that merely overlaps the
+///   detector's box and must not be discarded as furniture (GH#793)
 /// - ListItem: text starts with list marker (digit, bullet, dash, etc.)
-/// - Other classes: always match (no text constraint)
+/// - Remaining classes (Text, Table, Form, KeyValueRegion, DocumentIndex, Other):
+///   always match (no text constraint)
 fn matches_hint_text(hint: &LayoutHint, para_text: &str) -> bool {
     use LayoutHintClass as L;
     match hint.class_name {
-        L::Title | L::SectionHeader => para_text.chars().count() <= 200,
-        L::Caption | L::Footnote => para_text.chars().count() <= 200,
+        L::Title | L::SectionHeader => para_text.chars().count() <= MAX_FURNITURE_HINT_TEXT_CHARS,
+        L::Caption | L::Footnote => para_text.chars().count() <= MAX_FURNITURE_HINT_TEXT_CHARS,
+        L::PageHeader | L::PageFooter | L::Picture => para_text.chars().count() <= MAX_FURNITURE_HINT_TEXT_CHARS,
         L::ListItem => {
             let trimmed = para_text.trim_start();
             trimmed.starts_with(|c: char| c.is_ascii_digit())
@@ -342,6 +370,24 @@ pub(super) fn infer_heading_level_from_text(text: &str, hint_class: LayoutHintCl
     }
 }
 
+/// GH#793 instrumentation: a paragraph was just marked `is_page_furniture = true` by
+/// a spatial hint match. It still reaches the output of `ocr_doc_to_layout_paragraphs`
+/// (see `trace_conversion`'s doc comment) -- this fires strictly earlier, at the
+/// classification decision itself, so the hint's class/confidence/containment can be
+/// read off directly instead of inferred from the paragraph afterward. Off by default;
+/// enable `target = "xberg::pdf::structure::layout_classify::furniture"` at `trace`
+/// level.
+fn trace_furniture_tagged(hint: &LayoutHint, para_text: &str) {
+    tracing::trace!(
+        target: "xberg::pdf::structure::layout_classify::furniture",
+        hint_class = ?hint.class_name,
+        confidence = hint.confidence,
+        word_count = para_text.split_whitespace().count(),
+        text = %para_text.trim().chars().take(60).collect::<String>(),
+        "paragraph marked page furniture by layout hint"
+    );
+}
+
 /// Apply a single hint's classification to a paragraph.
 ///
 /// `body_font_size`: when provided, used to guard against promoting body-text-sized
@@ -458,12 +504,46 @@ pub(super) fn apply_hint_to_paragraph(para: &mut PdfParagraph, hint: &LayoutHint
         LayoutHintClass::ListItem if hint.confidence >= 0.8 => {
             para.is_list_item = true;
         }
+        // `best_spatial_match` already filtered out any candidate hint of these three
+        // classes whose matched paragraph exceeds `MAX_FURNITURE_HINT_TEXT_CHARS`
+        // (`matches_hint_text`), so a paragraph reaching this arm is short enough to
+        // plausibly be a real running header/footer or an in-picture label -- not a
+        // caption, title/author block, or other prose that merely overlaps the box
+        // (GH#793). This function has no text of its own to re-check.
         LayoutHintClass::PageHeader | LayoutHintClass::PageFooter if para.heading_level.is_none() => {
             para.is_page_furniture = hint.confidence >= 0.8;
+            if para.is_page_furniture {
+                trace_furniture_tagged(hint, &para_text);
+            }
         }
-        LayoutHintClass::Picture if para.heading_level.is_none() => {
-            para.is_page_furniture = true;
-        }
+        // Unlike the PageHeader/PageFooter arm above, this has no confidence floor of
+        // its own beyond the caller's `min_confidence` eligibility gate on `hint` --
+        // `best_spatial_match` already required `hint.confidence >= min_confidence` and
+        // `containment >= min_containment` before this ever runs, but for the OCR
+        // layout route those are 0.5 / 0.2 respectively
+        // (`extractors::pdf::ocr::assemble_ocr_page_paragraphs`), so a Picture hint
+        // only 20% confident and only 20% overlapping a short (<=200
+        // char, `MAX_FURNITURE_HINT_TEXT_CHARS`) paragraph is enough to mark it
+        // furniture unconditionally. GH#793 candidate site: traced separately from the
+        // header/footer arm so the two can be told apart.
+        // GH#793: a `Picture` hint does NOT make its text page furniture. Furniture is
+        // content that FRAMES a page -- a running header, a footer, a watermark -- and is
+        // safe to drop because it repeats elsewhere. Text inside a figure is the opposite:
+        // it is the figure's own data, and it appears exactly once.
+        //
+        // Measured on nougat_009 with both routes instrumented: every one of the 12
+        // furniture taggings on that document came from this arm, none from
+        // PageHeader/PageFooter. They suppressed 8 paragraphs / 27 words -- `How it
+        // worked`, `35.20%`, `$263`, `increase in aided` -- each of which IS in the ground
+        // truth. Paragraph conversion itself lost nothing (525 words in, 525 out on both
+        // routes); the entire 161-byte deficit against the non-layout route, and GT recall
+        // of 44/77 against 46/77, came from this one arm plus the render-time body filter.
+        //
+        // The arm also had no confidence floor, while PageHeader/PageFooter require
+        // `>= 0.8`. The suppressing hints here measured 0.769 to 0.837, so a floor would
+        // have recovered some and kept discarding the rest. `is_page_furniture` now belongs
+        // only to the two classes whose name means what it says.
+        LayoutHintClass::Picture => {}
         LayoutHintClass::Text | LayoutHintClass::Caption | LayoutHintClass::Footnote
             if !debug.no_demote
                 && para.heading_level.is_some()
@@ -1510,13 +1590,17 @@ mod tests {
         );
     }
 
+    /// GH#793: a figure label is the figure's own data and appears once, so a `Picture`
+    /// hint must leave it in the document. This asserted the opposite until nougat_009 was
+    /// measured: that page's `Picture` hints suppressed 27 words of chart labels -- `How it
+    /// worked`, `35.20%`, `$263` -- every one of them present in the ground truth.
     #[test]
-    fn test_picture_hint_applies_to_non_heading_paragraph() {
+    fn test_picture_hint_does_not_make_a_figure_label_furniture() {
         let mut para = make_para(12.0, 400.0, 100.0, 16.0);
         para.text = "Figure 1: schematic".to_string();
         let hint = make_hint(LayoutHintClass::Picture, 0.85, 0.0, 390.0, 200.0, 420.0);
         apply_hint_to_paragraph(&mut para, &hint, None);
-        assert!(para.is_page_furniture, "figure label must become furniture");
+        assert!(!para.is_page_furniture, "figure text is content, not page furniture");
         assert_eq!(para.heading_level, None, "non-heading para must stay non-heading");
     }
 

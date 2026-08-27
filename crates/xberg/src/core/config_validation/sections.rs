@@ -13,7 +13,23 @@ const VALID_BINARIZATION_METHODS: &[&str] = &["otsu", "adaptive", "sauvola"];
 const VALID_TOKEN_REDUCTION_LEVELS: &[&str] = &["off", "light", "moderate", "aggressive", "maximum"];
 
 /// Valid OCR backends.
-const VALID_OCR_BACKENDS: &[&str] = &["tesseract", "paddleocr", "paddle-ocr", "sceptre", "vlm"];
+///
+/// Every name a backend registers under must appear here, or config validation rejects a backend
+/// the registry is perfectly capable of serving. The list is deliberately not feature-gated: the
+/// entries already present (`sceptre`, `vlm`, `paddle-ocr`) are feature-gated backends too, and a
+/// name that is valid-but-not-compiled-in is reported by backend resolution with a message about
+/// the missing feature, which is more useful than "invalid OCR backend".
+const VALID_OCR_BACKENDS: &[&str] = &[
+    "tesseract",
+    "paddleocr",
+    "paddle-ocr",
+    "sceptre",
+    "vlm",
+    "candle-trocr",
+    "candle-paddleocr-vl",
+    "candle-glm-ocr",
+    "candle-deepseek-ocr",
+];
 
 /// Common ISO 639-1 language codes (extended list).
 /// Covers most major languages and variants used in document processing.
@@ -558,12 +574,6 @@ pub(crate) fn validate_dpi(dpi: i32) -> Result<()> {
 ///
 /// Checks that max_chars > 0 and max_overlap < max_chars.
 ///
-/// Note: `ChunkingConfig::breadcrumb_target` (`BreadcrumbTarget`) needs no runtime
-/// validation function alongside this one — it is a genuine Rust enum
-/// (`content`/`metadata`/`both`), so an invalid value already fails config
-/// deserialization with a clear serde "unknown variant" error before `validate()`
-/// ever runs (#337).
-///
 /// # Arguments
 ///
 /// * `max_chars` - The maximum characters per chunk
@@ -669,6 +679,46 @@ pub(crate) fn validate_csv_delimiter(delimiter: &str) -> Result<()> {
             source: None,
         })
     }
+}
+
+/// Whether enabling layout detection while `output_format` stays [`crate::OutputFormat::Plain`]
+/// wastes the layout pass.
+///
+/// Layout detection exists to feed the structured-reconstruction pipeline that turns
+/// detected regions into headings, lists and tables. At [`crate::OutputFormat::Plain`] no renderer
+/// consumes that structure — the layout model still runs (measured: 20s on tesseract, 202s
+/// on paddle, for a 16-page scan) and every region it detects is discarded. This implements
+/// point 4 of the documented OCR/layout contract: "layout enabled implies output should be
+/// structured, never plain."
+///
+/// This is a pure predicate meant to back a *warning*, not a validation error and not a
+/// coercion: `Plain` stays the default output format and layout stays off by default, so a
+/// caller combining both deliberately is still free to do so. Pass the fully resolved values
+/// (after every override has been applied), not raw CLI flags.
+///
+/// # Arguments
+///
+/// * `layout_enabled` - Whether layout detection will run for this extraction.
+/// * `output_format` - The resolved output format the extraction will render.
+///
+/// # Returns
+///
+/// `true` when layout is enabled and the output format is [`crate::OutputFormat::Plain`] — the
+/// layout work will be computed and its structure discarded.
+///
+/// # Examples
+///
+/// ```
+/// use xberg::core::config_validation::layout_wastes_plain_output;
+/// use xberg::OutputFormat;
+///
+/// assert!(layout_wastes_plain_output(true, &OutputFormat::Plain));
+/// assert!(!layout_wastes_plain_output(true, &OutputFormat::Markdown));
+/// assert!(!layout_wastes_plain_output(false, &OutputFormat::Plain));
+/// ```
+#[cfg_attr(alef, alef(skip))]
+pub fn layout_wastes_plain_output(layout_enabled: bool, output_format: &crate::OutputFormat) -> bool {
+    layout_enabled && *output_format == crate::OutputFormat::Plain
 }
 
 /// Validate that a VLM OCR backend has the required `vlm_config`.

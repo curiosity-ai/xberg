@@ -76,6 +76,13 @@ pub(crate) fn cluster_font_sizes(blocks: &[TextBlock], k: usize) -> Result<Vec<F
     let actual_k = k.min(blocks.len());
 
     let mut font_sizes: Vec<f32> = blocks.iter().map(|b| b.font_size).filter(|fs| fs.is_finite()).collect();
+    if font_sizes.is_empty() {
+        // Every block's font size was NaN/infinite (a PDF can produce this via a
+        // degenerate text/font matrix), so there is no usable font-size signal at
+        // all — treat it the same as the no-blocks case above rather than let the
+        // `else` branch below underflow `font_sizes.len() - 1` on an empty `Vec`.
+        return Ok(Vec::new());
+    }
     font_sizes.sort_by(|a, b| b.total_cmp(a));
     font_sizes.dedup_by(|a, b| (*a - *b).abs() < 0.05);
 
@@ -177,16 +184,32 @@ pub(crate) fn cluster_font_sizes(blocks: &[TextBlock], k: usize) -> Result<Vec<F
 ///
 /// * `clusters` - Slice of FontSizeCluster objects (sorted by centroid descending)
 /// * `min_heading_ratio` - Minimum ratio of heading centroid to body centroid (e.g. 1.15)
-/// * `min_heading_gap` - Minimum absolute font-size difference in points (e.g. 1.5)
 ///
 /// # Returns
 ///
 /// Vector of tuples `(centroid, heading_level)` where `None` means body text
 /// and `Some(1..=6)` means H1-H6. Sorted by centroid descending.
+///
+/// # Scale invariance
+///
+/// `font_size` on a [`TextBlock`] is an opaque magnitude: for native PDFs it is
+/// typographic points, for OCR-derived blocks it is a render-DPI-dependent pixel
+/// measurement. This function previously also accepted a `min_heading_gap`
+/// absolute-unit parameter and required a candidate cluster to clear
+/// `body_centroid + min_heading_gap` in addition to the ratio. That is
+/// mathematically indistinguishable, for any single scale-free function of
+/// `body_centroid` alone, from just a second (smaller) ratio bound: for a fixed
+/// gap `g`, `body + g` only ever equals `body * (1 + g / body)`, i.e. a ratio
+/// that *shrinks* as `body_centroid` grows. On a 300 DPI OCR render a 21px body
+/// cluster is already "large" in raw units even though it represents an
+/// ordinary ~5pt-equivalent font, so the shrunk ratio let a 23px cluster
+/// (23/21 = 1.095, well under a 1.15 ratio) through purely because 23 >= 21 +
+/// 1.5. There is no absolute-unit choice that is simultaneously correct for
+/// points and for pixels, so the gap term has been removed and the ratio is
+/// now the sole (scale-invariant) test.
 pub(crate) fn assign_heading_levels_smart(
     clusters: &[FontSizeCluster],
     min_heading_ratio: f32,
-    min_heading_gap: f32,
 ) -> Vec<(f32, Option<u8>)> {
     if clusters.is_empty() {
         return Vec::new();
@@ -205,9 +228,7 @@ pub(crate) fn assign_heading_levels_smart(
 
     let body_centroid = clusters[body_idx].centroid;
 
-    let min_heading_size = body_centroid * min_heading_ratio;
-    let min_heading_abs = body_centroid + min_heading_gap;
-    let heading_threshold = min_heading_size.min(min_heading_abs);
+    let heading_threshold = body_centroid * min_heading_ratio;
 
     let mut heading_candidates: Vec<(usize, f32)> = clusters
         .iter()
@@ -330,6 +351,44 @@ mod tests {
         }
     }
 
+    /// Every block's font size is non-finite (NaN), which a PDF can produce via a
+    /// degenerate text/font matrix. Before the `font_sizes.is_empty()` guard, the
+    /// `.filter(|fs| fs.is_finite())` step emptied `font_sizes` entirely, and the
+    /// `else` branch (taken whenever `font_sizes.len() < actual_k`, which includes
+    /// zero) then computed `font_sizes[font_sizes.len() - 1]`: `0usize - 1`
+    /// underflows (a debug-mode panic on its own), and in a release build (no
+    /// `overflow-checks`, matching this workspace's profile) the wrapped
+    /// `usize::MAX` index still panics on the following `Vec` index — bounds
+    /// checks are independent of `overflow-checks`. `cluster_font_sizes` must
+    /// instead return an empty cluster list, exactly like the pre-existing
+    /// no-blocks-at-all case just above it.
+    #[test]
+    fn all_non_finite_font_sizes_returns_empty_clusters_instead_of_panicking() {
+        let blocks = vec![make_block("Heading with a broken font matrix", f32::NAN)];
+
+        let clusters = cluster_font_sizes(&blocks, 1).expect("must not panic on all-NaN font sizes");
+
+        assert!(
+            clusters.is_empty(),
+            "no finite font-size signal exists, so no clusters should be produced, got {clusters:?}"
+        );
+    }
+
+    /// Positive control: a normal single finite-font-size block (the same shape
+    /// as the panic case, minus the NaN) must still produce one cluster centered
+    /// on that font size — the fix must not turn ordinary single-block input into
+    /// an empty result too.
+    #[test]
+    fn single_finite_font_size_still_produces_one_cluster() {
+        let blocks = vec![make_block("Ordinary heading", 18.0)];
+
+        let clusters = cluster_font_sizes(&blocks, 1).expect("clustering a single finite font size must succeed");
+
+        assert_eq!(clusters.len(), 1, "expected exactly one cluster, got {clusters:?}");
+        assert_eq!(clusters[0].centroid, 18.0);
+        assert_eq!(clusters[0].members.len(), 1);
+    }
+
     #[test]
     fn test_body_cluster_by_text_content_not_member_count() {
         let mut blocks = Vec::new();
@@ -341,12 +400,106 @@ mod tests {
         }
 
         let clusters = cluster_font_sizes(&blocks, 2).unwrap();
-        let levels = assign_heading_levels_smart(&clusters, 1.15, 1.5);
+        let levels = assign_heading_levels_smart(&clusters, 1.15);
 
         let body_centroid = levels.iter().find(|(_, l)| l.is_none()).map(|(c, _)| *c);
         assert!(body_centroid.is_some(), "should have a body cluster");
         let bc = body_centroid.unwrap();
         assert!((bc - 12.0).abs() < 1.0, "body centroid should be near 12pt, got {bc}");
+    }
+
+    /// Builds two `FontSizeCluster`s directly (bypassing k-means) so the body/candidate
+    /// centroids can be pinned to exact values, matching a measured input distribution.
+    fn two_clusters(body_centroid: f32, candidate_centroid: f32) -> Vec<FontSizeCluster> {
+        vec![
+            FontSizeCluster {
+                centroid: candidate_centroid,
+                members: vec![make_block("Short", candidate_centroid)],
+            },
+            FontSizeCluster {
+                centroid: body_centroid,
+                members: vec![make_block(
+                    "This cluster carries far more running text so char-weighted mass picks it as body.",
+                    body_centroid,
+                )],
+            },
+        ]
+    }
+
+    /// Real Tesseract hOCR `x_fsize` values from a 300 DPI scan (measured against
+    /// `test_documents/images_extra/ocr_image.tiff`): body text clusters at 21, a
+    /// secondary/subhead-looking tier clusters at 23. Their ratio is 23/21 = 1.095,
+    /// which correctly fails the 1.15 `MIN_HEADING_FONT_RATIO` gate. Their absolute
+    /// gap is 23 - 21 = 2.0, which incorrectly *clears* the old 1.5 absolute
+    /// `MIN_HEADING_FONT_GAP`, so the pre-fix `min(ratio_bound, abs_bound)` combinator
+    /// picked the weaker (abs) bound and promoted a 9%-larger body run to a heading.
+    ///
+    /// Fails without the fix: the removed code computed
+    /// `heading_threshold = (21.0 * 1.15).min(21.0 + 1.5) = 22.5`, and 23.0 >= 22.5,
+    /// so `candidate_level` was `Some(1)` instead of `None`.
+    #[test]
+    fn test_pixel_scale_ratio_gate_rejects_ocr_subhead_noise() {
+        let clusters = two_clusters(21.0, 23.0);
+        let levels = assign_heading_levels_smart(&clusters, 1.15);
+
+        let candidate_level = levels
+            .iter()
+            .find(|(centroid, _)| (*centroid - 23.0).abs() < 0.01)
+            .map(|(_, level)| *level);
+        assert_eq!(
+            candidate_level,
+            Some(None),
+            "a 23px cluster over a 21px body (ratio 1.095) must not be promoted to a heading"
+        );
+    }
+
+    /// Pins the documented calibration point shared by `MIN_HEADING_FONT_RATIO`'s and
+    /// the old `MIN_HEADING_FONT_GAP`'s doc comments (both cite a 10pt body): at
+    /// exactly body=10, `body * 1.15` and `body + 1.5` are numerically identical
+    /// (11.5), so removing the gap term changes nothing at this reference size. This
+    /// does not fail without the fix (both formulas agree here); it documents why the
+    /// native corpus, calibrated near a 10pt body, is expected to be unaffected.
+    #[test]
+    fn test_native_reference_body_boundary_is_unaffected_by_gap_removal() {
+        let clusters = two_clusters(10.0, 11.5);
+        let levels = assign_heading_levels_smart(&clusters, 1.15);
+
+        let candidate_level = levels
+            .iter()
+            .find(|(centroid, _)| (*centroid - 11.5).abs() < 0.01)
+            .map(|(_, level)| *level);
+        assert_eq!(
+            candidate_level,
+            Some(Some(1)),
+            "11.5 over a 10pt body sits exactly on the ratio boundary"
+        );
+    }
+
+    /// Documents a genuine, deliberate *native*-scale behavior change: for a body font
+    /// above the 10pt reference (e.g. the common 12pt Word default), the removed gap
+    /// term let candidates clear a shrunk effective ratio (13.5/12 = 12.5%) instead of
+    /// the full 15%. A 13.6pt candidate (ratio 1.133) cleared the old gap-relaxed bound
+    /// but fails the pure-ratio bound used after this fix.
+    ///
+    /// Fails without the fix: the removed code computed
+    /// `heading_threshold = (12.0 * 1.15).min(12.0 + 1.5) = 13.5`, and 13.6 >= 13.5, so
+    /// `candidate_level` was `Some(1)` instead of `None`. If a real fixture relies on
+    /// this specific relaxed-ratio window (body ~12pt, heading ~12.5-13.7pt), this test
+    /// documents exactly why it would now read as body text — see report.
+    #[test]
+    fn test_native_body_above_reference_no_longer_gets_gap_relaxation() {
+        let clusters = two_clusters(12.0, 13.6);
+        let levels = assign_heading_levels_smart(&clusters, 1.15);
+
+        let candidate_level = levels
+            .iter()
+            .find(|(centroid, _)| (*centroid - 13.6).abs() < 0.01)
+            .map(|(_, level)| *level);
+        assert_eq!(
+            candidate_level,
+            Some(None),
+            "13.6pt over a 12pt body (ratio 1.133) no longer clears the pure-ratio 1.15 gate"
+        );
     }
 
     #[test]
@@ -359,7 +512,7 @@ mod tests {
         ];
 
         let clusters = cluster_font_sizes(&blocks, 2).unwrap();
-        let levels = assign_heading_levels_smart(&clusters, 1.15, 1.5);
+        let levels = assign_heading_levels_smart(&clusters, 1.15);
 
         let body_centroid = levels.iter().find(|(_, l)| l.is_none()).map(|(c, _)| *c);
         assert!(body_centroid.is_some());

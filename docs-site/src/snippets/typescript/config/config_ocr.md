@@ -13,11 +13,11 @@ const config = {
 
 const output = await extract(
   {
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "document.pdf",
   },
   config,
 );
 
-console.log(output.results[0].content);
+console.log(output.results?.[0]?.content);
 ```

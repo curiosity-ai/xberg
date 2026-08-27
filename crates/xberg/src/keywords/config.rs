@@ -1,14 +1,102 @@
 //! Configuration for keyword extraction.
 
 use super::types::KeywordAlgorithm;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 fn default_max_keywords() -> usize {
     10
 }
 
-fn default_ngram_range() -> (usize, usize) {
-    (1, 3)
+/// Inclusive word-count range used to form keyword candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NgramRange {
+    /// Minimum number of words in a candidate.
+    pub min: usize,
+    /// Maximum number of words in a candidate.
+    pub max: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NgramRangeWire {
+    Positional((usize, usize)),
+    Named { min: usize, max: usize },
+}
+
+impl Serialize for NgramRange {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (self.min, self.max).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NgramRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let range = match NgramRangeWire::deserialize(deserializer)? {
+            NgramRangeWire::Positional(range) => range.into(),
+            NgramRangeWire::Named { min, max } => Self { min, max },
+        };
+
+        range.validate().map_err(serde::de::Error::custom)
+    }
+}
+
+impl NgramRange {
+    fn validate(self) -> Result<Self, String> {
+        if self.min == 0 {
+            return Err("ngram range minimum must be at least 1, got 0".to_string());
+        }
+        if self.min > self.max {
+            return Err(format!(
+                "ngram range minimum must not exceed maximum ({} > {})",
+                self.min, self.max
+            ));
+        }
+
+        Ok(self)
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for NgramRange {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ArrayBuilder, ArrayItems, ObjectBuilder, Type};
+
+        let positive_integer = ObjectBuilder::new().schema_type(Type::Integer).minimum(Some(1)).build();
+
+        ArrayBuilder::new()
+            .items(ArrayItems::False)
+            .prefix_items([positive_integer.clone(), positive_integer])
+            .min_items(Some(2))
+            .max_items(Some(2))
+            .into()
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for NgramRange {}
+
+impl From<(usize, usize)> for NgramRange {
+    fn from((min, max): (usize, usize)) -> Self {
+        Self { min, max }
+    }
+}
+
+impl From<NgramRange> for (usize, usize) {
+    fn from(range: NgramRange) -> Self {
+        (range.min, range.max)
+    }
+}
+
+impl Default for NgramRange {
+    fn default() -> Self {
+        Self { min: 1, max: 3 }
+    }
 }
 
 /// YAKE-specific parameters.
@@ -75,10 +163,8 @@ pub struct KeywordConfig {
     /// (1, 1) = unigrams only
     /// (1, 2) = unigrams and bigrams
     /// (1, 3) = unigrams, bigrams, and trigrams (default)
-    #[serde(default = "default_ngram_range")]
-    #[cfg_attr(alef, alef(skip))]
-    #[cfg_attr(feature = "api", schema(value_type = [usize; 2]))]
-    pub ngram_range: (usize, usize),
+    #[serde(default)]
+    pub ngram_range: NgramRange,
 
     /// Language code for stopword filtering (e.g., "en", "de", "fr").
     ///
@@ -102,13 +188,29 @@ impl Default for KeywordConfig {
             algorithm: KeywordAlgorithm::default(),
             max_keywords: 10,
             min_score: 0.0,
-            ngram_range: (1, 3),
+            ngram_range: NgramRange::default(),
             language: Some("en".to_string()),
             #[cfg(feature = "keywords-yake")]
             yake_params: None,
             #[cfg(feature = "keywords-rake")]
             rake_params: None,
         }
+    }
+}
+
+impl KeywordConfig {
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        if !self.min_score.is_finite() || !(0.0..=1.0).contains(&self.min_score) {
+            return Err(crate::XbergError::validation(format!(
+                "keywords.min_score must be a finite value between 0.0 and 1.0, got {}",
+                self.min_score
+            )));
+        }
+
+        self.ngram_range
+            .validate()
+            .map(|_| ())
+            .map_err(|message| crate::XbergError::Validation { message, source: None })
     }
 }
 
@@ -133,6 +235,7 @@ impl KeywordConfig {
     }
 
     /// Set maximum number of keywords to extract.
+    #[cfg(feature = "keywords-yake")]
     pub(crate) fn with_max_keywords(mut self, max: usize) -> Self {
         self.max_keywords = max;
         self
@@ -146,7 +249,7 @@ impl KeywordConfig {
 
     /// Set n-gram range.
     pub(crate) fn with_ngram_range(mut self, min: usize, max: usize) -> Self {
-        self.ngram_range = (min, max);
+        self.ngram_range = NgramRange { min, max };
         self
     }
 
@@ -168,5 +271,76 @@ impl KeywordConfig {
     pub(crate) fn with_rake_params(mut self, params: RakeParams) -> Self {
         self.rake_params = Some(params);
         self
+    }
+}
+
+#[cfg(test)]
+mod binding_value_serde_tests {
+    use super::{KeywordConfig, NgramRange};
+    use serde_json::json;
+
+    #[cfg(feature = "api")]
+    fn assert_legacy_array_schema<T: utoipa::PartialSchema>(length: usize) {
+        let schema = serde_json::to_value(T::schema()).expect("schema must serialize");
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], length);
+        assert_eq!(schema["maxItems"], length);
+        assert_eq!(schema["items"], false);
+        assert_eq!(schema["prefixItems"].as_array().map(Vec::len), Some(length));
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_describe_ngram_range_as_legacy_array_schema() {
+        assert_legacy_array_schema::<NgramRange>(2);
+    }
+
+    #[test]
+    fn should_preserve_legacy_ngram_range_tuple_wire_format() {
+        let legacy = json!([1, 3]);
+        let range: NgramRange = serde_json::from_value(legacy.clone()).expect("legacy range must deserialize");
+        let named: NgramRange =
+            serde_json::from_value(json!({"min": 1, "max": 3})).expect("named range must deserialize");
+
+        assert_eq!(range, NgramRange { min: 1, max: 3 });
+        assert_eq!(named, range);
+        assert_eq!(serde_json::to_value(range).expect("range must serialize"), legacy);
+        assert_eq!(serde_json::to_value(named).expect("named range must serialize"), legacy);
+    }
+
+    #[test]
+    fn should_reject_zero_ngram_range_in_both_wire_shapes() {
+        for value in [json!([0, 0]), json!({"min": 0, "max": 0})] {
+            let error = serde_json::from_value::<NgramRange>(value).expect_err("zero range must be rejected");
+
+            assert_eq!(error.to_string(), "ngram range minimum must be at least 1, got 0");
+        }
+    }
+
+    #[test]
+    fn should_reject_reversed_ngram_range_in_both_wire_shapes() {
+        for value in [json!([4, 2]), json!({"min": 4, "max": 2})] {
+            let error = serde_json::from_value::<NgramRange>(value).expect_err("reversed range must be rejected");
+
+            assert_eq!(error.to_string(), "ngram range minimum must not exceed maximum (4 > 2)");
+        }
+    }
+
+    #[test]
+    fn should_deserialize_keyword_config_with_legacy_range() {
+        let config: KeywordConfig = serde_json::from_value(json!({
+            "algorithm": "rake",
+            "max_keywords": 5,
+            "min_score": 0.1,
+            "ngram_range": [2, 4],
+            "language": "en"
+        }))
+        .expect("legacy keyword config must deserialize");
+
+        assert_eq!(config.ngram_range, NgramRange { min: 2, max: 4 });
+        assert_eq!(
+            serde_json::to_value(config.ngram_range).expect("range must serialize"),
+            json!([2, 4])
+        );
     }
 }

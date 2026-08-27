@@ -1,40 +1,49 @@
-```typescript title="WASM (Browser)"
-import { enableOcr, extract, initWasm } from "@xberg-io/xberg-wasm";
+---
+language: typescript
+target: wasm
+---
 
-await initWasm();
-await enableOcr();
+```typescript title="WASM (Browser)"
+import init, { extract } from "@xberg-io/xberg-wasm";
+
+await init();
 
 const fileInput = document.getElementById("file") as HTMLInputElement;
 const file = fileInput.files?.[0];
 
 if (file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
   const result = await extract(
-    { kind: "bytes", bytes: file, mimeType: file.type },
+    { kind: "bytes", bytes, mimeType: file.type },
     {
       ocr: {
-        backend: "xberg-tesseract",
-        language: "eng",
+        enabled: true,
+        backend: "tesseract",
+        language: ["eng"],
       },
     },
   );
-  console.log(result.content);
+  console.log(result.results[0].content);
 }
 ```
 
 ```typescript title="WASM (Node.js / Deno / Bun)"
-import { enableOcr, extract, initWasm } from "@xberg-io/xberg-wasm";
+import init, { extract } from "@xberg-io/xberg-wasm";
 
-await initWasm();
-await enableOcr(); // Uses native xberg-tesseract backend
+// Outside the browser the default `fetch`-based init cannot read a `file://`
+// URL: pass the `xberg_wasm_bg.wasm` bytes yourself, either as
+// `init({ module_or_path: bytes })` or via the synchronous `initSync({ module: bytes })`.
+await init();
 
 const result = await extract(
   { kind: "uri", uri: "./scanned_document.png" },
   {
     ocr: {
-      backend: "xberg-tesseract",
-      language: "eng",
+      enabled: true,
+      backend: "tesseract",
+      language: ["eng"],
     },
   },
 );
-console.log(result.content);
+console.log(result.results[0].content);
 ```

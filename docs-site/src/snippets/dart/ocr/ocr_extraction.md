@@ -18,7 +18,7 @@ Future<void> main() async {
     kind: ExtractInputKind.uri,
     uri: 'scanned.pdf',
   );
-  final output = await XbergBridge.extract(input, config);
+  final output = await XbergBridge.extract(input, config: config);
   final document = output.results.first;
 
   print(document.content);

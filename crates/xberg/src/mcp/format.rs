@@ -13,6 +13,9 @@ pub(super) fn build_config(
     default_config: &ExtractionConfig,
     config_json: Option<serde_json::Value>,
 ) -> Result<ExtractionConfig, String> {
+    if let Some(config) = config_json.as_ref() {
+        crate::core::config::request_security::validate_caller_extraction_config(config)?;
+    }
     let json_string = config_json
         .map(|v| serde_json::to_string(&v))
         .transpose()
@@ -198,6 +201,36 @@ mod tests {
         assert!(
             merged.use_cache,
             "Should use explicit override even if it matches default"
+        );
+    }
+
+    #[test]
+    fn should_reject_caller_llm_transport_config_before_merging_trusted_defaults() {
+        let default_config = ExtractionConfig {
+            ocr: Some(crate::OcrConfig {
+                vlm_config: Some(crate::LlmConfig {
+                    model: "trusted/model".to_string(),
+                    base_url: Some("https://trusted.example".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let safe_override = serde_json::json!({"force_ocr": true});
+        assert!(
+            build_config(&default_config, Some(safe_override))
+                .expect("trusted default transport config must remain valid")
+                .force_ocr
+        );
+
+        let caller_override = serde_json::json!({
+            "ocr": {"vlm_config": {"model": "caller/model", "headers": {"Authorization": "secret"}}}
+        });
+        assert_eq!(
+            build_config(&default_config, Some(caller_override)).expect_err("caller transport config must be rejected"),
+            "Caller extraction config may not set ocr.vlm_config.headers"
         );
     }
 }

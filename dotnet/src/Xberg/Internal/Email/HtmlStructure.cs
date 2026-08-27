@@ -2,6 +2,7 @@
 // HtmlWalker) and crates/xberg/src/types/builder.rs (DocumentStructureBuilder). Used by the
 // email extractor's HTML-body path (email.rs build_internal_document).
 using System.Text;
+using Xberg.Internal.Tables;
 using Xberg.Types;
 
 namespace Xberg.Internal.Email;
@@ -88,9 +89,25 @@ internal sealed class DocStructBuilder
 
     internal uint PushList(bool ordered) => PushBodyNode(NodeContent.List(ordered), null);
 
-    internal uint PushListItem(uint list, string text)
+    /// <summary>
+    /// Push a list node as a child of <paramref name="parent"/> rather than of the
+    /// section/container stack, so a sublist stays inside the item it is written in.
+    /// </summary>
+    internal uint PushNestedList(uint parent, bool ordered)
     {
-        uint idx = PushNodeRaw(NodeContent.ListItem(text), null);
+        uint idx = PushNodeRaw(NodeContent.List(ordered), null);
+        AddChild(parent, idx);
+        return idx;
+    }
+
+    /// <summary>
+    /// Push a list item as a child of <paramref name="list"/>. <paramref name="annotations"/>
+    /// carries the item's inline formatting with offsets relative to <paramref name="text"/>,
+    /// mirroring <see cref="PushParagraph"/>.
+    /// </summary>
+    internal uint PushListItem(uint list, string text, List<TextAnnotation>? annotations = null)
+    {
+        uint idx = PushNodeRaw(NodeContent.ListItem(text), annotations);
         AddChild(list, idx);
         return idx;
     }
@@ -210,6 +227,32 @@ internal sealed class HtmlWalker
         public void PushText(string t) { if (InCell) CurrentCell.Append(t); }
     }
 
+    /// <summary>One open <c>&lt;ul&gt;</c>/<c>&lt;ol&gt;</c> level.</summary>
+    private sealed class ListContext
+    {
+        /// <summary>The <c>List</c> node this level emitted.</summary>
+        public uint NodeIdx;
+
+        /// <summary>
+        /// Whether an <c>&lt;li&gt;</c> at this nesting level is currently open.
+        /// </summary>
+        /// <remarks>
+        /// Distinct from <c>_inListItem</c>, which only says whether text is being buffered right
+        /// now: descending into a sublist flushes and clears that flag while the enclosing item is
+        /// still open. This one survives the descent, so closing the sublist can resume buffering
+        /// into the enclosing item.
+        /// </remarks>
+        public bool ItemOpen;
+
+        /// <summary>
+        /// The <c>ListItem</c> node most recently emitted at this level, if the currently open
+        /// <c>&lt;li&gt;</c> has already produced one. Reset when an <c>&lt;li&gt;</c> opens, so it
+        /// never names a previous sibling's item; a sublist opening while <see cref="ItemOpen"/> is
+        /// set is parented under this node.
+        /// </summary>
+        public uint? LastItemIdx;
+    }
+
     private sealed class DefListContext { public uint ListIdx; public string? CurrentTerm; }
 
     private sealed class FigureContext
@@ -229,8 +272,14 @@ internal sealed class HtmlWalker
     private bool _inPre;
     private PreBlock? _preBlock;
     private TableAccumulator? _table;
-    private readonly List<uint> _listStack = new();
+    private readonly List<ListContext> _listStack = new();
     private bool _inListItem;
+
+    /// <summary>
+    /// Number of <c>&lt;table&gt;</c> elements open inside the accumulated table. A nested table is
+    /// flattened into the enclosing cell instead of replacing the enclosing table.
+    /// </summary>
+    private int _nestedTableDepth;
     private readonly StringBuilder _listItemText = new();
     private DefListContext? _defList;
     private bool _inDt;
@@ -360,37 +409,66 @@ internal sealed class HtmlWalker
                 }
             case "ul":
                 {
+                    // Flush any pending parent <li> text against the still-current (outer) list
+                    // before descending, so it does not get misattributed to the list about to be
+                    // pushed. The item is flushed *before* the paragraph: while an <li> is open
+                    // HandleText buffers into _listItemText, so the item is the live context and
+                    // owns the pending annotations, which FlushParagraph would otherwise discard on
+                    // its way past an empty paragraph buffer.
+                    FlushListItem();
                     FlushParagraph();
-                    uint idx = _builder.PushList(false);
-                    _listStack.Add(idx);
+                    uint idx = PushListNode(false);
+                    _listStack.Add(new ListContext { NodeIdx = idx });
                     break;
                 }
             case "ol":
                 {
+                    FlushListItem();
                     FlushParagraph();
-                    uint idx = _builder.PushList(true);
+                    uint idx = PushListNode(true);
                     string? startVal = ExtractAttr(attrs, "start");
                     if (startVal is not null) _builder.SetAttributes(idx, new() { ["start"] = startVal });
-                    _listStack.Add(idx);
+                    _listStack.Add(new ListContext { NodeIdx = idx });
                     break;
                 }
             case "li":
                 FlushListItem();
                 _inListItem = true;
                 _listItemText.Clear();
+                if (_listStack.Count > 0)
+                {
+                    _listStack[^1].ItemOpen = true;
+                    _listStack[^1].LastItemIdx = null;
+                }
                 break;
             case "table":
-                FlushParagraph();
-                _table = new TableAccumulator();
-                break;
-            case "tr": case "thead": case "tbody": case "tfoot":
-                if (tag == "tr" && _table is not null) _table.OpenRow();
-                break;
-            case "th": case "td":
                 if (_table is not null)
                 {
-                    uint colSpan = ParseUintOr(ExtractAttr(attrs, "colspan"), 1);
-                    uint rowSpan = ParseUintOr(ExtractAttr(attrs, "rowspan"), 1);
+                    _nestedTableDepth++;
+                    _table.PushText(" ");
+                }
+                else
+                {
+                    FlushParagraph();
+                    _table = new TableAccumulator();
+                }
+                break;
+            case "tr": case "thead": case "tbody": case "tfoot":
+                if (tag == "tr" && _nestedTableDepth == 0 && _table is not null) _table.OpenRow();
+                break;
+            case "th": case "td":
+                if (_nestedTableDepth > 0)
+                {
+                    _table?.PushText(" ");
+                }
+                else if (_table is not null)
+                {
+                    // Clamped at parse time so an out-of-range attribute (a hostile
+                    // colspan="4294967295", say) never enters CellMeta/GridCell at all, on top of
+                    // the same clamp GridFlatten applies when it consumes these values. The bounds
+                    // are the HTML Living Standard's own caps on these attributes.
+                    uint colSpan = Math.Clamp(ParseUintOr(ExtractAttr(attrs, "colspan"), 1), 1u, (uint)GridFlatten.MaxColSpan);
+                    uint rowSpan = Math.Clamp(ParseUintOr(ExtractAttr(attrs, "rowspan"), 1), 1u, (uint)GridFlatten.MaxRowSpan);
                     _table.OpenCell(colSpan, rowSpan, tag == "th");
                 }
                 break;
@@ -499,7 +577,7 @@ internal sealed class HtmlWalker
             case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
                 {
                     byte level = byte.TryParse(tag.AsSpan(1), out var lv) ? lv : (byte)1;
-                    string text = _textBuf.ToString().Trim();
+                    string text = NormalizeWhitespace(_textBuf.ToString()).Trim();
                     if (text.Length > 0)
                     {
                         uint idx = _builder.PushHeading(level, text);
@@ -544,12 +622,22 @@ internal sealed class HtmlWalker
             case "ul": case "ol":
                 FlushListItem();
                 if (_listStack.Count > 0) _listStack.RemoveAt(_listStack.Count - 1);
+                // Content can resume in the enclosing <li> after a sublist closes
+                // (<li>before<ul>…</ul>after</li>). Without restoring the flag that text falls
+                // through to the paragraph buffer and is emitted as a bare paragraph instead of
+                // staying list content.
+                _inListItem = _listStack.Count > 0 && _listStack[^1].ItemOpen;
                 break;
             case "li":
                 FlushListItem();
+                if (_listStack.Count > 0) _listStack[^1].ItemOpen = false;
                 break;
             case "table":
-                if (_table is not null)
+                if (_nestedTableDepth > 0)
+                {
+                    _nestedTableDepth--;
+                }
+                else if (_table is not null)
                 {
                     _table.CloseCell();
                     _table.CloseRow();
@@ -558,10 +646,10 @@ internal sealed class HtmlWalker
                 }
                 break;
             case "tr":
-                if (_table is not null) { _table.CloseCell(); _table.CloseRow(); }
+                if (_nestedTableDepth == 0 && _table is not null) { _table.CloseCell(); _table.CloseRow(); }
                 break;
             case "th": case "td":
-                _table?.CloseCell();
+                if (_nestedTableDepth == 0) _table?.CloseCell();
                 break;
             case "dl":
                 FlushDefinitionItem();
@@ -719,14 +807,57 @@ internal sealed class HtmlWalker
         _inlineStack.Clear();
     }
 
+    /// <summary>
+    /// Create the <c>List</c> node for a <c>&lt;ul&gt;</c>/<c>&lt;ol&gt;</c> start tag, parented at
+    /// the level the markup actually nests it at.
+    /// </summary>
+    /// <remarks>
+    /// A sublist is a child of the <c>&lt;li&gt;</c> it is written inside, so that a consumer
+    /// walking the tree renders it before the item's trailing text rather than after the whole
+    /// outer list. Going through <c>PushList</c> instead parents under the section/container stack,
+    /// which makes every sublist a root-level sibling.
+    /// <para>
+    /// Two shapes have no item node to hang the sublist on: <c>&lt;li&gt;&lt;ul&gt;…</c> (the item
+    /// has no text of its own, so no <c>ListItem</c> was emitted) and a <c>&lt;ul&gt;</c> sitting
+    /// directly inside another <c>&lt;ul&gt;</c> with no <c>&lt;li&gt;</c> open. Both fall back to
+    /// the enclosing <c>List</c> node, which keeps the sublist inside the list subtree without
+    /// minting an empty item.
+    /// </para>
+    /// </remarks>
+    private uint PushListNode(bool ordered)
+    {
+        if (_listStack.Count == 0) return _builder.PushList(ordered);
+        var ctx = _listStack[^1];
+        uint parent = ctx.ItemOpen ? ctx.LastItemIdx ?? ctx.NodeIdx : ctx.NodeIdx;
+        return _builder.PushNestedList(parent, ordered);
+    }
+
+    /// <summary>
+    /// Emit the buffered <c>&lt;li&gt;</c> text as a <c>ListItem</c> and reset the inline state
+    /// that belonged to it.
+    /// </summary>
+    /// <remarks>
+    /// The annotation buffer is taken (not just read) and the inline stack is cleared, for the same
+    /// reason <c>FlushParagraph</c> does both: <c>PopInline</c> measures spans against
+    /// <c>_listItemText</c>, which this method empties. Anything still referring to it after the
+    /// flush — a completed annotation left behind, or a span whose closing tag has not arrived yet —
+    /// would resolve against whatever text is buffered next and annotate an unrelated node at
+    /// meaningless offsets.
+    /// </remarks>
     private void FlushListItem()
     {
         if (!_inListItem) return;
         _inListItem = false;
         string text = NormalizeWhitespace(_listItemText.ToString());
+        var annotations = _annotations;
+        _annotations = new List<TextAnnotation>();
         if (text.Length > 0 && _listStack.Count > 0)
-            _builder.PushListItem(_listStack[^1], text);
+        {
+            uint itemIdx = _builder.PushListItem(_listStack[^1].NodeIdx, text, annotations);
+            _listStack[^1].LastItemIdx = itemIdx;
+        }
         _listItemText.Clear();
+        _inlineStack.Clear();
     }
 
     private void FlushDefinitionItem()

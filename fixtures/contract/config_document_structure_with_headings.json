@@ -9,7 +9,7 @@
       "operations": [
         {
           "op": "show",
-          "path": "results[0].document_structure"
+          "path": "results[0].document"
         }
       ]
     },

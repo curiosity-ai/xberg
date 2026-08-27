@@ -4,10 +4,8 @@
 //! TOML, YAML, and JSON files.
 //!
 //! Loading here is entirely generic (`toml`/`serde_yaml_ng`/`serde_json` deserializing
-//! straight into `ExtractionConfig`) — it never names individual fields, including
-//! nested ones like `ChunkingConfig::breadcrumb_target`. New `#[serde(default)]`
-//! fields on any nested config (e.g. #337's `breadcrumb_target`) are picked up
-//! automatically with no change required in this file.
+//! straight into `ExtractionConfig`). New `#[serde(default)]` fields on nested config
+//! types are picked up automatically with no change required in this file.
 
 use crate::{Result, XbergError};
 use std::path::Path;

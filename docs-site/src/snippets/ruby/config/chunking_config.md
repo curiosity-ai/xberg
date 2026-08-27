@@ -34,24 +34,3 @@ result.results.first.chunks.each do |chunk|
   end
 end
 ```
-
-```ruby title="Ruby - Prepend Heading Context"
-require 'xberg'
-
-config = Xberg::ExtractionConfig.new(
-  chunking: Xberg::ChunkingConfig.new(
-    chunker_type: "markdown",
-    max_characters: 500,
-    overlap: 50,
-    prepend_heading_context: true
-  )
-)
-
-input = Xberg::ExtractInput.new(uri: "document.md")
-result = Xberg.extract(input, config)
-
-result.results.first.chunks.each do |chunk|
-  # Each chunk's content is prefixed with its heading breadcrumb
-  puts chunk.content[0, 100]
-end
-```

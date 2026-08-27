@@ -98,6 +98,7 @@ use input::{
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Instant;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use xberg::{OutputFormat as ContentOutputFormat, detect_mime_type};
 
 /// Xberg document intelligence CLI
@@ -712,10 +713,24 @@ fn main() -> Result<()> {
 
     let env_filter = logging::build_env_filter(cli.log_level.as_deref());
 
-    let _ = tracing_subscriber::fmt()
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
-        .try_init();
+        .finish();
+
+    // The PDF glyph-drop capture is COMPOSED IN, not installed on its own. `tracing` has a
+    // single global dispatcher slot and the `try_init()` below claims it at the top of
+    // `main()`, so a capture that called `set_global_default` for itself would simply lose the
+    // race and go dark here -- invisibly, because a test binary installs no `fmt` subscriber
+    // and so wins the slot and passes. Warnings arriving in a test say nothing about whether
+    // they arrive in the CLI. See `xberg::pdf::render::install_pdf_render_diagnostics`. ~keep
+    #[cfg(feature = "pdf-surface")]
+    let subscriber = {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        subscriber.with(xberg::pdf::render::glyph_drop_capture_layer())
+    };
+
+    let _ = subscriber.try_init();
 
     match cli.command {
         Commands::Extract {

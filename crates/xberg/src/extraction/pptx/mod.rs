@@ -76,6 +76,16 @@ pub struct PptxExtractionOptions {
     pub include_structure: bool,
     /// Whether to emit `![alt](target)` references in markdown output.
     pub inject_placeholders: bool,
+    /// Security limits applied at container open: entry count
+    /// (`max_files_in_archive`), aggregate uncompressed size (`max_archive_size`),
+    /// and compression ratio (`max_compression_ratio`), from
+    /// `ExtractionConfig.security_limits`. Defaults to `SecurityLimits::default()`
+    /// when unset.
+    pub security_limits: crate::extractors::security::SecurityLimits,
+    /// Maximum number of slides the presentation may contain, from
+    /// `ExtractionConfig.security_limits.max_pages` (#1451). `None` (the
+    /// default) means unlimited.
+    pub max_pages: Option<usize>,
 }
 
 /// Crate-internal PPTX extraction output.
@@ -104,8 +114,25 @@ impl Default for PptxExtractionOptions {
             plain: false,
             include_structure: false,
             inject_placeholders: true,
+            security_limits: crate::extractors::security::SecurityLimits::default(),
+            max_pages: crate::extractors::security::SecurityLimits::default().max_pages,
         }
     }
+}
+
+/// Reject a presentation whose slide count exceeds `options.max_pages` before any
+/// per-slide work (text rendering, chart/diagram resolution, image lookup) begins
+/// (#1451).
+///
+/// Unlike PDF, where the page count needs a fallback parser because some
+/// documents defeat the primary one (see `extractors::pdf::enforce_page_limit`),
+/// a PPTX's slide count has no such failure mode here: `PptxContainer::open`/
+/// `from_bytes` already resolve `slide_paths` (via
+/// `ppt/_rels/presentation.xml.rels`, falling back to scanning
+/// `ppt/slides/slideN.xml` names) before this function ever runs, so the count is
+/// exact by the time it is checked.
+fn enforce_slide_limit(slide_count: usize, max_pages: Option<usize>) -> Result<()> {
+    Ok(crate::extractors::security::enforce_page_count(slide_count, max_pages)?)
 }
 
 /// Join text runs with smart spacing: inserts a space between adjacent runs
@@ -143,7 +170,7 @@ pub(crate) fn extract_pptx_from_path_with_slide_contents(
     options: &PptxExtractionOptions,
     warnings: &mut Vec<ProcessingWarning>,
 ) -> Result<PptxInternalExtraction> {
-    let container = PptxContainer::open(path)?;
+    let container = PptxContainer::open(path, &options.security_limits)?;
     extract_pptx_from_container(container, options, warnings)
 }
 
@@ -171,7 +198,7 @@ pub(crate) fn extract_pptx_from_bytes_with_slide_contents(
     options: &PptxExtractionOptions,
     warnings: &mut Vec<ProcessingWarning>,
 ) -> Result<PptxInternalExtraction> {
-    let container = PptxContainer::from_bytes(data)?;
+    let container = PptxContainer::from_bytes(data, &options.security_limits)?;
     extract_pptx_from_container(container, options, warnings)
 }
 
@@ -180,6 +207,8 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
     options: &PptxExtractionOptions,
     warnings: &mut Vec<ProcessingWarning>,
 ) -> Result<PptxInternalExtraction> {
+    enforce_slide_limit(container.slide_paths().len(), options.max_pages)?;
+
     let config = ParserConfig {
         extract_images: options.extract_images,
         plain: options.plain,
@@ -376,7 +405,7 @@ fn extract_pptx_from_container<R: std::io::Read + std::io::Seek>(
             page_structure,
             page_contents,
             document,
-            hyperlinks: collected_hyperlinks,
+            hyperlinks: collected_hyperlinks.into_iter().map(Into::into).collect(),
             office_metadata,
             revisions,
         },
@@ -557,7 +586,7 @@ fn build_slide_structure(
                             doc_builder.push_formula(formula, None);
                         }
                         if !item_text.trim().is_empty() {
-                            doc_builder.push_list_item(list_node, item_text.trim(), None);
+                            doc_builder.push_list_item(list_node, item_text.trim(), Vec::new(), None);
                         }
                     }
                 }
@@ -835,7 +864,7 @@ impl elements::Slide {
 pub(crate) mod tests {
     use super::*;
 
-    fn create_test_pptx_bytes(slides: Vec<&str>) -> Vec<u8> {
+    pub(crate) fn create_test_pptx_bytes(slides: Vec<&str>) -> Vec<u8> {
         use std::io::Write;
         use zip::write::{SimpleFileOptions, ZipWriter};
 
@@ -1962,7 +1991,11 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(math, vec!["Q", "Z"], "text shape and list item both emit a formula node");
+        assert_eq!(
+            math,
+            vec!["Q", "Z"],
+            "text shape and list item both emit a formula node"
+        );
 
         let texts: Vec<String> = structure
             .nodes
@@ -1979,7 +2012,87 @@ pub(crate) mod tests {
             !joined.contains('Q') && !joined.contains('Z'),
             "no text node keeps the bare LaTeX: {joined}"
         );
-        assert!(joined.contains("Rate") && joined.contains("Growth"), "words survive: {joined}");
+        assert!(
+            joined.contains("Rate") && joined.contains("Growth"),
+            "words survive: {joined}"
+        );
+    }
+
+    /// A crafted `<a:pPr lvl="4294967294">` must not turn `add_list_item`'s
+    /// per-level `"  "` indent loop into ~4.29 billion pushes. Against the unfixed
+    /// parser (`lvl_attr.parse::<u32>().unwrap_or(0) + 1` with no upper bound) this
+    /// scenario does not fail an assertion -- the process hangs or is OOM-killed
+    /// building several GB of indentation before any `assert_eq!` runs. The fixed
+    /// parser must instead come back immediately with the level clamped to
+    /// `MAX_LIST_NESTING_LEVEL` (8), i.e. 8 two-space indents.
+    #[test]
+    fn test_pptx_list_level_bomb_is_clamped_not_allocated() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+            <a:p><a:r><a:t>Intro</a:t></a:r></a:p>
+            <a:p><a:pPr lvl="4294967294"><a:buChar char="•"/></a:pPr><a:r><a:t>Bomb</a:t></a:r></a:p>
+        </p:txBody></p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = build_single_slide_pptx(slide_xml, None, &[]);
+        let result = extract_pptx_from_bytes(
+            &pptx,
+            &PptxExtractionOptions {
+                extract_images: false,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .expect("extraction must succeed for an out-of-range (clamped) list level");
+
+        // Match the WHOLE line, not a substring: `contains` is satisfied by any
+        // indent at least this deep, so it passes even with the clamp widened to
+        // 50_000 and cannot detect over-indentation -- the exact thing the clamp
+        // is here to bound.
+        let expected_line = format!("{}- Bomb", "  ".repeat(8));
+        assert!(
+            result.content.lines().any(|line| line == expected_line),
+            "lvl=4294967294 must clamp to exactly 8 levels of indentation, got: {:?}",
+            result.content
+        );
+    }
+
+    /// Positive control: a normal `lvl="2"` list item (well within the clamp) must
+    /// render with exactly the same two-space-per-level indentation as before this
+    /// fix -- the guard against a cap set too tight.
+    #[test]
+    fn test_pptx_list_level_two_positive_control_unchanged() {
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+            <a:p><a:r><a:t>Intro</a:t></a:r></a:p>
+            <a:p><a:pPr lvl="2"><a:buChar char="•"/></a:pPr><a:r><a:t>Nested</a:t></a:r></a:p>
+        </p:txBody></p:sp>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+
+        let pptx = build_single_slide_pptx(slide_xml, None, &[]);
+        let result = extract_pptx_from_bytes(
+            &pptx,
+            &PptxExtractionOptions {
+                extract_images: false,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .expect("extraction must succeed for a normal lvl=2 list item");
+
+        assert!(
+            result.content.lines().any(|line| line == "    - Nested"),
+            "lvl=2 must render with exactly 2 two-space indents, got: {:?}",
+            result.content
+        );
     }
 
     /// #47: OMML math wrapped in `mc:AlternateContent`/`mc:Choice`/`a14:m` must be

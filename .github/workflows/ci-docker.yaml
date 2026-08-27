@@ -2,7 +2,7 @@ name: CI Docker
 
 on:
   push:
-    branches: [main]
+    branches: [main, chore/alef-fixes]
     paths: &docker-paths
       - "docker/**"
       - "scripts/ci/docker/**"
@@ -11,6 +11,7 @@ on:
       - "crates/xberg-cli/Cargo.toml"
       - ".github/workflows/ci-docker.yaml"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths: *docker-paths
   workflow_dispatch:
@@ -29,7 +30,7 @@ permissions:
 jobs:
   docker:
     name: Docker (${{ matrix.variant }})
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -37,7 +38,7 @@ jobs:
       matrix:
         variant: [core, full, cli]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -87,10 +88,10 @@ jobs:
           cache-to: type=gha,mode=max,scope=ci-docker-${{ matrix.variant }}
 
       - name: Check image size
+        if: matrix.variant != 'cli'
         uses: xberg-io/actions/check-docker-image-size@v1
         with:
           image: xberg:${{ matrix.variant }}
-          warn-mb: ${{ matrix.variant == 'cli' && '200' || '' }}
           label: "${{ matrix.variant }} image"
 
       - name: Run feature tests

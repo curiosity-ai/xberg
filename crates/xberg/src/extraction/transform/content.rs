@@ -267,11 +267,11 @@ pub(super) fn process_hierarchy(
     let mut has_any_body_blocks = false;
 
     for block in &hierarchy.blocks {
-        let coords = block.bbox.as_ref().map(|(left, top, right, bottom)| BoundingBox {
-            x0: *left as f64,
-            y0: *top as f64,
-            x1: *right as f64,
-            y1: *bottom as f64,
+        let coords = block.bbox.as_ref().map(|bbox| BoundingBox {
+            x0: bbox.left as f64,
+            y0: bbox.top as f64,
+            x1: bbox.right as f64,
+            y1: bbox.bottom as f64,
         });
 
         let element_type = match block.level.as_str() {

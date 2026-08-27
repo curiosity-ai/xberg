@@ -5,14 +5,14 @@ import (
 	"errors"
 	"log"
 
-	"github.com/xberg-io/xberg"
+	"github.com/xberg-io/xberg/packages/go"
 )
 
 func main() {
 	input := xberg.ExtractInputFromURI("missing.pdf")
 	result, err := xberg.Extract(*input, xberg.ExtractionConfig{})
 	if err != nil {
-		if errors.Is(err, xberg.ErrIo) {
+		if errors.Is(err, xberg.ErrXbergIo) {
 			log.Printf("file not found: %v", err)
 		} else if errors.Is(err, xberg.ErrUnsupportedFormat) {
 			log.Printf("unsupported format: %v", err)

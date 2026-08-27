@@ -9,7 +9,7 @@
       "operations": [
         {
           "op": "iterate",
-          "path": "results[0].keywords",
+          "path": "results[0].extracted_keywords",
           "item": "keyword",
           "fields": [
             "text",

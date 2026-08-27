@@ -24,6 +24,10 @@ public class CloudOcrBackend : IOcrBackend
     public bool SupportsTableDetection => false;
     public bool SupportsDocumentProcessing => false;
     public bool EmitsStructuredMarkdown => false;
+    // The cloud service reports no calibrated page confidence and needs an upright
+    // raster, so declare the least-capable option for both descriptors.
+    public ConfidenceSemantics ConfidenceSemantics => Xberg.ConfidenceSemantics.Uncalibrated;
+    public PageOrientationHandling PageOrientationHandling => Xberg.PageOrientationHandling.RequiresUpright;
 
     public void Initialize() { }
     public void Shutdown() => _httpClient.Dispose();

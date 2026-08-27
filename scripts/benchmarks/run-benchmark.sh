@@ -14,6 +14,9 @@ COHORT="${COHORT:-}"
 BATCH_SIZE="${BATCH_SIZE:-}"
 SHARD="${SHARD:-}"
 XBERG_MAX_THREADS="${XBERG_MAX_THREADS:-4}"
+# PDF backends to pass through to `run --pdf-backends` (comma-separated: native, pdfium).
+# Unset by every caller except the pdfium leg -- omitting it keeps today's native-only default. ~keep
+PDF_BACKENDS="${PDF_BACKENDS:-}"
 
 if [ -z "$FRAMEWORK" ] || [ -z "$MODE" ]; then
   echo "::error::FRAMEWORK and MODE environment variables are required" >&2
@@ -105,6 +108,9 @@ fi
 if [ -n "$BATCH_SIZE" ]; then
   EXTRA_ARGS+=("--batch-size" "${BATCH_SIZE}")
 fi
+if [ -n "$PDF_BACKENDS" ]; then
+  EXTRA_ARGS+=("--pdf-backends" "${PDF_BACKENDS}")
+fi
 
 BENCHMARK_DEBUG=1 "${HARNESS_PATH}" \
   run \
@@ -118,3 +124,26 @@ BENCHMARK_DEBUG=1 "${HARNESS_PATH}" \
   --xberg-max-threads "${XBERG_MAX_THREADS}" \
   --output-format "${OUTPUT_FORMAT}" \
   "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+
+# Guard against a green run that silently measured nothing (this repo has a history of
+# feature-gated / misrouted legs passing vacuously). A pdfium leg that registers zero rows
+# would otherwise report success while the pdfium backend was never actually exercised.
+if printf '%s' "$PDF_BACKENDS" | tr ',' '\n' | grep -qx "pdfium"; then
+  RESULTS_FILE="${OUTPUT_DIR}/results.json"
+  if [ ! -f "$RESULTS_FILE" ]; then
+    echo "::error::pdfium leg did not produce ${RESULTS_FILE}" >&2
+    exit 1
+  fi
+  # Count PDFIUM rows specifically, not total rows: a native-only result set is also non-empty,
+  # so a bare `length` check would pass while the pdfium backend went unexercised -- the exact
+  # vacuous green this guard exists to prevent.
+  # `contains`, not `endswith`: batch mode appends a `-batch` suffix AFTER the backend
+  # suffix (`xberg-markdown-baseline-pdfium-batch`, see main.rs's framework_name), so an
+  # endswith("-pdfium") check would match nothing on half the matrix and fail spuriously.
+  ROW_COUNT="$(jq '[.[] | select(.framework | contains("-pdfium"))] | length' "$RESULTS_FILE")"
+  if [ "$ROW_COUNT" -eq 0 ]; then
+    echo "::error::pdfium leg produced zero -pdfium rows in ${RESULTS_FILE} -- the run reported success but never exercised the pdfium backend" >&2
+    exit 1
+  fi
+  echo "pdfium leg produced ${ROW_COUNT} -pdfium row(s) in ${RESULTS_FILE}"
+fi

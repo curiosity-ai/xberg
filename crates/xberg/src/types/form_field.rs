@@ -6,7 +6,7 @@ use super::extraction::BoundingBox;
 
 /// Kind of a PDF form field.
 ///
-/// Mirrors `pdf_oxide`'s widget field taxonomy without leaking the upstream
+/// Mirrors `xberg_native_pdf`'s widget field taxonomy without leaking the upstream
 /// type across the binding surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
@@ -31,13 +31,12 @@ pub enum FormFieldType {
 
 /// A form field extracted from a PDF's AcroForm or XFA structure.
 ///
-/// Populated by the PDF extractor when [`PdfConfig::extract_form_fields`] is
+/// Populated by the PDF extractor when `PdfConfig::extract_form_fields` is
 /// enabled and the document is a fillable form. Supports both AcroForm (standard)
 /// and XFA (XML Forms Architecture) layers. When both are present, AcroForm fields
 /// take priority (canonical fallback per PDF spec), and XFA-only fields are appended.
 /// The collection is empty for non-form PDFs and for non-PDF formats.
 ///
-/// [`PdfConfig::extract_form_fields`]: crate::core::config::PdfConfig::extract_form_fields
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct PdfFormField {

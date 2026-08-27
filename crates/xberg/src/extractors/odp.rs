@@ -29,10 +29,10 @@ use crate::Result;
 use crate::core::config::ExtractionConfig;
 use crate::extraction::office_metadata;
 use crate::extractors::odt::{
-    build_internal_elements, build_list_style_map, build_style_map, extract_table_cells, pre_extract_formulas,
-    pre_extract_images,
+    MAX_ODT_MEMBER_SIZE, build_internal_elements, build_list_style_map, build_style_map, extract_table_cells,
+    pre_extract_formulas, pre_extract_images,
 };
-use crate::extractors::security::SecurityBudget;
+use crate::extractors::security::{SecurityBudget, ZipBombValidator};
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 use crate::types::ExtractedImage;
 use crate::types::Metadata;
@@ -96,20 +96,48 @@ impl Plugin for OdpExtractor {
     }
 }
 
+/// Count the `draw:page` slides an ODP's `content.xml` declares, without doing
+/// any of the per-slide element-building work in [`build_internal_document`]'s
+/// main loop below. Used by [`enforce_slide_limit`] (#1451) to reject an
+/// oversized deck before that per-slide work starts.
+fn count_odp_slides(root: roxmltree::Node) -> usize {
+    root.children()
+        .filter(|n| n.tag_name().name() == "body")
+        .flat_map(|body| body.children().filter(|n| n.tag_name().name() == "presentation"))
+        .flat_map(|presentation| presentation.children().filter(|n| n.tag_name().name() == "page"))
+        .count()
+}
+
+/// Reject a presentation whose slide count exceeds `max_pages` before any
+/// per-slide work (text/table/image extraction via `process_page_object`)
+/// begins (#1451).
+///
+/// Unlike PPTX, an ODP's slide count is not available before parsing
+/// `content.xml`: ODF has no separate manifest of per-slide archive entries, so
+/// the count comes from a full XML parse either way. `count_odp_slides` reuses
+/// the DOM `Document::parse` already produced and only counts `draw:page`
+/// children -- cheap relative to `process_page_object`'s recursive walk of each
+/// page's frames, shapes, tables, and images, which is what this guards.
+fn enforce_slide_limit(slide_count: usize, max_pages: Option<usize>) -> Result<()> {
+    Ok(crate::extractors::security::enforce_page_count(slide_count, max_pages)?)
+}
+
 /// Parse an ODP `content.xml` into an [`InternalDocument`], emitting one slide
 /// marker per `draw:page` followed by that slide's text, tables, and images.
 fn build_internal_document(
     archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>,
     budget: &mut SecurityBudget,
+    max_pages: Option<usize>,
 ) -> crate::error::Result<InternalDocument> {
-    let image_data = pre_extract_images(archive);
+    let image_data = pre_extract_images(archive)?;
     let formula_data = pre_extract_formulas(archive, budget)?;
 
     let mut xml_content = String::new();
     match archive.by_name("content.xml") {
-        Ok(mut file) => {
+        Ok(file) => {
             use std::io::Read;
-            file.read_to_string(&mut xml_content)
+            file.take(MAX_ODT_MEMBER_SIZE)
+                .read_to_string(&mut xml_content)
                 .map_err(|e| crate::error::XbergError::parsing(format!("Failed to read content.xml: {}", e)))?;
         }
         Err(_) => {
@@ -127,6 +155,8 @@ fn build_internal_document(
         .map_err(|e| crate::error::XbergError::parsing(format!("Failed to parse content.xml: {}", e)))?;
 
     let root = doc.root_element();
+    enforce_slide_limit(count_odp_slides(root), max_pages)?;
+
     let style_map = build_style_map(root);
     let list_style_map = build_list_style_map(root);
     let mut builder = InternalDocumentBuilder::new("odp");
@@ -306,10 +336,10 @@ fn extract_odp_master_page_text(archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, 
     use std::io::Read;
 
     let mut styles_xml = String::new();
-    let Ok(mut file) = archive.by_name("styles.xml") else {
+    let Ok(file) = archive.by_name("styles.xml") else {
         return;
     };
-    if file.read_to_string(&mut styles_xml).is_err() {
+    if file.take(MAX_ODT_MEMBER_SIZE).read_to_string(&mut styles_xml).is_err() {
         return;
     }
     let Ok(doc) = Document::parse(&styles_xml) else {
@@ -393,13 +423,16 @@ impl InternalDocumentExtractor for OdpExtractor {
     ) -> Result<InternalDocument> {
         tracing::debug!(format = "odp", size_bytes = content.len(), "extraction starting");
         let content_owned = content.to_vec();
+        let limits = config.security_limits.clone().unwrap_or_default();
 
         let cursor = Cursor::new(content_owned.clone());
         let mut archive = zip::ZipArchive::new(cursor)
             .map_err(|e| crate::error::XbergError::parsing(format!("Failed to open ZIP archive: {}", e)))?;
+        ZipBombValidator::new(limits.clone()).validate(&mut archive)?;
 
         let mut budget = SecurityBudget::from_config(config);
-        let mut doc = build_internal_document(&mut archive, &mut budget)?;
+        let max_pages = config.security_limits.as_ref().and_then(|limits| limits.max_pages);
+        let mut doc = build_internal_document(&mut archive, &mut budget, max_pages)?;
         doc.mime_type = mime_type.to_string();
 
         let mut metadata_map = AHashMap::new();
@@ -408,6 +441,9 @@ impl InternalDocumentExtractor for OdpExtractor {
         let mut meta_archive = zip::ZipArchive::new(meta_cursor).map_err(|e| {
             crate::error::XbergError::parsing(format!("Failed to open ZIP archive for metadata: {}", e))
         })?;
+        // Second, independent `ZipArchive::new` over the same bytes: needs its own
+        // validation call, the same gap DOCX has at `extractors/docx.rs:913`. ~keep
+        ZipBombValidator::new(limits).validate(&mut meta_archive)?;
 
         // ODP `meta.xml` uses the same ODF metadata schema as ODT. ~keep
         if let Ok(props) = office_metadata::extract_odt_properties(&mut meta_archive) {
@@ -785,6 +821,80 @@ mod tests {
         assert!(
             any_table,
             "at least one .odp fixture (with_table.odp) should yield a table"
+        );
+    }
+
+    /// A three-slide deck, for exercising `max_pages` independent of the
+    /// single-slide `minimal_odp` fixture.
+    fn three_slide_odp() -> Vec<u8> {
+        odp_bytes(concat!(
+            r#"<draw:page draw:name="One"><draw:frame><draw:text-box><text:p>Slide 1</text:p></draw:text-box></draw:frame></draw:page>"#,
+            r#"<draw:page draw:name="Two"><draw:frame><draw:text-box><text:p>Slide 2</text:p></draw:text-box></draw:frame></draw:page>"#,
+            r#"<draw:page draw:name="Three"><draw:frame><draw:text-box><text:p>Slide 3</text:p></draw:text-box></draw:frame></draw:page>"#,
+        ))
+    }
+
+    /// #1451: `max_pages` must reject a presentation once its slide count is
+    /// known, before any per-slide work (`process_page_object`) begins. Against
+    /// unfixed code `build_internal_document` takes no `max_pages` parameter and
+    /// nothing calls `enforce_slide_limit`, so this fails to compile; once wired
+    /// up but not enforced, `extract_content` would return `Ok` with 3 slides
+    /// instead of the expected `SecurityError::TooManyPages`.
+    #[tokio::test]
+    async fn test_odp_extract_content_rejects_presentation_exceeding_max_pages() {
+        let bytes = three_slide_odp();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_pages: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = OdpExtractor::new().extract_content(&bytes, ODP_MIME, &config).await;
+        let error = result.expect_err("a presentation with more slides than max_pages must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("too many pages") || message.contains("max_pages"),
+            "error must name the limit that was hit: {message}"
+        );
+    }
+
+    /// A presentation exactly at the configured `max_pages` ceiling must extract
+    /// in full -- the off-by-one boundary case #1451 asked to get right.
+    #[tokio::test]
+    async fn test_odp_extract_content_succeeds_when_slide_count_is_at_max_pages() {
+        let bytes = three_slide_odp();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_pages: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let doc = OdpExtractor::new()
+            .extract_content(&bytes, ODP_MIME, &config)
+            .await
+            .expect("a presentation exactly at max_pages must extract fully, not be rejected");
+        assert!(
+            doc.elements.iter().any(|e| e.text.contains("Slide 3")),
+            "extraction at the boundary must still produce every slide's content"
+        );
+    }
+
+    /// The default `SecurityLimits` (`max_pages: None`) must never reject a
+    /// multi-slide presentation: a real ceiling here is opt-in.
+    #[tokio::test]
+    async fn test_odp_extract_content_succeeds_with_default_max_pages() {
+        let bytes = three_slide_odp();
+        let result = OdpExtractor::new()
+            .extract_content(&bytes, ODP_MIME, &ExtractionConfig::default())
+            .await;
+        assert!(
+            result.is_ok(),
+            "default security limits must not reject a normal multi-slide presentation: {:?}",
+            result.err()
         );
     }
 }

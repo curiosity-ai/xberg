@@ -9,7 +9,7 @@ const MIN_WIDE_TABLE_COLUMNS: usize = 16;
 ///
 /// Returns `true` when the table was changed.
 pub(crate) fn repair_consistently_merged_numeric_column(table: &mut Table) -> bool {
-    // TODO(https://github.com/yfedoseev/pdf_oxide/issues/975): remove this repair after upstream preserves
+    // TODO(https://github.com/yfedoseev/xberg_native_pdf/issues/975): remove this repair after upstream preserves
     // adjacent numeric columns. ~keep
     let Some(header) = table.cells.first() else {
         return false;

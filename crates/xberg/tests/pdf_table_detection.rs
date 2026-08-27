@@ -29,7 +29,7 @@ const NON_TABLE_PDFS: &[&str] = &["simple.pdf", "fake_memo.pdf", "searchable.pdf
 /// Documents that do contain tabular content.
 ///
 /// No per-document table *count* is asserted: counts shift legitimately with
-/// pdf_oxide's native grid detector and with the bordered/heuristic tiers (see
+/// xberg_native_pdf's native grid detector and with the bordered/heuristic tiers (see
 /// `pdf_heuristic_tables.rs`, which documents `table_document.pdf` as borderline
 /// for the prose filter). What is asserted is that the group as a whole yields at
 /// least one table and that every table produced is well formed.

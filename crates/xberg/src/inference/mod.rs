@@ -19,7 +19,6 @@
 //! and its files are absent from `alef.toml` sources, so the generator emits
 //! nothing for it.
 //!
-//! Since v5.0.0 (issue #1275).
 
 mod backend;
 mod tensor;

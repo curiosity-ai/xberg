@@ -3,7 +3,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::borrow::Cow;
 
-use memchr::memmem;
+use memchr::{memchr, memmem};
 
 // ============================================================================
 // ============================================================================
@@ -99,7 +99,7 @@ fn count_tag_bytes(text: &str, open_needle: &[u8], close_needle: &[u8]) -> usize
         };
         let open_start = pos + open_start;
 
-        let tag_body_start = match bytes[open_start..].iter().position(|&b| b == b'>') {
+        let tag_body_start = match memchr(b'>', &bytes[open_start..]) {
             Some(rel) => open_start + rel + 1,
             None => break,
         };

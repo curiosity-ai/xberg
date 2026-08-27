@@ -3,14 +3,14 @@ title: "Rust Core API"
 description: Comprehensive guide to the wide Rust-only public surface of the xberg crate — plugin traits, embeddings, NER, chunking, diff, MIME detection, PDF rendering, and code intelligence.
 ---
 
-The `xberg` crate exposes a much wider surface than the two-function API that language bindings mirror. Use it directly to:
-register custom extractors or OCR backends without writing any FFI; call embeddings, NER, and chunking pipelines from Rust without a binding layer; render PDF pages to PNG bytes; or diff two document extractions line by line. Everything below is verified against the actual source and re-exported from `crates/xberg/src/lib.rs`.
+The `xberg` crate exposes advanced primitives that are intentionally absent from language bindings. Use it directly to:
+register custom extractors or OCR backends without writing any FFI; call embeddings, NER, and chunking pipelines from Rust without a binding layer; render PDF pages to PNG bytes; or diff two document extractions line by line. The APIs below are available either from the crate root or from the public module path shown.
 
-For the exhaustive field-by-field reference, see [`docs/reference/api-rust.md`](/reference/api-rust/) and [`docs/reference/configuration.md`](/reference/configuration/).
+For generated field-by-field references, see [`docs/reference/api-rust.md`](/reference/api-rust/) and [`docs/reference/configuration.md`](/reference/configuration/).
 
 ## Entry Points
 
-Two async functions are the public extraction entry points.
+The crate-level functions are the simplest extraction entry points:
 
 ```rust
 pub async fn extract(
@@ -24,7 +24,11 @@ pub async fn extract_batch(
 ) -> Result<ExtractionResult>;
 ```
 
-`extract_batch` processes inputs concurrently when the `tokio-runtime` feature is active; otherwise it falls back to a sequential loop. Both functions return the same `ExtractionResult` envelope.
+`extract_batch` processes inputs concurrently when the `tokio-runtime` feature is active; otherwise it uses a sequential loop. Set `ExtractionConfig::concurrency` with `xberg::ConcurrencyConfig` to constrain Rust-side worker and thread budgets.
+
+Both functions return an `ExtractionResult` envelope rather than a bare document vector. A URI may expand to multiple documents through crawling, so even `extract` can return more than one result. Initial batch outcomes are collected in input order, and each input may contribute zero or more documents; recursively followed document URLs are appended in traversal order. Per-input failures are recorded in `errors` while successful inputs remain in `results`. An outer `Err` means the operation itself could not run, for example because configuration validation failed or the operation was cancelled. An empty batch returns an empty successful envelope.
+
+Rust applications that need reusable cache and progress implementations can construct `xberg::engine::Engine`. The crate-level functions use the default engine behavior.
 
 **Constructing inputs**
 
@@ -75,7 +79,7 @@ pub struct ExtractedDocument {
 
 ## Configuration
 
-`ExtractionConfig` and every sub-config are re-exported at the crate root. Pass `ExtractionConfig::default()` to get safe defaults.
+`ExtractionConfig`, `ConcurrencyConfig`, and the detailed LLM budget, cache, provider, and rate-limit configs are re-exported at the crate root. Their defining module remains `xberg::core::config`, so both paths are available to Rust callers. Pass `ExtractionConfig::default()` to get safe defaults.
 
 Key sub-configs that unlock capabilities at the field level:
 
@@ -283,6 +287,8 @@ pub struct EnrichmentConfig {
 
 `EnrichedResult` fields mirror the enabled stages.
 
+`xberg::enrichment` is a separate schema-only module. Its `EnrichOptions`, `EnrichResult`, and `EnrichStatus` types are serializable request and lifecycle shapes for external enrichment workers; they do not execute the stages above.
+
 ### Image Captioning
 
 Requires `captioning` + `tokio-runtime` features. Calls a vision-language model.
@@ -351,15 +357,15 @@ pub fn detect_mime_type_from_bytes(content: &[u8]) -> Result<String>;
 // Reverse lookup: MIME type → registered file extensions
 pub fn get_extensions_for_mime(mime_type: &str) -> Result<Vec<String>>;
 
-// Returns all 100 supported formats (120 file extensions) with name, MIME type, and extension list
+// Returns the registered extension/MIME pairs available in this build
 pub fn list_supported_formats() -> Vec<SupportedFormat>;
 ```
 
-`SupportedFormat` carries `name: String`, `mime_type: String`, and `extensions: Vec<String>`.
+`SupportedFormat` carries `extension: String` and `mime_type: String`. The list is sorted by extension and reflects the active extractor registry, so feature-gated or unavailable extractors are not advertised.
 
 ## PDF Rendering
 
-Requires the `pdf` feature. Renders PDF pages to PNG bytes using the bundled `pdf-oxide` renderer.
+Requires the `pdf` feature. Renders PDF pages to PNG bytes using the bundled `xberg-native-pdf` renderer.
 
 ```rust
 pub fn render_pdf_page_to_png(
@@ -373,7 +379,21 @@ pub fn pdf_page_count(
     pdf_bytes: &[u8],
     password: Option<&str>,
 ) -> Result<usize>;
+
+pub struct PdfRenderSession { /* private fields */ }
+
+impl PdfRenderSession {
+    pub fn open(pdf_bytes: &[u8], password: Option<&str>) -> Result<Self>;
+    pub fn page_count(&self) -> usize;
+    pub fn render_page_to_png(
+        &self,
+        page_index: usize,
+        dpi: Option<i32>,
+    ) -> Result<Vec<u8>>;
+}
 ```
+
+Import `PdfRenderSession` from `xberg::pdf`. Use it when rendering multiple pages from one document: the session opens and authenticates the PDF once, then reuses that parsed document for every page. The standalone functions remain convenient for one page or a page-count-only call.
 
 The renderer automatically reduces DPI on very wide pages to avoid exceeding the 16 384 px dimension cap.
 
@@ -446,4 +466,4 @@ pub struct SecurityLimits {
 }
 ```
 
-`SecurityLimits::default()` applies production-safe limits. Override individual fields to tighten or relax them for your workload.
+`SecurityLimits::default()` bounds archive expansion, parser growth, nesting, iterations, XML depth, and table cells. `max_pages` defaults to `None`; set it explicitly to bound per-page OCR, layout, and rendering work for your workload.

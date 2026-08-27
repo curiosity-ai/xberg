@@ -11,26 +11,34 @@
     "c/batch/extract_batch_uri_basic.md",
     "c/batch/extract_batch_uri_not_found.md",
     "c/batch/extract_batch_uri_partial_failure.md",
+    "c/chunking/chunking_config_and_output.md",
+    "c/chunking/chunking_rag_handoff.md",
     "c/code/code_shebang_detection.md",
+    "c/config/ocr_dpi_config.md",
+    "c/config/pdf_hierarchy_config.md",
+    "c/configuration/config_cache_quality.md",
     "c/contract/api_extract_batch_bytes.md",
     "c/contract/api_extract_batch_bytes_with_config.md",
     "c/contract/api_extract_batch_uri.md",
     "c/contract/api_extract_batch_uri_with_config.md",
     "c/contract/api_extract_bytes_input.md",
     "c/contract/api_extract_uri.md",
-    "c/contract/config_chunking_prepend_heading_context.md",
     "c/contract/config_document_structure_with_headings.md",
     "c/contract/config_element_types.md",
     "c/contract/config_embedding_plugin.md",
     "c/contract/config_extraction_timeout.md",
     "c/contract/config_keywords.md",
+    "c/contract/config_llm_max_concurrency.md",
     "c/contract/config_llm_structured_extraction.md",
     "c/contract/config_pages.md",
     "c/contract/config_quality_enabled.md",
     "c/contract/config_security_limits.md",
     "c/contract/config_tree_sitter.md",
+    "c/contract/metadata_access.md",
+    "c/contract/ocr_basic_config.md",
     "c/contract/output_format_bytes_markdown.md",
     "c/contract/output_format_markdown.md",
+    "c/contract/table_access.md",
     "c/error/error_empty_bytes.md",
     "c/error/error_empty_mime.md",
     "c/error/error_extract_input_conflicting_ocr.md",
@@ -45,6 +53,12 @@
     "c/format_specific/format_pdf_text.md",
     "c/format_specific/format_pptx.md",
     "c/format_specific/format_xlsx.md",
+    "c/language-detection/language_detection_config.md",
+    "c/language-detection/language_detection_multilingual.md",
+    "c/ocr/ocr_force_all_pages.md",
+    "c/ocr/ocr_multi_language.md",
+    "c/ocr/ocr_paddle_backend.md",
+    "c/ocr/vlm_ocr.md",
     "c/plugin_api/clear_reranker_backends.md",
     "c/plugin_api/embedding_backends_clear.md",
     "c/plugin_api/embedding_backends_list.md",
@@ -101,26 +115,34 @@
     "csharp/batch/extract_batch_uri_basic.md",
     "csharp/batch/extract_batch_uri_not_found.md",
     "csharp/batch/extract_batch_uri_partial_failure.md",
+    "csharp/chunking/chunking_config_and_output.md",
+    "csharp/chunking/chunking_rag_handoff.md",
     "csharp/code/code_shebang_detection.md",
+    "csharp/config/ocr_dpi_config.md",
+    "csharp/config/pdf_hierarchy_config.md",
+    "csharp/configuration/config_cache_quality.md",
     "csharp/contract/api_extract_batch_bytes.md",
     "csharp/contract/api_extract_batch_bytes_with_config.md",
     "csharp/contract/api_extract_batch_uri.md",
     "csharp/contract/api_extract_batch_uri_with_config.md",
     "csharp/contract/api_extract_bytes_input.md",
     "csharp/contract/api_extract_uri.md",
-    "csharp/contract/config_chunking_prepend_heading_context.md",
     "csharp/contract/config_document_structure_with_headings.md",
     "csharp/contract/config_element_types.md",
     "csharp/contract/config_embedding_plugin.md",
     "csharp/contract/config_extraction_timeout.md",
     "csharp/contract/config_keywords.md",
+    "csharp/contract/config_llm_max_concurrency.md",
     "csharp/contract/config_llm_structured_extraction.md",
     "csharp/contract/config_pages.md",
     "csharp/contract/config_quality_enabled.md",
     "csharp/contract/config_security_limits.md",
     "csharp/contract/config_tree_sitter.md",
+    "csharp/contract/metadata_access.md",
+    "csharp/contract/ocr_basic_config.md",
     "csharp/contract/output_format_bytes_markdown.md",
     "csharp/contract/output_format_markdown.md",
+    "csharp/contract/table_access.md",
     "csharp/error/error_empty_bytes.md",
     "csharp/error/error_empty_mime.md",
     "csharp/error/error_extract_input_conflicting_ocr.md",
@@ -135,6 +157,12 @@
     "csharp/format_specific/format_pdf_text.md",
     "csharp/format_specific/format_pptx.md",
     "csharp/format_specific/format_xlsx.md",
+    "csharp/language-detection/language_detection_config.md",
+    "csharp/language-detection/language_detection_multilingual.md",
+    "csharp/ocr/ocr_force_all_pages.md",
+    "csharp/ocr/ocr_multi_language.md",
+    "csharp/ocr/ocr_paddle_backend.md",
+    "csharp/ocr/vlm_ocr.md",
     "csharp/plugin_api/clear_reranker_backends.md",
     "csharp/plugin_api/embedding_backends_clear.md",
     "csharp/plugin_api/embedding_backends_list.md",
@@ -191,26 +219,34 @@
     "dart/batch/extract_batch_uri_basic.md",
     "dart/batch/extract_batch_uri_not_found.md",
     "dart/batch/extract_batch_uri_partial_failure.md",
+    "dart/chunking/chunking_config_and_output.md",
+    "dart/chunking/chunking_rag_handoff.md",
     "dart/code/code_shebang_detection.md",
+    "dart/config/ocr_dpi_config.md",
+    "dart/config/pdf_hierarchy_config.md",
+    "dart/configuration/config_cache_quality.md",
     "dart/contract/api_extract_batch_bytes.md",
     "dart/contract/api_extract_batch_bytes_with_config.md",
     "dart/contract/api_extract_batch_uri.md",
     "dart/contract/api_extract_batch_uri_with_config.md",
     "dart/contract/api_extract_bytes_input.md",
     "dart/contract/api_extract_uri.md",
-    "dart/contract/config_chunking_prepend_heading_context.md",
     "dart/contract/config_document_structure_with_headings.md",
     "dart/contract/config_element_types.md",
     "dart/contract/config_embedding_plugin.md",
     "dart/contract/config_extraction_timeout.md",
     "dart/contract/config_keywords.md",
+    "dart/contract/config_llm_max_concurrency.md",
     "dart/contract/config_llm_structured_extraction.md",
     "dart/contract/config_pages.md",
     "dart/contract/config_quality_enabled.md",
     "dart/contract/config_security_limits.md",
     "dart/contract/config_tree_sitter.md",
+    "dart/contract/metadata_access.md",
+    "dart/contract/ocr_basic_config.md",
     "dart/contract/output_format_bytes_markdown.md",
     "dart/contract/output_format_markdown.md",
+    "dart/contract/table_access.md",
     "dart/error/error_empty_bytes.md",
     "dart/error/error_empty_mime.md",
     "dart/error/error_extract_input_conflicting_ocr.md",
@@ -225,6 +261,12 @@
     "dart/format_specific/format_pdf_text.md",
     "dart/format_specific/format_pptx.md",
     "dart/format_specific/format_xlsx.md",
+    "dart/language-detection/language_detection_config.md",
+    "dart/language-detection/language_detection_multilingual.md",
+    "dart/ocr/ocr_force_all_pages.md",
+    "dart/ocr/ocr_multi_language.md",
+    "dart/ocr/ocr_paddle_backend.md",
+    "dart/ocr/vlm_ocr.md",
     "dart/plugin_api/clear_reranker_backends.md",
     "dart/plugin_api/embedding_backends_clear.md",
     "dart/plugin_api/embedding_backends_list.md",
@@ -281,26 +323,34 @@
     "elixir/batch/extract_batch_uri_basic.md",
     "elixir/batch/extract_batch_uri_not_found.md",
     "elixir/batch/extract_batch_uri_partial_failure.md",
+    "elixir/chunking/chunking_config_and_output.md",
+    "elixir/chunking/chunking_rag_handoff.md",
     "elixir/code/code_shebang_detection.md",
+    "elixir/config/ocr_dpi_config.md",
+    "elixir/config/pdf_hierarchy_config.md",
+    "elixir/configuration/config_cache_quality.md",
     "elixir/contract/api_extract_batch_bytes.md",
     "elixir/contract/api_extract_batch_bytes_with_config.md",
     "elixir/contract/api_extract_batch_uri.md",
     "elixir/contract/api_extract_batch_uri_with_config.md",
     "elixir/contract/api_extract_bytes_input.md",
     "elixir/contract/api_extract_uri.md",
-    "elixir/contract/config_chunking_prepend_heading_context.md",
     "elixir/contract/config_document_structure_with_headings.md",
     "elixir/contract/config_element_types.md",
     "elixir/contract/config_embedding_plugin.md",
     "elixir/contract/config_extraction_timeout.md",
     "elixir/contract/config_keywords.md",
+    "elixir/contract/config_llm_max_concurrency.md",
     "elixir/contract/config_llm_structured_extraction.md",
     "elixir/contract/config_pages.md",
     "elixir/contract/config_quality_enabled.md",
     "elixir/contract/config_security_limits.md",
     "elixir/contract/config_tree_sitter.md",
+    "elixir/contract/metadata_access.md",
+    "elixir/contract/ocr_basic_config.md",
     "elixir/contract/output_format_bytes_markdown.md",
     "elixir/contract/output_format_markdown.md",
+    "elixir/contract/table_access.md",
     "elixir/error/error_empty_bytes.md",
     "elixir/error/error_empty_mime.md",
     "elixir/error/error_extract_input_conflicting_ocr.md",
@@ -315,6 +365,12 @@
     "elixir/format_specific/format_pdf_text.md",
     "elixir/format_specific/format_pptx.md",
     "elixir/format_specific/format_xlsx.md",
+    "elixir/language-detection/language_detection_config.md",
+    "elixir/language-detection/language_detection_multilingual.md",
+    "elixir/ocr/ocr_force_all_pages.md",
+    "elixir/ocr/ocr_multi_language.md",
+    "elixir/ocr/ocr_paddle_backend.md",
+    "elixir/ocr/vlm_ocr.md",
     "elixir/plugin_api/clear_reranker_backends.md",
     "elixir/plugin_api/embedding_backends_clear.md",
     "elixir/plugin_api/embedding_backends_list.md",
@@ -371,26 +427,34 @@
     "go/batch/extract_batch_uri_basic.md",
     "go/batch/extract_batch_uri_not_found.md",
     "go/batch/extract_batch_uri_partial_failure.md",
+    "go/chunking/chunking_config_and_output.md",
+    "go/chunking/chunking_rag_handoff.md",
     "go/code/code_shebang_detection.md",
+    "go/config/ocr_dpi_config.md",
+    "go/config/pdf_hierarchy_config.md",
+    "go/configuration/config_cache_quality.md",
     "go/contract/api_extract_batch_bytes.md",
     "go/contract/api_extract_batch_bytes_with_config.md",
     "go/contract/api_extract_batch_uri.md",
     "go/contract/api_extract_batch_uri_with_config.md",
     "go/contract/api_extract_bytes_input.md",
     "go/contract/api_extract_uri.md",
-    "go/contract/config_chunking_prepend_heading_context.md",
     "go/contract/config_document_structure_with_headings.md",
     "go/contract/config_element_types.md",
     "go/contract/config_embedding_plugin.md",
     "go/contract/config_extraction_timeout.md",
     "go/contract/config_keywords.md",
+    "go/contract/config_llm_max_concurrency.md",
     "go/contract/config_llm_structured_extraction.md",
     "go/contract/config_pages.md",
     "go/contract/config_quality_enabled.md",
     "go/contract/config_security_limits.md",
     "go/contract/config_tree_sitter.md",
+    "go/contract/metadata_access.md",
+    "go/contract/ocr_basic_config.md",
     "go/contract/output_format_bytes_markdown.md",
     "go/contract/output_format_markdown.md",
+    "go/contract/table_access.md",
     "go/error/error_empty_bytes.md",
     "go/error/error_empty_mime.md",
     "go/error/error_extract_input_conflicting_ocr.md",
@@ -405,6 +469,12 @@
     "go/format_specific/format_pdf_text.md",
     "go/format_specific/format_pptx.md",
     "go/format_specific/format_xlsx.md",
+    "go/language-detection/language_detection_config.md",
+    "go/language-detection/language_detection_multilingual.md",
+    "go/ocr/ocr_force_all_pages.md",
+    "go/ocr/ocr_multi_language.md",
+    "go/ocr/ocr_paddle_backend.md",
+    "go/ocr/vlm_ocr.md",
     "go/plugin_api/clear_reranker_backends.md",
     "go/plugin_api/embedding_backends_clear.md",
     "go/plugin_api/embedding_backends_list.md",
@@ -461,26 +531,34 @@
     "java/batch/extract_batch_uri_basic.md",
     "java/batch/extract_batch_uri_not_found.md",
     "java/batch/extract_batch_uri_partial_failure.md",
+    "java/chunking/chunking_config_and_output.md",
+    "java/chunking/chunking_rag_handoff.md",
     "java/code/code_shebang_detection.md",
+    "java/config/ocr_dpi_config.md",
+    "java/config/pdf_hierarchy_config.md",
+    "java/configuration/config_cache_quality.md",
     "java/contract/api_extract_batch_bytes.md",
     "java/contract/api_extract_batch_bytes_with_config.md",
     "java/contract/api_extract_batch_uri.md",
     "java/contract/api_extract_batch_uri_with_config.md",
     "java/contract/api_extract_bytes_input.md",
     "java/contract/api_extract_uri.md",
-    "java/contract/config_chunking_prepend_heading_context.md",
     "java/contract/config_document_structure_with_headings.md",
     "java/contract/config_element_types.md",
     "java/contract/config_embedding_plugin.md",
     "java/contract/config_extraction_timeout.md",
     "java/contract/config_keywords.md",
+    "java/contract/config_llm_max_concurrency.md",
     "java/contract/config_llm_structured_extraction.md",
     "java/contract/config_pages.md",
     "java/contract/config_quality_enabled.md",
     "java/contract/config_security_limits.md",
     "java/contract/config_tree_sitter.md",
+    "java/contract/metadata_access.md",
+    "java/contract/ocr_basic_config.md",
     "java/contract/output_format_bytes_markdown.md",
     "java/contract/output_format_markdown.md",
+    "java/contract/table_access.md",
     "java/error/error_empty_bytes.md",
     "java/error/error_empty_mime.md",
     "java/error/error_extract_input_conflicting_ocr.md",
@@ -495,6 +573,12 @@
     "java/format_specific/format_pdf_text.md",
     "java/format_specific/format_pptx.md",
     "java/format_specific/format_xlsx.md",
+    "java/language-detection/language_detection_config.md",
+    "java/language-detection/language_detection_multilingual.md",
+    "java/ocr/ocr_force_all_pages.md",
+    "java/ocr/ocr_multi_language.md",
+    "java/ocr/ocr_paddle_backend.md",
+    "java/ocr/vlm_ocr.md",
     "java/plugin_api/clear_reranker_backends.md",
     "java/plugin_api/embedding_backends_clear.md",
     "java/plugin_api/embedding_backends_list.md",
@@ -551,26 +635,34 @@
     "kotlin-android/batch/extract_batch_uri_basic.md",
     "kotlin-android/batch/extract_batch_uri_not_found.md",
     "kotlin-android/batch/extract_batch_uri_partial_failure.md",
+    "kotlin-android/chunking/chunking_config_and_output.md",
+    "kotlin-android/chunking/chunking_rag_handoff.md",
     "kotlin-android/code/code_shebang_detection.md",
+    "kotlin-android/config/ocr_dpi_config.md",
+    "kotlin-android/config/pdf_hierarchy_config.md",
+    "kotlin-android/configuration/config_cache_quality.md",
     "kotlin-android/contract/api_extract_batch_bytes.md",
     "kotlin-android/contract/api_extract_batch_bytes_with_config.md",
     "kotlin-android/contract/api_extract_batch_uri.md",
     "kotlin-android/contract/api_extract_batch_uri_with_config.md",
     "kotlin-android/contract/api_extract_bytes_input.md",
     "kotlin-android/contract/api_extract_uri.md",
-    "kotlin-android/contract/config_chunking_prepend_heading_context.md",
     "kotlin-android/contract/config_document_structure_with_headings.md",
     "kotlin-android/contract/config_element_types.md",
     "kotlin-android/contract/config_embedding_plugin.md",
     "kotlin-android/contract/config_extraction_timeout.md",
     "kotlin-android/contract/config_keywords.md",
+    "kotlin-android/contract/config_llm_max_concurrency.md",
     "kotlin-android/contract/config_llm_structured_extraction.md",
     "kotlin-android/contract/config_pages.md",
     "kotlin-android/contract/config_quality_enabled.md",
     "kotlin-android/contract/config_security_limits.md",
     "kotlin-android/contract/config_tree_sitter.md",
+    "kotlin-android/contract/metadata_access.md",
+    "kotlin-android/contract/ocr_basic_config.md",
     "kotlin-android/contract/output_format_bytes_markdown.md",
     "kotlin-android/contract/output_format_markdown.md",
+    "kotlin-android/contract/table_access.md",
     "kotlin-android/error/error_empty_bytes.md",
     "kotlin-android/error/error_empty_mime.md",
     "kotlin-android/error/error_extract_input_conflicting_ocr.md",
@@ -585,6 +677,12 @@
     "kotlin-android/format_specific/format_pdf_text.md",
     "kotlin-android/format_specific/format_pptx.md",
     "kotlin-android/format_specific/format_xlsx.md",
+    "kotlin-android/language-detection/language_detection_config.md",
+    "kotlin-android/language-detection/language_detection_multilingual.md",
+    "kotlin-android/ocr/ocr_force_all_pages.md",
+    "kotlin-android/ocr/ocr_multi_language.md",
+    "kotlin-android/ocr/ocr_paddle_backend.md",
+    "kotlin-android/ocr/vlm_ocr.md",
     "kotlin-android/plugin_api/clear_reranker_backends.md",
     "kotlin-android/plugin_api/embedding_backends_clear.md",
     "kotlin-android/plugin_api/embedding_backends_list.md",
@@ -641,26 +739,34 @@
     "php/batch/extract_batch_uri_basic.md",
     "php/batch/extract_batch_uri_not_found.md",
     "php/batch/extract_batch_uri_partial_failure.md",
+    "php/chunking/chunking_config_and_output.md",
+    "php/chunking/chunking_rag_handoff.md",
     "php/code/code_shebang_detection.md",
+    "php/config/ocr_dpi_config.md",
+    "php/config/pdf_hierarchy_config.md",
+    "php/configuration/config_cache_quality.md",
     "php/contract/api_extract_batch_bytes.md",
     "php/contract/api_extract_batch_bytes_with_config.md",
     "php/contract/api_extract_batch_uri.md",
     "php/contract/api_extract_batch_uri_with_config.md",
     "php/contract/api_extract_bytes_input.md",
     "php/contract/api_extract_uri.md",
-    "php/contract/config_chunking_prepend_heading_context.md",
     "php/contract/config_document_structure_with_headings.md",
     "php/contract/config_element_types.md",
     "php/contract/config_embedding_plugin.md",
     "php/contract/config_extraction_timeout.md",
     "php/contract/config_keywords.md",
+    "php/contract/config_llm_max_concurrency.md",
     "php/contract/config_llm_structured_extraction.md",
     "php/contract/config_pages.md",
     "php/contract/config_quality_enabled.md",
     "php/contract/config_security_limits.md",
     "php/contract/config_tree_sitter.md",
+    "php/contract/metadata_access.md",
+    "php/contract/ocr_basic_config.md",
     "php/contract/output_format_bytes_markdown.md",
     "php/contract/output_format_markdown.md",
+    "php/contract/table_access.md",
     "php/error/error_empty_bytes.md",
     "php/error/error_empty_mime.md",
     "php/error/error_extract_input_conflicting_ocr.md",
@@ -675,6 +781,12 @@
     "php/format_specific/format_pdf_text.md",
     "php/format_specific/format_pptx.md",
     "php/format_specific/format_xlsx.md",
+    "php/language-detection/language_detection_config.md",
+    "php/language-detection/language_detection_multilingual.md",
+    "php/ocr/ocr_force_all_pages.md",
+    "php/ocr/ocr_multi_language.md",
+    "php/ocr/ocr_paddle_backend.md",
+    "php/ocr/vlm_ocr.md",
     "php/plugin_api/clear_reranker_backends.md",
     "php/plugin_api/embedding_backends_clear.md",
     "php/plugin_api/embedding_backends_list.md",
@@ -731,26 +843,34 @@
     "python/batch/extract_batch_uri_basic.md",
     "python/batch/extract_batch_uri_not_found.md",
     "python/batch/extract_batch_uri_partial_failure.md",
+    "python/chunking/chunking_config_and_output.md",
+    "python/chunking/chunking_rag_handoff.md",
     "python/code/code_shebang_detection.md",
+    "python/config/ocr_dpi_config.md",
+    "python/config/pdf_hierarchy_config.md",
+    "python/configuration/config_cache_quality.md",
     "python/contract/api_extract_batch_bytes.md",
     "python/contract/api_extract_batch_bytes_with_config.md",
     "python/contract/api_extract_batch_uri.md",
     "python/contract/api_extract_batch_uri_with_config.md",
     "python/contract/api_extract_bytes_input.md",
     "python/contract/api_extract_uri.md",
-    "python/contract/config_chunking_prepend_heading_context.md",
     "python/contract/config_document_structure_with_headings.md",
     "python/contract/config_element_types.md",
     "python/contract/config_embedding_plugin.md",
     "python/contract/config_extraction_timeout.md",
     "python/contract/config_keywords.md",
+    "python/contract/config_llm_max_concurrency.md",
     "python/contract/config_llm_structured_extraction.md",
     "python/contract/config_pages.md",
     "python/contract/config_quality_enabled.md",
     "python/contract/config_security_limits.md",
     "python/contract/config_tree_sitter.md",
+    "python/contract/metadata_access.md",
+    "python/contract/ocr_basic_config.md",
     "python/contract/output_format_bytes_markdown.md",
     "python/contract/output_format_markdown.md",
+    "python/contract/table_access.md",
     "python/error/error_empty_bytes.md",
     "python/error/error_empty_mime.md",
     "python/error/error_extract_input_conflicting_ocr.md",
@@ -765,6 +885,12 @@
     "python/format_specific/format_pdf_text.md",
     "python/format_specific/format_pptx.md",
     "python/format_specific/format_xlsx.md",
+    "python/language-detection/language_detection_config.md",
+    "python/language-detection/language_detection_multilingual.md",
+    "python/ocr/ocr_force_all_pages.md",
+    "python/ocr/ocr_multi_language.md",
+    "python/ocr/ocr_paddle_backend.md",
+    "python/ocr/vlm_ocr.md",
     "python/plugin_api/clear_reranker_backends.md",
     "python/plugin_api/embedding_backends_clear.md",
     "python/plugin_api/embedding_backends_list.md",
@@ -821,26 +947,34 @@
     "ruby/batch/extract_batch_uri_basic.md",
     "ruby/batch/extract_batch_uri_not_found.md",
     "ruby/batch/extract_batch_uri_partial_failure.md",
+    "ruby/chunking/chunking_config_and_output.md",
+    "ruby/chunking/chunking_rag_handoff.md",
     "ruby/code/code_shebang_detection.md",
+    "ruby/config/ocr_dpi_config.md",
+    "ruby/config/pdf_hierarchy_config.md",
+    "ruby/configuration/config_cache_quality.md",
     "ruby/contract/api_extract_batch_bytes.md",
     "ruby/contract/api_extract_batch_bytes_with_config.md",
     "ruby/contract/api_extract_batch_uri.md",
     "ruby/contract/api_extract_batch_uri_with_config.md",
     "ruby/contract/api_extract_bytes_input.md",
     "ruby/contract/api_extract_uri.md",
-    "ruby/contract/config_chunking_prepend_heading_context.md",
     "ruby/contract/config_document_structure_with_headings.md",
     "ruby/contract/config_element_types.md",
     "ruby/contract/config_embedding_plugin.md",
     "ruby/contract/config_extraction_timeout.md",
     "ruby/contract/config_keywords.md",
+    "ruby/contract/config_llm_max_concurrency.md",
     "ruby/contract/config_llm_structured_extraction.md",
     "ruby/contract/config_pages.md",
     "ruby/contract/config_quality_enabled.md",
     "ruby/contract/config_security_limits.md",
     "ruby/contract/config_tree_sitter.md",
+    "ruby/contract/metadata_access.md",
+    "ruby/contract/ocr_basic_config.md",
     "ruby/contract/output_format_bytes_markdown.md",
     "ruby/contract/output_format_markdown.md",
+    "ruby/contract/table_access.md",
     "ruby/error/error_empty_bytes.md",
     "ruby/error/error_empty_mime.md",
     "ruby/error/error_extract_input_conflicting_ocr.md",
@@ -855,6 +989,12 @@
     "ruby/format_specific/format_pdf_text.md",
     "ruby/format_specific/format_pptx.md",
     "ruby/format_specific/format_xlsx.md",
+    "ruby/language-detection/language_detection_config.md",
+    "ruby/language-detection/language_detection_multilingual.md",
+    "ruby/ocr/ocr_force_all_pages.md",
+    "ruby/ocr/ocr_multi_language.md",
+    "ruby/ocr/ocr_paddle_backend.md",
+    "ruby/ocr/vlm_ocr.md",
     "ruby/plugin_api/clear_reranker_backends.md",
     "ruby/plugin_api/embedding_backends_clear.md",
     "ruby/plugin_api/embedding_backends_list.md",
@@ -911,26 +1051,34 @@
     "rust/batch/extract_batch_uri_basic.md",
     "rust/batch/extract_batch_uri_not_found.md",
     "rust/batch/extract_batch_uri_partial_failure.md",
+    "rust/chunking/chunking_config_and_output.md",
+    "rust/chunking/chunking_rag_handoff.md",
     "rust/code/code_shebang_detection.md",
+    "rust/config/ocr_dpi_config.md",
+    "rust/config/pdf_hierarchy_config.md",
+    "rust/configuration/config_cache_quality.md",
     "rust/contract/api_extract_batch_bytes.md",
     "rust/contract/api_extract_batch_bytes_with_config.md",
     "rust/contract/api_extract_batch_uri.md",
     "rust/contract/api_extract_batch_uri_with_config.md",
     "rust/contract/api_extract_bytes_input.md",
     "rust/contract/api_extract_uri.md",
-    "rust/contract/config_chunking_prepend_heading_context.md",
     "rust/contract/config_document_structure_with_headings.md",
     "rust/contract/config_element_types.md",
     "rust/contract/config_embedding_plugin.md",
     "rust/contract/config_extraction_timeout.md",
     "rust/contract/config_keywords.md",
+    "rust/contract/config_llm_max_concurrency.md",
     "rust/contract/config_llm_structured_extraction.md",
     "rust/contract/config_pages.md",
     "rust/contract/config_quality_enabled.md",
     "rust/contract/config_security_limits.md",
     "rust/contract/config_tree_sitter.md",
+    "rust/contract/metadata_access.md",
+    "rust/contract/ocr_basic_config.md",
     "rust/contract/output_format_bytes_markdown.md",
     "rust/contract/output_format_markdown.md",
+    "rust/contract/table_access.md",
     "rust/error/error_empty_bytes.md",
     "rust/error/error_empty_mime.md",
     "rust/error/error_extract_input_conflicting_ocr.md",
@@ -945,6 +1093,12 @@
     "rust/format_specific/format_pdf_text.md",
     "rust/format_specific/format_pptx.md",
     "rust/format_specific/format_xlsx.md",
+    "rust/language-detection/language_detection_config.md",
+    "rust/language-detection/language_detection_multilingual.md",
+    "rust/ocr/ocr_force_all_pages.md",
+    "rust/ocr/ocr_multi_language.md",
+    "rust/ocr/ocr_paddle_backend.md",
+    "rust/ocr/vlm_ocr.md",
     "rust/plugin_api/clear_reranker_backends.md",
     "rust/plugin_api/embedding_backends_clear.md",
     "rust/plugin_api/embedding_backends_list.md",
@@ -1001,26 +1155,34 @@
     "swift/batch/extract_batch_uri_basic.md",
     "swift/batch/extract_batch_uri_not_found.md",
     "swift/batch/extract_batch_uri_partial_failure.md",
+    "swift/chunking/chunking_config_and_output.md",
+    "swift/chunking/chunking_rag_handoff.md",
     "swift/code/code_shebang_detection.md",
+    "swift/config/ocr_dpi_config.md",
+    "swift/config/pdf_hierarchy_config.md",
+    "swift/configuration/config_cache_quality.md",
     "swift/contract/api_extract_batch_bytes.md",
     "swift/contract/api_extract_batch_bytes_with_config.md",
     "swift/contract/api_extract_batch_uri.md",
     "swift/contract/api_extract_batch_uri_with_config.md",
     "swift/contract/api_extract_bytes_input.md",
     "swift/contract/api_extract_uri.md",
-    "swift/contract/config_chunking_prepend_heading_context.md",
     "swift/contract/config_document_structure_with_headings.md",
     "swift/contract/config_element_types.md",
     "swift/contract/config_embedding_plugin.md",
     "swift/contract/config_extraction_timeout.md",
     "swift/contract/config_keywords.md",
+    "swift/contract/config_llm_max_concurrency.md",
     "swift/contract/config_llm_structured_extraction.md",
     "swift/contract/config_pages.md",
     "swift/contract/config_quality_enabled.md",
     "swift/contract/config_security_limits.md",
     "swift/contract/config_tree_sitter.md",
+    "swift/contract/metadata_access.md",
+    "swift/contract/ocr_basic_config.md",
     "swift/contract/output_format_bytes_markdown.md",
     "swift/contract/output_format_markdown.md",
+    "swift/contract/table_access.md",
     "swift/error/error_empty_bytes.md",
     "swift/error/error_empty_mime.md",
     "swift/error/error_extract_input_conflicting_ocr.md",
@@ -1035,6 +1197,12 @@
     "swift/format_specific/format_pdf_text.md",
     "swift/format_specific/format_pptx.md",
     "swift/format_specific/format_xlsx.md",
+    "swift/language-detection/language_detection_config.md",
+    "swift/language-detection/language_detection_multilingual.md",
+    "swift/ocr/ocr_force_all_pages.md",
+    "swift/ocr/ocr_multi_language.md",
+    "swift/ocr/ocr_paddle_backend.md",
+    "swift/ocr/vlm_ocr.md",
     "swift/plugin_api/clear_reranker_backends.md",
     "swift/plugin_api/embedding_backends_clear.md",
     "swift/plugin_api/embedding_backends_list.md",
@@ -1091,26 +1259,34 @@
     "typescript/batch/extract_batch_uri_basic.md",
     "typescript/batch/extract_batch_uri_not_found.md",
     "typescript/batch/extract_batch_uri_partial_failure.md",
+    "typescript/chunking/chunking_config_and_output.md",
+    "typescript/chunking/chunking_rag_handoff.md",
     "typescript/code/code_shebang_detection.md",
+    "typescript/config/ocr_dpi_config.md",
+    "typescript/config/pdf_hierarchy_config.md",
+    "typescript/configuration/config_cache_quality.md",
     "typescript/contract/api_extract_batch_bytes.md",
     "typescript/contract/api_extract_batch_bytes_with_config.md",
     "typescript/contract/api_extract_batch_uri.md",
     "typescript/contract/api_extract_batch_uri_with_config.md",
     "typescript/contract/api_extract_bytes_input.md",
     "typescript/contract/api_extract_uri.md",
-    "typescript/contract/config_chunking_prepend_heading_context.md",
     "typescript/contract/config_document_structure_with_headings.md",
     "typescript/contract/config_element_types.md",
     "typescript/contract/config_embedding_plugin.md",
     "typescript/contract/config_extraction_timeout.md",
     "typescript/contract/config_keywords.md",
+    "typescript/contract/config_llm_max_concurrency.md",
     "typescript/contract/config_llm_structured_extraction.md",
     "typescript/contract/config_pages.md",
     "typescript/contract/config_quality_enabled.md",
     "typescript/contract/config_security_limits.md",
     "typescript/contract/config_tree_sitter.md",
+    "typescript/contract/metadata_access.md",
+    "typescript/contract/ocr_basic_config.md",
     "typescript/contract/output_format_bytes_markdown.md",
     "typescript/contract/output_format_markdown.md",
+    "typescript/contract/table_access.md",
     "typescript/error/error_empty_bytes.md",
     "typescript/error/error_empty_mime.md",
     "typescript/error/error_extract_input_conflicting_ocr.md",
@@ -1125,6 +1301,12 @@
     "typescript/format_specific/format_pdf_text.md",
     "typescript/format_specific/format_pptx.md",
     "typescript/format_specific/format_xlsx.md",
+    "typescript/language-detection/language_detection_config.md",
+    "typescript/language-detection/language_detection_multilingual.md",
+    "typescript/ocr/ocr_force_all_pages.md",
+    "typescript/ocr/ocr_multi_language.md",
+    "typescript/ocr/ocr_paddle_backend.md",
+    "typescript/ocr/vlm_ocr.md",
     "typescript/plugin_api/clear_reranker_backends.md",
     "typescript/plugin_api/embedding_backends_clear.md",
     "typescript/plugin_api/embedding_backends_list.md",
@@ -1181,26 +1363,34 @@
     "wasm/batch/extract_batch_uri_basic.md",
     "wasm/batch/extract_batch_uri_not_found.md",
     "wasm/batch/extract_batch_uri_partial_failure.md",
+    "wasm/chunking/chunking_config_and_output.md",
+    "wasm/chunking/chunking_rag_handoff.md",
     "wasm/code/code_shebang_detection.md",
+    "wasm/config/ocr_dpi_config.md",
+    "wasm/config/pdf_hierarchy_config.md",
+    "wasm/configuration/config_cache_quality.md",
     "wasm/contract/api_extract_batch_bytes.md",
     "wasm/contract/api_extract_batch_bytes_with_config.md",
     "wasm/contract/api_extract_batch_uri.md",
     "wasm/contract/api_extract_batch_uri_with_config.md",
     "wasm/contract/api_extract_bytes_input.md",
     "wasm/contract/api_extract_uri.md",
-    "wasm/contract/config_chunking_prepend_heading_context.md",
     "wasm/contract/config_document_structure_with_headings.md",
     "wasm/contract/config_element_types.md",
     "wasm/contract/config_embedding_plugin.md",
     "wasm/contract/config_extraction_timeout.md",
     "wasm/contract/config_keywords.md",
+    "wasm/contract/config_llm_max_concurrency.md",
     "wasm/contract/config_llm_structured_extraction.md",
     "wasm/contract/config_pages.md",
     "wasm/contract/config_quality_enabled.md",
     "wasm/contract/config_security_limits.md",
     "wasm/contract/config_tree_sitter.md",
+    "wasm/contract/metadata_access.md",
+    "wasm/contract/ocr_basic_config.md",
     "wasm/contract/output_format_bytes_markdown.md",
     "wasm/contract/output_format_markdown.md",
+    "wasm/contract/table_access.md",
     "wasm/error/error_empty_bytes.md",
     "wasm/error/error_empty_mime.md",
     "wasm/error/error_extract_input_conflicting_ocr.md",
@@ -1215,6 +1405,12 @@
     "wasm/format_specific/format_pdf_text.md",
     "wasm/format_specific/format_pptx.md",
     "wasm/format_specific/format_xlsx.md",
+    "wasm/language-detection/language_detection_config.md",
+    "wasm/language-detection/language_detection_multilingual.md",
+    "wasm/ocr/ocr_force_all_pages.md",
+    "wasm/ocr/ocr_multi_language.md",
+    "wasm/ocr/ocr_paddle_backend.md",
+    "wasm/ocr/vlm_ocr.md",
     "wasm/plugin_api/clear_reranker_backends.md",
     "wasm/plugin_api/embedding_backends_clear.md",
     "wasm/plugin_api/embedding_backends_list.md",
@@ -1271,26 +1467,34 @@
     "zig/batch/extract_batch_uri_basic.md",
     "zig/batch/extract_batch_uri_not_found.md",
     "zig/batch/extract_batch_uri_partial_failure.md",
+    "zig/chunking/chunking_config_and_output.md",
+    "zig/chunking/chunking_rag_handoff.md",
     "zig/code/code_shebang_detection.md",
+    "zig/config/ocr_dpi_config.md",
+    "zig/config/pdf_hierarchy_config.md",
+    "zig/configuration/config_cache_quality.md",
     "zig/contract/api_extract_batch_bytes.md",
     "zig/contract/api_extract_batch_bytes_with_config.md",
     "zig/contract/api_extract_batch_uri.md",
     "zig/contract/api_extract_batch_uri_with_config.md",
     "zig/contract/api_extract_bytes_input.md",
     "zig/contract/api_extract_uri.md",
-    "zig/contract/config_chunking_prepend_heading_context.md",
     "zig/contract/config_document_structure_with_headings.md",
     "zig/contract/config_element_types.md",
     "zig/contract/config_embedding_plugin.md",
     "zig/contract/config_extraction_timeout.md",
     "zig/contract/config_keywords.md",
+    "zig/contract/config_llm_max_concurrency.md",
     "zig/contract/config_llm_structured_extraction.md",
     "zig/contract/config_pages.md",
     "zig/contract/config_quality_enabled.md",
     "zig/contract/config_security_limits.md",
     "zig/contract/config_tree_sitter.md",
+    "zig/contract/metadata_access.md",
+    "zig/contract/ocr_basic_config.md",
     "zig/contract/output_format_bytes_markdown.md",
     "zig/contract/output_format_markdown.md",
+    "zig/contract/table_access.md",
     "zig/error/error_empty_bytes.md",
     "zig/error/error_empty_mime.md",
     "zig/error/error_extract_input_conflicting_ocr.md",
@@ -1305,6 +1509,12 @@
     "zig/format_specific/format_pdf_text.md",
     "zig/format_specific/format_pptx.md",
     "zig/format_specific/format_xlsx.md",
+    "zig/language-detection/language_detection_config.md",
+    "zig/language-detection/language_detection_multilingual.md",
+    "zig/ocr/ocr_force_all_pages.md",
+    "zig/ocr/ocr_multi_language.md",
+    "zig/ocr/ocr_paddle_backend.md",
+    "zig/ocr/vlm_ocr.md",
     "zig/plugin_api/clear_reranker_backends.md",
     "zig/plugin_api/embedding_backends_clear.md",
     "zig/plugin_api/embedding_backends_list.md",
@@ -1475,10 +1685,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "c"
+      },
+      "path": "c/chunking/chunking_config_and_output.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "c"
+      },
+      "path": "c/chunking/chunking_rag_handoff.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "c"
       },
       "path": "c/code/code_shebang_detection.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "c"
+      },
+      "path": "c/config/ocr_dpi_config.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "c"
+      },
+      "path": "c/config/pdf_hierarchy_config.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "c"
+      },
+      "path": "c/configuration/config_cache_quality.md",
       "language": "c",
       "target": "c",
       "session": "c",
@@ -1559,18 +1829,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "c"
-      },
-      "path": "c/contract/config_chunking_prepend_heading_context.md",
-      "language": "c",
-      "target": "c",
-      "session": "c",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "c"
       },
@@ -1623,6 +1881,18 @@
         "language": "c"
       },
       "path": "c/contract/config_keywords.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "c"
+      },
+      "path": "c/contract/config_llm_max_concurrency.md",
       "language": "c",
       "target": "c",
       "session": "c",
@@ -1691,6 +1961,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "c"
+      },
+      "path": "c/contract/metadata_access.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "c"
+      },
+      "path": "c/contract/ocr_basic_config.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "c"
       },
@@ -1707,6 +2001,18 @@
         "language": "c"
       },
       "path": "c/contract/output_format_markdown.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "c"
+      },
+      "path": "c/contract/table_access.md",
       "language": "c",
       "target": "c",
       "session": "c",
@@ -1875,6 +2181,78 @@
         "language": "c"
       },
       "path": "c/format_specific/format_xlsx.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "c"
+      },
+      "path": "c/language-detection/language_detection_config.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "c"
+      },
+      "path": "c/language-detection/language_detection_multilingual.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "c"
+      },
+      "path": "c/ocr/ocr_force_all_pages.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "c"
+      },
+      "path": "c/ocr/ocr_multi_language.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "c"
+      },
+      "path": "c/ocr/ocr_paddle_backend.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "c"
+      },
+      "path": "c/ocr/vlm_ocr.md",
       "language": "c",
       "target": "c",
       "session": "c",
@@ -2555,10 +2933,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "csharp"
+      },
+      "path": "csharp/chunking/chunking_config_and_output.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "csharp"
+      },
+      "path": "csharp/chunking/chunking_rag_handoff.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "csharp"
       },
       "path": "csharp/code/code_shebang_detection.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "csharp"
+      },
+      "path": "csharp/config/ocr_dpi_config.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "csharp"
+      },
+      "path": "csharp/config/pdf_hierarchy_config.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "csharp"
+      },
+      "path": "csharp/configuration/config_cache_quality.md",
       "language": "csharp",
       "target": "csharp",
       "session": "csharp",
@@ -2639,18 +3077,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "csharp"
-      },
-      "path": "csharp/contract/config_chunking_prepend_heading_context.md",
-      "language": "csharp",
-      "target": "csharp",
-      "session": "csharp",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "csharp"
       },
@@ -2703,6 +3129,18 @@
         "language": "csharp"
       },
       "path": "csharp/contract/config_keywords.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "csharp"
+      },
+      "path": "csharp/contract/config_llm_max_concurrency.md",
       "language": "csharp",
       "target": "csharp",
       "session": "csharp",
@@ -2771,6 +3209,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "csharp"
+      },
+      "path": "csharp/contract/metadata_access.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "csharp"
+      },
+      "path": "csharp/contract/ocr_basic_config.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "csharp"
       },
@@ -2787,6 +3249,18 @@
         "language": "csharp"
       },
       "path": "csharp/contract/output_format_markdown.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "csharp"
+      },
+      "path": "csharp/contract/table_access.md",
       "language": "csharp",
       "target": "csharp",
       "session": "csharp",
@@ -2955,6 +3429,78 @@
         "language": "csharp"
       },
       "path": "csharp/format_specific/format_xlsx.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "csharp"
+      },
+      "path": "csharp/language-detection/language_detection_config.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "csharp"
+      },
+      "path": "csharp/language-detection/language_detection_multilingual.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "csharp"
+      },
+      "path": "csharp/ocr/ocr_force_all_pages.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "csharp"
+      },
+      "path": "csharp/ocr/ocr_multi_language.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "csharp"
+      },
+      "path": "csharp/ocr/ocr_paddle_backend.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "csharp"
+      },
+      "path": "csharp/ocr/vlm_ocr.md",
       "language": "csharp",
       "target": "csharp",
       "session": "csharp",
@@ -3635,10 +4181,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "dart"
+      },
+      "path": "dart/chunking/chunking_config_and_output.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "dart"
+      },
+      "path": "dart/chunking/chunking_rag_handoff.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "dart"
       },
       "path": "dart/code/code_shebang_detection.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "dart"
+      },
+      "path": "dart/config/ocr_dpi_config.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "dart"
+      },
+      "path": "dart/config/pdf_hierarchy_config.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "dart"
+      },
+      "path": "dart/configuration/config_cache_quality.md",
       "language": "dart",
       "target": "dart",
       "session": "dart",
@@ -3719,18 +4325,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "dart"
-      },
-      "path": "dart/contract/config_chunking_prepend_heading_context.md",
-      "language": "dart",
-      "target": "dart",
-      "session": "dart",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "dart"
       },
@@ -3783,6 +4377,18 @@
         "language": "dart"
       },
       "path": "dart/contract/config_keywords.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "dart"
+      },
+      "path": "dart/contract/config_llm_max_concurrency.md",
       "language": "dart",
       "target": "dart",
       "session": "dart",
@@ -3851,6 +4457,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "dart"
+      },
+      "path": "dart/contract/metadata_access.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "dart"
+      },
+      "path": "dart/contract/ocr_basic_config.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "dart"
       },
@@ -3867,6 +4497,18 @@
         "language": "dart"
       },
       "path": "dart/contract/output_format_markdown.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "dart"
+      },
+      "path": "dart/contract/table_access.md",
       "language": "dart",
       "target": "dart",
       "session": "dart",
@@ -4035,6 +4677,78 @@
         "language": "dart"
       },
       "path": "dart/format_specific/format_xlsx.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "dart"
+      },
+      "path": "dart/language-detection/language_detection_config.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "dart"
+      },
+      "path": "dart/language-detection/language_detection_multilingual.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "dart"
+      },
+      "path": "dart/ocr/ocr_force_all_pages.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "dart"
+      },
+      "path": "dart/ocr/ocr_multi_language.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "dart"
+      },
+      "path": "dart/ocr/ocr_paddle_backend.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "dart"
+      },
+      "path": "dart/ocr/vlm_ocr.md",
       "language": "dart",
       "target": "dart",
       "session": "dart",
@@ -4715,10 +5429,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "elixir"
+      },
+      "path": "elixir/chunking/chunking_config_and_output.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "elixir"
+      },
+      "path": "elixir/chunking/chunking_rag_handoff.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "elixir"
       },
       "path": "elixir/code/code_shebang_detection.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "elixir"
+      },
+      "path": "elixir/config/ocr_dpi_config.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "elixir"
+      },
+      "path": "elixir/config/pdf_hierarchy_config.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "elixir"
+      },
+      "path": "elixir/configuration/config_cache_quality.md",
       "language": "elixir",
       "target": "elixir",
       "session": "elixir",
@@ -4799,18 +5573,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "elixir"
-      },
-      "path": "elixir/contract/config_chunking_prepend_heading_context.md",
-      "language": "elixir",
-      "target": "elixir",
-      "session": "elixir",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "elixir"
       },
@@ -4863,6 +5625,18 @@
         "language": "elixir"
       },
       "path": "elixir/contract/config_keywords.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "elixir"
+      },
+      "path": "elixir/contract/config_llm_max_concurrency.md",
       "language": "elixir",
       "target": "elixir",
       "session": "elixir",
@@ -4931,6 +5705,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "elixir"
+      },
+      "path": "elixir/contract/metadata_access.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "elixir"
+      },
+      "path": "elixir/contract/ocr_basic_config.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "elixir"
       },
@@ -4947,6 +5745,18 @@
         "language": "elixir"
       },
       "path": "elixir/contract/output_format_markdown.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "elixir"
+      },
+      "path": "elixir/contract/table_access.md",
       "language": "elixir",
       "target": "elixir",
       "session": "elixir",
@@ -5115,6 +5925,78 @@
         "language": "elixir"
       },
       "path": "elixir/format_specific/format_xlsx.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "elixir"
+      },
+      "path": "elixir/language-detection/language_detection_config.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "elixir"
+      },
+      "path": "elixir/language-detection/language_detection_multilingual.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "elixir"
+      },
+      "path": "elixir/ocr/ocr_force_all_pages.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "elixir"
+      },
+      "path": "elixir/ocr/ocr_multi_language.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "elixir"
+      },
+      "path": "elixir/ocr/ocr_paddle_backend.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "elixir"
+      },
+      "path": "elixir/ocr/vlm_ocr.md",
       "language": "elixir",
       "target": "elixir",
       "session": "elixir",
@@ -5795,10 +6677,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "go"
+      },
+      "path": "go/chunking/chunking_config_and_output.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "go"
+      },
+      "path": "go/chunking/chunking_rag_handoff.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "go"
       },
       "path": "go/code/code_shebang_detection.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "go"
+      },
+      "path": "go/config/ocr_dpi_config.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "go"
+      },
+      "path": "go/config/pdf_hierarchy_config.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "go"
+      },
+      "path": "go/configuration/config_cache_quality.md",
       "language": "go",
       "target": "go",
       "session": "go",
@@ -5879,18 +6821,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "go"
-      },
-      "path": "go/contract/config_chunking_prepend_heading_context.md",
-      "language": "go",
-      "target": "go",
-      "session": "go",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "go"
       },
@@ -5943,6 +6873,18 @@
         "language": "go"
       },
       "path": "go/contract/config_keywords.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "go"
+      },
+      "path": "go/contract/config_llm_max_concurrency.md",
       "language": "go",
       "target": "go",
       "session": "go",
@@ -6011,6 +6953,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "go"
+      },
+      "path": "go/contract/metadata_access.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "go"
+      },
+      "path": "go/contract/ocr_basic_config.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "go"
       },
@@ -6027,6 +6993,18 @@
         "language": "go"
       },
       "path": "go/contract/output_format_markdown.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "go"
+      },
+      "path": "go/contract/table_access.md",
       "language": "go",
       "target": "go",
       "session": "go",
@@ -6195,6 +7173,78 @@
         "language": "go"
       },
       "path": "go/format_specific/format_xlsx.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "go"
+      },
+      "path": "go/language-detection/language_detection_config.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "go"
+      },
+      "path": "go/language-detection/language_detection_multilingual.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "go"
+      },
+      "path": "go/ocr/ocr_force_all_pages.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "go"
+      },
+      "path": "go/ocr/ocr_multi_language.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "go"
+      },
+      "path": "go/ocr/ocr_paddle_backend.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "go"
+      },
+      "path": "go/ocr/vlm_ocr.md",
       "language": "go",
       "target": "go",
       "session": "go",
@@ -6875,10 +7925,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "java"
+      },
+      "path": "java/chunking/chunking_config_and_output.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "java"
+      },
+      "path": "java/chunking/chunking_rag_handoff.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "java"
       },
       "path": "java/code/code_shebang_detection.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "java"
+      },
+      "path": "java/config/ocr_dpi_config.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "java"
+      },
+      "path": "java/config/pdf_hierarchy_config.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "java"
+      },
+      "path": "java/configuration/config_cache_quality.md",
       "language": "java",
       "target": "java",
       "session": "java",
@@ -6959,18 +8069,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "java"
-      },
-      "path": "java/contract/config_chunking_prepend_heading_context.md",
-      "language": "java",
-      "target": "java",
-      "session": "java",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "java"
       },
@@ -7023,6 +8121,18 @@
         "language": "java"
       },
       "path": "java/contract/config_keywords.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "java"
+      },
+      "path": "java/contract/config_llm_max_concurrency.md",
       "language": "java",
       "target": "java",
       "session": "java",
@@ -7091,6 +8201,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "java"
+      },
+      "path": "java/contract/metadata_access.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "java"
+      },
+      "path": "java/contract/ocr_basic_config.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "java"
       },
@@ -7107,6 +8241,18 @@
         "language": "java"
       },
       "path": "java/contract/output_format_markdown.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "java"
+      },
+      "path": "java/contract/table_access.md",
       "language": "java",
       "target": "java",
       "session": "java",
@@ -7275,6 +8421,78 @@
         "language": "java"
       },
       "path": "java/format_specific/format_xlsx.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "java"
+      },
+      "path": "java/language-detection/language_detection_config.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "java"
+      },
+      "path": "java/language-detection/language_detection_multilingual.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "java"
+      },
+      "path": "java/ocr/ocr_force_all_pages.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "java"
+      },
+      "path": "java/ocr/ocr_multi_language.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "java"
+      },
+      "path": "java/ocr/ocr_paddle_backend.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "java"
+      },
+      "path": "java/ocr/vlm_ocr.md",
       "language": "java",
       "target": "java",
       "session": "java",
@@ -7955,10 +9173,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/chunking/chunking_config_and_output.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/chunking/chunking_rag_handoff.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "kotlin_android"
       },
       "path": "kotlin-android/code/code_shebang_detection.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/config/ocr_dpi_config.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/config/pdf_hierarchy_config.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/configuration/config_cache_quality.md",
       "language": "kotlin",
       "target": "kotlin_android",
       "session": "kotlin_android",
@@ -8039,18 +9317,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "kotlin_android"
-      },
-      "path": "kotlin-android/contract/config_chunking_prepend_heading_context.md",
-      "language": "kotlin",
-      "target": "kotlin_android",
-      "session": "kotlin_android",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "kotlin_android"
       },
@@ -8103,6 +9369,18 @@
         "language": "kotlin_android"
       },
       "path": "kotlin-android/contract/config_keywords.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/contract/config_llm_max_concurrency.md",
       "language": "kotlin",
       "target": "kotlin_android",
       "session": "kotlin_android",
@@ -8171,6 +9449,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/contract/metadata_access.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/contract/ocr_basic_config.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "kotlin_android"
       },
@@ -8187,6 +9489,18 @@
         "language": "kotlin_android"
       },
       "path": "kotlin-android/contract/output_format_markdown.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/contract/table_access.md",
       "language": "kotlin",
       "target": "kotlin_android",
       "session": "kotlin_android",
@@ -8355,6 +9669,78 @@
         "language": "kotlin_android"
       },
       "path": "kotlin-android/format_specific/format_xlsx.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/language-detection/language_detection_config.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/language-detection/language_detection_multilingual.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/ocr/ocr_force_all_pages.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/ocr/ocr_multi_language.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/ocr/ocr_paddle_backend.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/ocr/vlm_ocr.md",
       "language": "kotlin",
       "target": "kotlin_android",
       "session": "kotlin_android",
@@ -9035,10 +10421,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "php"
+      },
+      "path": "php/chunking/chunking_config_and_output.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "php"
+      },
+      "path": "php/chunking/chunking_rag_handoff.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "php"
       },
       "path": "php/code/code_shebang_detection.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "php"
+      },
+      "path": "php/config/ocr_dpi_config.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "php"
+      },
+      "path": "php/config/pdf_hierarchy_config.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "php"
+      },
+      "path": "php/configuration/config_cache_quality.md",
       "language": "php",
       "target": "php",
       "session": "php",
@@ -9119,18 +10565,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "php"
-      },
-      "path": "php/contract/config_chunking_prepend_heading_context.md",
-      "language": "php",
-      "target": "php",
-      "session": "php",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "php"
       },
@@ -9183,6 +10617,18 @@
         "language": "php"
       },
       "path": "php/contract/config_keywords.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "php"
+      },
+      "path": "php/contract/config_llm_max_concurrency.md",
       "language": "php",
       "target": "php",
       "session": "php",
@@ -9251,6 +10697,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "php"
+      },
+      "path": "php/contract/metadata_access.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "php"
+      },
+      "path": "php/contract/ocr_basic_config.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "php"
       },
@@ -9267,6 +10737,18 @@
         "language": "php"
       },
       "path": "php/contract/output_format_markdown.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "php"
+      },
+      "path": "php/contract/table_access.md",
       "language": "php",
       "target": "php",
       "session": "php",
@@ -9435,6 +10917,78 @@
         "language": "php"
       },
       "path": "php/format_specific/format_xlsx.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "php"
+      },
+      "path": "php/language-detection/language_detection_config.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "php"
+      },
+      "path": "php/language-detection/language_detection_multilingual.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "php"
+      },
+      "path": "php/ocr/ocr_force_all_pages.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "php"
+      },
+      "path": "php/ocr/ocr_multi_language.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "php"
+      },
+      "path": "php/ocr/ocr_paddle_backend.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "php"
+      },
+      "path": "php/ocr/vlm_ocr.md",
       "language": "php",
       "target": "php",
       "session": "php",
@@ -10115,10 +11669,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "python"
+      },
+      "path": "python/chunking/chunking_config_and_output.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "python"
+      },
+      "path": "python/chunking/chunking_rag_handoff.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "python"
       },
       "path": "python/code/code_shebang_detection.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "python"
+      },
+      "path": "python/config/ocr_dpi_config.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "python"
+      },
+      "path": "python/config/pdf_hierarchy_config.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "python"
+      },
+      "path": "python/configuration/config_cache_quality.md",
       "language": "python",
       "target": "python",
       "session": "python",
@@ -10199,18 +11813,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "python"
-      },
-      "path": "python/contract/config_chunking_prepend_heading_context.md",
-      "language": "python",
-      "target": "python",
-      "session": "python",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "python"
       },
@@ -10263,6 +11865,18 @@
         "language": "python"
       },
       "path": "python/contract/config_keywords.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "python"
+      },
+      "path": "python/contract/config_llm_max_concurrency.md",
       "language": "python",
       "target": "python",
       "session": "python",
@@ -10331,6 +11945,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "python"
+      },
+      "path": "python/contract/metadata_access.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "python"
+      },
+      "path": "python/contract/ocr_basic_config.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "python"
       },
@@ -10347,6 +11985,18 @@
         "language": "python"
       },
       "path": "python/contract/output_format_markdown.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "python"
+      },
+      "path": "python/contract/table_access.md",
       "language": "python",
       "target": "python",
       "session": "python",
@@ -10515,6 +12165,78 @@
         "language": "python"
       },
       "path": "python/format_specific/format_xlsx.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "python"
+      },
+      "path": "python/language-detection/language_detection_config.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "python"
+      },
+      "path": "python/language-detection/language_detection_multilingual.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "python"
+      },
+      "path": "python/ocr/ocr_force_all_pages.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "python"
+      },
+      "path": "python/ocr/ocr_multi_language.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "python"
+      },
+      "path": "python/ocr/ocr_paddle_backend.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "python"
+      },
+      "path": "python/ocr/vlm_ocr.md",
       "language": "python",
       "target": "python",
       "session": "python",
@@ -11195,10 +12917,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "ruby"
+      },
+      "path": "ruby/chunking/chunking_config_and_output.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "ruby"
+      },
+      "path": "ruby/chunking/chunking_rag_handoff.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "ruby"
       },
       "path": "ruby/code/code_shebang_detection.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "ruby"
+      },
+      "path": "ruby/config/ocr_dpi_config.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "ruby"
+      },
+      "path": "ruby/config/pdf_hierarchy_config.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "ruby"
+      },
+      "path": "ruby/configuration/config_cache_quality.md",
       "language": "ruby",
       "target": "ruby",
       "session": "ruby",
@@ -11279,18 +13061,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "ruby"
-      },
-      "path": "ruby/contract/config_chunking_prepend_heading_context.md",
-      "language": "ruby",
-      "target": "ruby",
-      "session": "ruby",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "ruby"
       },
@@ -11343,6 +13113,18 @@
         "language": "ruby"
       },
       "path": "ruby/contract/config_keywords.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "ruby"
+      },
+      "path": "ruby/contract/config_llm_max_concurrency.md",
       "language": "ruby",
       "target": "ruby",
       "session": "ruby",
@@ -11411,6 +13193,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "ruby"
+      },
+      "path": "ruby/contract/metadata_access.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "ruby"
+      },
+      "path": "ruby/contract/ocr_basic_config.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "ruby"
       },
@@ -11427,6 +13233,18 @@
         "language": "ruby"
       },
       "path": "ruby/contract/output_format_markdown.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "ruby"
+      },
+      "path": "ruby/contract/table_access.md",
       "language": "ruby",
       "target": "ruby",
       "session": "ruby",
@@ -11595,6 +13413,78 @@
         "language": "ruby"
       },
       "path": "ruby/format_specific/format_xlsx.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "ruby"
+      },
+      "path": "ruby/language-detection/language_detection_config.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "ruby"
+      },
+      "path": "ruby/language-detection/language_detection_multilingual.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "ruby"
+      },
+      "path": "ruby/ocr/ocr_force_all_pages.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "ruby"
+      },
+      "path": "ruby/ocr/ocr_multi_language.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "ruby"
+      },
+      "path": "ruby/ocr/ocr_paddle_backend.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "ruby"
+      },
+      "path": "ruby/ocr/vlm_ocr.md",
       "language": "ruby",
       "target": "ruby",
       "session": "ruby",
@@ -12162,7 +14052,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12174,7 +14067,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12186,7 +14082,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12198,7 +14097,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12210,7 +14112,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12222,7 +14127,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12234,7 +14142,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12246,7 +14157,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12258,7 +14172,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12270,8 +14187,41 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "rust"
+      },
+      "path": "rust/chunking/chunking_config_and_output.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "rust"
+      },
+      "path": "rust/chunking/chunking_rag_handoff.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
     },
     {
       "key": {
@@ -12282,7 +14232,55 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "rust"
+      },
+      "path": "rust/config/ocr_dpi_config.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "rust"
+      },
+      "path": "rust/config/pdf_hierarchy_config.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "rust"
+      },
+      "path": "rust/configuration/config_cache_quality.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12294,7 +14292,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12306,7 +14307,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12318,7 +14322,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12330,7 +14337,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12342,7 +14352,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12354,19 +14367,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "rust"
-      },
-      "path": "rust/contract/config_chunking_prepend_heading_context.md",
-      "language": "rust",
-      "target": "rust",
-      "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12378,7 +14382,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12390,7 +14397,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12402,7 +14412,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12414,7 +14427,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12426,7 +14442,25 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "rust"
+      },
+      "path": "rust/contract/config_llm_max_concurrency.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12438,7 +14472,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12450,7 +14487,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12462,7 +14502,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12474,7 +14517,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12486,7 +14532,40 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "metadata_access",
+        "language": "rust"
+      },
+      "path": "rust/contract/metadata_access.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "rust"
+      },
+      "path": "rust/contract/ocr_basic_config.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12498,7 +14577,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12510,7 +14592,25 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "rust"
+      },
+      "path": "rust/contract/table_access.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12522,7 +14622,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12534,7 +14637,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12546,7 +14652,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12558,7 +14667,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12570,7 +14682,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12582,7 +14697,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12594,7 +14712,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12606,7 +14727,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -12618,7 +14742,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12630,7 +14757,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12642,7 +14772,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12654,7 +14787,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12666,7 +14802,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -12678,7 +14817,100 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "rust"
+      },
+      "path": "rust/language-detection/language_detection_config.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "rust"
+      },
+      "path": "rust/language-detection/language_detection_multilingual.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "rust"
+      },
+      "path": "rust/ocr/ocr_force_all_pages.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "rust"
+      },
+      "path": "rust/ocr/ocr_multi_language.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "rust"
+      },
+      "path": "rust/ocr/ocr_paddle_backend.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "rust"
+      },
+      "path": "rust/ocr/vlm_ocr.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13062,7 +15294,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "safe"
     },
     {
@@ -13074,7 +15309,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13086,7 +15324,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13098,7 +15339,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13110,7 +15354,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13122,7 +15369,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13134,7 +15384,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13146,7 +15399,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13158,7 +15414,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13170,7 +15429,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13182,7 +15444,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13194,7 +15459,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13206,7 +15474,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13218,7 +15489,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13230,7 +15504,10 @@
       "language": "rust",
       "target": "rust",
       "session": "rust",
-      "requires": [],
+      "requires": [
+        "crate:serde_json",
+        "crate:tokio"
+      ],
       "side_effect": "server"
     },
     {
@@ -13355,10 +15632,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "swift"
+      },
+      "path": "swift/chunking/chunking_config_and_output.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "swift"
+      },
+      "path": "swift/chunking/chunking_rag_handoff.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "swift"
       },
       "path": "swift/code/code_shebang_detection.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "swift"
+      },
+      "path": "swift/config/ocr_dpi_config.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "swift"
+      },
+      "path": "swift/config/pdf_hierarchy_config.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "swift"
+      },
+      "path": "swift/configuration/config_cache_quality.md",
       "language": "swift",
       "target": "swift",
       "session": "swift",
@@ -13439,18 +15776,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "swift"
-      },
-      "path": "swift/contract/config_chunking_prepend_heading_context.md",
-      "language": "swift",
-      "target": "swift",
-      "session": "swift",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "swift"
       },
@@ -13503,6 +15828,18 @@
         "language": "swift"
       },
       "path": "swift/contract/config_keywords.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "swift"
+      },
+      "path": "swift/contract/config_llm_max_concurrency.md",
       "language": "swift",
       "target": "swift",
       "session": "swift",
@@ -13571,6 +15908,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "swift"
+      },
+      "path": "swift/contract/metadata_access.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "swift"
+      },
+      "path": "swift/contract/ocr_basic_config.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "swift"
       },
@@ -13587,6 +15948,18 @@
         "language": "swift"
       },
       "path": "swift/contract/output_format_markdown.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "swift"
+      },
+      "path": "swift/contract/table_access.md",
       "language": "swift",
       "target": "swift",
       "session": "swift",
@@ -13755,6 +16128,78 @@
         "language": "swift"
       },
       "path": "swift/format_specific/format_xlsx.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "swift"
+      },
+      "path": "swift/language-detection/language_detection_config.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "swift"
+      },
+      "path": "swift/language-detection/language_detection_multilingual.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "swift"
+      },
+      "path": "swift/ocr/ocr_force_all_pages.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "swift"
+      },
+      "path": "swift/ocr/ocr_multi_language.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "swift"
+      },
+      "path": "swift/ocr/ocr_paddle_backend.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "swift"
+      },
+      "path": "swift/ocr/vlm_ocr.md",
       "language": "swift",
       "target": "swift",
       "session": "swift",
@@ -14435,10 +16880,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "node"
+      },
+      "path": "typescript/chunking/chunking_config_and_output.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "node"
+      },
+      "path": "typescript/chunking/chunking_rag_handoff.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "node"
       },
       "path": "typescript/code/code_shebang_detection.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "node"
+      },
+      "path": "typescript/config/ocr_dpi_config.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "node"
+      },
+      "path": "typescript/config/pdf_hierarchy_config.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "node"
+      },
+      "path": "typescript/configuration/config_cache_quality.md",
       "language": "typescript",
       "target": "node",
       "session": "node",
@@ -14519,18 +17024,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "node"
-      },
-      "path": "typescript/contract/config_chunking_prepend_heading_context.md",
-      "language": "typescript",
-      "target": "node",
-      "session": "node",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "node"
       },
@@ -14583,6 +17076,18 @@
         "language": "node"
       },
       "path": "typescript/contract/config_keywords.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "node"
+      },
+      "path": "typescript/contract/config_llm_max_concurrency.md",
       "language": "typescript",
       "target": "node",
       "session": "node",
@@ -14651,6 +17156,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "node"
+      },
+      "path": "typescript/contract/metadata_access.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "node"
+      },
+      "path": "typescript/contract/ocr_basic_config.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "node"
       },
@@ -14667,6 +17196,18 @@
         "language": "node"
       },
       "path": "typescript/contract/output_format_markdown.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "node"
+      },
+      "path": "typescript/contract/table_access.md",
       "language": "typescript",
       "target": "node",
       "session": "node",
@@ -14835,6 +17376,78 @@
         "language": "node"
       },
       "path": "typescript/format_specific/format_xlsx.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "node"
+      },
+      "path": "typescript/language-detection/language_detection_config.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "node"
+      },
+      "path": "typescript/language-detection/language_detection_multilingual.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "node"
+      },
+      "path": "typescript/ocr/ocr_force_all_pages.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "node"
+      },
+      "path": "typescript/ocr/ocr_multi_language.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "node"
+      },
+      "path": "typescript/ocr/ocr_paddle_backend.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "node"
+      },
+      "path": "typescript/ocr/vlm_ocr.md",
       "language": "typescript",
       "target": "node",
       "session": "node",
@@ -15515,10 +18128,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "wasm"
+      },
+      "path": "wasm/chunking/chunking_config_and_output.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "wasm"
+      },
+      "path": "wasm/chunking/chunking_rag_handoff.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "wasm"
       },
       "path": "wasm/code/code_shebang_detection.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "wasm"
+      },
+      "path": "wasm/config/ocr_dpi_config.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "wasm"
+      },
+      "path": "wasm/config/pdf_hierarchy_config.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "wasm"
+      },
+      "path": "wasm/configuration/config_cache_quality.md",
       "language": "typescript",
       "target": "wasm",
       "session": "wasm",
@@ -15599,18 +18272,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "wasm"
-      },
-      "path": "wasm/contract/config_chunking_prepend_heading_context.md",
-      "language": "typescript",
-      "target": "wasm",
-      "session": "wasm",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "wasm"
       },
@@ -15663,6 +18324,18 @@
         "language": "wasm"
       },
       "path": "wasm/contract/config_keywords.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "wasm"
+      },
+      "path": "wasm/contract/config_llm_max_concurrency.md",
       "language": "typescript",
       "target": "wasm",
       "session": "wasm",
@@ -15731,6 +18404,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "wasm"
+      },
+      "path": "wasm/contract/metadata_access.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "wasm"
+      },
+      "path": "wasm/contract/ocr_basic_config.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "wasm"
       },
@@ -15747,6 +18444,18 @@
         "language": "wasm"
       },
       "path": "wasm/contract/output_format_markdown.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "wasm"
+      },
+      "path": "wasm/contract/table_access.md",
       "language": "typescript",
       "target": "wasm",
       "session": "wasm",
@@ -15915,6 +18624,78 @@
         "language": "wasm"
       },
       "path": "wasm/format_specific/format_xlsx.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "wasm"
+      },
+      "path": "wasm/language-detection/language_detection_config.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "wasm"
+      },
+      "path": "wasm/language-detection/language_detection_multilingual.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "wasm"
+      },
+      "path": "wasm/ocr/ocr_force_all_pages.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "wasm"
+      },
+      "path": "wasm/ocr/ocr_multi_language.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "wasm"
+      },
+      "path": "wasm/ocr/ocr_paddle_backend.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "wasm"
+      },
+      "path": "wasm/ocr/vlm_ocr.md",
       "language": "typescript",
       "target": "wasm",
       "session": "wasm",
@@ -16595,10 +19376,70 @@
     },
     {
       "key": {
+        "fixture_id": "chunking_config_and_output",
+        "language": "zig"
+      },
+      "path": "zig/chunking/chunking_config_and_output.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "chunking_rag_handoff",
+        "language": "zig"
+      },
+      "path": "zig/chunking/chunking_rag_handoff.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "code_shebang_detection",
         "language": "zig"
       },
       "path": "zig/code/code_shebang_detection.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_dpi_config",
+        "language": "zig"
+      },
+      "path": "zig/config/ocr_dpi_config.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "pdf_hierarchy_config",
+        "language": "zig"
+      },
+      "path": "zig/config/pdf_hierarchy_config.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_cache_quality",
+        "language": "zig"
+      },
+      "path": "zig/configuration/config_cache_quality.md",
       "language": "zig",
       "target": "zig",
       "session": "zig",
@@ -16679,18 +19520,6 @@
     },
     {
       "key": {
-        "fixture_id": "config_chunking_prepend_heading_context",
-        "language": "zig"
-      },
-      "path": "zig/contract/config_chunking_prepend_heading_context.md",
-      "language": "zig",
-      "target": "zig",
-      "session": "zig",
-      "requires": [],
-      "side_effect": "server"
-    },
-    {
-      "key": {
         "fixture_id": "config_document_structure_with_headings",
         "language": "zig"
       },
@@ -16743,6 +19572,18 @@
         "language": "zig"
       },
       "path": "zig/contract/config_keywords.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "config_llm_max_concurrency",
+        "language": "zig"
+      },
+      "path": "zig/contract/config_llm_max_concurrency.md",
       "language": "zig",
       "target": "zig",
       "session": "zig",
@@ -16811,6 +19652,30 @@
     },
     {
       "key": {
+        "fixture_id": "metadata_access",
+        "language": "zig"
+      },
+      "path": "zig/contract/metadata_access.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_basic_config",
+        "language": "zig"
+      },
+      "path": "zig/contract/ocr_basic_config.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
         "fixture_id": "output_format_bytes_markdown",
         "language": "zig"
       },
@@ -16827,6 +19692,18 @@
         "language": "zig"
       },
       "path": "zig/contract/output_format_markdown.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "table_access",
+        "language": "zig"
+      },
+      "path": "zig/contract/table_access.md",
       "language": "zig",
       "target": "zig",
       "session": "zig",
@@ -16995,6 +19872,78 @@
         "language": "zig"
       },
       "path": "zig/format_specific/format_xlsx.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_config",
+        "language": "zig"
+      },
+      "path": "zig/language-detection/language_detection_config.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "language_detection_multilingual",
+        "language": "zig"
+      },
+      "path": "zig/language-detection/language_detection_multilingual.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_force_all_pages",
+        "language": "zig"
+      },
+      "path": "zig/ocr/ocr_force_all_pages.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_multi_language",
+        "language": "zig"
+      },
+      "path": "zig/ocr/ocr_multi_language.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_paddle_backend",
+        "language": "zig"
+      },
+      "path": "zig/ocr/ocr_paddle_backend.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "server"
+    },
+    {
+      "key": {
+        "fixture_id": "vlm_ocr",
+        "language": "zig"
+      },
+      "path": "zig/ocr/vlm_ocr.md",
       "language": "zig",
       "target": "zig",
       "session": "zig",
@@ -17916,6 +20865,126 @@
       "language": "zig"
     },
     {
+      "fixture_id": "chunking_config_and_output",
+      "language": "c"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "go"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "java"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "node"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "php"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "python"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "c"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "go"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "java"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "node"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "php"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "python"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "zig"
+    },
+    {
       "fixture_id": "clear_reranker_backends",
       "language": "c"
     },
@@ -18036,63 +21105,63 @@
       "language": "zig"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "c"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "csharp"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "dart"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "elixir"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "go"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "java"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "kotlin_android"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "node"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "php"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "python"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "ruby"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "rust"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "swift"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "wasm"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "zig"
     },
     {
@@ -18393,6 +21462,66 @@
     },
     {
       "fixture_id": "config_keywords",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "c"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "go"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "java"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "node"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "php"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "python"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
       "language": "zig"
     },
     {
@@ -20256,6 +23385,126 @@
       "language": "zig"
     },
     {
+      "fixture_id": "language_detection_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "c"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "go"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "java"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "node"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "php"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "python"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "zig"
+    },
+    {
       "fixture_id": "list_embedding_backends",
       "language": "c"
     },
@@ -20616,6 +23865,66 @@
       "language": "zig"
     },
     {
+      "fixture_id": "metadata_access",
+      "language": "c"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "go"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "java"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "node"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "php"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "python"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "zig"
+    },
+    {
       "fixture_id": "ocr_backends_clear",
       "language": "c"
     },
@@ -20796,6 +24105,186 @@
       "language": "zig"
     },
     {
+      "fixture_id": "ocr_basic_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "zig"
+    },
+    {
       "fixture_id": "ocr_image_png",
       "language": "c"
     },
@@ -20853,6 +24342,126 @@
     },
     {
       "fixture_id": "ocr_image_png",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
       "language": "zig"
     },
     {
@@ -20973,6 +24582,66 @@
     },
     {
       "fixture_id": "output_format_markdown",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
       "language": "zig"
     },
     {
@@ -22116,6 +25785,66 @@
       "language": "zig"
     },
     {
+      "fixture_id": "table_access",
+      "language": "c"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "go"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "java"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "node"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "php"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "python"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "zig"
+    },
+    {
       "fixture_id": "tokenizer_backends_clear",
       "language": "c"
     },
@@ -22953,6 +26682,66 @@
     },
     {
       "fixture_id": "validators_list",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "c"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "go"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "java"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "node"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "php"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "python"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "vlm_ocr",
       "language": "zig"
     }
   ],
@@ -23318,6 +27107,126 @@
       "language": "zig"
     },
     {
+      "fixture_id": "chunking_config_and_output",
+      "language": "c"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "go"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "java"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "node"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "php"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "python"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "chunking_config_and_output",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "c"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "go"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "java"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "node"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "php"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "python"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "chunking_rag_handoff",
+      "language": "zig"
+    },
+    {
       "fixture_id": "clear_reranker_backends",
       "language": "c"
     },
@@ -23438,63 +27347,63 @@
       "language": "zig"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "c"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "csharp"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "dart"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "elixir"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "go"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "java"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "kotlin_android"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "node"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "php"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "python"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "ruby"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "rust"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "swift"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "wasm"
     },
     {
-      "fixture_id": "config_chunking_prepend_heading_context",
+      "fixture_id": "config_cache_quality",
       "language": "zig"
     },
     {
@@ -23795,6 +27704,66 @@
     },
     {
       "fixture_id": "config_keywords",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "c"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "go"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "java"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "node"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "php"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "python"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "config_llm_max_concurrency",
       "language": "zig"
     },
     {
@@ -25658,6 +29627,126 @@
       "language": "zig"
     },
     {
+      "fixture_id": "language_detection_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "language_detection_config",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "c"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "go"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "java"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "node"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "php"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "python"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "language_detection_multilingual",
+      "language": "zig"
+    },
+    {
       "fixture_id": "list_embedding_backends",
       "language": "c"
     },
@@ -26018,6 +30107,66 @@
       "language": "zig"
     },
     {
+      "fixture_id": "metadata_access",
+      "language": "c"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "go"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "java"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "node"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "php"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "python"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "metadata_access",
+      "language": "zig"
+    },
+    {
       "fixture_id": "ocr_backends_clear",
       "language": "c"
     },
@@ -26198,6 +30347,186 @@
       "language": "zig"
     },
     {
+      "fixture_id": "ocr_basic_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_basic_config",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_dpi_config",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_force_all_pages",
+      "language": "zig"
+    },
+    {
       "fixture_id": "ocr_image_png",
       "language": "c"
     },
@@ -26255,6 +30584,126 @@
     },
     {
       "fixture_id": "ocr_image_png",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_multi_language",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_paddle_backend",
       "language": "zig"
     },
     {
@@ -26375,6 +30824,66 @@
     },
     {
       "fixture_id": "output_format_markdown",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "c"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "go"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "java"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "node"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "php"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "python"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "pdf_hierarchy_config",
       "language": "zig"
     },
     {
@@ -27518,6 +32027,66 @@
       "language": "zig"
     },
     {
+      "fixture_id": "table_access",
+      "language": "c"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "go"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "java"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "node"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "php"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "python"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "table_access",
+      "language": "zig"
+    },
+    {
       "fixture_id": "tokenizer_backends_clear",
       "language": "c"
     },
@@ -28355,6 +32924,66 @@
     },
     {
       "fixture_id": "validators_list",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "c"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "go"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "java"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "node"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "php"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "python"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "vlm_ocr",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "vlm_ocr",
       "language": "zig"
     }
   ],

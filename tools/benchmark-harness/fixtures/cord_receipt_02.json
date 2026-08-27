@@ -1,6 +1,6 @@
 {
   "document": "../../../test_documents/images/cord_receipt_02.jpg",
-  "file_type": "jpeg",
+  "file_type": "jpg",
   "file_size": 83667,
   "expected_frameworks": [
     "xberg"

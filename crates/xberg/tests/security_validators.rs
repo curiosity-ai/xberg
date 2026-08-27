@@ -33,6 +33,9 @@ fn tight_limits() -> SecurityLimits {
         max_iterations: 10_000,
         max_xml_depth: 16,
         max_table_cells: 64,
+        // No fixture in this file is a PDF, so the page cap is left at the
+        // production default rather than dialled down like the others.
+        max_pages: None,
     }
 }
 

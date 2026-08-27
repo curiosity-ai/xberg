@@ -17,8 +17,8 @@ pub(crate) fn render_attributes(attrs: &crate::types::Attributes) -> String {
         parts.push(format!(".{}", class));
     }
 
-    for (key, value) in &attrs.key_values {
-        parts.push(format!("{}=\"{}\"", key, value));
+    for attribute in &attrs.key_values {
+        parts.push(format!("{}=\"{}\"", attribute.key, attribute.value));
     }
 
     if parts.is_empty() {
@@ -37,7 +37,7 @@ mod tests {
         let attrs = crate::types::Attributes {
             id: Some("my-id".to_string()),
             classes: vec!["class1".to_string(), "class2".to_string()],
-            key_values: vec![("data-test".to_string(), "value".to_string())],
+            key_values: vec![("data-test".to_string(), "value".to_string()).into()],
         };
 
         let rendered = render_attributes(&attrs);

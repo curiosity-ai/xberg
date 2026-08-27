@@ -54,7 +54,12 @@ impl DjotExtractor {
         let mut list_stack: Vec<bool> = Vec::new();
         let mut list_item_text = String::new();
         let mut list_item_annotations: Vec<TextAnnotation> = Vec::new();
-        let mut in_list_item = false;
+        // Depth counter, not a bool: a sublist nested inside a list item closes its own
+        // `ListItem` before the enclosing item closes, and trailing text after the sublist
+        // still belongs to the enclosing item. A bool cleared to `false` by the inner
+        // `End(ListItem)` let that trailing text fall through to the paragraph guard below
+        // and be emitted as a bare paragraph instead of list-item content (GH#1459).
+        let mut in_list_item: usize = 0;
         let mut in_raw_block = false;
         let mut raw_format: Option<String> = None;
         let mut raw_text = String::new();
@@ -105,7 +110,7 @@ impl DjotExtractor {
                     heading_annotations.clear();
                 }
                 Event::Start(Container::Paragraph, _)
-                    if !in_heading && !in_list_item && !in_description_term && !in_description_details =>
+                    if !in_heading && in_list_item == 0 && !in_description_term && !in_description_details =>
                 {
                     paragraph_text.clear();
                     paragraph_annotations.clear();
@@ -138,7 +143,7 @@ impl DjotExtractor {
                         paragraph_annotations.clear();
                         figure_image_index = None;
                         figure_disqualified = false;
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                     }
                 }
                 Event::Start(Container::Strong, _) => {
@@ -146,7 +151,7 @@ impl DjotExtractor {
                         annotation_starts.push((0, paragraph_text.len() as u32, None));
                     } else if in_heading {
                         annotation_starts.push((0, heading_text.len() as u32, None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((0, list_item_text.len() as u32, None));
                     }
                 }
@@ -163,7 +168,7 @@ impl DjotExtractor {
                             if start < end {
                                 heading_annotations.push(builder::bold(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = list_item_text.len() as u32;
                             if start < end {
                                 list_item_annotations.push(builder::bold(start, end));
@@ -176,7 +181,7 @@ impl DjotExtractor {
                         annotation_starts.push((1, paragraph_text.len() as u32, None));
                     } else if in_heading {
                         annotation_starts.push((1, heading_text.len() as u32, None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((1, list_item_text.len() as u32, None));
                     }
                 }
@@ -193,7 +198,7 @@ impl DjotExtractor {
                             if start < end {
                                 heading_annotations.push(builder::italic(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = list_item_text.len() as u32;
                             if start < end {
                                 list_item_annotations.push(builder::italic(start, end));
@@ -206,7 +211,7 @@ impl DjotExtractor {
                         annotation_starts.push((2, paragraph_text.len() as u32, None));
                     } else if in_heading {
                         annotation_starts.push((2, heading_text.len() as u32, None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((2, list_item_text.len() as u32, None));
                     }
                 }
@@ -223,7 +228,7 @@ impl DjotExtractor {
                             if start < end {
                                 heading_annotations.push(builder::strikethrough(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = list_item_text.len() as u32;
                             if start < end {
                                 list_item_annotations.push(builder::strikethrough(start, end));
@@ -238,7 +243,7 @@ impl DjotExtractor {
                     } else if in_heading {
                         in_verbatim = true;
                         verbatim_start = heading_text.len() as u32;
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         in_verbatim = true;
                         verbatim_start = list_item_text.len() as u32;
                     }
@@ -255,7 +260,7 @@ impl DjotExtractor {
                         if verbatim_start < end {
                             heading_annotations.push(builder::code(verbatim_start, end));
                         }
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         let end = list_item_text.len() as u32;
                         if verbatim_start < end {
                             list_item_annotations.push(builder::code(verbatim_start, end));
@@ -267,7 +272,7 @@ impl DjotExtractor {
                         annotation_starts.push((4, paragraph_text.len() as u32, Some(url.to_string())));
                     } else if in_heading {
                         annotation_starts.push((4, heading_text.len() as u32, Some(url.to_string())));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((4, list_item_text.len() as u32, Some(url.to_string())));
                     }
                 }
@@ -291,7 +296,7 @@ impl DjotExtractor {
                                 } else {
                                     None
                                 }
-                            } else if in_list_item {
+                            } else if in_list_item > 0 {
                                 let end = list_item_text.len() as u32;
                                 if start < end {
                                     list_item_annotations.push(builder::link(start, end, &url, None));
@@ -384,6 +389,32 @@ impl DjotExtractor {
                     description_details_text.clear();
                 }
                 Event::Start(Container::List { kind, .. }, _) => {
+                    // A sublist nests INSIDE its parent item (`Start(ListItem)` -> ... ->
+                    // `Start(List)` -> ... -> `End(List)` -> ... -> `End(ListItem)`), so the
+                    // parent's text has already accumulated in `list_item_text` by the time this
+                    // sublist starts. Flush it now, before descending, so the parent lands before
+                    // its children in document order — an emit-on-`End(ListItem)` design would
+                    // place it after them instead. Flush the WHOLE buffer (and its annotations),
+                    // not just the last `Str` event: item text arrives across multiple events
+                    // (strong/emphasis/delete/link/verbatim/math/soft-break all write into
+                    // `list_item_text`). `list_stack.last()` is still the ENCLOSING list here —
+                    // the sublist itself hasn't been pushed yet. See GH#1459.
+                    if in_list_item > 0 {
+                        let text = list_item_text.trim().to_string();
+                        if let Some(ordered) = list_stack.last().copied()
+                            && !text.is_empty()
+                        {
+                            let annotations = adjust_annotations_for_trim(
+                                std::mem::take(&mut list_item_annotations),
+                                &list_item_text,
+                                &text,
+                            );
+                            b.push_list_item(&text, ordered, annotations, None, None);
+                        }
+                        list_item_text.clear();
+                        list_item_annotations.clear();
+                        annotation_starts.clear();
+                    }
                     let ordered = matches!(kind, jotdown::ListKind::Ordered { .. });
                     b.push_list(ordered);
                     list_stack.push(ordered);
@@ -395,10 +426,10 @@ impl DjotExtractor {
                     list_item_text.clear();
                     list_item_annotations.clear();
                     annotation_starts.clear();
-                    in_list_item = true;
+                    in_list_item += 1;
                 }
                 Event::End(Container::ListItem | Container::TaskListItem { .. }) => {
-                    in_list_item = false;
+                    in_list_item = in_list_item.saturating_sub(1);
                     let text = list_item_text.trim().to_string();
                     if let Some(ordered) = list_stack.last().copied()
                         && !text.is_empty()
@@ -421,7 +452,7 @@ impl DjotExtractor {
                         paragraph_text.push('$');
                     } else if in_heading {
                         heading_text.push('$');
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push('$');
                     } else if in_description_term {
                         description_term_text.push('$');
@@ -441,7 +472,7 @@ impl DjotExtractor {
                         paragraph_text.push('$');
                     } else if in_heading {
                         heading_text.push('$');
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push('$');
                     } else if in_description_term {
                         description_term_text.push('$');
@@ -549,7 +580,7 @@ impl DjotExtractor {
                         math_text.push_str(s);
                     } else if in_heading {
                         heading_text.push_str(s);
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push_str(s);
                     } else if in_description_term {
                         description_term_text.push_str(s);
@@ -564,7 +595,7 @@ impl DjotExtractor {
                         code_text.push('\n');
                     } else if in_heading {
                         heading_text.push(' ');
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push(' ');
                     } else if in_description_term {
                         description_term_text.push(' ');
@@ -830,5 +861,157 @@ mod tests {
 
         let has_image_uri = doc.uris.iter().any(|u| u.url.contains("diagram.png"));
         assert!(has_image_uri, "image URI should be captured from Djot image node");
+    }
+
+    /// Collect `(text, ordered, depth)` for every `ListItem` element, in document order.
+    fn list_items(doc: &crate::types::internal::InternalDocument) -> Vec<(String, bool, u16)> {
+        use crate::types::internal::ElementKind;
+        doc.elements
+            .iter()
+            .filter_map(|e| match e.kind {
+                ElementKind::ListItem { ordered } => Some((e.text.clone(), ordered, e.depth)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression test for GH#1459 (Djot's own copy of the same bug): a nested list used
+    /// to silently lose every ancestor item's text. Only the deepest item ("L3") survived
+    /// because `Start(Container::ListItem)` unconditionally clears `list_item_text` with
+    /// no flush of the enclosing item's buffer at `Start(Container::List)`.
+    ///
+    /// Against the unfixed code this assertion fails: `list_items(&doc).len()` is `1`
+    /// (only `[("L3", false, 3)]`) instead of the expected 3 levels.
+    #[tokio::test]
+    async fn test_nested_list_preserves_all_ancestor_text_djot() {
+        // Djot requires a blank line between a list item's own content and a nested
+        // sublist marker (unlike CommonMark, where it's optional) — see jotdown's
+        // `parse_list_nest` test fixture, which this mirrors.
+        let djot = b"- L1\n\n  - L2\n\n    - L3\n";
+        let extractor = DjotExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let doc = extractor
+            .extract_content(djot, "text/djot", &config)
+            .await
+            .expect("nested djot list should extract");
+
+        let items = list_items(&doc);
+        assert_eq!(
+            items,
+            vec![
+                ("L1".to_string(), false, 1),
+                ("L2".to_string(), false, 2),
+                ("L3".to_string(), false, 3),
+            ],
+            "all three nesting levels must survive with increasing depth, got {items:?}"
+        );
+    }
+
+    /// Regression test for GH#1459 (Djot): the parent item's text can arrive across
+    /// multiple jotdown events (a `Strong` span plus a soft-break-joined continuation
+    /// line) before the sublist starts. The flush at `Start(Container::List)` must carry
+    /// the whole accumulated buffer and its annotations, not just the most recent `Str`
+    /// event.
+    ///
+    /// Against the unfixed code this assertion fails: `list_items(&doc)` contains only
+    /// `[("Child", false, 2)]` — the parent's text and its bold annotation are discarded
+    /// entirely when `Start(Container::ListItem)` for "Child" clears `list_item_text`.
+    #[tokio::test]
+    async fn test_nested_list_flushes_full_multi_event_parent_buffer_djot() {
+        use crate::types::document_structure::AnnotationKind;
+
+        // No lazy soft-break continuation line here (unlike the Markdown counterpart of
+        // this test): jotdown's list-item paragraph continuation indentation rules are
+        // not the same as CommonMark's, so this sticks to the single-line item content
+        // that jotdown's own test fixtures use. The `Strong` span alone is enough to
+        // prove the flush carries multiple events, not just the last `Str`.
+        let djot = b"- Parent *bold* line\n\n  - Child\n";
+        let extractor = DjotExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let doc = extractor
+            .extract_content(djot, "text/djot", &config)
+            .await
+            .expect("nested djot list with formatting should extract");
+
+        let items = list_items(&doc);
+        assert_eq!(
+            items,
+            vec![
+                ("Parent bold line".to_string(), false, 1),
+                ("Child".to_string(), false, 2),
+            ],
+            "the parent's multi-event text (leading Str + Strong span + trailing Str) must \
+             be flushed whole before descending into the sublist, got {items:?}"
+        );
+
+        let parent = doc
+            .elements
+            .iter()
+            .find(|e| e.text == "Parent bold line")
+            .expect("flushed parent item must be present");
+        assert_eq!(
+            parent.annotations.len(),
+            1,
+            "the bold annotation on \"bold\" must survive the flush, got {:?}",
+            parent.annotations
+        );
+        let annotation = &parent.annotations[0];
+        assert_eq!(annotation.kind, AnnotationKind::Bold);
+        assert_eq!(
+            &parent.text[annotation.start as usize..annotation.end as usize],
+            "bold",
+            "annotation byte range must still point at \"bold\" after the flush"
+        );
+    }
+
+    /// Regression test for GH#1459 (Djot): trailing text after a sublist used to be
+    /// emitted as a bare `Paragraph` element instead of staying list-item content,
+    /// because `End(Container::ListItem)` for the inner item set the old boolean
+    /// `in_list_item` back to `false` while the outer item was still open, so the outer
+    /// item's trailing text hit the `Paragraph` start guard.
+    ///
+    /// Against the unfixed code this assertion fails: `list_items(&doc)` contains only
+    /// `[("Child", false, 2)]` (the parent's own text is *also* lost, per the flush
+    /// defect above), and a `Paragraph` element with text `"Trailing"` exists in
+    /// `doc.elements` where none should.
+    #[tokio::test]
+    async fn test_trailing_text_after_sublist_stays_list_item_djot() {
+        use crate::types::internal::ElementKind;
+
+        // Blank line before the nested marker (djot requirement, see the earlier test's
+        // comment); "Trailing" is indented to the OUTER item's content column (2), which
+        // is less than the nested item's (4), so it closes the sublist and continues the
+        // outer item rather than the inner one.
+        let djot = b"- Parent\n\n  - Child\n\n  Trailing\n";
+        let extractor = DjotExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let doc = extractor
+            .extract_content(djot, "text/djot", &config)
+            .await
+            .expect("djot list with trailing text should extract");
+
+        let items = list_items(&doc);
+        assert_eq!(
+            items,
+            vec![
+                ("Parent".to_string(), false, 1),
+                ("Child".to_string(), false, 2),
+                ("Trailing".to_string(), false, 1),
+            ],
+            "trailing text after the sublist must become a sibling list item at the \
+             parent's depth, got {items:?}"
+        );
+
+        let stray_paragraph = doc
+            .elements
+            .iter()
+            .any(|e| matches!(e.kind, ElementKind::Paragraph) && e.text == "Trailing");
+        assert!(
+            !stray_paragraph,
+            "trailing list-item text must not be emitted as a bare Paragraph element"
+        );
     }
 }

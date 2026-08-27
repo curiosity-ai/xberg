@@ -1,7 +1,7 @@
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:917bbfdad5cea593917f1a41af806fd4fb83410a4acc13558ce217d6548702ef
-Source-Hash: blake3:ac8bab9ae4a76e61f437af29b4a45a38326056a50769a177038927c69353edaf
+Content-Hash: blake3:b674569aa5b2afcac3d2ef580532fd5d6dcccd6ac9c4821879dceb4317bd9c70
+Source-Hash: blake3:45cb11995592f052d075d6a24353eb8b647075dcb25f77187fcb4c161b574d49
 Schema-Version: v1
 -->
 
@@ -129,7 +129,7 @@ interface ExtractionConfig {
 
   // Output control
   maxConcurrentExtractions?: number;
-  outputFormat?: "plain" | "markdown" | "djot" | "html"; // default: 'plain'
+  outputFormat?: "plain" | "markdown" | "djot" | "html" | "json" | "doctags" | string; // default: 'plain'
   resultFormat?: "unified" | "element_based"; // default: 'unified'
   securityLimits?: SecurityLimits;
 }
@@ -157,7 +157,6 @@ interface ChunkingConfig {
   maxCharacters?: number; // max characters per chunk
   overlap?: number; // overlap between chunks
   chunkerType?: "text" | "markdown" | "semantic";
-  prependHeadingContext?: boolean; // markdown chunker: prefix heading breadcrumb
   embedding?: { model?: { type: "preset"; name: string } } | Record<string, unknown>; // embedding config
   preset?: string; // named preset
 }
@@ -473,4 +472,4 @@ console.log(listSupportedFormats());
 
 ## Supported Document Formats
 
-Xberg supports 96 file formats: PDF, Office (DOCX, PPTX, XLSX, …), eBooks, images (with OCR), HTML/XML/SVG, email (EML, MSG), archives, data (JSON/YAML/TOML/CSV), academic, and source code (371 languages). See [supported-formats.md](supported-formats.md) for the complete list.
+Xberg supports 100 formats across 120 file extensions: PDF, Office, eBooks, images, HTML/XML/SVG, email, archives, structured data, academic formats, and source code. See [supported-formats.md](supported-formats.md) for the complete list.

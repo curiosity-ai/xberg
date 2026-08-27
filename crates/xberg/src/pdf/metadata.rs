@@ -1,6 +1,6 @@
 //! PDF metadata types (backend-agnostic).
 //!
-//! These types are shared between the oxide extraction backend and any callers
+//! These types are shared between the native extraction backend and any callers
 //! that consume PDF metadata. No PDF-library-specific dependencies.
 
 use serde::{Deserialize, Serialize};

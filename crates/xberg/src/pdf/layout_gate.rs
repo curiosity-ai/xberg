@@ -16,9 +16,9 @@
 //!
 //! [`LayoutStrategy::Auto`]: crate::core::config::layout::LayoutStrategy::Auto
 
-use pdf_oxide::PdfDocument;
-use pdf_oxide::annotation_types::AnnotationSubtype;
-use pdf_oxide::document::ReadingOrder;
+use xberg_native_pdf::PdfDocument;
+use xberg_native_pdf::annotation_types::AnnotationSubtype;
+use xberg_native_pdf::document::ReadingOrder;
 
 use super::rules::{GRID_EDGE_ALIGN_TOLERANCE_PTS, count_rules};
 
@@ -338,7 +338,7 @@ fn recurring_edge_clusters(rows: &[&Vec<&SpanBox>], edge: fn(&SpanBox) -> f32) -
 /// Failures are advisory (matching [`super::scan_detect`]): the caller maps
 /// `None` to [`GateReason::SignalsUnavailable`] and runs the model.
 fn page_signals(doc: &PdfDocument, page_index: usize) -> Option<PageGateSignals> {
-    let page_text = super::oxide::guard_oxide_panic(
+    let page_text = super::native::guard_native_panic(
         || {
             doc.extract_page_text_with_options(page_index, ReadingOrder::ColumnAware)
                 .map_err(|error| error.to_string())
@@ -365,9 +365,9 @@ fn page_signals(doc: &PdfDocument, page_index: usize) -> Option<PageGateSignals>
         .sum();
 
     // One content-stream path parse serves both the rule counter and the
-    // vector-coverage signal; pdf_oxide's extract_lines would re-run
+    // vector-coverage signal; xberg_native_pdf's extract_lines would re-run
     // extract_paths internally. ~keep
-    let paths = super::oxide::guard_oxide_panic(
+    let paths = super::native::guard_native_panic(
         || doc.extract_paths(page_index).map_err(|error| error.to_string()),
         |message| message,
     )
@@ -386,7 +386,11 @@ fn page_signals(doc: &PdfDocument, page_index: usize) -> Option<PageGateSignals>
 
 /// Fraction of the page under raster images plus stroked or filled vector
 /// paths, without decoding pixels. Summed, not unioned: an upper bound.
-fn graphics_coverage(doc: &PdfDocument, page_index: usize, paths: &[pdf_oxide::elements::PathContent]) -> Option<f32> {
+fn graphics_coverage(
+    doc: &PdfDocument,
+    page_index: usize,
+    paths: &[xberg_native_pdf::elements::PathContent],
+) -> Option<f32> {
     let (x0, y0, x1, y1) = doc.get_page_media_box(page_index).ok()?;
     let page_area = ((x1 - x0) * (y1 - y0)).abs();
     if page_area <= f32::EPSILON {
@@ -409,7 +413,7 @@ fn graphics_coverage(doc: &PdfDocument, page_index: usize, paths: &[pdf_oxide::e
 }
 
 fn has_form_widgets(doc: &PdfDocument, page_index: usize) -> Option<bool> {
-    let annotations = super::oxide::guard_oxide_panic(
+    let annotations = super::native::guard_native_panic(
         || doc.get_annotations(page_index).map_err(|error| error.to_string()),
         |message| message,
     )

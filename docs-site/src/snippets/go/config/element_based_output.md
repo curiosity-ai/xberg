@@ -3,13 +3,14 @@ package main
 
 import (
     "fmt"
-    "xberg"
+    "github.com/xberg-io/xberg/packages/go"
 )
 
 func main() {
     // Configure element-based output
+    resultFormat := xberg.ResultFormatElementBased
     cfg := xberg.ExtractionConfig{
-        OutputFormat: "element_based",
+        ResultFormat: &resultFormat,
     }
 
     // Extract document
@@ -36,7 +37,7 @@ func main() {
         if element.Metadata.Coordinates != nil {
             coords := element.Metadata.Coordinates
             fmt.Printf("Coords: (%f, %f) - (%f, %f)\n",
-                coords.Left, coords.Top, coords.Right, coords.Bottom)
+                coords.X0, coords.Y1, coords.X1, coords.Y0)
         }
 
         fmt.Println("---")
@@ -51,7 +52,7 @@ func main() {
     }
 
     for _, title := range titles {
-        level, ok := title.Metadata.Additional["level"].(string)
+        level, ok := title.Metadata.Additional["level"]
         if !ok {
             level = "unknown"
         }

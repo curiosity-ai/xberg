@@ -76,7 +76,7 @@ pub struct DocumentCounts {
 /// Structured per-language detection result: confidence, document share, and script —
 /// the information the ISO-code-only `detected_languages` list cannot convey (#261).
 ///
-/// Populated by [`crate::language_detection`] alongside `detected_languages`, with one
+/// Populated by the language-detection processor alongside `detected_languages`, with one
 /// entry per language, in the same order as `detected_languages`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
@@ -698,9 +698,8 @@ pub struct ChunkMetadata {
     ///
     /// Joins a chunk back to the structured document tree via
     /// [`DocumentNode::id`](super::document_structure::DocumentNode::id).
-    /// Empty until the node-to-rendered-offset mapping needed to compute the
-    /// intersection is implemented (tracked under #1294/#1295); this field is
-    /// the wire-format foundation for that follow-up.
+    /// Populated from exact node provenance when available, with a textual
+    /// containment fallback for rendered chunks that do not retain byte offsets.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub node_ids: Vec<String>,
 
@@ -893,43 +892,6 @@ pub enum ResultFormat {
     /// Element-based format with semantic element extraction
     ElementBased,
 }
-#[cfg_attr(alef, alef(skip))]
-/// Unique identifier for semantic elements.
-///
-/// Wraps a string identifier that is deterministically generated
-/// from element type, content, and page number.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "api", schema(value_type = String))]
-pub struct ElementId(String);
-
-impl ElementId {
-    /// Create a new ElementId from a string.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the string is not valid.
-    pub(crate) fn new(hex_str: impl Into<String>) -> std::result::Result<Self, String> {
-        let s = hex_str.into();
-        if s.is_empty() {
-            return Err("ElementId cannot be empty".to_string());
-        }
-        Ok(ElementId(s))
-    }
-}
-
-impl AsRef<str> for ElementId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for ElementId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Semantic element type classification.
 ///
 /// Categorizes text content into semantic units for downstream processing.
@@ -1000,10 +962,10 @@ pub struct ElementMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct Element {
-    /// Unique element identifier
-    #[cfg_attr(alef, alef(skip))]
-    #[serde(skip)]
-    pub element_id: ElementId,
+    /// Deterministic element identifier. Empty only when deserializing legacy payloads
+    /// that predate this field's wire representation.
+    #[serde(default)]
+    pub element_id: String,
     /// Semantic type of this element
     pub element_type: ElementType,
     /// Text content of the element
@@ -1048,6 +1010,26 @@ impl super::tables::Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn element_identifier_round_trips_on_the_public_wire() {
+        let element = Element {
+            element_id: "elem-42".to_string(),
+            element_type: ElementType::NarrativeText,
+            text: "content".to_string(),
+            metadata: ElementMetadata {
+                page_number: None,
+                filename: None,
+                coordinates: None,
+                element_index: None,
+                additional: HashMap::new(),
+            },
+        };
+
+        let value = serde_json::to_value(&element).unwrap();
+        assert_eq!(value["element_id"], "elem-42");
+        assert_eq!(serde_json::from_value::<Element>(value).unwrap().element_id, "elem-42");
+    }
 
     #[test]
     fn chunk_metadata_omitting_heading_path_deserializes_to_empty_vec() {

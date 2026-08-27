@@ -16,22 +16,86 @@
 mod helpers;
 use helpers::extract_bytes_document_blocking;
 
-use pdf_oxide::geometry::Rect;
-use pdf_oxide::writer::{DocumentBuilder, TextAlign};
 use xberg::core::config::ExtractionConfig;
 
+/// Escape a PDF literal-string show-text operand: only `(`, `)`, and `\`
+/// need a backslash per ISO 32000-1:2008 §7.3.4.2.
+fn pdf_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '(' || ch == ')' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Assemble a one-page PDF from a raw content stream and a Standard-14
+/// Helvetica font resource. Hand-built rather than via the (now-removed)
+/// `xberg_native_pdf::writer::DocumentBuilder`: these heuristics key off
+/// column/row alignment and text density, not exact glyph placement, so a
+/// minimal `Tj`-only content stream (no ruling lines -- these fixtures are
+/// deliberately unruled) reproduces the same geometry the writer used to
+/// emit.
+fn build_pdf_with_content(content: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+          /Contents 4 0 R /Resources << /Font << /Helvetica 5 0 R >> >> >>\nendobj\n",
+    );
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content.as_bytes());
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+          /Encoding /WinAnsiEncoding >>\nendobj\n",
+    );
+
+    let xref_pos = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for &off in &offsets[1..] {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            offsets.len(),
+            xref_pos
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 fn text_pdf(rows: &[Vec<(f32, f32, String)>]) -> Vec<u8> {
-    let mut doc = DocumentBuilder::new();
-    let mut page = doc.a4_page();
     let (top, row_h) = (760.0_f32, 16.0_f32);
+    let mut content = String::new();
     for (i, row) in rows.iter().enumerate() {
         let y = top - row_h * i as f32;
-        for (x, w, text) in row {
-            page = page.text_in_rect(Rect::new(*x, y, *w, row_h), text, TextAlign::Left);
+        let baseline = y + 4.0;
+        for (x, _w, text) in row {
+            content.push_str(&format!(
+                "BT\n/Helvetica 10 Tf\n1 0 0 1 {x} {baseline} Tm\n({}) Tj\nET\n",
+                pdf_escape(text)
+            ));
         }
     }
-    page.done();
-    doc.build().expect("build pdf")
+    build_pdf_with_content(&content)
 }
 
 fn table_count(bytes: &[u8]) -> usize {

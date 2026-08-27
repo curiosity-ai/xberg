@@ -4,6 +4,10 @@
 //! Runtime, the pure-Rust tract engine, or hand-written networks over candle
 //! (CPU, Metal, or CUDA). Readers are initialized lazily and cached by their
 //! effective model and inference configuration.
+//!
+//! [`build_document`] applies a document-assembly pass sceptre itself has no
+//! concept of: [`assign_sceptre_block_ids`] groups recognized lines into
+//! paragraph blocks by geometry, mirroring PaddleOCR's `assign_line_block_ids`.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -291,6 +295,22 @@ impl OcrBackend for SceptreOcrBackend {
     fn supported_languages(&self) -> Vec<String> {
         supported_language_aliases().into_iter().map(str::to_string).collect()
     }
+
+    /// Sceptre's page confidence is EasyOCR's length-penalised `custom_mean` rescaled to
+    /// 0-100. It is not comparable to Tesseract's scale: on one document a real text page
+    /// scored 39 while a pure line-art drawing scored 74, an inverted ordering relative to
+    /// legibility. Never gate on this value.
+    fn confidence_semantics(&self) -> crate::plugins::ConfidenceSemantics {
+        crate::plugins::ConfidenceSemantics::Uncalibrated
+    }
+
+    /// Measured on a `/Rotate 270` scanned ordinance: sceptre produced character garbage on the
+    /// sideways raster and only read correctly once the same page was rendered upright first.
+    /// This is the same value as the trait default, made explicit here because it is a
+    /// measurement, not an unverified inheritance.
+    fn page_orientation_handling(&self) -> crate::plugins::PageOrientationHandling {
+        crate::plugins::PageOrientationHandling::RequiresUpright
+    }
 }
 
 struct BlockingOutput {
@@ -431,7 +451,9 @@ fn line_to_element(line: &TextLine) -> OcrElement {
             points: line
                 .quad
                 .points
-                .map(|point| (pixel_coordinate(point.x), pixel_coordinate(point.y))),
+                .into_iter()
+                .map(|point| (pixel_coordinate(point.x), pixel_coordinate(point.y)).into())
+                .collect(),
         },
         confidence: OcrConfidence {
             detection: None,
@@ -452,11 +474,195 @@ fn pixel_coordinate(value: f32) -> u32 {
     value.round().min(u32::MAX as f32) as u32
 }
 
+/// Attribute key `pdf::structure::adapters::hocr_block_id` reads to merge
+/// consecutive OCR lines into one `PdfParagraph`. Duplicated as a literal
+/// (rather than imported) because it is also defined locally in
+/// `ocr::hocr_parser` behind `feature = "ocr"`, which a sceptre-only build
+/// does not enable.
+const HOCR_BLOCK_ID_ATTRIBUTE: &str = "hocr_block_id";
+
+/// Maximum vertical gap between two consecutive sceptre lines, expressed as a
+/// multiple of the running median line height seen so far, for the lines to
+/// be grouped into the same paragraph block. Mirrors
+/// `MAX_BLOCK_VERTICAL_GAP_IN_LINE_HEIGHTS` in `ocr::conversion`.
+const BLOCK_MAX_VERTICAL_GAP_IN_LINE_HEIGHTS: f64 = 0.6;
+/// Minimum fraction of the narrower of two consecutive lines' horizontal
+/// extent that must overlap for them to be considered the same paragraph
+/// column. Mirrors `MIN_BLOCK_HORIZONTAL_OVERLAP_RATIO` in `ocr::conversion`.
+const BLOCK_MIN_HORIZONTAL_OVERLAP_RATIO: f64 = 0.3;
+/// Maximum left-edge offset between two consecutive lines, expressed as a
+/// multiple of the running median line height, allowed as a fallback when the
+/// lines don't x-overlap enough on their own. Mirrors
+/// `MAX_BLOCK_LEFT_EDGE_OFFSET_IN_LINE_HEIGHTS` in `ocr::conversion`.
+const BLOCK_MAX_LEFT_EDGE_OFFSET_IN_LINE_HEIGHTS: f64 = 0.5;
+/// Maximum y-center delta between two consecutive elements, expressed as a
+/// multiple of the running median line height, for them to be treated as
+/// fragments of the same physical text line rather than two different lines.
+///
+/// Sceptre's `width_ths` detection parameter under-merges letter-spaced or
+/// widely-kerned runs on some documents, splitting one physical line into
+/// several `TextLine` entries (see `sceptre::config::DetectionConfig::width_ths`,
+/// measured on this same 16-page ordinance: 339 detected lines, 85 of them
+/// single words, at the current default). Verified against Sceptre's own
+/// output for `test_documents/pdf_scanned/ordinance_2197_scanned.pdf`: a line
+/// split into 9 word fragments (e.g. "In" / "accordance" / "with" / "Section"
+/// / "2-133," / "the" / "PD" / "must" / "be") has consecutive y-center deltas
+/// of ~1-3px against line heights of ~32-45px (ratio < 0.1), while genuinely
+/// distinct lines on the same page have deltas of at least ~38px (ratio ≥ 0.5
+/// even where their AABBs happen to vertically overlap). Fragments have a
+/// near-zero vertical gap already, so the vertical-gap check below would let
+/// them through regardless, but their narrow, non-overlapping x-extents fail
+/// the horizontal overlap/left-edge check meant for paragraph continuation --
+/// which produced one spurious block per word. This constant lets same-line
+/// fragments skip that horizontal test entirely, mirroring the `ycenter_ths`
+/// test `sceptre::detect::group::combine_into_lines` already uses internally
+/// to decide the same "is this the same physical line" question.
+const LINE_YCENTER_THS: f64 = 0.5;
+
+/// Minimum first-line indent, as a multiple of the running median line height,
+/// for a line to start a new paragraph block even though the vertical-gap and
+/// horizontal-overlap checks would otherwise continue the current one. Mirrors
+/// `MIN_PARAGRAPH_INDENT_IN_LINE_HEIGHTS` in `ocr::conversion`, which was added
+/// for PaddleOCR after a 16-page scanned document produced exactly 16
+/// paragraphs -- one full-page block per page -- because its paragraph breaks
+/// are marked by indentation alone, with uniform leading throughout.
+///
+/// Unlike the PaddleOCR copy this check must NOT fire for the word fragments of
+/// a single physical line (see [`LINE_YCENTER_THS`]): those march rightward
+/// across the line and so look arbitrarily "indented" against the block's left
+/// margin. [`assign_sceptre_block_ids`] therefore consults it only for lines
+/// that are not same-line fragments.
+const PARAGRAPH_MIN_INDENT_IN_LINE_HEIGHTS: f64 = 0.75;
+
+/// Group sceptre's per-line elements into paragraph blocks using their own
+/// AABB geometry, returning a stable block id per input element in the same
+/// order, so `pdf::structure::adapters::ocr_doc_to_paragraphs` can merge
+/// consecutive sceptre lines into one `PdfParagraph` instead of treating every
+/// line as its own paragraph.
+///
+/// This is a deliberate, intentionally-flagged duplicate of
+/// `crate::ocr::conversion::assign_line_block_ids`, which already gives
+/// PaddleOCR the same paragraph grouping it otherwise lacks (#631). That
+/// function is `#[cfg(paddle_ocr)]` inside a module gated on `feature =
+/// "ocr"`; sceptre-ocr builds (`sceptre-ocr-ort` / `sceptre-ocr-tract`) enable
+/// neither, so it cannot be called from here without pulling `feature = "ocr"`
+/// into every sceptre-ocr build. Reconcile by extracting a shared, ungated
+/// helper once both call sites are stable, rather than letting these two
+/// copies drift apart silently.
+fn assign_sceptre_block_ids(elements: &[OcrElement]) -> Vec<String> {
+    let mut block_ids = Vec::with_capacity(elements.len());
+    let mut heights_seen: Vec<f64> = Vec::with_capacity(elements.len());
+    let mut block_index: u32 = 0;
+    let mut previous: Option<BoundingBox> = None;
+    // Leftmost edge established so far by the current block's lines, used to
+    // detect an indented paragraph start (see `starts_indented_paragraph`).
+    let mut block_left_margin: f64 = 0.0;
+
+    for element in elements {
+        let bounds = geometry_bounds(&element.geometry).unwrap_or_default();
+        insert_sorted(&mut heights_seen, bounds.y1 - bounds.y0);
+        let median_line_height = running_median(&heights_seen);
+
+        let continues_block = previous.as_ref().is_some_and(|previous| {
+            lines_share_block(previous, &bounds, median_line_height)
+                && (shares_physical_line(previous, &bounds, median_line_height)
+                    || !starts_indented_paragraph(bounds.x0, block_left_margin, median_line_height))
+        });
+        if continues_block {
+            block_left_margin = block_left_margin.min(bounds.x0);
+        } else {
+            block_index += 1;
+            block_left_margin = bounds.x0;
+        }
+        block_ids.push(format!("sceptre-block-{block_index}"));
+        previous = Some(bounds);
+    }
+
+    block_ids
+}
+
+/// Whether `current` is a fragment of the same physical text line as
+/// `previous`, judged by their y-centers (see [`LINE_YCENTER_THS`]).
+fn shares_physical_line(previous: &BoundingBox, current: &BoundingBox, median_line_height: f64) -> bool {
+    if median_line_height <= 0.0 {
+        return false;
+    }
+    let previous_ycenter = (previous.y0 + previous.y1) / 2.0;
+    let current_ycenter = (current.y0 + current.y1) / 2.0;
+    (current_ycenter - previous_ycenter).abs() < LINE_YCENTER_THS * median_line_height
+}
+
+/// Whether `x0` sits far enough right of `block_left_margin` -- the leftmost
+/// edge established by the current block's lines so far -- to read as a new
+/// paragraph's indented first line, in units of `median_line_height`.
+///
+/// This is independent of (and can override) the vertical-gap/overlap checks in
+/// [`lines_share_block`], because real body text often marks a paragraph break
+/// with indentation alone and no extra vertical space (see
+/// [`PARAGRAPH_MIN_INDENT_IN_LINE_HEIGHTS`]).
+fn starts_indented_paragraph(x0: f64, block_left_margin: f64, median_line_height: f64) -> bool {
+    if median_line_height <= 0.0 {
+        return false;
+    }
+    x0 - block_left_margin > median_line_height * PARAGRAPH_MIN_INDENT_IN_LINE_HEIGHTS
+}
+
+fn lines_share_block(previous: &BoundingBox, current: &BoundingBox, median_line_height: f64) -> bool {
+    if median_line_height <= 0.0 {
+        return false;
+    }
+
+    if shares_physical_line(previous, current, median_line_height) {
+        return true;
+    }
+
+    let vertical_gap = if current.y0 >= previous.y1 {
+        current.y0 - previous.y1
+    } else if previous.y0 >= current.y1 {
+        previous.y0 - current.y1
+    } else {
+        0.0
+    };
+    if vertical_gap > median_line_height * BLOCK_MAX_VERTICAL_GAP_IN_LINE_HEIGHTS {
+        return false;
+    }
+
+    let overlap = (previous.x1.min(current.x1) - previous.x0.max(current.x0)).max(0.0);
+    let narrower_width = (previous.x1 - previous.x0).min(current.x1 - current.x0);
+    let overlap_ratio = if narrower_width > 0.0 {
+        overlap / narrower_width
+    } else {
+        0.0
+    };
+    let left_edge_offset = (previous.x0 - current.x0).abs();
+
+    overlap_ratio >= BLOCK_MIN_HORIZONTAL_OVERLAP_RATIO
+        || left_edge_offset <= median_line_height * BLOCK_MAX_LEFT_EDGE_OFFSET_IN_LINE_HEIGHTS
+}
+
+fn insert_sorted(sorted: &mut Vec<f64>, value: f64) {
+    let index = sorted.partition_point(|existing| *existing < value);
+    sorted.insert(index, value);
+}
+
+fn running_median(sorted: &[f64]) -> f64 {
+    let len = sorted.len();
+    if len == 0 {
+        return 0.0;
+    }
+    if len % 2 == 1 {
+        sorted[len / 2]
+    } else {
+        (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
+    }
+}
+
 fn build_internal_document(elements: &[OcrElement]) -> InternalDocument {
     let mut document = InternalDocument::new("ocr");
     document.mime_type = "text/plain".to_string();
     document.prebuilt_ocr_elements = Some(elements.to_vec());
-    for element in elements {
+    let block_ids = assign_sceptre_block_ids(elements);
+    for (element, block_id) in elements.iter().zip(block_ids) {
         let mut internal = InternalElement::text(
             ElementKind::OcrText {
                 level: OcrElementLevel::Line,
@@ -468,6 +674,7 @@ fn build_internal_document(elements: &[OcrElement]) -> InternalDocument {
         internal.bbox = geometry_bounds(&element.geometry);
         internal.ocr_geometry = Some(element.geometry.clone());
         internal.ocr_confidence = Some(element.confidence.clone());
+        internal.attributes = Some([(HOCR_BLOCK_ID_ATTRIBUTE.to_string(), block_id)].into_iter().collect());
         document.push_element(internal);
     }
     document
@@ -477,10 +684,10 @@ fn geometry_bounds(geometry: &OcrBoundingGeometry) -> Option<BoundingBox> {
     let OcrBoundingGeometry::Quadrilateral { points } = geometry else {
         return None;
     };
-    let x0 = points.iter().map(|(x, _)| *x).min()?;
-    let y0 = points.iter().map(|(_, y)| *y).min()?;
-    let x1 = points.iter().map(|(x, _)| *x).max()?;
-    let y1 = points.iter().map(|(_, y)| *y).max()?;
+    let x0 = points.iter().map(|point| point.x).min()?;
+    let y0 = points.iter().map(|point| point.y).min()?;
+    let x1 = points.iter().map(|point| point.x).max()?;
+    let y1 = points.iter().map(|point| point.y).max()?;
     Some(BoundingBox {
         x0: f64::from(x0),
         y0: f64::from(y0),
@@ -491,14 +698,7 @@ fn geometry_bounds(geometry: &OcrBoundingGeometry) -> Option<BoundingBox> {
 
 fn select_output_elements(elements: &[OcrElement], config: &OcrConfig) -> Option<Vec<OcrElement>> {
     let options = config.element_config.as_ref()?;
-    if !options.include_elements || !matches!(options.min_level, OcrElementLevel::Word | OcrElementLevel::Line) {
-        return None;
-    }
-    let selected: Vec<OcrElement> = elements
-        .iter()
-        .filter(|element| element.confidence.recognition >= options.min_confidence)
-        .cloned()
-        .collect();
+    let selected = options.select_elements(elements);
     (!selected.is_empty()).then_some(selected)
 }
 
@@ -633,6 +833,40 @@ fn build_metadata(languages: &[String], output: &BlockingOutput) -> Metadata {
     metadata
 }
 
+/// `object.get("detection")` is how `sceptre::DetectionConfig::detect_orientation` reaches
+/// this backend: any caller can already flip it on today with
+/// `backend_options: {"detection": {"detect_orientation": true}}`. Nothing here defaults it
+/// to `true`, and that is a deliberate decision (#662), not an oversight to "finish wiring".
+///
+/// `detect_orientation` is sceptre's own opt-in whole-page rotation guesser: it probes CRAFT
+/// at 0/90/180/270 degrees on a reduced canvas, rotates internally for the winning angle, and
+/// unrotates the output quads back onto the frame of the `Image` this backend passed in
+/// (`sceptre::engine::sceptre_engine`, `detect::orientation::unrotate_corners`) before
+/// `TextLine`s are ever returned here. So enabling it introduces no coordinate-frame bug for
+/// this crate's `line_to_element` / `build_internal_document` / table geometry — that risk was
+/// checked and ruled out, not assumed away.
+///
+/// The reason to leave it off is that xberg already has two better-targeted fixes for exactly
+/// the defect it targets, and stacking a third, weaker one on top adds cost without adding
+/// coverage:
+///   - For PDF-sourced pages, `extractors::pdf::ocr::upright_raster_for_backend` (#643) rotates
+///     the raster to upright using the page's own `/Rotate` value — a known fact, not a guess —
+///     whenever this backend's `page_orientation_handling()` reports `RequiresUpright`, and
+///     `undo_upright_raster_correction` maps the returned geometry back deterministically. Zero
+///     false-positive risk, because there is nothing to infer.
+///   - For raw images with no `/Rotate` to consult, `crate::doc_orientation` (a PP-LCNet
+///     classifier) already runs ahead of this backend, cross-backend, behind `config.auto_rotate`
+///     (`decode_and_rotate` below), with its own coordinate-frame correction in
+///     `extractors::pdf::ocr::undo_auto_rotate_document_bboxes`.
+///
+/// That leaves only images with unknown rotation and `auto_rotate` left off as a case
+/// `detect_orientation` could add coverage for — and sceptre's own ADR 0038 keeps the flag
+/// `false` by default even after fixing its false-positive rate to 0/23 on its labeled corpus,
+/// because it costs four extra CRAFT forward passes on every page (rotated or not) and the
+/// validation set is 23 images. Defaulting it on in xberg would pay that unconditional cost
+/// for every Sceptre page to cover a narrower gap than it looks like, and inherit a heuristic
+/// xberg has not independently validated. Revisit if `crate::doc_orientation` is ever removed,
+/// or if a corpus-backed measurement on xberg's own fixtures justifies the cost.
 fn parse_sceptre_options(config: &OcrConfig) -> Result<sceptre::OcrConfig> {
     let Some(options) = config.backend_options.as_ref() else {
         return Ok(sceptre::OcrConfig::default());
@@ -990,6 +1224,9 @@ mod tests {
             element.geometry,
             OcrBoundingGeometry::Quadrilateral {
                 points: [(10, 20), (111, 20), (111, 43), (10, 43)]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect()
             }
         );
     }
@@ -1260,5 +1497,186 @@ mod tests {
     fn plugin_version_matches_sceptre_crate() {
         let backend = SceptreOcrBackend::new().expect("backend should construct");
         assert_eq!(backend.version(), sceptre::VERSION);
+    }
+
+    /// Axis-aligned `TextLine` at the given extent, for block-grouping tests.
+    fn word_line(text: &str, x0: f32, x1: f32, y0: f32, y1: f32, confidence: f32) -> TextLine {
+        TextLine {
+            quad: Quad {
+                points: [
+                    Point::new(x0, y0),
+                    Point::new(x1, y0),
+                    Point::new(x1, y1),
+                    Point::new(x0, y1),
+                ],
+            },
+            text: text.to_string(),
+            confidence,
+        }
+    }
+
+    /// Regression for the "no block/paragraph grouping" WP-D defect (#668):
+    /// `build_internal_document` never set `attributes`, so
+    /// `pdf::structure::adapters::hocr_block_id` always returned `None` and
+    /// every sceptre line became its own paragraph. This mirrors the
+    /// geometric grouping already applied to PaddleOCR
+    /// (`ocr::conversion::assign_line_block_ids`, #631) via the intentionally
+    /// duplicated `assign_sceptre_block_ids` (see its doc comment for why it
+    /// is not a shared call).
+    ///
+    /// Against unfixed code (`internal.attributes` left `None`, as it was
+    /// before this change), `block_id(0)` and `block_id(1)` both return `None`
+    /// and the `.expect(...)` calls below panic.
+    #[test]
+    fn should_assign_shared_block_id_to_close_lines_and_a_new_id_after_a_gap() {
+        let elements = vec![
+            line_to_element(&word_line("First line", 10.0, 200.0, 100.0, 120.0, 0.9)),
+            line_to_element(&word_line("Second line", 10.0, 200.0, 124.0, 144.0, 0.9)),
+            line_to_element(&word_line("Far below", 10.0, 200.0, 400.0, 420.0, 0.9)),
+        ];
+
+        let document = build_internal_document(&elements);
+
+        let block_id = |index: usize| {
+            document.elements[index]
+                .attributes
+                .as_ref()
+                .and_then(|attributes| attributes.get(HOCR_BLOCK_ID_ATTRIBUTE))
+                .cloned()
+        };
+
+        let first = block_id(0).expect("first line must carry a block id");
+        let second = block_id(1).expect("second line must carry a block id");
+        let third = block_id(2).expect("third line must carry a block id");
+
+        assert_eq!(first, second, "vertically adjacent lines must share a block id");
+        assert_ne!(second, third, "a large vertical gap must start a new block");
+    }
+
+    /// Regression for a structural defect in `lines_share_block`, found by feeding it
+    /// Sceptre's own detected geometry (not a Tesseract proxy) for
+    /// `test_documents/pdf_scanned/ordinance_2197_scanned.pdf`: Sceptre's `width_ths`
+    /// detection parameter under-merges this line, so one physical line surfaces as 9
+    /// separate `TextLine` entries ("In" / "accordance" / "with" / "Section" / "2-133,"
+    /// / "the" / "PD" / "must" / "be"), reproduced here with their real detected
+    /// coordinates.
+    ///
+    /// Each fragment's vertical gap against its predecessor is already 0 (their y-ranges
+    /// overlap), so the vertical-gap check alone never rejected them. The bug was the
+    /// horizontal overlap/left-edge fallback that follows it: consecutive word fragments
+    /// don't x-overlap and their left edges march rightward across the line, so
+    /// `overlap_ratio` stays 0 and `left_edge_offset` (~47-260px) blows past the ~16-23px
+    /// threshold derived from the line's own ~32-36px height -- producing one spurious
+    /// block per word instead of one block for the whole line.
+    ///
+    /// Against unfixed code (no y-center short-circuit in `lines_share_block`), each
+    /// fragment after the first starts a new block, so `block_id(1)` (`"accordance"`)
+    /// differs from `block_id(0)` (`"In"`) and the first `assert_eq!` below fails.
+    #[test]
+    fn should_merge_word_fragments_of_one_sceptre_line_sharing_a_ycenter() {
+        let elements = vec![
+            line_to_element(&word_line("In", 718.0, 752.0, 906.0, 938.0, 0.9)),
+            line_to_element(&word_line("accordance", 765.0, 923.0, 905.0, 941.0, 0.9)),
+            line_to_element(&word_line("with", 936.0, 1002.0, 908.0, 940.0, 0.9)),
+            line_to_element(&word_line("Section", 1015.0, 1123.0, 905.0, 941.0, 0.9)),
+            line_to_element(&word_line("2-133,", 1135.0, 1223.0, 905.0, 941.0, 0.9)),
+            line_to_element(&word_line("the", 1244.0, 1292.0, 908.0, 940.0, 0.9)),
+            line_to_element(&word_line("PD", 1306.0, 1354.0, 908.0, 940.0, 0.9)),
+            line_to_element(&word_line("must", 1368.0, 1444.0, 910.0, 942.0, 0.9)),
+            line_to_element(&word_line("be", 1458.0, 1496.0, 908.0, 940.0, 0.9)),
+            // A genuinely new paragraph, far below: must still start a new block.
+            line_to_element(&word_line("2_", 285.0, 305.0, 1059.0, 1087.0, 0.9)),
+        ];
+
+        let document = build_internal_document(&elements);
+
+        let block_id = |index: usize| {
+            document.elements[index]
+                .attributes
+                .as_ref()
+                .and_then(|attributes| attributes.get(HOCR_BLOCK_ID_ATTRIBUTE))
+                .cloned()
+                .expect("every line must carry a block id")
+        };
+
+        let line_block_ids: Vec<String> = (0..9).map(block_id).collect();
+        for (index, id) in line_block_ids.iter().enumerate().skip(1) {
+            assert_eq!(
+                *id, line_block_ids[0],
+                "word fragment {index} must share the same-line block id as the first fragment"
+            );
+        }
+
+        assert_ne!(
+            block_id(9),
+            line_block_ids[0],
+            "a distant, unrelated line must still start a new block"
+        );
+    }
+
+    /// Sceptre counterpart of
+    /// `ocr::conversion::assign_line_block_ids_splits_indent_marked_paragraphs_with_uniform_leading`.
+    /// The PaddleOCR grouper gained an indent check after a 16-page scanned
+    /// document produced exactly 16 paragraphs; `assign_sceptre_block_ids` was
+    /// copied from it before that check existed and never received it, so this
+    /// same page collapses into a single block under sceptre.
+    ///
+    /// Paragraph breaks here are marked ONLY by first-line indentation (left
+    /// margin 200px, indent 300px): every line sits 16px below its predecessor,
+    /// well inside the 0.6x-line-height gap threshold, and every pair overlaps
+    /// horizontally. Against unfixed code all eight entries come back as
+    /// `"sceptre-block-1"`.
+    #[test]
+    fn should_split_indent_marked_paragraphs_that_share_uniform_leading() {
+        let elements = vec![
+            // Paragraph 1: indented first line, two flush continuation lines.
+            line_to_element(&word_line("Para one first", 300.0, 2200.0, 200.0, 234.0, 0.9)),
+            line_to_element(&word_line("continues here", 200.0, 2200.0, 250.0, 284.0, 0.9)),
+            line_to_element(&word_line("and ends", 200.0, 1000.0, 300.0, 334.0, 0.9)),
+            // Paragraph 2: indented first line, same 16px gap as within paragraph 1.
+            line_to_element(&word_line("Para two first", 300.0, 2200.0, 350.0, 384.0, 0.9)),
+            line_to_element(&word_line("continues here", 200.0, 2200.0, 400.0, 434.0, 0.9)),
+            line_to_element(&word_line("and ends", 200.0, 700.0, 450.0, 484.0, 0.9)),
+            // Paragraph 3: indented first line, same 16px gap again.
+            line_to_element(&word_line("Para three first", 300.0, 2200.0, 500.0, 534.0, 0.9)),
+            line_to_element(&word_line("continues here", 200.0, 2200.0, 550.0, 584.0, 0.9)),
+        ];
+
+        let block_ids = assign_sceptre_block_ids(&elements);
+
+        assert_eq!(
+            block_ids,
+            vec![
+                "sceptre-block-1",
+                "sceptre-block-1",
+                "sceptre-block-1",
+                "sceptre-block-2",
+                "sceptre-block-2",
+                "sceptre-block-2",
+                "sceptre-block-3",
+                "sceptre-block-3",
+            ],
+            "indented first lines must start a new block even though the vertical gap never changes"
+        );
+    }
+
+    /// Companion control to the indent-split test: OCR boxes are never
+    /// pixel-perfect, so continuation lines flush with the block's established
+    /// left margin must not be split apart by sub-pixel left-edge jitter.
+    #[test]
+    fn should_not_split_flush_continuation_lines_on_left_edge_jitter() {
+        let elements = vec![
+            line_to_element(&word_line("Indented first", 300.0, 2200.0, 200.0, 234.0, 0.9)),
+            line_to_element(&word_line("flush second", 201.0, 2200.0, 250.0, 284.0, 0.9)),
+            line_to_element(&word_line("flush third", 199.0, 2200.0, 300.0, 334.0, 0.9)),
+        ];
+
+        let block_ids = assign_sceptre_block_ids(&elements);
+
+        assert_eq!(
+            block_ids,
+            vec!["sceptre-block-1", "sceptre-block-1", "sceptre-block-1"],
+            "sub-pixel left-edge jitter on flush continuation lines must not start a new block"
+        );
     }
 }

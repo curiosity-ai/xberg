@@ -5,7 +5,7 @@
 set -euo pipefail
 
 PREFIX="${1:-${PREFIX:-/usr/local}}"
-PDFIUM_VERSION="${2:-${PDFIUM_VERSION:-7578}}"
+PDFIUM_VERSION="${2:-${PDFIUM_VERSION:-7881}}"
 PDFIUM_PLATFORM="linux-x64"
 DOWNLOAD_URL="https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/${PDFIUM_VERSION}/pdfium-${PDFIUM_PLATFORM}.tgz"
 

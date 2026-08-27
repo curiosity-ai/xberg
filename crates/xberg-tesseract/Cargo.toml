@@ -33,12 +33,22 @@ build-tesseract-wasm = ["cmake", "reqwest", "zip"]
 bundle-tessdata-eng = []
 static-linking = ["build-tesseract"]
 dynamic-linking = []
+# Link the host's Tesseract and Leptonica instead of downloading and building vendored copies,
+# for a build with no network access such as a conda-forge recipe or a distro package.
+#
+# `build-tesseract` is included because it gates the FFI declarations, not because anything is
+# built: `main` in build.rs gives `dynamic-linking` precedence and skips the vendored path. The
+# gating is why `dynamic-linking` cannot stand alone today -- without `build-tesseract` the
+# extern blocks vanish and the crate fails to compile. Untangling that spans 38 sites across six
+# cfg shapes, including inverted ones selecting stub implementations, so it is left as separate
+# work rather than folded in here. ~keep
+system-linking = ["build-tesseract", "dynamic-linking"]
 
 [dependencies]
 thiserror = { workspace = true }
 
 [build-dependencies]
-cc = { version = "^1.4.3", optional = true }
+cc = { version = "^1.4.4", optional = true }
 cmake = { version = "0.1.58", optional = true }
 zip = { version = ">=7.0.0", optional = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

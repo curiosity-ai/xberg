@@ -631,6 +631,7 @@ mod tests {
                         content: text.to_string(),
                         tables: vec![],
                         image_indices: vec![],
+                        image_preprocessing: None,
                         hierarchy: None,
                         is_blank: None,
                         layout_regions: None,

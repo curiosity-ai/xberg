@@ -133,7 +133,9 @@ pub use provenance::{ModelProvenance, RunProvenance, write_run_provenance};
 pub use quality::{compute_quality, compute_quality_with_structure};
 pub use registry::AdapterRegistry;
 pub use runner::BenchmarkRunner;
-pub use types::{BenchmarkResult, DiskSizeInfo, FrameworkCapabilities, OutputFormat, PdfMetadata, XbergPipeline};
+pub use types::{
+    BenchmarkResult, DiskSizeInfo, FrameworkCapabilities, OutputFormat, PdfMetadata, XbergPdfBackend, XbergPipeline,
+};
 
 pub use sizes::{
     FrameworkSize, FrameworkSizes, load_framework_sizes as load_sizes_json, measure_framework_sizes,

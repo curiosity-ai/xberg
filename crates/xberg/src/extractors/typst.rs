@@ -22,13 +22,13 @@ use crate::Result;
 #[cfg(feature = "office")]
 use crate::core::config::ExtractionConfig;
 #[cfg(feature = "office")]
+use crate::extraction::typst_math::convert_typst_math_to_latex;
+#[cfg(feature = "office")]
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 #[cfg(feature = "office")]
 use crate::types::builder;
 #[cfg(feature = "office")]
 use crate::types::document_structure::TextAnnotation;
-#[cfg(feature = "office")]
-use crate::extraction::typst_math::convert_typst_math_to_latex;
 #[cfg(feature = "office")]
 use crate::types::internal::InternalDocument;
 #[cfg(feature = "office")]
@@ -1355,7 +1355,9 @@ mod tests {
 
         assert_eq!(
             typst_formulas(content),
-            vec!["\\begin{aligned}\\nabla \\cdot \\mathbf{D} & = \\rho \\\\ \\nabla \\cdot \\mathbf{B} & = 0\\end{aligned}"]
+            vec![
+                "\\begin{aligned}\\nabla \\cdot \\mathbf{D} & = \\rho \\\\ \\nabla \\cdot \\mathbf{B} & = 0\\end{aligned}"
+            ]
         );
     }
 

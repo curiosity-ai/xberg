@@ -31,6 +31,11 @@ public sealed class PdfExtractor : IExtractor
         if (pageCount == 0)
             throw new InvalidDataException("pdf has no readable pages");
 
+        // Reject a document whose page count exceeds the configured ceiling before any per-page
+        // work starts. Byte-size limits do not bound page count: a scanned page can compress to a
+        // few kilobytes, so a file well under max_content_size can still hold thousands of pages.
+        DocumentLimits.EnforcePageCount(pageCount, config.SecurityLimits);
+
         // Per-document wall-clock guard so pathological files cannot hang extraction. Scaled by
         // page count, so it is computed here rather than before the open: a fixed budget either
         // starves a large document or lets a small broken one spin for just as long.

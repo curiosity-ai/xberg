@@ -72,6 +72,26 @@ pub(crate) async fn extract_bytes(
 ) -> Result<ExtractedDocument> {
     use crate::core::mime;
 
+    // `token.cancel()` below needs a token to signal, but `config.cancel_token` is
+    // `None` on every binding-driven and CLI-driven call (see
+    // `ExtractionConfig::ensure_cancel_token`) — install an internal fallback so a
+    // timeout actually stops the extraction instead of merely returning
+    // `Err(Timeout)` while the spawned work keeps running. A caller-supplied token
+    // is always left untouched. Gated identically to the timeout block below: on
+    // wasm32 / without `tokio-runtime` there is no timeout to enforce, so no token
+    // is ever needed.
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    let owned_config_with_cancel_token;
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    let config: &ExtractionConfig = if config.extraction_timeout_secs.is_some() && config.cancel_token.is_none() {
+        let mut owned = config.clone();
+        owned.ensure_cancel_token();
+        owned_config_with_cancel_token = owned;
+        &owned_config_with_cancel_token
+    } else {
+        config
+    };
+
     let extraction_future = Box::pin(async {
         if config.force_ocr && config.effective_disable_ocr() {
             return Err(crate::XbergError::Validation {

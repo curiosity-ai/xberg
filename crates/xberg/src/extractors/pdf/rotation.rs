@@ -1,6 +1,6 @@
 //! Rotated text-matrix run assembly for PDF pages.
 //!
-//! pdf_oxide reports each span's text-matrix rotation
+//! xberg_native_pdf reports each span's text-matrix rotation
 //! ([`TextSpan::rotation_degrees`]) and bakes a rotated run's word gaps into
 //! that run's *own* baseline rather than into page-x. Concatenating span text
 //! in page order therefore both glues adjacent words together and can read a
@@ -24,7 +24,7 @@
 
 /// A text span with bounding box information.
 ///
-/// `x`/`y`/`width`/`height` are always the page-space bbox pdf_oxide reports:
+/// `x`/`y`/`width`/`height` are always the page-space bbox xberg_native_pdf reports:
 /// for a rotated run the origin is in page coordinates but `width`/`height`
 /// are flattened onto the run's own (rotated) axis — see
 /// [`upright_reading_origin`] for why ordering must account for this.
@@ -35,7 +35,7 @@ pub struct TextSpan {
     pub y: f32,
     pub width: f32,
     pub height: f32,
-    /// Text-matrix rotation in degrees, as reported by pdf_oxide
+    /// Text-matrix rotation in degrees, as reported by xberg_native_pdf
     /// (`TextSpan::rotation_degrees`). Zero for the overwhelming majority of
     /// (unrotated) spans.
     pub rotation_degrees: f32,
@@ -62,8 +62,8 @@ const ROTATED_LINE_CROSS_TOLERANCE_RATIO: f32 = 0.5;
 
 /// Rotate a span's page-space origin into its own upright reading frame.
 ///
-/// Mirrors [`crate::pdf::oxide::span_geometry::upright_origin`] (which
-/// operates on `pdf_oxide::layout::TextSpan`) for the simpler geometry this
+/// Mirrors [`crate::pdf::native::span_geometry::upright_origin`] (which
+/// operates on `xberg_native_pdf::layout::TextSpan`) for the simpler geometry this
 /// module works with. Returns `(advance, cross)`: `advance` is the position
 /// along the span's own reading direction and `cross` is the position along
 /// the axis lines stack on. For unrotated spans (`rotation_degrees == 0`,
@@ -81,13 +81,13 @@ pub(crate) fn upright_reading_origin(span: &TextSpan) -> (f32, f32) {
 /// into page text.
 ///
 /// Plain concatenation of `spans[i].text` in index order is correct only when
-/// every span shares the page's own upright axis: pdf_oxide bakes word gaps
+/// every span shares the page's own upright axis: xberg_native_pdf bakes word gaps
 /// into a rotated run's *own* baseline, not into page-x, so naive
 /// concatenation of a 90/180/270-degree-rotated run's fragments both glues
 /// adjacent words together (no separator survives reordering) and can read
 /// the fragments out of order (a rotated run's local word order is only
 /// well-defined along its own advance axis, [`upright_reading_origin`], not
-/// along whatever order pdf_oxide happened to emit fragments in).
+/// along whatever order xberg_native_pdf happened to emit fragments in).
 ///
 /// This groups `order` into maximal same-rotation runs first — a mixed page
 /// (rotated body text beside an upright footer, for example) must not have
@@ -224,7 +224,7 @@ pub(crate) fn page_has_rotated_spans(spans: &[TextSpan]) -> bool {
 /// replaces the *entire page's* text via [`assemble_reading_order_text`],
 /// whose unrotated path is a legacy verbatim concatenation with no inserted
 /// separators at all (see [`append_run`]'s unrotated branch), unlike
-/// `assemble_page_text` in `pdf::oxide::text` (paragraph/line-break
+/// `assemble_page_text` in `pdf::native::text` (paragraph/line-break
 /// detection, RTL handling, glyph-fragmentation repair for #962). A page
 /// where rotation is a tiny minority — one rotated caption, axis label, or
 /// section-tab digit sitting on an otherwise entirely upright page — pays
@@ -296,7 +296,7 @@ mod tests {
     // already emits the correct span-index order, but the caller
     // (`apply_reading_order_reordering` in extraction.rs) used to concatenate
     // `spans[index].text` back-to-back with no separator at all. For a
-    // 90-degree-rotated run pdf_oxide bakes word gaps into the run's own
+    // 90-degree-rotated run xberg_native_pdf bakes word gaps into the run's own
     // (rotated) baseline, not into page-x, so naive concatenation glued
     // adjacent words together. `assemble_reading_order_text` fixes this by
     // grouping same-rotation runs, sorting each rotated line by its own
@@ -351,7 +351,7 @@ mod tests {
 
         #[test]
         fn should_not_insert_space_for_kerning_tight_rotated_fragments() {
-            // "Eng" and "ine" are two fragments of one word pdf_oxide split,
+            // "Eng" and "ine" are two fragments of one word xberg_native_pdf split,
             // 0.5pt apart on a 10pt run — well under the kerning cutoff
             // (10.0 * ATOMIC_FRAGMENT_GAP_RATIO = 1.5), so no space belongs
             // between them.
@@ -472,7 +472,7 @@ mod tests {
             }
         }
 
-        /// A rotated run in the scrambled order pdf_oxide emits it: fragments
+        /// A rotated run in the scrambled order xberg_native_pdf emits it: fragments
         /// arrive back-to-front, with real 3pt word gaps (well above the
         /// kerning cutoff of 10.0 * ATOMIC_FRAGMENT_GAP_RATIO = 1.5).
         fn scrambled_rotated_page() -> Vec<TextSpan> {

@@ -189,7 +189,7 @@ impl Cohort {
 
     /// Whether this release cohort includes the normal ONNX Runtime Sceptre variants.
     pub fn includes_sceptre_ort(self) -> bool {
-        matches!(self, Cohort::Ocr | Cohort::Images)
+        matches!(self, Cohort::Ocr)
     }
 
     /// Build this cohort's pinned release contract.
@@ -503,6 +503,25 @@ fn xberg_entries(cohort: &str, include_layout: bool, include_paddle: bool, inclu
     entries
 }
 
+/// The native-PDF Pdfium comparison cells emitted by the benchmark workflow.
+fn xberg_pdfium_entries(cohort: &str) -> Vec<MatrixEntry> {
+    let mut entries = Vec::new();
+    for output_format in [OutputFormat::Markdown, OutputFormat::Plaintext] {
+        for mode in [ExecutionMode::SingleFile, ExecutionMode::Batch] {
+            entries.push(matrix_entry(
+                format!(
+                    "benchmarks-rust-pdfium-baseline-{output_format}-{}-{cohort}",
+                    mode.artifact_slug()
+                ),
+                format!("xberg-{output_format}-baseline-pdfium"),
+                output_format,
+                mode,
+            ));
+        }
+    }
+    entries
+}
+
 /// The full markdown/plaintext x single/batch grid for one competitor framework.
 fn grid_entries(framework: &str, cohort: &str) -> Vec<MatrixEntry> {
     let mut entries = Vec::new();
@@ -554,6 +573,7 @@ fn optional(entries: Vec<MatrixEntry>) -> Vec<MatrixEntry> {
 
 fn native_matrix() -> Vec<MatrixEntry> {
     let mut matrix = xberg_entries(NATIVE_COHORT, true, false, false);
+    matrix.extend(xberg_pdfium_entries(NATIVE_COHORT));
     matrix.extend(grid_entries("docling", NATIVE_COHORT));
     matrix.push(matrix_entry(
         format!("benchmarks-markitdown-markdown-single-file-{NATIVE_COHORT}"),
@@ -639,7 +659,10 @@ fn email_matrix() -> Vec<MatrixEntry> {
 }
 
 fn images_matrix() -> Vec<MatrixEntry> {
-    let mut matrix = xberg_entries(IMAGES_COHORT, true, true, true);
+    // Sceptre's structured-image coverage runs as a bounded diagnostic outside
+    // the published release contract. Keep the release cohort limited to the
+    // pipelines whose full 14-image matrix is a stable comparison surface.
+    let mut matrix = xberg_entries(IMAGES_COHORT, true, true, false);
     matrix.extend(optional(grid_entries("docling", IMAGES_COHORT)));
     // pymupdf4llm has no OCR path (`pymupdf4llm.to_markdown` only reads existing text layers), so on
     // a scanned-image cohort it always returns empty content and can never clear the min-success-rate
@@ -758,14 +781,14 @@ mod tests {
     /// artifact / aggregate validators gate publication on; optional competitor cells are allowed
     /// but never required for the per-format-family cohorts.
     const CONTRACT_CELL_COUNTS: [(Cohort, usize, usize); 8] = [
-        (Cohort::Native, 21, 20),
+        (Cohort::Native, 25, 24),
         (Cohort::Ocr, 39, 36),
         (Cohort::Office, 11, 4),
         (Cohort::Markup, 11, 4),
         (Cohort::Ebook, 6, 4),
         (Cohort::Email, 6, 4),
         (Cohort::Data, 11, 4),
-        (Cohort::Images, 35, 28),
+        (Cohort::Images, 23, 16),
     ];
 
     #[test]
@@ -802,6 +825,31 @@ mod tests {
                 cohort.as_str()
             );
         }
+    }
+
+    #[test]
+    fn native_contract_includes_every_pdfium_workflow_cell() {
+        let contract = Cohort::Native.contract();
+        let pdfium_entries: Vec<_> = contract
+            .matrix
+            .iter()
+            .filter(|entry| entry.artifact.starts_with("benchmarks-rust-pdfium-"))
+            .collect();
+
+        assert_eq!(pdfium_entries.len(), 4);
+        assert!(pdfium_entries.iter().all(|entry| !entry.optional));
+        assert_eq!(
+            pdfium_entries
+                .iter()
+                .map(|entry| entry.artifact.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "benchmarks-rust-pdfium-baseline-markdown-single-file-native-pdf-fast-b8",
+                "benchmarks-rust-pdfium-baseline-markdown-batch-native-pdf-fast-b8",
+                "benchmarks-rust-pdfium-baseline-plaintext-single-file-native-pdf-fast-b8",
+                "benchmarks-rust-pdfium-baseline-plaintext-batch-native-pdf-fast-b8",
+            ])
+        );
     }
 
     #[test]
@@ -863,19 +911,19 @@ mod tests {
     }
 
     #[test]
-    fn ocr_release_cohorts_include_explicit_ort_variants_but_not_tract() {
-        for cohort in [Cohort::Ocr, Cohort::Images] {
-            let contract = cohort.contract();
-            let frameworks: HashSet<&str> = contract.matrix.iter().map(|entry| entry.framework.as_str()).collect();
-            for variant in ["sceptre-ort", "sceptre-ort-layout", "sceptre-ort-autorotate"] {
-                assert!(
-                    frameworks.iter().any(|framework| framework.ends_with(variant)),
-                    "{} missing {variant}",
-                    cohort.as_str()
-                );
-            }
-            assert!(!frameworks.iter().any(|framework| framework.contains("sceptre-tract")));
+    fn ocr_pdf_release_contract_includes_ort_variants_but_not_tract() {
+        let contract = Cohort::Ocr.contract();
+        let frameworks: HashSet<&str> = contract.matrix.iter().map(|entry| entry.framework.as_str()).collect();
+        for variant in ["sceptre-ort", "sceptre-ort-layout", "sceptre-ort-autorotate"] {
+            assert!(frameworks.iter().any(|framework| framework.ends_with(variant)));
         }
+        assert!(!frameworks.iter().any(|framework| framework.contains("sceptre-tract")));
+    }
+
+    #[test]
+    fn image_release_contract_excludes_sceptre_diagnostic_variants() {
+        let contract = Cohort::Images.contract();
+        assert!(contract.matrix.iter().all(|entry| !entry.framework.contains("sceptre")));
     }
 
     #[test]

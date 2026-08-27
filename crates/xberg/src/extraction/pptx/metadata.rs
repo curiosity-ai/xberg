@@ -328,6 +328,12 @@ mod tests {
     use std::io::Cursor;
     use zip::write::{SimpleFileOptions, ZipWriter};
 
+    /// Default security limits for tests with no `ExtractionConfig` of their own to
+    /// derive one from.
+    fn default_security_limits() -> crate::extractors::security::SecurityLimits {
+        crate::extractors::security::SecurityLimits::default()
+    }
+
     fn make_pptx_with_sections(slide_ids: &[(u32, &str)], sections: &[(&str, &[u32])]) -> Vec<u8> {
         use std::io::Write;
 
@@ -422,7 +428,7 @@ mod tests {
             ],
             &[("Introduction", &[256]), ("Main Content", &[257, 258])],
         );
-        let mut container = PptxContainer::from_bytes(&pptx).unwrap();
+        let mut container = PptxContainer::from_bytes(&pptx, &default_security_limits()).unwrap();
         let sections = extract_section_names(&mut container).unwrap();
 
         assert_eq!(sections.get(&1), Some(&"Introduction".to_string()));
@@ -433,7 +439,7 @@ mod tests {
     #[test]
     fn test_extract_section_names_no_sections() {
         let pptx = make_pptx_with_sections(&[(256, "slides/slide1.xml"), (257, "slides/slide2.xml")], &[]);
-        let mut container = PptxContainer::from_bytes(&pptx).unwrap();
+        let mut container = PptxContainer::from_bytes(&pptx, &default_security_limits()).unwrap();
         let sections = extract_section_names(&mut container).unwrap();
 
         assert!(sections.is_empty(), "Expected empty map when no sections defined");
@@ -445,7 +451,7 @@ mod tests {
             &[(300, "slides/slide1.xml"), (301, "slides/slide2.xml")],
             &[("Only Section", &[300, 301])],
         );
-        let mut container = PptxContainer::from_bytes(&pptx).unwrap();
+        let mut container = PptxContainer::from_bytes(&pptx, &default_security_limits()).unwrap();
         let sections = extract_section_names(&mut container).unwrap();
 
         assert_eq!(sections.get(&1), Some(&"Only Section".to_string()));
@@ -480,7 +486,7 @@ mod tests {
 
         let _ = zip.finish().unwrap();
 
-        let mut container = PptxContainer::from_bytes(&buffer).unwrap();
+        let mut container = PptxContainer::from_bytes(&buffer, &default_security_limits()).unwrap();
         let sections = extract_section_names(&mut container).unwrap();
         assert!(
             sections.is_empty(),

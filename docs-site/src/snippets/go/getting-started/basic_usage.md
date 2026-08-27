@@ -19,9 +19,13 @@ func main() {
 	fmt.Println(result.Results[0].Content)
 
 	fmt.Println("\nMetadata:")
-	if result.Results[0].Metadata != nil {
-		fmt.Printf("Title: %v\n", result.Results[0].Metadata["title"])
-		fmt.Printf("Author: %v\n", result.Results[0].Metadata["author"])
+	if meta := result.Results[0].Metadata; meta != nil {
+		if meta.Title != nil {
+			fmt.Printf("Title: %s\n", *meta.Title)
+		}
+		if len(meta.Authors) > 0 {
+			fmt.Printf("Author: %s\n", meta.Authors[0])
+		}
 	}
 
 	fmt.Printf("\nTables found: %d\n", len(result.Results[0].Tables))

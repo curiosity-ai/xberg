@@ -101,7 +101,10 @@ internal static class ComrakBridge
                 }
                 case ElementKindTag.Heading:
                 {
-                    var heading = new MdNode(NodeType.Heading) { Heading = new NodeHeading { Level = elemKind.Level } };
+                    var heading = new MdNode(NodeType.Heading)
+                    {
+                        Heading = new NodeHeading { Level = Math.Clamp(elemKind.Level, MinHeadingLevel, MaxHeadingLevel) },
+                    };
                     BuildInlines(heading, elemText, elemAnnotations);
                     parent.Append(heading);
                     break;
@@ -116,9 +119,23 @@ internal static class ComrakBridge
                 }
                 case ElementKindTag.ListItem:
                 {
+                    // The CommonMark writer takes the marker style and the running number from the
+                    // *enclosing* List node alone — an item's own NodeList is not consulted — and
+                    // CommonMark cannot express a lettered or parenthesized marker like "B." or
+                    // "(a)" as an ordinal at all. So when a source label survived, it is written as
+                    // leading text and the list is forced to bulleted: emitting it as ordered would
+                    // print a synthesized "1." beside the real "B.", renumbering a document whose
+                    // clauses are cross-referenced by their printed label. A bullet defers to the
+                    // label instead of competing with it.
+                    string? sourceLabel = elemAttributes is not null
+                        && elemAttributes.TryGetValue(InternalElement.ListItemSourceLabelAttribute, out var rawLabel)
+                        && rawLabel.Length > 0
+                        ? rawLabel
+                        : null;
+                    bool numbered = elemKind.Ordered && sourceLabel is null;
                     var itemList = new NodeList
                     {
-                        ListType = elemKind.Ordered ? ListType.Ordered : ListType.Bullet,
+                        ListType = numbered ? ListType.Ordered : ListType.Bullet,
                         BulletChar = (byte)'-',
                         Start = 1,
                         Tight = true,
@@ -126,11 +143,26 @@ internal static class ComrakBridge
                     };
                     var item = new MdNode(NodeType.Item) { List = itemList };
                     var itemPara = new MdNode(NodeType.Paragraph);
-                    BuildInlines(itemPara, elemText, elemAnnotations);
+                    if (sourceLabel is not null) itemPara.Append(MkText(sourceLabel + " "));
+                    var (itemText, itemAnnotations) = StripRedundantListMarker(elemText, elemAnnotations);
+                    BuildInlines(itemPara, itemText, itemAnnotations);
                     item.Append(itemPara);
 
                     MdNode listParent;
-                    if (parent.Type == NodeType.List) listParent = parent;
+                    if (parent.Type == NodeType.List)
+                    {
+                        // A run opened by ListStart is already numbered; a labelled item joining it
+                        // has to demote the whole run, or the writer resumes counting around it.
+                        // NodeList is a struct, so the demoted copy has to be written back.
+                        if (!numbered)
+                        {
+                            var openList = parent.List;
+                            openList.ListType = ListType.Bullet;
+                            openList.BulletChar = (byte)'-';
+                            parent.List = openList;
+                        }
+                        listParent = parent;
+                    }
                     else
                     {
                         var implicitList = new MdNode(NodeType.List) { List = itemList };
@@ -171,15 +203,19 @@ internal static class ComrakBridge
                     if (ti >= 0 && ti < doc.Tables.Count)
                     {
                         var table = doc.Tables[ti];
-                        if (table.Cells.Count > 0)
+                        // Most formats mark their header row by writing one. A CSV, an org table or
+                        // a typst table has a first row that may be data, and the extractor says
+                        // which by whether it recorded `Columns`. Promoting that row anyway labels
+                        // the first record as the column names.
+                        bool hasHeader = doc.SourceFormat is not ("csv" or "orgmode" or "typst")
+                            || table.Columns is not null;
+                        // A grid whose every row is empty has no columns to align, and a table node
+                        // with zero columns renders as a bare row of pipes. Fall through to the
+                        // pre-rendered markdown, if the extractor left any.
+                        var tableNode = BuildTable(table.Cells, hasHeader);
+                        if (tableNode is not null)
                         {
-                            // Most formats mark their header row by writing one. A CSV, an org
-                            // table or a typst table has a first row that may be data, and the
-                            // extractor says which by whether it recorded `Columns`. Promoting
-                            // that row anyway labels the first record as the column names.
-                            bool hasHeader = doc.SourceFormat is not ("csv" or "orgmode" or "typst")
-                                || table.Columns is not null;
-                            parent.Append(BuildTable(table.Cells, hasHeader));
+                            parent.Append(tableNode);
                         }
                         else if (table.Markdown.Trim().Length > 0)
                         {
@@ -476,9 +512,84 @@ internal static class ComrakBridge
     /// synthesized ahead of the data, since GFM has no headerless table and promoting the first
     /// data row would relabel it as the column names.
     /// </summary>
-    private static MdNode BuildTable(IReadOnlyList<List<string>> cells, bool hasHeader = true)
+    /// <summary>
+    /// Build a table subtree from a 2-D cell grid, or <c>null</c> when the grid has no columns
+    /// for the caller to fall back on its pre-rendered markdown.
+    /// </summary>
+
+    /// <summary>Lower bound comrak accepts for a heading level.</summary>
+    private const byte MinHeadingLevel = 1;
+
+    /// <summary>Upper bound comrak accepts for a heading level.</summary>
+    private const byte MaxHeadingLevel = 6;
+
+    /// <summary>Bullet glyphs a list item's own text may redundantly carry.</summary>
+    private static readonly char[] BulletMarkerChars = { '-', '*', '\u2022', '\u2023', '\u25E6' };
+
+    /// <summary>
+    /// Length, in UTF-16 units, of a list marker at the head of <paramref name="text"/> that the
+    /// enclosing list will render for itself — or 0 if the text carries none.
+    /// </summary>
+    /// <remarks>
+    /// Structure detection reads a numbered marker as part of the line's own text, so an item's
+    /// text can still start with "1. " even though the element is correctly flagged as an ordered
+    /// list item. Left in place, the renderer emits its own "1. " marker followed by the untouched
+    /// label — and the CommonMark writer then backslash-escapes that second period, to keep it from
+    /// being misread as a second list start on re-parse, producing "1. 1\. Land Use…".
+    /// </remarks>
+    private static int RedundantListMarkerLength(string text)
+    {
+        if (text.Length == 0) return 0;
+
+        if (Array.IndexOf(BulletMarkerChars, text[0]) >= 0)
+        {
+            int afterBullet = 1;
+            int bulletSpaces = 0;
+            while (afterBullet + bulletSpaces < text.Length && text[afterBullet + bulletSpaces] == ' ') bulletSpaces++;
+            return bulletSpaces > 0 ? afterBullet + bulletSpaces : 0;
+        }
+
+        int digits = 0;
+        while (digits < text.Length && text[digits] is >= '0' and <= '9') digits++;
+        if (digits == 0 || digits >= text.Length) return 0;
+
+        if (text[digits] is not ('.' or ')')) return 0;
+
+        int afterDelimiter = digits + 1;
+        int spaces = 0;
+        while (afterDelimiter + spaces < text.Length && text[afterDelimiter + spaces] == ' ') spaces++;
+        return spaces > 0 ? afterDelimiter + spaces : 0;
+    }
+
+    /// <summary>
+    /// <paramref name="text"/> without the marker the enclosing list renders anyway, with the
+    /// annotation offsets shifted to match. See <see cref="RedundantListMarkerLength"/>.
+    /// </summary>
+    private static (string Text, IReadOnlyList<TextAnnotation> Annotations) StripRedundantListMarker(
+        string text, IReadOnlyList<TextAnnotation> annotations)
+    {
+        int markerLen = RedundantListMarkerLength(text);
+        if (markerLen == 0) return (text, annotations);
+
+        uint offset = (uint)Encoding.UTF8.GetByteCount(text.AsSpan(0, markerLen));
+        var adjusted = new List<TextAnnotation>(annotations.Count);
+        foreach (var ann in annotations)
+        {
+            if (ann.End <= offset) continue;
+            adjusted.Add(new TextAnnotation
+            {
+                Start = ann.Start > offset ? ann.Start - offset : 0,
+                End = ann.End - offset,
+                Kind = ann.Kind,
+            });
+        }
+        return (text[markerLen..], adjusted);
+    }
+
+    private static MdNode? BuildTable(IReadOnlyList<List<string>> cells, bool hasHeader = true)
     {
         int numCols = cells.Count > 0 ? cells.Max(r => r.Count) : 0;
+        if (numCols == 0) return null;
         int nonEmpty = cells.Sum(r => r.Count(c => c.Length > 0));
         int syntheticHeaderRows = hasHeader ? 0 : 1;
 

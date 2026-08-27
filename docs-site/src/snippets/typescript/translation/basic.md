@@ -1,8 +1,8 @@
 ```typescript title="TypeScript"
-import { extract } from '@xberg-io/xberg';
+import { ExtractInputKind, extract } from '@xberg-io/xberg';
 
 const output = await extract({
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "contract.pdf",
 }, {
     translation: {
@@ -11,7 +11,8 @@ const output = await extract({
         llm: { model: "openai/gpt-4o-mini" },
     },
 });
-if (output.results[0].translation) {
-    console.log(output.results[0].translation.content);
+const [first] = output.results ?? [];
+if (first?.translation) {
+    console.log(first.translation.content);
 }
 ```

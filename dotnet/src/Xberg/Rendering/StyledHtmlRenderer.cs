@@ -158,7 +158,14 @@ public sealed class StyledHtmlRenderer
                     break;
                 }
                 case ElementKindTag.ListItem:
-                    buf.Append($"<li class=\"{p}li\">{RenderInline(elem, p)}</li>");
+                    // <ol>/<ul> only ever render an auto-incrementing decimal or a bullet glyph;
+                    // a literal source label that shape cannot express is written out as visible
+                    // leading text, the convention every other renderer uses.
+                    if (elem.ListItemSourceLabel is { Length: > 0 } htmlLabel)
+                        buf.Append($"<li class=\"{p}li\"><span class=\"{p}list-marker\">"
+                                   + $"{Esc(htmlLabel)}</span> {RenderInline(elem, p)}</li>");
+                    else
+                        buf.Append($"<li class=\"{p}li\">{RenderInline(elem, p)}</li>");
                     break;
 
                 case ElementKindTag.QuoteStart:

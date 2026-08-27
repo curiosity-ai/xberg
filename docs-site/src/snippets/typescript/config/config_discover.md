@@ -1,5 +1,5 @@
 ```typescript title="TypeScript"
-import { extract, type ExtractionConfig } from "@xberg-io/xberg";
+import { ExtractInputKind, extract, type ExtractionConfig } from "@xberg-io/xberg";
 
 // Note: the Node binding has no config-file discovery helper. Build the
 // config object directly (or load `xberg.toml`/`xberg.yaml`/`xberg.json`
@@ -8,6 +8,6 @@ const config: ExtractionConfig = {
   useCache: true,
 };
 
-const output = await extract({ kind: "uri", uri: "document.pdf" }, config);
-console.log(output.results[0].content);
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.pdf" }, config);
+console.log(output.results?.[0]?.content);
 ```

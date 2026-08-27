@@ -246,12 +246,12 @@ fn merge_render_warning(
     }
 }
 
-/// Runs the layout pass and returns it paired with any `pdf_oxide`
+/// Runs the layout pass and returns it paired with any `xberg_native_pdf`
 /// glyph-drop warnings captured while rendering its pages (#353).
 ///
 /// On the `tokio-runtime` path the whole pass — including every render call
 /// — executes inside `spawn_blocking`, on a blocking-pool OS thread distinct
-/// from the extracting task's thread. [`crate::pdf::render::take_pdf_oxide_render_warnings`]
+/// from the extracting task's thread. [`crate::pdf::render::take_xberg_native_pdf_render_warnings`]
 /// drains a *thread-local* buffer, so it must be called from that same
 /// blocking-pool thread before the closure returns; nothing else ever visits
 /// that thread again to drain it later. The drained warnings are threaded
@@ -283,9 +283,9 @@ async fn run_layout_for_pdf_pages_async(
             .map(merge_render_warning);
             // Drain this blocking-pool thread's captured glyph-drop warnings
             // before returning: still on the thread that rendered the pages,
-            // which is the only place `PDF_OXIDE_PENDING_WARNINGS` (thread-local)
+            // which is the only place `ENGINE_PENDING_WARNINGS` (thread-local)
             // can be observed from. See the function doc comment above.
-            let glyph_drop_warnings = crate::pdf::render::take_pdf_oxide_render_warnings();
+            let glyph_drop_warnings = crate::pdf::render::take_xberg_native_pdf_render_warnings();
             (result, glyph_drop_warnings)
         })
         .await
@@ -307,7 +307,7 @@ async fn run_layout_for_pdf_pages_async(
         // No `spawn_blocking` here, so this already runs on the caller's own
         // thread; draining here keeps both branches return warnings the same
         // way regardless of which one compiled in.
-        let glyph_drop_warnings = crate::pdf::render::take_pdf_oxide_render_warnings();
+        let glyph_drop_warnings = crate::pdf::render::take_xberg_native_pdf_render_warnings();
         result.map(|attempt| (attempt, glyph_drop_warnings))
     }
 }
@@ -343,7 +343,7 @@ fn displayed_page_dimensions(width: f32, height: f32, rotation_degrees: u32) -> 
 /// Run the `Auto` gate over every page, or `None` under strategy `Always`.
 #[cfg(all(feature = "pdf", feature = "layout-detection"))]
 fn auto_gate_decisions(
-    doc: &pdf_oxide::PdfDocument,
+    doc: &xberg_native_pdf::PdfDocument,
     layout_config: &LayoutDetectionConfig,
     page_count: usize,
 ) -> Option<Vec<PageGateDecision>> {
@@ -375,7 +375,7 @@ fn gate_selects_page(gate_decisions: Option<&[PageGateDecision]>, page_index: us
 
 #[cfg(all(feature = "pdf", feature = "layout-detection"))]
 fn render_layout_chunk(
-    doc: &pdf_oxide::PdfDocument,
+    doc: &xberg_native_pdf::PdfDocument,
     page_rotations: &[u32],
     chunk_start: usize,
     chunk_end: usize,
@@ -428,7 +428,7 @@ fn render_layout_chunk(
 
 #[cfg(all(feature = "pdf", feature = "layout-detection"))]
 fn render_layout_page(
-    doc: &pdf_oxide::PdfDocument,
+    doc: &xberg_native_pdf::PdfDocument,
     page_index: usize,
     page_width_pts: f32,
     page_height_pts: f32,
@@ -592,7 +592,7 @@ pub(super) fn run_layout_for_pdf_pages(
     thread_budget: usize,
     gated_handling: GatedPageHandling,
 ) -> Result<(LayoutRunOutput, Option<crate::types::ProcessingWarning>)> {
-    let doc = pdf_oxide::PdfDocument::from_bytes(content.to_vec()).map_err(|e| XbergError::Parsing {
+    let doc = xberg_native_pdf::PdfDocument::from_bytes(content.to_vec()).map_err(|e| XbergError::Parsing {
         message: format!("layout runner: failed to open PDF: {e}"),
         source: None,
     })?;
@@ -631,7 +631,7 @@ pub(super) fn run_layout_for_pdf_pages(
     let mut engine = crate::layout::take_or_create_engine(layout_config, thread_budget)
         .map_err(|e| XbergError::Other(format!("layout runner: engine init failed: {e}")))?;
 
-    let page_rotations = crate::pdf::render::get_page_rotations(content, page_count);
+    let page_rotations = crate::pdf::render::get_page_rotations(&doc, page_count);
 
     let mut all_images: Vec<image::RgbImage> = Vec::with_capacity(page_count);
     let mut all_layout_results: Vec<PageLayoutResult> = Vec::with_capacity(page_count);
@@ -703,7 +703,7 @@ pub(super) fn run_layout_for_pdf_pages(
 /// the proactively resolved or recovered CPU acceleration config so downstream
 /// TATR/OCR models use the same provider. Rendering and inference run off the
 /// async executor when a Tokio runtime is enabled. The eighth value carries any
-/// `pdf_oxide` glyph-drop warnings captured while rendering this pass's pages
+/// `xberg_native_pdf` glyph-drop warnings captured while rendering this pass's pages
 /// (#353); always present (possibly empty) rather than folded into the sixth
 /// value so each cause stays a distinct, individually-deduped
 /// `ProcessingWarning` when the caller merges it via `push_warning_deduped`.
@@ -833,7 +833,7 @@ pub(super) async fn maybe_run_layout_for_markdown(
 /// then proceeds exactly as if layout were off, rendering its own OCR rasters once.
 /// Mirrors the markdown path's CPU fallback and warning on accelerated failure (#1344).
 ///
-/// The second element of the returned tuple carries any `pdf_oxide` glyph-drop
+/// The second element of the returned tuple carries any `xberg_native_pdf` glyph-drop
 /// warnings captured while this pass rendered its pages (#353); the caller must
 /// merge them into the document's `processing_warnings`.
 #[cfg(all(
@@ -1160,7 +1160,7 @@ mod tests {
 
     /// A PDF whose page tree declares `/Count 2` in the `Pages` dictionary but
     /// whose `/Kids` array lists only one real page. `page_count()` trusts the
-    /// declared `/Count` (pdf_oxide's primary reader), so the runner iterates
+    /// declared `/Count` (xberg_native_pdf's primary reader), so the runner iterates
     /// page index 1 as if it existed; the page tree walk that resolves that
     /// index then genuinely fails, giving a real (not injected) render
     /// failure at the same seam production traffic would hit for a
@@ -1200,11 +1200,11 @@ mod tests {
         bytes
     }
 
-    fn assert_pdf_oxide_applies_rotation(bytes: Vec<u8>) {
-        let document = pdf_oxide::PdfDocument::from_bytes(bytes.clone()).expect("fixture PDF must open");
+    fn assert_xberg_native_pdf_applies_rotation(bytes: Vec<u8>) {
+        let document = xberg_native_pdf::PdfDocument::from_bytes(bytes.clone()).expect("fixture PDF must open");
         let rendered =
             crate::pdf::render::render_page_with_safeguards(&document, 0, 72).expect("rotated fixture must render");
-        let rotations = crate::pdf::render::get_page_rotations(&bytes, 1);
+        let rotations = crate::pdf::render::get_page_rotations(&document, 1);
         let (media_width, media_height) = document
             .get_page_media_box(0)
             .map(|(llx, lly, urx, ury)| ((urx - llx).abs(), (ury - lly).abs()))
@@ -1363,7 +1363,7 @@ mod tests {
         use crate::core::config::layout::LayoutStrategy;
 
         let bytes = prose_pdf(20);
-        let doc = pdf_oxide::PdfDocument::from_bytes(bytes.clone()).expect("fixture PDF must open");
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(bytes.clone()).expect("fixture PDF must open");
         let decisions = crate::pdf::layout_gate::decide_pages(&doc, 1);
         assert_eq!(decisions.len(), 1);
         assert!(
@@ -1441,7 +1441,7 @@ mod tests {
     #[test]
     fn gated_handling_controls_whether_gated_pages_render() {
         let bytes = rotated_pdf(false, 90);
-        let doc = pdf_oxide::PdfDocument::from_bytes(bytes).expect("fixture PDF must open");
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(bytes).expect("fixture PDF must open");
         let decisions = vec![gate_decision(false)];
 
         let skipped = render_layout_chunk(&doc, &[0], 0, 1, Some(&decisions), GatedPageHandling::SkipRender);
@@ -1473,7 +1473,7 @@ mod tests {
                 .expect("fixture should contain one page")
                 .1
                 .to_rgb8();
-            let document = pdf_oxide::PdfDocument::from_bytes(bytes).expect("layout OCR fixture PDF must open");
+            let document = xberg_native_pdf::PdfDocument::from_bytes(bytes).expect("layout OCR fixture PDF must open");
             let mut layout_pages = render_layout_chunk(
                 &document,
                 &[rotation as u32],
@@ -1493,18 +1493,18 @@ mod tests {
     }
 
     #[test]
-    fn pdf_oxide_applies_direct_page_rotation() {
-        assert_pdf_oxide_applies_rotation(rotated_pdf(false, 90));
+    fn xberg_native_pdf_applies_direct_page_rotation() {
+        assert_xberg_native_pdf_applies_rotation(rotated_pdf(false, 90));
     }
 
     #[test]
-    fn pdf_oxide_applies_inherited_page_rotation() {
-        assert_pdf_oxide_applies_rotation(rotated_pdf(true, 90));
+    fn xberg_native_pdf_applies_inherited_page_rotation() {
+        assert_xberg_native_pdf_applies_rotation(rotated_pdf(true, 90));
     }
 
     /// Drives a genuine, unrenderable page through the full
     /// `run_layout_for_pdf_pages` entry point (#196): the fixture's page tree
-    /// declares `/Count 2` but only lists one real page, so pdf_oxide's page
+    /// declares `/Count 2` but only lists one real page, so xberg_native_pdf's page
     /// tree walk for index 1 fails for real — this is not an injected error.
     /// The other page renders and runs inference normally, proving the
     /// warning is additive rather than replacing the successful pages.
@@ -1566,7 +1566,7 @@ mod tests {
     /// `tests/issue_291_dropped_glyph_warning.rs`. Duplicated here (rather
     /// than shared) because `run_layout_for_pdf_pages_async` is private to
     /// this crate and unreachable from that external integration test.
-    /// `pdf_oxide`'s `PageRenderer::load_resources` requires every `/Font`
+    /// `xberg_native_pdf`'s `PageRenderer::load_resources` requires every `/Font`
     /// resource to resolve to a dictionary and logs `Failed to parse font ...`
     /// then drops the glyph rather than failing the page.
     #[cfg(feature = "tokio-runtime")]
@@ -1613,8 +1613,8 @@ mod tests {
     /// Layout-detection rasterization runs the whole layout pass — including
     /// every render call — inside `tokio::task::spawn_blocking`, which always
     /// executes on a blocking-pool OS thread distinct from the thread that
-    /// called it. `take_pdf_oxide_render_warnings` drains a *thread-local*
-    /// buffer (`PDF_OXIDE_PENDING_WARNINGS`), so before this fix nothing ever
+    /// called it. `take_xberg_native_pdf_render_warnings` drains a *thread-local*
+    /// buffer (`ENGINE_PENDING_WARNINGS`), so before this fix nothing ever
     /// visited that blocking-pool thread again to drain it: any glyph-drop
     /// warning captured during layout rendering was silently lost, and kept
     /// accumulating, unbounded, on that pooled thread across documents.
@@ -1622,28 +1622,28 @@ mod tests {
     /// This drives the real `spawn_blocking` boundary
     /// (`run_layout_for_pdf_pages_async`, gated on the default-on
     /// `tokio-runtime` feature) with a page whose font resource is
-    /// structurally invalid, so `pdf_oxide` drops every glyph drawn with it
-    /// and reports the drop through `log::warn!` (see `crate::pdf::render`
+    /// structurally invalid, so `xberg_native_pdf` drops every glyph drawn with it
+    /// and reports the drop through `tracing::warn!` (see `crate::pdf::render`
     /// and the #291/#1364 fixture in `tests/issue_291_dropped_glyph_warning.rs`).
     #[cfg(feature = "tokio-runtime")]
     #[tokio::test]
     async fn glyph_drop_warnings_survive_the_spawn_blocking_layout_pass() {
         use crate::core::config::layout::LayoutStrategy;
 
-        // Capture is opt-in: unless an application (here, the test) asks for
-        // it, `render_page_capturing_glyph_drops` arms nothing. Asserting the
-        // return value (rather than ignoring it) is required, not cosmetic —
-        // a test binary where some other component already owns the `log`
-        // backend would otherwise pass this test for the wrong reason: no
-        // warnings would ever be captured at all, layout render or not. ~keep
+        // Capture is opt-in: unless an application (here, the test) asks for it,
+        // `render_page_capturing_glyph_drops` arms nothing. Asserting the return value
+        // (rather than ignoring it) is required, not cosmetic — a test binary where some
+        // other component already owns the `tracing` dispatcher would otherwise pass this
+        // test for the wrong reason: no warnings would ever be captured at all, layout
+        // render or not. ~keep
         assert!(
             crate::pdf::render::install_pdf_render_diagnostics(),
-            "no other component should own the log backend in this test binary"
+            "no other component should own the tracing dispatcher in this test binary"
         );
         // Drain any residual state left on this thread by an earlier test
         // that happened to reuse it, so the empty-buffer assertion below is
         // exact rather than "no worse than before".
-        let _ = crate::pdf::render::take_pdf_oxide_render_warnings();
+        let _ = crate::pdf::render::take_xberg_native_pdf_render_warnings();
 
         let bytes = malformed_font_layout_fixture();
         let config = LayoutDetectionConfig {
@@ -1680,7 +1680,7 @@ mod tests {
         );
         assert!(
             warning.message.contains("Failed to parse font"),
-            "warning must carry pdf_oxide's own diagnosis of the cause, got: {}",
+            "warning must carry xberg_native_pdf's own diagnosis of the cause, got: {}",
             warning.message
         );
 
@@ -1689,7 +1689,7 @@ mod tests {
         // thread; before this fix, that thread's captured warning was never
         // returned to the caller and nothing else ever drained it, so it
         // would neither show up here nor above.
-        let leaked_to_caller_thread = crate::pdf::render::take_pdf_oxide_render_warnings();
+        let leaked_to_caller_thread = crate::pdf::render::take_xberg_native_pdf_render_warnings();
         assert!(
             leaked_to_caller_thread.is_empty(),
             "glyph-drop warnings must come back through the spawn_blocking closure's return value, not leak into \

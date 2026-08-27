@@ -131,9 +131,8 @@ pub struct CleanOutcome {
     pub failed: usize,
 }
 
-/// Remove the stray files reported by [`check_cache`]. Only regular files
-/// directly in the xberg cache base are touched — directories and symlinks
-/// never; see [`stray_files`]. Returns `None` without touching anything when
+/// Remove obsolete regular files directly inside the xberg cache directory.
+/// Directories and symlinks are never removed. Returns `None` without touching anything when
 /// `XBERG_CACHE_DIR` is set: ownership of an overridden base cannot be
 /// verified, so it is never cleaned.
 ///

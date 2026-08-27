@@ -294,7 +294,20 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 }
             }
             ElementKind::ListItem { .. } => {
-                write!(buf, r#"<li class="{p}li">{}</li>"#, render_inline(doc, elem, p)).unwrap();
+                // `<ol>`/`<ul>` only ever render an auto-incrementing decimal or a bullet
+                // glyph; a literal source label (e.g. "B.", "(a)") that shape cannot
+                // express is written out as visible leading text instead, same convention
+                // the other renderers use.
+                match elem.list_item_source_label() {
+                    Some(label) if !label.is_empty() => write!(
+                        buf,
+                        r#"<li class="{p}li"><span class="{p}list-marker">{}</span> {}</li>"#,
+                        esc(label),
+                        render_inline(doc, elem, p)
+                    )
+                    .unwrap(),
+                    _ => write!(buf, r#"<li class="{p}li">{}</li>"#, render_inline(doc, elem, p)).unwrap(),
+                }
             }
 
             ElementKind::QuoteStart => {

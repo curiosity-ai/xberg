@@ -3,22 +3,8 @@ title: "Extraction Basics"
 ---
 
 import { Tabs, TabItem } from "@astrojs/starlight/components";
-import { Content as Snip_python_getting_started_read_content } from "../../../snippets/python/getting-started/read_content.md";
-import { Content as Snip_go_getting_started_basic_usage } from "../../../snippets/go/getting-started/basic_usage.md";
-import { Content as Snip_ruby_getting_started_basic_usage } from "../../../snippets/ruby/getting-started/basic_usage.md";
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 import { Content as Snip_wasm_getting_started_browser_file_input } from "../../../snippets/wasm/getting-started/browser-file-input.md";
-import { Content as Snip_csharp_advanced_batch_processing } from "../../../snippets/csharp/advanced/batch_processing.md";
-import { Content as Snip_php_extraction_batch_processing } from "../../../snippets/php/extraction/batch_processing.md";
-import { Content as Snip_wasm_getting_started_batch_processing } from "../../../snippets/wasm/getting-started/batch-processing.md";
-import { Content as Snip_python_utils_error_handling } from "../../../snippets/python/utils/error_handling.md";
-import { Content as Snip_typescript_api_error_handling } from "../../../snippets/typescript/api/error_handling.md";
-import { Content as Snip_rust_api_error_handling } from "../../../snippets/rust/api/error_handling.md";
-import { Content as Snip_go_api_error_handling } from "../../../snippets/go/api/error_handling.md";
-import { Content as Snip_java_api_error_handling } from "../../../snippets/java/api/error_handling.md";
-import { Content as Snip_csharp_error_handling } from "../../../snippets/csharp/error_handling.md";
-import { Content as Snip_ruby_api_error_handling } from "../../../snippets/ruby/api/error_handling.md";
-import { Content as Snip_c_api_error_handling } from "../../../snippets/c/api/error_handling.md";
-import { Content as Snip_wasm_api_error_handling_wasm } from "../../../snippets/wasm/api/error_handling_wasm.md";
 
 Extract text, metadata, and structure from 100 file formats — PDFs, Office documents, images, email, HTML, archives, and more. Single files or batches, from local paths or in-memory bytes, with per-document configuration overrides and built-in content filtering.
 
@@ -87,23 +73,7 @@ println!("{}", output.results[0].content);
 
 Every entry in `results` carries the text plus the structures found in the document. Read the content, the tables, and the format metadata from the same document:
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_getting_started_read_content />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_getting_started_basic_usage />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_getting_started_basic_usage />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="contract/api_extract_uri" />
 
 ## Extract from Bytes
 
@@ -174,73 +144,7 @@ The Wasm package has no filesystem access, so a browser upload always goes throu
 `extract_batch` accepts a list of `ExtractInput` values. Mix URI and byte inputs
 in one request when a pipeline receives documents from multiple sources.
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-```python title="extract_batch.py"
-from xberg import ExtractInput, extract_batch
-
-inputs = [
-    ExtractInput(kind="uri", uri="report.pdf"),
-    ExtractInput(kind="uri", uri="scan.tiff", mime_type="image/tiff"),
-]
-
-output = await extract_batch(inputs)
-for result in output.results:
-    print(result.content[:200])
-```
-
-</TabItem>
-<TabItem label="TypeScript">
-
-```typescript title="extract-batch.ts"
-import { ExtractInputKind, extractBatch } from "@xberg-io/xberg";
-
-const output = await extractBatch([
-  { kind: ExtractInputKind.Uri, uri: "report.pdf" },
-  { kind: ExtractInputKind.Uri, uri: "scan.tiff", mimeType: "image/tiff" },
-]);
-for (const result of output.results) {
-  console.log(result.content.slice(0, 200));
-}
-```
-
-</TabItem>
-<TabItem label="Rust">
-
-```rust title="extract_batch.rs"
-use xberg::{extract_batch, ExtractInput, ExtractionConfig};
-
-let config = ExtractionConfig::default();
-let inputs = vec![
-    ExtractInput::from_uri("report.pdf"),
-    ExtractInput {
-        uri: Some("scan.tiff".to_string()),
-        mime_type: Some("image/tiff".to_string()),
-        ..Default::default()
-    },
-];
-
-let output = extract_batch(inputs, &config).await?;
-```
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_advanced_batch_processing />
-
-</TabItem>
-<TabItem label="PHP">
-
-<Snip_php_extraction_batch_processing />
-
-</TabItem>
-<TabItem label="Wasm">
-
-<Snip_wasm_getting_started_batch_processing />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="batch/extract_batch_uri_basic" />
 
 ### Per-Input Configuration
 
@@ -369,6 +273,7 @@ should never come close to the defaults below.
 | `max_content_size`       | Aggregate text growth across a whole document (catches long-tail expansion that `max_entity_length` alone would miss) | 100 MB |
 | `max_iterations`         | Infinite or near-infinite parser loops (XML token loop, HTML tokenizer, JSON parser) | 10,000,000 |
 | `max_table_cells`        | Documents claiming an unreasonable number of table cells (CSV, XLSX, HTML tables) | 100,000 |
+| `max_pages`              | Excessive per-page OCR, layout, and rendering work                                | Unlimited      |
 
 When both `max_nesting_depth` and `max_xml_depth` apply to the same parse, the
 tighter of the two wins — lowering either one alone is enough to clamp nesting.
@@ -393,7 +298,10 @@ config = ExtractionConfig(
     security_limits=SecurityLimits(
         max_archive_size=100 * 1024 * 1024,  # 100 MiB
         max_files_in_archive=1_000,
+        max_pages=250,
     ),
+    max_embedded_file_bytes=20 * 1024 * 1024,
+    extraction_timeout_secs=120,
 )
 
 output = await extract(ExtractInput(kind="uri", uri="archive.zip"), config=config)
@@ -411,7 +319,10 @@ const output = await extract(
     securityLimits: {
       maxArchiveSize: 100 * 1024 * 1024, // 100 MiB
       maxFilesInArchive: 1_000,
+      maxPages: 250,
     },
+    maxEmbeddedFileBytes: 20 * 1024 * 1024,
+    extractionTimeoutSecs: 120,
   },
 );
 ```
@@ -426,8 +337,11 @@ let config = ExtractionConfig {
     security_limits: Some(SecurityLimits {
         max_archive_size: 100 * 1024 * 1024, // 100 MiB
         max_files_in_archive: 1_000,
+        max_pages: Some(250),
         ..Default::default()
     }),
+    max_embedded_file_bytes: Some(20 * 1024 * 1024),
+    extraction_timeout_secs: Some(120),
     ..Default::default()
 };
 
@@ -467,11 +381,15 @@ xberg_security_limits_free(limits);
 Any field left unset falls back to the `SecurityLimits::default()` value shown
 in the table above.
 
-**PHP note:** `SecurityLimits` is constructible and readable in PHP, but
-`ExtractionConfig` does not accept a `SecurityLimits` argument in its
-constructor — the `getSecurityLimits()` getter always reflects the defaults.
-PHP callers cannot currently tighten or loosen these limits; if you need
-non-default limits from PHP, extract via another binding or the CLI.
+`max_pages` is enforced before per-page work for PDF, PPTX, Keynote, ODP, and
+multi-frame TIFF when OCR is enabled. It is not a universal document-page cap:
+DOCX, ODT, XLSX, legacy Office files, Pages, Numbers, and TIFF without OCR do
+not expose a reliable page count before extraction. Keep the byte, archive,
+embedded-file, and timeout limits enabled even when you set `max_pages`.
+
+**PHP note:** construct `SecurityLimits`, then apply it with
+`ExtractionConfig::setSecurityLimits()`; the generated constructor does not
+take `securityLimits` directly.
 
 ### What happens when a limit is hit
 
@@ -655,6 +573,45 @@ stripping. See the
 [reference page](/reference/configuration/#contentfilterconfig) for the full
 field semantics and per-format behavior.
 
+## Jupyter Notebook Cells
+
+Choose whether `.ipynb` extraction includes code-cell source, saved outputs, or
+both. Xberg never executes notebook cells; output modes expose only data already
+stored in the notebook. Markdown cells and structural metadata are unaffected.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+
+```python
+from xberg import ExtractionConfig, JupyterCellRendering
+
+config = ExtractionConfig(jupyter_cell_rendering=JupyterCellRendering.SOURCE)
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+use xberg::{ExtractionConfig, JupyterCellRendering};
+
+let config = ExtractionConfig {
+    jupyter_cell_rendering: JupyterCellRendering::Source,
+    ..Default::default()
+};
+```
+
+</TabItem>
+<TabItem label="CLI">
+
+```bash
+xberg extract notebook.ipynb --jupyter-cell-rendering source
+```
+
+</TabItem>
+</Tabs>
+
+Use `source`, `outputs`, or `both` (the default).
+
 ## Supported Formats
 
 Xberg supports 100 file formats across 120 file extensions in 8 categories:
@@ -795,55 +752,11 @@ result = await extract(
 
 ## Error Handling
 
-All extraction functions raise typed exceptions on failure. Catch specific exceptions to handle different failure modes:
+Extraction failures use each language's typed error surface: exceptions in
+exception-based bindings, `Result` in Rust, and error values or status codes in
+other targets. This example handles an unsupported MIME type:
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_utils_error_handling />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_api_error_handling />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_api_error_handling />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_api_error_handling />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_api_error_handling />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_error_handling />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_api_error_handling />
-
-</TabItem>
-<TabItem label="C">
-
-<Snip_c_api_error_handling />
-
-</TabItem>
-<TabItem label="Wasm">
-
-<Snip_wasm_api_error_handling_wasm />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="error/error_unsupported_mime" />
 
 :::caution[System Errors]
 `OSError` (Python), `IOException` (Rust), and system-level errors always propagate through. These indicate real system problems (permissions, disk space, etc.) that your application should handle.

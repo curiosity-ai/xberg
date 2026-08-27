@@ -16,6 +16,8 @@
 //!         ocrx_word  →  word text with bbox and confidence
 //! ```
 
+use memchr::memchr;
+
 use crate::types::extraction::BoundingBox;
 use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
 use crate::types::ocr_elements::{OcrBoundingGeometry, OcrConfidence, OcrElementLevel};
@@ -49,7 +51,42 @@ struct HocrBlockExtent {
 /// | `ocrx_word`   | word text, bbox, `x_wconf` → `OcrConfidence` |
 ///
 /// Page numbers come from the `ppageno` title property (converted to 1-indexed).
+#[cfg(test)]
 pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocument {
+    parse_hocr_to_internal_document_with_dictionary_filter(hocr_html, None)
+}
+
+/// Same as [`parse_hocr_to_internal_document`], with an optional per-line
+/// dictionary-invalid noise filter (#783). See [`DictionaryLineFilter`] for why this must
+/// run here -- before a paragraph's `ocr_line` groups are joined into its `\n`-joined
+/// `text` -- rather than against either of that text's two independent downstream
+/// consumers.
+///
+/// Kept as a separate function (rather than adding a parameter to
+/// [`parse_hocr_to_internal_document`] directly) so the ~30 existing call sites that only
+/// ever want the unfiltered parse -- almost all of them tests -- do not need to change.
+#[cfg(test)]
+pub(crate) fn parse_hocr_to_internal_document_with_dictionary_filter(
+    hocr_html: &str,
+    dictionary_filter: Option<&DictionaryLineFilter<'_>>,
+) -> InternalDocument {
+    parse_hocr_to_internal_document_with_page_offset(hocr_html, dictionary_filter, 1)
+}
+
+/// Same as [`parse_hocr_to_internal_document_with_dictionary_filter`], except elements' page
+/// numbers are computed as `ppageno + page_offset` instead of always `ppageno + 1`.
+///
+/// Tesseract numbers every single-image `recognize()` call's hOCR page as `ppageno 0`
+/// regardless of which page of the source document that image actually is -- `perform_ocr`
+/// (`ocr::processor::execution`) loads and recognizes exactly one image per call, so the hOCR
+/// it gets back can never know the true page number on its own. Callers that OCR one page at a
+/// time out of a larger document (the PDF OCR route) pass the real 1-indexed page number here,
+/// via `TesseractConfig::page_number`, instead of letting every page collapse to `1`.
+pub(crate) fn parse_hocr_to_internal_document_with_page_offset(
+    hocr_html: &str,
+    dictionary_filter: Option<&DictionaryLineFilter<'_>>,
+    page_offset: u32,
+) -> InternalDocument {
     let mut doc = InternalDocument::new("ocr");
     doc.mime_type = "application/x-hocr".to_string();
 
@@ -78,7 +115,7 @@ pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocume
         if has_class(tag_content, "ocr_page") {
             let title = extract_title_attr(tag_content);
             let props = parse_title_properties(&title);
-            let page_number = props.ppageno.map(|p| p + 1);
+            let page_number = props.ppageno.map(|p| p + page_offset);
 
             if let Some(prev) = last_page
                 && page_number != Some(prev)
@@ -111,8 +148,14 @@ pub(crate) fn parse_hocr_to_internal_document(hocr_html: &str) -> InternalDocume
                 .next()
                 .unwrap_or("p")
                 .to_ascii_lowercase();
-            let (paragraph, end_pos) =
-                parse_paragraph(hocr_html, pos, last_page.unwrap_or(1), element_index, &par_tag_name);
+            let (paragraph, end_pos) = parse_paragraph(
+                hocr_html,
+                pos,
+                last_page.unwrap_or(page_offset),
+                element_index,
+                &par_tag_name,
+                dictionary_filter,
+            );
             pos = end_pos;
 
             if let Some(mut elem) = paragraph {
@@ -154,6 +197,23 @@ struct HocrProperties {
     x_font: Option<String>,
     /// Font size in points.
     x_fsize: Option<u32>,
+    /// Whether the word is rendered in a bold font, from the word's `x_bold`
+    /// hOCR property. Only present on `ocrx_word` titles when Tesseract's
+    /// `hocr_font_info` variable is enabled (`ocr/processor/config.rs`).
+    x_bold: bool,
+    /// Whether the word is rendered in an italic font, from the word's
+    /// `x_italic` hOCR property. Same availability as `x_bold`.
+    x_italic: bool,
+    /// x-height in pixels — the height of the line's lowercase letters
+    /// excluding ascenders/descenders. Emitted by Tesseract on `ocr_line`/
+    /// `ocrx_line` titles, not on individual words. A better heading signal
+    /// than raw bbox height because it is insensitive to how many ascenders
+    /// or descenders happen to appear in a given line.
+    x_size: Option<f64>,
+    /// Ascender height in pixels, from the line's `x_ascenders` property.
+    x_ascenders: Option<f64>,
+    /// Descender height in pixels, from the line's `x_descenders` property.
+    x_descenders: Option<f64>,
 }
 
 /// Parse all properties from an hOCR title attribute string.
@@ -214,6 +274,27 @@ fn parse_title_properties(title: &str) -> HocrProperties {
                     props.x_fsize = Some(val);
                 }
             }
+            "x_bold" => {
+                props.x_bold = true;
+            }
+            "x_italic" => {
+                props.x_italic = true;
+            }
+            "x_size" => {
+                if let Some(val) = tokens.next().and_then(|s| s.parse::<f64>().ok()) {
+                    props.x_size = Some(val);
+                }
+            }
+            "x_ascenders" => {
+                if let Some(val) = tokens.next().and_then(|s| s.parse::<f64>().ok()) {
+                    props.x_ascenders = Some(val);
+                }
+            }
+            "x_descenders" => {
+                if let Some(val) = tokens.next().and_then(|s| s.parse::<f64>().ok()) {
+                    props.x_descenders = Some(val);
+                }
+            }
             _ => {}
         }
     }
@@ -240,6 +321,128 @@ struct HocrWordInfo {
     font_size: Option<u32>,
     /// Text rotation angle in degrees, from the word's `textangle` hOCR property.
     text_angle: Option<f64>,
+    /// Font family name, from the word's `x_font` hOCR property.
+    font_name: Option<String>,
+    /// Whether the word is bold, from the word's `x_bold` hOCR property.
+    is_bold: bool,
+    /// Whether the word is italic, from the word's `x_italic` hOCR property.
+    is_italic: bool,
+}
+
+/// Per-`ocr_line`/`ocrx_line` metadata parsed from that tag's own `title`
+/// attribute, plus the words it contains.
+///
+/// Kept as one entry per physical hOCR line (rather than folded immediately
+/// into a paragraph-wide average) so a downstream consumer can recover a
+/// line-level font size — the paragraph mean alone hides variation between,
+/// say, a heading's first line and a wrapped continuation line at body size.
+#[derive(Default)]
+struct HocrLineInfo {
+    words: Vec<HocrWordInfo>,
+    /// x-height in pixels (`x_size`) — see [`HocrProperties::x_size`].
+    x_size: Option<f64>,
+    /// Ascender height in pixels (`x_ascenders`).
+    x_ascenders: Option<f64>,
+    /// Descender height in pixels (`x_descenders`).
+    x_descenders: Option<f64>,
+    /// Baseline (slope, constant), from the line's `baseline` property.
+    baseline: Option<(f64, i32)>,
+}
+
+/// Per-line dictionary-invalid noise filter, threaded through hOCR parsing (#783).
+///
+/// Applied while a paragraph's `ocr_line` groups are still separate physical lines —
+/// before their words are joined into the paragraph's `\n`-joined `text` — so every
+/// consumer of that text sees the same, already-filtered lines. That matters because
+/// there are two such consumers built from the same `InternalElement.text`:
+/// `flatten_hocr_elements_to_text` (feeding the flat OCR page string) and
+/// `pdf::structure::adapters::ocr_doc_to_paragraphs` / `ocr_doc_to_layout_paragraphs`
+/// (feeding the rendered document's paragraphs). Filtering later, against either
+/// rendering independently, risks the two silently drifting apart: a prior attempt at
+/// this fix (reverted as `29738a1f29`) stripped noise lines only from the flat text
+/// string, which never changed the rendered document for any page that also produced
+/// structured paragraphs — exactly the elevations-page case this filter targets.
+pub(crate) struct DictionaryLineFilter<'a> {
+    /// Dictionary membership test, e.g. `TesseractAPI::is_valid_word`. `Some(true)` =
+    /// valid, `Some(false)` = invalid, `None` = the lookup itself failed or was
+    /// unavailable (never counted as evidence either way).
+    pub is_valid_word: &'a dyn Fn(&str) -> Option<bool>,
+    /// A line is dropped when its dictionary-checkable words' invalid fraction is
+    /// STRICTLY GREATER than this. See [`DEFAULT_DICT_INVALID_LINE_RATIO`] for how the
+    /// default value was derived.
+    pub max_invalid_ratio: f64,
+}
+
+/// Minimum letters a word must have before a dictionary lookup on it is meaningful.
+/// Mirrors `ocr::processor::execution::MIN_WORD_LEN_FOR_DICT_CHECK` — both filter the
+/// same class of noise (an OCR fragment too short for the dictionary to judge either
+/// way), kept as a separate constant here rather than a shared import so this module
+/// does not need `ocr::processor::execution` to be `pub(crate)`.
+const MIN_WORD_LEN_FOR_DICT_CHECK: usize = 3;
+
+/// Minimum dictionary-checkable words a single hOCR line must contain before
+/// [`is_dictionary_noise_line`] scores it at all.
+///
+/// A physical line is short (a title-block label, a heading), so a high floor would
+/// silence this signal for nearly every line on a drawing page. Two independently
+/// checkable words distinguish "every word on this line is nonsense" from "one unusual
+/// term stands alone on this line" — the latter is exactly the shape of a real proper
+/// noun or technical term (a plant genus, a part number) that must not be flagged from a
+/// single data point. The blast radius of a wrong per-line call is only that one line,
+/// not the whole page, which is what makes a lower floor than a page-level check safe.
+pub(crate) const MIN_DICT_CANDIDATES_FOR_LINE: usize = 2;
+
+/// Default [`DictionaryLineFilter::max_invalid_ratio`] (#783).
+///
+/// Not a config field: [`OcrQualityThresholds`](crate::core::config::OcrQualityThresholds)
+/// is part of xberg's alef-generated multi-language binding surface, and every field on it
+/// is regenerated into ~15 language bindings, so adding one requires a full `alef
+/// generate` pass this fix does not perform. This constant is the internal default until
+/// that threading is done deliberately, as its own change with its own binding regen.
+///
+/// `0.6`, derived directly from two measured examples (2026-08-22), not picked as a round
+/// number:
+/// - The motivating noise line, "OWATS DNDEVET OPMENT", scores 2 invalid of 3
+///   dictionary-checkable candidates (0.667) even though Tesseract's DAWG lookup itself
+///   falsely reports "OPMENT" as a valid word -- counting that false positive as valid
+///   still leaves the line above 0.6.
+/// - The plant-list guard line, "Ligustrum, Photinia, Azalea, Indian Hawthorne", scores 2
+///   invalid of 5 (0.4) and must survive untouched.
+///
+/// 0.6 sits roughly the same distance below the first number as above the second, and
+/// matches the existing `max_fragmented_word_ratio` convention in
+/// `OcrQualityThresholds`. Unlike that struct's page-level
+/// `max_ocr_output_dict_invalid_word_ratio` (disabled by default at `1.01` pending a
+/// corpus-wide calibration), this is enabled from the start: the blast radius of a wrong
+/// call here is exactly one line, never a whole page, so the acceptable cost of a false
+/// positive is far lower.
+pub(crate) const DEFAULT_DICT_INVALID_LINE_RATIO: f64 = 0.6;
+
+/// Whether `line`'s dictionary-checkable words are, on balance, not real words.
+///
+/// Returns `false` (never noise) for a line with fewer than
+/// [`MIN_DICT_CANDIDATES_FOR_LINE`] checkable words — see that constant's doc comment.
+fn is_dictionary_noise_line(line: &HocrLineInfo, filter: &DictionaryLineFilter<'_>) -> bool {
+    let mut candidates = 0usize;
+    let mut invalid = 0usize;
+    for word in &line.words {
+        let text = word.text.trim();
+        if text.chars().count() < MIN_WORD_LEN_FOR_DICT_CHECK || !text.chars().all(|c| c.is_alphabetic()) {
+            continue;
+        }
+        match (filter.is_valid_word)(text) {
+            Some(true) => candidates += 1,
+            Some(false) => {
+                candidates += 1;
+                invalid += 1;
+            }
+            None => {}
+        }
+    }
+    if candidates < MIN_DICT_CANDIDATES_FOR_LINE {
+        return false;
+    }
+    (invalid as f64 / candidates as f64) > filter.max_invalid_ratio
 }
 
 /// Attribute key holding the paragraph's average word font size (points, as a
@@ -250,6 +453,110 @@ pub(crate) const HOCR_FONT_SIZE_ATTRIBUTE: &str = "x_fsize";
 /// Attribute key holding the paragraph's average word text-rotation angle in
 /// degrees (as a decimal string), when any word reported a non-zero angle.
 pub(crate) const HOCR_TEXT_ANGLE_ATTRIBUTE: &str = "textangle";
+
+/// Attribute key holding the paragraph's average line x-height in pixels (as
+/// a decimal string), averaged over lines that reported an `x_size` on their
+/// `ocr_line`/`ocrx_line` title. x-height is a better heading signal than raw
+/// bbox height because it is insensitive to ascender/descender mix.
+pub(crate) const HOCR_X_HEIGHT_ATTRIBUTE: &str = "x_size";
+
+/// Attribute key holding the paragraph's average line ascender height in
+/// pixels (as a decimal string).
+pub(crate) const HOCR_X_ASCENDERS_ATTRIBUTE: &str = "x_ascenders";
+
+/// Attribute key holding the paragraph's average line descender height in
+/// pixels (as a decimal string).
+pub(crate) const HOCR_X_DESCENDERS_ATTRIBUTE: &str = "x_descenders";
+
+/// Attribute key holding the paragraph's average line baseline slope (as a
+/// decimal string), averaged over lines that reported a `baseline` on their
+/// `ocr_line`/`ocrx_line` title.
+pub(crate) const HOCR_BASELINE_SLOPE_ATTRIBUTE: &str = "baseline_slope";
+
+/// Attribute key holding the paragraph's average line baseline constant
+/// (pixels, as a decimal string).
+pub(crate) const HOCR_BASELINE_CONST_ATTRIBUTE: &str = "baseline_const";
+
+/// Attribute key holding one average word font size (points) per physical
+/// text line, comma-separated in the same order as the `\n`-separated lines
+/// of the element's `text`. A line with no word reporting `x_fsize` is
+/// rendered as an empty field so field position still lines up with `text`.
+/// Lets a downstream consumer compute a line-level (not just paragraph-mean)
+/// font size without carrying every word's bounding box.
+pub(crate) const HOCR_LINE_FONT_SIZES_ATTRIBUTE: &str = "line_font_sizes";
+
+/// Attribute key holding one line x-height (pixels, from `x_size`) per
+/// physical text line, comma-separated in the same order as the
+/// `\n`-separated lines of the element's `text`, with the same empty-field
+/// alignment rule as [`HOCR_LINE_FONT_SIZES_ATTRIBUTE`].
+pub(crate) const HOCR_LINE_X_HEIGHTS_ATTRIBUTE: &str = "line_x_heights";
+
+/// Attribute key holding the fraction (0.0-1.0, as a decimal string) of the
+/// paragraph's words that Tesseract reported as bold via `x_bold`. Only
+/// populated on `ocrx_word` titles when `hocr_font_info` is enabled
+/// (`ocr/processor/config.rs`). Boldness is an independent heading cue from
+/// font size, restoring a signal `from_ocr_elements` consumed before it was
+/// deleted as collateral of an unrelated refactor (commit `22161b0d1cc`).
+pub(crate) const HOCR_BOLD_FRACTION_ATTRIBUTE: &str = "x_bold_fraction";
+
+/// Attribute key holding the fraction (0.0-1.0, as a decimal string) of the
+/// paragraph's words that Tesseract reported as italic via `x_italic`. Same
+/// availability and provenance as [`HOCR_BOLD_FRACTION_ATTRIBUTE`].
+pub(crate) const HOCR_ITALIC_FRACTION_ATTRIBUTE: &str = "x_italic_fraction";
+
+/// Attribute key holding the most common font family name (from `x_font`)
+/// among the paragraph's words, when at least one word reported one.
+pub(crate) const HOCR_FONT_NAME_ATTRIBUTE: &str = "x_font";
+
+/// Bold/italic fraction and dominant font name aggregated across a
+/// paragraph's words.
+struct WordStyleAggregate {
+    bold_fraction: f64,
+    italic_fraction: f64,
+    dominant_font_name: Option<String>,
+}
+
+/// Aggregate the `x_bold`/`x_italic`/`x_font` hOCR word properties into
+/// paragraph-level signals. `words` must be non-empty.
+fn aggregate_word_style(words: &[&HocrWordInfo]) -> WordStyleAggregate {
+    let word_count = words.len() as f64;
+    let bold_count = words.iter().filter(|w| w.is_bold).count() as f64;
+    let italic_count = words.iter().filter(|w| w.is_italic).count() as f64;
+
+    let mut font_name_counts: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for word in words {
+        if let Some(ref name) = word.font_name {
+            *font_name_counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+    }
+    let dominant_font_name = font_name_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(name, _)| name.to_string());
+
+    WordStyleAggregate {
+        bold_fraction: bold_count / word_count,
+        italic_fraction: italic_count / word_count,
+        dominant_font_name,
+    }
+}
+
+/// Render one optional numeric value per line as a comma-joined string,
+/// preserving line position (a missing value becomes an empty field) so a
+/// downstream consumer can zip the result back up against `text.split('\n')`.
+fn join_per_line_values(values: &[Option<f64>]) -> String {
+    values
+        .iter()
+        .map(|value| value.map(format_decimal).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Format a float without a trailing `.0` for whole numbers, matching the
+/// existing paragraph-average attribute formatting (`f64::to_string`).
+fn format_decimal(value: f64) -> String {
+    value.to_string()
+}
 
 /// Parse a single `<p class="ocr_par">` (or `<span class="ocr_par">`) and all nested
 /// content up to the matching closing tag.
@@ -267,12 +574,13 @@ fn parse_paragraph(
     page: u32,
     element_index: u32,
     par_tag: &str,
+    dictionary_filter: Option<&DictionaryLineFilter<'_>>,
 ) -> (Option<InternalElement>, usize) {
     let bytes = html.as_bytes();
     let mut pos = start;
 
-    let mut lines: Vec<Vec<HocrWordInfo>> = Vec::new();
-    let mut current_line: Vec<HocrWordInfo> = Vec::new();
+    let mut lines: Vec<HocrLineInfo> = Vec::new();
+    let mut current_line = HocrLineInfo::default();
     let mut in_line = false;
 
     let mut depth: u32 = 1;
@@ -292,7 +600,7 @@ fn parse_paragraph(
             if closing_name == par_tag {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    if !current_line.is_empty() {
+                    if !current_line.words.is_empty() {
                         lines.push(std::mem::take(&mut current_line));
                     }
                     break;
@@ -308,10 +616,16 @@ fn parse_paragraph(
         let tag_name = tag_content.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
 
         if has_class(tag_content, "ocr_line") || has_class(tag_content, "ocrx_line") {
-            if in_line && !current_line.is_empty() {
+            if in_line && !current_line.words.is_empty() {
                 lines.push(std::mem::take(&mut current_line));
             }
             in_line = true;
+            let title = extract_title_attr(tag_content);
+            let props = parse_title_properties(&title);
+            current_line.x_size = props.x_size;
+            current_line.x_ascenders = props.x_ascenders;
+            current_line.x_descenders = props.x_descenders;
+            current_line.baseline = props.baseline;
             if tag_name == par_tag {
                 depth += 1;
             }
@@ -330,7 +644,7 @@ fn parse_paragraph(
 
             if !trimmed.is_empty() {
                 let (x0, y0, x1, y1) = props.bbox.unwrap_or((0, 0, 0, 0));
-                current_line.push(HocrWordInfo {
+                current_line.words.push(HocrWordInfo {
                     text: trimmed.to_string(),
                     x0,
                     y0,
@@ -339,6 +653,9 @@ fn parse_paragraph(
                     confidence: props.x_wconf,
                     font_size: props.x_fsize,
                     text_angle: props.textangle,
+                    font_name: props.x_font,
+                    is_bold: props.x_bold,
+                    is_italic: props.x_italic,
                 });
             }
             continue;
@@ -349,14 +666,30 @@ fn parse_paragraph(
         }
     }
 
-    let all_words: Vec<&HocrWordInfo> = lines.iter().flat_map(|l| l.iter()).collect();
+    if let Some(filter) = dictionary_filter {
+        let lines_before = lines.len();
+        lines.retain(|line| !is_dictionary_noise_line(line, filter));
+        let removed_line_count = lines_before - lines.len();
+        if removed_line_count > 0 {
+            tracing::warn!(
+                page,
+                removed_line_count,
+                max_invalid_ratio = filter.max_invalid_ratio,
+                "removed OCR line(s) whose dictionary-checkable words are mostly not real words"
+            );
+        }
+    }
+
+    let all_words: Vec<&HocrWordInfo> = lines.iter().flat_map(|l| l.words.iter()).collect();
     if all_words.is_empty() {
         return (None, pos);
     }
 
+    let style = aggregate_word_style(&all_words);
+
     let text: String = lines
         .iter()
-        .map(|line| line.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "))
+        .map(|line| line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -391,6 +724,54 @@ fn parse_paragraph(
             angle_count += 1;
         }
     }
+
+    let mut x_size_sum = 0.0f64;
+    let mut x_size_count = 0u32;
+    let mut x_ascenders_sum = 0.0f64;
+    let mut x_ascenders_count = 0u32;
+    let mut x_descenders_sum = 0.0f64;
+    let mut x_descenders_count = 0u32;
+    let mut baseline_slope_sum = 0.0f64;
+    let mut baseline_const_sum = 0.0f64;
+    let mut baseline_count = 0u32;
+
+    for line in &lines {
+        if let Some(x_size) = line.x_size {
+            x_size_sum += x_size;
+            x_size_count += 1;
+        }
+        if let Some(ascenders) = line.x_ascenders {
+            x_ascenders_sum += ascenders;
+            x_ascenders_count += 1;
+        }
+        if let Some(descenders) = line.x_descenders {
+            x_descenders_sum += descenders;
+            x_descenders_count += 1;
+        }
+        if let Some((slope, constant)) = line.baseline {
+            baseline_slope_sum += slope;
+            baseline_const_sum += f64::from(constant);
+            baseline_count += 1;
+        }
+    }
+
+    // Per-line font size / x-height, aligned to the `\n`-separated lines of
+    // `text` above, so a downstream consumer can recover line-level detail
+    // instead of only the paragraph mean (#667, #669).
+    let line_font_sizes: Vec<Option<f64>> = lines
+        .iter()
+        .map(|line| {
+            let sizes: Vec<f64> = line.words.iter().filter_map(|w| w.font_size).map(f64::from).collect();
+            if sizes.is_empty() {
+                None
+            } else {
+                Some(sizes.iter().sum::<f64>() / sizes.len() as f64)
+            }
+        })
+        .collect();
+    let line_x_heights: Vec<Option<f64>> = lines.iter().map(|line| line.x_size).collect();
+    let any_line_font_size = line_font_sizes.iter().any(Option::is_some);
+    let any_line_x_height = line_x_heights.iter().any(Option::is_some);
 
     let has_valid_bbox = max_x1 > 0 || max_y1 > 0;
 
@@ -458,22 +839,74 @@ fn parse_paragraph(
                 .insert(HOCR_TEXT_ANGLE_ATTRIBUTE.to_string(), avg_angle.to_string());
         }
     }
+    if x_size_count > 0 {
+        let avg_x_size = x_size_sum / f64::from(x_size_count);
+        elem.attributes
+            .get_or_insert_with(Default::default)
+            .insert(HOCR_X_HEIGHT_ATTRIBUTE.to_string(), avg_x_size.to_string());
+    }
+    if x_ascenders_count > 0 {
+        let avg_ascenders = x_ascenders_sum / f64::from(x_ascenders_count);
+        elem.attributes
+            .get_or_insert_with(Default::default)
+            .insert(HOCR_X_ASCENDERS_ATTRIBUTE.to_string(), avg_ascenders.to_string());
+    }
+    if x_descenders_count > 0 {
+        let avg_descenders = x_descenders_sum / f64::from(x_descenders_count);
+        elem.attributes
+            .get_or_insert_with(Default::default)
+            .insert(HOCR_X_DESCENDERS_ATTRIBUTE.to_string(), avg_descenders.to_string());
+    }
+    if baseline_count > 0 {
+        let avg_slope = baseline_slope_sum / f64::from(baseline_count);
+        let avg_const = baseline_const_sum / f64::from(baseline_count);
+        let attrs = elem.attributes.get_or_insert_with(Default::default);
+        attrs.insert(HOCR_BASELINE_SLOPE_ATTRIBUTE.to_string(), avg_slope.to_string());
+        attrs.insert(HOCR_BASELINE_CONST_ATTRIBUTE.to_string(), avg_const.to_string());
+    }
+    if any_line_font_size {
+        elem.attributes.get_or_insert_with(Default::default).insert(
+            HOCR_LINE_FONT_SIZES_ATTRIBUTE.to_string(),
+            join_per_line_values(&line_font_sizes),
+        );
+    }
+    if any_line_x_height {
+        elem.attributes.get_or_insert_with(Default::default).insert(
+            HOCR_LINE_X_HEIGHTS_ATTRIBUTE.to_string(),
+            join_per_line_values(&line_x_heights),
+        );
+    }
+    {
+        let attrs = elem.attributes.get_or_insert_with(Default::default);
+        attrs.insert(
+            HOCR_BOLD_FRACTION_ATTRIBUTE.to_string(),
+            style.bold_fraction.to_string(),
+        );
+        attrs.insert(
+            HOCR_ITALIC_FRACTION_ATTRIBUTE.to_string(),
+            style.italic_fraction.to_string(),
+        );
+        if let Some(font_name) = style.dominant_font_name {
+            attrs.insert(HOCR_FONT_NAME_ATTRIBUTE.to_string(), font_name);
+        }
+    }
 
     (Some(elem), pos)
-}
-
-/// Fast single-byte search (equivalent to `memchr::memchr` but without the dependency).
-#[inline]
-fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == needle)
 }
 
 /// Check if a tag's class attribute contains the given class name.
 fn has_class(tag_content: &str, cls: &str) -> bool {
     if let Some(class_start) = tag_content.find("class=") {
         let rest = &tag_content[class_start + 6..];
-        let quote = rest.as_bytes().first().copied().unwrap_or(b'"');
-        if quote == b'"' || quote == b'\'' {
+        // `rest` is empty when `class=` is the last thing in `tag_content` (a
+        // truncated or malformed tag). `.first()` (not `.unwrap_or(..)` on the
+        // whole byte) is required here: defaulting a missing byte to `b'"'`
+        // would make the `quote` check below pass on an empty `rest`, and the
+        // following `&rest[1..]` then panics slicing byte index 1 out of a
+        // 0-length string.
+        if let Some(quote) = rest.as_bytes().first().copied()
+            && (quote == b'"' || quote == b'\'')
+        {
             let inner = &rest[1..];
             if let Some(end) = inner.find(quote as char) {
                 let class_value = &inner[..end];
@@ -500,8 +933,12 @@ fn extract_attribute(tag_content: &str, attribute: &str) -> Option<String> {
     let marker = format!("{attribute}=");
     if let Some(attribute_start) = tag_content.find(&marker) {
         let rest = &tag_content[attribute_start + marker.len()..];
-        let quote = rest.as_bytes().first().copied().unwrap_or(b'"');
-        if quote == b'"' || quote == b'\'' {
+        // See the matching comment in `has_class`: `rest` can be empty when the
+        // attribute marker is the last thing in `tag_content`, and defaulting a
+        // missing byte to a quote char would make `&rest[1..]` panic below.
+        if let Some(quote) = rest.as_bytes().first().copied()
+            && (quote == b'"' || quote == b'\'')
+        {
             let inner = &rest[1..];
             if let Some(end) = inner.find(quote as char) {
                 return Some(inner[..end].to_string());
@@ -636,6 +1073,40 @@ mod tests {
         assert!((conf.recognition - 0.925).abs() < 0.01);
     }
 
+    /// Regression test: Tesseract numbers every single-image `recognize()` call's hOCR page
+    /// as `ppageno 0`, since each `perform_ocr` call only ever loads one image. When that
+    /// image is page 2 of a larger document, the parser must report the caller-supplied true
+    /// page number rather than the ppageno-derived `1` every single-image hOCR call would
+    /// otherwise produce for every page of the document.
+    ///
+    /// Fails against unfixed code: before `parse_hocr_to_internal_document_with_page_offset`
+    /// existed, this exact hOCR (`ppageno 0`, identical to what Tesseract emits for page 2 of
+    /// a document, page 5, or any other page) could only be parsed by
+    /// `parse_hocr_to_internal_document`/`_with_dictionary_filter`, both of which hardcode the
+    /// offset to `1` -- so every page of a multi-page source would assert `elem.page ==
+    /// Some(1)`, never the true page number.
+    #[test]
+    fn should_report_the_true_page_number_for_each_ocr_element() {
+        let hocr = r#"<div class="ocr_page" title="bbox 0 0 1000 1500; ppageno 0">
+            <p class="ocr_par" title="bbox 100 100 900 200">
+                <span class="ocr_line" title="bbox 100 100 900 150">
+                    <span class="ocrx_word" title="bbox 100 100 200 140; x_wconf 95">Hello</span>
+                    <span class="ocrx_word" title="bbox 210 100 350 140; x_wconf 90">World</span>
+                </span>
+            </p>
+        </div>"#;
+
+        // `page_offset: 2` stands in for `TesseractConfig::page_number` when `perform_ocr` is
+        // called on page 2 of a multi-page document.
+        let doc = parse_hocr_to_internal_document_with_page_offset(hocr, None, 2);
+        let elements = doc.elements;
+
+        assert_eq!(elements.len(), 1);
+        let elem = &elements[0];
+        assert_eq!(elem.text, "Hello World");
+        assert_eq!(elem.page, Some(2));
+    }
+
     #[test]
     fn test_multi_line_paragraph() {
         let hocr = r#"<div class="ocr_page" title="ppageno 0">
@@ -744,6 +1215,20 @@ mod tests {
     }
 
     #[test]
+    fn test_bold_and_italic_flag_parsing() {
+        let props = parse_title_properties("x_wconf 95; x_bold; x_italic");
+        assert!(props.x_bold);
+        assert!(props.x_italic);
+    }
+
+    #[test]
+    fn test_bold_and_italic_default_to_false_when_absent() {
+        let props = parse_title_properties("x_wconf 95");
+        assert!(!props.x_bold);
+        assert!(!props.x_italic);
+    }
+
+    #[test]
     fn test_has_class() {
         assert!(has_class(
             r#"div class="ocr_page" title="bbox 0 0 100 100""#,
@@ -754,10 +1239,30 @@ mod tests {
         assert!(has_class(r#"span class="ocrx_word ocr_line""#, "ocr_line"));
     }
 
+    /// A tag whose `class=` marker is the very last thing in `tag_content` (no
+    /// quote, no value, nothing after it — e.g. produced by truncated or
+    /// malformed hOCR markup) used to panic: `rest` became an empty string,
+    /// `rest.as_bytes().first().copied().unwrap_or(b'"')` masked the empty
+    /// case by defaulting to a quote byte, and the following `&rest[1..]`
+    /// then sliced byte index 1 out of a 0-length string ("byte index 1 is
+    /// out of bounds of ``"). Must return `false`, not panic.
+    #[test]
+    fn has_class_returns_false_instead_of_panicking_when_class_marker_is_truncated() {
+        assert!(!has_class("span class=", "ocr_par"));
+    }
+
     #[test]
     fn test_extract_title_attr() {
         let title = extract_title_attr(r#"div class="ocr_page" title="bbox 0 0 100 200; ppageno 0""#);
         assert_eq!(title, "bbox 0 0 100 200; ppageno 0");
+    }
+
+    /// Same truncated-marker defect as `has_class`, exercised through
+    /// `extract_attribute`/`extract_title_attr`: a tag content ending in
+    /// `title=` with nothing after it must not panic.
+    #[test]
+    fn extract_title_attr_returns_empty_instead_of_panicking_when_title_marker_is_truncated() {
+        assert_eq!(extract_title_attr("span title="), "");
     }
 
     #[test]
@@ -774,6 +1279,48 @@ mod tests {
         let doc = parse_hocr_to_internal_document(hocr);
         let attrs = doc.elements[0].attributes.as_ref().expect("attributes present");
         assert_eq!(attrs.get(HOCR_FONT_SIZE_ATTRIBUTE), Some(&"22".to_string()));
+    }
+
+    #[test]
+    fn test_paragraph_stores_bold_italic_fraction_and_font_name_attributes() {
+        // Two bold words out of four total ("HEADING" split into two spans),
+        // one italic, and a single reported font family.
+        let hocr = r#"<div class='ocr_page' title='ppageno 0'>
+            <p class='ocr_par'>
+                <span class='ocr_line'>
+                    <span class='ocrx_word' title='bbox 10 10 50 30; x_wconf 90; x_font "Arial"; x_bold'>HEAD</span>
+                    <span class='ocrx_word' title='bbox 60 10 100 30; x_wconf 90; x_font "Arial"; x_bold'>ING</span>
+                    <span class='ocrx_word' title='bbox 110 10 150 30; x_wconf 90; x_font "Arial"; x_italic'>plain</span>
+                    <span class='ocrx_word' title='bbox 160 10 200 30; x_wconf 90; x_font "Arial"'>text</span>
+                </span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let attrs = doc.elements[0].attributes.as_ref().expect("attributes present");
+
+        // Without the fix, `HOCR_BOLD_FRACTION_ATTRIBUTE`/`HOCR_ITALIC_FRACTION_ATTRIBUTE`
+        // are never inserted (parse_paragraph has no bold/italic aggregation), so this
+        // lookup returns None and the assert_eq fails against `Some("0.5")`.
+        assert_eq!(attrs.get(HOCR_BOLD_FRACTION_ATTRIBUTE), Some(&"0.5".to_string()));
+        assert_eq!(attrs.get(HOCR_ITALIC_FRACTION_ATTRIBUTE), Some(&"0.25".to_string()));
+        assert_eq!(attrs.get(HOCR_FONT_NAME_ATTRIBUTE), Some(&"Arial".to_string()));
+    }
+
+    #[test]
+    fn test_paragraph_all_words_non_bold_reports_zero_bold_fraction() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocrx_word" title="bbox 10 10 50 30; x_wconf 90">plain</span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let attrs = doc.elements[0].attributes.as_ref().expect("attributes present");
+
+        assert_eq!(attrs.get(HOCR_BOLD_FRACTION_ATTRIBUTE), Some(&"0".to_string()));
+        assert_eq!(attrs.get(HOCR_ITALIC_FRACTION_ATTRIBUTE), Some(&"0".to_string()));
+        assert_eq!(attrs.get(HOCR_FONT_NAME_ATTRIBUTE), None);
     }
 
     #[test]
@@ -1348,5 +1895,299 @@ mod tests {
             2,
             "Should capture both paragraphs around separator"
         );
+    }
+
+    #[test]
+    fn test_property_parsing_recovers_x_size_ascenders_descenders() {
+        // Fails against unfixed code: `HocrProperties` had no `x_size` /
+        // `x_ascenders` / `x_descenders` fields at all, so these keys parsed
+        // to nothing regardless of what the title string contained.
+        let props =
+            parse_title_properties("bbox 100 40 900 150; baseline 0.015 -18; x_size 30; x_descenders 6; x_ascenders 8");
+        assert_eq!(props.x_size, Some(30.0));
+        assert_eq!(props.x_ascenders, Some(8.0));
+        assert_eq!(props.x_descenders, Some(6.0));
+        assert_eq!(props.baseline, Some((0.015, -18)));
+    }
+
+    #[test]
+    fn test_ocr_line_title_parsed_into_paragraph_x_height_and_baseline_attributes() {
+        // Fails against unfixed code: the `ocr_line`/`ocrx_line` branch only
+        // flipped `in_line` and never called `parse_title_properties` on that
+        // tag's own title, so `baseline`/`x_size`/`x_ascenders`/`x_descenders`
+        // were unreachable even though Tesseract emits them on the line tag
+        // (not the word tag).
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line"
+                    title="bbox 100 40 900 150; baseline 0.01 -18; x_size 30; x_ascenders 8; x_descenders 6">
+                    <span class="ocrx_word" title="bbox 100 40 300 150; x_wconf 95">Heading</span>
+                </span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let attrs = doc.elements[0].attributes.as_ref().expect("attributes present");
+
+        assert_eq!(attrs.get(HOCR_X_HEIGHT_ATTRIBUTE), Some(&"30".to_string()));
+        assert_eq!(attrs.get(HOCR_X_ASCENDERS_ATTRIBUTE), Some(&"8".to_string()));
+        assert_eq!(attrs.get(HOCR_X_DESCENDERS_ATTRIBUTE), Some(&"6".to_string()));
+        assert_eq!(attrs.get(HOCR_BASELINE_SLOPE_ATTRIBUTE), Some(&"0.01".to_string()));
+        assert_eq!(attrs.get(HOCR_BASELINE_CONST_ATTRIBUTE), Some(&"-18".to_string()));
+    }
+
+    #[test]
+    fn test_paragraph_without_line_title_has_no_x_height_attributes() {
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 10 50 30; x_wconf 90">Plain</span>
+                </span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let has_x_height = doc.elements[0]
+            .attributes
+            .as_ref()
+            .is_some_and(|attrs| attrs.contains_key(HOCR_X_HEIGHT_ATTRIBUTE));
+        assert!(!has_x_height, "should not synthesize x-height when hOCR provides none");
+    }
+
+    #[test]
+    fn test_multi_line_paragraph_preserves_per_line_font_size_and_x_height() {
+        // Fails against unfixed code in two ways: (1) `line_font_sizes` /
+        // `line_x_heights` attributes don't exist at all pre-fix, so both
+        // `get` calls return `None`; (2) even measuring only the paragraph
+        // mean (22 = (24+20)/2) would hide that line one is a 24pt heading
+        // and line two is 20pt body text, which is exactly the per-line
+        // detail #667/#669 ask to preserve.
+        let hocr = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line" title="bbox 10 10 200 40; x_size 28">
+                    <span class="ocrx_word" title="bbox 10 10 100 40; x_wconf 90; x_fsize 24">BIG</span>
+                </span>
+                <span class="ocr_line" title="bbox 10 50 200 70">
+                    <span class="ocrx_word" title="bbox 10 50 100 70; x_wconf 90; x_fsize 20">small</span>
+                </span>
+            </p>
+        </div>"#;
+
+        let doc = parse_hocr_to_internal_document(hocr);
+        let attrs = doc.elements[0].attributes.as_ref().expect("attributes present");
+
+        // Paragraph mean still present for existing consumers (#185).
+        assert_eq!(attrs.get(HOCR_FONT_SIZE_ATTRIBUTE), Some(&"22".to_string()));
+
+        // Per-line detail: line one is 24pt/x_size 28, line two is 20pt with
+        // no line-level x_size (second field empty, position preserved).
+        assert_eq!(attrs.get(HOCR_LINE_FONT_SIZES_ATTRIBUTE), Some(&"24,20".to_string()));
+        assert_eq!(attrs.get(HOCR_LINE_X_HEIGHTS_ATTRIBUTE), Some(&"28,".to_string()));
+    }
+
+    /// Coverage for the per-line dictionary-invalid noise filter (#783).
+    ///
+    /// Named-import trap check: the reverted prior attempt (`29738a1f29`) added its tests
+    /// to a module that imported by name (`use super::{...}`), and the new function was
+    /// never added to that list, so the tests silently never compiled. This module uses
+    /// `use super::*;` (see the top of `mod tests`), so that specific failure mode cannot
+    /// recur here.
+    mod dictionary_line_filter_tests {
+        use super::*;
+
+        /// Elevations-page hOCR, reconstructed directly from the recorded GH#783 defect:
+        /// a correctly-read heading line, a fully garbled title-block line, and a second
+        /// correctly-read heading line, all in one `ocr_par` block (Tesseract commonly
+        /// groups a title block's short lines into a single paragraph).
+        const ELEVATIONS_PAGE_HOCR: &str = r#"<div class="ocr_page" title="ppageno 0">
+            <p class="ocr_par">
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 10 100 40">RIGHT</span>
+                    <span class="ocrx_word" title="bbox 110 10 260 40">ELEVATION</span>
+                </span>
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 50 100 80">OWATS</span>
+                    <span class="ocrx_word" title="bbox 110 50 220 80">DNDEVET</span>
+                    <span class="ocrx_word" title="bbox 230 50 320 80">OPMENT</span>
+                </span>
+                <span class="ocr_line">
+                    <span class="ocrx_word" title="bbox 10 90 100 120">LEFT</span>
+                    <span class="ocrx_word" title="bbox 110 90 260 120">ELEVATION</span>
+                </span>
+            </p>
+        </div>"#;
+
+        /// Dictionary lookup matching the real measurement recorded against GH#783:
+        /// "OWATS" and "DNDEVET" are invalid, "OPMENT" is a Tesseract DAWG false
+        /// positive (reported valid), and the two "ELEVATION"/"RIGHT"/"LEFT" words are
+        /// genuinely valid. Every test in this module uses this exact table so the
+        /// scenario matches the measured behavior, not an idealized dictionary.
+        fn measured_is_valid_word(word: &str) -> Option<bool> {
+            Some(!matches!(word, "OWATS" | "DNDEVET"))
+        }
+
+        /// 0.6, matching [`DEFAULT_DICT_INVALID_LINE_RATIO`] -- duplicated here as a
+        /// literal (rather than referencing the constant directly) because what this
+        /// module tests is the *filtering mechanism* at a fixed, known threshold, not
+        /// that the production default stays at any particular value.
+        const TEST_THRESHOLD: f64 = 0.6;
+
+        /// The exact defect from #783: with the real (imperfect) dictionary behavior,
+        /// the garbage line is still removed -- 2 invalid of 3 candidates (0.667) clears
+        /// the 0.6 threshold even though "OPMENT" is counted as valid -- while both
+        /// correctly-read heading lines survive untouched.
+        ///
+        /// This is checked on `doc.elements[0].text` rather than on
+        /// `ocr::processor::execution::flatten_hocr_elements_to_text`'s output (private to
+        /// that module, not reachable from here) -- but that is exactly the point being
+        /// proven: `flatten_hocr_elements_to_text` only ever concatenates/transforms
+        /// element text that is already present, so a line filtered out here, before any
+        /// `InternalElement` is constructed, cannot resurface in that flattening OR in the
+        /// `PdfParagraph`s `pdf::structure::adapters` builds from these same elements. One
+        /// filtered `text` field feeds both downstream renderings; there is no second
+        /// place for the two to drift apart.
+        #[test]
+        fn removes_the_garbage_line_but_keeps_both_real_headings() {
+            let filter = DictionaryLineFilter {
+                is_valid_word: &measured_is_valid_word,
+                max_invalid_ratio: TEST_THRESHOLD,
+            };
+            let doc = parse_hocr_to_internal_document_with_dictionary_filter(ELEVATIONS_PAGE_HOCR, Some(&filter));
+
+            assert_eq!(
+                doc.elements.len(),
+                1,
+                "the paragraph survives: two of its three lines are real text"
+            );
+            let text = &doc.elements[0].text;
+            assert!(!text.contains("OWATS"), "the noise line must be gone: {text:?}");
+            assert!(!text.contains("DNDEVET"), "the noise line must be gone: {text:?}");
+            assert_eq!(
+                text, "RIGHT ELEVATION\nLEFT ELEVATION",
+                "exactly the two real lines remain, in order"
+            );
+        }
+
+        /// A line with only ONE dictionary-checkable word must never be scored, even when
+        /// that word is invalid -- a lone proper noun or a truncated title-block fragment
+        /// standing alone on its own line must not be flagged from a single data point.
+        #[test]
+        fn a_single_candidate_line_is_never_flagged() {
+            let hocr = r#"<div class="ocr_page" title="ppageno 0">
+                <p class="ocr_par">
+                    <span class="ocr_line">
+                        <span class="ocrx_word" title="bbox 10 10 100 40">Ligustrum</span>
+                    </span>
+                </p>
+            </div>"#;
+            let always_invalid = |_: &str| Some(false);
+            let filter = DictionaryLineFilter {
+                is_valid_word: &always_invalid,
+                max_invalid_ratio: 0.0,
+            };
+
+            let doc = parse_hocr_to_internal_document_with_dictionary_filter(hocr, Some(&filter));
+
+            assert_eq!(
+                doc.elements.len(),
+                1,
+                "a single-candidate line must survive regardless of the ratio"
+            );
+            assert_eq!(doc.elements[0].text, "Ligustrum");
+        }
+
+        /// A mixed line at or below the threshold survives -- the plant-list guard from
+        /// the original #783 report ("Ligustrum, Photinia, Azalea, Indian Hawthorne" mixes
+        /// recognized words with unrecognized botanical genus names, 2 invalid of 5 =
+        /// 0.4), reconstructed here as a single hOCR line.
+        #[test]
+        fn a_mixed_line_below_threshold_survives_verbatim() {
+            let hocr = r#"<div class="ocr_page" title="ppageno 0">
+                <p class="ocr_par">
+                    <span class="ocr_line">
+                        <span class="ocrx_word" title="bbox 10 10 100 40">Ligustrum</span>
+                        <span class="ocrx_word" title="bbox 110 10 220 40">Photinia</span>
+                        <span class="ocrx_word" title="bbox 230 10 320 40">Azalea</span>
+                        <span class="ocrx_word" title="bbox 330 10 420 40">Indian</span>
+                        <span class="ocrx_word" title="bbox 430 10 560 40">Hawthorne</span>
+                    </span>
+                </p>
+            </div>"#;
+            let is_valid = |word: &str| Some(matches!(word, "Azalea" | "Indian" | "Hawthorne"));
+            let filter = DictionaryLineFilter {
+                is_valid_word: &is_valid,
+                max_invalid_ratio: TEST_THRESHOLD,
+            };
+
+            let doc = parse_hocr_to_internal_document_with_dictionary_filter(hocr, Some(&filter));
+
+            assert_eq!(doc.elements.len(), 1);
+            assert_eq!(doc.elements[0].text, "Ligustrum Photinia Azalea Indian Hawthorne");
+        }
+
+        /// A ratio exactly AT the threshold must survive -- the check is strictly
+        /// greater-than, matching the page-level `is_dictionary_invalid_noise` convention
+        /// (`extractors::pdf::ocr`).
+        #[test]
+        fn a_line_exactly_at_the_threshold_is_not_removed() {
+            let hocr = r#"<div class="ocr_page" title="ppageno 0">
+                <p class="ocr_par">
+                    <span class="ocr_line">
+                        <span class="ocrx_word" title="bbox 10 10 100 40">Photinia</span>
+                        <span class="ocrx_word" title="bbox 110 10 220 40">Ligustrum</span>
+                    </span>
+                </p>
+            </div>"#;
+            let always_invalid = |_: &str| Some(false);
+            let filter = DictionaryLineFilter {
+                is_valid_word: &always_invalid,
+                max_invalid_ratio: 1.0,
+            };
+
+            let doc = parse_hocr_to_internal_document_with_dictionary_filter(hocr, Some(&filter));
+
+            assert_eq!(
+                doc.elements.len(),
+                1,
+                "ratio 1.0 is not > threshold 1.0, so the line must survive"
+            );
+        }
+
+        /// A paragraph whose every line is noise disappears from the document entirely --
+        /// the same "no words survived" path an all-empty paragraph already takes,
+        /// exercised here via dictionary filtering rather than empty text.
+        #[test]
+        fn a_paragraph_left_with_no_lines_produces_no_element() {
+            let hocr = r#"<div class="ocr_page" title="ppageno 0">
+                <p class="ocr_par">
+                    <span class="ocr_line">
+                        <span class="ocrx_word" title="bbox 10 10 100 40">OWATS</span>
+                        <span class="ocrx_word" title="bbox 110 10 220 40">DNDEVET</span>
+                    </span>
+                </p>
+            </div>"#;
+            let always_invalid = |_: &str| Some(false);
+            let filter = DictionaryLineFilter {
+                is_valid_word: &always_invalid,
+                max_invalid_ratio: TEST_THRESHOLD,
+            };
+
+            let doc = parse_hocr_to_internal_document_with_dictionary_filter(hocr, Some(&filter));
+
+            assert!(
+                doc.elements.is_empty(),
+                "a paragraph with no surviving lines must not appear at all"
+            );
+        }
+
+        /// No filter at all (the plain [`parse_hocr_to_internal_document`] entry point,
+        /// what every other test in this file uses) must behave exactly as before this
+        /// feature existed: nothing is removed, no matter how garbled the text is.
+        #[test]
+        fn no_filter_leaves_every_line_untouched() {
+            let doc = parse_hocr_to_internal_document(ELEVATIONS_PAGE_HOCR);
+            assert_eq!(doc.elements.len(), 1);
+            assert!(doc.elements[0].text.contains("OWATS DNDEVET OPMENT"));
+        }
     }
 }

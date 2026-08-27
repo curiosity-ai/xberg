@@ -189,6 +189,7 @@ async fn classify_batch(
 /// calling the LLM fails for every batch; partial failures on a subset of
 /// batches are recorded here as a `ProcessingWarning` on `result` instead of
 /// aborting the whole run.
+#[cfg_attr(alef, alef(skip))]
 pub async fn classify_chunks(result: &mut ExtractedDocument, config: &ChunkClassificationConfig) -> crate::Result<()> {
     if config.definitions.is_empty() {
         return Err(crate::XbergError::validation(
@@ -290,6 +291,22 @@ pub async fn classify_chunks(result: &mut ExtractedDocument, config: &ChunkClass
     }
 
     Ok(())
+}
+
+/// Classify a document's chunks and return the updated document.
+///
+/// This owned form preserves the mutations when the document crosses a language-binding boundary.
+/// Rust callers that already own a mutable document can use [`classify_chunks`] to avoid moving it.
+///
+/// # Errors
+///
+/// Returns the same validation and LLM errors as [`classify_chunks`].
+pub async fn classify_chunks_owned(
+    mut result: ExtractedDocument,
+    config: &ChunkClassificationConfig,
+) -> crate::Result<ExtractedDocument> {
+    classify_chunks(&mut result, config).await?;
+    Ok(result)
 }
 
 /// Build the warning message for a chunk-classification run where some
@@ -533,5 +550,30 @@ mod tests {
         };
         classify_chunks(&mut result, &config).await.unwrap();
         assert!(result.chunks.is_none());
+    }
+
+    #[tokio::test]
+    async fn classify_chunks_owned_returns_the_updated_document() {
+        let config = ChunkClassificationConfig {
+            prompt_template: None,
+            definitions: definitions(),
+            llm: crate::core::config::LlmConfig {
+                model: "openai/gpt-4o-mini".to_string(),
+                ..Default::default()
+            },
+            batch_size: 10,
+            max_concurrency: 4,
+        };
+        let result = ExtractedDocument {
+            content: "x".to_string(),
+            mime_type: std::borrow::Cow::Borrowed("text/plain"),
+            chunks: None,
+            ..Default::default()
+        };
+
+        let updated = classify_chunks_owned(result, &config).await.unwrap();
+
+        assert_eq!(updated.content, "x");
+        assert!(updated.chunks.is_none());
     }
 }

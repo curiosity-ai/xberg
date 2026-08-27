@@ -13,7 +13,6 @@ use tree_sitter_language_pack as tslp;
 use crate::Result;
 use crate::core::config::{CodeContentMode, ExtractionConfig};
 use crate::core::mime::SOURCE_CODE_MIME_TYPE;
-use crate::extractors::SyncExtractor;
 use crate::internal_builder::InternalDocumentBuilder;
 use crate::plugins::InternalDocumentExtractor;
 use crate::plugins::Plugin;
@@ -334,29 +333,6 @@ impl InternalDocumentExtractor for CodeExtractor {
 
     fn priority(&self) -> i32 {
         50
-    }
-}
-
-impl SyncExtractor for CodeExtractor {
-    fn extract_sync(&self, content: &[u8], _mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
-        let source = String::from_utf8_lossy(content);
-        let decoded_lossily = matches!(source, Cow::Owned(_));
-
-        let language = tslp::detect_language_from_content(&source)
-            .or_else(|| config.source_name.as_deref().and_then(tslp::detect_language_from_path))
-            .ok_or_else(|| {
-                crate::XbergError::UnsupportedFormat("Cannot detect programming language from content".to_string())
-            })?;
-
-        let mut doc = Self::extract_with_language(&source, language, config)?;
-        if decoded_lossily {
-            crate::core::diagnostics::push_lossy_decode_warning(
-                &mut doc.processing_warnings,
-                CODE_WARNING_SOURCE,
-                "source file",
-            );
-        }
-        Ok(doc)
     }
 }
 

@@ -4,7 +4,6 @@
 //! to reorder candidate documents by relevance. Three backend variants are supported:
 //! local ONNX cross-encoder, provider-hosted via liter-llm, and an in-process plugin.
 //!
-//! Since v5.0.0.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,7 +15,6 @@ use super::llm::LlmConfig;
 /// Controls which model to use, how many results to return, and download/cache
 /// behavior for local ONNX models.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankerConfig {
     /// The reranker model to use (defaults to "balanced" preset if not specified).
@@ -76,9 +74,7 @@ pub struct RerankerConfig {
 impl Default for RerankerConfig {
     fn default() -> Self {
         Self {
-            model: RerankerModelType::Preset {
-                name: "balanced".to_string(),
-            },
+            model: default_reranker_model(),
             top_k: None,
             batch_size: 32,
             show_download_progress: false,
@@ -100,8 +96,7 @@ impl Default for RerankerConfig {
 ///   via a softmax over those two logits. Already a `[0, 1]` probability —
 ///   no sigmoid is applied.
 ///
-/// Since v5.0.0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RerankerHead {
     /// Single-logit cross-encoder head (sigmoid applied by the caller).
@@ -134,21 +129,40 @@ impl From<RerankerHead> for String {
 
 /// Parse the head from its serde `snake_case` tag.
 ///
-/// Unknown values fall back to [`RerankerHead::CrossEncoder`] rather than
-/// erroring, matching the `.unwrap_or_default()` the binding glue applies. This
-/// is the inverse of [`From<RerankerHead>`] for [`String`].
+/// Compatibility-only infallible conversion retained through Xberg 1.x.
+/// Unknown values default to [`RerankerHead::CrossEncoder`]; input boundaries
+/// must use [`str::parse`] or [`TryFrom<&str>`]. This conversion is
+/// scheduled for removal in 2.0.
 impl From<String> for RerankerHead {
     fn from(value: String) -> Self {
-        match value.as_str() {
-            "qwen3_generative" => RerankerHead::Qwen3Generative,
-            _ => RerankerHead::CrossEncoder,
+        Self::try_from(value.as_str()).unwrap_or_default()
+    }
+}
+
+impl TryFrom<&str> for RerankerHead {
+    type Error = crate::XbergError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "cross_encoder" => Ok(Self::CrossEncoder),
+            "qwen3_generative" => Ok(Self::Qwen3Generative),
+            _ => Err(crate::XbergError::validation(format!(
+                "invalid RerankerHead value `{value}`; expected one of: cross_encoder, qwen3_generative"
+            ))),
         }
+    }
+}
+
+impl std::str::FromStr for RerankerHead {
+    type Err = crate::XbergError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
     }
 }
 
 /// Reranker model types supported by Xberg.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RerankerModelType {
@@ -334,6 +348,47 @@ mod tests {
             serde_json::to_string(&RerankerHead::Qwen3Generative).unwrap(),
             "\"qwen3_generative\""
         );
+    }
+
+    #[test]
+    fn reranker_head_parsing_accepts_every_wire_value() {
+        assert_eq!(
+            "cross_encoder"
+                .parse::<RerankerHead>()
+                .expect("the cross-encoder head must parse"),
+            RerankerHead::CrossEncoder
+        );
+        assert_eq!(
+            "qwen3_generative"
+                .parse::<RerankerHead>()
+                .expect("the Qwen3 head must parse"),
+            RerankerHead::Qwen3Generative
+        );
+    }
+
+    #[test]
+    fn reranker_head_parsing_rejects_unknown_values() {
+        let error = "classification"
+            .parse::<RerankerHead>()
+            .expect_err("unknown heads must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            concat!(
+                "Validation error: invalid RerankerHead value `classification`; ",
+                "expected one of: cross_encoder, qwen3_generative"
+            )
+        );
+    }
+
+    #[test]
+    fn custom_model_deserialization_rejects_unknown_head() {
+        let error = serde_json::from_str::<RerankerModelType>(
+            r#"{"type":"custom","model_id":"example/model","head":"classification"}"#,
+        )
+        .expect_err("unknown heads must not cross the JSON configuration boundary");
+
+        assert!(error.to_string().contains("unknown variant `classification`"));
     }
 
     #[test]

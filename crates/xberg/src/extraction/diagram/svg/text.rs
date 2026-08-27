@@ -163,17 +163,19 @@ impl TextPass {
         loop {
             match reader.read_event() {
                 Ok(Event::Start(e)) => {
-                    let name = local_name(e.name().as_ref());
-                    let combined = self.open(&e, &name);
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref());
+                    let combined = self.open(&e, name);
                     self.transforms.push(combined);
-                    self.depth.push(name);
+                    self.depth.push(name.to_string());
                 }
                 // A self-closing element opens and closes in one event, and
                 // never passes its transform to a child.
                 Ok(Event::Empty(e)) => {
-                    let name = local_name(e.name().as_ref());
-                    self.open(&e, &name);
-                    self.close(&name, self.depth.len());
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref());
+                    self.open(&e, name);
+                    self.close(name, self.depth.len());
                 }
                 Ok(Event::End(_)) => {
                     let name = self.depth.pop().unwrap_or_default();
@@ -181,8 +183,8 @@ impl TextPass {
                     self.close(&name, self.depth.len());
                 }
                 Ok(Event::Text(e)) => {
-                    let raw = String::from_utf8_lossy(e.as_ref());
-                    self.push_text(&raw);
+                    let raw = e.as_ref();
+                    self.push_text(raw);
                 }
                 // A malformed tail costs the labels after it and nothing else;
                 // the shapes come from a parse `usvg` already accepted. ~keep
@@ -203,18 +205,17 @@ fn map_point(transform: &Transform, x: f32, y: f32) -> (f32, f32) {
 }
 
 /// Strip any namespace prefix: `svg:text` and `text` are the same element.
-fn local_name(raw: &[u8]) -> String {
-    let name = String::from_utf8_lossy(raw);
-    match name.rsplit_once(':') {
-        Some((_, local)) => local.to_string(),
-        None => name.into_owned(),
+fn local_name(raw: &str) -> &str {
+    match raw.rsplit_once(':') {
+        Some((_, local)) => local,
+        None => raw,
     }
 }
 
 fn attribute(e: &quick_xml::events::BytesStart<'_>, wanted: &str) -> Option<String> {
-    e.attributes().flatten().find_map(|attr| {
-        (local_name(attr.key.as_ref()) == wanted).then(|| String::from_utf8_lossy(&attr.value).trim().to_string())
-    })
+    e.attributes()
+        .flatten()
+        .find_map(|attr| (local_name(attr.key.as_ref()) == wanted).then(|| attr.value.trim().to_string()))
 }
 
 /// First number of an SVG attribute that may hold a list, e.g. `x="10 20 30"`

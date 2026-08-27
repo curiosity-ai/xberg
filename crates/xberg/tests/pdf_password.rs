@@ -10,31 +10,21 @@ use helpers::extract_bytes_document_blocking;
 use xberg::core::config::{ExtractionConfig, PdfConfig};
 
 const PDF_MIME: &str = "application/pdf";
-const MARKER: &str = "PINEAPPLE42";
 
-/// Build an AES-256 encrypted single-page PDF whose text contains `MARKER`,
-/// protected by user password "secret123". Returns the encrypted bytes.
+/// A committed encrypted single-page PDF, protected by user password
+/// "secret". Shared with `xberg-native-pdf`'s own encryption tests
+/// (`crates/xberg-native-pdf/tests/fixtures/encrypted_needs_password.pdf`,
+/// see `document.rs::test_encrypted_pdf_works_after_authentication`).
+///
+/// Previously this test built a fresh AES-256 encrypted PDF at runtime via
+/// `xberg_native_pdf::writer::DocumentBuilder::save_encrypted`. That API
+/// went away with the PDF writer; hand-rolling an AES-256 R6 encryption
+/// (ISO 32000-2 Algorithm 2.A/2.B key derivation) is not something that can
+/// be done reliably without a way to verify it, so this reuses the
+/// already-encrypted, already-verified fixture instead.
 fn encrypted_pdf() -> Vec<u8> {
-    use pdf_oxide::geometry::Rect;
-    use pdf_oxide::writer::{DocumentBuilder, TextAlign};
-
-    let mut doc = DocumentBuilder::new();
-    doc.a4_page()
-        .text_in_rect(
-            Rect::new(72.0, 700.0, 400.0, 40.0),
-            &format!("Confidential. The secret marker is {MARKER}."),
-            TextAlign::Left,
-        )
-        .done();
-
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("xberg_pw_fixture_{}_{n}.pdf", std::process::id()));
-    doc.save_encrypted(&path, "secret123", "owner123")
-        .expect("save_encrypted must succeed");
-    let bytes = std::fs::read(&path).expect("read encrypted pdf");
-    let _ = std::fs::remove_file(&path);
-    bytes
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pdf/encrypted_needs_password.pdf");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"))
 }
 
 fn config_with_passwords(passwords: Vec<String>) -> ExtractionConfig {
@@ -50,7 +40,7 @@ fn config_with_passwords(passwords: Vec<String>) -> ExtractionConfig {
 #[test]
 fn correct_password_authenticates_and_does_not_error() {
     let bytes = encrypted_pdf();
-    let config = config_with_passwords(vec!["secret123".to_string()]);
+    let config = config_with_passwords(vec!["secret".to_string()]);
     // erroring on the encrypted document. NOTE: recovering the *decrypted text*
     let result = extract_bytes_document_blocking(&bytes, PDF_MIME, &config);
     assert!(

@@ -1,10 +1,10 @@
-//! Pure-Rust PDF document processing via the `pdf-oxide` backend.
+//! Pure-Rust PDF document processing via the `native` backend.
 //!
 //! Used internally by the PDF extractor plugin. Requires the `pdf` feature.
 //!
 //! # Features
 //!
-//! - **Text extraction**: Extract text content from PDFs using `pdf_oxide`
+//! - **Text extraction**: Extract text content from PDFs using `xberg_native_pdf`
 //! - **Metadata extraction**: Parse PDF metadata (title, author, creation date, etc.)
 //! - **Image extraction**: Extract embedded images from PDF pages
 //! - **Error handling**: Comprehensive PDF-specific error types
@@ -27,9 +27,9 @@ pub(crate) mod layout_gate;
 /// PDF metadata types: document info dictionary and page structure.
 pub mod metadata;
 #[cfg(feature = "pdf")]
-pub(crate) mod oxide;
+pub(crate) mod native;
 #[cfg(all(feature = "pdf", feature = "tokio-runtime"))]
-pub(crate) mod oxide_text;
+pub(crate) mod native_text;
 #[cfg(feature = "pdf")]
 /// PDF page rendering to raster images.
 pub mod render;
@@ -56,3 +56,5 @@ pub(crate) mod xref_revisions;
 pub use crate::core::config::HierarchyConfig;
 #[cfg(feature = "pdf")]
 pub use error::PdfError;
+#[cfg(feature = "pdf")]
+pub use render::PdfRenderSession;

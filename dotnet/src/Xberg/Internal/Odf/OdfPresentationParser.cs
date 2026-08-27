@@ -38,6 +38,17 @@ internal static class OdfPresentationParser
         var listStyleMap = OdfStyles.BuildListStyleMap(root);
         var builder = new InternalDocumentBuilder("odp");
 
+        // Reject a presentation whose slide count exceeds the configured ceiling before the
+        // recursive per-slide walk of frames, shapes, tables and images below. Unlike PPTX, an
+        // ODP's slide count is not available before parsing content.xml — ODF has no manifest of
+        // per-slide archive entries — so it is counted off the DOM already parsed above.
+        DocumentLimits.EnforcePageCount(
+            root.Elements().Where(n => n.Name.LocalName == "body")
+                .SelectMany(body => body.Elements().Where(n => n.Name.LocalName == "presentation"))
+                .SelectMany(pres => pres.Elements().Where(n => n.Name.LocalName == "page"))
+                .Count(),
+            limits);
+
         uint slideNumber = 0;
         foreach (var body in root.Elements().Where(n => n.Name.LocalName == "body"))
         foreach (var presentation in body.Elements().Where(n => n.Name.LocalName == "presentation"))

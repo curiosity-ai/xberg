@@ -3,6 +3,7 @@
 mod helpers;
 use helpers::{extract_bytes_document, extract_uri_document};
 
+#[cfg(feature = "tokio-runtime")]
 use std::time::Instant;
 use xberg::XbergError;
 use xberg::core::config::ExtractionConfig;

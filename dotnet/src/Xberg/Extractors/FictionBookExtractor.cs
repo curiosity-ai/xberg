@@ -281,7 +281,10 @@ public sealed class FictionBookExtractor : IExtractor
         var text = new Utf8Buf();
         var anns = new List<TextAnnotation>();
         int depth = 0;
-        var formatStack = new Stack<(string tag, uint start)>();
+        // A list rather than a Stack: the joining space inserted below has to bump the
+        // recorded start of every entry that begins exactly there, which means writing
+        // through entries a Stack only lets us peek at.
+        var formatStack = new List<(string Tag, uint Start)>();
 
         // A split flushes what has been read so far verbatim; only the paragraph's own end
         // trims it. The text after a footnote reference opens with the space that separated it
@@ -317,14 +320,15 @@ public sealed class FictionBookExtractor : IExtractor
 
                 depth++;
                 if (ev.Name is "emphasis" or "strong" or "strikethrough" or "code")
-                    formatStack.Push((ev.Name, text.Len));
+                    formatStack.Add((ev.Name, text.Len));
             }
             else if (ev.Kind == EvKind.End)
             {
                 if ((ev.Name == "p" || ev.Name == "v") && depth <= 1) break;
                 if (ev.Name is "emphasis" or "strong" or "strikethrough" or "code" && formatStack.Count > 0)
                 {
-                    var (fmtTag, start) = formatStack.Pop();
+                    var (fmtTag, start) = formatStack[^1];
+                    formatStack.RemoveAt(formatStack.Count - 1);
                     uint end = text.Len;
                     if (end > start)
                     {
@@ -346,7 +350,23 @@ public sealed class FictionBookExtractor : IExtractor
                 string normalized = NormalizeWhitespace(ev.Text);
                 if (normalized.Length != 0)
                 {
-                    if (text.Len != 0 && !EndsWithSpace(text)) text.Append(" ");
+                    if (text.Len != 0 && !EndsWithSpace(text))
+                    {
+                        // NormalizeWhitespace trims trailing whitespace off the preceding text
+                        // run, so the joining space inserted here lands exactly at the byte offset
+                        // any still-open formatStack entry recorded as its annotation start. Left
+                        // unbumped, that entry's span swallows this space -- e.g. <code> right
+                        // after "Some " records start=4 for "Some", then this append moves the
+                        // real "code" text to byte 5, so the emitted Code annotation covers
+                        // " code" instead of "code" (upstream #859).
+                        uint joinPos = text.Len;
+                        text.Append(" ");
+                        for (int i = 0; i < formatStack.Count; i++)
+                        {
+                            if (formatStack[i].Start == joinPos)
+                                formatStack[i] = (formatStack[i].Tag, formatStack[i].Start + 1);
+                        }
+                    }
                     text.Append(normalized);
                 }
             }

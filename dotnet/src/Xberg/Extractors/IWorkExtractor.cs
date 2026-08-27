@@ -150,7 +150,7 @@ public sealed class KeynoteExtractor : IExtractor
         // The outer container is validated before any package member is read.
         using var archive = ZipBombValidator.OpenValidated(stream, config.SecurityLimits);
 
-        var data = ParseKeynote(archive);
+        var data = ParseKeynote(archive, config.SecurityLimits);
         var doc = Build(data);
         doc.MimeType = mimeType;
         foreach (var warning in data.Warnings) doc.ProcessingWarnings.Add(warning);
@@ -165,7 +165,7 @@ public sealed class KeynoteExtractor : IExtractor
         public List<ProcessingWarning> Warnings = new();
     }
 
-    private static KeynoteData ParseKeynote(ZipArchive archive)
+    private static KeynoteData ParseKeynote(ZipArchive archive, SecurityLimits? limits = null)
     {
         var data = new KeynoteData { Metadata = IwaContainer.ExtractMetadataFromZip(archive) };
         var paths = IwaContainer.CollectIwaPaths(archive);
@@ -178,6 +178,10 @@ public sealed class KeynoteExtractor : IExtractor
         }
 
         var slidePaths = paths.Where(IsSlide).OrderBy(p => p, StringComparer.Ordinal).ToList();
+        // Reject a deck whose slide count exceeds the configured ceiling before any member is
+        // decompressed and walked. The Index/Slide-*.iwa entries are already enumerated here, so
+        // the count is exact.
+        DocumentLimits.EnforcePageCount(slidePaths.Count, limits);
         var otherPaths = paths.Where(p => !IsSlide(p)).ToList();
 
         // Each slide keeps its own text, deduped only within itself: a footer or title

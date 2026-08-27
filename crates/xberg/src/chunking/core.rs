@@ -58,7 +58,8 @@ pub fn chunk_text(
     config: &ChunkingConfig,
     page_boundaries: Option<&[PageBoundary]>,
 ) -> Result<ChunkingResult> {
-    chunk_text_with_heading_source(text, config, page_boundaries, None)
+    let resolved_config = config.resolve_preset();
+    chunk_text_with_heading_source(text, &resolved_config, page_boundaries, None)
 }
 
 /// Chunk text with an optional separate markdown source for heading context resolution.
@@ -144,29 +145,10 @@ pub(crate) fn chunk_text_with_heading_source(
                 chunk.chunk_type = classify_chunk(&chunk.content, chunk.metadata.heading_context.as_ref());
             }
 
-            // `chunk.content` is never mutated with a heading breadcrumb here (#1393
-            // revised design, superseding the `BreadcrumbTarget::Content` mutation this
-            // block used to perform for issue #337). `content` always stays exactly the
-            // `[byte_start, byte_end)` source span — see the `#1294` note on
-            // `ChunkMetadata::byte_start`/`byte_end` this closes: prepending used to make
-            // `chunk.content.len() != byte_end - byte_start`, so slicing the original
-            // document by the chunk's own offsets silently returned different text than
-            // `content` whenever a breadcrumb had been prepended.
-            //
-            // `heading_context`/`heading_path` (set above, and derived from it by
-            // `chunk_for_rag`) are the source of truth for the breadcrumb instead. Three
-            // retrieval consumers want three different views of the same chunk — dense
-            // wants the breadcrumb inline, BM25 wants it excluded or down-weighted,
-            // SPLADE wants it out entirely — so rendering it into `content` is a
-            // *consumer* decision applied at index time, not something the chunker
-            // picks once for everyone. A caller that wants the `Content`-mode view for
-            // the dense/embedding arm calls [`render_heading_breadcrumb`] explicitly with
-            // the chunk's (clean) `content` and its `heading_context`.
-            //
-            // `prepend_heading_context` and `breadcrumb_target` are deprecated and now
-            // inert: neither field has any effect on `content` any more. They are kept on
-            // `ChunkingConfig` only so existing callers keep compiling; see
-            // [`render_heading_breadcrumb`] for the explicit replacement. ~keep
+            // Chunk content must remain the exact source span. Retrieval consumers
+            // choose whether to add heading context with `render_heading_breadcrumb`;
+            // mutating content here would invalidate byte offsets and force one
+            // representation on dense, lexical, and sparse indexes. ~keep
         }
     }
 
@@ -196,8 +178,7 @@ pub(crate) fn chunk_text_with_heading_source(
 /// This is the explicit, consumer-applied rendering step described by the
 /// revised #1393 design: [`chunk_text`] never mutates `chunk.content` with a
 /// heading breadcrumb — `content` always stays exactly the source span
-/// (`chunk.content == &source[byte_start..byte_end]`), regardless of the
-/// deprecated `prepend_heading_context`/`breadcrumb_target` config fields.
+/// (`chunk.content == &source[byte_start..byte_end]`).
 /// A caller that wants the breadcrumb inline — e.g. for the dense/embedding
 /// retrieval arm, which benefits from a self-contained passage that carries
 /// its own structural context — calls this function directly at index time
@@ -534,6 +515,40 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn chunk_text_applies_fast_preset_and_preserves_trim_setting() {
+        const MANUAL_MAX_CHARACTERS: usize = 64;
+        const FAST_PRESET_MAX_CHARACTERS: usize = 512;
+        const FAST_PRESET_OVERLAP: usize = 50;
+
+        let text = format!("  {}", "abcdefghijklmnopqrstuvwxyz".repeat(100));
+        let config = ChunkingConfig {
+            max_characters: MANUAL_MAX_CHARACTERS,
+            overlap: 0,
+            trim: false,
+            preset: Some("fast".to_string()),
+            ..Default::default()
+        };
+
+        let result = chunk_text(&text, &config, None).unwrap();
+
+        assert!(result.chunks.len() > 2);
+        assert_eq!(result.chunks[0].content, "  ");
+        assert!(
+            result
+                .chunks
+                .iter()
+                .all(|chunk| chunk.content.len() <= FAST_PRESET_MAX_CHARACTERS)
+        );
+
+        let body_chunks: Vec<_> = result.chunks.iter().filter(|chunk| chunk.content.len() > 2).collect();
+        assert_eq!(body_chunks[0].content.len(), FAST_PRESET_MAX_CHARACTERS);
+        let first = &body_chunks[0].content;
+        let expected_overlap = &first[first.len() - FAST_PRESET_OVERLAP..];
+        assert!(body_chunks[1].content.starts_with(expected_overlap));
+    }
+
     #[test]
     fn test_chunk_markdown_preserves_structure() {
         let config = ChunkingConfig {
@@ -814,24 +829,14 @@ mod tests {
         assert!(result.chunk_count >= 1);
     }
 
-    /// Core invariant of the #1393 revised design: `chunk.content` is *always* the
-    /// exact `[byte_start, byte_end)` span of the original document, byte-for-byte,
-    /// even with the (deprecated) `prepend_heading_context` flag enabled. Before this
-    /// fix, `BreadcrumbTarget::Content` (the default) prepended a breadcrumb into
-    /// `content` without adjusting `byte_start`/`byte_end` — the `#1294` NOTE this
-    /// function used to sit under admitted as much — so slicing the source document
-    /// by a chunk's own offsets returned different text than `chunk.content` for
-    /// every chunk under a heading. This test fails against that old behavior and
-    /// passes now that `content` is never mutated.
     #[test]
-    fn chunk_content_matches_source_span_byte_for_byte_when_heading_breadcrumb_enabled() {
+    fn markdown_chunk_content_matches_source_span_byte_for_byte() {
         let original_document = "# Title\n\nSome text\n\n## Section\n\nMore text that will not be merged back up";
         let config = ChunkingConfig {
             max_characters: 50,
             overlap: 0,
             trim: true,
             chunker_type: ChunkerType::Markdown,
-            prepend_heading_context: true,
             ..Default::default()
         };
 
@@ -855,125 +860,6 @@ mod tests {
         );
     }
 
-    /// `prepend_heading_context` is deprecated and now inert: setting it to `true`
-    /// must not change `content` at all relative to leaving it `false` (#1393 revised
-    /// design). `heading_context` is still populated so a caller can render the
-    /// breadcrumb explicitly via `render_heading_breadcrumb` instead.
-    #[test]
-    fn prepend_heading_context_flag_is_deprecated_and_inert() {
-        let markdown = "# Title\n\nSome text\n\n## Section\n\nMore text";
-        let base_config = ChunkingConfig {
-            max_characters: 50,
-            overlap: 0,
-            trim: true,
-            chunker_type: ChunkerType::Markdown,
-            ..Default::default()
-        };
-        let flagged_config = ChunkingConfig {
-            prepend_heading_context: true,
-            ..base_config.clone()
-        };
-
-        let baseline = chunk_text(markdown, &base_config, None).unwrap();
-        let flagged = chunk_text(markdown, &flagged_config, None).unwrap();
-
-        assert_eq!(baseline.chunks.len(), flagged.chunks.len());
-        assert!(!flagged.chunks.is_empty());
-
-        for (base, flagged) in baseline.chunks.iter().zip(flagged.chunks.iter()) {
-            assert_eq!(
-                base.content, flagged.content,
-                "prepend_heading_context=true must produce byte-identical content to prepend_heading_context=false"
-            );
-        }
-
-        let has_heading_context = flagged.chunks.iter().any(|c| c.metadata.heading_context.is_some());
-        assert!(
-            has_heading_context,
-            "heading_context must still be populated even though content is never mutated"
-        );
-    }
-
-    /// Regression test for #1294 item 3, re-scoped to the #1393 revised design:
-    /// `byte_start`/`byte_end` must index the source text regardless of
-    /// `prepend_heading_context`, and page-range attribution derived from those
-    /// offsets must be unaffected. Since `content` is never mutated any more, the
-    /// baseline and flagged runs must now match on `content` too, not just offsets.
-    #[test]
-    fn prepend_heading_context_does_not_desync_byte_offsets_or_page_range() {
-        let p1 = "Body text for page one goes here";
-        let p2 = "Body text for page two goes here";
-        let source = format!("# Title\n\n{p1}\n\n## Section\n\n{p2}");
-
-        let boundaries = vec![
-            PageBoundary {
-                page_number: 1,
-                byte_start: 0,
-                byte_end: "# Title\n\n".len() + p1.len(),
-            },
-            PageBoundary {
-                page_number: 2,
-                byte_start: "# Title\n\n".len() + p1.len(),
-                byte_end: source.len(),
-            },
-        ];
-
-        let base_config = ChunkingConfig {
-            max_characters: 40,
-            overlap: 0,
-            trim: true,
-            chunker_type: ChunkerType::Markdown,
-            ..Default::default()
-        };
-        let prepend_config = ChunkingConfig {
-            prepend_heading_context: true,
-            ..base_config.clone()
-        };
-
-        let baseline = chunk_text(&source, &base_config, Some(&boundaries)).unwrap();
-        let flagged = chunk_text(&source, &prepend_config, Some(&boundaries)).unwrap();
-
-        assert_eq!(baseline.chunks.len(), flagged.chunks.len());
-        assert!(!flagged.chunks.is_empty());
-
-        for (base, flagged) in baseline.chunks.iter().zip(flagged.chunks.iter()) {
-            assert_eq!(
-                base.metadata.byte_start, flagged.metadata.byte_start,
-                "prepend_heading_context must not shift byte_start"
-            );
-            assert_eq!(
-                base.metadata.byte_end, flagged.metadata.byte_end,
-                "prepend_heading_context must not shift byte_end"
-            );
-            assert_eq!(
-                base.metadata.first_page, flagged.metadata.first_page,
-                "prepend_heading_context must not change page-range attribution"
-            );
-            assert_eq!(base.metadata.last_page, flagged.metadata.last_page);
-            assert!(
-                flagged.metadata.byte_end <= source.len(),
-                "byte_end must index into the source text length"
-            );
-            assert_eq!(
-                base.content, flagged.content,
-                "prepend_heading_context must not change content at all any more"
-            );
-        }
-
-        let has_page_provenance = flagged.chunks.iter().any(|c| c.metadata.first_page.is_some());
-        assert!(
-            has_page_provenance,
-            "page-range attribution must survive regardless of prepend_heading_context"
-        );
-    }
-
-    /// `render_heading_breadcrumb` is the explicit rendering step that replaces the
-    /// old in-place mutation (#1393 revised design): a caller who wants the
-    /// `Content`-mode breadcrumb for the dense/embedding retrieval arm now calls it
-    /// directly on a chunk's (always-clean) `content` instead of relying on the
-    /// chunker to have mutated it. Uses an explicit `HeadingContext`, independent of
-    /// the Markdown splitter's own boundary choices, so it only exercises the
-    /// rendering logic itself.
     #[test]
     fn render_heading_breadcrumb_reconstructs_the_expected_breadcrumb_prefixed_text() {
         use crate::types::HeadingLevel;

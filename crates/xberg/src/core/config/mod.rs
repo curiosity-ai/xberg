@@ -26,6 +26,8 @@ pub mod page;
 pub mod pdf;
 pub mod processing;
 pub mod redaction;
+#[cfg(any(feature = "api", feature = "mcp"))]
+pub(crate) mod request_security;
 pub mod reranker;
 pub mod sparse_embedding;
 pub mod summarization;
@@ -41,14 +43,10 @@ pub use csv::CsvConfig;
 #[allow(unused_imports)]
 pub(crate) use download_progress::DownloadProgress;
 pub use email::EmailConfig;
-#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
-pub(crate) use extraction::BatchBytesItem;
-#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
-pub(crate) use extraction::BatchFileItem;
 pub use extraction::{
-    BreadcrumbTarget, ExtractInput, ExtractInputKind, ExtractionConfig, ExtractionErrorItem, ExtractionResult,
-    ExtractionSummary, FileExtractionConfig, ImageExtractionConfig, LanguageDetectionConfig, TokenReductionOptions,
-    UrlExtractionConfig, UrlExtractionMode,
+    ExtractInput, ExtractInputKind, ExtractionConfig, ExtractionErrorItem, ExtractionResult, ExtractionSummary,
+    FileExtractionConfig, ImageExtractionConfig, LanguageDetectionConfig, TokenReductionOptions, UrlExtractionConfig,
+    UrlExtractionMode,
 };
 pub use formats::{JupyterCellRendering, OutputFormat};
 #[cfg(feature = "html")]
@@ -70,7 +68,7 @@ pub use ocr::{
 pub(crate) use ocr::OcrPipelineSelection;
 pub use page::PageConfig;
 #[cfg(feature = "pdf")]
-pub use pdf::{HierarchyConfig, PdfConfig};
+pub use pdf::{HierarchyConfig, PdfBackend, PdfConfig};
 pub use processing::{
     ChunkSizing, ChunkerType, ChunkingConfig, EmbeddingConfig, EmbeddingModelType, PostProcessorConfig,
     TableChunkingMode,

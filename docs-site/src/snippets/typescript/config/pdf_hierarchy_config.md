@@ -1,5 +1,5 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, extract } from "@xberg-io/xberg";
 
 const config = {
   pdfOptions: {
@@ -13,9 +13,9 @@ const config = {
   },
 };
 
-const output = await extract({ kind: "uri", uri: "document.pdf" }, config);
-const result = output.results[0];
-if (result.pages) {
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.pdf" }, config);
+const result = output.results?.[0];
+if (result?.pages) {
   result.pages.forEach((page) => {
     console.log(`Page ${page.pageNumber}:`);
     console.log(`  Content: ${page.content.substring(0, 100)}...`);

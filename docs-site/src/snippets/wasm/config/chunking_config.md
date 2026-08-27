@@ -1,71 +1,56 @@
-```typescript title="WASM"
-import { initWasm, extract } from "@xberg-io/xberg-wasm";
+---
+language: typescript
+target: wasm
+---
 
-await initWasm();
+```typescript title="WASM"
+import init, { extract } from "@xberg-io/xberg-wasm";
+
+await init();
 
 const config = {
   chunking: {
-    maxChars: 1000,
-    chunkOverlap: 100,
+    max_characters: 1000,
+    overlap: 100,
   },
 };
 
+const buffer = await fetch("document.pdf").then((response) => response.arrayBuffer());
 const bytes = new Uint8Array(buffer);
 const result = await extract({ kind: "bytes", bytes, mimeType: "application/pdf" }, config);
 
-result.chunks?.forEach((chunk, idx) => {
+result.results[0].chunks?.forEach((chunk, idx) => {
   console.log(`Chunk ${idx}: ${chunk.content.substring(0, 50)}...`);
-  console.log(`Tokens: ${chunk.metadata?.token_count}`);
+  console.log(`Tokens: ${chunk.metadata?.tokenCount}`);
 });
 ```
 
 ```typescript title="WASM - Markdown with Heading Context"
-import { initWasm, extract } from "@xberg-io/xberg-wasm";
+import init, { extract } from "@xberg-io/xberg-wasm";
 
-await initWasm();
+await init();
 
 const config = {
   chunking: {
-    chunkerType: "markdown",
-    maxChars: 2000,
+    chunker_type: "markdown",
+    max_characters: 2000,
     // Note: Token-based sizing is not available in WASM builds.
     // Use character-based sizing instead.
   },
 };
 
+const buffer = await fetch("document.md").then((response) => response.arrayBuffer());
 const bytes = new Uint8Array(buffer);
 const result = await extract({ kind: "bytes", bytes, mimeType: "text/markdown" }, config);
 
-result.chunks?.forEach((chunk, idx) => {
+result.results[0].chunks?.forEach((chunk, idx) => {
   console.log(`Chunk ${idx}: ${chunk.content.substring(0, 50)}...`);
 
   if (chunk.metadata?.headingContext?.headings) {
     console.log("Headings:");
-    chunk.metadata.headingContext.headings.forEach((h) => {
+    chunk.metadata.headingContext.headings.forEach((h: any) => {
       console.log(`  Level ${h.level}: ${h.text}`);
     });
   }
-});
-```
-
-```typescript title="WASM - Prepend Heading Context"
-import { initWasm, extract } from "@xberg-io/xberg-wasm";
-
-await initWasm();
-
-const config = {
-  chunking: {
-    chunkerType: "markdown",
-    maxChars: 2000,
-    prependHeadingContext: true,
-  },
-};
-
-const bytes = new Uint8Array(buffer);
-const result = await extract({ kind: "bytes", bytes, mimeType: "text/markdown" }, config);
-
-result.chunks?.forEach((chunk, idx) => {
-  // Each chunk's content is prefixed with its heading breadcrumb
-  console.log(`Chunk ${idx}: ${chunk.content.substring(0, 80)}...`);
 });
 ```

@@ -148,22 +148,22 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
                 let local_name = local.as_ref();
 
                 match local_name {
-                    b"inline" => {
+                    "inline" => {
                         drawing.drawing_type = DrawingType::Inline;
                         depth += 1;
                     }
-                    b"anchor" => {
+                    "anchor" => {
                         let anchor = AnchorProperties {
-                            behind_doc: get_attr_bool(e, b"behindDoc"),
-                            layout_in_cell: get_attr_bool(e, b"layoutInCell"),
-                            relative_height: get_attr_i64(e, b"relativeHeight"),
+                            behind_doc: get_attr_bool(e, "behindDoc"),
+                            layout_in_cell: get_attr_bool(e, "layoutInCell"),
+                            relative_height: get_attr_i64(e, "relativeHeight"),
                             ..Default::default()
                         };
                         drawing.drawing_type = DrawingType::Anchored(anchor);
                         depth += 1;
                     }
-                    b"positionH" => {
-                        let relative_from = get_attr(e, b"relativeFrom").unwrap_or_else(|| "page".to_string());
+                    "positionH" => {
+                        let relative_from = get_attr(e, "relativeFrom").unwrap_or_else(|| "page".to_string());
                         let position = parse_position(reader, "positionH");
                         // `parse_position` reads through its own `</wp:positionH>`
                         // without touching `budget`; refund the enter above.
@@ -175,8 +175,8 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
                             });
                         }
                     }
-                    b"positionV" => {
-                        let relative_from = get_attr(e, b"relativeFrom").unwrap_or_else(|| "paragraph".to_string());
+                    "positionV" => {
+                        let relative_from = get_attr(e, "relativeFrom").unwrap_or_else(|| "paragraph".to_string());
                         let position = parse_position(reader, "positionV");
                         // Same as `positionH`: consumes its own end tag.
                         budget.leave();
@@ -187,13 +187,13 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
                             });
                         }
                     }
-                    b"blip" => {
+                    "blip" => {
                         if drawing.image_ref.is_none() {
-                            drawing.image_ref = get_attr(e, b"embed").or_else(|| get_attr(e, b"link"));
+                            drawing.image_ref = get_attr(e, "embed").or_else(|| get_attr(e, "link"));
                         }
                         depth += 1;
                     }
-                    b"txbxContent" => {
+                    "txbxContent" => {
                         // Consumes through its own `</w:txbxContent>` end tag, so it
                         // must not also increment `depth` (#81). `collect_txbx_content_text`
                         // now threads `budget` through and balances the `enter()` above
@@ -203,13 +203,13 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
                             drawing.text_box_content = Some(text);
                         }
                     }
-                    b"wrapSquare" | b"wrapTight" | b"wrapTopAndBottom" | b"wrapThrough" => {
+                    "wrapSquare" | "wrapTight" | "wrapTopAndBottom" | "wrapThrough" => {
                         if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
                             match local_name {
-                                b"wrapSquare" => anchor.wrap_type = WrapType::Square,
-                                b"wrapTight" => anchor.wrap_type = WrapType::Tight,
-                                b"wrapTopAndBottom" => anchor.wrap_type = WrapType::TopAndBottom,
-                                b"wrapThrough" => anchor.wrap_type = WrapType::Through,
+                                "wrapSquare" => anchor.wrap_type = WrapType::Square,
+                                "wrapTight" => anchor.wrap_type = WrapType::Tight,
+                                "wrapTopAndBottom" => anchor.wrap_type = WrapType::TopAndBottom,
+                                "wrapThrough" => anchor.wrap_type = WrapType::Through,
                                 _ => {}
                             }
                         }
@@ -225,42 +225,42 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
                 let local_name = local.as_ref();
 
                 match local_name {
-                    b"extent" => {
-                        if let (Some(cx), Some(cy)) = (get_attr_i64(e, b"cx"), get_attr_i64(e, b"cy")) {
+                    "extent" => {
+                        if let (Some(cx), Some(cy)) = (get_attr_i64(e, "cx"), get_attr_i64(e, "cy")) {
                             drawing.extent = Some(Extent { cx, cy });
                         }
                     }
-                    b"docPr" => {
+                    "docPr" => {
                         drawing.doc_properties = Some(DocProperties {
-                            id: get_attr(e, b"id"),
-                            name: get_attr(e, b"name"),
-                            description: get_attr(e, b"descr"),
+                            id: get_attr(e, "id"),
+                            name: get_attr(e, "name"),
+                            description: get_attr(e, "descr"),
                         });
                     }
-                    b"blip" if drawing.image_ref.is_none() => {
-                        drawing.image_ref = get_attr(e, b"embed").or_else(|| get_attr(e, b"link"));
+                    "blip" if drawing.image_ref.is_none() => {
+                        drawing.image_ref = get_attr(e, "embed").or_else(|| get_attr(e, "link"));
                     }
-                    b"wrapNone" => {
+                    "wrapNone" => {
                         if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
                             anchor.wrap_type = WrapType::None;
                         }
                     }
-                    b"wrapSquare" => {
+                    "wrapSquare" => {
                         if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
                             anchor.wrap_type = WrapType::Square;
                         }
                     }
-                    b"wrapTight" => {
+                    "wrapTight" => {
                         if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
                             anchor.wrap_type = WrapType::Tight;
                         }
                     }
-                    b"wrapTopAndBottom" => {
+                    "wrapTopAndBottom" => {
                         if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
                             anchor.wrap_type = WrapType::TopAndBottom;
                         }
                     }
-                    b"wrapThrough" => {
+                    "wrapThrough" => {
                         if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
                             anchor.wrap_type = WrapType::Through;
                         }
@@ -271,7 +271,7 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
             Ok(Event::End(e)) => {
                 budget.leave();
                 depth -= 1;
-                if e.local_name().as_ref() as &[u8] == b"drawing" && depth == 0 {
+                if e.local_name().as_ref() == "drawing" && depth == 0 {
                     break;
                 }
             }
@@ -293,22 +293,20 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
 /// Consumes all events through the closing element_name end tag.
 fn parse_position(reader: &mut Reader<&[u8]>, element_name: &str) -> Option<i64> {
     let mut buf = Vec::new();
-    let element_bytes = element_name.as_bytes();
     let mut result = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() as &[u8] == b"posOffset" => {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "posOffset" => {
                 let mut text_buf = Vec::new();
-                if let Ok(Event::Text(t)) = reader.read_event_into(&mut text_buf)
-                    && let Ok(text) = t.decode()
-                {
+                if let Ok(Event::Text(t)) = reader.read_event_into(&mut text_buf) {
+                    let text = t.xml10_content();
                     result = text.parse::<i64>().ok();
                 }
                 let mut end_buf = Vec::new();
                 let _ = reader.read_event_into(&mut end_buf);
             }
-            Ok(Event::End(e)) if e.local_name().as_ref() as &[u8] == element_bytes => {
+            Ok(Event::End(e)) if e.local_name().as_ref() == element_name => {
                 return result;
             }
             Ok(Event::Eof) => {
@@ -324,23 +322,23 @@ fn parse_position(reader: &mut Reader<&[u8]>, element_name: &str) -> Option<i64>
 }
 
 /// Extract a string attribute by local name.
-fn get_attr(e: &BytesStart, key: &[u8]) -> Option<String> {
+fn get_attr(e: &BytesStart, key: &str) -> Option<String> {
     e.attributes()
         .flatten()
-        .find(|attr| attr.key.local_name().as_ref() as &[u8] == key)
+        .find(|attr| attr.key.local_name().as_ref() == key)
         .and_then(|attr| {
-            let raw = std::str::from_utf8(&attr.value).ok()?;
+            let raw = attr.value.as_ref();
             quick_xml::escape::unescape(raw).ok().map(|s| s.into_owned())
         })
 }
 
 /// Extract an i64 attribute by local name.
-fn get_attr_i64(e: &BytesStart, key: &[u8]) -> Option<i64> {
+fn get_attr_i64(e: &BytesStart, key: &str) -> Option<i64> {
     get_attr(e, key).and_then(|s| s.parse().ok())
 }
 
 /// Extract a boolean attribute by local name (value "1" = true).
-fn get_attr_bool(e: &BytesStart, key: &[u8]) -> bool {
+fn get_attr_bool(e: &BytesStart, key: &str) -> bool {
     get_attr(e, key).as_deref() == Some("1")
 }
 
@@ -371,27 +369,26 @@ fn collect_txbx_content_text(reader: &mut Reader<&[u8]>, budget: &mut SecurityBu
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
                 match e.local_name().as_ref() {
-                    b"txbxContent" => depth += 1,
-                    b"t" => in_text = true,
+                    "txbxContent" => depth += 1,
+                    "t" => in_text = true,
                     _ => {}
                 }
             }
             Ok(Event::Empty(ref e)) => match e.local_name().as_ref() {
-                b"tab" => current.push('\t'),
-                b"br" => current.push('\n'),
+                "tab" => current.push('\t'),
+                "br" => current.push('\n'),
                 _ => {}
             },
-            Ok(Event::Text(e)) => {
-                if in_text && let Ok(text) = e.decode() {
-                    current.push_str(&text);
-                }
+            Ok(Event::Text(e)) if in_text => {
+                let text = e.xml10_content();
+                current.push_str(&text);
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
                 match e.local_name().as_ref() {
-                    b"t" => in_text = false,
-                    b"p" => paragraphs.push(std::mem::take(&mut current)),
-                    b"txbxContent" => {
+                    "t" => in_text = false,
+                    "p" => paragraphs.push(std::mem::take(&mut current)),
+                    "txbxContent" => {
                         depth -= 1;
                         if depth == 0 {
                             break;
@@ -436,7 +433,7 @@ fn parse_vml_textbox(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) ->
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                if e.local_name().as_ref() == b"txbxContent" {
+                if e.local_name().as_ref() == "txbxContent" {
                     // `collect_txbx_content_text` consumes its own end tag and
                     // balances the `enter()` above internally, so no manual
                     // `budget.leave()` is needed here. ~keep
@@ -491,7 +488,7 @@ pub(crate) fn parse_vml_pict(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                if e.local_name().as_ref() == b"textbox" {
+                if e.local_name().as_ref() == "textbox" {
                     // `parse_vml_textbox` consumes its own end tag and balances
                     // the `enter()` above internally, so no manual
                     // `budget.leave()` is needed here. ~keep
@@ -530,7 +527,7 @@ mod tests {
 
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) if e.local_name().as_ref() as &[u8] == b"drawing" => {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == "drawing" => {
                     break;
                 }
                 Ok(Event::Eof) => {

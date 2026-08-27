@@ -5,7 +5,7 @@
 //!
 //! # PDF text-layer detection
 //!
-//! The `heuristics-pdf` feature gates the branch that calls into `pdf_oxide`
+//! The `heuristics-pdf` feature gates the branch that calls into `xberg_native_pdf`
 //! to detect whether a PDF already has a usable text layer.  When that feature
 //! is absent the function follows a "text-layer-unknown" path and proceeds
 //! directly to chunking based on size/page-count thresholds.

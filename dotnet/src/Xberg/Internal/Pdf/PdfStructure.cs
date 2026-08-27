@@ -426,7 +426,7 @@ public static class PdfStructure
         int effectiveK = paragraphCount < 20 ? Math.Min(kClusters, Math.Max(2, paragraphCount / 4)) : kClusters;
 
         var clusters = ClusterFontSizes(blockFonts, effectiveK);
-        var map = AssignHeadingLevelsSmart(clusters, MIN_HEADING_FONT_RATIO, MIN_HEADING_FONT_GAP);
+        var map = AssignHeadingLevelsSmart(clusters, MIN_HEADING_FONT_RATIO);
 
         // Rust has no cluster-level H1 fallback: its equivalent is the paragraph-level rescue in
         // RefineHeadingHierarchy, which is gated on the document having enough blocks to judge.
@@ -511,6 +511,13 @@ public static class PdfStructure
         int actualK = Math.Min(k, blockFonts.Count);
 
         var fontSizes = blockFonts.Select(b => b.FontSize).Where(f => !float.IsNaN(f) && !float.IsInfinity(f)).ToList();
+        if (fontSizes.Count == 0)
+        {
+            // Every block's font size was NaN or infinite (a PDF can produce this via a degenerate
+            // text or font matrix), so there is no usable font-size signal at all — the same case
+            // as no blocks at all, rather than letting the seeding below index an empty list.
+            return new();
+        }
         fontSizes.Sort((a, b) => b.CompareTo(a)); // descending
         // dedup within 0.05
         var deduped = new List<float>();
@@ -611,7 +618,14 @@ public static class PdfStructure
         return result;
     }
 
-    private static List<(float centroid, byte? level)> AssignHeadingLevelsSmart(List<FontSizeCluster> clusters, float minRatio, float minGap)
+    /// <remarks>
+    /// The threshold is purely a ratio against the body centroid. It used to be the smaller of
+    /// that ratio and an absolute 1.5pt gap, which let a candidate through on raw size alone —
+    /// unsafe once the same code consumes OCR-derived sizes, and upstream measured no change on
+    /// native documents when the absolute term was dropped (228 fixtures, 7963 headings,
+    /// byte-identical).
+    /// </remarks>
+    private static List<(float centroid, byte? level)> AssignHeadingLevelsSmart(List<FontSizeCluster> clusters, float minRatio)
     {
         if (clusters.Count == 0) return new();
         if (clusters.Count == 1) return new() { (clusters[0].Centroid, (byte?)null) };
@@ -627,9 +641,7 @@ public static class PdfStructure
         }
 
         float bodyCentroid = clusters[bodyIdx].Centroid;
-        float minHeadingSize = bodyCentroid * minRatio;
-        float minHeadingAbs = bodyCentroid + minGap;
-        float threshold = Math.Min(minHeadingSize, minHeadingAbs);
+        float threshold = bodyCentroid * minRatio;
 
         var candidates = new List<(int idx, float centroid)>();
         for (int i = 0; i < clusters.Count; i++)
@@ -860,6 +872,18 @@ public static class PdfStructure
                 // `IsNumberedSectionHeading` is used so prose opening on a bare year does not
                 // break its own paragraph.
                 bool startsSection = startsNewLine && IsNumberedSectionHeading(line.Text);
+                // A numbered section heading also always ENDS the element it opens: nothing else
+                // distinguishes a heading from the body text that follows it when both share font
+                // size, weight, role and line spacing. `startsSection` above only fires while
+                // classifying the heading's own line and cannot see forward to close it; this
+                // looks backward at `prev` instead. Restricting to a single accumulated line
+                // scopes the break to the line directly after the heading, so a paragraph already
+                // several lines long is untouched, and `HeadingWrapsOnto` exempts a heading that
+                // is itself still wrapping onto its next physical line.
+                bool followsSection = startsNewLine
+                    && current.Count == 1
+                    && IsNumberedSectionHeading(prev.Text)
+                    && !HeadingWrapsOnto(prev, line);
                 bool crossedGap = false;
                 foreach (var gapY in gapYs)
                 {
@@ -869,7 +893,8 @@ public static class PdfStructure
                     else { upper = currentBaseline; lower = previousBaseline; }
                     if (gapY < upper && gapY > lower) { crossedGap = true; break; }
                 }
-                shouldBreak = rotationChange || fontChange || boldChange || isList || startsSection || crossedGap;
+                shouldBreak = rotationChange || fontChange || boldChange || isList
+                    || startsSection || followsSection || crossedGap;
             }
 
             if (shouldBreak && current.Count > 0)
@@ -1472,8 +1497,21 @@ public static class PdfStructure
             // not a requirement — and a run of consecutive subsection headings would be rejoined
             // here even after the line grouper split them.
             bool nextStartsSection = StartsNumberedSection(next);
+            // The mirror of `nextStartsSection`: a numbered section heading must never be absorbed
+            // AS a continuation either. The line grouper already splits a heading from unrelated
+            // text that follows it, but that split is undone here unless this pass independently
+            // refuses to re-join it — the two passes see none of each other's decisions. The one
+            // exception is a heading still wrapping onto its next physical line, which must stay
+            // joined; `HeadingWrapsOnto` is the same right-edge test the grouper uses, applied to
+            // the boundary segments so both passes agree on the same wrap.
+            bool currentStartsSection = StartsNumberedSection(current);
+            var boundaryPrev = current.Lines.LastOrDefault()?.Segments.LastOrDefault();
+            var boundaryNext = next.Lines.FirstOrDefault()?.Segments.FirstOrDefault();
+            bool boundaryIsHeadingWrap = boundaryPrev is not null && boundaryNext is not null
+                && HeadingWrapsOnto(boundaryPrev, boundaryNext);
             if (bothBody && fontsCompatible && boldCompatible && continuationSignal
-                && sameRotation && verticalGapCompatible && !nextStartsSection)
+                && sameRotation && verticalGapCompatible && !nextStartsSection
+                && (!currentStartsSection || boundaryIsHeadingWrap))
             {
                 current.Text = "";
                 current.BlockBbox = UnionBlockBbox(current.BlockBbox, next.BlockBbox);
@@ -1529,6 +1567,34 @@ public static class PdfStructure
     /// </summary>
     /// <remarks>The line's segments are rejoined because word-processor output often splits the
     /// numbering into its own run, leaving the leading segment as a bare "1.3".</remarks>
+    /// <summary>
+    /// Tolerance, as a multiple of font size, on the right-edge alignment that says a heading is
+    /// still wrapping onto its next physical line.
+    /// </summary>
+    private const float HEADING_WRAP_RIGHT_EDGE_TOLERANCE_FONT_FACTOR = 2.0f;
+
+    /// <summary>
+    /// Whether <paramref name="line"/> reads as the wrapped continuation of a heading on
+    /// <paramref name="prev"/>, rather than unrelated content handed off to.
+    /// </summary>
+    /// <remarks>
+    /// A wrapped heading line ends at roughly the same right edge as the line it wrapped from.
+    /// Both paragraph passes use this same test, so they agree on the same wrap.
+    /// </remarks>
+    private static bool HeadingWrapsOnto(SegmentData prev, SegmentData line)
+    {
+        if (!prev.HasSameRotation(line)) return false;
+        if (!float.IsFinite(prev.FontSize) || !float.IsFinite(line.FontSize)) return false;
+
+        float prevEnd = prev.UprightAdvanceExtent().End;
+        float lineEnd = line.UprightAdvanceExtent().End;
+        if (!float.IsFinite(prevEnd) || !float.IsFinite(lineEnd)) return false;
+
+        float tolerance = HEADING_WRAP_RIGHT_EDGE_TOLERANCE_FONT_FACTOR
+                          * Math.Max(Math.Max(prev.FontSize, line.FontSize), 1.0f);
+        return Math.Abs(prevEnd - lineEnd) <= tolerance;
+    }
+
     private static bool StartsNumberedSection(PdfParagraph para)
     {
         var firstLine = para.Lines.FirstOrDefault();
@@ -2447,7 +2513,7 @@ public static class PdfStructure
     /// glyph, a dash followed by a space, or an ordered marker that has both a separator and
     /// alphabetic content after it.
     /// </summary>
-    private static bool LooksLikeListItem(string text)
+    internal static bool LooksLikeListItem(string text)
     {
         string t = text.TrimStart();
         if (t.Length == 0) return false;
@@ -2471,11 +2537,45 @@ public static class PdfStructure
         if (IsNumberedSectionHeading(t)) return false;
 
         if (PdfListMarker.Parse(t) is not { } marker) return false;
+        if (marker.ContentStart >= t.Length) return false;
+        char firstContentChar = t[marker.ContentStart];
         return marker.HasContent
             && marker.HasSeparator
             && !PdfListMarker.IsProbableAuthorByline(t)
-            && marker.ContentStart < t.Length
-            && char.IsLetter(t[marker.ContentStart]);
+            && char.IsLetter(firstContentChar)
+            && !IsInlineParenthesizedQuantity(t, marker, firstContentChar);
+    }
+
+    /// <summary>
+    /// Whether a line-leading <c>(N)</c> reads as a mid-sentence quantity clarification rather
+    /// than a list marker.
+    /// </summary>
+    /// <remarks>
+    /// "Two" followed by a line break and "(2) additional on-street parking spaces" wraps onto a
+    /// physical line that
+    /// <em>starts</em> with <c>(2)</c>, which is shaped identically to a genuine numbered marker
+    /// like <c>(2) Second item</c>, so the sentence was split into a list item mid-clause.
+    /// <para>
+    /// The distinguishing signal is capitalization plus how the marker was separated from its
+    /// content. A newline between the two means the marker arrived as
+    /// its own text run, glued to the next by line reconstruction rather than by the author — that
+    /// shape is trusted regardless of case. A plain space on the same physical line followed by a
+    /// lowercase word is the shape of a number spelled out in prose; a genuine enumerated item is
+    /// a new sentence and starts with a capital.
+    /// </para>
+    /// <para>
+    /// Scoped to parenthesized <em>numeric</em> markers only: <c>(a)</c>/<c>(b)</c> are genuine
+    /// sub-item markers (nobody writes "two (b) items"), and non-parenthesized families
+    /// (<c>"1. "</c>, <c>"[1] "</c>) have no English idiom that produces this false positive.
+    /// </para>
+    /// </remarks>
+    private static bool IsInlineParenthesizedQuantity(
+        string t, PdfListMarker.OrderedListMarker marker, char firstContentChar)
+    {
+        if (!t.StartsWith('(') || marker.NumericValue is null) return false;
+        string separatorRegion = t[..Math.Min(marker.ContentStart, t.Length)];
+        if (separatorRegion.Contains('\n') || separatorRegion.Contains('\r')) return false;
+        return !char.IsUpper(firstContentChar);
     }
 
     private static bool IsStructuralHeadingWord(string text) => text.Trim() switch
@@ -2843,7 +2943,12 @@ public static class PdfStructure
             else anns = new();
             var (normalized, removedPrefixLen) = NormalizeListText(text);
             anns = ShiftAnnotationsAfterPrefixRemoval(anns, removedPrefixLen, Utf8Len(normalized));
-            builder.PushListItem(normalized, ordered, anns, page, bbox);
+            uint listItemIndex = builder.PushListItem(normalized, ordered, anns, page, bbox);
+            // The marker just stripped off `text` is the document's own label. Keep it: an
+            // ordinance is cross-referenced by printed clause number, so a synthesized sequence
+            // position is not an acceptable substitute — "B." rendering as "1." renumbers the text.
+            if (ordered && removedPrefixLen > 0)
+                builder.SetListItemSourceLabel(listItemIndex, text[..removedPrefixLen].Trim());
             return;
         }
 

@@ -9,7 +9,7 @@
       "operations": [
         {
           "op": "show",
-          "path": "results[0].structured_data"
+          "path": "results[0].structured_output"
         }
       ]
     },
@@ -93,6 +93,7 @@
         ]
       },
       "schema_name": "memo_data",
+      "strict": true,
       "llm": {
         "model": "openai/gpt-4o"
       }

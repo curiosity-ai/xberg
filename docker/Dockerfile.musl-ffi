@@ -14,7 +14,7 @@ WORKDIR /build
 SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 
 RUN apk add --no-cache \
-    curl musl-dev cmake make pkgconf \
+    curl musl-dev cmake make pkgconf bash patchelf \
     perl linux-headers git file && \
     apk add --no-cache \
         gcc g++ libstdc++ libstdc++-dev \
@@ -36,37 +36,37 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
-COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-ffi/ crates/xberg-ffi/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
+COPY crates/xberg-pdfium-render/ crates/xberg-pdfium-render/
+COPY crates/xberg-native-pdf/ crates/xberg-native-pdf/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
 COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 
-RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-cli/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
+RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-cli/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /e2e\/rust/d' Cargo.toml
 
 RUN cargo build --release --package xberg-ffi && \
     cp target/release/libxberg_ffi.so /build/libxberg_ffi.so && \
     strip /build/libxberg_ffi.so
 
-# Bundle the vendored shared-lib closure (ONNX Runtime + image codecs) that the
-# runtime Alpine .NET base image does not provide, and point every bundled
-# library's RUNPATH at its own directory so the musl loader resolves them beside
-# libxberg_ffi.so. Without this the NuGet package ships the FFI library alone and
-# .NET raises DllNotFoundException on its unresolved libonnxruntime (xberg #1280).
-# Best-effort: the allowlist skips base-image-provided libs (musl libc, libstdc++,
-# libgcc); an unmatched dep is left out rather than failing the build. ~keep
-RUN apk add --no-cache patchelf && \
-    ldd /build/libxberg_ffi.so | awk '{print $3}' | grep -E '^/' | while read -r lib; do \
-        base="$(basename "$lib")"; \
-        case "$base" in \
-            libonnxruntime.so*|libheif.so*|libde265.so*|libaom.so*|libx265.so*|libdav1d.so*|libSvtAv1*) \
-                cp -Ln "$lib" "/build/$base" && echo "bundled $base" ;; \
-        esac; \
-    done && \
-    for f in /build/*.so; do patchelf --set-rpath '$ORIGIN' "$f"; done
+# Bundle the FULL transitive shared-lib closure (ONNX Runtime + image codecs,
+# and everything THEY need in turn) that the runtime Alpine .NET/JDK base image
+# does not provide, and point every bundled library's RUNPATH at its own
+# directory so the musl loader resolves them beside libxberg_ffi.so. Without
+# this the NuGet/Maven package ships the FFI library alone and the consumer
+# raises DllNotFoundException / UnsatisfiedLinkError on an unresolved transitive
+# dependency (xberg #1280, recurred for libonnxruntime's own libprotobuf-lite +
+# ~40 libabsl_*/libre2/libicu* dependents that a hand-maintained allowlist of
+# top-level libs can never keep in sync with). vendor-native-closure.sh walks
+# `ldd` recursively instead of naming libraries by hand, and hard-fails the
+# build (verify_local_closure) if anything is still unresolved after
+# vendoring, so a missing transitive dependency breaks CI here instead of
+# shipping silently. ~keep
+COPY scripts/ci/vendor-native-closure.sh /usr/local/bin/vendor-native-closure.sh
+RUN bash /usr/local/bin/vendor-native-closure.sh /build/libxberg_ffi.so
 
 RUN file /build/libxberg_ffi.so && \
     echo "=== Dynamic dependencies ===" && \

@@ -1,6 +1,6 @@
 //! Docling DocTags extractor.
 //!
-//! Thin adapter over [`crate::extraction::doctags`], which holds the parser.
+//! Parses Docling DocTags documents through the extractor registry.
 
 use crate::Result;
 use crate::core::config::ExtractionConfig;
@@ -11,10 +11,7 @@ use async_trait::async_trait;
 
 /// Extractor for Docling DocTags documents.
 ///
-/// Skipped for binding generation like every sibling extractor: `extract_content`
-/// returns `InternalDocument`, which is itself binding-excluded, so alef would
-/// sanitize the return type to `String` and emit a lossy surface. Extractors are
-/// reached through the registry, never constructed directly by binding callers.
+/// Register this Rust-only extractor through the document-extractor registry.
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Default)]
 pub struct DocTagsExtractor;

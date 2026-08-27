@@ -16,7 +16,6 @@
 //!   the three files' bytes themselves. This module vendors no JS-fetch
 //!   integration; `from_bytes` is the seam a WASM host binds to.
 //!
-//! Since v5.1.0 (`lightweight` preset).
 
 use model2vec_rs::model::StaticModel;
 

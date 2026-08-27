@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/ttf-parser-compat",
     "crates/xberg",
     "crates/xberg-candle-ocr",
     "crates/xberg-cli",
@@ -9,8 +8,10 @@ members = [
     "crates/xberg-jni",
     "crates/xberg-libheif",
     "crates/xberg-libwpd",
+    "crates/xberg-native-pdf",
     "crates/xberg-node",
     "crates/xberg-paddle-ocr",
+    "crates/xberg-pdfium-render",
     "crates/xberg-php",
     "crates/xberg-py",
     "crates/xberg-tesseract",
@@ -26,7 +27,7 @@ resolver = "2"
 [workspace.package]
 version = "1.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.92"
 authors = ["Na'aman Hirschfeld <naaman@xberg.io>"]
 license = "MIT"
 repository = "https://github.com/xberg-io/xberg"
@@ -61,7 +62,7 @@ chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "color", "suggestions"] }
 comrak = { version = "0.54", default-features = false }
 console_error_panic_hook = "0.1"
-crawlberg = { version = "1.3.0", default-features = false }
+crawlberg = { version = "1.4.0", default-features = false }
 criterion = { version = "0.8", features = ["html_reports"] }
 dbase = "0.8"
 flate2 = "1.1"
@@ -81,24 +82,33 @@ libc = "0.2.189"
 # cross-compilation (zigbuild aarch64/musl) where no host libz is usable.
 # Only consumed by crates/xberg-libwpd. ~keep
 libz-sys = { version = "1.1", features = ["static"] }
-liter-llm = { version = "1.17.0", default-features = false }
-log = "0.4"
+liter-llm = { version = "1.18.1", default-features = false }
+# `std` is NOT a default feature of `log`. `pdf::render`'s glyph-drop warning capture
+# calls `log::set_boxed_logger`, which only exists behind it, so a feature set that
+# happens not to pull `log/std` in transitively fails to compile (`pdf` without `ocr`
+# did exactly that). Requesting it here makes the requirement explicit instead of
+# leaving it to whichever unrelated crate enables it first.
+log = { version = "0.4", features = ["std"] }
 memmap2 = "0.9"
 minijinja = "2"
-nom-exif = { version = "3.6", default-features = false }
+nom-exif = { version = "3.7", default-features = false }
 num_cpus = "1.17.0"
 once_cell = "1.21.4"
 
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "api-18"] }
 parking_lot = "0.12.5"
-pdf_oxide = { version = "0.3.77", default-features = false, features = ["rendering", "legacy-crypto"] }
+# Our fork of pdfium-render. `package =` keeps the extern crate name `pdfium_render`
+# (matches the `[lib] name = "pdfium_render"` in crates/xberg-pdfium-render/Cargo.toml),
+# so any `use pdfium_render::...` call site is unaffected. Path dependency inside the
+# workspace; needs no [patch.crates-io] entry (see the note above that block).
+pdfium-render = { package = "xberg-pdfium-render", path = "./crates/xberg-pdfium-render", version = "1.1.0" }
 rayon = "1.12.0"
 reqwest = { version = "0.13.4", default-features = false }
 # SVG rendering (resvg re-exports tiny_skia and usvg; default-features = false
 # drops text, system-fonts, memmap-fonts, raster-images — all pure-Rust, WASM-safe).
 resvg = { version = "0.48", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
-sceptre = { version = "0.6.0", default-features = false }
+sceptre = { version = "0.7.2", default-features = false }
 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151" }
@@ -128,8 +138,8 @@ tracing = "0.1"
 # no-ORT targets (wasm32, x86_64-linux-android). The ONNX frontend crate is CPU-only
 # and WASM-safe; the top-level `tract` facade instead defaults to CUDA and bundles
 # GPU backends, so it is unusable here. See issue #1275.
-tract-onnx = { version = "0.23.4", default-features = false }
-tree-sitter-language-pack = { version = "1.15.0", default-features = false, features = ["serde"] }
+tract-onnx = { version = "0.23.5", default-features = false }
+tree-sitter-language-pack = { version = "1.15.8", default-features = false, features = ["serde"] }
 url = "2.5.8"
 # usvg (re-exported by resvg) with only the `writer` feature so `Tree::to_string`
 # / `WriteOptions` are available for SVG sanitize re-serialization. `writer` pulls
@@ -150,42 +160,37 @@ web-sys = { version = "0.3", features = [
 ] }
 xberg = { path = "./crates/xberg", version = "1.1.0", default-features = false }
 xberg-gliner = { path = "./crates/xberg-gliner", version = "1.1.0", default-features = false }
+# The native PDF engine, vendored into this workspace at crates/xberg-native-pdf. It began as
+# a fork of a third-party project; see ATTRIBUTIONS.md, which is now the ONLY place in this
+# repo that names the upstream. There is deliberately no `package =` alias: the extern crate
+# name is the real one, so `use xberg_native_pdf::...` at every call site, and the tracing log
+# target (`module_path!()`, rooted at `[lib] name`) matches the crate you are reading. An alias
+# hiding a different lib name is what cost twelve days of dropped font warnings in GH#697.
+# Path dependency inside the workspace; needs no [patch.crates-io] entry.
+xberg-native-pdf = { path = "./crates/xberg-native-pdf", version = "1.1.0" }
 
 [patch.crates-io]
+# No out-of-tree sibling override is active, so the standing "do not release while a patch
+# entry is present" rule is disarmed. `cargo publish` IGNORES [patch], so any future entry
+# pointing outside the workspace must be removed before a release cut.
+#
+# The liter-llm entry that lived here is gone: the in-flight provider-request limiter
+# (GH#1465) shipped in liter-llm 1.18.0, which is now on crates.io, and the requirement above
+# was bumped to 1.18.0 in the same commit that deleted the override -- doing only one of the
+# two would silently resolve a liter-llm with no `in_flight_limit` field.
+#
+# The native PDF engine needs no entry: it is a workspace member at crates/xberg-native-pdf
+# and resolves by path (see the note above that dependency).
+
+# The five entries below are self-patches of our own workspace members, which are already
+# declared as `path = ..., version = ...` deps -- so path resolution wins locally with or
+# without them. They only bite if some third-party crates.io dependency ever depends on
+# `xberg*`. Left in place deliberately; see task #751 before removing. ~keep
 xberg = { path = "crates/xberg" }
 xberg-gliner = { path = "crates/xberg-gliner" }
 xberg-tesseract = { path = "crates/xberg-tesseract" }
 xberg-paddle-ocr = { path = "crates/xberg-paddle-ocr" }
 xberg-candle-ocr = { path = "crates/xberg-candle-ocr" }
-# Redirects the transitive ttf-parser used by pdf_oxide and fontdb onto
-# xberg-ttf-parser, which carries the CFF dotsection fix and eight other fixes
-# unreleased upstream. Cargo matches patch entries on package name alone, so the
-# redirect goes through a name-compat shim; see crates/ttf-parser-compat.
-#
-# EXPOSURE: [patch] only rewrites resolution for builds going through this
-# workspace root. Anyone who depends on published `xberg` (crates.io, currently
-# 1.0.14) from their own Cargo.toml pulls pdf_oxide's and fontdb's real,
-# unpatched ttf-parser instead, with none of these nine fixes. The dotsection
-# one is user-visible: xberg's `pdf` feature silently drops the i, j, period,
-# colon, semicolon, exclamation, and question-mark glyphs of any CFF font that
-# uses the deprecated `dotsection` operator (e.g. distiller-produced Type 1C
-# subsets) when rendering a page to an image. There is no workaround for those
-# consumers short of this fix shipping from upstream ttf-parser itself.
-#
-# STATUS (checked 2026-08-06, re-verify before touching this entry):
-# harfbuzz/ttf-parser#228 (dotsection) is merged to upstream `main`, but
-# nothing is tagged or published — crates.io still serves 0.25.1, the same as
-# GitHub's newest tag (v0.25.1). The backport-to-0.25.2 proposal (#229) was
-# closed and folded into #228, so no 0.25.x patch release is in flight. The
-# fix now only ships via the next `main` release, tracked as 0.26.0 in
-# harfbuzz/ttf-parser#242 (also closed, blocked on crates.io publish access,
-# no tag cut). Even once 0.26.0 publishes, it will NOT satisfy pdf_oxide's and
-# fontdb's `ttf-parser = "^0.25"` requirement — 0.x caret ranges do not cross a
-# minor version — so this patch stays load-bearing until pdf_oxide and fontdb
-# themselves widen that requirement and re-publish. Do not drop this entry on
-# the assumption that a release landed; confirm crates.io serves >=0.25.2 (or
-# pdf_oxide/fontdb accept 0.26) first.
-ttf-parser = { path = "crates/ttf-parser-compat" }
 
 [profile.release]
 lto = "thin"

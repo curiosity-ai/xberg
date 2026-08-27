@@ -272,12 +272,19 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
             }
 
             ElementKind::ListItem { ordered } => {
+                // JSON list items are plain strings with no separate marker slot -- a
+                // literal source label (e.g. "B.", "(a)") is prefixed onto the item text,
+                // same convention the other text-based renderers use.
+                let item_text = match elem.list_item_source_label() {
+                    Some(label) if !label.is_empty() => format!("{label} {}", elem.text),
+                    _ => elem.text.clone(),
+                };
                 if let Some(ref mut list) = open_list {
-                    list.items.push(elem.text.clone());
+                    list.items.push(item_text);
                 } else {
                     let node = JsonNode::List {
                         ordered,
-                        items: vec![elem.text.clone()],
+                        items: vec![item_text],
                     };
                     push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
                 }

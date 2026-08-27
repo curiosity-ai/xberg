@@ -40,10 +40,13 @@ export default defineConfig({
         title: "Xberg",
         description:
           "Full content intelligence engine: extract text, tables, entities, and embeddings from " +
-          "101 formats with OCR, transcription, code intelligence, and LLM integration. Native " +
+          "100 formats with OCR, transcription, code intelligence, and LLM integration. Native " +
           "bindings for 15 languages.",
         githubUrl: "https://github.com/xberg-io/xberg",
         editBaseUrl: "https://github.com/xberg-io/xberg/edit/main/docs-site/",
+        starlight: {
+          favicon: "https://cdn.jsdelivr.net/gh/xberg-io/assets@v1.0.0/docs/app-icon.svg",
+        },
         plugins: [
           starlightLlmsTxt({
             customSets: [
@@ -99,7 +102,7 @@ export default defineConfig({
               { label: "Quick Start", slug: "getting-started/quickstart" },
               {
                 label: "Live Demo",
-                link: "/demo.html",
+                link: "https://docs.xberg.io/demo.html",
                 attrs: { target: "_blank" },
               },
             ],

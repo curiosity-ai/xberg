@@ -12,7 +12,7 @@
 pub mod chunk_classifier;
 pub mod page_classifier;
 
-pub use chunk_classifier::classify_chunks;
+pub use chunk_classifier::{classify_chunks, classify_chunks_owned};
 pub use page_classifier::{classify_pages, classify_text};
 
 /// Classify a single document (as multiple pages or a single text block).

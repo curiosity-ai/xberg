@@ -11,6 +11,20 @@ use lopdf::{Document, Object};
 #[cfg(feature = "tokio-runtime")]
 use std::borrow::Cow;
 
+/// Maximum recursion depth when walking the `/EmbeddedFiles` name tree's `/Kids`
+/// chain. Mirrors `bookmarks.rs`'s `MAX_NAME_TREE_DEPTH`: without a depth cap, a
+/// name-tree node whose `/Kids` array references one of its own ancestors (or
+/// itself) makes `collect_from_name_tree` recurse without ever returning, which
+/// overflows the stack and aborts the whole process — unlike an ordinary panic,
+/// a stack overflow cannot be caught with `catch_unwind`.
+#[cfg(feature = "tokio-runtime")]
+const MAX_EMBEDDED_NAME_TREE_DEPTH: usize = 50;
+
+/// Maximum number of name-tree nodes visited in total, independent of depth, so
+/// a wide (rather than deep) malformed tree cannot force unbounded work either.
+#[cfg(feature = "tokio-runtime")]
+const MAX_EMBEDDED_NAME_TREE_NODES: usize = 500;
+
 /// Embedded file descriptor extracted from the PDF name tree.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddedFile {
@@ -60,14 +74,30 @@ pub(crate) fn extract_embedded_files(document: &Document) -> Vec<EmbeddedFile> {
         _ => return files,
     };
 
-    collect_from_name_tree(document, &ef_dict, &mut files);
+    let mut visited_nodes = 0usize;
+    collect_from_name_tree(document, &ef_dict, &mut files, &mut visited_nodes, 0);
 
     files
 }
 
 /// Recursively collect embedded files from a PDF name tree node.
+///
+/// Traversal is bounded by both `depth` and `visited_nodes` (see
+/// `MAX_EMBEDDED_NAME_TREE_DEPTH`/`MAX_EMBEDDED_NAME_TREE_NODES`) so a
+/// malformed or cyclic `/Kids` chain cannot recurse indefinitely.
 #[cfg(feature = "tokio-runtime")]
-fn collect_from_name_tree(document: &Document, dict: &lopdf::Dictionary, files: &mut Vec<EmbeddedFile>) {
+fn collect_from_name_tree(
+    document: &Document,
+    dict: &lopdf::Dictionary,
+    files: &mut Vec<EmbeddedFile>,
+    visited_nodes: &mut usize,
+    depth: usize,
+) {
+    if depth > MAX_EMBEDDED_NAME_TREE_DEPTH || *visited_nodes >= MAX_EMBEDDED_NAME_TREE_NODES {
+        return;
+    }
+    *visited_nodes += 1;
+
     if let Ok(Object::Array(names_arr)) = dict.get(b"Names") {
         let mut i = 0;
         while i + 1 < names_arr.len() {
@@ -92,9 +122,12 @@ fn collect_from_name_tree(document: &Document, dict: &lopdf::Dictionary, files: 
 
     if let Ok(Object::Array(kids)) = dict.get(b"Kids") {
         for kid in kids {
+            if *visited_nodes >= MAX_EMBEDDED_NAME_TREE_NODES {
+                break;
+            }
             let kid_obj = resolve_object(document, kid);
             if let Some(Object::Dictionary(kid_dict)) = kid_obj {
-                collect_from_name_tree(document, &kid_dict, files);
+                collect_from_name_tree(document, &kid_dict, files, visited_nodes, depth + 1);
             }
         }
     }
@@ -281,6 +314,100 @@ mod tests {
     use super::*;
     use crate::core::config::ExtractionConfig;
     use crate::extractors::security::SecurityLimits;
+    use lopdf::dictionary;
+
+    /// Build a filespec (`/EF` -> `/F` -> embedded-file stream) object graph and
+    /// return the filespec's own object id, ready to be referenced from a `/Names`
+    /// array entry.
+    fn build_filespec(doc: &mut Document, name: &str, payload: &[u8]) -> lopdf::ObjectId {
+        use lopdf::{Dictionary, Stream, StringFormat};
+
+        let mut ef_stream_dict = Dictionary::new();
+        ef_stream_dict.set("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        ef_stream_dict.set("Length", Object::Integer(payload.len() as i64));
+        let ef_stream = Stream::new(ef_stream_dict, payload.to_vec());
+        let ef_stream_id = doc.add_object(ef_stream);
+
+        let mut ef_dict = Dictionary::new();
+        ef_dict.set("F", Object::Reference(ef_stream_id));
+        let ef_dict_id = doc.add_object(ef_dict);
+
+        let mut fs_dict = Dictionary::new();
+        fs_dict.set("F", Object::String(name.as_bytes().to_vec(), StringFormat::Literal));
+        fs_dict.set("EF", Object::Reference(ef_dict_id));
+        doc.add_object(fs_dict)
+    }
+
+    /// Wire a `/EmbeddedFiles` name-tree root into the catalog of `doc`.
+    fn attach_embedded_files_root(doc: &mut Document, root: lopdf::ObjectId) {
+        let mut names_dict = lopdf::Dictionary::new();
+        names_dict.set("EmbeddedFiles", Object::Reference(root));
+        let names_id = doc.add_object(names_dict);
+        let mut catalog_dict = lopdf::Dictionary::new();
+        catalog_dict.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog_dict.set("Names", Object::Reference(names_id));
+        let catalog_id = doc.add_object(catalog_dict);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+    }
+
+    /// A `/Kids` chain nested deeper than `MAX_EMBEDDED_NAME_TREE_DEPTH` must not
+    /// let a leaf named far down the chain surface.
+    ///
+    /// Before `MAX_EMBEDDED_NAME_TREE_DEPTH`/`visited_nodes` were added,
+    /// `collect_from_name_tree` had no bound on `/Kids` recursion at all: a name
+    /// tree node whose `/Kids` array references one of its own ancestors (a
+    /// cycle a malformed or malicious PDF can trivially construct) makes the
+    /// function recurse forever, overflowing the stack and aborting the whole
+    /// process. A stack overflow cannot be caught with `catch_unwind`, so
+    /// reproducing the crash directly in a test would take the entire test
+    /// binary down with it; instead this proves the bound that prevents it: a
+    /// legal-looking chain nested past the depth cap must not be walked to its
+    /// end, which is exactly the condition that made the cycle case unbounded.
+    #[test]
+    fn deeply_nested_kids_chain_beyond_the_depth_cap_is_not_walked() {
+        let mut doc = Document::with_version("1.7");
+
+        let leaf_fs_id = build_filespec(&mut doc, "after-budget.txt", b"unreachable");
+        let mut current = doc.add_object(dictionary! {
+            "Names" => vec![Object::string_literal("after-budget.txt"), Object::Reference(leaf_fs_id)],
+        });
+        for _ in 0..(MAX_EMBEDDED_NAME_TREE_DEPTH + 5) {
+            current = doc.add_object(dictionary! { "Kids" => vec![Object::Reference(current)] });
+        }
+        attach_embedded_files_root(&mut doc, current);
+
+        let files = extract_embedded_files(&doc);
+        assert!(
+            files.iter().all(|f| f.name != "after-budget.txt"),
+            "leaf beyond the {MAX_EMBEDDED_NAME_TREE_DEPTH}-deep traversal cap must not be reached, got {:?}",
+            files.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Positive control: an ordinary, shallow `/Kids` chain (well within the
+    /// depth cap) must still surface its embedded file exactly as before the
+    /// cap was added — this is a crash fix, not a tightening of what resolves.
+    #[test]
+    fn shallow_kids_chain_still_resolves_embedded_file() {
+        let mut doc = Document::with_version("1.7");
+        let fs_id = build_filespec(&mut doc, "report.txt", b"hello");
+        let leaf = doc.add_object(dictionary! {
+            "Names" => vec![Object::string_literal("report.txt"), Object::Reference(fs_id)],
+        });
+        let mid = doc.add_object(dictionary! { "Kids" => vec![Object::Reference(leaf)] });
+        let root = doc.add_object(dictionary! { "Kids" => vec![Object::Reference(mid)] });
+        attach_embedded_files_root(&mut doc, root);
+
+        let files = extract_embedded_files(&doc);
+        assert_eq!(
+            files.len(),
+            1,
+            "expected the shallow chain's leaf file to be found, got {:?}",
+            files.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert_eq!(files[0].name, "report.txt");
+        assert_eq!(files[0].data.as_slice(), b"hello".as_slice());
+    }
 
     #[test]
     fn test_extract_embedded_files_no_names() {

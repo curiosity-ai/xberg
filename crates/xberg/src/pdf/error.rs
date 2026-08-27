@@ -26,7 +26,7 @@ pub enum PdfError {
     FontLoadingFailed(String),
     /// An I/O error occurred while reading the PDF stream.
     IOError(String),
-    /// The operation was cancelled via a `CancellationToken`.
+    /// The operation was cancelled (reachable only via the REST async-jobs API).
     Cancelled,
 }
 

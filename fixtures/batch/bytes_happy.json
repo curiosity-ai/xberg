@@ -7,7 +7,7 @@
 		"title": "Extract a batch of byte inputs",
 		"description": "Extract multiple in-memory documents in one batch.",
 		"presentation": {
-			"files": [{ "field": "/inputs/1/bytes", "path": "test_documents/html/html.html" }]
+			"files": [{ "field": "/inputs/1/bytes", "path": "html/html.html" }]
 		}
 	},
 	"call": "extract_batch",

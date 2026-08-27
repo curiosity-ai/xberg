@@ -67,7 +67,6 @@ pub static EMBEDDING_BACKEND_REGISTRY: LazyLock<Arc<RwLock<EmbeddingBackendRegis
 
 /// Global reranker backend registry singleton.
 ///
-/// Since v5.0.0.
 pub static RERANKER_BACKEND_REGISTRY: LazyLock<Arc<RwLock<RerankerBackendRegistry>>> =
     LazyLock::new(|| Arc::new(RwLock::new(RerankerBackendRegistry::new())));
 
@@ -105,7 +104,6 @@ pub fn get_embedding_backend_registry() -> Arc<RwLock<EmbeddingBackendRegistry>>
 
 /// Get the global reranker backend registry.
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 pub fn get_reranker_backend_registry() -> Arc<RwLock<RerankerBackendRegistry>> {
     RERANKER_BACKEND_REGISTRY.clone()

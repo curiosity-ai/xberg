@@ -53,7 +53,7 @@ jobs:
       artifact-name: benchmarks-target
       source-sha: ${{ steps.source-revision.outputs.sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.branch || github.sha }}
 
@@ -106,13 +106,13 @@ jobs:
         uses: xberg-io/actions/fetch-test-documents@v1
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_BENCHMARK_SA }}
 
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Install zstd (corpus cache decompression)
         run: sudo apt-get install -y zstd
@@ -128,7 +128,13 @@ jobs:
           --fixtures tools/benchmark-harness/fixtures --strict
 
       - name: Validate benchmark cohorts
-        run: cargo test --locked --release -p benchmark-harness 'cohort::tests::'
+        run: |
+          set -euo pipefail
+          cargo test --locked --release -p benchmark-harness 'cohort::tests::' 2>&1 | tee /tmp/cohort-tests.log
+          if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' /tmp/cohort-tests.log; then
+            echo "::error::'cohort::tests::' matched 0 tests -- benchmark cohort validation silently stopped executing" >&2
+            exit 1
+          fi
 
       - name: Validate benchmark harness contracts
         # --no-fail-fast: cargo stops after the first failing test BINARY, so a
@@ -214,6 +220,8 @@ jobs:
         # families a layout run would merely duplicate baseline, so drop those cells.
         # The PaddleOCR-engine variants (baseline-paddle, layout-paddle) force OCR, so they run ONLY
         # on the OCR cohorts (ocr-pdf-fast-b4, ocr-images-fast); drop them from every non-OCR cohort.
+        # Sceptre ORT remains a release comparison for OCR PDFs. Its image coverage runs against the
+        # bounded structured-image diagnostic cohort below, outside the published release contract.
         # NOTE: keep this block a clean list of `- {...}` entries — the validate-workflow-matrix.py
         # exclude parser stops at the first non-entry line, so do not intersperse comments here.
         exclude:
@@ -240,20 +248,23 @@ jobs:
           - { pipeline: sceptre-ort, cohort: native-ebook-fast }
           - { pipeline: sceptre-ort, cohort: native-email-fast }
           - { pipeline: sceptre-ort, cohort: native-data-fast }
+          - { pipeline: sceptre-ort, cohort: ocr-images-fast }
           - { pipeline: sceptre-ort-layout, cohort: native-pdf-fast-b8 }
           - { pipeline: sceptre-ort-layout, cohort: native-office-fast }
           - { pipeline: sceptre-ort-layout, cohort: native-markup-fast }
           - { pipeline: sceptre-ort-layout, cohort: native-ebook-fast }
           - { pipeline: sceptre-ort-layout, cohort: native-email-fast }
           - { pipeline: sceptre-ort-layout, cohort: native-data-fast }
+          - { pipeline: sceptre-ort-layout, cohort: ocr-images-fast }
           - { pipeline: sceptre-ort-autorotate, cohort: native-pdf-fast-b8 }
           - { pipeline: sceptre-ort-autorotate, cohort: native-office-fast }
           - { pipeline: sceptre-ort-autorotate, cohort: native-markup-fast }
           - { pipeline: sceptre-ort-autorotate, cohort: native-ebook-fast }
           - { pipeline: sceptre-ort-autorotate, cohort: native-email-fast }
           - { pipeline: sceptre-ort-autorotate, cohort: native-data-fast }
+          - { pipeline: sceptre-ort-autorotate, cohort: ocr-images-fast }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -360,8 +371,24 @@ jobs:
           path: benchmark-results/
           retention-days: 30
 
-  sceptre-tract-diagnostic:
-    name: sceptre-tract diagnostic (${{ matrix.mode }})
+  # Exercises `PdfBackend::Pdfium` (crates/xberg/src/extractors/pdf/pdfium_engine.rs) as its own
+  # recorded framework, separate from `bench-rust`'s native-backend legs. `setup` already builds
+  # `xberg-cli` with `--features all,...`, and `all` includes `pdf-pdfium-surface` ->
+  # `xberg/pdf-pdfium` (crates/xberg-cli/Cargo.toml), so the CLI binary this job downloads already
+  # has the pdfium engine compiled in -- what it lacks is a real `libpdfium` runtime library,
+  # provisioned below via the same `download-pdfium` composite action `ci-rust.yaml`'s
+  # `pdfium-engine` job uses, pinned to the same 7678 release the checked-in
+  # `crates/xberg-pdfium-render` bindings were generated against (see that job for the version
+  # mismatch rationale). Restricted to the `baseline` pipeline and the PDF-only cohort: the
+  # pdfium engine has no OCR fallback and is deliberately smaller in scope than the native engine
+  # (no tables/images/annotations/form fields), so this is not a fair substitute for the
+  # native-backend legs above -- it is a distinct measurement, hence the `-pdfium` framework
+  # suffix and its own uploaded artifact.
+  #
+  # Pdfium is part of the native cohort's pinned release contract, so the `bench-` prefix keeps
+  # these required cells visible to the workflow/contract validator and aggregation gate. ~keep
+  bench-pdfium:
+    name: pdfium-benchmark (baseline, ${{ matrix.output_format }}, ${{ matrix.mode }})
     needs: setup
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
@@ -370,9 +397,101 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        output_format: [markdown, plaintext]
         mode: [single-file, batch]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.setup.outputs.source-sha }}
+
+          submodules: recursive
+      - name: Free disk space
+        uses: xberg-io/actions/free-disk-space-linux@v1
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup Rust toolchain
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          cache-key-prefix: benchmarks-rust-pdfium
+          use-sccache: "true"
+          report-stats: "true"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.setup.outputs.artifact-name }}
+          path: target/release
+
+      - name: Restore benchmark binary permissions
+        run: scripts/benchmarks/restore-binary-permissions.sh
+
+      # Only the pdf/ fixtures the native-pdf-fast-b8 cohort references are needed here.
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+        with:
+          include: |
+            pdf/**
+
+      - name: Download reference corpus cache
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-corpus-cache
+          path: ${{ runner.temp }}/benchmark-corpus-cache
+
+      - name: Unpack reference corpus cache
+        run: tar -C test_documents -xf "${RUNNER_TEMP}/benchmark-corpus-cache/corpus-cache.tar"
+
+      # bench-rust runs this step unconditionally regardless of pipeline (not gated on
+      # `contains(matrix.pipeline, ...)`), so the `xberg-cli` binary built with `--features all`
+      # apparently expects an ONNX Runtime library reachable even for a baseline-only run.
+      # Mirrored here rather than assumed-unnecessary. ~keep
+      - name: Setup ONNX Runtime
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Download Pdfium runtime (pinned to the checked-in bindings' release)
+        uses: ./.github/actions/download-pdfium
+        with:
+          pdfium-version: "7678"
+
+      - name: Run benchmark
+        env:
+          FRAMEWORK: xberg-${{ matrix.output_format }}-baseline-pdfium
+          MODE: ${{ matrix.mode }}
+          OUTPUT_FORMAT: ${{ matrix.output_format }}
+          PDF_BACKENDS: pdfium
+          ITERATIONS: ${{ env.ITERATIONS }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          COHORT: tools/benchmark-harness/cohorts/native-pdf-fast-b8.json
+          PDFIUM_DYNAMIC_LIB_PATH: ${{ env.XBERG_PDFIUM_PREBUILT }}/lib
+          LD_LIBRARY_PATH: ${{ env.XBERG_PDFIUM_PREBUILT }}/lib:${{ env.LD_LIBRARY_PATH }}
+        run: scripts/benchmarks/run-benchmark.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-rust-pdfium-baseline-${{ matrix.output_format }}-${{ matrix.mode }}-native-pdf-fast-b8-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 30
+
+  sceptre-structured-diagnostic:
+    name: sceptre structured-image diagnostic (${{ matrix.pipeline }}, ${{ matrix.mode }})
+    needs: setup
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        pipeline: [sceptre-ort, sceptre-ort-layout, sceptre-ort-autorotate, sceptre-tract]
+        mode: [single-file, batch]
+    steps:
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
           submodules: recursive
@@ -402,16 +521,37 @@ jobs:
         with:
           ort-version: ${{ env.ORT_VERSION }}
 
-      - name: Pre-warm Sceptre tract models
-        run: >-
-          ./target/release/xberg extract test_documents/images/test_hello_world.png
-          --ocr true --force-ocr true --ocr-backend sceptre
-          --ocr-backend-options '{"model":{"backend":"tract"}}'
-          --ocr-language eng --no-cache true --format json >/dev/null
+      - name: Setup Layout Models
+        if: contains(matrix.pipeline, 'layout')
+        uses: ./.github/actions/setup-layout-models
+
+      - name: Pre-warm Sceptre diagnostic models
+        env:
+          PIPELINE: ${{ matrix.pipeline }}
+        run: |
+          set -euo pipefail
+          backend="ort"
+          if [[ "$PIPELINE" == "sceptre-tract" ]]; then
+            backend="tract"
+          fi
+          args=(
+            extract test_documents/images/test_hello_world.png
+            --ocr true
+            --force-ocr true
+            --ocr-backend sceptre
+            --ocr-backend-options "{\"model\":{\"backend\":\"${backend}\"}}"
+            --ocr-language eng
+            --no-cache true
+            --format json
+          )
+          if [[ "$PIPELINE" == "sceptre-ort-autorotate" ]]; then
+            args+=(--ocr-auto-rotate true)
+          fi
+          ./target/release/xberg "${args[@]}" >/dev/null
 
       - name: Run bounded diagnostic benchmark
         env:
-          FRAMEWORK: xberg-markdown-sceptre-tract
+          FRAMEWORK: xberg-markdown-${{ matrix.pipeline }}
           MODE: ${{ matrix.mode }}
           OUTPUT_FORMAT: markdown
           ITERATIONS: ${{ env.ITERATIONS }}
@@ -423,7 +563,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: diagnostic-sceptre-tract-markdown-${{ matrix.mode }}-ocr-images-structured-${{ github.run_id }}
+          name: diagnostic-${{ matrix.pipeline }}-markdown-${{ matrix.mode }}-ocr-images-structured-${{ github.run_id }}
           path: benchmark-results/
           retention-days: 30
 
@@ -451,7 +591,7 @@ jobs:
           - native-data-fast
           - ocr-images-fast
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -504,7 +644,7 @@ jobs:
 
       - name: Restore EasyOCR model cache (docling OCR)
         id: easyocr-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.EasyOCR
           key: docling-easyocr-en-ko-ja-v1-${{ runner.os }}-${{ runner.arch }}
@@ -562,7 +702,7 @@ jobs:
         exclude:
           - output_format: plaintext
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -651,7 +791,7 @@ jobs:
           ocr-images-fast,
         ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -747,7 +887,7 @@ jobs:
         exclude:
           - output_format: markdown
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -836,7 +976,7 @@ jobs:
         exclude:
           - output_format: plaintext
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -920,7 +1060,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.branch || github.sha }}
           submodules: recursive
@@ -956,7 +1096,7 @@ jobs:
 
       - name: Restore MinerU model cache
         id: mineru-model-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/huggingface/hub
@@ -1048,7 +1188,7 @@ jobs:
         exclude:
           - output_format: plaintext
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -1178,7 +1318,7 @@ jobs:
         output_format: [markdown, plaintext]
         cohort: [native-pdf-fast-b8, ocr-pdf-fast-b4]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha }}
 
@@ -1258,6 +1398,7 @@ jobs:
         setup,
         prefetch-mineru-models,
         bench-rust,
+        bench-pdfium,
         bench-docling,
         bench-markitdown,
         bench-unstructured,
@@ -1281,12 +1422,12 @@ jobs:
         # aggregation itself. Losing it degrades to default GITHUB_TOKEN, it does not mask a
         # benchmark result. ~keep
         continue-on-error: true
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.source-sha || github.sha }}
           submodules: recursive
@@ -1502,6 +1643,7 @@ jobs:
           echo "=== Upstream job results ==="
           echo "setup=${{ needs.setup.result }}"
           echo "bench-rust=${{ needs.bench-rust.result }}"
+          echo "bench-pdfium=${{ needs.bench-pdfium.result }}"
           echo "bench-docling=${{ needs.bench-docling.result }}"
           echo "bench-markitdown=${{ needs.bench-markitdown.result }}"
           echo "bench-unstructured=${{ needs.bench-unstructured.result }}"

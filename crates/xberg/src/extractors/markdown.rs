@@ -162,7 +162,12 @@ impl MarkdownExtractor {
         let mut list_stack: Vec<bool> = Vec::new();
         let mut list_item_text = String::new();
         let mut list_item_annotations: Vec<TextAnnotation> = Vec::new();
-        let mut in_list_item = false;
+        // Depth counter, not a bool: a sublist nested inside a list item closes its own
+        // `Item` before the enclosing item closes, and trailing text after the sublist
+        // still belongs to the enclosing item. A bool cleared to `false` by the inner
+        // `End(Item)` let that trailing text fall through to the paragraph guard below
+        // and be emitted as a bare paragraph instead of list-item content (GH#1459).
+        let mut in_list_item: usize = 0;
         let mut in_image = false;
         let mut image_alt = String::new();
         let mut image_url: Option<String> = None;
@@ -215,7 +220,7 @@ impl MarkdownExtractor {
                     heading_annotations.clear();
                 }
                 Event::Start(Tag::Paragraph)
-                    if !in_heading && !in_list_item && footnote_def_label.is_none() && !in_def_desc =>
+                    if !in_heading && in_list_item == 0 && footnote_def_label.is_none() && !in_def_desc =>
                 {
                     paragraph_text.clear();
                     paragraph_annotations.clear();
@@ -240,7 +245,7 @@ impl MarkdownExtractor {
                         annotation_starts.push((0, active_text_offset(&paragraph_text), None));
                     } else if in_heading {
                         annotation_starts.push((0, active_text_offset(&heading_text), None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((0, active_text_offset(&list_item_text), None));
                     }
                 }
@@ -257,7 +262,7 @@ impl MarkdownExtractor {
                             if start < end {
                                 heading_annotations.push(builder::bold(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = active_text_offset(&list_item_text);
                             if start < end {
                                 list_item_annotations.push(builder::bold(start, end));
@@ -270,7 +275,7 @@ impl MarkdownExtractor {
                         annotation_starts.push((1, active_text_offset(&paragraph_text), None));
                     } else if in_heading {
                         annotation_starts.push((1, active_text_offset(&heading_text), None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((1, active_text_offset(&list_item_text), None));
                     }
                 }
@@ -287,7 +292,7 @@ impl MarkdownExtractor {
                             if start < end {
                                 heading_annotations.push(builder::italic(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = active_text_offset(&list_item_text);
                             if start < end {
                                 list_item_annotations.push(builder::italic(start, end));
@@ -300,7 +305,7 @@ impl MarkdownExtractor {
                         annotation_starts.push((2, active_text_offset(&paragraph_text), None));
                     } else if in_heading {
                         annotation_starts.push((2, active_text_offset(&heading_text), None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((2, active_text_offset(&list_item_text), None));
                     }
                 }
@@ -317,7 +322,7 @@ impl MarkdownExtractor {
                             if start < end {
                                 heading_annotations.push(builder::strikethrough(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = active_text_offset(&list_item_text);
                             if start < end {
                                 list_item_annotations.push(builder::strikethrough(start, end));
@@ -330,7 +335,7 @@ impl MarkdownExtractor {
                         annotation_starts.push((5, active_text_offset(&paragraph_text), None));
                     } else if in_heading {
                         annotation_starts.push((5, active_text_offset(&heading_text), None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((5, active_text_offset(&list_item_text), None));
                     }
                 }
@@ -347,7 +352,7 @@ impl MarkdownExtractor {
                             if start < end {
                                 heading_annotations.push(builder::superscript(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = active_text_offset(&list_item_text);
                             if start < end {
                                 list_item_annotations.push(builder::superscript(start, end));
@@ -360,7 +365,7 @@ impl MarkdownExtractor {
                         annotation_starts.push((6, active_text_offset(&paragraph_text), None));
                     } else if in_heading {
                         annotation_starts.push((6, active_text_offset(&heading_text), None));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((6, active_text_offset(&list_item_text), None));
                     }
                 }
@@ -377,7 +382,7 @@ impl MarkdownExtractor {
                             if start < end {
                                 heading_annotations.push(builder::subscript(start, end));
                             }
-                        } else if in_list_item {
+                        } else if in_list_item > 0 {
                             let end = active_text_offset(&list_item_text);
                             if start < end {
                                 list_item_annotations.push(builder::subscript(start, end));
@@ -396,7 +401,7 @@ impl MarkdownExtractor {
                         annotation_starts.push((4, active_text_offset(&paragraph_text), Some((url, title_opt))));
                     } else if in_heading {
                         annotation_starts.push((4, active_text_offset(&heading_text), Some((url, title_opt))));
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         annotation_starts.push((4, active_text_offset(&list_item_text), Some((url, title_opt))));
                     }
                 }
@@ -420,7 +425,7 @@ impl MarkdownExtractor {
                                 } else {
                                     None
                                 }
-                            } else if in_list_item {
+                            } else if in_list_item > 0 {
                                 let end = active_text_offset(&list_item_text);
                                 if start < end {
                                     list_item_annotations.push(builder::link(start, end, &url, title.as_deref()));
@@ -486,6 +491,31 @@ impl MarkdownExtractor {
                     }
                 }
                 Event::Start(Tag::List(start)) => {
+                    // A sublist nests INSIDE its parent item (`Start(Item)` -> ... -> `Start(List)`
+                    // -> ... -> `End(List)` -> ... -> `End(Item)`), so the parent's text has already
+                    // accumulated in `list_item_text` by the time this sublist starts. Flush it now,
+                    // before descending, so the parent lands before its children in document order —
+                    // an emit-on-`End(Item)` design would place it after them instead. Flush the WHOLE
+                    // buffer (and its annotations), not just the last `Text` event: item text arrives
+                    // across multiple events (emphasis/strong/strikethrough/link/code/math/soft-break/
+                    // task marker all write into `list_item_text`). `list_stack.last()` is still the
+                    // ENCLOSING list here — the sublist itself hasn't been pushed yet. See GH#1459.
+                    if in_list_item > 0 {
+                        let trimmed = list_item_text.trim();
+                        if let Some(ordered) = list_stack.last().copied()
+                            && !trimmed.is_empty()
+                        {
+                            let annotations = adjust_annotations_for_trim(
+                                std::mem::take(&mut list_item_annotations),
+                                &list_item_text,
+                                trimmed,
+                            );
+                            b.push_list_item(trimmed, ordered, annotations, None, None);
+                        }
+                        list_item_text.clear();
+                        list_item_annotations.clear();
+                        annotation_starts.clear();
+                    }
                     let ordered = start.is_some();
                     b.push_list(ordered);
                     list_stack.push(ordered);
@@ -497,10 +527,10 @@ impl MarkdownExtractor {
                     list_item_text.clear();
                     list_item_annotations.clear();
                     annotation_starts.clear();
-                    in_list_item = true;
+                    in_list_item += 1;
                 }
                 Event::End(TagEnd::Item) => {
-                    in_list_item = false;
+                    in_list_item = in_list_item.saturating_sub(1);
                     let trimmed = list_item_text.trim();
                     if let Some(ordered) = list_stack.last().copied()
                         && !trimmed.is_empty()
@@ -645,7 +675,7 @@ impl MarkdownExtractor {
                         image_alt.push_str(s);
                     } else if in_table_cell {
                         current_cell.push_str(s);
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         let start = list_item_text.len() as u32;
                         list_item_text.push_str(s);
                         let end = list_item_text.len() as u32;
@@ -674,7 +704,7 @@ impl MarkdownExtractor {
                         image_alt.push_str(s);
                     } else if in_table_cell {
                         current_cell.push_str(s);
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push_str(s);
                     } else if footnote_def_label.is_some() {
                         footnote_def_text.push_str(s);
@@ -693,7 +723,7 @@ impl MarkdownExtractor {
                         current_cell.push('$');
                         current_cell.push_str(s);
                         current_cell.push('$');
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push('$');
                         list_item_text.push_str(s);
                         list_item_text.push('$');
@@ -722,7 +752,7 @@ impl MarkdownExtractor {
                         code_text.push('\n');
                     } else if in_heading {
                         heading_text.push(' ');
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push(' ');
                     } else if footnote_def_label.is_some() {
                         footnote_def_text.push(' ');
@@ -740,7 +770,7 @@ impl MarkdownExtractor {
                         heading_text.push_str(s);
                     } else if in_table_cell {
                         current_cell.push_str(s);
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push_str(s);
                     } else if footnote_def_label.is_some() {
                         footnote_def_text.push_str(s);
@@ -759,7 +789,7 @@ impl MarkdownExtractor {
                         heading_text.push_str(s);
                     } else if in_table_cell {
                         current_cell.push_str(s);
-                    } else if in_list_item {
+                    } else if in_list_item > 0 {
                         list_item_text.push_str(s);
                     } else if footnote_def_label.is_some() {
                         footnote_def_text.push_str(s);
@@ -774,7 +804,7 @@ impl MarkdownExtractor {
                         }
                     }
                 }
-                Event::TaskListMarker(checked) if in_list_item => {
+                Event::TaskListMarker(checked) if in_list_item > 0 => {
                     list_item_text.push_str(if *checked { "[x] " } else { "[ ] " });
                 }
                 _ => {}
@@ -1380,6 +1410,139 @@ nested:
 
         assert!(result.content.contains("太字"), "Bold CJK content present");
         assert!(result.content.contains("これは"), "Leading CJK preserved");
+    }
+
+    /// Collect `(text, ordered, depth)` for every `ListItem` element, in document order.
+    fn list_items(doc: &crate::types::internal::InternalDocument) -> Vec<(String, bool, u16)> {
+        use crate::types::internal::ElementKind;
+        doc.elements
+            .iter()
+            .filter_map(|e| match e.kind {
+                ElementKind::ListItem { ordered } => Some((e.text.clone(), ordered, e.depth)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression test for GH#1459: a nested list used to silently lose every ancestor
+    /// item's text. Only the deepest item ("L3") survived because `Start(Tag::Item)`
+    /// unconditionally clears `list_item_text` with no flush of the enclosing item's
+    /// buffer at `Start(Tag::List)`.
+    ///
+    /// Against the unfixed code this assertion fails: `list_items(&doc).len()` is `1`
+    /// (only `[("L3", false, 3)]`) instead of the expected 3 levels.
+    #[tokio::test]
+    async fn test_nested_list_preserves_all_ancestor_text() {
+        let md = b"- L1\n  - L2\n    - L3\n";
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(md, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("extraction should succeed");
+
+        let items = list_items(&doc);
+        assert_eq!(
+            items,
+            vec![
+                ("L1".to_string(), false, 1),
+                ("L2".to_string(), false, 2),
+                ("L3".to_string(), false, 3),
+            ],
+            "all three nesting levels must survive with increasing depth, got {items:?}"
+        );
+    }
+
+    /// Regression test for GH#1459: the parent item's text can arrive across multiple
+    /// pulldown-cmark events (a `Strong` span plus a soft-break-joined continuation line)
+    /// before the sublist starts. The flush at `Start(Tag::List)` must carry the whole
+    /// accumulated buffer and its annotations, not just the most recent `Text` event.
+    ///
+    /// Against the unfixed code this assertion fails: `list_items(&doc)` contains only
+    /// `[("Child", false, 2)]` — the parent's text and its bold annotation are discarded
+    /// entirely when `Start(Tag::Item)` for "Child" clears `list_item_text`.
+    #[tokio::test]
+    async fn test_nested_list_flushes_full_multi_event_parent_buffer() {
+        use crate::types::document_structure::AnnotationKind;
+
+        let md = b"- Parent **bold** line\n  continued\n  - Child\n";
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(md, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("extraction should succeed");
+
+        let items = list_items(&doc);
+        assert_eq!(
+            items,
+            vec![
+                ("Parent bold line continued".to_string(), false, 1),
+                ("Child".to_string(), false, 2),
+            ],
+            "the parent's multi-event text (emphasis span + soft-break continuation) \
+             must be flushed whole before descending into the sublist, got {items:?}"
+        );
+
+        let parent = doc
+            .elements
+            .iter()
+            .find(|e| e.text == "Parent bold line continued")
+            .expect("flushed parent item must be present");
+        assert_eq!(
+            parent.annotations.len(),
+            1,
+            "the bold annotation on \"bold\" must survive the flush, got {:?}",
+            parent.annotations
+        );
+        let annotation = &parent.annotations[0];
+        assert_eq!(annotation.kind, AnnotationKind::Bold);
+        assert_eq!(
+            &parent.text[annotation.start as usize..annotation.end as usize],
+            "bold",
+            "annotation byte range must still point at \"bold\" after the flush"
+        );
+    }
+
+    /// Regression test for GH#1459: trailing text after a sublist used to be emitted as a
+    /// bare `Paragraph` element instead of staying list-item content, because
+    /// `End(TagEnd::Item)` for the inner item set the old boolean `in_list_item` back to
+    /// `false` while the outer item was still open, so the outer item's trailing text hit
+    /// the `Paragraph` start guard.
+    ///
+    /// Against the unfixed code this assertion fails: `list_items(&doc)` contains only
+    /// `[("Child", false, 2)]` (the parent's own text is *also* lost, per the flush defect
+    /// above), and a `Paragraph` element with text `"Trailing"` exists in `doc.elements`
+    /// where none should.
+    #[tokio::test]
+    async fn test_trailing_text_after_sublist_stays_list_item() {
+        use crate::types::internal::ElementKind;
+
+        let md = b"- Parent\n  - Child\n\n  Trailing\n";
+        let extractor = MarkdownExtractor::new();
+        let doc = extractor
+            .extract_content(md, "text/markdown", &ExtractionConfig::default())
+            .await
+            .expect("extraction should succeed");
+
+        let items = list_items(&doc);
+        assert_eq!(
+            items,
+            vec![
+                ("Parent".to_string(), false, 1),
+                ("Child".to_string(), false, 2),
+                ("Trailing".to_string(), false, 1),
+            ],
+            "trailing text after the sublist must become a sibling list item at the \
+             parent's depth, got {items:?}"
+        );
+
+        let stray_paragraph = doc
+            .elements
+            .iter()
+            .any(|e| matches!(e.kind, ElementKind::Paragraph) && e.text == "Trailing");
+        assert!(
+            !stray_paragraph,
+            "trailing list-item text must not be emitted as a bare Paragraph element"
+        );
     }
 
     #[test]

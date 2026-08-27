@@ -12,14 +12,13 @@ namespace Xberg;
  */
 interface OcrBackend
 {
-
     // Optional methods the bridge calls when the class defines them (the
     // trait's Rust default behavior applies otherwise): process_image_file, supported_languages, supports_table_detection, supports_document_processing, emits_structured_markdown, process_document.
     // The lifecycle hooks initialize()/shutdown() are likewise optional.
     /**
      * Process an image and extract text via OCR.
      *
-
+     *
      * @param mixed $image_bytes
      * @param OcrConfig $config
      * @return ExtractedDocument Return value from the plugin method
@@ -29,7 +28,7 @@ interface OcrBackend
     /**
      * Check if this backend supports a given language code.
      *
-
+     *
      * @param string $lang
      * @return bool Return value from the plugin method
      */
@@ -38,9 +37,8 @@ interface OcrBackend
     /**
      * Get the backend type identifier.
      *
-
+     *
      * @return mixed Return value from the plugin method
      */
     public function backend_type(): mixed;
-
 }

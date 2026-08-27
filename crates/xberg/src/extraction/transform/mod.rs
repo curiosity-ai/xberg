@@ -104,6 +104,19 @@ pub fn convert_internal_elements_to_elements(doc: &InternalDocument, filename: &
             continue;
         }
 
+        // `ElementKind::Heading { level }` carries the depth that distinguishes `##`
+        // from `######`, but that level lives on the enum discriminant, not in
+        // `InternalElement::attributes` -- `push_heading`/`push_heading_in_current_container`
+        // never write it there, so `public_attributes()` alone always omits it. Every other
+        // heading-emitting path in this crate (`transform/content.rs`) already publishes the
+        // level under the `heading_level` key as a decimal string, so match that key and
+        // format here instead of leaving `elements` unable to tell heading depths apart
+        // (xberg-io/xberg#1504). ~keep
+        let mut additional = internal_elem.public_attributes().unwrap_or_default();
+        if let ElementKind::Heading { level } = internal_elem.kind {
+            additional.insert("heading_level".to_string(), level.to_string());
+        }
+
         let element_id = elements::generate_element_id(&text, element_type, page_number);
         elements.push(Element {
             element_id,
@@ -114,7 +127,7 @@ pub fn convert_internal_elements_to_elements(doc: &InternalDocument, filename: &
                 filename: filename.clone(),
                 coordinates,
                 element_index: Some(elements.len()),
-                additional: std::collections::HashMap::new(),
+                additional,
             },
         });
     }
@@ -269,6 +282,150 @@ mod tests {
     }
 
     #[test]
+    fn test_internal_element_attributes_reach_metadata_additional() {
+        use crate::types::internal::InternalElement;
+        use ahash::AHashMap;
+
+        // Must match the private `SUPPRESS_IMAGE_OCR_RENDER_ATTRIBUTE` constant in
+        // `types/internal.rs`, which is not visible from this module.
+        const SUPPRESS_KEY: &str = "xberg:internal:suppress-image-ocr-render";
+
+        let mut doc = InternalDocument::new("text/markdown");
+        let mut elem = InternalElement::text(ElementKind::Title, "Heading text", 0);
+        let mut attrs = AHashMap::new();
+        attrs.insert("style_name".to_string(), "Heading 1".to_string());
+        attrs.insert(SUPPRESS_KEY.to_string(), "true".to_string());
+        elem.attributes = Some(attrs);
+        doc.elements.push(elem);
+
+        let elements = convert_internal_elements_to_elements(&doc, &None);
+        assert_eq!(elements.len(), 1);
+        // Unfixed code hardcodes `additional: HashMap::new()`, so this would be empty and
+        // the assertion below would fail with a missing key.
+        assert_eq!(
+            elements[0].metadata.additional.get("style_name"),
+            Some(&"Heading 1".to_string())
+        );
+        // The internal suppression marker must never leak through `public_attributes()`.
+        assert!(!elements[0].metadata.additional.contains_key(SUPPRESS_KEY));
+    }
+
+    /// Regression test for xberg-io/xberg#1504: `##` through `######` must report
+    /// distinct `heading_level` values. Before the fix, every non-H1 heading fell
+    /// into the `ElementKind::Heading { .. }` catch-all with `additional` unconditionally
+    /// empty, so a test that only checked "the key exists" would have passed on broken
+    /// code (every level would have looked the same: absent). Asserting the values
+    /// differ is the assertion that actually catches the collapse.
+    #[test]
+    fn test_heading_levels_are_distinguishable_in_elements() {
+        use crate::types::internal::InternalElement;
+
+        let mut doc = InternalDocument::new("text/markdown");
+        doc.elements
+            .push(InternalElement::text(ElementKind::Heading { level: 2 }, "Section", 0));
+        doc.elements.push(InternalElement::text(
+            ElementKind::Heading { level: 6 },
+            "Deep subsection",
+            0,
+        ));
+
+        let elements = convert_internal_elements_to_elements(&doc, &None);
+        assert_eq!(elements.len(), 2);
+
+        let level_2 = elements[0].metadata.additional.get("heading_level").map(String::as_str);
+        let level_6 = elements[1].metadata.additional.get("heading_level").map(String::as_str);
+
+        assert_eq!(level_2, Some("2"));
+        assert_eq!(level_6, Some("6"));
+        assert_ne!(level_2, level_6, "## and ###### must not report the same heading_level");
+    }
+
+    /// Reporter's own fixture shape (xberg-io/xberg#1504): `#`, `##`, `###`, `###`.
+    /// Asserts the full expected sequence of element types and `heading_level` values,
+    /// including that an H1 maps to `ElementType::Title` while still carrying
+    /// `heading_level: "1"` -- matching the convention already established by
+    /// `transform/content.rs::process_hierarchy` for its own Title-mapped H1 elements.
+    #[test]
+    fn test_reporter_fixture_heading_sequence() {
+        use crate::types::ElementType;
+        use crate::types::internal::InternalElement;
+
+        let mut doc = InternalDocument::new("text/markdown");
+        doc.elements.push(InternalElement::text(
+            ElementKind::Heading { level: 1 },
+            "Project aanpak",
+            0,
+        ));
+        doc.elements.push(InternalElement::text(
+            ElementKind::Paragraph,
+            "Body text under the top-level heading.",
+            0,
+        ));
+        doc.elements.push(InternalElement::text(
+            ElementKind::Heading { level: 2 },
+            "Configuration of the blueprint location in 5 phases",
+            0,
+        ));
+        doc.elements.push(InternalElement::text(
+            ElementKind::Heading { level: 3 },
+            "1. Recognising vehicles",
+            0,
+        ));
+        doc.elements.push(InternalElement::text(
+            ElementKind::Paragraph,
+            "Body text under the third-level heading.",
+            0,
+        ));
+        doc.elements.push(InternalElement::text(
+            ElementKind::Heading { level: 3 },
+            "2. Drawing the zones",
+            0,
+        ));
+        doc.elements
+            .push(InternalElement::text(ElementKind::Paragraph, "More body text.", 0));
+
+        let elements = convert_internal_elements_to_elements(&doc, &None);
+
+        let actual: Vec<(ElementType, Option<&str>)> = elements
+            .iter()
+            .map(|e| {
+                (
+                    e.element_type,
+                    e.metadata.additional.get("heading_level").map(String::as_str),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                (ElementType::Title, Some("1")),
+                (ElementType::NarrativeText, None),
+                (ElementType::Heading, Some("2")),
+                (ElementType::Heading, Some("3")),
+                (ElementType::NarrativeText, None),
+                (ElementType::Heading, Some("3")),
+                (ElementType::NarrativeText, None),
+            ]
+        );
+    }
+
+    /// Negative control: the fix must not blanket-populate `additional` for every
+    /// element. A non-heading element with no attributes still gets an empty map.
+    #[test]
+    fn test_non_heading_element_keeps_empty_additional() {
+        use crate::types::internal::InternalElement;
+
+        let mut doc = InternalDocument::new("text/markdown");
+        doc.elements
+            .push(InternalElement::text(ElementKind::Paragraph, "Just a paragraph.", 0));
+
+        let elements = convert_internal_elements_to_elements(&doc, &None);
+        assert_eq!(elements.len(), 1);
+        assert!(elements[0].metadata.additional.is_empty());
+    }
+
+    #[test]
     fn test_detect_bullet_items() {
         let text = "- First item\n- Second item\n- Third item";
         let items = detect_list_items(text);
@@ -308,10 +465,10 @@ mod tests {
         use crate::types::ElementType;
         let id1 = generate_element_id("test", ElementType::Title, Some(1));
         let id2 = generate_element_id("test", ElementType::Title, Some(1));
-        assert_eq!(id1.as_ref(), id2.as_ref());
+        assert_eq!(id1, id2);
 
         let id3 = generate_element_id("different", ElementType::Title, Some(1));
-        assert_ne!(id1.as_ref(), id3.as_ref());
+        assert_ne!(id1, id3);
     }
 
     #[test]
@@ -378,6 +535,7 @@ mod tests {
                     content: "This is a test paragraph.\n\nAnother paragraph here.".to_string(),
                     tables: vec![],
                     image_indices: vec![],
+                    image_preprocessing: None,
                     hierarchy: Some(PageHierarchy {
                         block_count: 2,
                         blocks: vec![
@@ -385,13 +543,13 @@ mod tests {
                                 text: "Main Title".to_string(),
                                 font_size: 24.0,
                                 level: "h1".to_string(),
-                                bbox: Some((10.0, 20.0, 100.0, 50.0)),
+                                bbox: Some((10.0, 20.0, 100.0, 50.0).into()),
                             },
                             HierarchicalBlock {
                                 text: "Subtitle".to_string(),
                                 font_size: 16.0,
                                 level: "h2".to_string(),
-                                bbox: Some((10.0, 60.0, 100.0, 80.0)),
+                                bbox: Some((10.0, 60.0, 100.0, 80.0).into()),
                             },
                         ],
                     }),
@@ -406,6 +564,7 @@ mod tests {
                     content: "- List item 1\n- List item 2".to_string(),
                     tables: vec![],
                     image_indices: vec![],
+                    image_preprocessing: None,
                     hierarchy: None,
                     is_blank: None,
                     layout_regions: None,
@@ -503,6 +662,7 @@ mod tests {
                 content: "Some text".to_string(),
                 tables: vec![Arc::new(table)],
                 image_indices: vec![0],
+                image_preprocessing: None,
                 hierarchy: None,
                 is_blank: None,
                 layout_regions: None,
@@ -671,6 +831,7 @@ mod tests {
                 content: "Some body text here.".to_string(),
                 tables: vec![],
                 image_indices: vec![],
+                image_preprocessing: None,
                 hierarchy: Some(PageHierarchy {
                     block_count: 2,
                     blocks: vec![
@@ -678,13 +839,13 @@ mod tests {
                             text: "Heading".to_string(),
                             font_size: 18.0,
                             level: "h1".to_string(),
-                            bbox: Some((10.0, 20.0, 200.0, 40.0)),
+                            bbox: Some((10.0, 20.0, 200.0, 40.0).into()),
                         },
                         HierarchicalBlock {
                             text: "Some body text here.".to_string(),
                             font_size: 12.0,
                             level: "body".to_string(),
-                            bbox: Some((10.0, 50.0, 200.0, 65.0)),
+                            bbox: Some((10.0, 50.0, 200.0, 65.0).into()),
                         },
                     ],
                 }),
@@ -744,6 +905,7 @@ mod tests {
                 content: "Paragraph one.\n\nParagraph two.".to_string(),
                 tables: vec![],
                 image_indices: vec![],
+                image_preprocessing: None,
                 hierarchy: Some(PageHierarchy {
                     block_count: 1,
                     blocks: vec![HierarchicalBlock {

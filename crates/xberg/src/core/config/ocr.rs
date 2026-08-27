@@ -118,6 +118,69 @@ pub struct OcrQualityThresholds {
     #[serde(default = "default_critical_fragmented_word_ratio")]
     pub critical_fragmented_word_ratio: f64,
 
+    /// Maximum fraction of short (1-2 char) words an *OCR result* may carry before the page
+    /// is rejected as recognition noise rather than accepted as content.
+    ///
+    /// This is a different decision, and a different operating point, from
+    /// [`Self::max_fragmented_word_ratio`] / [`Self::critical_fragmented_word_ratio`]: those
+    /// ask "is the native text bad enough that we should OCR this page?", and are tuned to
+    /// only fire on text that is already definitively broken (0.6 / 0.8). Here we are judging
+    /// what OCR *produced*, where the failure mode is an engine run over line art — a scanned
+    /// plat, an engineering drawing, a signature flourish — returning confident-looking
+    /// strings that are not words.
+    ///
+    /// Measured over the 16 pages of a recorded municipal ordinance (13 prose pages, 3 scanned
+    /// survey drawings): prose ran 0.04-0.28, the drawings 0.42-0.47. The default sits in that
+    /// gap with margin on both sides. Raise it to keep more marginal text, lower it to be
+    /// stricter — but note the cost is asymmetric, since a false positive deletes real content
+    /// while a false negative only leaves noise in place.
+    #[serde(default = "default_max_ocr_output_fragmented_word_ratio")]
+    pub max_ocr_output_fragmented_word_ratio: f64,
+
+    /// Minimum mean OCR confidence (0-100) a page must reach for its text to be accepted.
+    ///
+    /// This is the engine's own uncertainty about what it read, and it is a far sharper
+    /// instrument than any statistic derived from the output text. Measured per page over a
+    /// recorded municipal ordinance (10 prose pages, 6 scanned survey/architectural drawings)
+    /// with Tesseract 5.5.3:
+    ///
+    ///     prose      86.3 - 95.3
+    ///     drawings   18.5 - 64.3
+    ///
+    /// The default sits in that gap with ~11 points of margin on each side. Compare the
+    /// short-word ratio, which separated the same two groups by 0.09 on a 0-1 scale.
+    ///
+    /// A backend that reports no confidence (no `mean_text_conf` in its result metadata)
+    /// skips this check entirely and falls back to
+    /// [`Self::max_ocr_output_fragmented_word_ratio`]. Set to 0.0 to disable.
+    #[serde(default = "default_min_ocr_mean_confidence")]
+    pub min_ocr_mean_confidence: f64,
+
+    /// Minimum word count before [`Self::max_ocr_output_fragmented_word_ratio`] may reject a
+    /// page. Short pages (a signature block, an exhibit title) are legitimately dominated by
+    /// short words, so the ratio is not meaningful on them and the veto stays disabled.
+    #[serde(default = "default_min_words_for_ocr_output_check")]
+    pub min_words_for_ocr_output_check: usize,
+
+    /// Maximum fraction of a Tesseract page's dictionary-checkable words that
+    /// `TesseractAPI::is_valid_word` may reject before the page is treated as recognition
+    /// noise, supplementing (never replacing) [`Self::max_ocr_output_fragmented_word_ratio`].
+    ///
+    /// Tesseract-only: other backends never report this ratio (see
+    /// `dictionary_invalid_word_ratio` in `ocr::processor::execution`), so this threshold is
+    /// simply never consulted for them.
+    ///
+    /// Calibration owed, same as `ocr::types::TesseractConfig::min_confidence`:
+    /// unlike [`Self::max_ocr_output_fragmented_word_ratio`] (measured across a recorded
+    /// ordinance's prose vs. drawing pages), this ratio has not yet had a page-level
+    /// measurement run over a labeled corpus. The default therefore disables the check
+    /// entirely (`1.01`, above the `[0.0, 1.0]` range a ratio can reach) rather than guess an
+    /// operating point. Do not lower this without running that measurement first — the cost
+    /// of a wrong threshold here is the same as for the fragmented-word-ratio veto: a false
+    /// positive deletes real content, a false negative only leaves noise in place.
+    #[serde(default = "default_max_ocr_output_dict_invalid_word_ratio")]
+    pub max_ocr_output_dict_invalid_word_ratio: f64,
+
     /// Minimum average word length. Below this with enough words indicates garbled extraction.
     #[serde(default = "default_min_avg_word_length")]
     pub min_avg_word_length: f64,
@@ -160,9 +223,9 @@ pub struct OcrQualityThresholds {
     #[serde(default = "default_min_undecodable_ratio")]
     pub min_undecodable_ratio: f64,
 
-    /// Whether to route a page to OCR when pdf_oxide reports that a high
+    /// Whether to route a page to OCR when xberg_native_pdf reports that a high
     /// fraction of its text was fabricated rather than read from the file
-    /// (`MappingProvenance::Fallback`, pdf_oxide 0.3.75+, issue #1254). This is
+    /// (`MappingProvenance::Fallback`, xberg_native_pdf 0.3.75+, issue #1254). This is
     /// a direct fact from the extractor's ISO 32000-1 §9.10.2 mapping cascade,
     /// distinct from the character-heuristic proxy behind `min_undecodable_ratio`.
     /// Defaults to `true`.
@@ -179,6 +242,69 @@ pub struct OcrQualityThresholds {
     pub min_provenance_fallback_ratio: f64,
 }
 
+const DISABLED_DICTIONARY_INVALID_WORD_RATIO: f64 = 1.01;
+
+impl OcrQualityThresholds {
+    fn validate(&self, path: &str) -> Result<(), XbergError> {
+        let unit_ratios = [
+            ("min_alnum_ratio", self.min_alnum_ratio),
+            ("max_fragmented_word_ratio", self.max_fragmented_word_ratio),
+            ("critical_fragmented_word_ratio", self.critical_fragmented_word_ratio),
+            (
+                "max_ocr_output_fragmented_word_ratio",
+                self.max_ocr_output_fragmented_word_ratio,
+            ),
+            ("min_consecutive_repeat_ratio", self.min_consecutive_repeat_ratio),
+            ("alnum_ws_ratio_threshold", self.alnum_ws_ratio_threshold),
+            ("pipeline_min_quality", self.pipeline_min_quality),
+            ("min_undecodable_ratio", self.min_undecodable_ratio),
+            ("min_provenance_fallback_ratio", self.min_provenance_fallback_ratio),
+        ];
+        for (field, value) in unit_ratios {
+            validate_quality_value(path, field, value, 0.0, 1.0)?;
+        }
+
+        validate_quality_value(
+            path,
+            "min_ocr_mean_confidence",
+            self.min_ocr_mean_confidence,
+            0.0,
+            100.0,
+        )?;
+        validate_nonnegative_quality_value(path, "min_non_whitespace_per_page", self.min_non_whitespace_per_page)?;
+        validate_nonnegative_quality_value(path, "min_avg_word_length", self.min_avg_word_length)?;
+
+        if self.max_ocr_output_dict_invalid_word_ratio != DISABLED_DICTIONARY_INVALID_WORD_RATIO {
+            validate_quality_value(
+                path,
+                "max_ocr_output_dict_invalid_word_ratio",
+                self.max_ocr_output_dict_invalid_word_ratio,
+                0.0,
+                1.0,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_quality_value(path: &str, field: &str, value: f64, min: f64, max: f64) -> Result<(), XbergError> {
+    if value.is_finite() && (min..=max).contains(&value) {
+        return Ok(());
+    }
+    Err(XbergError::validation(format!(
+        "{path}.{field} must be a finite value between {min} and {max}, got {value}"
+    )))
+}
+
+fn validate_nonnegative_quality_value(path: &str, field: &str, value: f64) -> Result<(), XbergError> {
+    if value.is_finite() && value >= 0.0 {
+        return Ok(());
+    }
+    Err(XbergError::validation(format!(
+        "{path}.{field} must be a finite nonnegative value, got {value}"
+    )))
+}
+
 impl Default for OcrQualityThresholds {
     fn default() -> Self {
         Self {
@@ -190,6 +316,10 @@ impl Default for OcrQualityThresholds {
             min_garbage_chars: 5,
             max_fragmented_word_ratio: 0.6,
             critical_fragmented_word_ratio: 0.80,
+            min_ocr_mean_confidence: default_min_ocr_mean_confidence(),
+            max_ocr_output_fragmented_word_ratio: default_max_ocr_output_fragmented_word_ratio(),
+            min_words_for_ocr_output_check: default_min_words_for_ocr_output_check(),
+            max_ocr_output_dict_invalid_word_ratio: default_max_ocr_output_dict_invalid_word_ratio(),
             min_avg_word_length: 2.0,
             min_words_for_avg_length_check: 50,
             min_consecutive_repeat_ratio: 0.08,
@@ -229,6 +359,20 @@ fn default_max_fragmented_word_ratio() -> f64 {
 fn default_critical_fragmented_word_ratio() -> f64 {
     0.80
 }
+fn default_min_ocr_mean_confidence() -> f64 {
+    75.0
+}
+fn default_max_ocr_output_fragmented_word_ratio() -> f64 {
+    0.35
+}
+fn default_min_words_for_ocr_output_check() -> usize {
+    20
+}
+/// Disables the dictionary-invalid-word-ratio veto by default: `1.01` is above `[0.0, 1.0]`,
+/// the range the ratio can actually reach, so it can never fire until calibrated and lowered.
+fn default_max_ocr_output_dict_invalid_word_ratio() -> f64 {
+    DISABLED_DICTIONARY_INVALID_WORD_RATIO
+}
 fn default_min_avg_word_length() -> f64 {
     2.0
 }
@@ -259,7 +403,7 @@ fn default_min_undecodable_ratio() -> f64 {
     0.5
 }
 /// Provenance-based fabricated-text OCR routing is on by default: it is a
-/// direct fact from pdf_oxide 0.3.75+, not a heuristic, so false positives are
+/// direct fact from xberg_native_pdf 0.3.75+, not a heuristic, so false positives are
 /// rare (issue #1254).
 fn default_enable_provenance_ocr_routing() -> bool {
     true
@@ -322,6 +466,28 @@ pub struct OcrPipelineStage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_options: Option<serde_json::Value>,
 }
+
+/// [`OcrConfig::backend_options`] key carrying the true resolution, in DPI, of the raster in
+/// this one call.
+///
+/// Stamped per page by the PDF OCR route, which is the only caller that can know it: it
+/// rendered the page itself and can divide the raster's pixel width by the MediaBox width (see
+/// `crate::pdf::render::rendered_page_dpi`). Deliberately absent for callers that genuinely do
+/// not know the resolution of the bytes they hold — the standalone image extractor, plugin
+/// callers passing arbitrary user images — so those keep defaulting to 72 DPI.
+///
+/// This is per *page*, not per document: the OCR route clones the config for each page (the
+/// same mechanism `page_rotation_degrees` uses), so a document mixing page sizes, or one page
+/// whose DPI `choose_safe_dpi` reduced, still reports its own value.
+///
+/// Declared here rather than as a literal at each end so the producer
+/// (`extractors::pdf::ocr::ocr_config_with_page_rotation_hint`) and the consumer
+/// (`ocr::tesseract_backend::TesseractBackend::config_to_tesseract`) cannot drift apart.
+///
+/// Both users are feature-gated (`ocr`/`ocr-pipeline`, and `pdf` for the producer), so builds
+/// that compile neither leave this unreferenced rather than unused-by-mistake.
+#[allow(dead_code)]
+pub(crate) const SOURCE_DPI_BACKEND_OPTION: &str = "source_dpi";
 
 fn default_priority() -> u32 {
     100
@@ -426,7 +592,7 @@ pub enum VlmFallbackPolicy {
     /// `quality_threshold`, send the page to the VLM.
     ///
     /// `quality_threshold` is in the `[0.0, 1.0]` range produced by
-    /// [`crate::text::quality::calculate_quality_score`]. A value of `0.5` is a
+    /// `text::quality::calculate_quality_score`. A value of `0.5` is a
     /// reasonable starting point; calibrate with the Stage 0 benchmark harness.
     OnLowQuality {
         /// Minimum acceptable quality score from the classical backend.
@@ -479,22 +645,32 @@ pub enum OcrStrategy {
     /// Detects that a text layer came from a scanner, not whether it is accurate,
     /// so a page carrying a good sidecar is OCR'd too.
     ScannedPages {
-        /// Minimum scan confidence, in `[0.0, 1.0]`. Values outside the range are
-        /// clamped. See [`DEFAULT_SCANNED_MIN_CONFIDENCE`] for how to pick one.
+        /// Minimum scan confidence, in `[0.0, 1.0]`. Configuration validation rejects
+        /// non-finite or out-of-range values. See [`DEFAULT_SCANNED_MIN_CONFIDENCE`]
+        /// for how to pick one.
         min_confidence: f64,
     },
 }
 
 impl OcrStrategy {
-    /// Confidence a page must reach to count as a scan, clamped to `[0.0, 1.0]`.
+    pub(crate) fn validate(&self) -> Result<(), XbergError> {
+        if let Self::ScannedPages { min_confidence } = self {
+            validate_quality_value("ocr_strategy", "min_confidence", *min_confidence, 0.0, 1.0)?;
+        }
+        Ok(())
+    }
+
+    /// Confidence a page must reach to count as a scan.
     ///
     /// [`OcrStrategy::Auto`] uses the default: it does not select pages by scan
-    /// confidence, but `scanned_pages` metadata still needs a threshold.
+    /// confidence, but `scanned_pages` metadata still needs a threshold. Finite direct
+    /// values are defensively clamped to `[0.0, 1.0]`; non-finite values use the default.
     #[must_use]
     pub fn effective_min_confidence(&self) -> f64 {
         match self {
             Self::Auto => DEFAULT_SCANNED_MIN_CONFIDENCE,
-            Self::ScannedPages { min_confidence } => min_confidence.clamp(0.0, 1.0),
+            Self::ScannedPages { min_confidence } if min_confidence.is_finite() => min_confidence.clamp(0.0, 1.0),
+            Self::ScannedPages { .. } => DEFAULT_SCANNED_MIN_CONFIDENCE,
         }
     }
 }
@@ -539,7 +715,7 @@ pub struct OcrConfig {
 
     /// PaddleOCR-specific configuration (optional, JSON passthrough).
     ///
-    /// Deserialized into a [`PaddleOcrConfig`](crate::PaddleOcrConfig), so any of its fields can be
+    /// Deserialized into a `PaddleOcrConfig`, so any of its fields can be
     /// overridden here — most notably `model_version` (`"pp-ocrv6"` default / `"pp-ocrv5"`) and
     /// `model_tier`. In TOML:
     ///
@@ -594,10 +770,16 @@ pub struct OcrConfig {
 
     /// Enable automatic page rotation based on orientation detection.
     ///
-    /// When enabled, uses Tesseract's `DetectOrientationScript()` to detect
-    /// page orientation (0/90/180/270 degrees) before OCR. If the page is
-    /// rotated with high confidence, the image is corrected before recognition.
-    /// This is critical for handling rotated scanned documents.
+    /// When enabled, page orientation (0/90/180/270 degrees) is detected with an
+    /// ONNX PP-LCNet document-orientation classifier — NOT Tesseract's own
+    /// `DetectOrientationScript()`/OSD, which this crate does not call. If the
+    /// page is rotated with high confidence, the image is corrected before
+    /// recognition. Applies to every OCR backend; the tesseract-only
+    /// `TesseractConfig::preprocessing` field of the same name is OR'd in on
+    /// top of this one and affects tesseract alone.
+    ///
+    /// Independent of a page's PDF `/Rotate` entry, which is handled separately
+    /// on every OCR route regardless of this setting.
     #[serde(default)]
     pub auto_rotate: bool,
 
@@ -686,6 +868,33 @@ impl Default for OcrConfig {
 }
 
 impl OcrConfig {
+    #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
+    pub(crate) fn select_public_elements(
+        &self,
+        elements: Option<Vec<crate::types::OcrElement>>,
+    ) -> Option<Vec<crate::types::OcrElement>> {
+        let element_config = self.element_config.as_ref()?;
+        let selected = element_config.select_elements(elements.as_deref().unwrap_or_default());
+        (!selected.is_empty()).then_some(selected)
+    }
+
+    #[cfg(any(feature = "ocr", all(feature = "pdf", feature = "ocr-pipeline")))]
+    pub(crate) fn apply_public_element_policy(&self, document: &mut crate::types::ExtractedDocument) {
+        document.ocr_elements = self.select_public_elements(document.ocr_elements.take());
+    }
+
+    fn validate_quality_thresholds(&self) -> Result<(), XbergError> {
+        if let Some(thresholds) = self.quality_thresholds.as_ref() {
+            thresholds.validate("ocr.quality_thresholds")?;
+        }
+        if let Some(pipeline) = self.pipeline.as_ref() {
+            pipeline
+                .quality_thresholds
+                .validate("ocr.pipeline.quality_thresholds")?;
+        }
+        Ok(())
+    }
+
     /// Validates that the configured backend is supported.
     ///
     /// This method checks that the backend name is one of the supported OCR backends:
@@ -700,7 +909,8 @@ impl OcrConfig {
     ///
     /// Also validates every non-blank entry of `language` (and, per pipeline stage, its
     /// `language` override) as an ISO 639 code, and the `vlm_fallback` quality threshold as a
-    /// `[0.0, 1.0]` confidence value. Blank language entries are tolerated here (they are
+    /// `[0.0, 1.0]` confidence value. OCR quality thresholds are validated against their
+    /// documented numeric domains. Blank language entries are tolerated here (they are
     /// filtered out by [`Self::effective_languages`] and fall back to the default language),
     /// but a non-blank, unrecognized code is rejected.
     ///
@@ -714,6 +924,15 @@ impl OcrConfig {
         if let VlmFallbackPolicy::OnLowQuality { quality_threshold } = &self.vlm_fallback {
             crate::core::config_validation::validate_confidence(*quality_threshold)?;
         }
+        if let Some(element_config) = self.element_config.as_ref()
+            && (!element_config.min_confidence.is_finite() || !(0.0..=1.0).contains(&element_config.min_confidence))
+        {
+            return Err(XbergError::validation(format!(
+                "ocr.element_config.min_confidence must be a finite value between 0.0 and 1.0, got {}",
+                element_config.min_confidence
+            )));
+        }
+        self.validate_quality_thresholds()?;
         validate_tesseract_tuning(self.tesseract_config.as_ref())?;
         if let Some(ref pipeline) = self.pipeline {
             for stage in &pipeline.stages {
@@ -1324,6 +1543,39 @@ mod tests {
     }
 
     #[test]
+    fn scanned_pages_strategy_uses_the_default_for_non_finite_direct_values() {
+        for min_confidence in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                OcrStrategy::ScannedPages { min_confidence }.effective_min_confidence(),
+                DEFAULT_SCANNED_MIN_CONFIDENCE
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_typed_scanned_pages_confidence_at_the_public_boundary() {
+        for min_confidence in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let config = crate::ExtractionConfig {
+                ocr_strategy: OcrStrategy::ScannedPages { min_confidence },
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("ocr_strategy.min_confidence"),
+                "unexpected error for {min_confidence}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_json_scanned_pages_confidence_at_the_public_boundary() {
+        let json = r#"{"ocr_strategy":{"mode":"scanned_pages","min_confidence":1.1}}"#;
+        let config: crate::ExtractionConfig = serde_json::from_str(json).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("ocr_strategy.min_confidence"));
+    }
+
+    #[test]
     fn test_vlm_fallback_disabled_validate_ok_without_vlm_config() {
         let config = OcrConfig {
             vlm_fallback: VlmFallbackPolicy::Disabled,
@@ -1688,6 +1940,107 @@ mod tests {
         assert_eq!(thresholds.min_meaningful_words, 3);
         assert_eq!(thresholds.min_garbage_chars, 5);
         assert!((thresholds.pipeline_min_quality - 0.5).abs() < f64::EPSILON);
+    }
+
+    fn config_with_quality_thresholds(thresholds: OcrQualityThresholds) -> crate::ExtractionConfig {
+        crate::ExtractionConfig {
+            ocr: Some(OcrConfig {
+                quality_thresholds: Some(thresholds),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn assert_invalid_quality_ratio(field: &str, mutate: fn(&mut OcrQualityThresholds)) {
+        let mut thresholds = OcrQualityThresholds::default();
+        mutate(&mut thresholds);
+        let error = config_with_quality_thresholds(thresholds).validate().unwrap_err();
+        assert!(
+            error.to_string().contains(field),
+            "unexpected error for {field}: {error}"
+        );
+    }
+
+    #[test]
+    fn should_reject_invalid_typed_ocr_quality_ratios() {
+        assert_invalid_quality_ratio("min_alnum_ratio", |value| value.min_alnum_ratio = -0.1);
+        assert_invalid_quality_ratio("max_fragmented_word_ratio", |value| {
+            value.max_fragmented_word_ratio = 1.1;
+        });
+        assert_invalid_quality_ratio("critical_fragmented_word_ratio", |value| {
+            value.critical_fragmented_word_ratio = f64::NAN;
+        });
+        assert_invalid_quality_ratio("max_ocr_output_fragmented_word_ratio", |value| {
+            value.max_ocr_output_fragmented_word_ratio = f64::INFINITY;
+        });
+        assert_invalid_quality_ratio("min_consecutive_repeat_ratio", |value| {
+            value.min_consecutive_repeat_ratio = -0.1;
+        });
+        assert_invalid_quality_ratio("alnum_ws_ratio_threshold", |value| {
+            value.alnum_ws_ratio_threshold = 1.1;
+        });
+        assert_invalid_quality_ratio("min_undecodable_ratio", |value| {
+            value.min_undecodable_ratio = -0.1;
+        });
+        assert_invalid_quality_ratio("min_provenance_fallback_ratio", |value| {
+            value.min_provenance_fallback_ratio = 1.1;
+        });
+    }
+
+    #[test]
+    fn should_reject_invalid_typed_ocr_quality_scalars() {
+        let mut thresholds = OcrQualityThresholds {
+            min_non_whitespace_per_page: -0.1,
+            ..Default::default()
+        };
+        assert!(config_with_quality_thresholds(thresholds.clone()).validate().is_err());
+
+        thresholds.min_non_whitespace_per_page = 1.0;
+        thresholds.min_avg_word_length = f64::INFINITY;
+        assert!(config_with_quality_thresholds(thresholds.clone()).validate().is_err());
+
+        thresholds.min_avg_word_length = 1.0;
+        thresholds.min_ocr_mean_confidence = 100.1;
+        assert!(config_with_quality_thresholds(thresholds.clone()).validate().is_err());
+
+        thresholds.min_ocr_mean_confidence = 50.0;
+        thresholds.pipeline_min_quality = f64::NAN;
+        assert!(config_with_quality_thresholds(thresholds).validate().is_err());
+    }
+
+    #[test]
+    fn should_validate_json_ocr_quality_thresholds_at_the_public_config_boundary() {
+        let invalid_json = r#"{"ocr":{"quality_thresholds":{"pipeline_min_quality":1.1}}}"#;
+        let invalid: crate::ExtractionConfig = serde_json::from_str(invalid_json).unwrap();
+        let error = invalid.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ocr.quality_thresholds.pipeline_min_quality")
+        );
+
+        let sentinel_json = r#"{"ocr":{"quality_thresholds":{"max_ocr_output_dict_invalid_word_ratio":1.01}}}"#;
+        let sentinel: crate::ExtractionConfig = serde_json::from_str(sentinel_json).unwrap();
+        sentinel.validate().unwrap();
+
+        let negative_count = r#"{"ocr":{"quality_thresholds":{"min_meaningful_words":-1}}}"#;
+        assert!(serde_json::from_str::<crate::ExtractionConfig>(negative_count).is_err());
+    }
+
+    #[test]
+    fn should_reject_invalid_explicit_pipeline_quality_thresholds() {
+        let json = r#"{
+            "ocr": {
+                "pipeline": {
+                    "stages": [],
+                    "quality_thresholds": {"max_ocr_output_dict_invalid_word_ratio": 1.001}
+                }
+            }
+        }"#;
+        let config: crate::ExtractionConfig = serde_json::from_str(json).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("max_ocr_output_dict_invalid_word_ratio"));
     }
 
     #[test]

@@ -107,6 +107,8 @@ async fn ocr_backend_vtable_process_image_passes_full_length_with_embedded_nuls(
         supports_table_detection: None,
         supports_document_processing: None,
         emits_structured_markdown: None,
+        confidence_semantics: None,
+        page_orientation_handling: None,
         process_document: None,
         free_string: None,
         free_user_data: None,

@@ -1,148 +1,277 @@
-//! PDF page rendering using pdf_oxide.
+//! PDF page rendering using xberg_native_pdf.
 
 use crate::Result;
 use crate::core::diagnostics::{push_warning_deduped, warning};
 use crate::error::XbergError;
 use crate::types::ProcessingWarning;
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
-use lopdf::{Document, ObjectId};
 use std::cell::RefCell;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `ProcessingWarning::source` used for glyphs the rasterizer could not paint.
 ///
-/// See [`take_pdf_oxide_render_warnings`] for why this exists and where the
+/// See [`take_xberg_native_pdf_render_warnings`] for why this exists and where the
 /// gap is upstream vs. xberg-side.
 const PDF_RENDER_WARNING_SOURCE: &str = "pdf-render";
 
 thread_local! {
-    /// Buffer for `pdf_oxide`'s `log::warn!` records emitted while a render
+    /// Buffer for `xberg_native_pdf`'s `tracing::warn!` records emitted while a render
     /// call made by this thread is in flight. `None` when no render call is
     /// currently capturing (the default, and the state between calls).
-    static PDF_OXIDE_LOG_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static ENGINE_LOG_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     /// Deduped warnings drained from completed render calls on this thread,
-    /// awaiting collection by [`take_pdf_oxide_render_warnings`].
-    static PDF_OXIDE_PENDING_WARNINGS: RefCell<Vec<ProcessingWarning>> = const { RefCell::new(Vec::new()) };
+    /// awaiting collection by [`take_xberg_native_pdf_render_warnings`].
+    static ENGINE_PENDING_WARNINGS: RefCell<Vec<ProcessingWarning>> = const { RefCell::new(Vec::new()) };
 }
 
-static PDF_OXIDE_LOGGER_INIT: Once = Once::new();
+static ENGINE_LOGGER_INIT: Once = Once::new();
 
-/// Whether [`install_pdf_render_diagnostics`] actually won the global `log`
-/// backend. Capture is skipped entirely while this is false, so the render
-/// path costs nothing for the overwhelming majority of embedders who never
-/// opt in.
-static PDF_OXIDE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether [`install_pdf_render_diagnostics`] actually won the process's
+/// global `tracing` [`Subscriber`](tracing::Subscriber) slot. Capture is
+/// skipped entirely while this is false, so the render path costs nothing for
+/// the overwhelming majority of embedders who never opt in.
+static ENGINE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// A [`log::Log`] sink that captures `pdf_oxide`'s warning-level records into
-/// the calling thread's [`PDF_OXIDE_LOG_CAPTURE`] buffer.
+/// A [`tracing::Subscriber`] that captures `xberg_native_pdf`'s warning-level events
+/// into the calling thread's [`ENGINE_LOG_CAPTURE`] buffer.
 ///
 /// # Why this exists (#1364)
 ///
-/// `pdf_oxide`'s rasterizer can silently drop a glyph — no font resolves for
+/// `xberg_native_pdf`'s rasterizer can silently drop a glyph — no font resolves for
 /// the current run (`text_rasterizer.rs`: "No font found for '{}'..."),
 /// parsing an embedded font fails (`page_renderer.rs`: "Failed to parse font
 /// '{}'..."), the CJK predefined-CIDFont substitution face is unavailable, or
 /// direct CID/CFF glyph-outline rendering errors mid-run. In every one of
-/// those cases `pdf_oxide` still returns `Ok(RenderedImage { .. })` — the
+/// those cases `xberg_native_pdf` still returns `Ok(RenderedImage { .. })` — the
 /// page just has a gap where the glyph should be, with the text-space cursor
 /// advanced as if it painted. `RenderedImage` carries no diagnostic field, so
 /// none of this is visible to callers through the return value.
 ///
-/// `pdf_oxide` *does* report every one of these cases through `log::warn!`,
-/// but this crate never installed a [`log::Log`] backend, so — independent of
-/// this fix — those records were going to the default no-op logger and were
-/// dropped a second time. That is the exact upstream-plus-local gap #1364
-/// describes: pdf_oxide's own diagnostic channel existed but nothing was
-/// listening.
+/// `xberg_native_pdf` *does* report every one of these cases through `tracing::warn!`,
+/// but this crate never installed a [`tracing::Subscriber`], so — independent
+/// of this fix — those records went to whatever the process's default
+/// dispatcher was (typically none) and were dropped a second time. That is
+/// the exact upstream-plus-local gap #1364 describes: xberg_native_pdf's own
+/// diagnostic channel existed but nothing was listening.
 ///
-/// This is the xberg-side fix: install a capturing logger (once per process;
-/// if the host application has already claimed the `log` facade for its own
-/// logger, [`ensure_pdf_oxide_log_capture_installed`] leaves it alone and
-/// this capture path silently yields nothing — no worse than today), and
-/// during each render call collect `pdf_oxide`'s own target-prefixed warnings
-/// into a `ProcessingWarning`. The actual *decision* about which glyph gets
-/// dropped and why remains entirely inside `pdf_oxide`/`ttf-parser` — that
-/// part is upstream and is not touched here.
-struct PdfOxideWarningCapture;
+/// # The migration off `log` (xberg_native_pdf 1.0.1, fork commit `0aed9f1b`)
+///
+/// This module used to install a [`log::Log`] backend instead, because at the
+/// time `xberg_native_pdf` reported these through `log::warn!`. As of xberg_native_pdf
+/// 1.0.1 the fork migrated its diagnostics off the `log` facade entirely
+/// ("refactor!: migrate from the log facade to tracing") — its `Cargo.toml`
+/// carries no `log` dependency at all any more, and every site this module
+/// cares about is now `tracing::warn!(target: "xberg_xberg_native_pdf::...", "{}",
+/// ...)`. A `log::Log` backend receives nothing from that, which is why the
+/// old capture silently went dark on this upgrade. This struct is the
+/// tracing-side replacement, installed the same way as before: opt-in, once
+/// per process, whichever side wins the single global slot keeps it.
+///
+/// This is the xberg-side fix: install a capturing subscriber (once per
+/// process; if the host application has already claimed the `tracing`
+/// dispatcher for its own subscriber, [`install_pdf_render_diagnostics`]
+/// leaves it alone and this capture path silently yields nothing — no worse
+/// than today), and during each render call collect `xberg_native_pdf`'s own
+/// target-prefixed warnings into a `ProcessingWarning`. The actual *decision*
+/// about which glyph gets dropped and why remains entirely inside
+/// `xberg_native_pdf`/`ttf-parser` — that part is upstream and is not touched here.
+/// The `tracing` target root of the native PDF engine, re-exported so consumers -- notably
+/// `xberg-cli`'s log filter -- match on a value rather than on a copied string literal.
+///
+/// This is the engine's own `module_path!()` evaluated at its crate root, so it tracks the
+/// engine's `[lib] name` automatically and cannot go stale.
+pub const ENGINE_LOG_TARGET_ROOT: &str = xberg_native_pdf::LOG_TARGET_ROOT;
 
-impl log::Log for PdfOxideWarningCapture {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Warn
+/// Whether a `tracing` target belongs to the PDF engine whose warnings this module captures.
+///
+/// Matches on [`ENGINE_LOG_TARGET_ROOT`] rather than a literal. That distinction is the whole
+/// point: in #697 this predicate held a hardcoded prefix, the engine's crate name moved, every
+/// record was rejected, and for twelve days no warning about unparseable fonts reached a
+/// caller. Nothing failed to compile, the test asserting warnings ARE captured went red, and
+/// its sibling asserting NO warnings kept passing vacuously. Deriving the prefix from the
+/// engine itself removes the class.
+fn is_pdf_engine_target(target: &str) -> bool {
+    target.starts_with(ENGINE_LOG_TARGET_ROOT)
+}
+
+struct EngineWarningCapture;
+
+impl EngineWarningCapture {
+    fn interested(metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::WARN && is_pdf_engine_target(metadata.target())
+    }
+}
+
+/// Pulls the `message` field out of a `tracing::Event`.
+///
+/// A `tracing` event's message is a *field* (named `"message"`), not
+/// something `Event` exposes as a plain string. `tracing::warn!("{}", x)` —
+/// the form xberg_native_pdf uses at `text_rasterizer.rs:502` — records it via
+/// [`record_debug`](tracing::field::Visit::record_debug): the value handed in
+/// is the formatted `fmt::Arguments`, and `fmt::Arguments`'s `Debug` impl
+/// forwards to its `Display` impl, so `format!("{value:?}")` below is the
+/// plain formatted text, not a debug-quoted string. A bare string-literal
+/// message (`tracing::warn!("literal")`, used by some other sites in the
+/// fork) instead reaches [`record_str`](tracing::field::Visit::record_str).
+/// Both are implemented so either form is captured. Same pattern as the
+/// `MessageVisitor` already used for tracing-capture tests elsewhere in this
+/// crate (`tests/gpu_acceleration.rs`).
+#[derive(Default)]
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
     }
 
-    /// Records outside `pdf_oxide` are dropped rather than re-emitted.
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_string();
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EngineWarningCapture {
+    /// Capture the engine's warnings into this thread's buffer; ignore every other event.
     ///
-    /// Forwarding them to `tracing` is the obvious instinct — this sink owns the
-    /// process's only `log` backend, so anything it drops is gone — but it does not
-    /// work here and must not be reintroduced. The `tracing/log` feature is enabled
-    /// in this build (pulled in through `tower`), which makes every `tracing` event
-    /// also emit a `log` record. A forwarding sink therefore feeds itself: one
-    /// `tracing::warn!` becomes a `log` record, which becomes a `tracing::warn!`,
-    /// until the thread's stack is exhausted. That is not hypothetical — it aborted
-    /// the #1364 regression test with `fatal runtime error: stack overflow`.
+    /// This is deliberately the **only** trait method overridden. `Layer::enabled` and
+    /// `Layer::max_level_hint` are filters over the *whole subscriber stack*, not per-layer
+    /// ones: narrowing either here would silence the host application's own `fmt` layer for
+    /// every non-`xberg_native_pdf` event, and cap the process at `WARN`. A library must not make
+    /// that trade on its embedder's behalf. Filtering inside the callback instead costs one
+    /// level check and one target comparison per event and affects nobody else.
     ///
-    /// Dropping them is acceptable precisely because installation is opt-in: before
-    /// [`install_pdf_render_diagnostics`] is called there is no `log` backend at all
-    /// and these records already go nowhere, so an application that opts in is
-    /// choosing this trade knowingly rather than having it imposed.
-    fn log(&self, record: &log::Record<'_>) {
-        if !self.enabled(record.metadata()) || !record.target().starts_with("pdf_oxide") {
+    /// Re-emitting a captured record through another facade is the obvious instinct and must
+    /// not be reintroduced. The `tracing/log` feature is enabled in this build (pulled in
+    /// through `tower`), which makes a `tracing::warn!` also emit a `log::Record` whenever no
+    /// global `tracing` dispatcher is set. If this method forwarded what it captured by
+    /// calling `log::warn!`, that record would round-trip back into `tracing` through the same
+    /// bridge, back to this layer, forever. That is not hypothetical: forwarding between the
+    /// two facades is exactly what produced the #1364 regression test's `fatal runtime error:
+    /// stack overflow`. This method only ever appends to a thread-local `Vec<String>`.
+    ///
+    /// The buffer is thread-local *by design*, and the layout pass runs the render inside
+    /// `tokio::task::spawn_blocking`. That works because a layer's `on_event` runs
+    /// synchronously on whichever thread emitted the event, so the warning lands in the same
+    /// thread's buffer that `render_page_capturing_glyph_drops` armed and will drain.
+    /// `glyph_drop_warnings_survive_the_spawn_blocking_layout_pass` exists to pin that.
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if !Self::interested(event.metadata()) {
             return;
         }
-        let message = record.args().to_string();
-        PDF_OXIDE_LOG_CAPTURE.with(|cell| {
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        ENGINE_LOG_CAPTURE.with(|cell| {
             if let Some(buffer) = cell.borrow_mut().as_mut() {
-                buffer.push(message);
+                buffer.push(visitor.0);
             }
         });
     }
-
-    fn flush(&self) {}
 }
 
-/// Install [`PdfOxideWarningCapture`] as the process-wide `log` backend,
-/// exactly once.
+/// A `tracing` [`Layer`](tracing_subscriber::Layer) that captures the PDF engine's glyph-drop
+/// warnings, for composing into an application's existing subscriber stack.
 ///
-/// If another component already installed a `log::Log` implementation (an
-/// application wiring `env_logger`, for instance), `log::set_boxed_logger`
-/// fails and this is a no-op: we do not fight over ownership of the global
-/// logger slot, and we do not touch `log::set_max_level` unless our install
-/// won, so we never silently raise or lower a level someone else configured.
-/// In that case `pdf_oxide`'s glyph-drop records go wherever that other
-/// logger sends them instead of into [`take_pdf_oxide_render_warnings`].
-/// **Opt-in.** Nothing calls this automatically, and that is deliberate: xberg
-/// is a library, and `log` has exactly one global backend slot per process. A
-/// library that claims it on its own behalf breaks its embedder — a host that
-/// later calls `env_logger::init()` panics, and until this returns, every
-/// `log` record in the process is routed here rather than wherever the host
-/// intended. That decision belongs to the application, so it is exposed as a
-/// call an application makes knowingly.
+/// Prefer this over [`install_pdf_render_diagnostics`] whenever the application installs a
+/// subscriber of its own, because `tracing` has exactly **one** global dispatcher slot and
+/// composing shares it instead of racing for it:
 ///
-/// Returns `true` if this call (or an earlier one) installed the capture, and
-/// `false` if some other component already owns the `log` backend — in which
-/// case `pdf_oxide`'s glyph-drop records go to that logger and
-/// [`take_pdf_oxide_render_warnings`] stays empty.
+/// ```ignore
+/// tracing_subscriber::fmt()
+///     .with_env_filter(env_filter)
+///     .finish()
+///     .with(xberg::pdf::render::glyph_drop_capture_layer())
+///     .try_init();
+/// ```
 ///
-/// Without this call the #1364 warnings are not produced. The glyph drop
-/// itself is decided inside `pdf_oxide`, which reports it only through
-/// `log::warn!`; there is no return-value channel to read instead.
+/// Constructing the layer arms the capture — [`render_page_capturing_glyph_drops`] is a no-op
+/// until something does, so that the render path costs nothing for the majority of embedders
+/// who never opt in. Building a layer you then discard leaves the render path arming and
+/// draining an empty buffer: harmless, but pointless.
+#[cfg_attr(alef, alef(skip))]
+pub fn glyph_drop_capture_layer<S: tracing::Subscriber>() -> impl tracing_subscriber::Layer<S> {
+    ENGINE_CAPTURE_ACTIVE.store(true, Ordering::Release);
+    EngineWarningCapture
+}
+
+/// Install the glyph-drop capture as the process-wide `tracing`
+/// [`Subscriber`](tracing::Subscriber), exactly once.
+///
+/// **Prefer [`glyph_drop_capture_layer`] if the application installs a subscriber of its own.**
+/// `tracing` has exactly one global default dispatcher slot per process, and this function
+/// claims it. If something else already holds it — an application wiring
+/// `tracing_subscriber::fmt()...try_init()`, which is what `xberg-cli` does in `main()` —
+/// `set_global_default` fails and this is a no-op, so the engine's glyph-drop records go to
+/// that other subscriber and [`take_xberg_native_pdf_render_warnings`] stays empty. This function is
+/// the fallback for embedders that have no subscriber at all; composing the layer is what
+/// works when they do.
+///
+/// ★ That distinction is not theoretical, and it does not show up in tests. A test binary
+/// installs no `fmt` subscriber, so the capture always wins the slot there and every test
+/// passes — while the CLI, which claims the slot first, captures nothing. The port that
+/// introduced this function in its `set_global_default`-only form would have gone green on all
+/// three glyph-drop tests with the real CLI path still dead. Warnings arriving in a test are
+/// not evidence that they arrive in production; the contested resource only exists once
+/// something else has claimed it.
+///
+/// **Opt-in.** Nothing calls this automatically: a library that seizes the global dispatcher on
+/// its own behalf breaks its embedder, because a host that later calls
+/// `tracing_subscriber::fmt()...init()` panics (`.try_init()` instead returns `Err`). That
+/// decision belongs to the application.
+///
+/// Returns whether the capture is active — `true` if this call installed it, an earlier call
+/// did, or a [`glyph_drop_capture_layer`] was composed into someone else's stack; `false` if
+/// some other component owns the dispatcher slot and no layer was composed.
+///
+/// Without one of the two opt-ins the #1364 warnings are not produced. The glyph drop itself is
+/// decided inside `xberg_native_pdf`, which reports it only through `tracing::warn!`; there is no
+/// return-value channel to read instead.
 pub fn install_pdf_render_diagnostics() -> bool {
-    PDF_OXIDE_LOGGER_INIT.call_once(|| {
-        if log::set_boxed_logger(Box::new(PdfOxideWarningCapture)).is_ok() {
-            // Only warnings are captured, so asking the `log` facade for anything
-            // more verbose would cost every dependency a formatted record per call
-            // for output this sink immediately discards.
-            log::set_max_level(log::LevelFilter::Warn);
-            PDF_OXIDE_CAPTURE_ACTIVE.store(true, Ordering::Release);
+    ENGINE_LOGGER_INIT.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // A bare `Registry` carrying only this layer: it neither filters nor caps the level for
+        // anything else, so the earlier form's side effect — every event in the process below
+        // `WARN` silently discarded, via a `max_level_hint` that applied stack-wide — is gone.
+        let subscriber = tracing_subscriber::registry().with(EngineWarningCapture);
+        if tracing::subscriber::set_global_default(subscriber).is_ok() {
+            ENGINE_CAPTURE_ACTIVE.store(true, Ordering::Release);
+            // Re-resolve any callsite whose interest was already cached (as
+            // `never()`, from being reached with no global dispatcher
+            // installed at all) before this call. This is safe here
+            // specifically *because* `set_global_default` just above
+            // succeeded: by the time this runs, the process has a global
+            // default (this subscriber) for every thread to resolve interest
+            // against. Calling this with no global default set at all is the
+            // known hazard that disables `tracing` process-wide.
+            tracing::callsite::rebuild_interest_cache();
         }
     });
-    PDF_OXIDE_CAPTURE_ACTIVE.load(Ordering::Acquire)
+    ENGINE_CAPTURE_ACTIVE.load(Ordering::Acquire)
 }
 
-/// Turn one captured `pdf_oxide` log line into a `(page, message)`
+/// Turn one captured `xberg_native_pdf` log line into a `(page, message)`
 /// [`ProcessingWarning`], naming the page so a multi-page document does not
 /// read as "somewhere in this PDF, something happened".
+/// Whether a captured engine warning actually means glyph ink went missing.
+///
+/// Everything this sink captures used to be wrapped as a glyph drop unconditionally. That was
+/// invisible while the capture was broken (#697) because nothing was ever wrapped, but the
+/// engine also emits warnings about situations it handled correctly, and telling a user that
+/// "glyph ink is missing" when the text rendered fine is worse than saying nothing.
+///
+/// The engine hands us a formatted string and no structured kind, so this has to match on the
+/// message. It is deliberately an EXCLUDE-list, not an include-list: an unrecognised warning is
+/// still reported as a glyph drop, so a new failure mode is over-reported rather than silently
+/// swallowed -- the failure direction #697 already cost us once.
+fn indicates_dropped_glyph_ink(cause: &str) -> bool {
+    // "No font provided for N bytes, using Latin-1 fallback (PDF spec compliant)" -- the text
+    // is rendered via the fallback, so there is no missing ink to warn about.
+    !cause.contains("PDF spec compliant")
+}
+
 fn glyph_drop_warning(page_index: usize, cause: &str) -> ProcessingWarning {
     warning(
         PDF_RENDER_WARNING_SOURCE,
@@ -154,28 +283,59 @@ fn glyph_drop_warning(page_index: usize, cause: &str) -> ProcessingWarning {
     )
 }
 
-/// Render a page while capturing any `pdf_oxide` glyph-drop warnings it logs
-/// during the call, deduping them into [`PDF_OXIDE_PENDING_WARNINGS`] for
-/// later collection via [`take_pdf_oxide_render_warnings`].
+/// Whether a captured engine warning means a whole image XObject failed to rasterize
+/// (e.g. its stream failed to decode, tripped a decompression-bomb guard, or carried an
+/// unsupported colour space), as opposed to a single glyph being dropped.
+///
+/// Matches the exact wording `xberg_native_pdf::rendering::page_renderer::render_xobject` logs
+/// at its `render_image`/`render_image_mask` catch sites ("Skipping unrenderable image
+/// XObject '{name}': {e}" / "Skipping unrenderable ImageMask XObject '{name}': {e}") when
+/// `render_image` returns `Err` and the page is left with a blank region instead. That is a
+/// materially different defect from a dropped glyph — a whole picture is missing, not one
+/// character's ink — and reporting it as "glyph ink is missing" would misdescribe the cause
+/// to anyone reading `processing_warnings`.
+fn indicates_unrenderable_image(cause: &str) -> bool {
+    cause.contains("unrenderable image XObject") || cause.contains("unrenderable ImageMask XObject")
+}
+
+fn image_render_failure_warning(page_index: usize, cause: &str) -> ProcessingWarning {
+    warning(
+        PDF_RENDER_WARNING_SOURCE,
+        format!(
+            "Page {} could not rasterize one or more images and left that region blank: {cause}",
+            page_index + 1
+        ),
+    )
+}
+
+/// Render a page while capturing any `xberg_native_pdf` render-degradation warnings it
+/// logs during the call — dropped glyphs and unrenderable image XObjects alike — deduping
+/// them into [`ENGINE_PENDING_WARNINGS`] for later collection via
+/// [`take_xberg_native_pdf_render_warnings`].
 ///
 /// Capture is opt-in: unless the application called
 /// [`install_pdf_render_diagnostics`], this arms nothing and is exactly
 /// equivalent to calling `render` directly, at no cost.
 fn render_page_capturing_glyph_drops(
     page_index: usize,
-    render: impl FnOnce() -> std::result::Result<pdf_oxide::rendering::RenderedImage, pdf_oxide::Error>,
-) -> std::result::Result<pdf_oxide::rendering::RenderedImage, pdf_oxide::Error> {
-    if !PDF_OXIDE_CAPTURE_ACTIVE.load(Ordering::Acquire) {
+    render: impl FnOnce() -> std::result::Result<xberg_native_pdf::rendering::RenderedImage, xberg_native_pdf::Error>,
+) -> std::result::Result<xberg_native_pdf::rendering::RenderedImage, xberg_native_pdf::Error> {
+    if !ENGINE_CAPTURE_ACTIVE.load(Ordering::Acquire) {
         return render();
     }
-    PDF_OXIDE_LOG_CAPTURE.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+    ENGINE_LOG_CAPTURE.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
     let result = render();
-    let captured = PDF_OXIDE_LOG_CAPTURE.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    let captured = ENGINE_LOG_CAPTURE.with(|cell| cell.borrow_mut().take().unwrap_or_default());
     if !captured.is_empty() {
-        PDF_OXIDE_PENDING_WARNINGS.with(|pending| {
+        ENGINE_PENDING_WARNINGS.with(|pending| {
             let mut pending = pending.borrow_mut();
-            for cause in &captured {
-                push_warning_deduped(&mut pending, glyph_drop_warning(page_index, cause));
+            for cause in captured.iter().filter(|cause| indicates_dropped_glyph_ink(cause)) {
+                let processing_warning = if indicates_unrenderable_image(cause) {
+                    image_render_failure_warning(page_index, cause)
+                } else {
+                    glyph_drop_warning(page_index, cause)
+                };
+                push_warning_deduped(&mut pending, processing_warning);
             }
         });
     }
@@ -201,7 +361,7 @@ fn render_page_capturing_glyph_drops(
 /// extraction that renders at least one page picks up any captured
 /// glyph-drop warnings for free. ~keep: that drain only ever observes
 /// warnings from render calls that happened on the *same OS thread* before it
-/// ran, because [`PDF_OXIDE_PENDING_WARNINGS`] is thread-local. OCR page
+/// ran, because [`ENGINE_PENDING_WARNINGS`] is thread-local. OCR page
 /// rendering runs inline on the extracting task's thread, so it is covered.
 /// Layout-detection rasterization runs inside `tokio::task::spawn_blocking`,
 /// which always executes on a different OS thread, so this function alone
@@ -212,8 +372,8 @@ fn render_page_capturing_glyph_drops(
 /// and threads the drained warnings back through its return value for the
 /// caller in `extractors::pdf::mod` to merge, so layout-path glyph drops are
 /// no longer silently lost.
-pub fn take_pdf_oxide_render_warnings() -> Vec<ProcessingWarning> {
-    PDF_OXIDE_PENDING_WARNINGS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+pub fn take_xberg_native_pdf_render_warnings() -> Vec<ProcessingWarning> {
+    ENGINE_PENDING_WARNINGS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
 }
 
 /// Reasonable max pixel dimension (on either axis) for a rendered page before we
@@ -223,7 +383,7 @@ pub fn take_pdf_oxide_render_warnings() -> Vec<ProcessingWarning> {
 ///
 /// Chosen as 16384px because a 20000pt-wide page at the default 150 DPI produces
 /// ~41667px on the long axis (20000 * 150 / 72), which triggers Pixmap creation
-/// or rasterization failures inside pdf_oxide/tiny-skia for real vector-heavy
+/// or rasterization failures inside xberg_native_pdf/tiny-skia for real vector-heavy
 /// content. 16384 is high enough for normal documents (A3 landscape at 300dpi ~
 /// 3500px) but catches the extreme cases reported in #1078. See the regression
 /// test in this module for the exact repro input that previously failed.
@@ -231,7 +391,7 @@ const MAX_RENDER_DIMENSION_PX: f32 = 16384.0;
 
 /// Compute a safe DPI for the given page MediaBox so that the rendered pixel
 /// size stays within practical limits for the underlying rasterizer (tiny-skia
-/// Pixmap + path/text rasterization in pdf_oxide).
+/// Pixmap + path/text rasterization in xberg_native_pdf).
 ///
 /// Falls back to 72 DPI minimum. Returns the (possibly reduced) DPI to use.
 fn choose_safe_dpi(w_pt: f32, h_pt: f32, base_dpi: u32) -> u32 {
@@ -250,17 +410,50 @@ fn choose_safe_dpi(w_pt: f32, h_pt: f32, base_dpi: u32) -> u32 {
 }
 
 /// Fetch page MediaBox (in points) with a sane Letter fallback.
-pub(crate) fn get_page_dimensions_pt(doc: &pdf_oxide::PdfDocument, page_index: usize) -> (f32, f32) {
+pub(crate) fn get_page_dimensions_pt(doc: &xberg_native_pdf::PdfDocument, page_index: usize) -> (f32, f32) {
     doc.get_page_media_box(page_index)
         .map(|(llx, lly, urx, ury)| ((urx - llx).abs(), (ury - lly).abs()))
         .unwrap_or((612.0, 792.0))
+}
+
+/// Derive the true resolution, in DPI, of a page raster produced by
+/// [`render_page_with_safeguards`].
+///
+/// The renderer does not necessarily honour the DPI it is asked for: [`choose_safe_dpi`]
+/// silently reduces it whenever the MediaBox would rasterize past
+/// [`MAX_RENDER_DIMENSION_PX`], and the effective value it picked is then discarded — the
+/// `RenderedImage` it returns carries only `data`, `width`, `height` and `format`. Recovering
+/// the resolution from the raster's own pixel width against the page's MediaBox width is
+/// exact whether or not that reduction fired, so nothing has to be threaded back out of the
+/// renderer. It also stays correct per page in a document that mixes page sizes, which is why
+/// this is derived per call rather than carried on a config.
+///
+/// The raster must be the MediaBox-oriented one [`normalize_rendered_page_for_ocr`] produces
+/// (its axes align with the MediaBox, see [`pixel_bbox_to_pdf_points`]), not a raster that has
+/// since been rotated upright — after a 90/270 degree rotation the width no longer corresponds
+/// to `page_width_pt`. The resolution itself is rotation-invariant, so deriving it before any
+/// such rotation and carrying the scalar forward is safe.
+///
+/// Returns `None` for a degenerate page box or an empty raster so callers keep their
+/// "resolution unknown" behaviour instead of adopting a fabricated one.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(crate) fn rendered_page_dpi(rendered_width_px: u32, page_width_pt: f32) -> Option<f64> {
+    /// Points per inch in PDF user space: a MediaBox is expressed in these units, so a page's
+    /// width in inches is its width in points divided by this.
+    const POINTS_PER_INCH: f64 = 72.0;
+
+    let page_width_pt = f64::from(page_width_pt);
+    if rendered_width_px == 0 || !page_width_pt.is_finite() || page_width_pt <= 0.0 {
+        return None;
+    }
+    Some(f64::from(rendered_width_px) * POINTS_PER_INCH / page_width_pt)
 }
 
 /// Map a bounding box from OCR-image pixel space (origin top-left, y down)
 /// to PDF point space (origin bottom-left, y up).
 ///
 /// `rendered_w`/`rendered_h` are the dimensions of the image the OCR backend
-/// saw. `pdf_oxide` renders in display orientation (`/Rotate` applied) and
+/// saw. `xberg_native_pdf` renders in display orientation (`/Rotate` applied) and
 /// [`normalize_rendered_page_for_ocr`] rotates that back to user-space
 /// orientation, so the OCR image axes already align with the MediaBox: the
 /// mapping is a pure scale plus a y flip. Scaling from the actual rendered
@@ -339,50 +532,82 @@ mod pixel_bbox_tests {
     }
 }
 
-/// Maximum /Parent hops when resolving an inherited /Rotate attribute.
-/// Bounds the walk so a malformed PDF with a parent cycle cannot loop forever.
+/// Read per-page /Rotate values for a whole document, normalized to
+/// 0/90/180/270.
+///
+/// Delegates to `xberg_native_pdf::PdfDocument::get_page_rotation`, which walks the
+/// page tree's `/Parent`-inheritance chain per ISO 32000-1 §7.7.3.4 (a page
+/// without its own `/Rotate` inherits from its `/Pages` ancestors) — the
+/// same resolution this function used to hand-roll via a second, separate
+/// `lopdf::Document::load_mem` parse of the same bytes. Every current caller
+/// already holds the `xberg_native_pdf::PdfDocument` passed in here open for
+/// rendering, so taking `&xberg_native_pdf::PdfDocument` instead of raw bytes
+/// removes that second parse entirely.
+///
+/// A per-page lookup that errors (e.g. an encrypted document whose page tree
+/// could not be decrypted, or a corrupt page-tree node that neither the tree
+/// walk nor its scanning fallback can resolve) defaults that page's rotation
+/// to `0`, matching this function's previous contract of defaulting to `0`
+/// on any parse failure — the difference is this now happens per page
+/// instead of for the whole document at once, since a `xberg_native_pdf::PdfDocument`
+/// reaching this function has by definition already opened successfully.
+///
+/// # Deliberate choice: non-multiple-of-90 `/Rotate` values are folded to 0
+///
+/// ISO 32000-1 §7.7.3.3 requires `/Rotate` to be a multiple of 90; a PDF that
+/// sets a non-multiple (e.g. `135`) is out of spec. The previous hand-rolled
+/// implementation stored such a value verbatim (after only a
+/// `rem_euclid(360)` fold for sign), which mattered only as a *value*:
+/// [`rotate_dynamic_image`] below only rotates on an exact 90/180/270 match
+/// and no-ops everything else, so a stored `135` never rotated a single
+/// pixel. Its one live effect was being forwarded unchanged into
+/// `ocr_config_with_page_rotation_hint`'s `page_rotation_degrees` backend
+/// hint (see `extractors::pdf::ocr`), telling an OCR backend the page is
+/// rotated by a degree count nothing in this pipeline can ever act on.
+/// `xberg_native_pdf::PdfDocument::get_page_rotation` instead folds any
+/// non-multiple-of-90 value to `0` at the source, treating an out-of-spec
+/// `/Rotate` exactly like a *missing* one. That is the behaviour kept here:
+/// it is strictly more correct (spec-conformant) than the old
+/// preserve-and-forward-garbage behaviour, and no test anywhere in this
+/// crate asserted the old value was ever used for anything, so nothing
+/// relies on it. See `get_page_rotations`' test module for the pinning test.
+///
+/// See [`get_page_rotations_from_bytes`] for callers that hold only the raw bytes.
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
-const MAX_ROTATE_INHERITANCE_DEPTH: usize = 32;
-
-/// Resolve a page's effective /Rotate value, following /Parent inheritance
-/// per the PDF spec (a page without its own /Rotate inherits from its Pages
-/// ancestors). Returns `None` when no ancestor defines it.
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
-fn resolve_inherited_rotation(doc: &Document, page_id: ObjectId) -> Option<i64> {
-    let mut dict = doc.get_object(page_id).ok()?.as_dict().ok()?;
-    for _ in 0..MAX_ROTATE_INHERITANCE_DEPTH {
-        if let Ok(rotate_obj) = dict.get(b"Rotate") {
-            return rotate_obj.as_i64().ok();
-        }
-        let parent_id = dict.get(b"Parent").ok()?.as_reference().ok()?;
-        dict = doc.get_object(parent_id).ok()?.as_dict().ok()?;
-    }
-    None
+pub(crate) fn get_page_rotations(doc: &xberg_native_pdf::PdfDocument, page_count: usize) -> Vec<u32> {
+    (0..page_count)
+        .map(|page_index| match doc.get_page_rotation(page_index) {
+            // `get_page_rotation`'s own contract guarantees a value in
+            // {0, 90, 180, 270}, always non-negative.
+            Ok(degrees) => degrees as u32,
+            Err(error) => {
+                tracing::warn!(
+                    page = page_index + 1,
+                    %error,
+                    "could not resolve /Rotate for page; defaulting to 0 (no rotation)"
+                );
+                0
+            }
+        })
+        .collect()
 }
 
-/// Read per-page /Rotate values for a whole document, normalized to
-/// 0/90/180/270 (negative multiples of 90 are folded via `rem_euclid`).
+/// Prefer the document-taking form wherever a `PdfDocument` is already open — three call
+/// sites were re-parsing the same bytes a second time purely to read `/Rotate`. This exists
+/// for the two routes that genuinely have no document in scope, and it opens one so the
+/// extra parse is at least explicit at the call site rather than hidden inside the lookup.
 ///
-/// Parses the PDF once with lopdf; a parse failure or missing attribute
-/// yields 0 (no rotation) for the affected pages. lopdf's `get_pages()`
-/// map is keyed by 1-based page number, which is the authoritative page
-/// order (object IDs are not ordered by page).
+/// Returns all-zero rotations if the document cannot be opened: this is a rendering hint,
+/// and a document that will not open fails for better reasons elsewhere.
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
-pub(crate) fn get_page_rotations(pdf_bytes: &[u8], page_count: usize) -> Vec<u32> {
-    let mut rotations = vec![0u32; page_count];
-    let Ok(doc) = Document::load_mem(pdf_bytes) else {
-        return rotations;
-    };
-    for (page_number, page_id) in doc.get_pages() {
-        let index = (page_number as usize).saturating_sub(1);
-        if index >= page_count {
-            continue;
-        }
-        if let Some(rotate_int) = resolve_inherited_rotation(&doc, page_id) {
-            rotations[index] = rotate_int.rem_euclid(360) as u32;
+pub(crate) fn get_page_rotations_from_bytes(content: &[u8], page_count: usize) -> Vec<u32> {
+    match xberg_native_pdf::PdfDocument::from_bytes(content.to_vec()) {
+        Ok(doc) => get_page_rotations(&doc, page_count),
+        Err(error) => {
+            tracing::warn!(%error, "failed to open PDF to read page rotations; assuming none");
+            vec![0; page_count]
         }
     }
-    rotations
 }
 
 /// Rotate a decoded page image per the page's normalized /Rotate value.
@@ -398,7 +623,7 @@ pub(crate) fn rotate_dynamic_image(img: image::DynamicImage, rotation_degrees: u
 }
 
 /// Return the correction needed to make a page raster upright after
-/// `pdf_oxide` has applied the PDF page's `/Rotate` value while rendering.
+/// `xberg_native_pdf` has applied the PDF page's `/Rotate` value while rendering.
 /// ~keep
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
 pub(crate) fn ocr_page_correction_degrees(rotation_degrees: u32) -> u32 {
@@ -437,9 +662,9 @@ pub(crate) fn rotate_png_page_if_needed(
     Ok((buf, w, h))
 }
 
-/// Normalize a `pdf_oxide` page raster for OCR.
+/// Normalize a `xberg_native_pdf` page raster for OCR.
 ///
-/// `pdf_oxide` already applies `/Rotate` to the rendered page. OCR needs the
+/// `xberg_native_pdf` already applies `/Rotate` to the rendered page. OCR needs the
 /// inverse transform exactly once so text is upright before layout and OCR
 /// inference consume the shared raster. ~keep
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
@@ -453,7 +678,7 @@ pub(crate) fn normalize_rendered_page_for_ocr(
 }
 
 /// Contain a panic raised while rasterizing one page, turning it into an
-/// ordinary `pdf_oxide::Error` for that page.
+/// ordinary `xberg_native_pdf::Error` for that page.
 ///
 /// Rasterization runs third-party code over attacker-controlled geometry, and a
 /// malformed page can violate an invariant the rasterizer only asserts: on a PDF
@@ -470,10 +695,10 @@ pub(crate) fn normalize_rendered_page_for_ocr(
 /// render-failure handling, and the rest of the document still extracts.
 fn guard_render_panic(
     page_index: usize,
-    render: impl FnOnce() -> std::result::Result<pdf_oxide::rendering::RenderedImage, pdf_oxide::Error>,
-) -> std::result::Result<pdf_oxide::rendering::RenderedImage, pdf_oxide::Error> {
-    super::oxide::guard_oxide_panic(render, |message| {
-        pdf_oxide::Error::InvalidPdf(format!(
+    render: impl FnOnce() -> std::result::Result<xberg_native_pdf::rendering::RenderedImage, xberg_native_pdf::Error>,
+) -> std::result::Result<xberg_native_pdf::rendering::RenderedImage, xberg_native_pdf::Error> {
+    super::native::guard_native_panic(render, |message| {
+        xberg_native_pdf::Error::InvalidPdf(format!(
             "page {} could not be rasterized: the rasterizer panicked and was contained ({message})",
             page_index + 1
         ))
@@ -486,10 +711,10 @@ fn guard_render_panic(
 ///
 /// Uses the opened document (so callers that batch multiple pages only parse once).
 pub(crate) fn render_page_with_safeguards(
-    doc: &pdf_oxide::PdfDocument,
+    doc: &xberg_native_pdf::PdfDocument,
     page_index: usize,
     base_dpi: u32,
-) -> std::result::Result<pdf_oxide::rendering::RenderedImage, pdf_oxide::Error> {
+) -> std::result::Result<xberg_native_pdf::rendering::RenderedImage, xberg_native_pdf::Error> {
     let (w_pt, h_pt) = get_page_dimensions_pt(doc, page_index);
     let safe_dpi = choose_safe_dpi(w_pt, h_pt, base_dpi);
     if safe_dpi != base_dpi {
@@ -502,13 +727,13 @@ pub(crate) fn render_page_with_safeguards(
             "reducing render DPI for page due to extreme dimensions (wide vector-heavy PDF or similar)"
         );
     }
-    let options = pdf_oxide::rendering::RenderOptions::with_dpi(safe_dpi);
+    let options = xberg_native_pdf::rendering::RenderOptions::with_dpi(safe_dpi);
     // The panic guard sits inside the capture wrapper, not around it, so a
     // panicking page still lets the wrapper take its thread-local buffer back
     // instead of leaving it armed on a pooled thread.
     render_page_capturing_glyph_drops(page_index, || {
         guard_render_panic(page_index, || {
-            pdf_oxide::rendering::render_page(doc, page_index, &options)
+            xberg_native_pdf::rendering::render_page(doc, page_index, &options)
         })
     })
 }
@@ -524,8 +749,8 @@ pub(crate) fn render_page_with_safeguards(
 /// # Errors
 ///
 /// Returns `XbergError::Parsing` if the PDF cannot be opened or authenticated.
-pub(crate) fn open_pdf_document(pdf_bytes: &[u8], password: Option<&str>) -> Result<pdf_oxide::PdfDocument> {
-    let doc = pdf_oxide::PdfDocument::from_bytes(pdf_bytes.to_vec()).map_err(|e| XbergError::Parsing {
+pub(crate) fn open_pdf_document(pdf_bytes: &[u8], password: Option<&str>) -> Result<xberg_native_pdf::PdfDocument> {
+    let doc = xberg_native_pdf::PdfDocument::from_bytes(pdf_bytes.to_vec()).map_err(|e| XbergError::Parsing {
         message: format!("Failed to open PDF: {e}"),
         source: None,
     })?;
@@ -545,7 +770,7 @@ pub(crate) fn open_pdf_document(pdf_bytes: &[u8], password: Option<&str>) -> Res
 /// # Errors
 ///
 /// Returns `XbergError::Parsing` if the page count cannot be read.
-pub(crate) fn document_page_count(doc: &pdf_oxide::PdfDocument) -> Result<usize> {
+pub(crate) fn document_page_count(doc: &xberg_native_pdf::PdfDocument) -> Result<usize> {
     doc.page_count().map_err(|e| XbergError::Parsing {
         message: format!("Failed to read page count: {e}"),
         source: None,
@@ -564,7 +789,7 @@ pub(crate) fn document_page_count(doc: &pdf_oxide::PdfDocument) -> Result<usize>
 ///
 /// Returns `XbergError::Parsing` if the page cannot be rendered.
 pub(crate) fn render_open_pdf_page_to_png(
-    doc: &pdf_oxide::PdfDocument,
+    doc: &xberg_native_pdf::PdfDocument,
     page_index: usize,
     dpi: Option<i32>,
 ) -> Result<Vec<u8>> {
@@ -577,10 +802,62 @@ pub(crate) fn render_open_pdf_page_to_png(
     Ok(rendered.data)
 }
 
+/// An open PDF document that can render multiple pages without reparsing the file.
+///
+/// This Rust-only session keeps the native PDF engine private while exposing the
+/// efficient open-once rendering path. Use [`render_pdf_page_to_png`] for a single
+/// page and this type when rendering several pages from the same document.
+#[cfg_attr(alef, alef(skip))]
+pub struct PdfRenderSession {
+    document: xberg_native_pdf::PdfDocument,
+    page_count: usize,
+}
+
+#[cfg_attr(alef, alef(skip))]
+impl PdfRenderSession {
+    /// Open and optionally authenticate a PDF document.
+    ///
+    /// # Errors
+    ///
+    /// Returns `XbergError::Parsing` if the PDF cannot be opened, authenticated,
+    /// or its page count cannot be read.
+    pub fn open(pdf_bytes: &[u8], password: Option<&str>) -> Result<Self> {
+        let document = open_pdf_document(pdf_bytes, password)?;
+        let page_count = document_page_count(&document)?;
+        Ok(Self { document, page_count })
+    }
+
+    /// Return the number of pages in the open document.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    /// Render a zero-based page index to PNG bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `XbergError::Parsing` if `page_index` is out of range or the page
+    /// cannot be rendered.
+    pub fn render_page_to_png(&self, page_index: usize, dpi: Option<i32>) -> Result<Vec<u8>> {
+        if page_index >= self.page_count {
+            return Err(XbergError::Parsing {
+                message: format!(
+                    "Page index {page_index} out of range (document has {} pages)",
+                    self.page_count
+                ),
+                source: None,
+            });
+        }
+
+        render_open_pdf_page_to_png(&self.document, page_index, dpi)
+    }
+}
+
 /// Render a single PDF page to PNG bytes.
 ///
 /// Returns raw PNG-encoded bytes for the specified page at the given DPI.
-/// Uses pdf_oxide with tiny-skia for pure-Rust rendering.
+/// Uses xberg_native_pdf with tiny-skia for pure-Rust rendering.
 ///
 /// For pages with extreme dimensions (very wide vector diagrams, etc.) the
 /// effective DPI may be automatically reduced to avoid rasterizer failure.
@@ -603,17 +880,7 @@ pub fn render_pdf_page_to_png(
     dpi: Option<i32>,
     password: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let doc = open_pdf_document(pdf_bytes, password)?;
-
-    let page_count = document_page_count(&doc)?;
-    if page_index >= page_count {
-        return Err(XbergError::Parsing {
-            message: format!("Page index {page_index} out of range (document has {page_count} pages)"),
-            source: None,
-        });
-    }
-
-    render_open_pdf_page_to_png(&doc, page_index, dpi)
+    PdfRenderSession::open(pdf_bytes, password)?.render_page_to_png(page_index, dpi)
 }
 
 /// Count the pages in a PDF without rendering any of them.
@@ -632,22 +899,7 @@ pub fn render_pdf_page_to_png(
 /// Returns `XbergError::Parsing` if the PDF cannot be opened, authenticated,
 /// or its page count read.
 pub fn pdf_page_count(pdf_bytes: &[u8], password: Option<&str>) -> Result<usize> {
-    let doc = pdf_oxide::PdfDocument::from_bytes(pdf_bytes.to_vec()).map_err(|e| XbergError::Parsing {
-        message: format!("Failed to open PDF: {e}"),
-        source: None,
-    })?;
-
-    if let Some(pwd) = password {
-        doc.authenticate(pwd.as_bytes()).map_err(|e| XbergError::Parsing {
-            message: format!("Failed to authenticate PDF: {e}"),
-            source: None,
-        })?;
-    }
-
-    doc.page_count().map_err(|e| XbergError::Parsing {
-        message: format!("Failed to read page count: {e}"),
-        source: None,
-    })
+    Ok(PdfRenderSession::open(pdf_bytes, password)?.page_count())
 }
 
 /// Build a minimal valid single-page PDF with the given MediaBox (in points).
@@ -792,6 +1044,38 @@ mod tests {
         assert_eq!(dpi, 72);
     }
 
+    /// The raster's own pixel width is the only honest record of the resolution a page was
+    /// rendered at, because `render_page_with_safeguards` throws `choose_safe_dpi`'s effective
+    /// value away. A Letter page rendered at the OCR route's requested 150 DPI is 1275px wide,
+    /// and that must read back as 150 — not as the 72 the preprocessor assumes when nobody
+    /// tells it otherwise.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn should_derive_render_dpi_from_raster_width_and_mediabox() {
+        assert_eq!(rendered_page_dpi(1275, 612.0), Some(150.0));
+    }
+
+    /// The same derivation on a page `choose_safe_dpi` reduced: a 20000pt-wide sheet asked for
+    /// at 150 DPI comes back at 72 (see `test_choose_safe_dpi_extreme_wide_reduced`), i.e.
+    /// 20000px, and must read back as the 72 it really is rather than the 150 that was asked
+    /// for.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn should_derive_reduced_render_dpi_when_safe_dpi_clamped_the_page() {
+        assert_eq!(rendered_page_dpi(20000, 20000.0), Some(72.0));
+    }
+
+    /// A degenerate MediaBox or an empty raster yields no resolution at all, so the caller
+    /// keeps its "unknown" behaviour instead of dividing by zero into an infinite DPI.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn should_return_none_when_page_box_or_raster_is_degenerate() {
+        assert_eq!(rendered_page_dpi(1275, 0.0), None);
+        assert_eq!(rendered_page_dpi(1275, -612.0), None);
+        assert_eq!(rendered_page_dpi(1275, f32::NAN), None);
+        assert_eq!(rendered_page_dpi(0, 612.0), None);
+    }
+
     #[test]
     fn test_render_pdf_page_to_png_very_wide_does_not_panic_or_hard_fail() {
         let wide_pdf = build_minimal_pdf_with_mediabox(20000.0, 300.0);
@@ -827,6 +1111,26 @@ mod tests {
         let pdf = build_minimal_pdf_with_mediabox(612.0, 792.0);
         let count = pdf_page_count(&pdf, None).expect("page count should succeed for a valid PDF");
         assert_eq!(count, 1, "minimal single-page PDF must report 1 page");
+    }
+
+    #[test]
+    fn pdf_render_session_reports_count_and_renders_without_reopening() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<PdfRenderSession>();
+        let pdf = build_minimal_pdf_with_mediabox(612.0, 792.0);
+        let session = PdfRenderSession::open(&pdf, None).expect("valid PDF should open");
+
+        assert_eq!(session.page_count(), 1);
+        let png = session
+            .render_page_to_png(0, Some(72))
+            .expect("open session should render its page");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+
+        let error = session
+            .render_page_to_png(1, Some(72))
+            .expect_err("out-of-range page must fail");
+        assert!(error.to_string().contains("document has 1 pages"));
     }
 
     #[test]
@@ -893,7 +1197,7 @@ mod tests {
 
     /// Regression test for CFF fonts whose charstrings carry the deprecated
     /// `dotsection` operator (12 0). ttf-parser 0.25.1 aborted the whole
-    /// charstring with `UnsupportedOperator`, so pdf_oxide painted nothing for
+    /// charstring with `UnsupportedOperator`, so xberg_native_pdf painted nothing for
     /// i, j, period, colon, semicolon, exclam and question while still
     /// advancing the cursor: OCR received page images with those letters
     /// silently missing. Exercises the full render path against the parser the
@@ -974,13 +1278,161 @@ mod tests {
     #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
     #[test]
     fn test_get_page_rotations_no_rotate_attribute_yields_zeroes() {
+        // Behavior-preserving: passes against both the old lopdf-based
+        // implementation and the new xberg_native_pdf-delegating one (a missing
+        // /Rotate defaults to 0 either way). Only the call mechanics changed
+        // (an already-open `PdfDocument` instead of raw bytes), to match the
+        // new `get_page_rotations` signature.
         let pdf = build_minimal_pdf_with_mediabox(612.0, 792.0);
-        assert_eq!(get_page_rotations(&pdf, 1), vec![0]);
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(pdf).expect("fixture PDF must open");
+        assert_eq!(get_page_rotations(&doc, 1), vec![0]);
+    }
+
+    /// Build a single-page PDF whose `/Rotate` is set either on the page
+    /// itself (`inherited = false`) or on its parent `/Pages` node
+    /// (`inherited = true`), for pinning [`get_page_rotations`]' inheritance
+    /// and value-normalization contract. Mirrors the equivalent fixture
+    /// builder in `extractors::pdf::layout_runner`'s test module, which is
+    /// private to that module and out of scope to reuse from here.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+    fn build_pdf_with_rotate(rotation: i64, inherited: bool) -> Vec<u8> {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let page_id = document.new_object_id();
+        let content_id = document.add_object(Stream::new(dictionary! {}, Vec::new()));
+
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 100.into()],
+            "Resources" => dictionary! {},
+            "Contents" => content_id,
+        };
+        if !inherited {
+            page.set("Rotate", rotation);
+        }
+        document.objects.insert(page_id, Object::Dictionary(page));
+
+        let mut pages = dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        };
+        if inherited {
+            pages.set("Rotate", rotation);
+        }
+        document.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("fixture PDF must serialize");
+        bytes
     }
 
     #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
     #[test]
-    fn test_get_page_rotations_unparsable_bytes_yield_zeroes() {
-        assert_eq!(get_page_rotations(b"not a pdf", 3), vec![0, 0, 0]);
+    fn test_get_page_rotations_own_rotate_is_read() {
+        // Behavior-preserving for a normal, in-spec /Rotate: both the old
+        // and new implementations resolve a page's own /Rotate to itself.
+        let pdf = build_pdf_with_rotate(90, false);
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(pdf).expect("fixture PDF must open");
+        assert_eq!(get_page_rotations(&doc, 1), vec![90]);
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+    #[test]
+    fn test_get_page_rotations_inherited_rotate_is_resolved_from_parent() {
+        // Behavior-preserving: both the old /Parent-walking implementation
+        // and the new xberg_native_pdf delegate correctly resolve a /Rotate set
+        // only on the ancestor /Pages node (ISO 32000-1 SS7.7.3.4).
+        let pdf = build_pdf_with_rotate(90, true);
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(pdf).expect("fixture PDF must open");
+        assert_eq!(get_page_rotations(&doc, 1), vec![90]);
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+    #[test]
+    fn test_get_page_rotations_negative_rotate_normalizes_to_positive_equivalent() {
+        // Behavior-preserving: the old `rem_euclid(360)` fold and the new
+        // `((raw % 360) + 360) % 360` fold both normalize -90 to 270.
+        let pdf = build_pdf_with_rotate(-90, false);
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(pdf).expect("fixture PDF must open");
+        assert_eq!(get_page_rotations(&doc, 1), vec![270]);
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+    #[test]
+    fn test_get_page_rotations_non_multiple_of_90_folds_to_zero() {
+        // Pins the deliberate behavior CHANGE documented on `get_page_rotations`:
+        // ISO 32000-1 SS7.7.3.3 requires /Rotate to be a multiple of 90, so 135 is
+        // out-of-spec. The old lopdf-based code stored it verbatim as 135 (only
+        // `rem_euclid`-folded for sign), which this test would NOT have caught
+        // under the old signature since 135 % 360 == 135 either way -- had that
+        // code been adapted to this fixture it would assert `vec![135]`, not
+        // `vec![0]`. This test only compiles and passes against the new,
+        // xberg_native_pdf-delegating implementation, which folds any non-multiple of 90
+        // to 0 (treating it the same as a missing /Rotate) rather than forwarding
+        // a degree value nothing downstream can act on.
+        let pdf = build_pdf_with_rotate(135, false);
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(pdf).expect("fixture PDF must open");
+        assert_eq!(get_page_rotations(&doc, 1), vec![0]);
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
+    #[test]
+    fn test_get_page_rotations_page_index_beyond_tree_defaults_to_zero() {
+        // Replaces the old `test_get_page_rotations_unparsable_bytes_yield_zeroes`:
+        // that test fed raw unparsable bytes straight into `get_page_rotations`,
+        // which no longer accepts raw bytes at all -- a document that fails to
+        // open now errors at `xberg_native_pdf::PdfDocument::from_bytes` (already
+        // covered by `test_pdf_page_count_invalid_pdf_errors`), before this
+        // function is ever reached. What this function itself can still fail to
+        // resolve, per page, is a page index the tree (and its scanning
+        // fallback) cannot find -- exercised here by asking for 3 pages from a
+        // document that only has 1. Each failing lookup must default to 0,
+        // matching this function's previous contract of defaulting to 0 on any
+        // per-page resolution failure.
+        let pdf = build_minimal_pdf_with_mediabox(612.0, 792.0);
+        let doc = xberg_native_pdf::PdfDocument::from_bytes(pdf).expect("fixture PDF must open");
+        assert_eq!(get_page_rotations(&doc, 3), vec![0, 0, 0]);
+    }
+
+    /// #697: the PDF engine's `log` target follows the fork's own `[lib] name`, so when it was
+    /// republished as `xberg-native` every glyph-drop warning silently stopped being captured
+    /// -- for twelve days, in production, not just in tests. The prefix this filter matches is
+    /// therefore load-bearing and easy to break invisibly, so it is pinned directly here rather
+    /// than only through the render-path tests that depend on it.
+    #[test]
+    fn engine_log_targets_are_captured_under_both_the_current_and_former_crate_names() {
+        assert!(
+            is_pdf_engine_target(&format!("{ENGINE_LOG_TARGET_ROOT}::rendering::page_renderer")),
+            "the CURRENT engine crate name must be captured -- this is the assertion that was \
+             failing in production"
+        );
+        assert!(
+            is_pdf_engine_target(&format!("{ENGINE_LOG_TARGET_ROOT}::fonts")),
+            "explicit-target sites inside the engine must be captured too"
+        );
+        assert!(
+            is_pdf_engine_target(ENGINE_LOG_TARGET_ROOT),
+            "the FORMER crate name must stay accepted so a revert or a rename back is not a \
+             silent regression"
+        );
+        assert!(
+            !is_pdf_engine_target("tower::buffer::worker"),
+            "unrelated crates must not be captured: this sink owns the process's only log \
+             backend, so anything it accepts is diverted from every other consumer"
+        );
+        assert!(
+            !is_pdf_engine_target("xberg::extractors::pdf"),
+            "xberg's own records must not be captured"
+        );
     }
 }

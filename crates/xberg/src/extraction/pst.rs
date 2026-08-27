@@ -145,8 +145,7 @@ pub(crate) fn extract_pst_messages(_pst_data: &[u8]) -> Result<(Vec<EmailExtract
 /// Used by `PstExtractor::extract_file` to avoid the double-allocation that
 /// occurs when the full PST is first read into a `Vec<u8>` and then written
 /// back out to a tempfile before parsing.
-#[cfg(feature = "email")]
-#[allow(dead_code)]
+#[cfg(all(feature = "email", feature = "tokio-runtime"))]
 pub(crate) fn extract_pst_from_path(
     path: &std::path::Path,
 ) -> Result<(Vec<EmailExtractionResult>, Vec<ProcessingWarning>)> {

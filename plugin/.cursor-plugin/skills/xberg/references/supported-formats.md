@@ -1,13 +1,13 @@
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:ff19d1ca4cc6da797d5c6600d53cbb5404eba67965a3c8a840a49e1d87a02466
-Source-Hash: blake3:ac8bab9ae4a76e61f437af29b4a45a38326056a50769a177038927c69353edaf
+Content-Hash: blake3:5da5ca252031c3a779c284995df906e791e68e115d39389f62dbcbf885be0d28
+Source-Hash: blake3:45cb11995592f052d075d6a24353eb8b647075dcb25f77187fcb4c161b574d49
 Schema-Version: v1
 -->
 
 # Supported Formats Reference
 
-Xberg supports 101 file formats across 115 file extensions in 8 major categories with intelligent format detection and comprehensive metadata extraction. All formats support text and metadata extraction. Additional capabilities like OCR and table detection are noted per format.
+Xberg supports 100 formats across 120 file extensions. The tables below summarize the current extension families; `xberg formats` and the [generated format reference](https://docs.xberg.io/reference/formats/) are authoritative for individual MIME mappings and feature-gated availability.
 
 ## Office Documents
 
@@ -15,10 +15,12 @@ Xberg supports 101 file formats across 115 file extensions in 8 major categories
 
 | Format             | Extensions               | MIME Type                                                                 | Capabilities                                                    |
 | ------------------ | ------------------------ | ------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| Microsoft Word     | `.docx`                  | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | Full text extraction, tables, embedded images, metadata, styles |
+| Microsoft Word     | `.docx`, `.doc`          | OOXML and legacy Word MIME types                                          | Full text extraction, tables, embedded images, metadata, styles |
 | Word Macro-Enabled | `.docm`                  | `application/vnd.ms-word.document.macroEnabled.12`                        | Macro-enabled document extraction, metadata                     |
 | Word Template      | `.dotx`, `.dotm`, `.dot` | Various Word template MIME types                                          | Template document extraction, metadata                          |
 | OpenDocument Text  | `.odt`                   | `application/vnd.oasis.opendocument.text`                                 | Full text extraction, tables, embedded images, metadata, styles |
+| Apple Pages        | `.pages`                 | `application/x-iwork-pages-sffpages`                                      | Text, tables, images, and metadata                               |
+| WordPerfect        | `.wpd`, `.wp`, `.wp5`, `.wp6` | `application/vnd.wordperfect`                                        | WordPerfect 4.2 through X-series documents                      |
 
 ### Spreadsheets
 
@@ -30,18 +32,21 @@ Xberg supports 101 file formats across 115 file extensions in 8 major categories
 | Excel Legacy             | `.xls`     | `application/vnd.ms-excel`                                             | Legacy sheet data extraction, metadata                   |
 | Excel Add-in             | `.xla`     | `application/vnd.ms-excel.template.macroEnabled.12`                    | Add-in data extraction                                   |
 | Excel Macro Add-in       | `.xlam`    | `application/vnd.ms-excel.addin.macroEnabled.12`                       | Macro add-in metadata                                    |
-| Excel Template (XML)     | `.xltx`    | `application/vnd.openxmlformats-officedocument.spreadsheetml.template` | XML template data and metadata                           |
+| Excel Template (XML)     | `.xltx`, `.xltm` | OOXML spreadsheet template MIME types                              | XML template data and metadata                           |
 | Excel Template (Legacy)  | `.xlt`     | `application/vnd.ms-excel`                                             | Legacy template data extraction                          |
 | OpenDocument Spreadsheet | `.ods`     | `application/vnd.oasis.opendocument.spreadsheet`                       | Sheet data, cell values, formulas, metadata              |
+| Apple Numbers            | `.numbers` | `application/x-iwork-numbers-sffnumbers`                               | Sheet data, formulas, and metadata                       |
 
 ### Presentations
 
 | Format                  | Extensions               | MIME Type                                                                   | Capabilities                                         |
 | ----------------------- | ------------------------ | --------------------------------------------------------------------------- | ---------------------------------------------------- |
-| PowerPoint Presentation | `.pptx`                  | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | Slide text, speaker notes, embedded images, metadata |
+| PowerPoint Presentation | `.pptx`, `.pptm`         | OOXML presentation MIME types                                             | Slide text, speaker notes, embedded images, metadata |
 | PowerPoint Legacy       | `.ppt`                   | `application/vnd.ms-powerpoint`                                             | Legacy slide text extraction, metadata               |
 | PowerPoint Slideshow    | `.ppsx`                  | `application/vnd.openxmlformats-officedocument.presentationml.slideshow`    | Slideshow content, speaker notes, metadata           |
 | PowerPoint Template     | `.potx`, `.potm`, `.pot` | Various PowerPoint template MIME types                                      | Template slide extraction, metadata                  |
+| OpenDocument Presentation | `.odp`                 | `application/vnd.oasis.opendocument.presentation`                           | Slides, notes, images, and metadata                   |
+| Apple Keynote           | `.key`                   | `application/x-iwork-keynote-sffkey`                                        | Slides, notes, images, and metadata                   |
 
 ### PDF
 
@@ -80,6 +85,7 @@ Xberg supports 101 file formats across 115 file extensions in 8 major categories
 | WebP   | `.webp`         | `image/webp` | OCR text extraction, metadata, lossy/lossless detection                      |
 | Bitmap | `.bmp`          | `image/bmp`  | OCR text extraction, dimensions, color depth                                 |
 | TIFF   | `.tiff`, `.tif` | `image/tiff` | OCR text extraction, multi-page support, EXIF metadata, compression info     |
+| HEIC family | `.heic`, `.heics`, `.heif`, `.avif`, `.avcs` | HEIF/AVIF MIME types | Metadata extraction and optional pixel decoding |
 
 ### Advanced Image Formats
 
@@ -127,6 +133,14 @@ Xberg supports 101 file formats across 115 file extensions in 8 major categories
 | reStructuredText | `.rst`             | `text/x-rst`      | RST parsing, directive handling, role extraction  |
 | Org Mode         | `.org`             | `text/org`        | Org mode structure, outline parsing, metadata     |
 | Rich Text Format | `.rtf`             | `application/rtf` | Text with formatting extraction, font information |
+| MDX              | `.mdx`             | `text/mdx`        | Markdown and embedded JSX content                  |
+
+## Audio & Video
+
+| Category | Extensions | Capabilities |
+| -------- | ---------- | ------------ |
+| Audio | `.mp3`, `.mpga`, `.m4a`, `.wav`, `.webm` | Whisper transcription |
+| Video audio track | `.mp4`, `.mpeg`, `.webm` | Audio-track transcription |
 
 ## Email & Archives
 
@@ -136,6 +150,7 @@ Xberg supports 101 file formats across 115 file extensions in 8 major categories
 | ----------------- | ---------- | ---------------------------- | -------------------------------------------------------------------------------------- |
 | Email Message     | `.eml`     | `message/rfc822`             | Headers (from, to, subject, date), body (HTML/plain text), attachments, threading info |
 | Microsoft Outlook | `.msg`     | `application/vnd.ms-outlook` | Outlook headers, body content, attachments, recipient metadata                         |
+| Outlook Data File | `.pst`     | `application/vnd.ms-outlook-pst` | Folder hierarchy, messages, attachments, and metadata                              |
 
 ### Archive Formats
 
@@ -165,10 +180,10 @@ Xberg supports 101 file formats across 115 file extensions in 8 major categories
 | Format           | Extensions       | MIME Type                  | Capabilities                                                |
 | ---------------- | ---------------- | -------------------------- | ----------------------------------------------------------- |
 | LaTeX            | `.tex`, `.latex` | `application/x-latex`      | LaTeX source parsing, commands, document structure          |
-| Typst            | `.typ`           | `application/x-typst`      | Typst markup parsing, document structure                    |
+| Typst            | `.typ`, `.typst` | `application/x-typst`      | Typst markup parsing, document structure                    |
 | JATS XML         | `.jats`          | `application/x-jats+xml`   | PubMed JATS parsing, article structure, metadata            |
 | Jupyter Notebook | `.ipynb`         | `application/x-ipynb+json` | Cell extraction (code + markdown), output parsing, metadata |
-| DocBook          | `.docbook`       | `application/docbook+xml`  | DocBook XML parsing, semantic structure                     |
+| DocBook          | `.docbook`, `.dbk`, `.docbook4`, `.docbook5` | `application/docbook+xml` | DocBook XML parsing, semantic structure |
 
 ### Documentation Formats
 
@@ -183,7 +198,7 @@ Xberg supports 101 file formats across 115 file extensions in 8 major categories
 
 ### Text Extraction
 
-All 101 formats support full or partial text extraction. Document structure and encoding are automatically detected.
+Supported formats expose text, metadata, or both according to the active feature set. OCR and transcription extend text extraction to images, scans, audio, and video.
 
 ### Metadata Support
 

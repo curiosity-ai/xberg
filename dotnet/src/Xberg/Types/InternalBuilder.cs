@@ -166,6 +166,19 @@ public sealed class InternalDocumentBuilder
         if (index < _doc.Elements.Count) _doc.Elements[(int)index].Layer = layer;
     }
 
+    /// <summary>
+    /// Attach a list item's literal source marker text.
+    /// </summary>
+    /// <remarks>
+    /// The one caller is the PDF assembly step, which records the prefix the list-text
+    /// normalization strips off the paragraph text. Other extractors never call it, so the
+    /// attribute is absent there and renderers fall back to a synthesized position.
+    /// </remarks>
+    public void SetListItemSourceLabel(uint index, string label)
+    {
+        if (index < _doc.Elements.Count) _doc.Elements[(int)index].SetListItemSourceLabel(label);
+    }
+
     public void SetAttributes(uint index, Dictionary<string, string> attributes)
     {
         if (index < _doc.Elements.Count) _doc.Elements[(int)index].Attributes = attributes;

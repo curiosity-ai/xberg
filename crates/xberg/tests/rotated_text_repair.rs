@@ -70,9 +70,9 @@ const SCRAMBLED_PHRASE: &str = "LEVEL OIL ENGINE";
 /// What a correct assembly produces. Confirmed independently by poppler and MuPDF.
 const REPAIRED_PHRASE: &str = "ENGINE OIL LEVEL";
 
-/// The same three words as `pdf_oxide` actually emits them on an **upright** run: glued.
+/// The same three words as `xberg_native_pdf` actually emits them on an **upright** run: glued.
 ///
-/// `pdf_oxide` drops inter-word spaces on the upright path — it merges adjacent upright
+/// `xberg_native_pdf` drops inter-word spaces on the upright path — it merges adjacent upright
 /// spans and concatenates their text verbatim, inserting nothing between them. Still
 /// present at 0.3.77 (upstream #847; it affects 44 of the 157 corpus documents). Probed
 /// against this exact fixture: `1 0 0 1` yields a single span `"LEVELOILENGINE"`.
@@ -85,7 +85,7 @@ const REPAIRED_PHRASE: &str = "ENGINE OIL LEVEL";
 /// does not disturb upright text, so the honest reference is what upright extraction
 /// really produces, not an idealised string it has never produced. When upstream #847
 /// lands, this constant goes red — which is the signal we want.
-const UPRIGHT_PHRASE_AS_PDF_OXIDE_EMITS_IT: &str = "ENGINEOILLEVEL";
+const UPRIGHT_PHRASE_AS_ENGINE_EMITS_IT: &str = "ENGINEOILLEVEL";
 
 /// One `Tm` + `Tj` pair: place `word` at (`x`, `y`) under the given text matrix.
 fn show_text(matrix: &str, x: u32, y: u32, word: &str) -> String {
@@ -301,10 +301,10 @@ async fn rotated_90_run_is_assembled_in_reading_order_on_the_default_config() {
     assert_words_in_order(&text, &READING_ORDER_WORDS, "90-degree rotated run");
 }
 
-/// Blocked upstream in `pdf_oxide` (yfedoseev/pdf_oxide#1029), which never reports a
+/// Blocked upstream in `xberg_native_pdf` (yfedoseev/xberg_native_pdf#1029), which never reports a
 /// 180-degree run as rotated.
 ///
-/// `pdf_oxide-0.3.77/src/extractors/text.rs:1931`, `snap_run_rotation`, opens with a
+/// `xberg_native_pdf-0.3.77/src/extractors/text.rs:1931`, `snap_run_rotation`, opens with a
 /// "pure horizontal fast path" that returns `0.0` whenever both off-diagonal terms of the
 /// composed matrix are ~0:
 ///
@@ -331,9 +331,9 @@ async fn rotated_90_run_is_assembled_in_reading_order_on_the_default_config() {
 /// 90 and 270 arrive as three separate spans carrying a real angle, which is why they are
 /// repairable and this is not.
 ///
-/// Kept as a live assertion rather than deleted: when `pdf_oxide` fixes the fast path this
+/// Kept as a live assertion rather than deleted: when `xberg_native_pdf` fixes the fast path this
 /// test starts passing, and `cargo test -- --ignored` is where we will see it.
-#[ignore = "blocked on pdf_oxide: snap_run_rotation's horizontal fast path reports -1 0 0 -1 as \
+#[ignore = "blocked on xberg_native_pdf: snap_run_rotation's horizontal fast path reports -1 0 0 -1 as \
             rotation 0, so the run is merged into one span and the words are unrecoverable"]
 #[tokio::test]
 async fn rotated_180_run_is_assembled_in_reading_order_on_the_default_config() {
@@ -413,7 +413,7 @@ async fn upright_run_beside_a_rotated_run_keeps_its_own_order() {
     );
     // Contiguous, in order, and untouched by the rotated frame beside it. Glued rather
     // than space-separated because that is what the upright path emits (see
-    // `UPRIGHT_PHRASE_AS_PDF_OXIDE_EMITS_IT`); what this pins is that the repair neither
+    // `UPRIGHT_PHRASE_AS_ENGINE_EMITS_IT`); what this pins is that the repair neither
     // reordered it nor dragged any of its words into the rotated run.
     assert!(
         text.contains("ALPHABETAGAMMA"),
@@ -427,7 +427,7 @@ async fn upright_run_beside_a_rotated_run_keeps_its_own_order() {
 /// space the original adjacency supplied (`Engineoil`). Checked separately from ordering
 /// because a fix for one has historically shipped without the other.
 ///
-/// 180 is excluded: `pdf_oxide` hands that run over as one already-concatenated span, so
+/// 180 is excluded: `xberg_native_pdf` hands that run over as one already-concatenated span, so
 /// there are no fragments to join and nothing this crate can separate. See
 /// `rotated_180_run_is_assembled_in_reading_order_on_the_default_config` for the upstream
 /// root cause; when that test comes off `#[ignore]`, add 180 back to this list.
@@ -459,9 +459,9 @@ async fn unrotated_page_text_is_exactly_the_expected_words() {
     let text = normalize_whitespace(&extract_pdf_text(upright_run_pdf(), "upright control").await);
 
     assert_eq!(
-        text, UPRIGHT_PHRASE_AS_PDF_OXIDE_EMITS_IT,
+        text, UPRIGHT_PHRASE_AS_ENGINE_EMITS_IT,
         "an upright page whose words are already in reading order must extract exactly as \
-         it did before the rotation repair — {UPRIGHT_PHRASE_AS_PDF_OXIDE_EMITS_IT:?}, glued \
+         it did before the rotation repair — {UPRIGHT_PHRASE_AS_ENGINE_EMITS_IT:?}, glued \
          by upstream #847 — and nothing else. Any drift here invalidates the ~173 calibrated \
          thresholds in pdf_markdown_regression.rs. Reading {REPAIRED_PHRASE:?} instead is not \
          a failure of this crate: it means upstream fixed the inter-word spacing and this \

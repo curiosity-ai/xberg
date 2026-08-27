@@ -6,9 +6,15 @@ Each format is "done" when the `Xberg.TestRunner` output matches the locally gen
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
-> **Status — read this before trusting any number below.** The goldens are **not committed**,
-> and a fresh container starts without them. They were regenerated on 2026-08-24 against the
-> current Rust tree: 3165 fixtures, one sorted single-process run, `failed=0`.
+> **Status — read this before trusting any number below.** Upstream was merged again on
+> **2026-08-27** (413 commits, up to `c09caac0`), and **the goldens have not been regenerated
+> against it**, so every corpus figure in this file describes the *pre-merge* Rust. See
+> "Upstream sync, 2026-08-27" below for what was ported, what was reviewed and skipped, and what
+> is still open; regenerate and re-measure before trusting anything numeric here.
+>
+> The goldens are **not committed**, and a fresh container starts without them. They were last
+> regenerated on 2026-08-24 against the then-current Rust tree: 3165 fixtures, one sorted
+> single-process run, `failed=0`.
 >
 > **That regeneration moved the target.** Every figure in the rest of this file was measured
 > against goldens generated on **2026-08-12**, and 18 commits have landed under `crates/` since.
@@ -885,6 +891,126 @@ current upstream. Its two remaining spellings are the stale golden traced above,
 `vendored/unstructured/eml/email-replace-mime-encodings-error-5.eml` and
 `vendored/unstructured/msg/fake-email-multiple-attachments.msg` (both traced and closed on every
 hard dimension — see "Every failing fixture, categorized" above).
+
+## Upstream sync, 2026-08-27
+
+Upstream `xberg-io/xberg` was merged at `c09caac0` (413 commits since the last common ancestor,
+`5858543e`). The Rust tree under `crates/` took the merge cleanly and `dotnet/` was untouched by
+it, so everything below is the re-derivation of the port's behaviour against the merged Rust.
+
+**Goldens have not been regenerated against this merge.** The corpus is not materialized in this
+container and `tools/xberg-reference-gen` was not run, so every corpus figure elsewhere in this
+file still describes the pre-merge Rust. The port's own unit tests are green (2011 passing; the 5
+failures are `OxPageExtractor`/`OxCharXOffsets` fixture reads against the absent
+`test_documents`). Regenerating and re-measuring is the first thing the next session should do —
+see "Re-syncing after an upstream merge" in `Claude.md`.
+
+### Ported in this pass
+
+Each entry names the upstream commit subject it comes from.
+
+- [x] **`fix(xml): clamp heading depth before narrowing`.** The port deliberately reproduced
+      upstream's `((depth as u8) + 1).min(6)` wrap past depth 255; upstream now clamps in the wide
+      type first, so the port does too and the test that pinned the wrap pins the ceiling.
+- [x] **`fix(doc): drop field instructions instead of emitting them as text` (GH#1460).** The
+      `.doc` stream's `0x13`/`0x14`/`0x15` markers were all dropped and both halves kept, so every
+      HYPERLINK target and TOC switch leaked into the extract. Fields nest, so termination is
+      scanned first and suppression is depth-counted; an unterminated `0x13` stays inert.
+- [x] **`fix(doc): keep the non-breaking hyphen instead of deleting it`.** `0x1E` → U+2011, to
+      match what the DOCX parser makes of `w:noBreakHyphen`. `0x1F` stays discarded.
+- [x] **`fix(fictionbook): keep a joining space out of an inline annotation span` (#859).**
+- [x] **`fix(html): close the open list item before descending into a sublist` (#719),
+      `… return to the outer list item after a nested list closes` (#721),
+      `… keep list-item annotations and nest sublists under their item` (#727, #728).** All four
+      in the tree-building walker (`Internal/Email/HtmlStructure.cs`) and, minus the tree-only
+      parenting, in the flat EPUB walker.
+- [x] **`fix(html): bound colspan and rowspan before sizing the occupancy grid`.** Clamped in
+      `GridFlatten` — the single choke point — and again at both attribute parsers. Nested
+      `<table>` is flattened into its enclosing cell; heading text is whitespace-normalized.
+- [x] **`fix(render): strip duplicated list markers and guard columnless tables`.**
+- [x] **`rendering/common`: clamp an annotation to the nearest char boundary before slicing**, and
+      drop one that collapses to nothing.
+- [x] **`rendering/plain`: `[Image: …]` for an image the extractor could not resolve.**
+- [x] **`fix(docx): report a Heading1 paragraph as level 1`.** The name-based fallback added one
+      to a digit that was already the level; the `w:outlineLvl` path keeps its `+1`.
+- [x] **`feat(security): add a per-document page limit` (GH#1451) + `… enforce max_pages beyond
+      the PDF path` + `fix(security): model max_pages as Option` (GH#764).** `SecurityLimits`
+      gains `MaxPages` (null = unlimited), enforced for PDF pages, PPTX/ODP slides, Keynote
+      `Slide-*.iwa` entries and multi-frame TIFF.
+- [x] **`fix(pptx,rst): clamp a declared list level and guard a cross-buffer slice`.**
+- [x] **`fix(security): apply the per-member ZIP ratio cap only to members of 1 MiB and above`
+      (GH#1496).**
+- [x] **`fix(epub): stop dropping chapters, metadata and whole books` (#1502/#1486).** Media-type
+      normalization (whole books extracted empty when declared `text/html`), per-item failures as
+      warnings, navigation decided from the package rather than a content heuristic run twice,
+      image-only pages kept, and the Dublin Core metadata rewrite (creators/subjects accumulate,
+      first title wins, `unique-identifier` wins, cover from `properties="cover-image"`).
+- [x] **`fix(pdf): keep a list item's own marker and stop splitting quantities`.** The stripped
+      marker is recorded on the element and written by every renderer; a parenthesized numeric
+      marker followed by a lowercase word is prose.
+- [x] **`fix(pdf): break a paragraph after a numbered section heading` (#1467).**
+- [x] **`fix(pdf): stop a non-finite font size underflowing the cluster count`.**
+- [x] **`fix(pdf): make k-means heading promotion purely ratio-based`.**
+- [x] **`fix(tables): merge multi-word cells before detecting columns` (#688) + `… keep grid and
+      column positions in lockstep through a repair`.**
+
+### Reviewed and deliberately not ported
+
+- **`fix(extraction): surface element attributes in element metadata`** and
+  **`fix(markdown): keep heading level in result.elements`.** Both change
+  `convert_internal_elements_to_elements`, which has no C# counterpart: `ResultFormat.ElementBased`
+  is declared but `ExtractedDocument.Elements` is never populated. They land for free whenever the
+  element-based result format is implemented — implement them with it, not before.
+- **`fix(docx): stop a leading blank-line trim flattening the first list item`.** Upstream's defect
+  is in `Document::to_markdown`, whose output *is* the DOCX `pages[]` field. The port builds
+  `InternalDocument` elements directly and derives pages from element page numbers, and DOCX tags
+  no element with a page number, so the port has no DOCX per-page content and nothing to trim.
+  Revisit if DOCX ever grows prebuilt pages.
+- **`fix(hwp): bound a table grid declared by the file's own header`.** The port's HWP extractor
+  has no table support at all, so there is no grid to bound. Port the bound *with* HWP tables.
+- **`fix(mathml): restore depth budget after failures`.** The port's MathML conversion is not
+  budget-aware — no `SecurityBudget.Enter`/`Leave` on that path — so there is no leaked depth to
+  restore. Port it if the budget is ever threaded through.
+- **`fix(jats): stop a crafted date-type attribute panicking`.** Upstream sliced `date_type[..1]`,
+  which panics mid-codepoint. The port already capitalizes via `char.ToUpperInvariant(s[0]) + s[1..]`,
+  which on a surrogate pair splits between the halves and reassembles them unchanged — no throw and
+  no corruption. Nothing to change.
+- **Everything OCR.** Tesseract/Paddle/candle/VLM, hOCR parsing, the OCR structure heuristics and
+  the OCR-only halves of the PDF and image extractors are out of scope per `Claude.md`.
+- **`feat(pdf): implement the pdfium extraction engine`, `feat(pdf): add the PdfBackend extraction
+  dispatch seam`, `refactor(native-pdf)!: remove the writer and editor stacks`.** A native-library
+  binding and a writer stack; the port is pure-managed and extraction-only.
+
+### Still open from this merge
+
+Reviewed, in scope, not yet done. Roughly in descending corpus impact.
+
+- [ ] **`fix(html): capture inline SVG so it reaches the image pipeline`.** HTML is already the
+      port's largest failing format (71 fixtures), so this wants measuring against fresh goldens
+      before and after.
+- [ ] **`feat(docx): identify table-of-contents entries and resolve their links`.**
+- [ ] **`include_watermarks` on `InternalDocument`.** The markdown renderer strips arXiv watermark
+      noise unconditionally; upstream gates it on a new document-level flag.
+- [ ] **PDF geometry and reading order:** `fix(pdf): preserve numbered column reading order`,
+      `… preserve inline font-size transitions`, `… lift rotated table frames instead of clamping
+      each word` (GH#1358 — this is the `/Rotate 90` disagreement already recorded under "Genuine
+      upstream defects"; upstream has moved, so re-read it before reproducing anything),
+      `… keep column_positions in step with the columns cleanup drops`, `… read /Rotate from the
+      open document`, `… bound the /EmbeddedFiles name-tree walk`, `… stop reattaching ambiguous
+      detached list markers`.
+- [ ] **Container member-read bounds:** `fix(archive): bound ZIP and TAR member reads`,
+      `fix(office): bound HWPX, PPTX and XLSX container member reads`, `fix(odf): validate ODT and
+      ODP containers`, `fix(ooxml): validate the PPTX and XLSX containers, not just entry count`,
+      `fix(ooxml): clamp the declared size of an embedded object before allocating`,
+      `fix(docx): clamp counts a document declares before allocating from them`,
+      `fix(excel): honour max_files_in_archive before calamine opens the workbook`. Each needs the
+      port's own container reader checked against the specific bound upstream added.
+- [ ] **`fix(pdf): stop rejecting benign scanned images as decompression bombs` /
+      `… allow bounded high-ratio image streams`.**
+- [ ] **`fix(epub)` remainder:** HTML named-entity expansion before parsing a chapter, non-UTF-8
+      member decoding, DRM detection via `META-INF/encryption.xml`, and the pre-parse depth scan.
+      The port's XML reader differs enough from roxmltree that each needs its own reading.
+- [ ] **`fix(office): stop a crafted PPTX panicking, and unify container path resolution`.**
 
 ## Known gaps after the merge
 

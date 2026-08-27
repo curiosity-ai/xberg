@@ -30,10 +30,10 @@ use std::borrow::Cow;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
-use crate::extractors::security::SecurityBudget;
-use content::{extract_text_from_xhtml, extract_text_from_xhtml_budgeted, looks_like_navigation_document};
+use crate::extractors::security::{SecurityBudget, ZipBombValidator};
+use content::{extract_text_from_xhtml, extract_text_from_xhtml_budgeted};
 use metadata::{build_additional_metadata, parse_opf};
-use parsing::{parse_container_xml, read_file_from_zip, resolve_path};
+use parsing::{MAX_EPUB_MEMBER_SIZE, parse_container_xml, parse_encrypted_members, read_file_from_zip, resolve_path};
 
 const MARKUP_SWITCH_NAMESPACES: &[&str] = &[content::XHTML_NAMESPACE, content::MATHML_NAMESPACE];
 const PLAIN_SWITCH_NAMESPACES: &[&str] = &[content::XHTML_NAMESPACE];
@@ -235,13 +235,14 @@ impl EpubExtractor {
         );
         let mut pre_rendered_fragments = Vec::new();
         let mut all_converted_successfully = wants_markup;
+        let mut warnings: Vec<ProcessingWarning> = Vec::new();
 
         if let Some(cover_path) = cover_image_path
             && !Self::spine_references_asset(spine_documents, cover_path)
         {
             let mut buf = Vec::new();
-            if let Ok(mut entry) = archive.by_name(cover_path) {
-                let _ = entry.read_to_end(&mut buf);
+            if let Ok(entry) = archive.by_name(cover_path) {
+                let _ = entry.take(MAX_EPUB_MEMBER_SIZE).read_to_end(&mut buf);
             }
             if !buf.is_empty() {
                 let fmt = cover_path
@@ -288,6 +289,15 @@ impl EpubExtractor {
 
         for (index, spine_doc) in spine_documents.iter().enumerate() {
             if budget.step().is_err() {
+                warnings.push(ProcessingWarning {
+                    source: Cow::Borrowed(EPUB_WARNING_SOURCE),
+                    message: Cow::Owned(format!(
+                        "Iteration limit reached; {} of {} spine items were not extracted (first skipped: '{}')",
+                        spine_documents.len() - index,
+                        spine_documents.len(),
+                        spine_doc.file_path
+                    )),
+                });
                 break;
             }
 
@@ -302,6 +312,7 @@ impl EpubExtractor {
 
             if wants_markup {
                 let rendered = Self::render_spine_document(spine_doc, sanitized, index, config);
+                warnings.extend(rendered.warnings);
                 if rendered.content_fully_converted {
                     pre_rendered_fragments.push(rendered.content_fragment);
                 } else {
@@ -309,13 +320,9 @@ impl EpubExtractor {
                 }
             }
 
-            if looks_like_navigation_document(sanitized) {
-                continue;
-            }
-
             let _ = budget.account_text(sanitized.len());
 
-            if extract_text_from_xhtml_budgeted(sanitized, budget).is_empty() {
+            if extract_text_from_xhtml_budgeted(sanitized, budget).is_empty() && !content::has_image_markup(sanitized) {
                 continue;
             }
 
@@ -431,7 +438,12 @@ impl EpubExtractor {
                             let image_data = src.as_ref().and_then(|img_src| {
                                 let resolved = resolve_path(xhtml_dir, img_src).ok()?;
                                 let mut buf = Vec::new();
-                                archive.by_name(&resolved.path).ok()?.read_to_end(&mut buf).ok()?;
+                                archive
+                                    .by_name(&resolved.path)
+                                    .ok()?
+                                    .take(MAX_EPUB_MEMBER_SIZE)
+                                    .read_to_end(&mut buf)
+                                    .ok()?;
                                 if buf.is_empty() {
                                     return None;
                                 }
@@ -532,9 +544,14 @@ impl EpubExtractor {
         }
 
         let mut doc = builder.build();
+        doc.processing_warnings.extend(warnings);
 
         if all_converted_successfully && !pre_rendered_fragments.is_empty() {
             let mut combined = pre_rendered_fragments.join("\n\n");
+            // html-to-markdown-rs serialises each <math> element into a comment
+            // next to its rendered text; the HTML extractor strips the same
+            // comment once the equation is recovered as LaTeX.
+            combined = super::html::MATHML_COMMENT_RE.replace_all(&combined, "").into_owned();
 
             combined = combined
                 .lines()
@@ -567,7 +584,19 @@ impl EpubExtractor {
     }
 }
 
+/// `ProcessingWarning::source` for every warning this module emits.
+#[cfg(feature = "office")]
+const EPUB_WARNING_SOURCE: &str = "epub";
+
 /// Extract URIs from document structure annotations (link annotations).
+///
+/// `ann.start`/`ann.end` are byte offsets recorded by
+/// `extraction::html::structure` against the *raw* text buffer (see
+/// `structure.rs:749`), but `text` here has already gone through
+/// `normalize_whitespace` (`structure.rs:824`), which collapses whitespace runs
+/// and trims. That shifts every recorded offset left of where it was taken, so a
+/// mid-codepoint landing on a non-ASCII document is routine, not exotic -- the
+/// length guard below does not imply the offsets are trustworthy.
 #[cfg(feature = "office")]
 fn collect_annotation_uris(
     annotations: &[crate::types::document_structure::TextAnnotation],
@@ -580,12 +609,30 @@ fn collect_annotation_uris(
         if let AnnotationKind::Link { url, .. } = &ann.kind
             && !url.is_empty()
         {
-            let label = if ann.start < ann.end && (ann.end as usize) <= text.len() {
-                let slice = &text[ann.start as usize..ann.end as usize];
-                if slice.is_empty() {
-                    None
+            let start = ann.start as usize;
+            let end = ann.end as usize;
+            let label = if ann.start < ann.end && end <= text.len() {
+                if text.is_char_boundary(start) && text.is_char_boundary(end) {
+                    let slice = &text[start..end];
+                    if slice.is_empty() {
+                        None
+                    } else {
+                        Some(slice.to_string())
+                    }
                 } else {
-                    Some(slice.to_string())
+                    // A non-ASCII chapter can have an annotation span whose byte
+                    // offsets land mid-codepoint (see the offset-drift note above);
+                    // slicing on that would panic. Degrade gracefully instead: drop
+                    // the label but keep the URI.
+                    builder.add_warning(crate::core::diagnostics::warning(
+                        EPUB_WARNING_SOURCE,
+                        format!(
+                            "A link annotation ({start}..{end}) did not align with a character \
+                             boundary in the source text; its label text was dropped, though the \
+                             link URL was preserved"
+                        ),
+                    ));
+                    None
                 }
             } else {
                 None
@@ -681,6 +728,11 @@ impl InternalDocumentExtractor for EpubExtractor {
             source: None,
         })?;
 
+        let security_limits = config.security_limits.clone().unwrap_or_default();
+        ZipBombValidator::new(security_limits.clone())
+            .validate(&mut archive)
+            .map_err(|e| crate::XbergError::validation(e.to_string()))?;
+
         let container_xml = read_file_from_zip(&mut archive, "META-INF/container.xml")?;
         let opf_path = parse_container_xml(&container_xml)?;
 
@@ -702,7 +754,21 @@ impl InternalDocumentExtractor for EpubExtractor {
             cover_image: package.metadata.cover_image_href.clone(),
         });
 
-        let (spine_documents, mut body_warnings) = content::read_body_documents(&mut archive, &package)?;
+        let mut encrypted_members = std::collections::BTreeSet::new();
+        if archive.index_for_name("META-INF/encryption.xml").is_some() {
+            match read_file_from_zip(&mut archive, "META-INF/encryption.xml") {
+                Ok(xml) => encrypted_members = parse_encrypted_members(&xml),
+                Err(error) => processing_warnings.push(ProcessingWarning {
+                    source: Cow::Borrowed(EPUB_WARNING_SOURCE),
+                    message: Cow::Owned(format!(
+                        "META-INF/encryption.xml could not be read ({}); encrypted members are not detected",
+                        error
+                    )),
+                }),
+            }
+        }
+        let (spine_documents, mut body_warnings) =
+            content::read_body_documents(&mut archive, &package, &encrypted_members, &security_limits)?;
         processing_warnings.append(&mut body_warnings);
 
         let metadata_map: AHashMap<Cow<'static, str>, serde_json::Value> = additional_metadata
@@ -718,9 +784,12 @@ impl InternalDocumentExtractor for EpubExtractor {
         doc.processing_warnings.extend(processing_warnings);
 
         let output_format = doc.metadata.output_format.take();
+        let creators = package.metadata.creators;
+        let subjects = package.metadata.subjects;
         doc.metadata = Metadata {
             title: package.metadata.title,
-            authors: package.metadata.creator.map(|c| vec![c]),
+            authors: (!creators.is_empty()).then_some(creators),
+            keywords: (!subjects.is_empty()).then_some(subjects),
             language: package.metadata.language,
             created_at: package.metadata.date,
             format: Some(epub_format_metadata),

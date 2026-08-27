@@ -116,11 +116,30 @@ pub(crate) fn extract_zip_text_content(bytes: &[u8], limits: &SecurityLimits) ->
         let path = file.name().to_string();
 
         if !file.is_dir() && TEXT_EXTENSIONS.iter().any(|ext| path.to_lowercase().ends_with(ext)) {
-            let estimated_size = (file.size() as usize).min(10 * 1024 * 1024);
-            let mut raw = Vec::with_capacity(estimated_size);
-            if let Err(e) = file.read_to_end(&mut raw) {
+            // `zip` 2.4.2 builds the entry's `Read` impl as `Crc32Reader::new(Decompressor::new(..))`
+            // with no `Take` on the decompressed side (only the *compressed* side is bounded) --
+            // the declared `size()` header field is not enforced by the reader at all, so a member
+            // can expand arbitrarily regardless of what it claims. Bound the read ourselves at
+            // `max_content_size`: that is the aggregate budget this member's decoded text is about
+            // to be checked against a few lines down, so no single member can legitimately need
+            // more than the whole document's text budget. `+1` lets us tell "exactly at the limit"
+            // apart from "over the limit" instead of silently truncating a hostile member's content.
+            let cap = limits.max_content_size as u64;
+            let mut raw = Vec::new();
+            let mut limited = (&mut file).take(cap.saturating_add(1));
+            if let Err(e) = limited.read_to_end(&mut raw) {
                 tracing::warn!(member = %path, error = %e, "skipping ZIP member: read failed");
                 continue;
+            }
+            if raw.len() as u64 > cap {
+                // Reject rather than silently truncate or skip: the pre-existing code already
+                // surfaced a hard error once the *decoded* total crossed `max_content_size`
+                // (below), so capping the read must not become a quieter failure mode than the
+                // one it replaces.
+                return Err(XbergError::validation(format!(
+                    "ZIP archive member '{}' exceeds max_content_size while decompressing (limit: {} bytes)",
+                    path, limits.max_content_size
+                )));
             }
             let content = super::decode_archive_text(&raw, &path);
             total_content_size = total_content_size.saturating_add(content.len());
@@ -176,9 +195,25 @@ pub(crate) fn extract_zip_file_bytes(bytes: &[u8], limits: &SecurityLimits) -> R
         }
 
         let path = file.name().to_string();
-        let estimated_size = (file.size() as usize).min(limits.max_archive_size);
-        let mut content = Vec::with_capacity(estimated_size);
-        if file.read_to_end(&mut content).is_ok() {
+        // See the comment in `extract_zip_text_content`: the underlying `zip` reader has no
+        // `Take` on the decompressed side, so `size()` (the declared header value) bounds
+        // nothing about this read. Cap it ourselves at `max_archive_size` -- the same budget
+        // `total_size` is checked against below, so no single member can legitimately need
+        // more than the whole archive's budget. The `+1` distinguishes "exactly at the limit"
+        // from "over" instead of silently truncating a hostile member's bytes.
+        let cap = limits.max_archive_size as u64;
+        let mut content = Vec::new();
+        let mut limited = (&mut file).take(cap.saturating_add(1));
+        if limited.read_to_end(&mut content).is_ok() {
+            if content.len() as u64 > cap {
+                // Reject rather than silently truncate: the pre-existing code already surfaced
+                // a hard error once the running `total_size` crossed `max_archive_size` (below),
+                // so capping the read must not become a quieter failure mode than that.
+                return Err(XbergError::validation(format!(
+                    "ZIP archive member '{}' exceeds max_archive_size while decompressing (limit: {} bytes)",
+                    path, limits.max_archive_size
+                )));
+            }
             total_size = total_size.saturating_add(content.len());
             if total_size > limits.max_archive_size {
                 return Err(XbergError::validation(format!(

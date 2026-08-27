@@ -9,15 +9,15 @@ import (
 )
 
 func main() {
-	maxChars := 500
-	maxOverlap := 50
+	maxChars := uint(500)
+	overlap := uint(50)
 	normalize := true
-	batchSize := int32(16)
+	batchSize := uint(16)
 
 	cfg := xberg.ExtractionConfig{
 		Chunking: &xberg.ChunkingConfig{
-			MaxChars:   &maxChars,
-			MaxOverlap: &maxOverlap,
+			MaxCharacters: &maxChars,
+			Overlap:       &overlap,
 			Embedding: &xberg.EmbeddingConfig{
 				Model:     xberg.EmbeddingModelTypePreset{Name: "quality"},
 				Normalize: &normalize,

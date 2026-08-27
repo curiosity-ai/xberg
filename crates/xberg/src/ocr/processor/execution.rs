@@ -13,7 +13,7 @@ use crate::image::normalize_image_dpi_owned;
 use crate::ocr::cache::OcrCache;
 use crate::ocr::conversion::{TsvRow, iterator_word_to_element, tsv_row_to_element};
 use crate::ocr::error::OcrError;
-use crate::ocr::hocr_parser::{HOCR_FONT_SIZE_ATTRIBUTE, parse_hocr_to_internal_document};
+use crate::ocr::hocr_parser::{DictionaryLineFilter, parse_hocr_to_internal_document_with_page_offset};
 #[cfg(feature = "pdf")]
 use crate::ocr::table::post_process_table;
 use crate::ocr::table::{extract_words_from_tsv, reconstruct_table, table_to_markdown};
@@ -43,6 +43,7 @@ fn doc_orientation_detector() -> &'static crate::doc_orientation::DocOrientation
     &DETECTOR
 }
 
+use crate::table_core::{MIN_TABLE_CANDIDATE_WORDS, cluster_words_into_table_regions};
 use crate::types::OcrElement;
 
 #[cfg(auto_rotate)]
@@ -115,11 +116,15 @@ fn rotate_rgb_image_data(data: &[u8], width: u32, height: u32, degrees: i32) -> 
 ///
 /// * `tsv_data` - Raw TSV output from Tesseract
 /// * `min_confidence` - Minimum confidence threshold (0-100 scale)
+/// * `page_number` - The true, 1-indexed page number of the source document this TSV came
+///   from. Tesseract's own `page_num` TSV column is always `1` for a single-image call (see
+///   `TesseractConfig::page_number`'s doc comment), so it is used only to build each
+///   element's opaque `parent_id`, never as the returned elements' page number.
 ///
 /// # Returns
 ///
 /// Vector of OcrElements for word-level and line-level entries
-fn parse_tsv_to_elements(tsv_data: &str, min_confidence: f64) -> Vec<OcrElement> {
+fn parse_tsv_to_elements(tsv_data: &str, min_confidence: f64, page_number: u32) -> Vec<OcrElement> {
     let mut elements = Vec::new();
 
     for line in tsv_data.lines().skip(1) {
@@ -164,7 +169,9 @@ fn parse_tsv_to_elements(tsv_data: &str, min_confidence: f64) -> Vec<OcrElement>
             text,
         };
 
-        elements.push(tsv_row_to_element(&tsv_row));
+        let mut element = tsv_row_to_element(&tsv_row);
+        element.page_number = page_number;
+        elements.push(element);
     }
 
     elements
@@ -187,70 +194,6 @@ where
         .unwrap_or(0.0);
 
     tracing::debug!(stage, timestamp = format!("{timestamp:.3}"), "{}", details());
-}
-
-/// Multiple of the page's average word height used as the vertical-gap
-/// threshold for splitting table candidate words into separate regions
-/// (#177). Normal row spacing inside one table rarely exceeds ~1.5x the
-/// average word height, so a wider multiple avoids splitting a single
-/// table's own row gaps while still separating genuinely distinct tables
-/// (or a table from surrounding prose) on the same page.
-const TABLE_REGION_GAP_HEIGHT_MULTIPLIER: u32 = 3;
-
-/// Minimum number of words for a spatial region to be treated as a table
-/// candidate. Mirrors the previous whole-page threshold so a single small
-/// table on an otherwise text-only page is not over-fabricated.
-const MIN_TABLE_CANDIDATE_WORDS: usize = 6;
-
-/// Split table-candidate words into vertically separated regions.
-///
-/// Tesseract's TSV output has no notion of "this is a separate table from
-/// that one" — [`reconstruct_table`] previously ran once over every
-/// table-confidence word on the page, producing at most one table whose
-/// bounding box spanned the union of all such words, even when the page had
-/// several independent tables separated by paragraphs of prose (#177).
-///
-/// This groups words by contiguous vertical extent: a gap between one row's
-/// bottom edge and the next word's top edge wider than
-/// `TABLE_REGION_GAP_HEIGHT_MULTIPLIER` times the average word height starts
-/// a new region. Each region is reconstructed independently, giving each
-/// table its own bounding box.
-fn cluster_words_into_table_regions(words: &[crate::table_core::HocrWord]) -> Vec<Vec<crate::table_core::HocrWord>> {
-    if words.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted: Vec<&crate::table_core::HocrWord> = words.iter().collect();
-    sorted.sort_by(|a, b| a.top.cmp(&b.top).then(a.left.cmp(&b.left)));
-
-    let avg_height: u32 = {
-        let total: u32 = sorted.iter().map(|w| w.height).sum();
-        (total / sorted.len() as u32).max(1)
-    };
-    let region_gap_threshold = avg_height * TABLE_REGION_GAP_HEIGHT_MULTIPLIER;
-
-    let mut regions: Vec<Vec<crate::table_core::HocrWord>> = Vec::new();
-    let mut current_region: Vec<crate::table_core::HocrWord> = Vec::new();
-    let mut current_bottom: u32 = 0;
-
-    for word in sorted {
-        let word_bottom = word.top + word.height;
-        let is_new_region =
-            !current_region.is_empty() && word.top.saturating_sub(current_bottom) > region_gap_threshold;
-
-        if is_new_region {
-            regions.push(std::mem::take(&mut current_region));
-            current_bottom = 0;
-        }
-
-        current_bottom = current_bottom.max(word_bottom);
-        current_region.push(word.clone());
-    }
-    if !current_region.is_empty() {
-        regions.push(current_region);
-    }
-
-    regions
 }
 
 /// Build content with OCR tables inlined at their correct vertical positions.
@@ -407,63 +350,30 @@ fn build_content_with_inline_tables(tsv_data: &str, tables: &[OcrTable], min_con
     output
 }
 
-/// Minimum ratio of a paragraph's average hOCR font size (`x_fsize`) to the
-/// page's median paragraph font size before the paragraph is promoted to a
-/// markdown heading (#185). Chosen so ordinary size variation between body
-/// paragraphs doesn't trigger false positives, while genuinely larger
-/// heading text (typically >=1.3x body size) does.
-const HEADING_FONT_SIZE_RATIO: f64 = 1.3;
-
-/// Maximum word count for a large-font paragraph to still be treated as a
-/// heading. Headings are short by convention; a large-font paragraph with
-/// many words is more likely emphasized body text or a pull-quote.
-const HEADING_MAX_WORD_COUNT: usize = 12;
-
-/// Read the paragraph-average hOCR font size stored by `hocr_parser` (#185).
-fn element_font_size(element: &crate::types::internal::InternalElement) -> Option<f64> {
-    element
-        .attributes
-        .as_ref()?
-        .get(HOCR_FONT_SIZE_ATTRIBUTE)?
-        .parse::<f64>()
-        .ok()
-}
-
-/// Render hOCR-derived paragraphs to markdown, promoting large-font, short,
-/// single-line paragraphs to `##` headings using the average `x_fsize`
-/// captured per paragraph by `hocr_parser::parse_hocr_to_internal_document`
-/// (#185). Paragraphs without a captured font size, or on a page where no
-/// paragraph reports one, render unchanged — matching the previous flat
-/// paragraph-join behavior.
-fn render_hocr_elements_as_markdown(elements: &[crate::types::internal::InternalElement]) -> String {
-    let mut font_sizes: Vec<f64> = elements.iter().filter_map(element_font_size).collect();
-    let median_font_size = if font_sizes.is_empty() {
-        None
-    } else {
-        font_sizes.sort_by(f64::total_cmp);
-        Some(font_sizes[font_sizes.len() / 2])
-    };
-
+/// Flatten hOCR-derived paragraph elements to unformatted text, joined by
+/// blank lines (#185).
+///
+/// This used to also promote large-font, short, single-line paragraphs to
+/// `## ` markdown headings using the average `x_fsize` captured per
+/// paragraph by `hocr_parser::parse_hocr_to_internal_document`. That baked
+/// markdown syntax directly into `OcrExtractionResult::content`, which is
+/// consumed unrendered by callers that expect `Plain` output (e.g. the
+/// `flat_ocr_page_document` fallback in `extractors/pdf/ocr.rs`), leaking
+/// `## ` into supposedly-plain text. It also duplicated the document-global
+/// structure pipeline, which classifies headings from the same `x_fsize`
+/// attribute across the whole document and is strictly better informed than
+/// a single page's local heuristic. That pipeline (driven by
+/// `hocr_document`/`internal_document`, not this string) is now the sole
+/// owner of heading detection for routes that have it; this function only
+/// flattens text. The standalone-image path, which has no structure
+/// pipeline behind it, keeps its own font-size-based heading promotion in
+/// `extractors/image.rs`, expressed as real `Heading` elements rather than
+/// pre-escaped markdown text.
+fn flatten_hocr_elements_to_text(elements: &[crate::types::internal::InternalElement]) -> String {
     elements
         .iter()
-        .filter_map(|e| match e.kind {
-            ElementKind::PageBreak => None,
-            _ if !e.text.is_empty() => {
-                let is_heading = median_font_size.is_some_and(|median| {
-                    element_font_size(e).is_some_and(|size| {
-                        size >= median * HEADING_FONT_SIZE_RATIO
-                            && !e.text.contains('\n')
-                            && e.text.split_whitespace().count() <= HEADING_MAX_WORD_COUNT
-                    })
-                });
-                Some(if is_heading {
-                    format!("## {}", e.text)
-                } else {
-                    e.text.clone()
-                })
-            }
-            _ => None,
-        })
+        .filter(|e| !matches!(e.kind, ElementKind::PageBreak) && !e.text.is_empty())
+        .map(|e| e.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -509,7 +419,11 @@ const MIN_LIGHT_PIXEL_FRACTION_FOR_INVERT: f64 = 0.01;
 /// representative.
 const POLARITY_SAMPLE_STRIDE: i32 = 4;
 
-/// Source resolution used when OCR receives the original image unchanged.
+/// Source resolution assumed when OCR receives the original image unchanged and the caller did
+/// not tell us what resolution it really is.
+///
+/// Only a fallback. `TesseractConfig::source_dpi`, when the caller knows the true value, takes
+/// precedence — see [`prepare_ocr_image`].
 const RAW_IMAGE_SOURCE_DPI: i32 = 72;
 /// Source resolution retained when explicit DPI normalization fails.
 const PREPROCESSING_FALLBACK_SOURCE_DPI: i32 = 300;
@@ -532,8 +446,16 @@ struct PreparedOcrImage {
     height: u32,
     source_dpi: i32,
     apply_pix_preprocessing: bool,
+    image_preprocessing: Option<crate::types::ImagePreprocessingMetadata>,
 }
 
+/// Prepare the raster Tesseract will recognize, and report the resolution it should be told.
+///
+/// `known_source_dpi` is the true resolution of `rgb_data` when the caller knows it (the PDF OCR
+/// route derives it from the render), and `None` when it genuinely does not (raw images handed in
+/// by a user). Both branches below honour it: the unpreprocessed branch reports it verbatim
+/// instead of the [`RAW_IMAGE_SOURCE_DPI`] assumption, and the preprocessed branch feeds it to
+/// DPI normalization so the resize scales from the real resolution.
 fn prepare_ocr_image(
     rgb_data: Vec<u8>,
     width: u32,
@@ -541,6 +463,7 @@ fn prepare_ocr_image(
     preprocessing: Option<&crate::types::ImagePreprocessingConfig>,
     images_config: Option<&crate::core::config::ImageExtractionConfig>,
     ci_debug_enabled: bool,
+    known_source_dpi: Option<f64>,
 ) -> PreparedOcrImage {
     let Some(preprocessing) = preprocessing else {
         if should_apply_default_preprocessing(&rgb_data) {
@@ -551,18 +474,30 @@ fn prepare_ocr_image(
                 &crate::types::ImagePreprocessingConfig::default(),
                 images_config,
                 ci_debug_enabled,
+                known_source_dpi,
             );
         }
         return PreparedOcrImage {
             data: rgb_data,
             width,
             height,
-            source_dpi: RAW_IMAGE_SOURCE_DPI,
+            // The image is passed through untouched, so its resolution is whatever the caller
+            // says it is; 72 remains the assumption only when nobody knows.
+            source_dpi: known_source_dpi.map_or(RAW_IMAGE_SOURCE_DPI, |dpi| dpi.round() as i32),
             apply_pix_preprocessing: false,
+            image_preprocessing: None,
         };
     };
 
-    prepare_preprocessed_ocr_image(rgb_data, width, height, preprocessing, images_config, ci_debug_enabled)
+    prepare_preprocessed_ocr_image(
+        rgb_data,
+        width,
+        height,
+        preprocessing,
+        images_config,
+        ci_debug_enabled,
+        known_source_dpi,
+    )
 }
 
 /// Classify bright, page-like RGB images that benefit from the default OCR preprocessing path.
@@ -597,6 +532,7 @@ fn prepare_preprocessed_ocr_image(
     preprocessing: &crate::types::ImagePreprocessingConfig,
     images_config: Option<&crate::core::config::ImageExtractionConfig>,
     ci_debug_enabled: bool,
+    known_source_dpi: Option<f64>,
 ) -> PreparedOcrImage {
     // `target_dpi` always comes from the (Tesseract-specific) `preprocessing` config, which
     // takes precedence when explicitly set. The dimension/auto-adjust limits have no home in
@@ -612,7 +548,12 @@ fn prepare_preprocessed_ocr_image(
             ..Default::default()
         },
     };
-    match normalize_image_dpi_owned(rgb_data, width as usize, height as usize, &dpi_config, None) {
+    // `known_source_dpi` is the whole point of this parameter: passing `None` here makes
+    // `normalize_image_dpi_owned` assume 72 DPI, which on a page rendered at 150 inflates the
+    // scale factor to `target_dpi / 72` and drives a Letter page into the `max_image_dimension`
+    // clamp — 6x the pixels of the correct resize, carrying no more information, and reported to
+    // Tesseract as roughly half the raster's real `scan_res`.
+    match normalize_image_dpi_owned(rgb_data, width as usize, height as usize, &dpi_config, known_source_dpi) {
         Ok(result) => {
             let normalized_width = result.dimensions.0 as u32;
             let normalized_height = result.dimensions.1 as u32;
@@ -635,6 +576,7 @@ fn prepare_preprocessed_ocr_image(
                 height: normalized_height,
                 source_dpi,
                 apply_pix_preprocessing: true,
+                image_preprocessing: Some(result.metadata),
             }
         }
         Err((error, data)) => {
@@ -643,8 +585,11 @@ fn prepare_preprocessed_ocr_image(
                 data,
                 width,
                 height,
-                source_dpi: PREPROCESSING_FALLBACK_SOURCE_DPI,
+                // The image comes back unresized here, so its resolution is still the source
+                // one. The 300 fallback is a guess for when there is nothing better.
+                source_dpi: known_source_dpi.map_or(PREPROCESSING_FALLBACK_SOURCE_DPI, |dpi| dpi.round() as i32),
                 apply_pix_preprocessing: true,
+                image_preprocessing: None,
             }
         }
     }
@@ -720,6 +665,78 @@ struct IteratorExtractionResult {
     /// embedded image region, or a ruling line) that are now retained in
     /// `elements` instead of being silently dropped (#180).
     non_text_block_word_count: usize,
+    /// Fraction of this page's dictionary-checkable words that Tesseract's own DAWG
+    /// dictionary (`TesseractAPI::is_valid_word`) rejects as not-a-word. See
+    /// [`dictionary_invalid_word_ratio`] for what counts as checkable and why `None`
+    /// (rather than `0.0`) means "too few checkable words to be meaningful".
+    dict_invalid_word_ratio: Option<f64>,
+}
+
+/// Minimum letters a word must have before Tesseract's dictionary lookup is meaningful.
+/// Digits, single letters, and punctuation are never in the DAWG dictionary regardless of
+/// legitimacy, so scoring them would bias the ratio toward "invalid" on output OCR read
+/// perfectly correctly.
+const MIN_WORD_LEN_FOR_DICT_CHECK: usize = 3;
+
+/// Minimum number of dictionary-checkable words on a page before
+/// [`dictionary_invalid_word_ratio`] reports a ratio at all, mirroring the same
+/// conservatism as `OcrQualityThresholds::min_words_for_ocr_output_check`: a short page
+/// (a signature block, an exhibit title) does not carry enough checkable words for the
+/// ratio to mean anything.
+const MIN_DICT_CANDIDATES_FOR_RATIO: usize = 5;
+
+/// Fraction of a page's alphabetic, dictionary-checkable words that Tesseract's own
+/// dictionary rejects as not-a-word.
+///
+/// This is the dictionary-validity supplement to the recognition-noise gate
+/// (`is_ocr_recognition_noise` in `extractors::pdf::ocr`): a page of scanned line art
+/// noise ("LAAALDLI", "AEA") is read by Tesseract with confident-looking output, so
+/// per-word OCR confidence and the fragmented-word-ratio heuristic do not always catch
+/// it — but few of its "words" are real dictionary words. `TesseractAPI::is_valid_word`
+/// is Tesseract's own DAWG dictionary lookup, and is only usable while the `TesseractAPI`
+/// handle that performed this page's OCR is still open (the dictionary lives inside that
+/// engine instance) — callers must call this before the API is dropped.
+///
+/// Returns `None`, never `0.0`, when there are too few dictionary-checkable words to make
+/// a ratio meaningful: a `0.0` here would read as "every word is valid" to a caller that
+/// cannot tell "no evidence" from "good evidence", and this signal is a veto input, so
+/// that conflation would suppress real content.
+fn dictionary_invalid_word_ratio(api: &TesseractAPI, words: &[xberg_tesseract::WordData]) -> Option<f64> {
+    invalid_word_ratio_from(words, |text| match api.is_valid_word(text) {
+        Ok(0) => Some(false),
+        Ok(_) => Some(true),
+        // Lookup failed (e.g. interior NUL byte); don't let it bias the ratio either way.
+        Err(_) => None,
+    })
+}
+
+/// Pure core of [`dictionary_invalid_word_ratio`], taking dictionary lookup as an injected
+/// function (`Some(true)` valid, `Some(false)` invalid, `None` lookup failed / skip) so it
+/// is unit-testable without a live `TesseractAPI` handle.
+fn invalid_word_ratio_from(
+    words: &[xberg_tesseract::WordData],
+    is_valid: impl Fn(&str) -> Option<bool>,
+) -> Option<f64> {
+    let mut candidates = 0usize;
+    let mut invalid = 0usize;
+    for word in words {
+        let text = word.text.trim();
+        if text.chars().count() < MIN_WORD_LEN_FOR_DICT_CHECK || !text.chars().all(|c| c.is_alphabetic()) {
+            continue;
+        }
+        match is_valid(text) {
+            Some(true) => candidates += 1,
+            Some(false) => {
+                candidates += 1;
+                invalid += 1;
+            }
+            None => {}
+        }
+    }
+    if candidates < MIN_DICT_CANDIDATES_FOR_RATIO {
+        return None;
+    }
+    Some(invalid as f64 / candidates as f64)
 }
 
 /// Block types that historically caused a word to be dropped entirely from
@@ -788,6 +805,7 @@ fn extract_elements_via_iterator(
         elements: Vec::new(),
         skipped_words: 0,
         non_text_block_word_count: 0,
+        dict_invalid_word_ratio: None,
     };
 
     let page_iter = match api.get_page_iterator() {
@@ -851,6 +869,8 @@ fn extract_elements_via_iterator(
         );
     }
 
+    let dict_invalid_word_ratio = dictionary_invalid_word_ratio(api, &word_extraction.words);
+
     let mut elements = Vec::new();
     let mut non_text_block_word_count = 0usize;
 
@@ -890,6 +910,7 @@ fn extract_elements_via_iterator(
         elements,
         skipped_words: word_extraction.skipped,
         non_text_block_word_count,
+        dict_invalid_word_ratio,
     })
 }
 
@@ -948,11 +969,13 @@ pub(super) fn perform_ocr(
         config.preprocessing.as_ref(),
         images_config,
         ci_debug_enabled,
+        config.source_dpi,
     );
     let image_data = prepared_image.data;
     let width = prepared_image.width;
     let height = prepared_image.height;
     let source_dpi = prepared_image.source_dpi;
+    let image_preprocessing = prepared_image.image_preprocessing;
     #[cfg_attr(not(auto_rotate), allow(unused_mut))]
     let mut ocr_image_width = width;
     #[cfg_attr(not(auto_rotate), allow(unused_mut))]
@@ -1245,8 +1268,23 @@ pub(super) fn perform_ocr(
                 .get_hocr_text(0)
                 .map_err(|e| OcrError::ProcessingFailed(format!("Failed to extract hOCR: {}", e)))?;
 
-            let internal_doc = parse_hocr_to_internal_document(&hocr);
-            let content = render_hocr_elements_as_markdown(&internal_doc.elements);
+            // Per-line dictionary-invalid noise filter (#783). Built here, immediately
+            // before parsing, using `hocr_parser::DEFAULT_DICT_INVALID_LINE_RATIO` -- see
+            // that constant's doc comment for why this is not yet a configurable
+            // `OcrQualityThresholds` field.
+            let is_valid_word = |text: &str| match api.is_valid_word(text) {
+                Ok(0) => Some(false),
+                Ok(_) => Some(true),
+                Err(_) => None,
+            };
+            let dictionary_filter = DictionaryLineFilter {
+                is_valid_word: &is_valid_word,
+                max_invalid_ratio: crate::ocr::hocr_parser::DEFAULT_DICT_INVALID_LINE_RATIO,
+            };
+
+            let internal_doc =
+                parse_hocr_to_internal_document_with_page_offset(&hocr, Some(&dictionary_filter), config.page_number);
+            let content = flatten_hocr_elements_to_text(&internal_doc.elements);
             hocr_document = Some(internal_doc);
 
             let mime_type = extraction_config
@@ -1280,6 +1318,15 @@ pub(super) fn perform_ocr(
     };
 
     let mut metadata = HashMap::new();
+    if let Some(image_preprocessing) = image_preprocessing {
+        let value = serde_json::to_value(image_preprocessing).map_err(|error| {
+            OcrError::ProcessingFailed(format!("Failed to serialize image preprocessing metadata: {error}"))
+        })?;
+        metadata.insert(
+            crate::ocr_metadata_keys::OCR_IMAGE_PREPROCESSING_METADATA_KEY.to_string(),
+            value,
+        );
+    }
     metadata.insert(
         crate::ocr_metadata_keys::OCR_PROCESSED_IMAGE_WIDTH_METADATA_KEY.to_string(),
         serde_json::Value::Number(ocr_image_width.into()),
@@ -1364,16 +1411,52 @@ pub(super) fn perform_ocr(
         let words = extract_words_from_tsv(tsv_data, config.table_min_confidence)?;
         let regions = cluster_words_into_table_regions(&words);
 
-        for region_words in regions {
+        for (region_index, region_words) in regions.into_iter().enumerate() {
             if region_words.len() < MIN_TABLE_CANDIDATE_WORDS {
+                tracing::debug!(
+                    target: "xberg::ocr::tables",
+                    region_index,
+                    word_count = region_words.len(),
+                    min_required = MIN_TABLE_CANDIDATE_WORDS,
+                    "OCR table region skipped: below MIN_TABLE_CANDIDATE_WORDS"
+                );
                 continue;
             }
+
+            let region_left = region_words.iter().map(|w| w.left).min().unwrap_or(0);
+            let region_top = region_words.iter().map(|w| w.top).min().unwrap_or(0);
+            let region_right = region_words.iter().map(|w| w.left + w.width).max().unwrap_or(0);
+            let region_bottom = region_words.iter().map(|w| w.top + w.height).max().unwrap_or(0);
+            let word_preview: String = region_words
+                .iter()
+                .take(12)
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(200)
+                .collect();
 
             let table = reconstruct_table(
                 &region_words,
                 config.table_column_threshold,
                 config.table_row_threshold_ratio,
             );
+
+            tracing::debug!(
+                target: "xberg::ocr::tables",
+                region_index,
+                word_count = region_words.len(),
+                left = region_left,
+                top = region_top,
+                right = region_right,
+                bottom = region_bottom,
+                word_preview = %word_preview,
+                raw_rows = table.len(),
+                raw_cols = table.first().map_or(0, Vec::len),
+                "OCR table region reconstructed"
+            );
+
             if table.is_empty() || table[0].is_empty() {
                 continue;
             }
@@ -1396,7 +1479,7 @@ pub(super) fn perform_ocr(
             tables.push(OcrTable {
                 cells: cleaned,
                 markdown: markdown_table,
-                page_number: 1,
+                page_number: config.page_number,
                 bounding_box: Some(OcrTableBoundingBox {
                     left,
                     top,
@@ -1428,7 +1511,7 @@ pub(super) fn perform_ocr(
         }
     }
 
-    let iterator_extraction = extract_elements_via_iterator(&api, 1, config.min_confidence);
+    let iterator_extraction = extract_elements_via_iterator(&api, config.page_number, config.min_confidence);
     match iterator_extraction {
         Ok(extraction) if !extraction.elements.is_empty() => {
             insert_word_iterator_skipped_count_metadata(&mut metadata, extraction.skipped_words);
@@ -1438,11 +1521,19 @@ pub(super) fn perform_ocr(
                     serde_json::Value::Number(extraction.non_text_block_word_count.into()),
                 );
             }
+            if let Some(ratio) = extraction.dict_invalid_word_ratio {
+                metadata.insert(
+                    crate::ocr_metadata_keys::OCR_TESSERACT_DICT_INVALID_WORD_RATIO_METADATA_KEY.to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(ratio).unwrap_or(serde_json::Number::from(0)),
+                    ),
+                );
+            }
             ocr_elements = Some(extraction.elements);
         }
         _ => {
             if let Some(ref tsv_data) = tsv_data_for_tables {
-                let elements = parse_tsv_to_elements(tsv_data, config.min_confidence);
+                let elements = parse_tsv_to_elements(tsv_data, config.min_confidence, config.page_number);
                 if !elements.is_empty() {
                     ocr_elements = Some(elements);
                 }
@@ -1727,6 +1818,7 @@ pub(super) fn process_image_files_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ocr::hocr_parser::HOCR_FONT_SIZE_ATTRIBUTE;
     use tempfile::tempdir;
 
     /// Exact count: a known number of skipped words must produce exactly the
@@ -1773,6 +1865,91 @@ mod tests {
     #[test]
     fn should_report_auto_rotate_unavailable_only_without_the_feature() {
         assert_eq!(is_auto_rotate_requested_but_unavailable(true), cfg!(not(auto_rotate)));
+    }
+
+    fn dict_word(text: &str) -> xberg_tesseract::WordData {
+        xberg_tesseract::WordData {
+            text: text.to_string(),
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+            confidence: 95.0,
+            font_attrs: None,
+            language: None,
+        }
+    }
+
+    /// A page dominated by non-dictionary "words" (the LAAALDLI-style noise a scanned
+    /// drawing produces) must report a HIGH invalid ratio, not `None` and not a low one.
+    #[test]
+    fn should_report_high_ratio_when_most_words_are_dictionary_invalid() {
+        let words = ["LAAALDLI", "sky", "AEA", "ails", "Bri", "ENT", "FRONT", "ELEVATION"].map(dict_word);
+        // Mirror the ordinance_2197 page-13 evidence: only FRONT/ELEVATION are real words.
+        let is_valid = |text: &str| Some(matches!(text, "FRONT" | "ELEVATION"));
+
+        let ratio = invalid_word_ratio_from(&words, is_valid).expect("enough candidates to score");
+
+        assert_eq!(
+            ratio, 0.75,
+            "6 of 8 candidates are dictionary-invalid, expected exactly 0.75"
+        );
+    }
+
+    /// A page of genuine prose (all real dictionary words) must report a LOW invalid
+    /// ratio, not one indistinguishable from the noise case above.
+    #[test]
+    fn should_report_low_ratio_when_all_words_are_dictionary_valid() {
+        let words = ["EXHIBIT", "PLANT", "LIST", "DATE", "November", "Nineteen"].map(dict_word);
+        let is_valid = |_: &str| Some(true);
+
+        let ratio = invalid_word_ratio_from(&words, is_valid).expect("enough candidates to score");
+
+        assert_eq!(ratio, 0.0, "an all-valid page must score exactly 0.0, not merely 'low'");
+    }
+
+    /// Words below `MIN_WORD_LEN_FOR_DICT_CHECK` or containing non-alphabetic characters
+    /// (numbers, punctuation) are never dictionary words regardless of legitimacy, so they
+    /// must not count as candidates at all -- scoring them would bias real content toward
+    /// "invalid".
+    #[test]
+    fn should_exclude_short_and_non_alphabetic_words_from_candidates() {
+        let words = ["12", "a", "Bo", "3.14", "PLANT", "LIST", "DATE", "November", "Nineteen"].map(dict_word);
+        let is_valid = |_: &str| Some(true);
+
+        let ratio = invalid_word_ratio_from(&words, is_valid).expect("enough candidates to score");
+
+        assert_eq!(
+            ratio, 0.0,
+            "only the 5 alphabetic 3+ char words should count as candidates"
+        );
+    }
+
+    /// Too few dictionary-checkable words must yield `None`, never `0.0` -- a page this
+    /// short is not evidence that "every word is valid".
+    #[test]
+    fn should_return_none_when_too_few_candidates() {
+        let words = ["PLANT", "LIST"].map(dict_word);
+        let is_valid = |_: &str| Some(true);
+
+        assert_eq!(
+            invalid_word_ratio_from(&words, is_valid),
+            None,
+            "fewer than MIN_DICT_CANDIDATES_FOR_RATIO checkable words must not produce a ratio"
+        );
+    }
+
+    /// A failed dictionary lookup must be excluded from both the numerator and the
+    /// denominator, not silently counted as invalid (which would bias the ratio) or as
+    /// valid (which would hide real noise).
+    #[test]
+    fn should_exclude_failed_lookups_from_candidates() {
+        let words = ["PLANT", "LIST", "DATE", "November", "Nineteen", "BROKEN"].map(dict_word);
+        let is_valid = |text: &str| if text == "BROKEN" { None } else { Some(true) };
+
+        let ratio = invalid_word_ratio_from(&words, is_valid).expect("enough candidates to score");
+
+        assert_eq!(ratio, 0.0, "the failed lookup must not count as invalid");
     }
 
     fn word_at(left: u32, top: u32, width: u32, height: u32, text: &str) -> crate::table_core::HocrWord {
@@ -1854,44 +2031,36 @@ mod tests {
     }
 
     #[test]
-    fn render_hocr_elements_as_markdown_promotes_large_font_short_paragraph_to_heading() {
+    fn flatten_hocr_elements_to_text_never_bakes_heading_syntax_regardless_of_font_size() {
+        // Regression test for the `Plain`-format markdown leak: a large-font,
+        // short, single-line paragraph used to be promoted to a `## ` heading
+        // right in this string, and `OcrExtractionResult::content` (built
+        // from this string) is consumed unrendered by some callers, so the
+        // markdown syntax leaked into `Plain` output. This must fail against
+        // the old behavior, which produced
+        // "## Chapter One\n\nBody text at normal size." instead.
         let elements = vec![
             text_element_with_font_size("Chapter One", Some(28.0)),
             text_element_with_font_size("Body text at normal size.", Some(12.0)),
-            text_element_with_font_size("More body text at normal size.", Some(12.0)),
         ];
 
-        let markdown = render_hocr_elements_as_markdown(&elements);
+        let flattened = flatten_hocr_elements_to_text(&elements);
 
-        assert_eq!(
-            markdown,
-            "## Chapter One\n\nBody text at normal size.\n\nMore body text at normal size."
+        assert_eq!(flattened, "Chapter One\n\nBody text at normal size.");
+        assert!(
+            !flattened.contains('#'),
+            "flattened OCR text must contain no markdown heading syntax: {flattened:?}"
         );
     }
 
     #[test]
-    fn render_hocr_elements_as_markdown_does_not_promote_long_large_font_paragraph() {
-        let long_text = std::iter::repeat_n("word", HEADING_MAX_WORD_COUNT + 1)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let elements = vec![
-            text_element_with_font_size(&long_text, Some(28.0)),
-            text_element_with_font_size("Normal paragraph.", Some(12.0)),
-        ];
-
-        let markdown = render_hocr_elements_as_markdown(&elements);
-
-        assert_eq!(markdown, format!("{long_text}\n\nNormal paragraph."));
-    }
-
-    #[test]
-    fn render_hocr_elements_as_markdown_leaves_content_unchanged_without_font_sizes() {
+    fn flatten_hocr_elements_to_text_leaves_content_unchanged_without_font_sizes() {
         let elements = vec![
             text_element_with_font_size("First paragraph.", None),
             text_element_with_font_size("Second paragraph.", None),
         ];
 
-        let markdown = render_hocr_elements_as_markdown(&elements);
+        let markdown = flatten_hocr_elements_to_text(&elements);
 
         assert_eq!(markdown, "First paragraph.\n\nSecond paragraph.");
     }
@@ -1984,6 +2153,82 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Builds a tiny valid PNG so `process_image_with_cache` runs Tesseract on real
+    /// (if content-free) image bytes instead of erroring out on invalid data.
+    fn tiny_test_png_bytes() -> Vec<u8> {
+        use image::{ImageBuffer, ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+
+        let img: RgbImage = ImageBuffer::from_pixel(32, 32, Rgb([255, 255, 255]));
+        let mut bytes: Vec<u8> = Vec::new();
+        img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png).unwrap();
+        bytes
+    }
+
+    /// Regression test for #687 PART 2: `TesseractConfig::use_cache = false` must be an
+    /// end-to-end bypass, not just a lookup skip — it must neither read a pre-existing
+    /// entry nor write a new one. Uses a real (non-mocked) `TesseractAPI`, matching the
+    /// pattern of `config::tests::test_apply_tesseract_variables_enables_hocr_font_info`:
+    /// gracefully skips when no Tesseract/tessdata is available in this environment.
+    ///
+    /// This exercises a genuinely new code path (an explicit cache pre-seed followed by a
+    /// `use_cache: false` call) that has no equivalent before this change, so there is
+    /// nothing "unfixed" to run it against — the bypass plumbing this proves either exists
+    /// or the test cannot be written.
+    #[test]
+    fn process_image_with_cache_does_not_read_or_write_the_cache_when_use_cache_is_false() {
+        let api = match xberg_tesseract::TesseractAPI::new() {
+            Ok(api) => api,
+            Err(_) => return, // no Tesseract/Leptonica available in this environment
+        };
+        if api.init("", "eng").is_err() {
+            return; // no "eng" tessdata available in this environment
+        }
+
+        let temp_dir = tempdir().unwrap();
+        let cache = OcrCache::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        let image_bytes = tiny_test_png_bytes();
+        let config = TesseractConfig {
+            output_format: "text".to_string(),
+            enable_table_detection: false,
+            use_cache: false,
+            ..TesseractConfig::default()
+        };
+
+        // Pre-seed the exact entry `process_image_resolved` would look up if caching were
+        // enabled, carrying an obviously-wrong marker. If the bypass ever regresses into a
+        // read, this is what would come back instead of a fresh OCR result.
+        let image_hash = crate::cache::blake3_hash_bytes(&image_bytes);
+        let config_str = hash_config(&config);
+        let marker = OcrExtractionResult {
+            content: "STALE MARKER: use_cache=false must never return this".to_string(),
+            mime_type: "text/plain".to_string(),
+            metadata: HashMap::new(),
+            tables: Vec::new(),
+            ocr_elements: None,
+            internal_document: None,
+        };
+        cache
+            .set_cached_result(&image_hash, "tesseract", &config_str, None, &marker)
+            .unwrap();
+
+        let api_pool = TesseractApiPool::new();
+        let result = process_image_with_cache(&image_bytes, &config, &cache, &api_pool, None)
+            .expect("OCR on a valid image must succeed");
+
+        assert_ne!(
+            result.content, marker.content,
+            "use_cache=false must not read the pre-seeded cache entry"
+        );
+
+        let stats = cache.get_stats().unwrap();
+        assert_eq!(
+            stats.total_files, 1,
+            "use_cache=false must not write a new cache entry (only the pre-seeded marker file may exist)"
+        );
+    }
+
     #[test]
     fn test_preprocess_pix_produces_grayscale_with_valid_resolution() {
         let width = 32;
@@ -2010,7 +2255,7 @@ mod tests {
     fn test_prepare_ocr_image_without_config_preserves_shadowed_rgb() {
         let rgb_data = vec![0, 1, 2, 3, 4, 5];
 
-        let prepared = prepare_ocr_image(rgb_data.clone(), 2, 1, None, None, false);
+        let prepared = prepare_ocr_image(rgb_data.clone(), 2, 1, None, None, false, None);
 
         assert_eq!(prepared.data, rgb_data);
         assert_eq!(prepared.width, 2);
@@ -2033,7 +2278,7 @@ mod tests {
         const HEIGHT: u32 = 4;
         let rgb_data = vec![u8::MAX; WIDTH as usize * HEIGHT as usize * RGB_CHANNEL_COUNT];
 
-        let prepared = prepare_ocr_image(rgb_data, WIDTH, HEIGHT, None, None, false);
+        let prepared = prepare_ocr_image(rgb_data, WIDTH, HEIGHT, None, None, false, None);
 
         assert!(prepared.apply_pix_preprocessing);
     }
@@ -2055,7 +2300,7 @@ mod tests {
             ..Default::default()
         };
 
-        let prepared = prepare_ocr_image(rgb_data, 2, 2, Some(&preprocessing), None, false);
+        let prepared = prepare_ocr_image(rgb_data, 2, 2, Some(&preprocessing), None, false, None);
 
         assert!(prepared.apply_pix_preprocessing);
     }
@@ -2084,6 +2329,7 @@ mod tests {
             &preprocessing,
             Some(&images_config),
             false,
+            None,
         );
 
         assert_eq!(prepared.width, 2, "max_image_dimension=2 must clamp the resized width");
@@ -2091,6 +2337,144 @@ mod tests {
             prepared.height, 2,
             "max_image_dimension=2 must clamp the resized height"
         );
+        let metadata = prepared
+            .image_preprocessing
+            .expect("successful normalization must retain its metadata");
+        assert_eq!(metadata.original_dimensions.width, SOURCE_DIMENSION as usize);
+        assert_eq!(metadata.original_dimensions.height, SOURCE_DIMENSION as usize);
+        assert_eq!(
+            metadata.new_dimensions.as_ref().map(|dimensions| dimensions.width),
+            Some(2)
+        );
+        assert_eq!(
+            metadata.new_dimensions.as_ref().map(|dimensions| dimensions.height),
+            Some(2)
+        );
+        assert!(metadata.dimension_clamped);
+    }
+
+    /// Pixel width of a US Letter page (612pt wide) rendered at the 150 DPI the PDF OCR route
+    /// asks `render_page_with_safeguards` for.
+    const LETTER_AT_150_DPI_WIDTH_PX: u32 = 1275;
+    /// Pixel height of the same page (792pt tall) at 150 DPI.
+    const LETTER_AT_150_DPI_HEIGHT_PX: u32 = 1650;
+
+    /// A clean white Letter-sized raster, the shape the PDF OCR route actually hands over: it
+    /// passes `should_apply_default_preprocessing`, so both the explicit and the implicit
+    /// preprocessing branch reach DPI normalization.
+    fn letter_page_raster_at_150_dpi() -> Vec<u8> {
+        vec![u8::MAX; LETTER_AT_150_DPI_WIDTH_PX as usize * LETTER_AT_150_DPI_HEIGHT_PX as usize * RGB_CHANNEL_COUNT]
+    }
+
+    /// The defect: a page rendered at 150 DPI was normalized as if it were 72 DPI, so the scale
+    /// factor became `target_dpi / 72` instead of `target_dpi / 150`.
+    ///
+    /// With the real 150 handed in, `calculate_smart_dpi` sees a 8.5x11in page (612x792pt),
+    /// finds 300 DPI fits inside `max_image_dimension` (11in * 300 = 3300px <= 4096), and
+    /// returns the full 300. The resize is then a clean 2.0x to exactly 2550x3300 with no
+    /// dimension clamp, and Tesseract is told 300 — which is what the raster now is.
+    ///
+    /// Fails against unfixed code: `prepare_ocr_image` has no `known_source_dpi` parameter at
+    /// all there, so this does not compile. Restoring the old six-argument call (dropping the
+    /// `Some(150.0)`) makes it compile and then fail on the first assertion, because the 72
+    /// assumption yields `final_dpi = 179` and a 3165x4096 clamped raster:
+    /// `assertion \`left == right\` failed: left: 4096, right: 3300`.
+    #[test]
+    fn should_honour_known_source_dpi_instead_of_assuming_72() {
+        const KNOWN_RENDER_DPI: f64 = 150.0;
+        const EXPECTED_WIDTH_PX: u32 = 2550;
+        const EXPECTED_HEIGHT_PX: u32 = 3300;
+        const EXPECTED_SOURCE_DPI: i32 = 300;
+
+        let prepared = prepare_ocr_image(
+            letter_page_raster_at_150_dpi(),
+            LETTER_AT_150_DPI_WIDTH_PX,
+            LETTER_AT_150_DPI_HEIGHT_PX,
+            Some(&crate::types::ImagePreprocessingConfig::default()),
+            None,
+            false,
+            Some(KNOWN_RENDER_DPI),
+        );
+
+        assert_eq!(
+            prepared.height, EXPECTED_HEIGHT_PX,
+            "a 150 DPI Letter page scaled to the 300 DPI target is 3300px tall, not the 4096px \
+             the max_image_dimension clamp produces when the source is mistaken for 72 DPI"
+        );
+        assert_eq!(
+            prepared.width, EXPECTED_WIDTH_PX,
+            "the matching width for a clean 2.0x resize"
+        );
+        assert_eq!(
+            prepared.source_dpi, EXPECTED_SOURCE_DPI,
+            "Tesseract must be told the raster's real resolution, not the 179 the 72 assumption \
+             derives"
+        );
+    }
+
+    /// The contrast leg, pinning the arithmetic the defect produced so a regression is visible
+    /// rather than merely different: with no known source DPI the 72 assumption still applies,
+    /// the smart-DPI step derives 179 from an apparent 17.7x22.9in page, and the resize runs
+    /// into the 4096px `max_image_dimension` clamp.
+    ///
+    /// Fails against unfixed code only by not compiling (the seventh argument does not exist);
+    /// its values are identical either way, which is the point — this leg proves the fix changed
+    /// nothing for callers that do not supply a DPI.
+    #[test]
+    fn should_keep_assuming_72_dpi_when_source_dpi_is_unknown() {
+        const CLAMPED_DIMENSION_PX: u32 = 4096;
+        const DERIVED_SOURCE_DPI: i32 = 179;
+
+        let prepared = prepare_ocr_image(
+            letter_page_raster_at_150_dpi(),
+            LETTER_AT_150_DPI_WIDTH_PX,
+            LETTER_AT_150_DPI_HEIGHT_PX,
+            Some(&crate::types::ImagePreprocessingConfig::default()),
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            prepared.height, CLAMPED_DIMENSION_PX,
+            "without a known source DPI the 72 assumption drives the resize into the clamp"
+        );
+        assert_eq!(
+            prepared.source_dpi, DERIVED_SOURCE_DPI,
+            "and reports the DPI that assumption implies"
+        );
+    }
+
+    /// A raw image the caller knows nothing about still gets the 72 fallback on the
+    /// pass-through branch, so standalone image OCR is untouched by the new parameter.
+    ///
+    /// Fails against unfixed code by not compiling; behaviourally it is the pre-existing
+    /// contract, asserted here so the new parameter cannot quietly displace it.
+    #[test]
+    fn should_default_to_72_dpi_for_unpreprocessed_raw_image_without_known_dpi() {
+        let rgb_data = vec![0, 1, 2, 3, 4, 5];
+
+        let prepared = prepare_ocr_image(rgb_data.clone(), 2, 1, None, None, false, None);
+
+        assert_eq!(prepared.data, rgb_data, "the raster must pass through untouched");
+        assert_eq!(prepared.source_dpi, RAW_IMAGE_SOURCE_DPI);
+    }
+
+    /// The same pass-through branch reports a known resolution verbatim rather than the 72
+    /// fallback: the bytes are unchanged, so their resolution is whatever the caller measured.
+    ///
+    /// Fails against unfixed code: there is no way to express this at all — `prepare_ocr_image`
+    /// hardcodes `RAW_IMAGE_SOURCE_DPI` on this branch, so the reported DPI is 72 and the
+    /// assertion reads `assertion \`left == right\` failed: left: 72, right: 150`.
+    #[test]
+    fn should_report_known_source_dpi_on_the_unpreprocessed_branch() {
+        const KNOWN_RENDER_DPI: f64 = 150.0;
+        let rgb_data = vec![0, 1, 2, 3, 4, 5];
+
+        let prepared = prepare_ocr_image(rgb_data, 2, 1, None, None, false, Some(KNOWN_RENDER_DPI));
+
+        assert_eq!(prepared.source_dpi, 150);
+        assert!(!prepared.apply_pix_preprocessing);
     }
 
     #[test]

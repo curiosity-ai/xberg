@@ -78,6 +78,22 @@ pub fn corpus_from_fixture_manager(manager: &FixtureManager) -> Vec<CorpusDocume
         .collect()
 }
 
+/// True when `requested` names the same format as `actual`, either literally or because both
+/// are extensions xberg's MIME table treats as aliases of one format (e.g. `typst` and `typ`).
+///
+/// Fixture `file_type` values are deliberately diverse per-document — the corpus keeps real
+/// documents under several legal extension aliases of the same format on purpose (see
+/// [`crate::fixture::canonical_extension_family`]) — so a literal filter match alone would
+/// silently return only a fraction of a format's fixtures to a caller who filtered by one
+/// spelling (e.g. `--file-types typst` missing every `typ`-labeled fixture).
+fn file_type_matches(requested: &str, actual: &str) -> bool {
+    if requested.eq_ignore_ascii_case(actual) {
+        return true;
+    }
+    crate::fixture::canonical_extension_family(requested)
+        .is_some_and(|family| family.iter().any(|extension| extension.eq_ignore_ascii_case(actual)))
+}
+
 fn matches_filter(doc: &CorpusDocument, relative_fixture_path: &Path, filter: &CorpusFilter) -> bool {
     let has_name_filter = !filter.name_patterns.is_empty() || !filter.exact_names.is_empty();
     let matches_name = filter
@@ -90,10 +106,11 @@ fn matches_filter(doc: &CorpusDocument, relative_fixture_path: &Path, filter: &C
             .any(|exact| exact == &doc.name || Path::new(exact) == relative_fixture_path);
 
     (!has_name_filter || matches_name)
-        && filter
-            .file_types
-            .as_ref()
-            .is_none_or(|types| types.contains(&doc.file_type))
+        && filter.file_types.as_ref().is_none_or(|types| {
+            types
+                .iter()
+                .any(|requested| file_type_matches(requested, &doc.file_type))
+        })
         && filter.max_file_size.is_none_or(|max_size| doc.file_size <= max_size)
         && (!filter.require_ground_truth || doc.ground_truth_text.is_some())
         && (!filter.require_markdown_ground_truth || doc.ground_truth_markdown.is_some())
@@ -172,6 +189,7 @@ pub fn pdf_markdown_corpus(fixtures_dir: &Path) -> Result<Vec<CorpusDocument>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_default_filter_is_permissive() {
@@ -259,5 +277,79 @@ mod tests {
             fixture_paths,
             [Path::new("xlsx/stanley_cups.json"), Path::new("csv/stanley_cups.json")]
         );
+    }
+
+    #[test]
+    fn file_type_matches_accepts_the_literal_spelling() {
+        assert!(file_type_matches("pdf", "pdf"));
+        assert!(!file_type_matches("pdf", "docx"));
+    }
+
+    #[test]
+    fn file_type_matches_accepts_a_recognized_alias_in_either_direction() {
+        // typst/typ, dbk/docbook, wp/wpd, jpg/jpeg, tiff/tif and yaml/yml are all legal alias
+        // pairs of one format per crates/xberg/src/core/mime.rs — a filter for either spelling
+        // must match a fixture labeled with the other.
+        assert!(file_type_matches("typst", "typ"));
+        assert!(file_type_matches("typ", "typst"));
+        assert!(file_type_matches("docbook", "dbk"));
+        assert!(file_type_matches("wpd", "wp"));
+        assert!(file_type_matches("jpg", "jpeg"));
+        assert!(file_type_matches("tiff", "tif"));
+        assert!(file_type_matches("yaml", "yml"));
+        assert!(!file_type_matches("typst", "docbook"));
+    }
+
+    /// Regression test for the fixture corpus's split file_type spelling: before
+    /// `matches_filter` became alias-aware, filtering by one spelling of a format silently
+    /// returned only the fixtures using that exact literal spelling. The typst family is the
+    /// starkest example — 8 of the corpus's 9 typst fixtures spell `file_type` as `"typ"`, so a
+    /// literal `"typst"` filter used to return just 1 document. It must now return all 9.
+    #[test]
+    fn typst_filter_returns_every_typ_and_typst_fixture() {
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixtures_dir = crate_root.join("fixtures");
+
+        let docs = build_corpus(
+            &fixtures_dir,
+            &CorpusFilter {
+                file_types: Some(vec!["typst".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let file_types: HashSet<_> = docs.iter().map(|doc| doc.file_type.as_str()).collect();
+        assert_eq!(file_types, HashSet::from(["typ", "typst"]));
+        assert_eq!(docs.len(), 9, "expected the full typst family, got {docs:?}");
+    }
+
+    /// Same regression as above, checked for every format the corpus keeps under a split
+    /// spelling: wordperfect (wp/wpd), docbook (dbk/docbook), jpeg (jpg/jpeg), tiff (tiff/tif)
+    /// and yaml (yaml/yml). Counts reflect the fixture corpus as of this fix and will need
+    /// updating if fixtures for these formats are added or removed.
+    #[test]
+    fn family_aware_filters_recover_the_full_bucket_for_every_split_format() {
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixtures_dir = crate_root.join("fixtures");
+
+        let expected_counts: &[(&str, usize)] = &[("wpd", 7), ("docbook", 7), ("jpeg", 17), ("tiff", 2), ("yaml", 6)];
+
+        for (requested, expected_count) in expected_counts {
+            let docs = build_corpus(
+                &fixtures_dir,
+                &CorpusFilter {
+                    file_types: Some(vec![(*requested).to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                docs.len(),
+                *expected_count,
+                "file_types=[{requested}] returned {} documents, expected {expected_count}",
+                docs.len()
+            );
+        }
     }
 }

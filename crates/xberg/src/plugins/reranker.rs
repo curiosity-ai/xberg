@@ -38,7 +38,6 @@
 //! # Ok::<(), xberg::XbergError>(())
 //! ```
 //!
-//! Since v5.0.0.
 
 use crate::Result;
 use crate::plugins::Plugin;
@@ -48,7 +47,7 @@ use std::sync::Arc;
 /// Trait for in-process reranker backend plugins.
 ///
 /// Cross-encoders score `(query, document)` pairs jointly and return a
-/// raw logit per document. The dispatcher in [`crate::rerank`] applies
+/// raw logit per document. The crate-level `rerank` dispatcher applies
 /// sigmoid to convert logits to `[0, 1]` scores, sorts descending by score,
 /// and truncates to `top_k`.
 ///
@@ -86,7 +85,6 @@ use std::sync::Arc;
 /// requires a multi-thread tokio runtime. Callers running inside a
 /// `current_thread` runtime must use `rerank_async` instead.
 ///
-/// Since v5.0.0.
 #[doc(alias = "rerank")]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -115,7 +113,6 @@ pub trait RerankerBackend: Plugin {
 /// - [`crate::XbergError::Plugin`] if a backend with that name is already registered.
 /// - Any error from the backend's `initialize()` method.
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 pub fn register_reranker_backend(backend: Arc<dyn RerankerBackend>) -> Result<()> {
     use crate::plugins::registry::get_reranker_backend_registry;
@@ -133,7 +130,6 @@ pub fn register_reranker_backend(backend: Arc<dyn RerankerBackend>) -> Result<()
 ///
 /// - Any error returned by the backend's `shutdown()` method.
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 pub fn unregister_reranker_backend(name: &str) -> Result<()> {
     use crate::plugins::registry::get_reranker_backend_registry;
@@ -152,7 +148,6 @@ pub fn unregister_reranker_backend(name: &str) -> Result<()> {
 /// - Any error returned by a backend's `shutdown()` method. The first error
 ///   encountered stops processing of remaining backends.
 ///
-/// Since v5.0.0.
 pub fn clear_reranker_backends() -> Result<()> {
     use crate::plugins::registry::get_reranker_backend_registry;
 
@@ -166,7 +161,6 @@ pub fn clear_reranker_backends() -> Result<()> {
 /// Used by `xberg-cli`, the api/mcp endpoints, and generated language
 /// bindings.
 ///
-/// Since v5.0.0.
 pub fn list_reranker_backends() -> Result<Vec<String>> {
     use crate::plugins::registry::get_reranker_backend_registry;
 

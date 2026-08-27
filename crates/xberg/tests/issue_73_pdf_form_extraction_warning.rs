@@ -10,7 +10,7 @@ use helpers::extract_bytes_document_blocking;
 use xberg::ExtractionConfig;
 
 /// Build a PDF whose catalog `/AcroForm` entry is present but malformed: it
-/// points to an integer, not a dictionary. `pdf_oxide::extractors::forms::
+/// points to an integer, not a dictionary. `xberg_native_pdf::extractors::forms::
 /// FormExtractor::extract_fields` returns `Err(InvalidPdf("AcroForm is not
 /// a dictionary"))` for this — a genuine parse failure, not the (very
 /// common) "no AcroForm at all" case that returns `Ok(vec![])`.

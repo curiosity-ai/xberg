@@ -78,13 +78,15 @@ Xberg is written following strict AI engineering practices. That is, its vibe co
 
 ### Conventions
 
-We use the tool `ai-rulez`, vibe coded by @Goldziher, to manage our AI conventions. You are encouraged to use this tool - running the `task setup` will get you going, or run in your terminal:
+We use `ai-rulez`, created by @Goldziher, to manage our AI conventions. Running `task setup` will get you going, or run:
 
 ```sh
-npx -y ai-rulez@latest generate
+task governance:generate
 ```
 
-This will be scaffold the AI agent conventions (e.g. CLAUDE.md, AGENTS.md, subagents, skills, etc.). You can see the AGENTS.md generated afterwards.
+This scaffolds the local AI agent conventions, including `CLAUDE.md`, `AGENTS.md`, subagents, and skills. Run
+`task governance:verify` after changing `.ai-rulez/`; CI runs the same pinned validation and render check without
+modifying the checkout.
 
 ### Customization
 

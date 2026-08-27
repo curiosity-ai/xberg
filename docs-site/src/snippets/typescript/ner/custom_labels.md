@@ -1,12 +1,12 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, NerBackendKind, extract } from "@xberg-io/xberg";
 
 const output = await extract({
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "contract.pdf",
 }, {
     ner: {
-        backend: "llm",
+        backend: NerBackendKind.Llm,
         llm: { model: "openai/gpt-4o-mini" },
         customLabels: ["Treatment", "Vessel", "Product"],
     },

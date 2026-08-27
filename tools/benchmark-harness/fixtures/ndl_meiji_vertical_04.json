@@ -1,6 +1,6 @@
 {
   "document": "../../../test_documents/images/ndl_meiji_vertical_04.jpg",
-  "file_type": "jpeg",
+  "file_type": "jpg",
   "file_size": 1329663,
   "expected_frameworks": [
     "xberg"

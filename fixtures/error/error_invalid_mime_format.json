@@ -10,7 +10,7 @@
       "files": [
         {
           "field": "/bytes",
-          "path": "test_documents/text/plain.txt"
+          "path": "text/plain.txt"
         }
       ],
       "operations": [

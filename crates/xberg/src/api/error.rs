@@ -264,9 +264,18 @@ mod tests {
                 "PluginError",
             ),
             (XbergError::LockPoisoned("t".to_string()), "LockPoisonedError"),
-            (XbergError::UnsupportedFormat("t/mime".to_string()), "UnsupportedFormatError"),
+            (
+                XbergError::UnsupportedFormat("t/mime".to_string()),
+                "UnsupportedFormatError",
+            ),
             (XbergError::embedding("t"), "EmbeddingError"),
-            (XbergError::Timeout { elapsed_ms: 1, limit_ms: 1 }, "TimeoutError"),
+            (
+                XbergError::Timeout {
+                    elapsed_ms: 1,
+                    limit_ms: 1,
+                },
+                "TimeoutError",
+            ),
             (XbergError::Other("t".to_string()), "Error"),
             (XbergError::Cancelled, "CancelledError"),
             (XbergError::security("t"), "SecurityError"),

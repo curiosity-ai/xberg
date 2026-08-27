@@ -151,4 +151,29 @@ public class RstExtractorTests
         Assert.Equal(new[] { "Name", "Note" }, table.Cells[0]);
         Assert.Equal(new[] { "Alice", "one, two" }, table.Cells[1]);
     }
+
+    /// <summary>
+    /// Upstream <c>fix(pptx,rst): … guard a cross-buffer slice</c>. A simple table's column
+    /// boundaries are byte offsets counted against the ASCII (<c>=</c>/space only) separator line,
+    /// then applied verbatim to each data row. A row with a multi-byte character straddling a
+    /// boundary puts that boundary mid-codepoint — a panic in Rust, mojibake here — so the
+    /// boundary is snapped inward instead.
+    /// </summary>
+    [Fact]
+    public void ASimpleTableColumnBoundaryInsideAMultibyteCharacterIsSnappedInward()
+    {
+        // "éé" is four bytes, so the column boundary at byte 3 lands inside the second one.
+        var doc = Parse("Intro.\n\n===  ===\néé  yyy\n===  ===\n\nOutro.\n");
+
+        // The separator's byte offsets do not line up with a row that is wider in bytes than it is
+        // in characters, so each column is the snapped slice: column one ends at byte 2, inside
+        // "éé", and column two starts at byte 5. What matters is that neither cell carries a
+        // replacement character from a codepoint cut in half.
+        var table = Assert.Single(doc.Tables);
+        var row = table.Cells[0];
+        Assert.Equal(2, row.Count);
+        Assert.All(row, cell => Assert.DoesNotContain('\uFFFD', cell));
+        Assert.Equal("é", row[0]);
+        Assert.Equal("yy", row[1]);
+    }
 }

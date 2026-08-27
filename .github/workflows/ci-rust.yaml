@@ -2,7 +2,7 @@ name: CI Rust
 
 on:
   push:
-    branches: [main]
+    branches: [main, chore/alef-fixes]
     paths:
       - "crates/**"
       - "packages/dart/rust/**"
@@ -18,6 +18,7 @@ on:
       # pin bump changes what this workflow actually verifies. ~keep
       - "test_documents"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
       - "crates/**"
@@ -56,7 +57,7 @@ permissions:
 jobs:
   rust:
     name: Rust (${{ matrix.os }})
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -74,7 +75,7 @@ jobs:
           - os: ubuntu-24.04-arm
           - os: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -112,6 +113,11 @@ jobs:
 
       - name: Install Task
         uses: xberg-io/actions/install-task@v1
+
+      - name: Verify system Tesseract dynamic linking
+        if: matrix.os == 'ubuntu-latest'
+        run: task rust:check:tesseract-dynamic
+        shell: bash
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -174,14 +180,14 @@ jobs:
           # sample was a bare ```rust fence, so it *executed*, called into Tesseract and
           # died with InitError on any machine without eng.traineddata installed.
           # Most carry no examples yet; gating them now is what stops the next one from
-          # rotting the same way. xberg-cli is a binary with no lib target, and
-          # crates/ttf-parser-compat is a vendored ttf-parser fork whose doctests are
-          # upstream's, so neither belongs here. ~keep
+          # rotting the same way. xberg-cli is a binary with no lib target, so it does
+          # not belong here. ~keep
           cargo test --locked -p xberg-tesseract --doc
           cargo test --locked -p xberg-gliner --doc
           cargo test --locked -p xberg-candle-ocr --doc
           cargo test --locked -p xberg-libheif --doc
           cargo test --locked -p xberg-libwpd --doc
+          cargo test --locked -p xberg-native-pdf --doc
           # Refuses to build without an inference backend selected.
           cargo test --locked -p xberg-paddle-ocr --features ort --doc
         shell: bash
@@ -212,30 +218,22 @@ jobs:
         run: cargo check --locked -p xberg-cli --features all
         shell: bash
 
-      - name: Check xberg-cli feature profiles
-        if: runner.os == 'Linux'
-        run: |
-          cargo clippy --locked -p xberg-cli -- -D warnings
-
-          for features in \
-            all \
-            pdf-heuristic \
-            pdf-ocr \
-            core-cli \
-            paddle-ocr \
-            candle-ocr \
-            liter-llm; do
-            echo "::group::xberg-cli features: ${features}"
-            cargo clippy --locked -p xberg-cli --no-default-features --features "${features}" -- -D warnings
-            echo "::endgroup::"
-          done
-
-          for features in pdf-heuristic pdf-ocr core-cli; do
-            echo "::group::xberg-cli profile tests: ${features}"
-            cargo test --locked -p xberg-cli --no-default-features --features "${features}" feature_profile_tests
-            echo "::endgroup::"
-          done
-        shell: bash
+      # #762: the per-feature xberg-cli clippy legs used to live here as the LAST step of
+      # this 20+-step job. Steps in a job run sequentially with no continue-on-error, so any
+      # earlier failure in this job (clippy on the main workspace, the unit-test run, a
+      # doctest, any of the `check` steps) skips every step after it -- this one included.
+      # Across every CI Rust run on `main` from 2026-07-29 (shortly after this step was
+      # added) through 2026-08-21 -- upwards of 100 runs -- "Check xberg-cli feature
+      # profiles" shows `skipped` in every single one, never once `success` or `failure`,
+      # because this job has not once gone all-green that far down the step list in that
+      # window. The 7 feature legs it was meant to gate were therefore never actually
+      # exercised by CI. (The in-loop `cargo clippy` calls also ran as sequential shell
+      # commands under Actions' default `bash -e`, so even a single green run would only
+      # ever have reported the FIRST broken leg -- any leg after it in the `for` loop would
+      # never run either, the same masking #741's `narrow-feature-legs` job was written to
+      # avoid.) Moved to its own job below (`xberg-cli-feature-legs`) as a `fail-fast: false`
+      # matrix, one leg per runner, so it no longer depends on this job's other steps and
+      # every leg always reports its own real result. ~keep
 
   # GH#1389 regression guard: `cargo add xberg --features full` then `cargo build` on
   # x86_64-pc-windows-msvc used to die at LINK with an LNK2038 RuntimeLibrary mismatch,
@@ -268,11 +266,11 @@ jobs:
   # time actually running the (fixture-heavy) test suite. ~keep
   windows-static-embeddings-link:
     name: Rust (windows-latest, static-embeddings link)
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -306,11 +304,11 @@ jobs:
   # Also the only job that builds/tests xberg-libwpd on Windows.
   clippy-windows:
     name: Rust (windows-latest)
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -363,13 +361,13 @@ jobs:
   # CI time for no new coverage. ~keep
   rust-tract-no-ort:
     name: Rust tract-only (no-ORT)
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     env:
       TRACT_FEATURES: "ocr,auto-rotate-tract,layout-tract,sceptre-ocr-tract,paddle-ocr-tract"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -408,17 +406,304 @@ jobs:
 
       - name: Run no-ORT tract tests
         run: |
+          set -euo pipefail
+          # --list (no execution) confirms each of the four filters still matches at least one
+          # test in this feature closure, before spending time running them. Without this, a
+          # renamed/moved/re-gated test under any one prefix would silently drop that prefix's
+          # coverage to zero while the other three still make the summary line say "N passed".
           cargo test --locked -p xberg --no-default-features --features "${TRACT_FEATURES}" --lib \
-            -- sceptre_ocr:: doc_orientation:: layout:: paddle_ocr::
+            -- sceptre_ocr:: doc_orientation:: layout:: paddle_ocr:: --list 2>&1 | tee /tmp/tract-no-ort-list.log
+          for prefix in sceptre_ocr:: doc_orientation:: layout:: paddle_ocr::; do
+            if ! grep -q "${prefix}" /tmp/tract-no-ort-list.log; then
+              echo "::error::no test matched filter '${prefix}' in the no-ORT tract leg -- this prefix's coverage silently dropped to zero" >&2
+              exit 1
+            fi
+          done
+
+          cargo test --locked -p xberg --no-default-features --features "${TRACT_FEATURES}" --lib \
+            -- sceptre_ocr:: doc_orientation:: layout:: paddle_ocr:: 2>&1 | tee /tmp/tract-no-ort-run.log
+          if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' /tmp/tract-no-ort-run.log; then
+            echo "::error::no-ORT tract leg matched tests via --list but the run reported 0 passed -- see /tmp/tract-no-ort-run.log" >&2
+            exit 1
+          fi
         shell: bash
+
+  # #741: narrow, non-ORT feature legs that no other job in this file exercises in
+  # isolation. `pdf` alone (no ocr/ocr-pipeline, no ML) rotted into two independent
+  # compile errors -- compute_quality_score missing its ocr/ocr-pipeline cfg gate, and
+  # render.rs's `log::set_boxed_logger` call (gated behind log's non-default `std`
+  # feature, only ever turned on transitively by unrelated crates in the full-feature
+  # graph) -- while `full`, `formats`, and every other leg in this file stayed green for
+  # months, because they all enable enough of the dependency graph to activate `log/std`
+  # by accident. `no-ort-target` and `formats-no-heic` share the exact `pdf` feature
+  # closure and are real shipping configurations (`no-ort-target` underlies both
+  # wasm-target and android-target; `formats-no-heic` underlies `full-no-heic`, which
+  # feeds macos-intel-target and the Swift cross-build), so a break in either is just as
+  # invisible to the rest of this file as the `pdf` break was.
+  #
+  # One matrix entry per leg (not sequential steps in one job): fixing the first of the
+  # two `pdf` breaks above only *revealed* the second -- a job that stops at its first
+  # failing step would have reported red, gotten "fixed", and then gone green again while
+  # still carrying the second break. `fail-fast: false` means every leg always reports its
+  # own real, independent result.
+  #
+  # No install-system-deps / setup-onnx-runtime / setup-tesseract-cache: none of these
+  # three feature sets pull ORT, Tesseract, or libheif, so this job stays cheap --
+  # `cargo check` (not build/test/clippy) against three feature closures that mostly
+  # reuse each other's dependency graph, on cached sccache artifacts.
+  narrow-feature-legs:
+    name: Narrow feature leg (${{ matrix.name }})
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pdf
+            features: pdf
+          - name: no-ort-target
+            features: no-ort-target
+          - name: formats-no-heic
+            features: formats-no-heic
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          cache-key-prefix: rust-feature-leg-${{ matrix.name }}
+          use-sccache: "true"
+
+      - name: cargo check -p xberg --no-default-features --features ${{ matrix.name }}
+        run: cargo check --locked -p xberg --no-default-features --features "${{ matrix.features }}"
+        shell: bash
+
+  # #741 continued: `wasm-target` is only ever compiled by publish.yaml's `wasm-bindings`
+  # job, which runs solely on a release tag *and* is `continue-on-error: true` (a WASM
+  # build failure does not block the release, by design -- see that job's comment). That
+  # means a wasm-target compile break can ride along through an unbounded number of PRs
+  # before a release attempt even notices it, and even then nothing goes red. This is the
+  # same blind spot the `pdf` break exploited, just on the WASM leg. `cargo check` against
+  # the wasm32 target is far cheaper than wasm-pack's full build+wasm-opt pipeline and
+  # gives every PR that touches crates/xberg the same coverage `narrow-feature-legs` gives
+  # the host-target legs. Kept as its own job (not folded into the matrix above) because
+  # it needs the wasm32 rustup target and the WASI SDK (`ocr-wasm` cross-compiles
+  # tesseract-wasm's C sources against it, same as publish.yaml's wasm-bindings job).
+  wasm-target-check:
+    name: Narrow feature leg (wasm-target, wasm32)
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache-key-prefix: rust-wasm-target-check
+          use-sccache: "true"
+
+      - uses: xberg-io/actions/install-wasi-sdk@v1
+
+      - name: cargo check -p xberg --no-default-features --features wasm-target --target wasm32-unknown-unknown
+        run: cargo check --locked -p xberg --no-default-features --features wasm-target --target wasm32-unknown-unknown
+        shell: bash
+
+  # #762: independent home for the xberg-cli per-feature clippy legs that used to be the
+  # last step of the `rust` job -- see the `~keep` comment left in that job's "Check
+  # xberg-cli --features all" step for why they never ran there. `fail-fast: false` matters
+  # here for the same reason it matters in `narrow-feature-legs` above: the original
+  # single-step `for features in ...` loop ran as sequential `bash -e` commands, so the
+  # first broken leg silently hid every leg after it in the same run. One matrix entry per
+  # leg means every leg always reports, independently, whether it actually compiles clean.
+  #
+  # `all` and `paddle-ocr` pull `xberg/paddle-ocr` (+ `embeddings`/`layout-detection` via
+  # `all`'s `default`), which link ONNX Runtime; `all` and `pdf-ocr` pull `xberg/ocr`, which
+  # links Tesseract. Every other leg (`pdf-heuristic`, `core-cli`, `candle-ocr`,
+  # `liter-llm`) is native-dependency-free, so their setup steps are skipped by matrix flag
+  # instead of paying the ORT/Tesseract download on every leg -- that is the cost this job
+  # trades for correctness: 7 separate runners (with 2 of them provisioning ORT and/or
+  # Tesseract) instead of 1 shared, but silently-never-executed, step.
+  #
+  # `feature_profile_tests` (pdf-heuristic, pdf-ocr, core-cli) is pure `clap` command
+  # introspection with no include_bytes! fixtures, so no test_documents fetch is needed.
+  xberg-cli-feature-legs:
+    name: xberg-cli feature leg (${{ matrix.name }})
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all
+            features: all
+            needs_ort: true
+            needs_tesseract: true
+            run_tests: false
+          - name: pdf-heuristic
+            features: pdf-heuristic
+            needs_ort: false
+            needs_tesseract: false
+            run_tests: true
+          - name: pdf-ocr
+            features: pdf-ocr
+            needs_ort: false
+            needs_tesseract: true
+            run_tests: true
+          - name: core-cli
+            features: core-cli
+            needs_ort: false
+            needs_tesseract: false
+            run_tests: true
+          - name: paddle-ocr
+            features: paddle-ocr
+            needs_ort: true
+            needs_tesseract: false
+            run_tests: false
+          - name: candle-ocr
+            features: candle-ocr
+            needs_ort: false
+            needs_tesseract: false
+            run_tests: false
+          - name: liter-llm
+            features: liter-llm
+            needs_ort: false
+            needs_tesseract: false
+            run_tests: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          cache-key-prefix: rust-xberg-cli-feature-leg-${{ matrix.name }}
+          use-sccache: "true"
+
+      - name: Install system dependencies
+        if: matrix.needs_ort || matrix.needs_tesseract
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup ONNX Runtime
+        if: matrix.needs_ort
+        uses: ./.github/actions/setup-onnx-runtime
+        with:
+          ort-version: ${{ env.ORT_VERSION }}
+
+      - name: Setup Tesseract cache
+        if: matrix.needs_tesseract
+        uses: ./.github/actions/setup-tesseract-cache
+        with:
+          label: xberg-cli-${{ matrix.name }}
+
+      - name: cargo clippy -p xberg-cli --features ${{ matrix.name }}
+        run: cargo clippy --locked -p xberg-cli --no-default-features --features "${{ matrix.features }}" -- -D warnings
+        shell: bash
+
+      - name: cargo test -p xberg-cli feature_profile_tests --features ${{ matrix.name }}
+        if: matrix.run_tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p xberg-cli --no-default-features --features "${{ matrix.features }}" \
+            feature_profile_tests 2>&1 | tee /tmp/feature-profile-tests-${{ matrix.name }}.log
+          if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' /tmp/feature-profile-tests-${{ matrix.name }}.log; then
+            echo "::error::feature_profile_tests matched 0 tests for the ${{ matrix.name }} feature leg -- clap command-introspection coverage for this leg silently dropped to zero" >&2
+            exit 1
+          fi
+        shell: bash
+
+  # #702: `PdfBackend::Pdfium` (crates/xberg/src/extractors/pdf/pdfium_engine.rs) had zero
+  # executed CI coverage. Its regression test,
+  # `pdfium_engine_serializes_concurrent_extractions_when_the_library_is_available`, is gated
+  # `#[cfg(all(feature = "pdf", feature = "pdf-pdfium"))]`, and `pdf-pdfium` is enabled by no
+  # feature set any job in this file (or `task rust:test:ci`) builds -- not even `full` -- so
+  # the test has never once compiled, let alone run. On top of that, the test itself
+  # soft-passes (returns early reporting success) whenever `bind_once()` cannot load a real
+  # `libpdfium`, which is true on every runner today because nothing provisions the library.
+  # This job closes both gaps: it builds the crate with `pdf,pdf-pdfium` explicitly and
+  # provisions a real pdfium runtime via the existing `download-pdfium` composite action
+  # (rather than a third bespoke download script), then runs only that one test.
+  #
+  # Version pin: the checked-in bindings under
+  # crates/xberg-pdfium-render/include/pdfium_7678/ were generated against pdfium release
+  # 7678, while scripts/download_pdfium_runtime.sh's own default (used by
+  # `task pdfium:download`) pins 7881 for unrelated reasons (see commit f88391c26c). A
+  # binary/bindings version mismatch resolves every `FPDF_*` symbol via `dlopen` at runtime,
+  # not at compile time, so a mismatched download would not fail cleanly -- it can crash the
+  # test process instead of raising `XbergError::MissingDependency`. Pin this job's download
+  # to 7678 (the bindings' actual version), not the script's default, to keep binary and
+  # bindings in lockstep.
+  #
+  # `stage-pdfium-runtime` (the second existing composite action) copies the runtime library
+  # into a binding crate/package directory for build-time linking or co-located dlopen (e.g.
+  # crates/xberg-node, packages/ruby) -- it has no role here. `pdfium_engine::bind_once` reads
+  # `PDFIUM_DYNAMIC_LIB_PATH` directly (see that function's doc comment), so this job points
+  # that env var at the directory `download-pdfium` already populated instead of staging a
+  # copy anywhere. ~keep
+  pdfium-engine:
+    name: Rust pdfium engine (real library)
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # Only the pdf/ fixtures this test reads (pdf_test_document("multi_page.pdf")) are
+      # needed -- no other extractor runs in this job. ~keep
+      - name: Fetch test_documents fixtures
+        uses: xberg-io/actions/fetch-test-documents@v1
+        with:
+          include: |
+            pdf/**
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          cache-key-prefix: rust-pdfium-engine
+          use-sccache: "true"
+
+      - name: Download Pdfium runtime (pinned to the checked-in bindings' release)
+        uses: ./.github/actions/download-pdfium
+        with:
+          pdfium-version: "7678"
+
+      - name: Run pdfium engine test (real library required, not skip-on-absence)
+        run: |
+          set -euo pipefail
+          cargo test --locked -p xberg --features "pdf,pdf-pdfium" --lib \
+            extractors::pdf::tests::pdfium_engine_serializes_concurrent_extractions_when_the_library_is_available \
+            -- --exact --nocapture 2>&1 | tee /tmp/pdfium-engine-test.log
+          if ! grep -qE '^test result: ok\. 1 passed' /tmp/pdfium-engine-test.log; then
+            echo "::error::pdfium_engine_serializes_concurrent_extractions_when_the_library_is_available did not run -- this is the sole CI execution of PdfBackend::Pdfium; a renamed/moved/re-gated test would silently go green here" >&2
+            exit 1
+          fi
+        shell: bash
+        env:
+          PDFIUM_DYNAMIC_LIB_PATH: ${{ env.XBERG_PDFIUM_PREBUILT }}/lib
+          LD_LIBRARY_PATH: ${{ env.XBERG_PDFIUM_PREBUILT }}/lib
+          DYLD_LIBRARY_PATH: ${{ env.XBERG_PDFIUM_PREBUILT }}/lib
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ env.XBERG_PDFIUM_PREBUILT }}/lib
+          # Turns the test's soft-skip-on-absence into a hard failure (see mod.rs:4008-4050): both
+          # the unreadable-fixture path and the bind-failure path assert `!require_pdfium`.
+          XBERG_REQUIRE_PDFIUM: "1"
 
   live-hf:
     name: Live HF preset tests
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -507,12 +792,13 @@ jobs:
               -p xberg \
               --features "layout-detection,auto-rotate,tract" \
               --lib inference::tract_backend \
-              -- --nocapture; then
+              -- --nocapture 2>&1 | tee "/tmp/tract-backend-attempt-${attempt}.log" \
+              && grep -qE '^test result: ok\. [1-9][0-9]* passed' "/tmp/tract-backend-attempt-${attempt}.log"; then
               exit 0
             fi
           done
 
-          echo "::error::tract parity tests failed after 3 attempts"
+          echo "::error::tract parity tests failed or matched 0 tests after 3 attempts -- inference::tract_backend is the sole tract/ORT parity enforcement in CI, and XBERG_REQUIRE_TRACT_PARITY only guards against missing models, not a zero-match filter"
           exit 1
         shell: bash
         env:

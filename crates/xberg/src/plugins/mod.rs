@@ -186,7 +186,8 @@ pub use extractor::{
     register_document_extractor, unregister_document_extractor,
 };
 pub use ocr::{
-    OcrBackend, OcrBackendType, clear_ocr_backends, list_ocr_backends, register_ocr_backend, unregister_ocr_backend,
+    ConfidenceSemantics, OcrBackend, OcrBackendType, PageOrientationHandling, clear_ocr_backends, list_ocr_backends,
+    register_ocr_backend, unregister_ocr_backend,
 };
 pub use processor::{
     PostProcessor, ProcessingStage, clear_post_processors, list_post_processors, register_post_processor,
@@ -224,7 +225,6 @@ pub mod embedding_backend {
 }
 /// Re-exports for the reranker backend plugin type, used by alef-generated bindings.
 ///
-/// Since v5.0.0.
 pub mod reranker_backend {
     pub use super::{
         RerankerBackend, clear_reranker_backends, list_reranker_backends, register_reranker_backend,

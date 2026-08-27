@@ -7,19 +7,19 @@ import (
 )
 
 func main() {
-    config := xberg.NewExtractionConfig(
-        xberg.WithIncludeDocumentStructure(true),
-    )
+    config := xberg.ExtractionConfig{
+        IncludeDocumentStructure: true,
+    }
 
     input := xberg.ExtractInputFromURI("document.pdf")
-    result, err := xberg.Extract(*input, *config)
+    result, err := xberg.Extract(*input, config)
     if err != nil {
         panic(err)
     }
 
     if result.Results[0].Document != nil {
         for _, node := range result.Results[0].Document.Nodes {
-            fmt.Printf("[%s]\n", node.Content.NodeType)
+            fmt.Printf("[%s]\n", node.Content.Type())
         }
     }
 }

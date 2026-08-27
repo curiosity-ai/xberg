@@ -4,7 +4,7 @@ from xberg import ExtractInput, extract, ExtractionConfig, OcrConfig
 
 async def main() -> None:
     config: ExtractionConfig = ExtractionConfig(
-        ocr=OcrConfig(backend="paddleocr", language="en")  # model_tier="server" for max accuracy
+        ocr=OcrConfig(backend="paddleocr", language=["en"])  # model_tier="server" for max accuracy
     )
 
     result = await extract(ExtractInput(uri="scanned.pdf"), config)

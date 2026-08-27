@@ -695,14 +695,14 @@ impl RedactionPass<'_> {
             }
         }
         if let Some(links) = text.links.as_mut() {
-            for (link_text, url) in links.iter_mut() {
-                self.redact_in_place(link_text);
-                self.redact_in_place(url);
+            for link in links.iter_mut() {
+                self.redact_in_place(&mut link.text);
+                self.redact_in_place(&mut link.url);
             }
         }
         if let Some(code_blocks) = text.code_blocks.as_mut() {
-            for (_language, code) in code_blocks.iter_mut() {
-                self.redact_in_place(code);
+            for code_block in code_blocks.iter_mut() {
+                self.redact_in_place(&mut code_block.code);
             }
         }
     }
@@ -1237,6 +1237,7 @@ mod tests {
                 content: format!("Page mentions {email}."),
                 tables: Vec::new(),
                 image_indices: Vec::new(),
+                image_preprocessing: None,
                 hierarchy: None,
                 is_blank: None,
                 layout_regions: None,

@@ -126,6 +126,25 @@ const TAG_TABLE: u16 = HWPTAG_BEGIN + 61;
 /// HWP 5.x body-text record tag: equation-editor script (HWPTAG_BEGIN + 72 = 0x58).
 const TAG_EQEDIT: u16 = HWPTAG_BEGIN + 72;
 
+/// Maximum row or column count accepted for a single table dimension.
+///
+/// Real HWP tables (financial reports, schedules, tables of contents) run to at most a
+/// few hundred rows or columns; 1,000 gives generous headroom over anything actually
+/// authored while still rejecting values anywhere near the field's `u16::MAX` range
+/// (65,535), which no legitimate document needs and which alone already makes the grid
+/// allocation in [`parse_table_at`] unbounded.
+const MAX_TABLE_DIMENSION: usize = 1_000;
+
+/// Maximum total cell count (`row_count * col_count`) accepted for a single table.
+///
+/// A per-dimension cap alone is not enough: two values each just under
+/// [`MAX_TABLE_DIMENSION`] (e.g. 999 x 999) would still allocate nearly a million
+/// cells. 100,000 bounds the grid to a few megabytes (each cell starts as an empty
+/// `String`, ~24 bytes on a 64-bit target) regardless of aspect ratio, while still
+/// comfortably fitting realistic table shapes (e.g. up to 1,000 columns by 100 rows,
+/// or a 316 x 316 square).
+const MAX_TABLE_CELLS: usize = 100_000;
+
 /// Paragraph-level tags below are **not** verified against a real document (neither
 /// available fixture contains a styled/outlined paragraph exercising them) and are
 /// left at their original, likely-incorrect values. They are dead code in practice
@@ -373,6 +392,24 @@ fn parse_table_at(records: &[Record]) -> Option<HwpTable> {
     if row_count == 0 || col_count == 0 {
         return None;
     }
+    if row_count > MAX_TABLE_DIMENSION
+        || col_count > MAX_TABLE_DIMENSION
+        || row_count.saturating_mul(col_count) > MAX_TABLE_CELLS
+    {
+        // `row_count` and `col_count` are two independent u16 fields straight from the
+        // file (up to 65,535 each), and the grid below allocates row_count * col_count
+        // `String`s. Left unchecked, a crafted `tbl ` record with both fields near
+        // u16::MAX (65,535 x 65,535 = ~4.29 billion cells, ~103 GB) forces an
+        // allocation abort that kills the process — not a recoverable `Result::Err`.
+        // A per-dimension cap alone is not sufficient (two values each just under
+        // MAX_TABLE_DIMENSION could still multiply past any sane budget), so both
+        // checks apply. Skip only this table and keep parsing the rest of the
+        // section/document, matching the `row_count == 0 || col_count == 0` guard
+        // above and this crate's preserve-partial-results-on-failure rule: the
+        // caller (`parse_body_text`, at the `TAG_TABLE` match arm) treats `None` as
+        // "no table here" and continues from `table_end`, not as a fatal error.
+        return None;
+    }
 
     let mut grid: Vec<Vec<String>> = vec![vec![String::new(); col_count]; row_count];
 
@@ -595,5 +632,150 @@ mod tests {
             .map(|p| p.text.as_ref().map(|t| t.content.as_str()).unwrap_or(""))
             .collect();
         assert_eq!(paragraph_texts, vec!["Table:", "After table"]);
+    }
+
+    /// Builds a bare `TAG_TABLE` record's payload: ctrl-id `"tbl "` (stored
+    /// byte-reversed, per [`parse_table_at`]'s doc comment) followed by the row and
+    /// column counts as little-endian `u16`s. No `TAG_LIST_HEADER` cells follow, which
+    /// is fine for the size-rejection tests below — the grid is (or would be)
+    /// allocated purely from these two fields, before any cell is ever read.
+    fn table_record_data(row_count: u16, col_count: u16) -> Vec<u8> {
+        let mut data = vec![b' ', b'l', b'b', b't']; // ctrl-id "tbl " reversed
+        data.extend_from_slice(&row_count.to_le_bytes());
+        data.extend_from_slice(&col_count.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn should_reject_table_with_maximal_row_and_column_counts_without_allocating() {
+        // The defect this guards: row_count and col_count are two independent u16
+        // fields read straight from the file (parser.rs offsets 4..6 and 6..8), and
+        // the unfixed code computes `vec![vec![String::new(); col_count]; row_count]`
+        // with no upper bound. 0xFFFF x 0xFFFF is ~4.29 billion cells (~103 GB), which
+        // aborts the process on allocation failure rather than returning an error —
+        // so a test that only checked "does this return an error" could never fail
+        // against the unfixed code (it never returns at all) — it would hang/abort
+        // the whole test process instead. This test relies on the fixed early-return
+        // in `parse_table_at` running before the `vec![vec![...]; ...]` line, so it
+        // only passes because that line is never reached; against the unfixed code
+        // it would attempt the multi-gigabyte allocation directly (no cell records
+        // are needed for that, since the grid is sized from the table header alone).
+        let table_data = table_record_data(0xFFFF, 0xFFFF);
+        let records = vec![Record {
+            tag_id: TAG_TABLE,
+            level: 1,
+            data: table_data,
+        }];
+
+        let table = parse_table_at(&records);
+
+        assert!(
+            table.is_none(),
+            "a table claiming {}x{} cells must be rejected, not allocated",
+            0xFFFFu16,
+            0xFFFFu16
+        );
+    }
+
+    #[test]
+    fn should_reject_table_at_maximal_dimensions_via_full_body_text_pipeline() {
+        // Same shape as the malformed-record test above, but driven through
+        // `parse_body_text` end-to-end so the fix is proven at the same call site the
+        // real extractor uses (parser.rs:311), and to show the rest of the document
+        // survives: a paragraph before and after the oversized table must both still
+        // come through.
+        let mut stream = make_record(TAG_PARA_HEADER, 0, &[0u8; 24]);
+        stream.extend(make_record(TAG_PARA_TEXT, 1, &utf16le("Before table")));
+        stream.extend(make_record(TAG_TABLE, 1, &table_record_data(0xFFFF, 0xFFFF)));
+        stream.extend(make_record(TAG_PARA_HEADER, 0, &[0u8; 24]));
+        stream.extend(make_record(TAG_PARA_TEXT, 1, &utf16le("After table")));
+
+        let mut warnings = Vec::new();
+        let sections = parse_body_text(stream, false, "Section0", &mut warnings).expect("parse must not error");
+
+        assert!(sections[0].tables.is_empty(), "the oversized table must be dropped");
+        let paragraph_texts: Vec<&str> = sections[0]
+            .paragraphs
+            .iter()
+            .map(|p| p.text.as_ref().map(|t| t.content.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(paragraph_texts, vec!["Before table", "After table"]);
+    }
+
+    #[test]
+    fn should_reject_table_just_over_the_total_cell_cap_even_under_the_per_dimension_cap() {
+        // Both dimensions individually satisfy MAX_TABLE_DIMENSION (1_000), but their
+        // product (1_000_000) exceeds MAX_TABLE_CELLS (100_000). A per-dimension cap
+        // alone would let this through.
+        let row_count = 1_000u16;
+        let col_count = 1_000u16;
+        assert!((row_count as usize) <= MAX_TABLE_DIMENSION);
+        assert!((col_count as usize) <= MAX_TABLE_DIMENSION);
+        assert!((row_count as usize) * (col_count as usize) > MAX_TABLE_CELLS);
+
+        let records = vec![Record {
+            tag_id: TAG_TABLE,
+            level: 1,
+            data: table_record_data(row_count, col_count),
+        }];
+
+        assert!(parse_table_at(&records).is_none());
+    }
+
+    #[test]
+    fn should_accept_table_exactly_at_the_total_cell_cap() {
+        // 316 x 316 = 99,856 <= MAX_TABLE_CELLS (100_000), and each dimension is well
+        // under MAX_TABLE_DIMENSION, so this must be accepted and produce a grid of
+        // exactly the requested shape.
+        let row_count = 316u16;
+        let col_count = 316u16;
+        assert!((row_count as usize) * (col_count as usize) <= MAX_TABLE_CELLS);
+
+        let records = vec![Record {
+            tag_id: TAG_TABLE,
+            level: 1,
+            data: table_record_data(row_count, col_count),
+        }];
+
+        let table = parse_table_at(&records).expect("a table at the cap must still parse");
+        assert_eq!(table.rows.len(), row_count as usize);
+        assert_eq!(table.rows[0].len(), col_count as usize);
+    }
+
+    #[test]
+    fn should_still_parse_an_ordinary_small_table_to_the_same_grid_as_before() {
+        // Positive control: an over-eager cap would silently drop real, small tables.
+        // This mirrors `should_extract_table_rows_and_cell_text_without_swallowing_trailing_paragraph`
+        // and asserts the exact cell contents, not just the dimensions.
+        let mut stream = make_record(TAG_PARA_HEADER, 0, &[0u8; 24]);
+        stream.extend(make_record(TAG_PARA_TEXT, 1, &utf16le("Table:")));
+        stream.extend(make_record(TAG_TABLE, 1, &table_record_data(3, 4)));
+
+        let mut expected: Vec<Vec<String>> = vec![vec![String::new(); 4]; 3];
+        for (row, col, text) in [
+            (0u16, 0u16, "R0C0"),
+            (0, 1, "R0C1"),
+            (0, 2, "R0C2"),
+            (0, 3, "R0C3"),
+            (1, 0, "R1C0"),
+            (2, 3, "R2C3"),
+        ] {
+            let mut list_header = vec![0u8; 16];
+            list_header[8..10].copy_from_slice(&col.to_le_bytes());
+            list_header[10..12].copy_from_slice(&row.to_le_bytes());
+            list_header[12..14].copy_from_slice(&1u16.to_le_bytes());
+            list_header[14..16].copy_from_slice(&1u16.to_le_bytes());
+            stream.extend(make_record(TAG_LIST_HEADER, 1, &list_header));
+            stream.extend(make_record(TAG_PARA_HEADER, 2, &[0u8; 24]));
+            stream.extend(make_record(TAG_PARA_TEXT, 3, &utf16le(text)));
+            expected[row as usize][col as usize] = text.to_string();
+        }
+
+        let mut warnings = Vec::new();
+        let sections = parse_body_text(stream, false, "Section0", &mut warnings).unwrap();
+
+        assert!(warnings.is_empty());
+        assert_eq!(sections[0].tables.len(), 1);
+        assert_eq!(sections[0].tables[0].rows, expected);
     }
 }

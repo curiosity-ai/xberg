@@ -73,7 +73,6 @@ use utoipa::OpenApi;
             crate::types::extraction::ExtractedImage,
             crate::types::extraction::Element,
             crate::types::extraction::ElementMetadata,
-            crate::types::extraction::ElementId,
             crate::types::extraction::ElementType,
             crate::types::extraction::BoundingBox,
             crate::types::ocr_elements::OcrElement,

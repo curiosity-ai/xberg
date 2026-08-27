@@ -317,13 +317,8 @@ pub(crate) fn verify_excerpt(excerpt: &str, source_text: &str) -> bool {
         return true;
     }
 
-    let normalized_excerpt = normalize_whitespace(excerpt);
-    let normalized_source = normalize_whitespace(source_text);
+    let normalized_excerpt = crate::utils::normalize_whitespace(excerpt);
+    let normalized_source = crate::utils::normalize_whitespace(source_text);
 
-    normalized_source.contains(&normalized_excerpt)
-}
-
-/// Normalize whitespace by collapsing runs to single spaces.
-fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    normalized_source.contains(normalized_excerpt.as_ref())
 }

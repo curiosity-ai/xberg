@@ -9,7 +9,6 @@
 //!
 //! [`InferenceSession`]: super::InferenceSession
 //!
-//! Since v5.0.0 (issue #1275).
 
 use ndarray::ArrayD;
 
@@ -34,6 +33,15 @@ pub enum InferenceTensor {
 
 impl InferenceTensor {
     /// Borrow the `f32` payload, or `None` when the tensor holds another dtype.
+    ///
+    /// `mod tensor` compiles unconditionally (this type is the engine-neutral seam's shared
+    /// currency), but its real callers each sit behind their own, mutually distinct feature
+    /// gates — `layout::models::table_classifier` under `layout-detection`/`pdf`,
+    /// `doc_orientation::detector` under `auto_rotate`, and `inference::tract_backend` under its
+    /// `tract`/`inference_ort` combination — so no single narrower `cfg` on this method covers
+    /// exactly its live callers without also going dead in some other feature slice. Kept as an
+    /// `allow` rather than a cfg for that reason; the `#[cfg(test)]` unit tests below exercise it
+    /// unconditionally regardless of which (if any) of those features are enabled.
     #[allow(dead_code)]
     pub fn as_f32(&self) -> Option<&ArrayD<f32>> {
         match self {

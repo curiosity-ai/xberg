@@ -1,19 +1,19 @@
+---
+language: typescript
+target: wasm
+---
+
 ```typescript title="Wasm"
-import { enableOcr, ExtractInputKind, extract, initWasm } from "@xberg-io/xberg-wasm";
+import init, { WasmExtractInputKind, extract } from "@xberg-io/xberg-wasm";
 
 async function extractWithOcr() {
-  await initWasm();
+  await init();
 
-  try {
-    await enableOcr();
-    console.log("OCR enabled successfully");
-  } catch (error) {
-    console.error("Failed to enable OCR:", error);
-    return;
-  }
+  const buffer = await fetch("scanned-page.png").then((response) => response.arrayBuffer());
+  const bytes = new Uint8Array(buffer);
 
-  const bytes = new Uint8Array(await fetch("scanned-page.png").then((r) => r.arrayBuffer()));
-
+  // OCR is turned on per extraction through the `ocr` config block. There is no
+  // separate global "enable OCR" call — the backend is selected by name here.
   const output = await extract(
     {
       kind: "bytes",
@@ -23,7 +23,8 @@ async function extractWithOcr() {
     },
     {
       ocr: {
-        backend: "tesseract-wasm",
+        enabled: true,
+        backend: "tesseract",
         language: ["eng"],
       },
     },
