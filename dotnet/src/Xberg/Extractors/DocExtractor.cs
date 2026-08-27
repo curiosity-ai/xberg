@@ -274,18 +274,139 @@ public sealed class DocExtractor : IExtractor
         return NormalizeDocText(sb.ToString());
     }
 
-    private static string NormalizeDocText(string text)
+    /// <summary>Word field BEGIN marker. Text from here to <see cref="FieldSeparator"/> is the
+    /// field <em>instruction</em> (<c>HYPERLINK "…"</c>, <c>PAGEREF _Toc1 \h</c>,
+    /// <c>TOC \o "1-3"</c>), i.e. markup.</summary>
+    private const char FieldBegin = '\x13';
+
+    /// <summary>Word field SEPARATOR marker. Text from here to <see cref="FieldEnd"/> is the field
+    /// <em>result</em> — the only part a reader sees, and the only part that is document
+    /// text.</summary>
+    private const char FieldSeparator = '\x14';
+
+    /// <summary>Word field END marker.</summary>
+    private const char FieldEnd = '\x15';
+
+    /// <summary>
+    /// Word non-breaking hyphen (<c>0x1E</c> in the binary text stream), emitted as U+2011.
+    /// </summary>
+    /// <remarks>
+    /// This is a <em>visible</em> character — the reader sees a hyphen; the only thing
+    /// "non-breaking" suppresses is a line break at that position. Dropping it welds the two
+    /// halves of a compound together (<c>twenty-one</c> → <c>twentyone</c>), corrupting the word
+    /// rather than merely losing formatting. U+2011 rather than ASCII <c>-</c> so that the same
+    /// document saved as <c>.doc</c> and as <c>.docx</c> extracts to the same text: the DOCX
+    /// parser maps <c>w:noBreakHyphen</c> — the same character in the modern serialization of the
+    /// same Word document model — to U+2011.
+    /// </remarks>
+    private const char NonBreakingHyphen = '\u2011';
+
+    /// <summary>
+    /// For each <see cref="FieldBegin"/> in <paramref name="text"/>, in order of occurrence,
+    /// whether it has a matching <see cref="FieldEnd"/>.
+    /// </summary>
+    /// <remarks>
+    /// Fields nest — a <c>TOC</c> result is full of <c>PAGEREF</c> fields — so matching is
+    /// innermost-first via a stack. Begins left on the stack at end of input are unterminated and
+    /// reported as <c>false</c>; the caller deliberately does <em>not</em> treat one as opening a
+    /// suppression region, because doing so would swallow the entire remainder of a document whose
+    /// stream happens to carry one stray <c>0x13</c>. Degrading to the historical behaviour (the
+    /// instruction leaks) is far cheaper than losing the document tail.
+    /// </remarks>
+    private static bool[] ScanFieldBeginTermination(string text)
     {
-        var result = new StringBuilder(text.Length);
+        var terminated = new List<bool>();
+        var open = new Stack<int>();
+
         foreach (char c in text)
         {
+            if (c == FieldBegin)
+            {
+                terminated.Add(false);
+                open.Push(terminated.Count - 1);
+            }
+            else if (c == FieldEnd && open.Count > 0)
+            {
+                // A stray END with nothing open is ignored rather than throwing: this is
+                // user-supplied binary content.
+                terminated[open.Pop()] = true;
+            }
+        }
+
+        return terminated.ToArray();
+    }
+
+    /// <summary>
+    /// Normalize extracted DOC text: strip field instructions, convert special characters and
+    /// clean up whitespace.
+    /// </summary>
+    /// <remarks>
+    /// Field handling (upstream GH#1460): the text between <see cref="FieldBegin"/> and
+    /// <see cref="FieldSeparator"/> is the field instruction and is markup, not document text, so
+    /// it is dropped; the result between <see cref="FieldSeparator"/> and <see cref="FieldEnd"/>
+    /// is kept. A terminated field with no separator has no result and contributes nothing.
+    /// </remarks>
+    internal static string NormalizeDocText(string text)
+    {
+        var result = new StringBuilder(text.Length);
+
+        bool[] beginTerminated = ScanFieldBeginTermination(text);
+        int beginOrdinal = 0;
+        // One entry per open field; true while that field is still in its instruction part.
+        var fieldStack = new List<bool>();
+        // Count of fieldStack entries still in their instruction part. Text is suppressed whenever
+        // this is non-zero, which is what makes nesting work: a PAGEREF inside a TOC instruction
+        // stays suppressed even after the inner field reaches its own separator.
+        int instructionDepth = 0;
+
+        foreach (char c in text)
+        {
+            if (c == FieldBegin)
+            {
+                bool terminated = beginOrdinal < beginTerminated.Length && beginTerminated[beginOrdinal];
+                beginOrdinal++;
+                if (terminated)
+                {
+                    fieldStack.Add(true);
+                    instructionDepth++;
+                }
+                continue;
+            }
+
+            if (c == FieldSeparator)
+            {
+                if (fieldStack.Count > 0 && fieldStack[^1])
+                {
+                    fieldStack[^1] = false;
+                    instructionDepth--;
+                }
+                continue;
+            }
+
+            if (c == FieldEnd)
+            {
+                if (fieldStack.Count > 0)
+                {
+                    bool inInstruction = fieldStack[^1];
+                    fieldStack.RemoveAt(fieldStack.Count - 1);
+                    if (inInstruction) instructionDepth--;
+                }
+                continue;
+            }
+
+            if (instructionDepth > 0) continue;
+
             switch (c)
             {
                 case '\r': result.Append('\n'); break;
                 case '\x07': result.Append('\t'); break;
                 case '\x0B': result.Append('\n'); break;
                 case '\x0C': result.Append('\n'); break;
-                case '\x01' or '\x08' or '\x13' or '\x14' or '\x15': break;
+                case '\x01' or '\x08': break;
+                case '\x1E': result.Append(NonBreakingHyphen); break;
+                // 0x1F is the *optional* (soft) hyphen: invisible unless the line happens to break
+                // there, so discarding it is correct and must stay that way — emitting it would
+                // insert a hyphen the reader never saw.
                 default:
                     if (c < '\x20' && c != '\n' && c != '\t') break;
                     result.Append(c); break;

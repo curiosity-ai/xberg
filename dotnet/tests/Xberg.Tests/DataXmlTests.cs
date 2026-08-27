@@ -123,23 +123,25 @@ public class DataXmlTests
     }
 
     /// <summary>
-    /// Upstream computes an element's heading level as `((depth as u8) + 1).min(6)` over a u16
-    /// depth: the cast keeps only the low byte and the add wraps. A document that never closes its
-    /// tags walks past depth 255 and its levels start over from 0 instead of staying pinned at 6.
-    /// Reproduced rather than fixed — the level lands in the rendered section tree, and the
-    /// docling `.doctags.txt` groundtruth files nest deeply enough to reach it.
+    /// Upstream used to compute an element's heading level as `((depth as u8) + 1).min(6)` over a
+    /// u16 depth: the cast kept only the low byte and the add wrapped, so a document that never
+    /// closes its tags walked past depth 255 and its levels started over from 0 instead of staying
+    /// pinned at 6. The port reproduced that deliberately. Upstream `fix(xml): clamp heading depth
+    /// before narrowing` clamps in the wide type first, so the level now stays in 1..=6 at every
+    /// depth — including the docling `.doctags.txt` groundtruth files that reach past 255.
     /// </summary>
     [Fact]
-    public void PastDepth255TheHeadingLevelWrapsRatherThanPinningAtSix()
+    public void PastDepth255TheHeadingLevelStaysPinnedAtSix()
     {
-        // 258 tags, none closed: the element opened at depth 255 is the one that wraps.
+        // 258 tags, none closed: the element opened at depth 255 is the one that used to wrap.
         var doc = Extract("<r>" + string.Concat(Enumerable.Range(0, 257).Select(i => $"<t{i}>")));
         var levels = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Heading)
                         .Select(e => e.Kind.Level).ToList();
 
         Assert.Equal(258, levels.Count);
         Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6, 6 }, levels.Take(7).ToArray());
-        // Depth 255 -> (255 + 1) wraps to 0; the two after it climb again.
-        Assert.Equal(new byte[] { 6, 0, 1, 2 }, levels.Skip(254).Take(4).ToArray());
+        // Depth 255 and everything past it stay at the ceiling instead of wrapping to 0.
+        Assert.Equal(new byte[] { 6, 6, 6, 6 }, levels.Skip(254).Take(4).ToArray());
+        Assert.All(levels, level => Assert.InRange(level, (byte)1, (byte)6));
     }
 }

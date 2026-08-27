@@ -122,16 +122,21 @@ public sealed class XmlExtractor : IExtractor
     /// The heading level for an element opened at <paramref name="depth"/>.
     /// </summary>
     /// <remarks>
-    /// Upstream writes this as <c>((depth as u8) + 1).min(6)</c> over a <c>u16</c> depth, and both
-    /// steps of that are lossy in release builds: the cast keeps only the low byte and the add
-    /// wraps. A document that never closes its tags — the docling `.doctags.txt` groundtruth files
-    /// nest `&lt;loc_12&gt;`, `&lt;page_1&gt;` and friends without ever closing them — walks past
-    /// depth 255, and its levels then start over from 0 instead of staying pinned at 6. Reproduced
-    /// rather than fixed: the level lands in the rendered section tree, so straightening it here
-    /// would put the port's JSON at odds with every such document upstream emits.
+    /// Upstream used to write this as <c>((depth as u8) + 1).min(6)</c> over a <c>u16</c> depth,
+    /// which was lossy twice over in release builds: the cast kept only the low byte and the add
+    /// wrapped. A document that never closes its tags — the docling `.doctags.txt` groundtruth
+    /// files nest `&lt;loc_12&gt;`, `&lt;page_1&gt;` and friends without ever closing them — walked
+    /// past depth 255 and its levels then started over from 0 instead of staying pinned at 6. The
+    /// port reproduced that deliberately, because the level lands in the rendered section tree.
+    /// Upstream <c>fix(xml): clamp heading depth before narrowing</c> clamps in the wide type
+    /// first (<c>depth.saturating_add(1).min(6) as u8</c>), so the port now clamps too.
     /// </remarks>
     private static byte HeadingLevel(int depth) =>
-        Math.Min(unchecked((byte)(unchecked((byte)depth) + 1)), (byte)6);
+        (byte)Math.Min(depth < 0 ? MaxXmlHeadingLevel : depth + 1, MaxXmlHeadingLevel);
+
+    /// <summary>Ceiling on the heading level this extractor emits, matching upstream's
+    /// <c>MAX_XML_HEADING_LEVEL</c>.</summary>
+    private const int MaxXmlHeadingLevel = 6;
 
     private static InternalElement MakeElement(ElementKind kind, string text, int depth, uint index,
         Dictionary<string, string>? attrs) => new()
