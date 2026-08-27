@@ -71,13 +71,27 @@ internal static class EpubContent
             var (resolvedPath, pathErr) = renderItem.ResolvedPath();
             if (resolvedPath is null)
             {
-                throw new EpubParseException(
-                    $"Unsafe manifest href for spine item '{spineItem.Idref}' (href '{renderItem.RawHref}'): {pathErr}");
+                // One spine item with an href that escapes the package root used to fail the whole
+                // book. It is skipped with a warning now, like a missing manifest entry or a
+                // missing archive member.
+                warnings.Add(new ProcessingWarning
+                {
+                    Source = "epub",
+                    Message =
+                        $"Unsafe manifest href for spine item '{spineItem.Idref}' (href '{renderItem.RawHref}'): {pathErr}",
+                });
+                continue;
             }
             string filePath = resolvedPath;
 
-            bool guideTocCandidate =
-                (sourceItem.Path is not null && package.IsGuideTocCandidatePath(sourceItem.Path))
+            // The package names its navigation documents: properties="nav" in EPUB 3,
+            // <guide><reference type="toc"> in EPUB 2. Only those items are checked against the
+            // content heuristic, because a navigation document often also carries body prose that
+            // must be kept — and running the heuristic on every item dropped bibliographies,
+            // endnotes, licence pages and chapter overviews.
+            bool navigationCandidate =
+                sourceItem.IsNav() || renderItem.IsNav()
+                || (sourceItem.Path is not null && package.IsGuideTocCandidatePath(sourceItem.Path))
                 || (renderItem.Path is not null && package.IsGuideTocCandidatePath(renderItem.Path));
 
             string rawXhtml;
@@ -100,10 +114,12 @@ internal static class EpubContent
             string renderXhtml = StripEmbeddedMediaElements(
                 StripSpecializedNavigationSections(StripDocumentHead(normalizedXhtml)));
 
-            if (guideTocCandidate && LooksLikeNavigationDocument(renderXhtml))
+            if (navigationCandidate && LooksLikeNavigationDocument(renderXhtml))
                 continue;
 
-            if (ExtractTextFromXhtml(renderXhtml).Length == 0)
+            // A page with no text but with image markup is kept, so covers, plates and
+            // fixed-layout pages reach the image pipeline instead of being dropped.
+            if (ExtractTextFromXhtml(renderXhtml).Length == 0 && !HasImageMarkup(renderXhtml))
                 continue;
 
             documents.Add(new EpubSpineDocument { FilePath = filePath, Xhtml = renderXhtml });
@@ -132,12 +148,29 @@ internal static class EpubContent
 
             if (item.Fallback is null)
             {
+                // EPUB 3 allows an SVG content document in the spine. It is rendered through the
+                // SVG text walk when no XHTML fallback exists.
+                if (item.IsSvg()) return (item, "");
+
                 string mediaType = item.MediaType ?? "unknown";
                 return (null, $"no renderable XHTML/DTBook fallback found for media type '{mediaType}'");
             }
 
             currentId = item.Fallback;
         }
+    }
+
+    /// <summary>Element names that make a page worth keeping even with no text of its own.</summary>
+    private static readonly string[] ImageMarkupTags = { "<img", "<svg", "<image", "<picture" };
+
+    /// <summary>
+    /// Whether the page carries image markup, and so is worth keeping even when it has no text —
+    /// a cover, a plate, or a fixed-layout page.
+    /// </summary>
+    public static bool HasImageMarkup(string xhtml)
+    {
+        string lower = xhtml.ToLowerInvariant();
+        return ImageMarkupTags.Any(tag => lower.Contains(tag, StringComparison.Ordinal));
     }
 
     // -----------------------------------------------------------------------

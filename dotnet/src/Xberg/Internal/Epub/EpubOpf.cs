@@ -12,12 +12,15 @@ namespace Xberg.Internal.Epub;
 internal sealed class OpfMetadata
 {
     public string? Title { get; set; }
-    public string? Creator { get; set; }
+
+    /// <summary>Every <c>dc:creator</c>, in document order. They become the authors.</summary>
+    public List<string> Creators { get; } = new();
     public string? Date { get; set; }
     public string? Language { get; set; }
     public string? Identifier { get; set; }
     public string? Publisher { get; set; }
-    public string? Subject { get; set; }
+    /// <summary>Every <c>dc:subject</c>, in document order. They become the keywords.</summary>
+    public List<string> Subjects { get; } = new();
     public string? Description { get; set; }
     public string? Rights { get; set; }
     public string? Coverage { get; set; }
@@ -45,9 +48,67 @@ internal sealed class ManifestItem
     public string? Properties { get; set; }
 
     /// <summary>Mirrors `is_renderable_body_document`.</summary>
-    public bool IsRenderableBodyDocument() =>
-        MediaType is "application/xhtml+xml" or "application/x-dtbook+xml"
-        || (MediaType is null && HasRenderableExtension(RawHref));
+    /// <remarks>
+    /// <c>text/html</c> is not an EPUB core media type, but real-world EPUB 3 files (Internet
+    /// Archive builds, for one) declare every page with it while the payload is XHTML. The spine
+    /// loop parses the payload as XML either way, so accepting the label costs nothing and rescues
+    /// whole books — an exact-string match against <c>application/xhtml+xml</c> alone extracted
+    /// them with zero content. The same match also rejected <c>text/xml</c>, a type carrying
+    /// parameters, and any uppercase letter (upstream #1486).
+    /// </remarks>
+    public bool IsRenderableBodyDocument()
+    {
+        string? mediaType = NormalizedMediaType();
+        return mediaType is null
+            ? HasRenderableExtension(RawHref)
+            : mediaType is "application/xhtml+xml" or "application/x-dtbook+xml"
+                          or "text/html" or "text/xml" or "application/xml";
+    }
+
+    /// <summary>
+    /// The media type without parameters, whitespace or case. <c>null</c> when the attribute is
+    /// missing or empty, so the file extension decides.
+    /// </summary>
+    private string? NormalizedMediaType()
+    {
+        if (MediaType is null) return null;
+        int semicolon = MediaType.IndexOf(';');
+        string normalized = (semicolon >= 0 ? MediaType[..semicolon] : MediaType).Trim().ToLowerInvariant();
+        return normalized.Length == 0 ? null : normalized;
+    }
+
+    /// <summary>Whether the item carries the EPUB 3 <c>nav</c> property.</summary>
+    public bool IsNav() => HasProperty("nav");
+
+    /// <summary>
+    /// True when the item is an image by media type, or by extension when the media type is
+    /// missing. The cover has to satisfy this: some producers point <c>&lt;meta name="cover"&gt;</c>
+    /// at the cover XHTML page instead of the image.
+    /// </summary>
+    public bool IsImage()
+    {
+        if (MediaType is not null)
+            return MediaType.Trim().StartsWith("image/", StringComparison.OrdinalIgnoreCase);
+        int dot = RawHref.LastIndexOf('.');
+        if (dot < 0) return false;
+        return RawHref[(dot + 1)..].ToLowerInvariant()
+            is "jpg" or "jpeg" or "png" or "gif" or "webp" or "svg" or "bmp";
+    }
+
+    /// <summary>Whether <paramref name="property"/> appears in the item's space-separated
+    /// <c>properties</c> attribute.</summary>
+    public bool HasProperty(string property) =>
+        Properties is not null
+        && Properties.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                     .Any(value => string.Equals(value, property, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// True when the item is an SVG content document. EPUB 3 allows one in the spine; it is
+    /// rendered through the SVG text walk when no XHTML fallback exists.
+    /// </summary>
+    public bool IsSvg() =>
+        MediaType is not null
+        && MediaType.Trim().Equals("image/svg+xml", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Mirrors `resolved_path`: the resolved path, or null with an error message.</summary>
     public (string? Path, string Error) ResolvedPath()
@@ -100,24 +161,70 @@ internal static class EpubOpf
         var manifest = new Dictionary<string, ManifestItem>(StringComparer.Ordinal);
         var meta = package.Metadata;
 
+        // <dc:date> is qualified by opf:event in EPUB 2; a modification date is used only when
+        // no other date exists. <dc:title> can appear more than once (subtitles, series names),
+        // and EPUB 3 marks the main one with a refining <meta property="title-type">main</meta>.
+        var dates = new List<(string? Event, string Value)>();
+        var titles = new List<(string? Id, string Value)>();
+        string? mainTitleId = null;
+        string? uniqueIdentifierId = doc.Descendants()
+            .FirstOrDefault(n => n.Name.LocalName == "package")?.Attribute("unique-identifier")?.Value;
+
         foreach (var node in doc.Descendants())
         {
+            // Dublin Core elements inside an EPUB 3 <collection> describe the collection, not the
+            // book, so they are not package metadata. Matching on the namespace rather than the
+            // local name alone is what keeps a bare <title> from overwriting the book's.
+            if (IsDublinCore(node))
+            {
+                string? text = DirectText(node);
+                if (text is null || text.Length == 0) continue;
+
+                // Every arm used to overwrite the previous value, so a subtitle replaced the
+                // title, an illustrator replaced the author, and a modification date replaced the
+                // publication date. Repeatable fields accumulate; single-valued ones keep the
+                // first they see.
+                switch (node.Name.LocalName.ToLowerInvariant())
+                {
+                    case "title": titles.Add((node.Attribute("id")?.Value, text)); break;
+                    case "creator": meta.Creators.Add(text); break;
+                    case "date":
+                        dates.Add((node.Attributes().FirstOrDefault(a => a.Name.LocalName == "event")
+                                       ?.Value.ToLowerInvariant(),
+                                   text));
+                        break;
+                    case "language": meta.Language ??= text; break;
+                    case "identifier":
+                        // The package's own unique-identifier wins outright; otherwise first wins.
+                        if (node.Attribute("id")?.Value is { } id && uniqueIdentifierId is not null
+                            && string.Equals(id, uniqueIdentifierId, StringComparison.Ordinal))
+                            meta.Identifier = text;
+                        else
+                            meta.Identifier ??= text;
+                        break;
+                    case "publisher": meta.Publisher ??= text; break;
+                    case "subject": meta.Subjects.Add(text); break;
+                    case "description": meta.Description ??= text; break;
+                    case "rights": meta.Rights ??= text; break;
+                    case "coverage": meta.Coverage ??= text; break;
+                    case "format": meta.Format ??= text; break;
+                    case "relation": meta.Relation ??= text; break;
+                    case "source": meta.Source ??= text; break;
+                    case "type": meta.DcType ??= text; break;
+                }
+                continue;
+            }
+
             switch (node.Name.LocalName)
             {
-                case "title": SetIfText(node, v => meta.Title = v); break;
-                case "creator": SetIfText(node, v => meta.Creator = v); break;
-                case "date": SetIfText(node, v => meta.Date = v); break;
-                case "language": SetIfText(node, v => meta.Language = v); break;
-                case "identifier": SetIfText(node, v => meta.Identifier = v); break;
-                case "publisher": SetIfText(node, v => meta.Publisher = v); break;
-                case "subject": SetIfText(node, v => meta.Subject = v); break;
-                case "description": SetIfText(node, v => meta.Description = v); break;
-                case "rights": SetIfText(node, v => meta.Rights = v); break;
-                case "coverage": SetIfText(node, v => meta.Coverage = v); break;
-                case "format": SetIfText(node, v => meta.Format = v); break;
-                case "relation": SetIfText(node, v => meta.Relation = v); break;
-                case "source": SetIfText(node, v => meta.Source = v); break;
-                case "type": SetIfText(node, v => meta.DcType = v); break;
+                case "meta":
+                    // EPUB 3 marks the main title with a refining meta element.
+                    if (node.Attribute("property")?.Value == "title-type"
+                        && DirectText(node) == "main"
+                        && node.Attribute("refines")?.Value is { } refines
+                        && refines.StartsWith('#'))
+                        mainTitleId ??= refines[1..];
+                    break;
                 case "item":
                 {
                     string? id = node.Attribute("id")?.Value;
@@ -168,28 +275,25 @@ internal static class EpubOpf
             }
         }
 
-        // Find cover image via <meta name="cover" content="item-id"/> (after manifest is complete).
-        string? coverItemId = null;
-        foreach (var node in doc.Descendants())
-        {
-            if (node.Name.LocalName == "meta"
-                && node.Attribute("name")?.Value == "cover")
-            {
-                var content = node.Attribute("content")?.Value;
-                if (content is not null)
-                {
-                    coverItemId = content;
-                    break;
-                }
-            }
-        }
+        meta.Date = SelectPublicationDate(dates);
+        // The main title wins if a refining meta named one; otherwise the first title does.
+        meta.Title = titles.FirstOrDefault(t => t.Id is not null && t.Id == mainTitleId).Value
+                     ?? (titles.Count > 0 ? titles[0].Value : null);
 
-        if (coverItemId is not null && manifest.TryGetValue(coverItemId, out var coverItem))
+        // EPUB 3 marks the cover with a manifest property; EPUB 2 points at it from a meta
+        // element. Either way the item has to be an image: some producers point the meta at the
+        // cover XHTML page instead.
+        ManifestItem? cover = manifest.Values.FirstOrDefault(i => i.HasProperty("cover-image") && i.IsImage());
+        if (cover is null)
         {
-            var (path, _) = coverItem.ResolvedPath();
-            if (path is not null)
-                meta.CoverImageHref = path;
+            string? coverItemId = doc.Descendants()
+                .FirstOrDefault(n => n.Name.LocalName == "meta" && n.Attribute("name")?.Value == "cover")
+                ?.Attribute("content")?.Value;
+            if (coverItemId is not null && manifest.TryGetValue(coverItemId, out var fromMeta) && fromMeta.IsImage())
+                cover = fromMeta;
         }
+        if (cover is not null && cover.ResolvedPath().Path is { } coverPath)
+            meta.CoverImageHref = coverPath;
 
         // Spine order (document order of <itemref idref="..."/>).
         foreach (var node in doc.Descendants())
@@ -217,17 +321,41 @@ internal static class EpubOpf
 
         if (meta.Identifier is not null) additional["identifier"] = S(meta.Identifier);
         if (meta.Publisher is not null) additional["publisher"] = S(meta.Publisher);
-        if (meta.Subject is not null) additional["subject"] = S(meta.Subject);
+        if (meta.Subjects.Count > 0) additional["subject"] = S(meta.Subjects[0]);
         if (meta.Description is not null) additional["description"] = S(meta.Description);
         if (meta.Rights is not null) additional["rights"] = S(meta.Rights);
         return additional;
     }
 
+    /// <summary>Namespace prefix every Dublin Core element carries.</summary>
+    private const string DublinCoreNamespacePrefix = "http://purl.org/dc/elements/";
+
     /// <summary>
-    /// Mirrors Rust `if let Some(text) = node.text() { ...trim... }`: only the element's direct
-    /// text content, trimmed, and only assigned when text nodes are present.
+    /// Whether <paramref name="node"/> is package Dublin Core metadata: in the Dublin Core
+    /// namespace and not inside an EPUB 3 <c>&lt;collection&gt;</c>, whose Dublin Core elements
+    /// describe the collection rather than the book.
     /// </summary>
-    private static void SetIfText(XElement node, Action<string> assign)
+    private static bool IsDublinCore(XElement node) =>
+        node.Name.NamespaceName.StartsWith(DublinCoreNamespacePrefix, StringComparison.Ordinal)
+        && !node.Ancestors().Any(a => a.Name.LocalName.Equals("collection", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Pick the publication date from every <c>dc:date</c>. EPUB 2 qualifies dates with
+    /// <c>opf:event</c>; a modification date is used only when no other date exists.
+    /// </summary>
+    private static string? SelectPublicationDate(List<(string? Event, string Value)> dates)
+    {
+        foreach (var (evt, value) in dates)
+            if (evt is null or "publication" or "creation" or "original-publication")
+                return value;
+        return dates.Count > 0 ? dates[0].Value : null;
+    }
+
+    /// <summary>
+    /// Mirrors Rust `node.text()`: only the element's direct text content, trimmed. <c>null</c>
+    /// when the element has no text nodes of its own.
+    /// </summary>
+    private static string? DirectText(XElement node)
     {
         var sb = new StringBuilder();
         bool sawText = false;
@@ -239,7 +367,6 @@ internal static class EpubOpf
                 sawText = true;
             }
         }
-        if (sawText)
-            assign(sb.ToString().Trim());
+        return sawText ? sb.ToString().Trim() : null;
     }
 }

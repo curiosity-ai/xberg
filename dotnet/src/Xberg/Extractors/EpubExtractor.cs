@@ -84,7 +84,8 @@ public sealed class EpubExtractor : IExtractor
         doc.Metadata = new Metadata
         {
             Title = package.Metadata.Title,
-            Authors = package.Metadata.Creator is { } creator ? new List<string> { creator } : null,
+            Authors = package.Metadata.Creators.Count > 0 ? new List<string>(package.Metadata.Creators) : null,
+            Keywords = package.Metadata.Subjects.Count > 0 ? new List<string>(package.Metadata.Subjects) : null,
             Language = package.Metadata.Language,
             CreatedAt = package.Metadata.Date,
             Format = epubFormatMetadata,
@@ -154,14 +155,16 @@ public sealed class EpubExtractor : IExtractor
             string filePath = spineDoc.FilePath;
             string sanitized = spineDoc.Xhtml;
 
-            // Skip navigation documents (TOC pages, etc.).
-            if (EpubContent.LooksLikeNavigationDocument(sanitized))
-                continue;
-
+            // No navigation check here any more: the spine walk already dropped the items the
+            // package itself names as navigation, and re-running the content heuristic on every
+            // document dropped bibliographies, endnotes and licence pages that markdown output
+            // kept — so the two formats disagreed.
             budget.TryAccountText(System.Text.Encoding.UTF8.GetByteCount(sanitized));
 
-            // Skip empty chapters.
-            if (EpubContent.ExtractTextFromXhtml(sanitized).Length == 0)
+            // Skip empty chapters, unless the page carries image markup: a cover, a plate or a
+            // fixed-layout page has no text of its own and still belongs in the document.
+            if (EpubContent.ExtractTextFromXhtml(sanitized).Length == 0
+                && !EpubContent.HasImageMarkup(sanitized))
                 continue;
 
             var nodes = EpubHtmlStructure.BuildDocumentStructure(sanitized);

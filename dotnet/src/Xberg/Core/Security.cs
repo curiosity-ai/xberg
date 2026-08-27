@@ -348,6 +348,18 @@ public static class ZipBombValidator
         return archive;
     }
 
+    /// <summary>
+    /// Smallest uncompressed member size the per-member ratio cap applies to.
+    /// </summary>
+    /// <remarks>
+    /// The ratio cap guards against one member that inflates to hundreds of megabytes. A member
+    /// measured in kilobytes cannot exhaust memory whatever its ratio, and blank-page JPEGs, empty
+    /// stylesheets and whitespace-padded pages routinely deflate past 100:1 — one 76 KB blank-page
+    /// JPEG rejected whole EPUBs (upstream GH#1496). The total-size cap and the whole-archive ratio
+    /// cap still bound the aggregate.
+    /// </remarks>
+    private const ulong MemberRatioFloor = 1024 * 1024;
+
     public static void Validate(System.IO.Compression.ZipArchive archive, SecurityLimits limits)
     {
         var entries = archive.Entries;
@@ -375,7 +387,7 @@ public static class ZipBombValidator
             totalUncompressed = SaturatingAdd(totalUncompressed, uncompressed);
             totalCompressed = SaturatingAdd(totalCompressed, compressed);
 
-            if (uncompressed > 0)
+            if (uncompressed > 0 && (compressed == 0 || uncompressed >= MemberRatioFloor))
             {
                 // A zero compressed size against a non-zero uncompressed one is not something any
                 // compressor produces; calling the ratio infinite stops the entry slipping past
