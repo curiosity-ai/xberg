@@ -252,15 +252,26 @@ public sealed class RstExtractor : IExtractor
             var row = new List<string>();
             foreach (var (start, end) in ranges)
             {
+                // The ranges are byte offsets counted against the ASCII ("="/" " only) separator
+                // line, but this is an arbitrary data row the document controls and may contain
+                // multi-byte UTF-8. A column boundary between the separator's columns is not
+                // guaranteed to land on a char boundary in a non-ASCII row, so snap inward rather
+                // than cutting a codepoint in half.
                 int e = Math.Min(end, bytes.Length);
                 int s = Math.Min(start, bytes.Length);
-                if (s >= bytes.Length) row.Add("");
-                else row.Add(Encoding.UTF8.GetString(bytes, s, e - s).Trim());
+                while (s < e && !IsUtf8CharBoundary(bytes, s)) s++;
+                while (e > s && !IsUtf8CharBoundary(bytes, e)) e--;
+                row.Add(s >= e ? "" : Encoding.UTF8.GetString(bytes, s, e - s).Trim());
             }
             if (row.Any(c => c.Length != 0)) cells.Add(row);
         }
         return cells;
     }
+
+    /// <summary>Whether <paramref name="offset"/> starts a UTF-8 codepoint in
+    /// <paramref name="bytes"/> (i.e. is not a continuation byte).</summary>
+    private static bool IsUtf8CharBoundary(byte[] bytes, int offset) =>
+        offset >= bytes.Length || (bytes[offset] & 0xC0) != 0x80;
 
     private static List<(int, int)> SimpleTableColumnRanges(string separator)
     {

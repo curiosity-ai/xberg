@@ -3,6 +3,8 @@ using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
 
+using Xberg.Core;
+
 namespace Xberg.Internal.Ooxml;
 
 /// <summary>Result of reading a PPTX: the assembled markdown/plain content plus metadata.</summary>
@@ -24,12 +26,17 @@ public sealed class PptxResult
 /// </summary>
 public static class PptxReader
 {
-    public static PptxResult Extract(ReadOnlySpan<byte> content, bool plain, bool injectPlaceholders)
+    public static PptxResult Extract(ReadOnlySpan<byte> content, bool plain, bool injectPlaceholders,
+        SecurityLimits? limits = null)
     {
         using var pkg = new OoxmlPackage(content);
         var result = new PptxResult();
 
         var slidePaths = FindSlidePaths(pkg);
+        // Reject a presentation whose slide count exceeds the configured ceiling before any
+        // per-slide work (text rendering, chart resolution, image lookup) begins. Unlike PDF, the
+        // count needs no fallback parser: the slide paths are already resolved here, so it is exact.
+        DocumentLimits.EnforcePageCount(slidePaths.Count, limits);
         result.SlideCount = slidePaths.Count;
 
         var notes = ExtractAllNotes(pkg, slidePaths);
@@ -173,6 +180,19 @@ public static class PptxReader
         }
     }
 
+    /// <summary>
+    /// Maximum PowerPoint list nesting level (<c>&lt;a:pPr lvl="…"&gt;</c>) honoured for
+    /// indentation.
+    /// </summary>
+    /// <remarks>
+    /// PowerPoint's own list UI caps nesting at 9 levels (<c>lvl</c> 0-8), mirroring the
+    /// <c>w:ilvl</c> ceiling DOCX enforces for the same reason. <c>lvl</c> is document-controlled
+    /// text parsed with no upper bound: without this clamp a crafted <c>lvl="4294967294"</c> turns
+    /// the per-level two-space indent loop into ~4.29 billion appends — several GB of string
+    /// growth — instead of a bounded few.
+    /// </remarks>
+    private const uint MaxListNestingLevel = 8;
+
     private static (uint Level, bool Ordered, bool HasBullet) ParseListProperties(XElement p)
     {
         uint level = 1; bool ordered = false, hasBullet = false;
@@ -180,7 +200,7 @@ public static class PptxReader
         if (pPr is not null)
         {
             var lvl = pPr.Attribute("lvl")?.Value;
-            if (lvl is not null) level = (uint.TryParse(lvl, out var v) ? v : 0) + 1;
+            if (lvl is not null) level = Math.Min(uint.TryParse(lvl, out var v) ? v : 0, MaxListNestingLevel) + 1;
             ordered = pPr.Elements().Any(e => e.Name.LocalName == "buAutoNum");
             bool buNone = pPr.Elements().Any(e => e.Name.LocalName == "buNone");
             hasBullet = !buNone && (ordered

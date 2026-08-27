@@ -32,7 +32,7 @@ public sealed class PptxExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         bool plain = config.OutputFormat.Equals(OutputFormat.Plain);
-        var result = PptxReader.Extract(content, plain, injectPlaceholders: true);
+        var result = PptxReader.Extract(content, plain, injectPlaceholders: true, config.SecurityLimits);
         return BuildDocumentFromResult(result, mimeType, config.SecurityLimits);
     }
 

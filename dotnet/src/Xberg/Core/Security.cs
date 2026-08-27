@@ -53,6 +53,20 @@ public sealed class SecurityLimits
     /// <summary>Maximum total table cells across one document.</summary>
     [JsonPropertyName("max_table_cells")]
     public long MaxTableCells { get; set; } = 100_000;
+
+    /// <summary>
+    /// Maximum number of pages in a single document. <c>null</c> means unlimited.
+    /// </summary>
+    /// <remarks>
+    /// Checked once the page count is known and before any per-page work starts. Byte-size limits
+    /// do not bound page count: a scanned page can compress to a few kilobytes, so a document well
+    /// under <see cref="MaxContentSize"/> or <see cref="MaxArchiveSize"/> can still hold thousands
+    /// of pages of per-page work. Defaults to unlimited because a real ceiling here is
+    /// workload-specific and a low default would silently reject legitimate large documents;
+    /// callers that want a ceiling set this explicitly. Upstream GH#1451, GH#764.
+    /// </remarks>
+    [JsonPropertyName("max_pages")]
+    public long? MaxPages { get; set; }
 }
 
 /// <summary>Which limit a <see cref="SecurityException"/> reports.</summary>
@@ -67,6 +81,7 @@ public enum SecurityViolation
     TooManyIterations,
     XmlDepthExceeded,
     TooManyCells,
+    TooManyPages,
     UnreadableEntry,
 }
 
@@ -113,6 +128,11 @@ public sealed class SecurityException : Exception
 
     internal static SecurityException TooManyCells(long cells, long max) =>
         new(SecurityViolation.TooManyCells, $"Too many table cells: {cells} (max: {max})");
+
+    internal static SecurityException TooManyPages(long count, long max) =>
+        new(SecurityViolation.TooManyPages,
+            $"Document has too many pages: {count} (max: {max}). Raise `security_limits.max_pages` "
+            + "if this document is legitimate, or split it before extraction.");
 
     internal static SecurityException UnreadableEntry(int index, string reason) =>
         new(SecurityViolation.UnreadableEntry,
@@ -177,6 +197,7 @@ public sealed class SecurityBudget
             MaxIterations = limits.MaxIterations,
             MaxXmlDepth = limits.MaxNestingDepth,
             MaxTableCells = limits.MaxTableCells,
+            MaxPages = limits.MaxPages,
         };
         return new SecurityBudget(l);
     }
@@ -268,6 +289,27 @@ public sealed class SecurityBudget
         // Overflow iff the operands share a sign that the result does not.
         if (((a ^ sum) & (b ^ sum)) < 0) return long.MaxValue;
         return sum;
+    }
+}
+
+/// <summary>
+/// Document-level checks that do not belong to any one parser.
+/// </summary>
+public static class DocumentLimits
+{
+    /// <summary>
+    /// Reject a document whose page (or slide, or frame) count exceeds
+    /// <see cref="SecurityLimits.MaxPages"/>.
+    /// </summary>
+    /// <remarks>
+    /// Rejects rather than truncates, matching every other primary-document limit. Call this once
+    /// the count is known and before any per-page work begins; it short-circuits entirely when the
+    /// limit is unset, which is the default. Upstream GH#1451.
+    /// </remarks>
+    public static void EnforcePageCount(long count, SecurityLimits? limits)
+    {
+        if (limits?.MaxPages is not { } max) return;
+        if (count > max) throw SecurityException.TooManyPages(count, max);
     }
 }
 

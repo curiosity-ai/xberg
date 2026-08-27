@@ -47,6 +47,7 @@ public sealed class ImageExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         byte[] bytes = content.ToArray();
+        EnforceImagePageLimit(bytes, mimeType, config.SecurityLimits);
         var imageMeta = HeifContainer.IsHeifContainer(bytes)
             ? HeifMetadata(bytes)
             : RasterMetadata(bytes);
@@ -68,6 +69,27 @@ public sealed class ImageExtractor : IExtractor
         doc.Metadata = new Metadata { Format = FormatMetadata.Image(imageMeta) };
         doc.MimeType = mimeType;
         return doc;
+    }
+
+    /// <summary>
+    /// Reject a multi-frame TIFF whose frame count exceeds the configured ceiling.
+    /// </summary>
+    /// <remarks>
+    /// A page here is a TIFF frame; every other supported raster format is single-frame, so the
+    /// check is scoped to TIFF. Frames are counted from the header alone — no raster data is
+    /// decoded. A file that will not identify is left to the extraction path to report, rather than
+    /// turned into a spurious page-limit rejection that masks the real error.
+    /// </remarks>
+    private static void EnforceImagePageLimit(byte[] bytes, string mimeType, SecurityLimits? limits)
+    {
+        if (limits?.MaxPages is null) return;
+        if (!mimeType.Contains("tiff", StringComparison.OrdinalIgnoreCase)) return;
+
+        int frameCount;
+        try { frameCount = Image.Identify(bytes).FrameMetadataCollection.Count; }
+        catch { return; }
+
+        DocumentLimits.EnforcePageCount(frameCount, limits);
     }
 
     private static ImageMetadata RasterMetadata(byte[] bytes)
