@@ -101,6 +101,7 @@ internal static class PdfRotationRepair
     public static string AssembleReadingOrderText(IReadOnlyList<TextSpan> spans, IReadOnlyList<int> order)
     {
         var text = new StringBuilder();
+        double paragraphGap = ParagraphGapThreshold(spans);
         int runStart = 0;
         while (runStart < order.Count)
         {
@@ -109,7 +110,7 @@ internal static class PdfRotationRepair
             while (runEnd < order.Count && SameRotation(SpanRotation(spans, order[runEnd]), rotation)) runEnd++;
 
             if (runStart > 0 && text.Length > 0 && !char.IsWhiteSpace(text[^1])) text.Append(' ');
-            AppendRun(text, spans, order, runStart, runEnd, rotation);
+            AppendRun(text, spans, order, runStart, runEnd, rotation, paragraphGap);
             runStart = runEnd;
         }
         return text.ToString();
@@ -118,14 +119,26 @@ internal static class PdfRotationRepair
     private static double SpanRotation(IReadOnlyList<TextSpan> spans, int index) =>
         index >= 0 && index < spans.Count ? spans[index].RotationDegrees : UnrotatedDegrees;
 
-    /// <summary>Append one maximal same-rotation run. Unrotated runs take the verbatim
-    /// concatenation path; any other rotation is line-clustered, advance-sorted and gap-spaced.</summary>
+    /// <summary>Baseline gap above which two upright spans are a new paragraph rather than the
+    /// next line. Median span height × 1.5, the same measure the page assembler uses.</summary>
+    private static double ParagraphGapThreshold(IReadOnlyList<TextSpan> spans)
+    {
+        if (spans.Count == 0) return 1.5;
+        var heights = new List<double>(spans.Count);
+        foreach (var s in spans) heights.Add(s.Height);
+        heights.Sort();
+        return heights[heights.Count / 2] * 1.5;
+    }
+
+    /// <summary>Append one maximal same-rotation run. A rotated run is line-clustered,
+    /// advance-sorted and gap-spaced; an upright run keeps the order it arrived in and is only
+    /// given back the separators the page assembler would have put between its spans.</summary>
     private static void AppendRun(StringBuilder text, IReadOnlyList<TextSpan> spans,
-        IReadOnlyList<int> order, int from, int to, double rotation)
+        IReadOnlyList<int> order, int from, int to, double rotation, double paragraphGap)
     {
         if (IsUnrotated(rotation))
         {
-            for (int i = from; i < to; i++) text.Append(spans[order[i]].Text);
+            AppendUprightRun(text, spans, order, from, to, paragraphGap);
             return;
         }
 
@@ -152,6 +165,51 @@ internal static class PdfRotationRepair
             lineStart = lineEnd;
         }
     }
+
+    /// <summary>
+    /// Append an upright run, in the order it arrived, separating consecutive spans the way the
+    /// page assembler would.
+    /// </summary>
+    /// <remarks>
+    /// The repair replaces the whole page's assembly, so whatever it does not reproduce is lost —
+    /// and concatenating an upright run verbatim loses every space and line break in it, welding
+    /// "MICHAEL TRINSEY" to the catalogue number under it and every line of a narrow column to the
+    /// next. That is the trade the dominance guard exists to bound, but a page can clear the guard
+    /// on two long rotated captions and still be upright text almost everywhere, so the run pays it
+    /// anyway. Ordering stays untouched — only the separators the concatenation dropped are put
+    /// back, on the same geometry rule <c>append_span_separator</c> uses.
+    /// </remarks>
+    private static void AppendUprightRun(StringBuilder text, IReadOnlyList<TextSpan> spans,
+        IReadOnlyList<int> order, int from, int to, double paragraphGap)
+    {
+        TextSpan? previous = null;
+        for (int i = from; i < to; i++)
+        {
+            var span = spans[order[i]];
+            if (previous is not null) text.Append(UprightSeparator(previous, span, paragraphGap));
+            text.Append(span.Text);
+            previous = span;
+        }
+    }
+
+    /// <summary>The separator between two consecutive upright spans: "" (glued), " ", "\n" or
+    /// "\n\n". Mirrors the tail of the page assembler's <c>SpanSeparator</c>.</summary>
+    private static string UprightSeparator(TextSpan previous, TextSpan span, double paragraphGap)
+    {
+        if (EndsWithWhitespace(previous.Text) || StartsWithWhitespace(span.Text)) return "";
+
+        double baselineGap = Math.Abs(previous.Y - span.Y);
+        double effectiveHeight = Math.Max(Math.Max(span.Height, previous.Height), span.FontSize * 0.5);
+        if (baselineGap < effectiveHeight * 0.5)
+            return span.X - previous.Right > span.FontSize * 0.15 ? " " : "";
+        return baselineGap > paragraphGap ? "\n\n" : "\n";
+    }
+
+    private static bool EndsWithWhitespace(string text) =>
+        text.Length > 0 && char.IsWhiteSpace(text[^1]);
+
+    private static bool StartsWithWhitespace(string text) =>
+        text.Length > 0 && char.IsWhiteSpace(text[0]);
 
     /// <summary>Sort one rotated-frame line by advance-axis position and join it, spacing
     /// wherever the advance gap looks like a real word boundary rather than kerning.</summary>
